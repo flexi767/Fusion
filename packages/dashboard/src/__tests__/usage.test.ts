@@ -2517,8 +2517,8 @@ describe("usage", () => {
         rate_limit: {
           primary_window: {
             used_percent: 67.5,
-            limit_window_seconds: 5 * 60 * 60, // 5 hours
-            reset_after_seconds: 2 * 60 * 60, // 2 hours
+            limit_window_seconds: 7 * 24 * 60 * 60, // 7 days
+            reset_after_seconds: 5 * 24 * 60 * 60, // 5 days
           },
           secondary_window: {
             used_percent: 12.0,
@@ -2570,11 +2570,12 @@ describe("usage", () => {
       expect(codex.email).toBe("test@example.com");
       expect(codex.plan).toBe("Pro");
       expect(codex.windows).toHaveLength(2);
+      expect(codex.windows.map((window) => window.label)).toEqual(["Weekly", "Weekly (secondary)"]);
 
-      const sessionWindow = codex.windows.find((w) => w.label.includes("Session"));
-      expect(sessionWindow).toBeDefined();
-      expect(sessionWindow!.percentUsed).toBe(67.5);
-      expect(sessionWindow!.percentLeft).toBe(32.5);
+      const primaryWeeklyWindow = codex.windows[0];
+      expect(primaryWeeklyWindow).toBeDefined();
+      expect(primaryWeeklyWindow!.percentUsed).toBe(67.5);
+      expect(primaryWeeklyWindow!.percentLeft).toBe(32.5);
     });
 
     it("sets resetAt from reset_at timestamp", async () => {

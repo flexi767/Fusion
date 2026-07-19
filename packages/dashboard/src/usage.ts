@@ -1322,8 +1322,21 @@ async function fetchCodexUsage(): Promise<ProviderUsage> {
 
     // Main rate limits
     if (data.rate_limit) {
-      const primary = parseWindow(data.rate_limit.primary_window, "Session (5h)");
-      const secondary = parseWindow(data.rate_limit.secondary_window, "Weekly");
+      /*
+      FNXC:UsageProviders 2026-07-19-17:22:
+      Codex can return a seven-day quota as primary_window, so its label must follow limit_window_seconds instead of assuming every primary window is a five-hour session. When both returned windows are weekly, distinguish the second one to keep hide/show identities unambiguous.
+      */
+      const primaryWindowSeconds = data.rate_limit.primary_window?.limit_window_seconds;
+      const primaryIsWeekly =
+        typeof primaryWindowSeconds === "number" && primaryWindowSeconds >= 6 * 24 * 60 * 60;
+      const primary = parseWindow(
+        data.rate_limit.primary_window,
+        primaryIsWeekly ? "Weekly" : "Session (5h)",
+      );
+      const secondary = parseWindow(
+        data.rate_limit.secondary_window,
+        primaryIsWeekly ? "Weekly (secondary)" : "Weekly",
+      );
       if (primary) usage.windows.push(primary);
       if (secondary) usage.windows.push(secondary);
     }
