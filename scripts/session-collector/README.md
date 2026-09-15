@@ -234,3 +234,18 @@ pass can retry previously rejected 400 deliveries when this normalization change
 the display text, retaining the exact event ID and observation revision. Other
 rejections remain parked. Patch counts stay intact and sanitized patch display is
 marked bounded. Native transcript files and AgentPulse recovery data are unchanged.
+
+
+## Native correction generations (collector v8)
+
+Native turns now carry their provider parser generation. The server accepts an
+earlier corrected timestamp only when both the parser generation and durable
+observation revision increase over the stored native turn. Same-generation stale
+snapshots and parser downgrades remain refused. Imported snapshots cannot claim
+this authority. Display or collector releases do not themselves advance a parser
+generation.
+
+Deploy the updated server before collector v8. Existing Claude turns are
+republished in durable keyset batches of 25 without rewinding file offsets.
+Codex history is not republished wholesale. Keep the existing spool when updating
+a collector; resetting it would discard the revision and acknowledgement chain.

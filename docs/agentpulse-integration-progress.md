@@ -324,3 +324,16 @@ Pricing bands committed as `472c6c232`; push failed again (`could not read Usern
 - Verification against a consistent copy of the real m3 spool advanced all four paused offsets, including `20,067,730 → 27,910,443` for the image-bearing tool output. The copied checkpoint then had zero parse/rejection/capacity errors. No production/native source record was edited or discarded.
 - One J delivery was retained as HTTP 400 because a patch contained an embedded NUL. v7 represents NUL visibly as `␀`, preserves patch counts and event identity, and retries only the changed display-normalization rejection. Other rejected records remain parked. Forty-five Python tests cover both providers, canonical/unknown oversized types, following prompts, partial lines, restart and exact acknowledgement/repair identity.
 - v7 is verified in source and the copied checkpoint; deployment and PostgreSQL reconciliation are next. The J server is still the frozen `62deba2ca` build. All-host, retention, full latency, outage/rollback and 24-hour gates remain open; AgentPulse is not retired.
+
+
+## v7 deployed; native parser upgrade contract in verification
+
+- Frozen `46ccd4b5c` (collector v7) is now running in both existing comparison jobs. J's original rejected NUL-bearing envelope was saved privately before restart; its repaired delivery retained the event ID and was acknowledged. At **19:45 UTC**, both hosts reported zero queued/rejected records, parse errors, delivery errors and capacity pauses. J discovered 8,132 transcripts and m3 766. Empty spools do not mean every historical byte has been parsed; bounded history cursors continue advancing.
+- Database verification found a second-order repair issue: incorrect earlier parser output could itself have a later `updatedAt`, so timestamp ordering blocked a corrected earlier result. The next server version records an explicit native parser generation. A higher generation with a higher durable observation revision may correct earlier native output; same-generation older timestamps, lower revisions and parser downgrades remain refused. Historical imports cannot claim this generation or be replaced merely by a native upgrade.
+- Collector v8 will republish existing Claude turns in batches of 25, with a durable keyset cursor, before continuing file reads. It preserves native file offsets and does not reparse all Codex history. Deploy the updated server **before** v8 so these generation markers are recorded. No server/collector change has yet been made for this contract.
+- Focused verification so far: 15 PostgreSQL ingestion/analytics tests and 46 Python collector tests pass, including bounded republish across SQLite restart. Build/gate verification is next. The isolated J server still runs `62deba2ca`; AgentPulse remains active and no cutover is claimed.
+
+
+### Native correction generation verification complete
+
+The v8 contract passed 15 PostgreSQL integration tests, eight turn/pricing unit tests, 46 Python collector tests and scoped lint. Serial `verify:fast` passed all 25 steps in 210.0 seconds; the serial merge gate passed all 754 tests and static validators. The deployment order remains server first, then collectors with their original spools.

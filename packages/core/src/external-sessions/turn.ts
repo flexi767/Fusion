@@ -8,6 +8,8 @@ export interface SessionModelUsage {
   requests: number | null; contextTokens: number | null; longContext: boolean; fast: boolean;
 }
 export interface SessionTurn {
+  /** Native normalization generation; imports cannot claim this authority. */
+  nativeParserVersion?: number;
   /** Server-owned snapshots; collector-supplied values are ignored by validation. */
   recordedPricing?: import("./rate-snapshot.js").RecordedSessionPrice[];
   id: string; startedAt: string; completedAt: string | null; updatedAt: string;
@@ -39,8 +41,9 @@ export function parseSessionTurn(value: unknown): SessionTurn {
   if (!Array.isArray(r.prompts) || r.prompts.length > 32 || !Array.isArray(r.files) || r.files.length > 256
     || !Array.isArray(r.usage) || r.usage.length > 64 || JSON.stringify(r).length > 1_500_000) throw new Error("Invalid turn size");
   const id = text(r.id, 256);
+  if (r.nativeParserVersion !== undefined && (!Number.isSafeInteger(r.nativeParserVersion) || Number(r.nativeParserVersion) < 1 || Number(r.nativeParserVersion) > 1_000_000)) throw new Error("Invalid native parser version");
   if (!id || /[\u0000-\u001f]/u.test(id)) throw new Error("Invalid turn identity");
-  return { id, startedAt: timestamp(r.startedAt), completedAt: r.completedAt == null ? null : timestamp(r.completedAt), updatedAt: timestamp(r.updatedAt),
+  return { ...(r.nativeParserVersion === undefined ? {} : { nativeParserVersion: Number(r.nativeParserVersion) }), id, startedAt: timestamp(r.startedAt), completedAt: r.completedAt == null ? null : timestamp(r.completedAt), updatedAt: timestamp(r.updatedAt),
     durationMs: count(r.durationMs), durationSource: r.durationSource === "provider" ? "provider" : "timestamps",
     prompts: r.prompts.map(p => redactSecrets(text(p, 65536))), response: redactSecrets(text(r.response, 131072)), toolCalls: count(r.toolCalls) ?? 0,
     provenance: r.provenance === "agentpulse-import" ? "agentpulse-import" : "native-transcript",

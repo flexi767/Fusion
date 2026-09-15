@@ -223,4 +223,31 @@ pgDescribe("External session durable ingestion", () => {
     }
   });
 
+  it("allows a newer native parser to correct stale future timestamps without accepting downgrade or out-of-order snapshots", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    for (const provider of ["claude", "codex"]) {
+      const base = { ...observation, provider };
+      const broken = { id: "replayed", startedAt: "2026-09-10T00:00:00Z", updatedAt: "2026-09-12T00:00:00Z", completedAt: "2026-09-09T00:00:00Z", prompts: ["Current"], response: "Unrelated replay", files: [], usage: [] };
+      const { id } = await store.ingest("m3", "old", base, [broken]);
+      const corrected = { ...broken, updatedAt: "2026-09-10T00:01:00Z", completedAt: "2026-09-10T00:01:00Z", response: "Correct output", nativeParserVersion: 5 };
+      await store.ingest("m3", "new", { ...base, revision: 11 }, [corrected]);
+      expect(await store.turn(id, "replayed")).toMatchObject({ response: "Correct output", completedAt: new Date(corrected.completedAt).toISOString(), nativeParserVersion: 5 });
+      await store.ingest("m3", "downgraded", { ...base, revision: 12 }, [{ ...broken, updatedAt: "2026-09-20T00:00:00Z" }]);
+      await store.ingest("m3", "new", { ...base, revision: 13 }, [{ ...corrected, response: "Older partial", updatedAt: "2026-09-10T00:00:10Z" }]);
+      await store.ingest("m3", "old-delivery", { ...base, revision: 9 }, [{ ...broken, nativeParserVersion: 6 }]);
+      expect((await store.turn(id, "replayed"))?.response).toBe("Correct output");
+      await store.ingest("m3", "new", { ...base, revision: 14 }, [{ ...corrected, response: "Later revision" }]);
+      expect((await store.turn(id, "replayed"))?.response).toBe("Later revision");
+    }
+  });
+
+  it("does not let imported history claim a native parser upgrade or let an upgrade replace newer imported content", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const original = { id: "imported", startedAt: observation.observedAt, updatedAt: "2026-09-16T00:00:00Z", prompts: [], response: "Imported complete", files: [], usage: [], nativeParserVersion: 999 };
+    const { id } = await store.ingest("m3", "import", observation, [original], true);
+    expect((await store.turn(id, "imported"))?.nativeParserVersion).toBeUndefined();
+    await store.ingest("m3", "native", { ...observation, revision: 11 }, [{ ...original, response: "Older native partial", updatedAt: observation.observedAt, nativeParserVersion: 5 }]);
+    expect((await store.turn(id, "imported"))?.response).toBe("Imported complete");
+  });
+
 });

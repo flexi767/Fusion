@@ -11,3 +11,11 @@ it("preserves historical patches inside and outside the project as display data"
     expect(() => parseSessionTurn({ ...turn, files: [{ path, diff: "" }] })).toThrow();
   }
 });
+
+it("accepts explicit native parser generations and refuses invalid authority markers", () => {
+  expect(parseSessionTurn({ ...turn, nativeParserVersion: 5 }).nativeParserVersion).toBe(5);
+  expect(parseSessionTurn(turn).nativeParserVersion).toBeUndefined();
+  for (const nativeParserVersion of [0,-1,1.5,Infinity,"5",1000001]) {
+    expect(() => parseSessionTurn({ ...turn, nativeParserVersion })).toThrow("Invalid native parser version");
+  }
+});

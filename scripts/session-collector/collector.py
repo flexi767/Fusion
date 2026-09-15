@@ -15,7 +15,7 @@ from turn_parser import consume, known, total, claude_turn_finished, bounded_tex
 import parser_ledger
 from opaque_records import ignored_header, scan_opaque_tail
 
-VERSION = "fusion-native-7"
+VERSION = "fusion-native-8"
 PARSER_VERSION = 4
 CLAUDE_PARSER_VERSION = 5
 LIVE_PARSER_VERSION = 1
@@ -239,8 +239,16 @@ def _scan_file(db, path, provider, max_pending=5000):
     if state and state.get('parserVersion') != parser_version: offset,state=0,{}
     state['parserVersion']=parser_version
     state.setdefault('ledgerGeneration',str(uuid.uuid4()))
-    if offset == stat.st_size and not state.get("turnsState", {}).get("changed"): return False
+    publish_pending=provider=='claude' and state.get('nativeFormatVersion')!=1
+    if offset == stat.st_size and not state.get("turnsState", {}).get("changed") and not publish_pending: return False
     parser_ledger.attach(db,path,state)
+    if publish_pending and not state['turnsState'].get('changed'):
+        keys=[row[0] for row in db.execute("SELECT key FROM parser_records WHERE path=? AND generation=? AND namespace='turns' AND key>? ORDER BY key LIMIT 25",
+            (str(path),state['ledgerGeneration'],state.get('publishCursor','')))]
+        if keys:
+            state['turnsState']['changed']=keys;state['publishCursor']=keys[-1]
+        else:
+            state['nativeFormatVersion']=1;state.pop('publishCursor',None)
     data=b''
     # Drain changed turns before reading more input; neither list nor snapshots
     # can grow indefinitely while history delivery is backlogged.
@@ -312,6 +320,7 @@ def _scan_file(db, path, provider, max_pending=5000):
                 if turn_id is not None:
                     result = json.loads(json.dumps(turns_state['turns'][turn_id]))
                     result['provenance'] = 'native-transcript'
+                    result['nativeParserVersion'] = parser_version
                     for file in result['files']:
                         path_value = Path(file['path'])
                         if path_value.is_absolute():

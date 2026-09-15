@@ -378,4 +378,24 @@ class CollectorTests(unittest.TestCase):
             row=self.db.execute('SELECT offset,state FROM files').fetchone()
             self.assertEqual(row[0],self.path.stat().st_size);self.assertNotIn('opaqueRecord',json.loads(row[1]))
 
+
+    def test_native_format_upgrade_republishes_bounded_existing_claude_turns_across_restart(self):
+        rows=[]
+        for index in range(40):
+            rows += [dict(type='user',uuid='turn-'+str(index),sessionId='claude',cwd='/repo',timestamp=f'2026-09-15T12:{index:02d}:00Z',message=dict(content='Prompt')),
+                     dict(type='assistant',uuid='answer-'+str(index),parentUuid='turn-'+str(index),timestamp=f'2026-09-15T12:{index:02d}:01Z',message=dict(content=[],stop_reason='end_turn'))]
+        self.write(rows)
+        for _ in range(3):scan_file(self.db,self.path,'claude');drain(self.db,lambda body:dict(acknowledged=True,eventId=body['eventId']))
+        offset,raw=self.db.execute('SELECT offset,state FROM files').fetchone();state=json.loads(raw);state.pop('nativeFormatVersion')
+        with self.db:self.db.execute('UPDATE files SET state=?',(json.dumps(state),))
+        scan_file(self.db,self.path,'claude')
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],25)
+        self.db.close();self.db=connect(self.root/'spool.sqlite')
+        for _ in range(2):scan_file(self.db,self.path,'claude')
+        turns=[turn for (body,) in self.db.execute('SELECT body FROM pending') for turn in json.loads(body).get('turns',[])]
+        self.assertEqual(len(turns),40);self.assertEqual(len({turn['id'] for turn in turns}),40)
+        self.assertTrue(all(turn['nativeParserVersion']==5 for turn in turns))
+        current=self.db.execute('SELECT offset,state FROM files').fetchone();self.assertEqual(current[0],offset)
+        self.assertEqual(json.loads(current[1])['nativeFormatVersion'],1)
+
 if __name__ == '__main__': unittest.main()

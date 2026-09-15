@@ -37,7 +37,10 @@ export class ExternalSessionStore {
     if (importedNotes !== undefined && (typeof importedNotes !== "string" || importedNotes.length > 32000)) throw new Error("Invalid imported notes");
     const importedMetadata = historical && importedValue !== undefined ? parseImportedSessionMetadata(importedValue) : undefined;
     const turns = turnValues.map(parseSessionTurn);
-    if (historical) for (const turn of turns) turn.provenance = "agentpulse-import";
+    for (const turn of turns) {
+      turn.provenance = historical ? "agentpulse-import" : "native-transcript";
+      if (historical) delete turn.nativeParserVersion;
+    }
     const observation = parseSessionObservation(value);
     observation.title = redactSecrets(observation.title);
     if (historical) observation.revision = 0;
@@ -69,9 +72,13 @@ export class ExternalSessionStore {
             set: { revision: observation.revision, startedAt: result.startedAt, result },
             setWhere: historical
               ? sql`${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}`
-              : and(lt(externalSessionTurns.revision, observation.revision), sql`(
+              : and(lt(externalSessionTurns.revision, observation.revision),
+                  sql`(${externalSessionTurns.result}->>'provenance' <> 'native-transcript' OR ${result.nativeParserVersion ?? 0} >= coalesce((${externalSessionTurns.result}->>'nativeParserVersion')::int, 0))`, sql`(
                   ${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}
-                  OR (${externalSessionTurns.result}->>'provenance' = 'native-transcript' AND ${externalSessionTurns.result}->>'updatedAt' = ${result.updatedAt})
+                  OR (${externalSessionTurns.result}->>'provenance' = 'native-transcript' AND (
+                    ${externalSessionTurns.result}->>'updatedAt' = ${result.updatedAt}
+                    OR ${result.nativeParserVersion ?? 0} > coalesce((${externalSessionTurns.result}->>'nativeParserVersion')::int, 0)
+                  ))
                 )`) });
       }
       if (historical && importedNotes) {
