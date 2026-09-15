@@ -59,6 +59,21 @@ export interface ModelPricing {
   cacheWritePer1M: number;
   /** Where the rate came from (provider pricing page / docs). */
   source: string;
+  /** Optional operator-specified applicability interval; absent means unknown. */
+  effectiveFrom?: string;
+  effectiveUntil?: string;
+}
+
+export function validModelPricing(rates: ModelPricing | undefined | null): rates is ModelPricing {
+  if (!rates || typeof rates.source !== "string" || rates.source.length > 4096) return false;
+  if (![rates.inputPer1M, rates.outputPer1M, rates.cacheReadPer1M, rates.cacheWritePer1M].every(rate => typeof rate === "number" && Number.isFinite(rate) && rate >= 0)) return false;
+  if ([rates.effectiveFrom, rates.effectiveUntil].some(date => date !== undefined && (typeof date !== "string" || !Number.isFinite(Date.parse(date)) || date.length > 40))) return false;
+  return !(rates.effectiveFrom && rates.effectiveUntil && Date.parse(rates.effectiveFrom) >= Date.parse(rates.effectiveUntil));
+}
+export function pricingAppliesAt(rates: ModelPricing, at: number): boolean {
+  return validModelPricing(rates) && Number.isFinite(at)
+    && (!rates.effectiveFrom || at >= Date.parse(rates.effectiveFrom))
+    && (!rates.effectiveUntil || at < Date.parse(rates.effectiveUntil));
 }
 
 /** User-managed pricing overrides keyed by lowercased `provider:model`. */
@@ -607,7 +622,7 @@ export function costFor(
 ): CostResult {
   const stale = isStale(now);
   const pricing = lookupPricing(model, overrides);
-  if (!pricing) {
+  if (!pricing || !pricingAppliesAt(pricing, now ?? Date.now())) {
     return { usd: null, unavailable: true, stale };
   }
   const usd =
@@ -616,5 +631,5 @@ export function costFor(
       usage.cachedTokens * pricing.cacheReadPer1M +
       usage.cacheWriteTokens * pricing.cacheWritePer1M) /
     1_000_000;
-  return { usd, unavailable: false, stale };
+  return Number.isFinite(usd) ? { usd, unavailable: false, stale } : { usd: null, unavailable: true, stale };
 }

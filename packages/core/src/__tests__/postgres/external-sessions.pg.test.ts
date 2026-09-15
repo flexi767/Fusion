@@ -144,4 +144,41 @@ pgDescribe("External session durable ingestion", () => {
     expect((await store.get(id))?.observation.activity).toBe("working");
   });
 
+  it("records server-owned rates atomically and preserves them across updates and process recreation", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const usage = { model: "fixture", inputTokens: 100, cachedInputTokens: 20, cacheWriteTokens: 0, cacheWriteHourTokens: 0, outputTokens: 10, requests: 1 };
+    const turn = { id: "priced", startedAt: observation.observedAt, updatedAt: observation.observedAt, prompts: [], response: "", files: [], usage: [usage], recordedPricing: [{ version: "spoofed" }] };
+    const prices = { "openai:fixture": { inputPer1M: 2, cacheReadPer1M: 1, cacheWritePer1M: 3, outputPer1M: 4, source: "fixture" } };
+    const { id } = await store.ingest("m3", "native", observation, [turn], false, undefined, undefined, prices);
+    const first = (await store.turn(id, "priced"))!.recordedPricing![0];
+    expect(first.version).toMatch(/^[a-f0-9]{64}$/);
+    const changedPrices = { "openai:fixture": { ...prices["openai:fixture"], inputPer1M: 20 } };
+    await new ExternalSessionStore(h.layer()).ingest("m3", "native", { ...observation, revision: 11 }, [{ ...turn, updatedAt: "2026-09-15T12:01:00Z" }], false, undefined, undefined, changedPrices);
+    expect((await store.turn(id, "priced"))!.recordedPricing![0]).toEqual(first);
+    const recorded = await externalSessionAnalytics(h.layer(), { sessionId: id, basis: "recorded" }, changedPrices);
+    const current = await externalSessionAnalytics(h.layer(), { sessionId: id }, changedPrices);
+    expect(recorded.sessions[0].usd).toBeCloseTo(0.00022, 12);
+    expect(current.sessions[0].usd).toBeCloseTo(0.00166, 12);
+    expect(recorded.sessions[0].usage[0].rateVersion).toBe(first.version);
+  });
+
+  it("groups recorded rates across capture times without pricing turns outside their effective period", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const usage = { model: "fixture", inputTokens: 100, cachedInputTokens: 20, cacheWriteTokens: 0, cacheWriteHourTokens: 0, outputTokens: 10, requests: 1 };
+    const prices = { "openai:fixture": { inputPer1M: 2, cacheReadPer1M: 1, cacheWritePer1M: 3, outputPer1M: 4, source: "fixture", effectiveFrom: "2026-09-15T00:00:00Z", effectiveUntil: "2026-09-16T00:00:00Z" } };
+    let sessionId = "";
+    for (const [index, startedAt] of ["2026-09-14T12:00:00Z", "2026-09-15T12:00:00Z", "2026-09-15T13:00:00Z", "2026-09-16T00:00:00Z"].entries()) {
+      const turn = { id: String(index), startedAt, updatedAt: startedAt, prompts: [], response: "", files: [], usage: [usage] };
+      ({ id: sessionId } = await store.ingest("m3", "native", { ...observation, revision: 10 + index }, [turn], false, undefined, undefined, prices));
+    }
+    const ranked = await externalSessionAnalytics(h.layer(), { sessionId, basis: "recorded" });
+    expect(ranked.sessions[0].turns).toBe(4);
+    expect(ranked.sessions[0].usage).toHaveLength(2);
+    expect(ranked.sessions[0].unpricedRows).toBe(1);
+    expect(ranked.sessions[0].usd).toBeCloseTo(0.00044, 12);
+    expect(ranked.sessions[0].requests).toBe(4);
+    const turns = await externalSessionAnalytics(h.layer(), { sessionId, basis: "recorded", groupBy: "turn" });
+    expect(turns.sessions.filter(row => row.usd === null).map(row => row.turnId).sort()).toEqual(["0", "3"]);
+  });
+
 });

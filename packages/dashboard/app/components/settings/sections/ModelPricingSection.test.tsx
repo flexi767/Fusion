@@ -75,7 +75,7 @@ describe("ModelPricingSection", () => {
     render(<Harness initial={initialForm()} />);
 
     openPricingTable();
-    expect(screen.getByRole("dialog", { name: "Model pricing table" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Model pricing table" })).toHaveAccessibleDescription("Manual edits are saved with the rest of Global settings.");
     fireEvent.click(screen.getByTestId("model-pricing-close"));
     expect(screen.queryByRole("dialog", { name: "Model pricing table" })).not.toBeInTheDocument();
 
@@ -171,4 +171,15 @@ describe("ModelPricingSection", () => {
     openPricingTable();
     expect(screen.getByText("openai:gpt-test")).toBeInTheDocument();
   });
+});
+
+it("preserves explicit UTC effective dates while other pricing fields change", () => {
+  render(<Harness initial={initialForm()} />); openPricingTable();
+  const from = screen.getByLabelText("openai:gpt-4o effective from UTC");
+  const until = screen.getByLabelText("openai:gpt-4o effective until UTC");
+  fireEvent.change(from, { target: { value: "2026-09-01T12:00" } });
+  fireEvent.change(until, { target: { value: "2026-10-01T12:00" } });
+  fireEvent.change(screen.getByLabelText("openai:gpt-4o input per 1M"), { target: { value: "3" } });
+  expect(screen.getByLabelText("openai:gpt-4o effective from UTC")).toBe(from);
+  expect(from).toHaveValue("2026-09-01T12:00"); expect(until).toHaveValue("2026-10-01T12:00");
 });

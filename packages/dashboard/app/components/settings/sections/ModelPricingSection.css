@@ -111,3 +111,7 @@
     border-top: thin solid var(--border);
   }
 }
+
+.model-pricing-source-fields { display: flex; flex-direction: column; gap: var(--space-xs); min-inline-size: 0; }
+.model-pricing-source-fields label { display: flex; flex-direction: column; gap: var(--space-xs); }
+.model-pricing-source-fields summary { cursor: pointer; }

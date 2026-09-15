@@ -1,3 +1,5 @@
+import { captureSessionPrice, usagePriceKey } from "./rate-snapshot.js";
+import type { ModelPricingOverrides } from "../ai/model-pricing.js";
 import { createHash } from "node:crypto";
 import { and, getTableColumns, desc, eq, lt, or, sql } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
@@ -30,7 +32,7 @@ export class ExternalSessionStore {
       .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: now, diagnostics } });
   }
 
-  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false, importedNotes?: string, importedValue?: unknown) {
+  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false, importedNotes?: string, importedValue?: unknown, pricingOverrides?: ModelPricingOverrides | null) {
     if (!Array.isArray(turnValues) || turnValues.length > 25) throw new Error("Invalid turn batch");
     if (importedNotes !== undefined && (typeof importedNotes !== "string" || importedNotes.length > 32000)) throw new Error("Invalid imported notes");
     const importedMetadata = historical && importedValue !== undefined ? parseImportedSessionMetadata(importedValue) : undefined;
@@ -58,6 +60,10 @@ export class ExternalSessionStore {
         if (JSON.stringify(parseSessionObservation(current.observation)) !== JSON.stringify(observation)) throw new Error("Observation revision conflict");
       }
       for (const result of turns) {
+        const [previous] = await tx.select({ result: externalSessionTurns.result }).from(externalSessionTurns)
+          .where(and(eq(externalSessionTurns.sessionId, id), eq(externalSessionTurns.id, result.id)));
+        result.recordedPricing = result.usage.map(usage => captureSessionPrice(observation.provider, usage, result.startedAt, receivedAt, pricingOverrides,
+          previous?.result.recordedPricing?.find(price => price.usageKey === usagePriceKey(usage))));
         await tx.insert(externalSessionTurns).values({ sessionId: id, id: result.id, revision: observation.revision, startedAt: result.startedAt, result })
           .onConflictDoUpdate({ target: [externalSessionTurns.sessionId, externalSessionTurns.id],
             set: { revision: observation.revision, startedAt: result.startedAt, result },

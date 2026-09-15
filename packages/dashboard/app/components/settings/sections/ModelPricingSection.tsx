@@ -29,7 +29,12 @@ interface PricingDraft {
   cacheReadPer1M: number;
   cacheWritePer1M: number;
   source: string;
+  effectiveFrom?: string;
+  effectiveUntil?: string;
 }
+
+function dateInput(value?: string): string { return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString().slice(0, 16) : ""; }
+function dateValue(value: string): string | undefined { return value ? new Date(`${value}Z`).toISOString() : undefined; }
 
 function pricingToDraft(key: string, pricing: ModelPricing): PricingDraft {
   return { key, ...pricing };
@@ -134,6 +139,8 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
         cacheReadPer1M: draft.cacheReadPer1M,
         cacheWritePer1M: draft.cacheWritePer1M,
         source: draft.source || "manual",
+        ...(draft.effectiveFrom ? { effectiveFrom: draft.effectiveFrom } : {}),
+        ...(draft.effectiveUntil ? { effectiveUntil: draft.effectiveUntil } : {}),
       },
     });
     setDraft({ key: "", inputPer1M: 0, outputPer1M: 0, cacheReadPer1M: 0, cacheWritePer1M: 0, source: "manual" });
@@ -169,17 +176,17 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
     if (!tableOpen) return null;
 
     return (
-      <div className="modal-overlay open" onClick={handleOverlayClick} role="dialog" aria-modal="true" aria-labelledby="model-pricing-table-title" data-testid="model-pricing-table-modal">
+      <div className="modal-overlay open" onClick={handleOverlayClick} role="dialog" aria-modal="true" aria-labelledby="model-pricing-table-title" aria-describedby="model-pricing-table-description" data-testid="model-pricing-table-modal">
         <div className="modal modal-lg model-pricing-modal">
           {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: The pricing table dialog shares the canonical header; its subtitle stays part of the header identity. */}
           <ViewHeader
             className="modal-header"
             headingLevel={3}
-            titleId="model-pricing-table-title"
+            titleId="model-pricing-table-heading"
             title={(
               <span>
-                <span>{t("settings.modelPricing.tableTitle", "Model pricing table")}</span>
-                <span className="settings-muted model-pricing-modal__subtitle">
+                <span id="model-pricing-table-title">{t("settings.modelPricing.tableTitle", "Model pricing table")}</span>
+                <span id="model-pricing-table-description" className="settings-muted model-pricing-modal__subtitle">
                   {t("settings.modelPricing.saveHint", "Manual edits are saved with the rest of Global settings.")}
                 </span>
               </span>
@@ -212,7 +219,14 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
                     <input aria-label={`${key} output per 1M`} className="input" type="number" step="any" value={row.outputPer1M} onChange={(event) => updateRow(key, { outputPer1M: parseRate(event.target.value) })} />
                     <input aria-label={`${key} cache read per 1M`} className="input" type="number" step="any" value={row.cacheReadPer1M} onChange={(event) => updateRow(key, { cacheReadPer1M: parseRate(event.target.value) })} />
                     <input aria-label={`${key} cache write per 1M`} className="input" type="number" step="any" value={row.cacheWritePer1M} onChange={(event) => updateRow(key, { cacheWritePer1M: parseRate(event.target.value) })} />
-                    <input aria-label={`${key} source`} className="input" value={row.source} onChange={(event) => updateRow(key, { source: event.target.value })} />
+                    <div className="model-pricing-source-fields" role="cell">
+                      <input aria-label={`${key} source`} className="input" value={row.source} onChange={(event) => updateRow(key, { source: event.target.value })} />
+                      <details><summary>Effective period (UTC)</summary>
+                        <label>From<input aria-label={`${key} effective from UTC`} className="input" type="datetime-local" value={dateInput(row.effectiveFrom)} onChange={event => updateRow(key, { effectiveFrom: dateValue(event.target.value) })} /></label>
+                        <label>Until<input aria-label={`${key} effective until UTC`} className="input" type="datetime-local" value={dateInput(row.effectiveUntil)} onChange={event => updateRow(key, { effectiveUntil: dateValue(event.target.value) })} /></label>
+                        <small className="settings-muted">Leave unknown dates blank. Existing session rate snapshots remain unchanged.</small>
+                      </details>
+                    </div>
                     <button type="button" className="btn btn-ghost btn-sm" onClick={() => deleteRow(key)}>{t("settings.modelPricing.delete", "Delete")}</button>
                   </div>
                 );
@@ -223,7 +237,13 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
                 <input aria-label={t("settings.modelPricing.newOutput", "New output rate")} className="input" type="number" step="any" value={draft.outputPer1M} onChange={(event) => setDraft((current) => ({ ...current, outputPer1M: parseRate(event.target.value) }))} />
                 <input aria-label={t("settings.modelPricing.newCacheRead", "New cache read rate")} className="input" type="number" step="any" value={draft.cacheReadPer1M} onChange={(event) => setDraft((current) => ({ ...current, cacheReadPer1M: parseRate(event.target.value) }))} />
                 <input aria-label={t("settings.modelPricing.newCacheWrite", "New cache write rate")} className="input" type="number" step="any" value={draft.cacheWritePer1M} onChange={(event) => setDraft((current) => ({ ...current, cacheWritePer1M: parseRate(event.target.value) }))} />
-                <input aria-label={t("settings.modelPricing.newSource", "New source")} className="input" value={draft.source} onChange={(event) => setDraft((current) => ({ ...current, source: event.target.value }))} />
+                <div className="model-pricing-source-fields" role="cell">
+                  <input aria-label={t("settings.modelPricing.newSource", "New source")} className="input" value={draft.source} onChange={(event) => setDraft((current) => ({ ...current, source: event.target.value }))} />
+                  <details><summary>Effective period (UTC)</summary>
+                    <label>From<input aria-label="New effective from UTC" className="input" type="datetime-local" value={dateInput(draft.effectiveFrom)} onChange={event => setDraft(current => ({ ...current, effectiveFrom: dateValue(event.target.value) }))} /></label>
+                    <label>Until<input aria-label="New effective until UTC" className="input" type="datetime-local" value={dateInput(draft.effectiveUntil)} onChange={event => setDraft(current => ({ ...current, effectiveUntil: dateValue(event.target.value) }))} /></label>
+                  </details>
+                </div>
                 <button type="button" className="btn btn-sm" onClick={addRow}>{t("settings.modelPricing.addRow", "Add row")}</button>
               </div>
             </div>

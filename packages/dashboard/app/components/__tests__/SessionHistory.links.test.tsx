@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
 import { SessionHistory } from "../SessionHistory";
@@ -13,7 +13,7 @@ beforeEach(() => {
 it("loads a linked older turn directly and preserves its native identity in the link", async () => {
   render(<SessionHistory id="session" />);
   await screen.findByText("Earlier failure");
-  expect(fetchTurn).toHaveBeenCalledWith("session", "old/turn");
+  expect(fetchTurn).toHaveBeenCalledWith("session", "old/turn", "current");
   expect(fetchSession).toHaveBeenCalledTimes(1);
   expect(screen.getByRole("link", { name: "Link to this turn" }).getAttribute("href")).toBe("?view=sessions&session=session&turn=old%2Fturn#session-turn-old%2Fturn");
   expect(screen.getByText("Earlier failure").closest("article")?.id).toBe("session-turn-old%2Fturn");
@@ -33,4 +33,17 @@ it("saves archive and pin labels without scheduling or deleting the session", as
   await user.click(screen.getByRole("button", { name: "Save preferences" }));
   await waitFor(() => expect(savePreferences).toHaveBeenCalledWith("session", true, true, 0));
   expect(screen.getByRole("checkbox", { name: "Archived" })).toBe(checkbox);
+});
+
+it("ignores an older cost-basis response after switching to recorded rates", async () => {
+  window.history.replaceState({}, "", "/?view=sessions&session=session");
+  let finish!: (value: typeof data) => void;
+  fetchSession.mockReset().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }))
+    .mockResolvedValue({ ...data, turns: [{ ...turn, response: "Recorded output" }], cost: { ...data.cost, basis: "recorded" } });
+  const user = userEvent.setup(); render(<SessionHistory id="session" />);
+  await user.selectOptions(screen.getByLabelText("Cost basis"), "recorded");
+  await screen.findByText("Recorded output");
+  await act(async () => { finish({ ...data, turns: [{ ...turn, response: "Stale current output" }] } as typeof data); });
+  expect(screen.queryByText("Stale current output")).toBeNull();
+  expect(screen.getByText("Recorded output")).toBeTruthy();
 });

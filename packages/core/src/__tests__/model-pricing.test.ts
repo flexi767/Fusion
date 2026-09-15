@@ -443,3 +443,10 @@ describe("model-pricing", () => {
     }
   });
 });
+
+it("honors explicitly dated rates across all costFor consumers", () => {
+  const usage = { inputTokens: 1_000_000, outputTokens: 0, cachedTokens: 0, cacheWriteTokens: 0 };
+  const prices = { "openai:dated": { inputPer1M: 2, outputPer1M: 4, cacheReadPer1M: 1, cacheWritePer1M: 3, source: "fixture", effectiveFrom: "2026-09-01T00:00:00Z", effectiveUntil: "2026-10-01T00:00:00Z" } };
+  expect(costFor(usage, { provider: "openai", model: "dated" }, Date.parse("2026-09-01T00:00:00Z"), prices).usd).toBe(2);
+  for (const at of ["2026-08-31T23:59:59Z", "2026-10-01T00:00:00Z"]) expect(costFor(usage, { provider: "openai", model: "dated" }, Date.parse(at), prices).unavailable).toBe(true);
+});

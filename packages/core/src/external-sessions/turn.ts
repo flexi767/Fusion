@@ -8,6 +8,8 @@ export interface SessionModelUsage {
   requests: number | null; contextTokens: number | null; longContext: boolean; fast: boolean;
 }
 export interface SessionTurn {
+  /** Server-owned snapshots; collector-supplied values are ignored by validation. */
+  recordedPricing?: import("./rate-snapshot.js").RecordedSessionPrice[];
   id: string; startedAt: string; completedAt: string | null; updatedAt: string;
   durationMs: number | null; durationSource: "provider" | "timestamps";
   prompts: string[]; response: string; toolCalls: number; usage: SessionModelUsage[];

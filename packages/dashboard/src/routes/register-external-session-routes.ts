@@ -1,3 +1,4 @@
+import { readSessionPricing } from "./session-pricing.js";
 import { createSessionSummaryWorker } from "./session-summary-worker.js";
 import { ExternalSessionStore, externalSessionAnalytics, priceSessionTurns, ExternalSessionControls, ExternalSessionSummaries } from "@fusion/core";
 import { ApiError } from "../api-error.js";
@@ -54,7 +55,8 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
         await sessions().heartbeat(hostId, collectorVersion, undefined, health);
         return res.json({ eventId, hostId, acknowledged: true });
       }
-      const result = await sessions().ingest(hostId, collectorVersion, observation, turns, historical === true, importedNotes, importedMetadata);
+      const pricing = Array.isArray(turns) && turns.length ? await readSessionPricing(() => store.getGlobalSettingsStore().getSettings()) : undefined;
+      const result = await sessions().ingest(hostId, collectorVersion, observation, turns, historical === true, importedNotes, importedMetadata, pricing);
       if (result.applied) summaryWorker?.enqueue(result.id);
       return res.json({ eventId, hostId, acknowledged: true, ...result });
     } catch (error) {
@@ -78,20 +80,21 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
   });
   router.get("/external-session-usage", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
-    const { from, to, host, model, groupBy } = req.query;
-    if ([from, to, host, model, groupBy].some(value => value !== undefined && typeof value !== "string")) throw new ApiError(400, "Invalid usage filter");
+    const { from, to, host, model, groupBy, basis } = req.query;
+    if ([from, to, host, model, groupBy, basis].some(value => value !== undefined && typeof value !== "string")) throw new ApiError(400, "Invalid usage filter");
     const settings = await store.getGlobalSettingsStore().getSettings();
-    try { return res.json(await externalSessionAnalytics(layer(), { from: from as string | undefined, to: to as string | undefined, host: host as string | undefined, model: model as string | undefined, groupBy: groupBy as "session" | "turn" | undefined }, settings.modelPricingOverrides)); }
+    try { return res.json(await externalSessionAnalytics(layer(), { from: from as string | undefined, to: to as string | undefined, host: host as string | undefined, model: model as string | undefined, groupBy: groupBy as "session" | "turn" | undefined, basis: basis as "current" | "recorded" | undefined }, settings.modelPricingOverrides)); }
     catch (error) { if (error instanceof Error && error.message.startsWith("Invalid analytics")) throw new ApiError(400, error.message); throw error; }
   });
   router.get("/external-sessions/:id", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
     const session = await sessions().get(String(req.params.id));
     if (!session) throw new ApiError(404, "Session not found");
+    const basis = req.query.basis === "recorded" ? "recorded" : "current";
     const history = await sessions().turns(session.id, typeof req.query.before === "string" ? req.query.before : undefined);
     const settings = await store.getGlobalSettingsStore().getSettings();
-    const wholeSessionUsage = await externalSessionAnalytics(layer(), { sessionId: session.id }, settings.modelPricingOverrides);
-    res.json({ session, ...history, turnCosts: Object.fromEntries(history.turns.map(turn => [turn.id, priceSessionTurns(session.provider, [turn], settings.modelPricingOverrides)])), wholeSessionUsage: wholeSessionUsage.sessions[0] ?? null, summariesEnabled: process.env.FUSION_SESSION_SUMMARIES === "1" && Boolean(process.env.FUSION_SESSION_SUMMARY_URL), details: await summaries().get(session.id), runtime: hostControlsEnabled(session.hostId) ? await controls().capability(session.id) : null, commands: await controls().list(session.id), cost: priceSessionTurns(session.provider, history.turns, settings.modelPricingOverrides) });
+    const wholeSessionUsage = await externalSessionAnalytics(layer(), { sessionId: session.id, basis }, settings.modelPricingOverrides);
+    res.json({ session, ...history, turnCosts: Object.fromEntries(history.turns.map(turn => [turn.id, priceSessionTurns(session.provider, [turn], settings.modelPricingOverrides, basis)])), wholeSessionUsage: wholeSessionUsage.sessions[0] ?? null, summariesEnabled: process.env.FUSION_SESSION_SUMMARIES === "1" && Boolean(process.env.FUSION_SESSION_SUMMARY_URL), details: await summaries().get(session.id), runtime: hostControlsEnabled(session.hostId) ? await controls().capability(session.id) : null, commands: await controls().list(session.id), cost: priceSessionTurns(session.provider, history.turns, settings.modelPricingOverrides, basis) });
   });
   router.get("/external-sessions/:id/turns/:turnId", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
@@ -100,7 +103,7 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     const turn = await sessions().turn(session.id, String(req.params.turnId));
     if (!turn) throw new ApiError(404, "Turn not found");
     const settings = await store.getGlobalSettingsStore().getSettings();
-    res.json({ turn, cost: priceSessionTurns(session.provider, [turn], settings.modelPricingOverrides) });
+    res.json({ turn, cost: priceSessionTurns(session.provider, [turn], settings.modelPricingOverrides, req.query.basis === "recorded" ? "recorded" : "current") });
   });
   router.post("/external-sessions/:id/commands", async (req, res) => {
     if (process.env.FUSION_SESSION_CONTROLS !== "1") return res.status(404).json({ error: "Session controls disabled" });

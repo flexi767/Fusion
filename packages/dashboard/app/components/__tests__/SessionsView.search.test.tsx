@@ -27,5 +27,5 @@ it("calculates a disclosed UTC range and reports an empty usage result", async (
   fireEvent.change(screen.getByLabelText("To (UTC)"), { target: { value: "2026-09-15" } });
   fireEvent.click(screen.getByRole("button", { name: "Calculate usage" }));
   await screen.findByText("No collected turns match this range.");
-  expect(fetchUsage).toHaveBeenCalledWith({ from: "2026-09-01T00:00:00.000Z", to: "2026-09-15T23:59:59.999Z", host: "", model: "", groupBy: "session" });
+  expect(fetchUsage).toHaveBeenCalledWith({ from: "2026-09-01T00:00:00.000Z", to: "2026-09-15T23:59:59.999Z", host: "", model: "", groupBy: "session", basis: "current" });
 });
