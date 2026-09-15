@@ -217,3 +217,12 @@ it("keeps optional cache and context rates through add, edits and explicit remov
   expect(screen.queryByLabelText(`${label} long-context source`)).not.toBeInTheDocument();
   expect(screen.getByLabelText(`${label} input per 1M`)).toHaveValue(3);
 });
+
+it("reports preserved explicit pricing separately from refreshed standard models", async () => {
+  const addToast = vi.fn();
+  apiMock.mockResolvedValueOnce({ count: 2, preservedCount: 3, fetchedAt: "2026-09-15T00:00:00Z", source: "fixture" })
+    .mockResolvedValueOnce({ modelPricingOverrides: initialForm().modelPricingOverrides });
+  render(<Harness initial={initialForm()} addToast={addToast} />);
+  fireEvent.click(screen.getByRole("button", { name: "Fetch latest prices" }));
+  await waitFor(() => expect(addToast).toHaveBeenCalledWith("Fetched 2 model prices. Kept 3 overrides with explicit rate bands or effective periods.", "success"));
+});

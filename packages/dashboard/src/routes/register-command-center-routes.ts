@@ -20,6 +20,7 @@ import {
   type TokenTimeGranularity,
 } from "@fusion/core";
 import type { Request, Response } from "express";
+import { mergePricingRefresh } from "./pricing-refresh.js";
 import { ApiError } from "../api-error.js";
 import { requireAsyncLayer } from "../require-async-layer.js";
 import {
@@ -261,17 +262,15 @@ export const registerCommandCenterRoutes: ApiRouteRegistrar = (ctx) => {
 
       const settings = await store.getGlobalSettingsStore().getSettings();
       const fetchedAt = new Date().toISOString();
+      const refreshed = mergePricingRefresh(settings.modelPricingOverrides ?? {}, parsed.overrides);
       await store.updateGlobalSettings({
-        modelPricingOverrides: {
-          ...(settings.modelPricingOverrides ?? {}),
-          ...parsed.overrides,
-        },
+        modelPricingOverrides: refreshed.overrides,
         modelPricingFetchedAt: fetchedAt,
         modelPricingSource: LITELLM_PRICING_SOURCE_URL,
       });
       invalidateAllGlobalSettingsCaches();
 
-      res.json({ count: parsed.count, fetchedAt, source: LITELLM_PRICING_SOURCE_URL });
+      res.json({ count: refreshed.updatedCount, preservedCount: refreshed.preservedCount, fetchedAt, source: LITELLM_PRICING_SOURCE_URL });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
       rethrowAsApiError(err, "Failed to fetch model pricing");

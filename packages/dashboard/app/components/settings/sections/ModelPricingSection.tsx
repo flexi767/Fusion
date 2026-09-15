@@ -11,6 +11,7 @@ import "./ModelPricingSection.css";
 
 interface PricingFetchResponse {
   count: number;
+  preservedCount?: number;
   fetchedAt: string;
   source: string;
 }
@@ -187,7 +188,9 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
         modelPricingFetchedAt: settings.modelPricingFetchedAt ?? result.fetchedAt,
         modelPricingSource: settings.modelPricingSource ?? result.source,
       }));
-      addToast(t("settings.modelPricing.fetchSuccess", "Fetched {{count}} model prices.", { count: result.count }), "success");
+      const message = t("settings.modelPricing.fetchSuccess", "Fetched {{count}} model prices.", { count: result.count });
+      const preserved = result.preservedCount ? t("settings.modelPricing.fetchPreserved", "Kept {{count}} overrides with explicit rate bands or effective periods.", { count: result.preservedCount }) : "";
+      addToast([message, preserved].filter(Boolean).join(" "), "success");
     } catch (error) {
       addToast(error instanceof Error ? error.message : t("settings.modelPricing.fetchFailed", "Failed to fetch latest model prices."), "error");
     } finally {
