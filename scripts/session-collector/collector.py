@@ -8,12 +8,14 @@ from pathlib import Path
 import sqlite3
 import time
 import urllib.request
+import urllib.error
 import uuid
 from turn_parser import consume
 
 VERSION = "fusion-native-1"
 MAX_READ = 1024 * 1024
 MAX_LINE = 4 * MAX_READ
+LIVE_TAIL = 256 * 1024
 
 
 def connect(path):
@@ -27,7 +29,14 @@ def connect(path):
       CREATE TABLE IF NOT EXISTS revisions(identity TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS pending(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE, body TEXT);
       CREATE TABLE IF NOT EXISTS health(key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS live_files(path TEXT PRIMARY KEY,inode TEXT,offset INTEGER,state TEXT);
     ''')
+    columns={row[1] for row in db.execute('PRAGMA table_info(pending)')}
+    if 'rejection' not in columns: db.execute('ALTER TABLE pending ADD COLUMN rejection TEXT')
+    if 'live_key' not in columns: db.execute('ALTER TABLE pending ADD COLUMN live_key TEXT')
+    if 'priority' not in columns: db.execute('ALTER TABLE pending ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS pending_live_key ON pending(live_key)')
+    db.commit()
     return db
 
 
@@ -74,6 +83,41 @@ def apply(state, event, provider):
     return True
 
 
+def scan_live(db, path, provider):
+    stat=path.stat();inode=f'{stat.st_dev}:{stat.st_ino}'
+    old=db.execute('SELECT inode,offset,state FROM live_files WHERE path=?',(str(path),)).fetchone()
+    state=json.loads(old[2]) if old and old[0]==inode else {}
+    if old and old[0]==inode and old[1]==stat.st_size:return
+    chunks=[]
+    with path.open('rb') as stream:
+        if not state:
+            chunks.append(stream.read(MAX_READ))
+        start=max(0,stat.st_size-LIVE_TAIL)
+        stream.seek(start)
+        if start:stream.readline(MAX_LINE) # Discard the leading partial record.
+        raw=stream.read(LIVE_TAIL);chunks.append(raw)
+        end=stream.tell()-(len(raw)-raw.rfind(b'\n')-1) if b'\n' in raw else start
+    changed=False
+    for chunk in chunks:
+        final=chunk.rfind(b'\n')+1
+        for raw in chunk[:final].splitlines():
+            try:
+                event=json.loads(raw)
+                if state.get('observedAt') and str(event.get('timestamp','')) < state['observedAt']:continue
+                changed=apply(state,event,provider) or changed
+            except (ValueError,TypeError,AttributeError):continue
+    if not changed:return
+    with db:
+        identity=json.dumps([provider,state['nativeSessionId']])
+        db.execute('INSERT INTO revisions VALUES (?,1) ON CONFLICT(identity) DO UPDATE SET revision=revision+1',(identity,))
+        revision=db.execute('SELECT revision FROM revisions WHERE identity=?',(identity,)).fetchone()[0]
+        observation={k:state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity')}
+        observation.update(version=1,provider=provider,revision=revision)
+        event_id=str(uuid.uuid4());body=json.dumps(dict(version=1,eventId=event_id,collectorVersion=VERSION,observation=observation))
+        db.execute('INSERT INTO pending(event_id,body,live_key,priority) VALUES (?,?,?,1) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,rejection=NULL',(event_id,body,identity))
+        db.execute('INSERT OR REPLACE INTO live_files VALUES (?,?,?,?)',(str(path),inode,end,json.dumps(state)))
+
+
 def scan_file(db, path, provider, max_pending=5000):
     if db.execute('SELECT COUNT(*) FROM pending').fetchone()[0] >= max_pending: return False
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
@@ -109,24 +153,23 @@ def scan_file(db, path, provider, max_pending=5000):
         if changed or changed_ids:
             identity = json.dumps([provider, state['nativeSessionId']])
             # One bounded turn per durable delivery; no batch can exceed HTTP limits.
+            live=db.execute('SELECT state FROM live_files WHERE path=?',(str(path),)).fetchone()
+            live_state=json.loads(live[0]) if live else state
             for turn_id in changed_ids or [None]:
                 db.execute('INSERT INTO revisions VALUES (?,1) ON CONFLICT(identity) DO UPDATE SET revision=revision+1', (identity,))
                 revision = db.execute('SELECT revision FROM revisions WHERE identity=?', (identity,)).fetchone()[0]
                 event_id = str(uuid.uuid4())
-                observation = {k: state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity')}
+                observation = {k: live_state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity')}
                 observation.update(version=1, provider=provider, revision=revision)
                 envelope = dict(version=1, eventId=event_id, collectorVersion=VERSION, observation=observation)
                 if turn_id is not None:
                     result = json.loads(json.dumps(turns_state['turns'][turn_id]))
                     result['provenance'] = 'native-transcript'
-                    safe_files = []
                     for file in result['files']:
                         path_value = Path(file['path'])
                         if path_value.is_absolute():
                             try: file['path'] = str(path_value.relative_to(state['projectPath']))
-                            except ValueError: continue
-                        if '..' not in Path(file['path']).parts: safe_files.append(file)
-                    result['files'] = safe_files
+                            except ValueError: pass
                     envelope['turns'] = [result]
                 db.execute('INSERT INTO pending(event_id,body) VALUES (?,?)', (event_id, json.dumps(envelope)))
             turns_state['changed'] = [tid for tid in turns_state.get('changed', []) if tid not in changed_ids]
@@ -134,24 +177,51 @@ def scan_file(db, path, provider, max_pending=5000):
     return True
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("Collector redirects are disabled")
+
+
+def bind_host(db, host):
+    old=db.execute("SELECT value FROM health WHERE key='host_id'").fetchone()
+    if old and old[0] != host: raise ValueError("Spool belongs to another host")
+    with db: db.execute("INSERT OR IGNORE INTO health VALUES ('host_id',?)",(host,))
+
+
 def post(url, token, body):
     request = urllib.request.Request(url.rstrip('/')+'/api/session-collector', data=json.dumps(body).encode(), headers={'Content-Type':'application/json', 'Authorization':'Bearer '+token}, method='POST')
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
         return json.loads(response.read(65536))
 
 
 def drain(db, send, limit=50):
-    for row_id, event_id, body in db.execute('SELECT id,event_id,body FROM pending ORDER BY id LIMIT ?', (limit,)).fetchall():
-        result = send(json.loads(body))
+    for row_id, event_id, body in db.execute('SELECT id,event_id,body FROM pending WHERE rejection IS NULL ORDER BY priority DESC,id LIMIT ?', (limit,)).fetchall():
+        try: result = send(json.loads(body))
+        except urllib.error.HTTPError as error:
+            error.close()
+            if error.code not in (400,409,413):raise
+            # Preserve rejected data for repair, but do not let one record block unrelated sessions.
+            with db:db.execute('UPDATE pending SET rejection=? WHERE id=? AND event_id=?',(str(error.code),row_id,event_id))
+            continue
         if result.get('acknowledged') is not True or result.get('eventId') != event_id: raise ValueError('Unmatched acknowledgement')
         with db:
-            db.execute('DELETE FROM pending WHERE id=? AND event_id=?', (row_id, event_id))
+            db.execute('DELETE FROM pending WHERE id=? AND event_id=? AND body=?', (row_id, event_id, body))
             db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('last_acknowledgement', str(time.time())))
+
+
+def diagnostics(db):
+    return dict(spoolDepth=db.execute('SELECT count(*) FROM pending WHERE rejection IS NULL').fetchone()[0],
+        rejectedDeliveries=db.execute('SELECT count(*) FROM pending WHERE rejection IS NOT NULL').fetchone()[0],
+        discoveredFiles=db.execute('SELECT count(*) FROM live_files').fetchone()[0],
+        parserStateBytes=db.execute('SELECT coalesce(sum(length(state)),0) FROM files').fetchone()[0],
+        parseError=bool(db.execute("SELECT 1 FROM health WHERE key IN ('parse_error','scan_error')").fetchone()),
+        deliveryError=bool(db.execute("SELECT 1 FROM health WHERE key='delivery_error'").fetchone()))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', required=True)
+    parser.add_argument('--host', required=True, help='Stable authenticated host id; permanently binds this spool')
     parser.add_argument('--token-file', required=True, type=Path)
     parser.add_argument('--home', type=Path, default=Path.home())
     parser.add_argument('--state', type=Path, default=Path.home()/'.fusion/session-collector/spool.sqlite')
@@ -165,22 +235,51 @@ def main():
     try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError: parser.error('Collector already running for this spool')
     db = connect(args.state)
+    bind_host(db,args.host)
     failures = 0
     while True:
         try:
             # Most recently changed transcripts first; finite read per file per pass.
             files = sorted(discover(args.home), key=lambda pair: pair[1].stat().st_mtime, reverse=True)
-            for provider, path in files[:2000]: scan_file(db, path, provider)
+            position=db.execute("SELECT value FROM health WHERE key='scan_cursor'").fetchone()
+            cursor=int(position[0]) if position else 0
+            older=files[100:]
+            if cursor>=len(older):cursor=0
+            selected=files[:100]+older[cursor:cursor+100]
+            for provider,path in selected:
+                try:scan_live(db,path,provider)
+                except (OSError,ValueError,TypeError,KeyError) as error:
+                    with db:db.execute('INSERT OR REPLACE INTO health VALUES (?,?)',('scan_error',type(error).__name__+': '+str(path)))
+            # Discovery/live tail and history have independent cursors. Backfill cannot hide live sessions.
+            budget=8*MAX_READ
+            for provider,path in selected:
+                if budget<=0:break
+                previous=db.execute('SELECT offset FROM files WHERE path=?',(str(path),)).fetchone()
+                size=max(0,path.stat().st_size-(previous[0] if previous else 0))
+                try:
+                    if scan_file(db,path,provider,max_pending=4500):budget-=min(size,MAX_READ)
+                except (OSError,ValueError,TypeError,KeyError) as error:
+                    with db:db.execute('INSERT OR REPLACE INTO health VALUES (?,?)',('parse_error',type(error).__name__+': '+str(path)))
+                    budget-=MAX_READ
+            with db:db.execute("INSERT OR REPLACE INTO health VALUES ('scan_cursor',?)",(str(cursor+100),))
+            # Verify the server credential before sending any session data.
+            hello=dict(version=1,eventId=str(uuid.uuid4()),collectorVersion=VERSION,diagnostics=diagnostics(db))
+            acknowledgement=post(args.url,token,hello)
+            if acknowledgement.get('hostId') != args.host or acknowledgement.get('eventId') != hello['eventId'] or acknowledgement.get('acknowledged') is not True:
+                raise ValueError('Collector credential is bound to another host')
             send = lambda body: post(args.url, token, body)
             drain(db, send)
-            send(dict(version=1, eventId=str(uuid.uuid4()), collectorVersion=VERSION))
+            with db:db.execute("DELETE FROM health WHERE key='delivery_error'")
+            send(dict(version=1, eventId=str(uuid.uuid4()), collectorVersion=VERSION,diagnostics=diagnostics(db)))
             failures = 0
         except (OSError, ValueError, sqlite3.Error) as error:
             failures += 1
             with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('delivery_error', type(error).__name__))
             print('Collector retry pending: '+type(error).__name__, flush=True)
-        if args.once: break
+        if args.once:
+            db.close();lock.close()
+            return 1 if failures else 0
         time.sleep(min(30, 5 * 2 ** min(failures, 3)))
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__': raise SystemExit(main())

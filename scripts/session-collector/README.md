@@ -14,12 +14,13 @@ WireGuard transport. One token may identify exactly one host.
 
 ```sh
 python3 scripts/session-collector/collector.py \
-  --url http://wj:4040 --token-file ~/.fusion/session-collector/token
+  --host m3 --url http://wj:4040 --token-file ~/.fusion/session-collector/token
 ```
 
 Default spool: `~/.fusion/session-collector/spool.sqlite`. This is only a local
 write-ahead delivery queue. It never shares AgentPulse state. Use `--once` for a
 bounded pass and `--home`/`--state` for disposable verification fixtures.
+The spool is bound to `--host`, and a credential preflight checks the server host binding before sending session data. HTTP redirects are rejected.
 A service manager should restart the collector; do not wrap it in detached
 shell launch patterns. The single-instance file lock prevents concurrent writers.
 Keep the spool on persistent local storage. Never delete it to repair delivery.
@@ -63,5 +64,4 @@ python3 scripts/session-collector/import_agentpulse.py \
 Run once per host credential/spool. Import resumes by snapshot SHA-256 and event
 cursor. It enqueues bounded deliveries; normal collector draining acknowledges
 them. Historical data never overwrites a live snapshot or a live turn. This
-initial importer handles collected turn-result events; session-only records,
-notes, and other AgentPulse event types need the parity import extension.
+importer handles session records, notes and collected turn-result events. Usage-only metadata and other AgentPulse event types still require the parity import extension.

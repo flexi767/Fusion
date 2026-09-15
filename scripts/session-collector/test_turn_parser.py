@@ -27,4 +27,27 @@ class TurnParserTests(unittest.TestCase):
         turn=state['turns']['t'];self.assertEqual(turn['usage'][0]['inputTokens'],60)
         self.assertEqual(turn['usage'][0]['cachedInputTokens'],20);self.assertEqual(turn['usage'][0]['cacheWriteTokens'],30)
         self.assertEqual(turn['files'][0]['added'],1);self.assertEqual(turn['files'][0]['removed'],1)
+    def test_missing_categories_remain_unknown_and_current_context_can_shrink(self):
+        state={}
+        def send(message): consume(state,dict(type='assistant',message=message,timestamp='2026-09-15T12:00:00Z'),'claude_code')
+        send(dict(id='a',model='claude',usage=dict(input_tokens=100,output_tokens=10),content=[]))
+        usage=next(iter(state['turns'].values()))['usage'][0]
+        self.assertIsNone(usage['inputTokens']);self.assertIsNone(usage['cachedInputTokens']);self.assertIsNone(usage['cacheWriteTokens'])
+        send(dict(id='b',model='claude',usage=dict(input_tokens=20,cache_read_input_tokens=0,cache_creation_input_tokens=0,output_tokens=5),content=[]))
+        usage=next(iter(state['turns'].values()))['usage'][0]
+        self.assertIsNone(usage['inputTokens']);self.assertEqual(usage['contextTokens'],20)
+        self.assertEqual(usage['outputTokens'],15)
+
+    def test_canonical_usage_in_one_turn_does_not_disable_next_turn_cumulative_deltas(self):
+        state={}
+        def send(kind,payload):consume(state,dict(type=kind,payload=payload,timestamp='2026-09-15T12:00:00Z'),'codex_cli')
+        send('event_msg',dict(type='task_started',turn_id='first'))
+        send('token_usage_record',dict(turn_id='first',response_id='r',usage=dict(input_tokens=100,output_tokens=20)))
+        send('event_msg',dict(type='token_count',info=dict(total_token_usage=dict(input_tokens=100,output_tokens=20))))
+        send('event_msg',dict(type='task_started',turn_id='second'))
+        send('event_msg',dict(type='token_count',info=dict(total_token_usage=dict(input_tokens=120,output_tokens=30),last_token_usage=dict(input_tokens=20))))
+        self.assertEqual(state['turns']['second']['usage'][0]['inputTokens'],20)
+        self.assertEqual(state['turns']['second']['usage'][0]['outputTokens'],10)
+        self.assertIsNone(state['turns']['second']['usage'][0]['cachedInputTokens'])
+
 if __name__ == '__main__':unittest.main()

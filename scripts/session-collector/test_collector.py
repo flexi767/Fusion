@@ -1,8 +1,10 @@
 import json
+from urllib.error import HTTPError
 from pathlib import Path
 import tempfile
 import unittest
-from collector import connect, scan_file, drain, discover
+from unittest.mock import patch
+from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main
 
 class CollectorTests(unittest.TestCase):
     def setUp(self):
@@ -43,5 +45,70 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(row['provider'],'claude'); self.assertNotIn('taskId',row); self.assertNotIn('capabilities',row)
         old=self.root/'.codex/sessions/2020/01/01/rollout-old.jsonl';old.parent.mkdir(parents=True);old.write_text('')
         self.assertIn(('codex',old), list(discover(self.root)))
+
+    def test_offline_pass_still_commits_discovered_data(self):
+        native=self.root/'.codex/sessions/2026/09/15/rollout.jsonl';native.parent.mkdir(parents=True)
+        native.write_text(''.join(json.dumps(row)+'\n' for row in self.codex()))
+        token=self.root/'token';token.write_text('x'*64);token.chmod(0o600)
+        spool=self.root/'offline.sqlite'
+        with patch('sys.argv',['collector','--host','m3','--url','http://127.0.0.1:1','--home',str(self.root),'--state',str(spool),'--token-file',str(token),'--once']), patch('collector.post',side_effect=OSError('offline')):
+            self.assertEqual(main(),1)
+        db=connect(spool)
+        self.assertGreater(db.execute('SELECT count(*) FROM pending').fetchone()[0],0)
+        self.assertEqual(db.execute('SELECT count(*) FROM files').fetchone()[0],1)
+        db.close()
+
+    def test_rejected_history_is_preserved_without_blocking_other_sessions(self):
+        for identity in ['bad','good']:
+            with self.db:self.db.execute('INSERT INTO pending(event_id,body) VALUES (?,?)',(identity,json.dumps(dict(eventId=identity))))
+        def send(e):
+            if e['eventId']=='bad':raise HTTPError('local',400,'invalid',{},None)
+            return dict(acknowledged=True,eventId=e['eventId'])
+        drain(self.db,send)
+        self.assertEqual(self.db.execute('SELECT event_id,rejection FROM pending').fetchall(),[('bad','400')])
+        drain(self.db,lambda _:self.fail('Rejected data must wait for repair'))
+
+    def test_host_binding_and_redirect_refusal(self):
+        bind_host(self.db,'m3');bind_host(self.db,'m3')
+        with self.assertRaises(ValueError):bind_host(self.db,'m5')
+        with self.assertRaises(ValueError):NoRedirect().redirect_request(None,None,302,'',{},'https://elsewhere')
+
+    def test_live_tail_overtakes_backfill_and_coalesces_offline_updates(self):
+        self.write(self.codex())
+        scan_file(self.db,self.path,'codex')
+        scan_live(self.db,self.path,'codex')
+        with self.path.open('a') as stream:
+            stream.write(json.dumps(dict(type='event_msg',timestamp='2026-09-15T12:01:00Z',payload=dict(type='task_completed')))+'\n')
+        scan_live(self.db,self.path,'codex')
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending WHERE priority=1').fetchone()[0],1)
+        seen=[]
+        def send(e):
+            seen.append(e['observation']);return dict(acknowledged=True,eventId=e['eventId'])
+        drain(self.db,send)
+        self.assertEqual(seen[0]['activity'],'waiting')
+        self.assertGreater(seen[0]['revision'],seen[1]['revision'])
+        scan_file(self.db,self.path,'codex')
+        self.assertEqual(json.loads(self.db.execute('SELECT body FROM pending').fetchone()[0])['observation']['activity'],'waiting')
+
+    def test_inflight_ack_cannot_remove_a_newer_coalesced_live_snapshot(self):
+        self.write(self.codex());scan_live(self.db,self.path,'codex')
+        def send(e):
+            with self.path.open('a') as stream:
+                stream.write(json.dumps(dict(type='event_msg',timestamp='2026-09-15T12:01:00Z',payload=dict(type='task_completed')))+'\n')
+            scan_live(self.db,self.path,'codex')
+            return dict(acknowledged=True,eventId=e['eventId'])
+        drain(self.db,send)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],1)
+        self.assertEqual(json.loads(self.db.execute('SELECT body FROM pending').fetchone()[0])['observation']['activity'],'waiting')
+
+    def test_live_cursor_waits_for_complete_record(self):
+        self.write(self.codex());scan_live(self.db,self.path,'codex')
+        drain(self.db,lambda e:dict(acknowledged=True,eventId=e['eventId']))
+        pending=json.dumps(dict(type='event_msg',timestamp='2026-09-15T12:01:00Z',payload=dict(type='task_completed')))
+        with self.path.open('a') as stream:stream.write(pending)
+        scan_live(self.db,self.path,'codex')
+        with self.path.open('a') as stream:stream.write('\n')
+        scan_live(self.db,self.path,'codex')
+        self.assertEqual(json.loads(self.db.execute('SELECT body FROM pending').fetchone()[0])['observation']['activity'],'waiting')
 
 if __name__ == '__main__': unittest.main()

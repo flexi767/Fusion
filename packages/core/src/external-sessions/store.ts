@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, desc, eq, lt, or, sql } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
-import { externalSessions, externalSessionTurns, sessionCollectors } from "../postgres/schema/central.js";
+import { externalSessions, externalSessionTurns, externalSessionDetails, sessionCollectors } from "../postgres/schema/central.js";
 import { parseSessionTurn } from "./turn.js";
 import { redactSecrets } from "../secrets/redact-secrets.js";
 import { externalSessionKey, parseSessionObservation, type SessionObservation } from "./observation.js";
@@ -24,13 +24,14 @@ function nextCursor(at: string, id: string) { return Buffer.from(JSON.stringify(
 export class ExternalSessionStore {
   constructor(private readonly layer: AsyncDataLayer) {}
 
-  async heartbeat(hostId: string, collectorVersion: string, now = new Date().toISOString()) {
-    await this.layer.db.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: now })
-      .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: now } });
+  async heartbeat(hostId: string, collectorVersion: string, now = new Date().toISOString(), diagnostics: Record<string, number | boolean> = {}) {
+    await this.layer.db.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: now, diagnostics })
+      .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: now, diagnostics } });
   }
 
-  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false) {
+  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false, importedNotes?: string) {
     if (!Array.isArray(turnValues) || turnValues.length > 25) throw new Error("Invalid turn batch");
+    if (importedNotes !== undefined && (typeof importedNotes !== "string" || importedNotes.length > 32000)) throw new Error("Invalid imported notes");
     const turns = turnValues.map(parseSessionTurn);
     if (historical) for (const turn of turns) turn.provenance = "agentpulse-import";
     const observation = parseSessionObservation(value);
@@ -57,6 +58,10 @@ export class ExternalSessionStore {
             setWhere: historical
               ? sql`${externalSessionTurns.result}->>'provenance' = 'agentpulse-import' AND ${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}`
               : lt(externalSessionTurns.revision, observation.revision) });
+      }
+      if (historical && importedNotes) {
+        await tx.insert(externalSessionDetails).values({ sessionId: id, notes: redactSecrets(importedNotes), notesRevision: 1 })
+          .onConflictDoUpdate({ target: externalSessionDetails.sessionId, set: { notes: redactSecrets(importedNotes), notesRevision: 1 }, setWhere: eq(externalSessionDetails.notesRevision, 0) });
       }
       return { id, revision: current.revision, applied: applied.length > 0 };
     });

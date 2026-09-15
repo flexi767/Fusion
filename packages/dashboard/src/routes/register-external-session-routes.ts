@@ -1,9 +1,10 @@
+import { createSessionSummaryWorker } from "./session-summary-worker.js";
 import { ExternalSessionStore, priceSessionTurns, ExternalSessionControls, ExternalSessionSummaries } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateSessionCollector } from "./session-collector-auth.js";
 
-export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store, options }) => {
+export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store, options, registerDispose }) => {
   const layer = () => {
     const layer = options?.centralCore?.asyncLayer ?? store.getAsyncLayer();
     if (!layer) throw new ApiError(503, "Sessions require PostgreSQL");
@@ -12,13 +13,16 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
   const sessions = () => new ExternalSessionStore(layer());
   const controls = () => new ExternalSessionControls(layer());
   const summaries = () => new ExternalSessionSummaries(layer());
+  const summaryWorker = process.env.FUSION_SESSION_SUMMARIES === "1" && process.env.FUSION_SESSION_SUMMARY_URL
+    ? createSessionSummaryWorker(layer, process.env.FUSION_SESSION_SUMMARY_URL) : undefined;
+  if (summaryWorker) registerDispose(() => summaryWorker.stop());
   // This exact POST is independently authenticated, including when dashboard auth is disabled.
   router.post("/session-collector", async (req, res) => {
     if (process.env.FUSION_SESSION_INGESTION !== "1") return res.status(404).json({ error: "Session ingestion disabled" });
     if (req.headers.origin || req.headers["sec-fetch-site"]) return res.status(403).json({ error: "Collector requests only" });
     const hostId = authenticateSessionCollector(req.headers.authorization, process.env.FUSION_SESSION_COLLECTORS);
     if (!hostId) return res.status(401).json({ error: "Invalid collector credential" });
-    const { version, eventId, collectorVersion, observation, turns, runtime, commandClaim, commandAck, historical } = req.body ?? {};
+    const { version, eventId, collectorVersion, observation, turns, runtime, commandClaim, commandAck, historical, importedNotes, diagnostics } = req.body ?? {};
     if (version !== 1 || typeof eventId !== "string" || !/^[a-zA-Z0-9:_-]{1,128}$/.test(eventId)
       || typeof collectorVersion !== "string" || !/^[a-zA-Z0-9._-]{1,64}$/.test(collectorVersion)) {
       return res.status(400).json({ error: "Invalid delivery envelope" });
@@ -33,10 +37,23 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
         return res.json({ eventId, acknowledged: await controls().acknowledge(hostId, commandAck.id, commandAck.generation, commandAck.status) });
       }
       if (observation === undefined) {
-        await sessions().heartbeat(hostId, collectorVersion);
+        const health: Record<string, number | boolean> = {};
+        if (diagnostics !== undefined) {
+          if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return res.status(400).json({ error: "Invalid collector diagnostics" });
+          for (const field of ["spoolDepth", "rejectedDeliveries", "discoveredFiles", "parserStateBytes"]) {
+            const value = diagnostics[field];
+            if (value !== undefined) {
+              if (!Number.isSafeInteger(value) || value < 0) return res.status(400).json({ error: "Invalid collector diagnostics" });
+              health[field] = value;
+            }
+          }
+          for (const field of ["parseError", "deliveryError"]) if (typeof diagnostics[field] === "boolean") health[field] = diagnostics[field];
+        }
+        await sessions().heartbeat(hostId, collectorVersion, undefined, health);
         return res.json({ eventId, hostId, acknowledged: true });
       }
-      const result = await sessions().ingest(hostId, collectorVersion, observation, turns, historical === true);
+      const result = await sessions().ingest(hostId, collectorVersion, observation, turns, historical === true, importedNotes);
+      if (result.applied) summaryWorker?.enqueue(result.id);
       return res.json({ eventId, hostId, acknowledged: true, ...result });
     } catch (error) {
       const message = error instanceof Error ? error.message : "";

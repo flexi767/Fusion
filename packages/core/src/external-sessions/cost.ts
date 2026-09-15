@@ -13,6 +13,7 @@ export function priceSessionUsage(provider: string, usage: SessionModelUsage, ov
   if (usage.fast || usage.longContext || (usage.cacheWriteHourTokens ?? 0) > 0) return { ...result, reason: "Unsupported tier, context band or cache lifetime" };
   const { inputTokens: input, cachedInputTokens: read, cacheWriteTokens: write, outputTokens: output } = usage;
   if (input === null || read === null || write === null || output === null) return { ...result, reason: "Missing token categories" };
+  if (provider === "claude" && write > 0 && usage.cacheWriteHourTokens === null) return { ...result, reason: "Cache lifetime unreported" };
   if (read + write > input) return { ...result, reason: "Inconsistent input counters" };
   const rates = lookupPricing({ provider: provider === "claude" ? "anthropic" : "openai", model: usage.model }, overrides);
   if (!rates) return { ...result, reason: "Model has no configured price" };

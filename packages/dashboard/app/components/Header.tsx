@@ -53,6 +53,7 @@ function GitHubLogo({ size = 16 }: { size?: number }) {
 
 
 export interface HeaderProps {
+  onOpenSessions?: () => void;
   onOpenSettings?: () => void;
   onOpenGitHubImport?: () => void;
   onOpenUsage?: (anchorRect?: DOMRect | null) => void;
@@ -122,6 +123,7 @@ export interface HeaderProps {
 }
 
 export function Header({
+  onOpenSessions,
   onOpenSettings,
   onOpenGitHubImport,
   onOpenUsage,
@@ -1076,6 +1078,7 @@ export function Header({
         FNXC:Navigation 2026-06-22-00:50:
         Usage (Activity) lives in the top header to the left of the right-sidebar toggle and opens the UsageIndicator as a header-anchored modal (not inline in the dock). Non-mobile only; mobile keeps its own usage button in the bottom-nav layout.
         */}
+        {!onChangeView && sessionsEnabled && onOpenSessions && <button className="btn-icon" onClick={onOpenSessions} title="Sessions" aria-label="Sessions"><Activity size={16} /></button>}
         {!isMobile && onOpenUsage && (
           <button
             className="btn-icon"

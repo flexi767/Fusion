@@ -16,3 +16,7 @@ it("unknown and unsupported rates or incomplete telemetry stay visibly unpriced"
     expect(priceSessionUsage("codex", { ...usage, ...patch }, { "openai:fixture": rates }).usd).toBeNull();
   }
 });
+
+it("does not assume a five-minute cache write when Claude omits its lifetime", () => {
+  expect(priceSessionUsage("claude", { ...usage, cacheWriteHourTokens: null }, { "anthropic/fixture": rates }).reason).toBe("Cache lifetime unreported");
+});

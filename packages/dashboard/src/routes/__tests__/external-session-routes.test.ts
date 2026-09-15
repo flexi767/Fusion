@@ -10,7 +10,8 @@ function request(app: express.Express, method: string, path: string, options: { 
   return rawRequest(app, method, path, options.body ? JSON.stringify(options.body) : undefined, { "Content-Type": "application/json", ...options.headers });
 }
 const ingest = vi.fn();
-vi.mock("@fusion/core", () => ({ ExternalSessionStore: class { ingest = ingest; heartbeat = vi.fn(); } }));
+const heartbeat = vi.fn();
+vi.mock("@fusion/core", () => ({ ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; } }));
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 function app() {
   vi.stubEnv("FUSION_SESSION_INGESTION", "1");
@@ -36,4 +37,12 @@ it("never acknowledges a failed commit, browser request, invalid envelope or dis
   expect((await request(server, "POST", "/api/session-collector", { body: { ...body, version: 2 }, headers })).status).toBe(400);
   vi.stubEnv("FUSION_SESSION_INGESTION", "0");
   expect((await request(server, "POST", "/api/session-collector", { body, headers })).status).toBe(404);
+});
+
+it("accepts bounded host diagnostics and discards unrecognized fields", async () => {
+  const server = app(); const headers = { Authorization: "Bearer collector-token" };
+  const envelope = { version: 1, eventId: "health", collectorVersion: "test", diagnostics: { spoolDepth: 12, rejectedDeliveries: 1, parseError: true, secret: "never retained" } };
+  expect((await request(server, "POST", "/api/session-collector", { body: envelope, headers })).status).toBe(200);
+  expect(heartbeat).toHaveBeenCalledWith("m3", "test", undefined, { spoolDepth: 12, rejectedDeliveries: 1, parseError: true });
+  expect((await request(server, "POST", "/api/session-collector", { body: { ...envelope, diagnostics: { spoolDepth: -1 } }, headers })).status).toBe(400);
 });

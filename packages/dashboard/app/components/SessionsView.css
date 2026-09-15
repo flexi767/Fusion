@@ -1,12 +1,16 @@
-.sessions-view { padding: var(--space-4); overflow: auto; }
-.sessions-filters { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-block: var(--space-4); }
-.sessions-filters label { display: flex; flex-direction: column; gap: var(--space-1); flex: 1; min-width: 0; }
-.sessions-grid { display: flex; flex-direction: column; gap: var(--space-3); }
-.session-card { border: var(--border-width, thin) solid var(--border-color); border-radius: var(--radius-md); padding: var(--space-4); background: var(--bg-secondary); overflow-wrap: anywhere; }
+.sessions-view { padding: var(--space-lg); }
+.sessions-filters { display: flex; flex-wrap: wrap; gap: var(--space-md); margin-block: var(--space-lg); }
+.sessions-filters label { display: flex; flex-direction: column; gap: var(--space-xs); flex: 1; min-inline-size: min(100%, calc(var(--space-2xl) * 5)); }
+.sessions-grid { display: flex; flex-direction: column; gap: var(--space-md); }
+.session-card { border: var(--btn-border-width) solid var(--border); border-radius: var(--radius-md); padding: var(--space-lg); margin-block-end: var(--space-md); background: var(--card); overflow-wrap: anywhere; }
 .session-card h3 { margin: 0; font-size: var(--font-size-md); }
-.session-card p { margin-block: var(--space-2); }
-.session-project { color: var(--text-secondary); }
-.session-output { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); max-width: 100%; }
+.session-card h3 a { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.session-card h4, .session-card p { margin-block: var(--space-sm); }
+.session-card details { margin-block: var(--space-sm); }
+.session-card summary { cursor: pointer; padding-block: var(--space-sm); }
+.session-card summary:focus-visible { outline: var(--btn-border-width) solid var(--accent); outline-offset: var(--space-xs); }
+.session-project { color: var(--text-muted); }
+.session-output { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); max-width: 100%; margin-block: var(--space-md); }
 .session-cost-table { overflow-x: auto; }
-.session-cost-table th, .session-cost-table td { text-align: left; padding: var(--space-2); }
-.session-card textarea { display: block; width: 100%; min-height: var(--space-16); margin-block: var(--space-2); }
+.session-cost-table th, .session-cost-table td { text-align: left; padding: var(--space-sm); }
+.session-card textarea { display: block; width: 100%; min-height: calc(var(--space-2xl) * 3); margin-block: var(--space-sm); }

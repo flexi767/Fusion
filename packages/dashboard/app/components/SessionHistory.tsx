@@ -15,7 +15,7 @@ export function SessionTurnResult({ turn }: { turn: SessionTurn }) {
     <section><h4>Response</h4><pre className="session-output">{turn.response || (turn.completedAt ? "Response unavailable" : "Response in progress")}</pre></section>
     <p>{turn.completedAt ? "Turn finished" : "Turn ongoing"} · {turn.durationMs === null ? "Duration unavailable" : `${(turn.durationMs / 1000).toFixed(1)} seconds (${turn.durationSource})`} · {turn.toolCalls} tool calls</p>
     {turn.usage.map((usage, i) => <p key={i}>{usage.model} · Context {usage.contextTokens ?? "unreported"} tokens · Reasoning {usage.reasoningTokens ?? "unreported"} tokens (included in output)</p>)}
-    {turn.files.length === 0 ? <p>No collected patches for this turn.</p> : <details><summary>{turn.files.length} file changes</summary>{turn.files.map(file => <details key={file.path}><summary>{file.path} · +{file.added}/−{file.removed}{file.truncated ? " · truncated" : ""}</summary>
+    {turn.files.length === 0 ? <p>No collected patches for this turn.</p> : <details><summary>{turn.files.length} file changes</summary>{turn.files.map(file => <details key={file.path}><summary>{file.path}{file.scope === "external" ? " · outside project" : ""} · +{file.added}/−{file.removed}{file.truncated ? " · truncated" : ""}</summary>
       {file.available ? <pre className="session-output">{file.diff || "Patch text unavailable"}</pre> : <p>Historical patch unavailable.</p>}</details>)}</details>}
   </article>;
 }

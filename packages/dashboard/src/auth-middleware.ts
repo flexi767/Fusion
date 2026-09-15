@@ -82,8 +82,8 @@ export function getDaemonToken(options?: { daemon?: { token: string }; noAuth?: 
 /**
  * Check if a request path is exempt from authentication.
  */
-function isExemptPath(path: string): boolean {
-  if (path === "/api/session-collector" || path === "/api/session-collector/") return true;
+function isExemptPath(path: string, method: string): boolean {
+  if (method === "POST" && (path === "/api/session-collector" || path === "/api/session-collector/")) return true;
   return EXEMPT_PATHS.some((exempt) => path === exempt || path.startsWith(exempt + "/"));
 }
 
@@ -175,7 +175,7 @@ export function createAuthMiddleware(token: string, options?: { validateRemoteSe
     }
 
     // Always allow exempt paths (liveness probes)
-    if (isExemptPath(req.path)) {
+    if (isExemptPath(req.path, req.method)) {
       next();
       return;
     }

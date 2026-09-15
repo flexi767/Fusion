@@ -5,7 +5,10 @@
 import difflib
 
 FIELDS = {'inputTokens':'input_tokens','cachedInputTokens':'cached_input_tokens','cacheWriteTokens':'cache_write_input_tokens','outputTokens':'output_tokens','reasoningTokens':'reasoning_output_tokens'}
-def num(v): return v if isinstance(v,(int,float)) and not isinstance(v,bool) and v>=0 else 0
+def known(v): return v if isinstance(v,int) and not isinstance(v,bool) and 0<=v<=9007199254740991 else None
+def num(v): return known(v) or 0
+def total(*values): return sum(values) if all(v is not None for v in values) else None
+def maximum(a,b): return max(a,b) if a is not None and b is not None else a if a is not None else b
 def text(content):
     if isinstance(content,str): return content
     return '\n'.join(b.get('text','') for b in content or [] if isinstance(b,dict) and b.get('type','').lower() in ('text','input_text','output_text'))
@@ -73,19 +76,21 @@ def consume(state,e,agent):
     if kind=='token_usage_record':
         tid=p.get('turn_id') or state.get('active');r=turn(tid)
         key=p.get('response_id') or str(e.get('ordinal'))
-        u=p.get('usage') or {};req={k:num(u.get(v)) for k,v in FIELDS.items()}
-        req.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(u.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':num(u.get('input_tokens')),'requests':1,'turn':tid})
+        u=p.get('usage') or {};req={k:known(u.get(v)) for k,v in FIELDS.items()};req['cacheWriteTokens']=0
+        req.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(u.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':known(u.get('input_tokens')),'requests':1,'turn':tid})
         previous=state.setdefault('requests',{}).get(key)
         if previous:
-            for k in FIELDS:req[k]=max(req[k],previous[k])
-        state['requests'][key]=req;state['canonical']=True;rebuild_usage(state,r);return
-    if kind=='event_msg' and sub=='token_count' and not state.get('canonical'):
+            for k in FIELDS:req[k]=maximum(req[k],previous[k])
+        state['requests'][key]=req;rebuild_usage(state,r);return
+    if kind=='event_msg' and sub=='token_count':
         info=p.get('info') or {};u=info.get('total_token_usage')
         if not isinstance(u,dict):return
         prev=state.get('previousUsage',{});state['previousUsage']=u
-        delta={k:max(0,num(u.get(v))-num(prev.get(v))) for k,v in FIELDS.items()}
-        if not any(delta.values()):return
-        r=turn();last=info.get('last_token_usage') or {};delta.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(last.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':num(last.get('input_tokens')),'requests':1,'turn':r['id']})
+        if any(request['turn']==state.get('active') for request in state.get('requests',{}).values()):return
+        delta={k:(max(0,u[v]-num(prev.get(v))) if known(u.get(v)) is not None else None) for k,v in FIELDS.items()}
+        delta['cacheWriteTokens']=0
+        if not any(value for value in delta.values() if value is not None):return
+        r=turn();last=info.get('last_token_usage') or {};delta.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(last.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':known(last.get('input_tokens')),'requests':1,'turn':r['id']})
         state.setdefault('fallback',{}).setdefault(r['id'],[]).append(delta);rebuild_usage(state,r);return
     if agent!='claude_code':return
     m=e.get('message') or {}
@@ -126,12 +131,12 @@ def consume(state,e,agent):
                 state['calls'][b.get('id')]={'name':b.get('name'),'input':b.get('input') or {},'turn':r['id']}
         u=m.get('usage')
         if isinstance(u,dict):
-            key=m.get('id') or e.get('uuid');cr=num(u.get('cache_read_input_tokens'));cw=num(u.get('cache_creation_input_tokens'));cache=u.get('cache_creation') or {}
-            req={'inputTokens':num(u.get('input_tokens'))+cr+cw,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':num(cache.get('ephemeral_1h_input_tokens')),'outputTokens':num(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'contextTokens':num(u.get('input_tokens'))+cr+cw,'fast':u.get('speed')=='fast','longContext':num(u.get('input_tokens'))+cr+cw>200000}
+            key=m.get('id') or e.get('uuid');cr=known(u.get('cache_read_input_tokens'));cw=known(u.get('cache_creation_input_tokens'));cache=u.get('cache_creation') or {};inclusive=total(known(u.get('input_tokens')),cr,cw)
+            req={'inputTokens':inclusive,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':known(cache.get('ephemeral_1h_input_tokens')) if cw != 0 else 0,'outputTokens':known(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'contextTokens':inclusive,'fast':u.get('speed')=='fast','longContext':(inclusive or 0)>200000}
             prev=state.setdefault('requests',{}).get(key)
             if prev:
-                for k in FIELDS:req[k]=max(req[k],prev[k])
-                req['cacheWriteHourTokens']=max(req['cacheWriteHourTokens'],prev['cacheWriteHourTokens'])
+                for k in FIELDS:req[k]=maximum(req[k],prev[k])
+                req['cacheWriteHourTokens']=maximum(req['cacheWriteHourTokens'],prev['cacheWriteHourTokens'])
             state['requests'][key]=req;rebuild_usage(state,r)
     if kind=='system' and e.get('subtype')=='turn_duration':
         r=turn();r['durationMs']=num(e.get('durationMs'));r['durationSource']='provider';r['completedAt']=at
@@ -150,6 +155,6 @@ def rebuild_usage(state,r):
         if key not in grouped:grouped[key]={k:v for k,v in u.items() if k!='turn'}
         else:
             g=grouped[key]
-            for k in (*FIELDS,'cacheWriteHourTokens','requests'):g[k]+=u[k]
-            g['contextTokens']=max(g['contextTokens'],u['contextTokens'])
+            for k in (*FIELDS,'cacheWriteHourTokens','requests'):g[k]=total(g[k],u[k])
+            g['contextTokens']=u['contextTokens']
     r['usage']=list(grouped.values())

@@ -36,7 +36,7 @@ pgDescribe("External session durable ingestion", () => {
     const ack = await store.ingest("m3", "test", observation, [turn]);
     await store.ingest("m3", "test", { ...observation, revision: 9 }, [{ ...turn, response: "Old result" }]);
     expect((await store.turns(ack.id)).turns[0].response).toBe("New result");
-    await expect(store.ingest("m3", "test", { ...observation, revision: 11 }, [{ ...turn, files: [{ ...turn.files[0], path: "../private" }] }])).rejects.toThrow("Invalid turn file path");
+    await expect(store.ingest("m3", "test", { ...observation, revision: 11 }, [{ ...turn, files: [{ ...turn.files[0], path: "\ninvalid" }] }])).rejects.toThrow("Invalid turn file path");
     expect((await store.get(ack.id))?.revision).toBe(10);
     expect((await store.turns(ack.id)).turns).toHaveLength(1);
   });

@@ -2323,6 +2323,7 @@ function AppInner() {
           <>
             <TopProgressBar visible={isRevalidating} />
             <Header
+        onOpenSessions={() => handleTaskViewChange("sessions")}
         shellHost={shellHost.host}
         onOpenSettings={openSettingsWithNav}
         onOpenGitHubImport={openGitHubImportWithNav}

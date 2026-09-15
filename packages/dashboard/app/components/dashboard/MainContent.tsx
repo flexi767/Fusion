@@ -591,6 +591,8 @@ export function MainContent(props: MainContentProps) {
     );
   }
 
+  if (taskView === "sessions") return <PageErrorBoundary><Suspense fallback={null}><SessionsView /></Suspense></PageErrorBoundary>;
+
   if (viewMode === "overview") {
     return (
       <PageErrorBoundary>
@@ -989,7 +991,6 @@ export function MainContent(props: MainContentProps) {
     );
   }
 
-  if (taskView === "sessions") return <PageErrorBoundary><Suspense fallback={null}><SessionsView /></Suspense></PageErrorBoundary>;
 
   if (taskView === "patchnode") {
     return (

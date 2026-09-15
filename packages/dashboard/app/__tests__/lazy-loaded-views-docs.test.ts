@@ -184,7 +184,7 @@ function expectDocumentedViews(include: Iterable<string>, section: string): void
 }
 
 describe("AGENTS lazy-loaded views inventory", () => {
-  it("documents the App-level and AppModals lazy views accurately and keeps the curated 22-view list in sync", () => {
+  it("documents the App-level and AppModals lazy views accurately and keeps the curated 23-view list in sync", () => {
     const agentsDoc = readFileSync(resolve(__dirname, "../../../../AGENTS.md"), "utf-8");
     const appSource = readFileSync(resolve(__dirname, "../App.tsx"), "utf-8");
     const appModalsSource = readFileSync(resolve(__dirname, "../components/AppModals.tsx"), "utf-8");
@@ -198,7 +198,7 @@ describe("AGENTS lazy-loaded views inventory", () => {
 
     const documentedViews = extractBacktickedNamesFromBullets(section);
     expect(new Set(documentedViews)).toEqual(EXPECTED_DOCUMENTED_VIEWS);
-    expect(documentedViews).toHaveLength(22);
+    expect(documentedViews).toHaveLength(23);
 
     expect(section).toContain("`ResearchView`");
     expect(section).toContain("`SettingsModal`");

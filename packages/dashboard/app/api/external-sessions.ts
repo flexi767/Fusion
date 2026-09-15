@@ -4,7 +4,7 @@ export interface ObservedSession {
   id: string; hostId: string; provider: string; nativeSessionId: string;
   revision: number; observation: SessionObservation; receivedAt: string;
 }
-export interface CollectorHealth { hostId: string; lastHeartbeatAt: string; lastAcknowledgementAt: string | null; collectorVersion: string }
+export interface CollectorHealth { hostId: string; lastHeartbeatAt: string; lastAcknowledgementAt: string | null; collectorVersion: string; diagnostics?: { spoolDepth?: number; rejectedDeliveries?: number; discoveredFiles?: number; parserStateBytes?: number; parseError?: boolean; deliveryError?: boolean } }
 export interface SessionPage { enabled: boolean; sessions: ObservedSession[]; collectors: CollectorHealth[]; nextCursor: string | null }
 export const fetchExternalSessions = (before?: string) => api<SessionPage>(`/external-sessions${before ? `?before=${encodeURIComponent(before)}` : ""}`);
 export interface SessionDetail {

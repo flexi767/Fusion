@@ -51,6 +51,12 @@ function SessionList() {
   return <ViewLayout header={<ViewHeader icon={Activity} title="Sessions" />}>
     <div className="sessions-view">
       <p>Codex and Claude sessions across your hosts. Observing a session does not schedule a Fusion task.</p>
+      <details className="session-card"><summary>Collector health</summary>{data?.collectors.map(collector => <section key={collector.hostId}>
+        <h3>{collector.hostId}</h3><p>Last heartbeat: {new Date(collector.lastHeartbeatAt).toLocaleString()} · Last acknowledged delivery: {collector.lastAcknowledgementAt ? new Date(collector.lastAcknowledgementAt).toLocaleString() : "None"}</p>
+        <p>{collector.diagnostics?.spoolDepth ?? "Unknown"} queued · {collector.diagnostics?.rejectedDeliveries ?? "Unknown"} rejected · {collector.diagnostics?.discoveredFiles ?? "Unknown"} discovered transcripts</p>
+        {collector.diagnostics?.parseError && <p>Transcript parsing needs attention. Inspect collector diagnostics on this host.</p>}
+        {collector.diagnostics?.deliveryError && <p>Delivery is retrying after a failure.</p>}
+      </section>)}</details>
       <div className="sessions-filters">
         <label>Host<select value={host} onChange={e => setHost(e.target.value)}><option value="">All hosts</option>{(data?.collectors ?? []).map(c => <option key={c.hostId}>{c.hostId}</option>)}</select></label>
         <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>

@@ -10,7 +10,7 @@ export interface SessionTurn {
   id: string; startedAt: string; completedAt: string | null; updatedAt: string;
   durationMs: number | null; durationSource: "provider" | "timestamps";
   prompts: string[]; response: string; toolCalls: number; usage: SessionModelUsage[];
-  files: { path: string; diff: string; added: number; removed: number; truncated: boolean; available: boolean }[];
+  files: { scope?: "project" | "external"; path: string; diff: string; added: number; removed: number; truncated: boolean; available: boolean }[];
   provenance: "native-transcript" | "agentpulse-import";
 }
 function text(value: unknown, max: number): string {
@@ -44,8 +44,9 @@ export function parseSessionTurn(value: unknown): SessionTurn {
     files: r.files.map(value => {
       const f = record(value); const path = text(f.path, 4096);
       // Historical display only: no API ever opens this path on the server.
-      if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..")) throw new Error("Invalid turn file path");
-      return { path, diff: redactSecrets(text(f.diff, 65536)), added: count(f.added) ?? 0, removed: count(f.removed) ?? 0, truncated: f.truncated === true, available: f.available !== false };
+      if (!path || Array.from(path).some(char => char.charCodeAt(0) < 32)) throw new Error("Invalid turn file path");
+      const external = /^(?:[\\/]|[A-Za-z]:)/u.test(path) || path.split(/[\\/]/u).includes("..");
+      return { path, scope: external ? "external" as const : "project" as const, diff: redactSecrets(text(f.diff, 65536)), added: count(f.added) ?? 0, removed: count(f.removed) ?? 0, truncated: f.truncated === true, available: f.available !== false };
     }),
     usage: r.usage.map(value => {
       const u = record(value);
