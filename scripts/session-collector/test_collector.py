@@ -45,6 +45,8 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(row['provider'],'claude'); self.assertNotIn('taskId',row); self.assertNotIn('capabilities',row)
         old=self.root/'.codex/sessions/2020/01/01/rollout-old.jsonl';old.parent.mkdir(parents=True);old.write_text('')
         self.assertIn(('codex',old), list(discover(self.root)))
+        archived=self.root/'.codex/archived_sessions/rollout-archived.jsonl';archived.parent.mkdir(parents=True);archived.write_text('')
+        self.assertIn(('codex',archived),list(discover(self.root)))
 
     def test_rate_limit_delays_history_without_blocking_new_live_updates(self):
         with self.db:

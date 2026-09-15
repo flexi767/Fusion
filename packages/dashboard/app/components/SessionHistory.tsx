@@ -1,6 +1,7 @@
+import { SessionPreferences } from "./SessionPreferences";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionTurn } from "@fusion/core";
-import { fetchExternalSession, saveSessionNotes, summarizeSession, sendSessionCommand, type SessionDetail } from "../api/external-sessions";
+import { fetchExternalSession, fetchExternalSessionTurn, saveSessionNotes, summarizeSession, sendSessionCommand, type SessionDetail } from "../api/external-sessions";
 import { useVisibilityAwarePoll } from "../hooks/visibilitySuspension";
 import { formatCost } from "../utils/taskTokenCost";
 import { ViewHeader } from "./ViewHeader";
@@ -8,12 +9,14 @@ import { ViewLayout } from "./ViewLayout";
 import "./SessionsView.css";
 
 /** Reusable history presentation: linked tasks can render the same durable turns. */
-export function SessionTurnResult({ turn }: { turn: SessionTurn }) {
-  return <article className="session-card" id={`turn-${turn.id}`}>
+export function SessionTurnResult({ turn, sessionId, cost }: { turn: SessionTurn; sessionId?: string; cost?: SessionDetail["cost"] }) {
+  return <article className="session-card" id={`session-turn-${encodeURIComponent(turn.id)}`}>
     <h3><time dateTime={turn.startedAt}>{new Date(turn.startedAt).toLocaleString()}</time></h3>
+    {sessionId && <a href={`?view=sessions&session=${encodeURIComponent(sessionId)}&turn=${encodeURIComponent(turn.id)}#session-turn-${encodeURIComponent(turn.id)}`}>Link to this turn</a>}
     {turn.prompts.map((prompt, index) => <section key={index}><h4>Prompt {index + 1}</h4><pre className="session-output">{prompt}</pre></section>)}
     <section><h4>Response</h4><pre className="session-output">{turn.response || (turn.completedAt ? "Response unavailable" : "Response in progress")}</pre></section>
     <p>{turn.completedAt ? "Turn finished" : "Turn ongoing"} · {turn.durationMs === null ? "Duration unavailable" : `${(turn.durationMs / 1000).toFixed(1)} seconds (${turn.durationSource})`} · {turn.toolCalls} tool calls</p>
+    {cost && <SessionCostDetails cost={cost} label="Turn cost" />}
     {turn.usage.map((usage, i) => <p key={i}>{usage.model} · Context {usage.contextTokens ?? "unreported"} tokens · Reasoning {usage.reasoningTokens ?? "unreported"} tokens (included in output)</p>)}
     {turn.files.length === 0 ? <p>No collected patches for this turn.</p> : <details><summary>{turn.files.length} file changes</summary>{turn.files.map(file => <details key={file.path}><summary>{file.path}{file.scope === "external" ? " · outside project" : ""} · +{file.added}/−{file.removed}{file.truncated ? " · truncated" : ""}</summary>
       {file.available ? <pre className="session-output">{file.diff || "Patch text unavailable"}</pre> : <p>Historical patch unavailable.</p>}</details>)}</details>}
@@ -79,6 +82,10 @@ function SessionSummary({ detail, refresh }: { detail: SessionDetail; refresh: (
 }
 
 export function SessionHistory({ id }: { id: string }) {
+  const targetId = new URLSearchParams(window.location.search).get("turn");
+  const [target, setTarget] = useState<SessionTurn>();
+  const [targetCost, setTargetCost] = useState<SessionDetail["cost"]>();
+  const [targetError, setTargetError] = useState("");
   const [detail, setDetail] = useState<SessionDetail>();
   const [older, setOlder] = useState<SessionTurn[]>([]);
   const [cursor, setCursor] = useState<string | null | undefined>();
@@ -89,15 +96,33 @@ export function SessionHistory({ id }: { id: string }) {
   const refresh = useCallback(async () => {
     if (refreshing.current) return;
     refreshing.current = true;
-    try { const data = await fetchExternalSession(id); if (active.current) { setDetail(data); setError(""); } }
+    try {
+      const data = await fetchExternalSession(id);
+      if (active.current) { setDetail(data); setError(""); }
+      if (targetId && !data.turns.some(turn => turn.id === targetId)) {
+        try { const page = await fetchExternalSessionTurn(id, targetId); if (active.current) { setTarget(page.turn); setTargetCost(page.cost); setTargetError(""); } }
+        catch { if (active.current) setTargetError("Linked turn is unavailable. Collected history remains below."); }
+      }
+    }
     catch { if (active.current) setError("History updates unavailable. Retry when the server reconnects."); }
     finally { refreshing.current = false; }
-  }, [id]);
+  }, [id, targetId]);
   useEffect(() => { active.current = true; void refresh(); return () => { active.current = false; }; }, [refresh]);
   useVisibilityAwarePoll(() => void refresh(), 5000);
   const rows = new Map(older.map(turn => [turn.id, turn]));
+  if (target) rows.set(target.id, target);
   for (const turn of detail?.turns ?? []) rows.set(turn.id, turn);
   const turns = [...rows.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  const jumped = useRef(false);
+  const linkedTurnReady = Boolean(targetId && rows.has(targetId));
+  useEffect(() => {
+    if (!targetId || !linkedTurnReady || jumped.current) return;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById(`session-turn-${encodeURIComponent(targetId)}`)?.scrollIntoView?.({ block: "start" });
+      jumped.current = true;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [targetId, linkedTurnReady]);
   const next = cursor === undefined ? detail?.nextCursor : cursor;
   const more = async () => {
     if (!next || busy) return;
@@ -108,11 +133,12 @@ export function SessionHistory({ id }: { id: string }) {
   };
   return <ViewLayout header={<ViewHeader title={detail?.session.observation.title ?? "Session history"} backAction={{ label: "Back to sessions", onClick: () => { window.location.search = "?view=sessions"; } }} />}>
     <div className="sessions-view">
+      {targetError && <p role="alert">{targetError}</p>}
       {error && <p role="alert">{error}</p>}
       {!detail && !error && <p role="status">Loading history…</p>}
       {detail?.wholeSessionUsage && <section className="session-card"><h3>Whole session: {formatCost(detail.wholeSessionUsage.usd, detail.wholeSessionUsage.usd === null)}</h3><p>{detail.wholeSessionUsage.turns} collected turns · {detail.wholeSessionUsage.unreportedTurns} turns without usage · {detail.wholeSessionUsage.unpricedRows} unpriced model groups. Estimate at current rates.</p></section>}
-      {detail && <><p>{detail.session.hostId} · {detail.session.provider} · {detail.session.observation.activity} · Observed session</p><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /></>}
-      <div className="sessions-grid">{turns.map(turn => <SessionTurnResult key={turn.id} turn={turn} />)}</div>
+      {detail && <><p>{detail.session.hostId} · {detail.session.provider} · {detail.session.observation.activity} · Observed session</p><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /><SessionPreferences id={id} details={detail.details} refresh={refresh} /></>}
+      <div className="sessions-grid">{turns.map(turn => <SessionTurnResult key={turn.id} turn={turn} sessionId={id} cost={detail?.turnCosts?.[turn.id] ?? (turn.id === targetId ? targetCost : undefined)} />)}</div>
       {detail && turns.length === 0 && <p>No turn history has been collected yet.</p>}
       {next && <button className="btn btn-secondary" disabled={busy} onClick={() => void more()}>Load older turns</button>}
     </div>

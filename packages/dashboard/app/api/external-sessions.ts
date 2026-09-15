@@ -1,13 +1,14 @@
 import type { SessionObservation } from "@fusion/core";
 import { api } from "./client/client.js";
 export interface ObservedSession {
+  archived?: boolean | null; pinned?: boolean | null;
   id: string; hostId: string; provider: string; nativeSessionId: string;
   usageSummary?: import("@fusion/core").ExternalSessionUsageSummary | null;
   revision: number; observation: SessionObservation; receivedAt: string;
 }
 export interface CollectorHealth { hostId: string; lastHeartbeatAt: string | null; lastAcknowledgementAt: string | null; collectorVersion: string; diagnostics?: { spoolDepth?: number; rejectedDeliveries?: number; discoveredFiles?: number; parserStateBytes?: number; spoolBytes?: number; resourcePaused?: boolean; parseError?: boolean; deliveryError?: boolean } }
 export interface SessionPage { enabled: boolean; sessions: ObservedSession[]; collectors: CollectorHealth[]; nextCursor: string | null }
-export interface SessionFilters { host?: string; provider?: string; activity?: string; q?: string }
+export interface SessionFilters { host?: string; provider?: string; activity?: string; q?: string; saved?: string }
 export const fetchExternalSessions = (before?: string, filters: SessionFilters = {}) => {
   const query = new URLSearchParams();
   if (before) query.set("before", before);
@@ -16,6 +17,7 @@ export const fetchExternalSessions = (before?: string, filters: SessionFilters =
 };
 export interface SessionDetail {
   session: ObservedSession;
+  turnCosts?: Record<string, SessionDetail["cost"]>;
   wholeSessionUsage?: import("@fusion/core").ExternalSessionUsageSummary | null;
   turns: import("@fusion/core").SessionTurn[];
   nextCursor: string | null;
@@ -30,8 +32,12 @@ export const saveSessionNotes = (id: string, notes: string, expectedRevision: nu
 export const summarizeSession = (id: string) => api<{ changed: boolean; reason?: string }>(`/external-sessions/${encodeURIComponent(id)}/summary`, { method: "POST", body: "{}" });
 export const sendSessionCommand = (sessionId: string, id: string, operation: string, text?: string) => api(`/external-sessions/${encodeURIComponent(sessionId)}/commands`, { method: "POST", body: JSON.stringify({ id, operation, text }) });
 
-export const fetchExternalSessionUsage = (filters: { from?: string; to?: string; host?: string; model?: string }) => {
+export const fetchExternalSessionUsage = (filters: { from?: string; to?: string; host?: string; model?: string; groupBy?: "session" | "turn" }) => {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) if (value) query.set(key, value);
   return api<Awaited<ReturnType<typeof import("@fusion/core").externalSessionAnalytics>>>(`/external-session-usage?${query}`);
 };
+
+export const fetchExternalSessionTurn = (id: string, turnId: string) => api<{ turn: import("@fusion/core").SessionTurn; cost: SessionDetail["cost"] }>(`/external-sessions/${encodeURIComponent(id)}/turns/${encodeURIComponent(turnId)}`);
+
+export const saveSessionPreferences = (id: string, archived: boolean, pinned: boolean, expectedRevision: number) => api(`/external-sessions/${encodeURIComponent(id)}/preferences`, { method: "PUT", body: JSON.stringify({ archived, pinned, expectedRevision }) });

@@ -9,13 +9,16 @@ class ImportTests(unittest.TestCase):
     def test_resumable_identity_scoped_import_and_unmapped_stop(self):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root);snapshot=root/'snapshot.db';source=sqlite3.connect(snapshot)
-            source.executescript('CREATE TABLE sessions(session_id TEXT,agent_type TEXT,display_name TEXT,cwd TEXT,status TEXT,is_working INTEGER,last_activity_at TEXT,notes TEXT,metadata TEXT); CREATE TABLE events(id INTEGER,session_id TEXT,provider_event_type TEXT,raw_payload TEXT);')
-            source.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)',('native','codex_cli','Old session','/repo','active',0,'2026-09-15T12:00:00Z','Imported note','{}'))
+            source.executescript('CREATE TABLE sessions(session_id TEXT,agent_type TEXT,display_name TEXT,cwd TEXT,status TEXT,is_working INTEGER,last_activity_at TEXT,notes TEXT,metadata TEXT,model TEXT,started_at TEXT,ended_at TEXT,git_branch TEXT,is_archived INTEGER,is_pinned INTEGER); CREATE TABLE events(id INTEGER,session_id TEXT,provider_event_type TEXT,raw_payload TEXT);')
+            source.execute('INSERT INTO sessions(session_id,agent_type,display_name,cwd,status,is_working,last_activity_at,notes,metadata) VALUES (?,?,?,?,?,?,?,?,?)',('native','codex_cli','Old session','/repo','active',0,'2026-09-15T12:00:00Z','Imported note','{}'))
+            source.execute("UPDATE sessions SET is_archived=1,is_pinned=0,model='fixture',started_at='2026-09-01T12:00:00Z',git_branch='main'")
             source.execute('INSERT INTO events VALUES (?,?,?,?)',(1,'native','agentpulse_turn_result',json.dumps(dict(id='t',files=[dict(path='/repo/a',diff='+new'),dict(path='/outside/b',diff='+external'),dict(path='../c',diff='+parent')],prompts=['Prompt'],response='Response'))));source.commit();source.close()
             db=connect(root/'spool.db')
             self.assertEqual(import_snapshot(snapshot,db,{},'m3')['unmapped'],['native'])
             mapping={'native':dict(hostId='m3',provider='codex',nativeSessionId='verified-native')}
             self.assertEqual(import_snapshot(snapshot,db,mapping,'m3')['queued'],1)
+            metadata=json.loads(db.execute('SELECT body FROM pending').fetchone()[0])['importedMetadata']
+            self.assertTrue(metadata['archived']);self.assertEqual(metadata['model'],'fixture');self.assertEqual(metadata['branch'],'main')
             self.assertEqual(import_snapshot(snapshot,db,mapping,'m3')['phase'],'events')
             self.assertEqual(import_snapshot(snapshot,db,mapping,'m3')['queued'],1)
             self.assertTrue(import_snapshot(snapshot,db,mapping,'m3')['complete'])
@@ -27,9 +30,9 @@ class ImportTests(unittest.TestCase):
     def test_unmapped_identities_are_durable_and_can_be_resolved_later(self):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root);snapshot=root/'snapshot.db';source=sqlite3.connect(snapshot)
-            source.executescript('CREATE TABLE sessions(session_id TEXT,agent_type TEXT,display_name TEXT,cwd TEXT,status TEXT,is_working INTEGER,last_activity_at TEXT,notes TEXT,metadata TEXT); CREATE TABLE events(id INTEGER,session_id TEXT,provider_event_type TEXT,raw_payload TEXT);')
+            source.executescript('CREATE TABLE sessions(session_id TEXT,agent_type TEXT,display_name TEXT,cwd TEXT,status TEXT,is_working INTEGER,last_activity_at TEXT,notes TEXT,metadata TEXT,model TEXT,started_at TEXT,ended_at TEXT,git_branch TEXT,is_archived INTEGER,is_pinned INTEGER); CREATE TABLE events(id INTEGER,session_id TEXT,provider_event_type TEXT,raw_payload TEXT);')
             for native,host in [('unmapped','m3'),('verified','m3'),('remote','j')]:
-                source.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)',(native,'codex_cli',native,'/repo','active',0,'2026-09-15T12:00:00Z','',json.dumps(dict(hostName=host))))
+                source.execute('INSERT INTO sessions(session_id,agent_type,display_name,cwd,status,is_working,last_activity_at,notes,metadata) VALUES (?,?,?,?,?,?,?,?,?)',(native,'codex_cli',native,'/repo','active',0,'2026-09-15T12:00:00Z','',json.dumps(dict(hostName=host))))
             source.commit();source.close();db=connect(root/'spool.db')
             mapping={'verified':dict(hostId='m3',provider='codex',nativeSessionId='verified')}
             first=import_snapshot(snapshot,db,mapping,'m3')
@@ -39,6 +42,7 @@ class ImportTests(unittest.TestCase):
             mapping['unmapped']=dict(hostId='m3',provider='codex',nativeSessionId='unmapped')
             import_snapshot(snapshot,db,mapping,'m3');import_snapshot(snapshot,db,mapping,'m3')
             self.assertTrue(import_snapshot(snapshot,db,mapping,'m3')['complete'])
+            self.assertEqual(db.execute('SELECT count(*) FROM import_unmapped').fetchone()[0],0)
             self.assertEqual(db.execute('SELECT count(*) FROM pending').fetchone()[0],2)
             db.close()
 if __name__=='__main__':unittest.main()

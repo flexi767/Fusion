@@ -1,6 +1,6 @@
 # AgentPulse integration into Fusion
 
-Status: proposed implementation plan; no integration implemented.
+Status: implementation in progress on `codex/agentpulse-sessions`; see [durable progress](agentpulse-integration-progress.md). Parity and cutover gates remain open.
 Prepared: 2026-09-15.
 Baseline: Fusion fork `a58b374c7`, including upstream `6e6adf393`; AgentPulse fork `04f0dcf`.
 

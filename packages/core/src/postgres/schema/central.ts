@@ -14,6 +14,7 @@
  */
 
 import {
+  boolean,
   pgSchema,
   text,
   integer,
@@ -355,6 +356,9 @@ export const externalSessionTurns = centralSchema.table("external_session_turns"
 
 export const externalSessionDetails = centralSchema.table("external_session_details", {
   sessionId: text("session_id").primaryKey().references(() => externalSessions.id, { onDelete: "cascade" }),
+  importedMetadata: jsonb("imported_metadata").$type<import("../../external-sessions/imported-metadata.js").ImportedSessionMetadata>(),
+  archived: boolean("archived").notNull().default(false), pinned: boolean("pinned").notNull().default(false),
+  preferencesRevision: bigint("preferences_revision", { mode: "number" }).notNull().default(0),
   notes: text("notes").notNull().default(""), notesRevision: bigint("notes_revision", { mode: "number" }).notNull().default(0),
   summary: jsonb("summary").$type<{ text: string; at: string; firstTurn: string; lastTurn: string; coveredTurns: number; model: string }>(),
   summaryHash: text("summary_hash"), summaryLeaseUntil: text("summary_lease_until"), summaryRetryAt: text("summary_retry_at"),

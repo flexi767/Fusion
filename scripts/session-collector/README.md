@@ -63,7 +63,7 @@ python3 scripts/session-collector/import_agentpulse.py \
 
 Run once per host credential/spool. Import resumes by snapshot SHA-256, identity-map digest and phase/event cursor. It enqueues bounded deliveries; normal collector draining acknowledges
 them. Historical data never overwrites a live activity snapshot. Turn results use the newest native timestamp across live and imported data; an older partial backfill cannot replace a newer complete result. This
-importer handles session records, notes and collected turn-result events. Usage-only metadata and other AgentPulse event types still require the parity import extension.
+importer handles session records, notes, archived/pinned labels, model/branch/timestamps, reported session usage and collected turn-result events. Reported session totals are retained separately from turn-based accounting to avoid double counting. Other AgentPulse event types still require their mapped replacements.
 
 ## Optional feedback hook adapter
 
@@ -114,3 +114,10 @@ clear prior context; compacted context may shrink. Capacity stays unreported whe
 the native format does not provide it. Unsupported reported service tiers remain
 unpriced. Exact native event identities deduplicate retries while preserving
 repeated user steering with distinct event ids.
+
+Codex archived transcripts are discovered in the verified native
+`~/.codex/archived_sessions/*.jsonl` directory as well as live rollouts. Moving a
+transcript into that directory preserves its host/provider/native identity.
+AgentPulse archived/pinned labels remain independent of collector connectivity
+and agent activity, and importing a snapshot never overwrites operator-edited
+labels. Import v4 replays earlier checkpoints to add this preserved metadata.

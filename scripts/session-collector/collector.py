@@ -79,6 +79,8 @@ def discover(home):
     # Bounded provider-owned directory depths; includes old/resumed desktop rollouts.
     for path in (home / '.codex/sessions').glob('*/*/*/*.jsonl'):
         if path.is_file() and not path.is_symlink(): yield 'codex', path
+    for path in (home / '.codex/archived_sessions').glob('*.jsonl'):
+        if path.is_file() and not path.is_symlink(): yield 'codex', path
     for path in (home / '.claude/projects').glob('*/*.jsonl'):
         if path.is_file() and not path.is_symlink(): yield 'claude', path
 

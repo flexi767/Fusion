@@ -27,20 +27,20 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
     with snapshot.open('rb') as snapshot_file:
         digest=hashlib.file_digest(snapshot_file,'sha256').hexdigest()
     identity_digest=hashlib.sha256(json.dumps(identities,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-    db.executescript('''CREATE TABLE IF NOT EXISTS imports_v3(snapshot TEXT,host TEXT,identity_digest TEXT,phase TEXT,cursor INTEGER NOT NULL,PRIMARY KEY(snapshot,host));
+    db.executescript('''CREATE TABLE IF NOT EXISTS imports_v4(snapshot TEXT,host TEXT,identity_digest TEXT,phase TEXT,cursor INTEGER NOT NULL,PRIMARY KEY(snapshot,host));
       CREATE TABLE IF NOT EXISTS import_unmapped(snapshot TEXT,host TEXT,phase TEXT,row_id INTEGER,session_id TEXT,PRIMARY KEY(snapshot,host,phase,row_id));''')
-    position=db.execute('SELECT identity_digest,phase,cursor FROM imports_v3 WHERE snapshot=? AND host=?',(digest,host_id)).fetchone()
+    position=db.execute('SELECT identity_digest,phase,cursor FROM imports_v4 WHERE snapshot=? AND host=?',(digest,host_id)).fetchone()
     phase,cursor=(position[1],position[2]) if position and position[0]==identity_digest else ('sessions',0)
-    if position and position[0]!=identity_digest:
+    if not position or position[0]!=identity_digest:
         with db:db.execute('DELETE FROM import_unmapped WHERE snapshot=? AND host=?',(digest,host_id))
     def checkpoint(current_phase,row_id):
-        db.execute('INSERT OR REPLACE INTO imports_v3 VALUES (?,?,?,?,?)',(digest,host_id,identity_digest,current_phase,row_id))
+        db.execute('INSERT OR REPLACE INTO imports_v4 VALUES (?,?,?,?,?)',(digest,host_id,identity_digest,current_phase,row_id))
     def unresolved():
         return [row[0] for row in db.execute('SELECT DISTINCT session_id FROM import_unmapped WHERE snapshot=? AND host=? ORDER BY session_id',(digest,host_id))]
     report={'queued':0,'excludedHost':0,'unmapped':unresolved(),'snapshot':digest,'phase':phase,'cursor':cursor,'complete':phase=='done' and not unresolved()}
     if phase=='done':source.close();return report
     if phase=='sessions':
-        rows=source.execute('SELECT rowid event_id,session_id,agent_type,display_name,cwd,status,is_working,last_activity_at,notes,metadata FROM sessions WHERE rowid>? ORDER BY rowid LIMIT ?',(cursor,limit)).fetchall()
+        rows=source.execute('SELECT rowid event_id,session_id,agent_type,display_name,cwd,status,is_working,last_activity_at,notes,metadata,model,started_at,ended_at,git_branch,is_archived,is_pinned FROM sessions WHERE rowid>? ORDER BY rowid LIMIT ?',(cursor,limit)).fetchall()
     else:
         rows=source.execute("SELECT e.id event_id,e.session_id,e.raw_payload,s.agent_type,s.display_name,s.cwd,s.status,s.is_working,s.last_activity_at,s.metadata FROM events e JOIN sessions s ON s.session_id=e.session_id WHERE e.provider_event_type='agentpulse_turn_result' AND e.id>? ORDER BY e.id LIMIT ?",(cursor,limit)).fetchall()
     for row in rows:
@@ -62,6 +62,7 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
         if identity.get('hostId') != host_id:
             with db:checkpoint(phase,row['event_id'])
             report['excludedHost']+=1;continue
+        with db:db.execute('DELETE FROM import_unmapped WHERE snapshot=? AND host=? AND session_id=?',(digest,host_id,row['session_id']))
         turn=None
         if phase=='events':
             turn=json.loads(row['raw_payload']);turn['provenance']='agentpulse-import'
@@ -75,7 +76,11 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
             title=(row['display_name'] or Path(row['cwd'] or '/').name or 'Imported session')[:512],projectPath=row['cwd'] or '(historical project unavailable)')
         event_id=hashlib.sha256(f'{digest}:{phase}:{row["event_id"]}'.encode()).hexdigest()
         envelope=dict(version=1,eventId=event_id,collectorVersion='agentpulse-import-1',historical=True,observation=observation,turns=[turn] if turn else [])
-        if phase=='sessions' and row['notes']:envelope['importedNotes']=row['notes']
+        if phase=='sessions':
+            if row['notes']:envelope['importedNotes']=row['notes']
+            metadata=json.loads(row['metadata'] or '{}')
+            envelope['importedMetadata']=dict(snapshot=digest,sourceSessionId=row['session_id'],archived=bool(row['is_archived']),pinned=bool(row['is_pinned']),model=row['model'],
+                startedAt=timestamp(row['started_at']) if row['started_at'] else None,endedAt=timestamp(row['ended_at']) if row['ended_at'] else None,branch=row['git_branch'],usage=metadata.get('costUsage') or [])
         try:
             with db:
                 db.execute('BEGIN IMMEDIATE')

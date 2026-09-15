@@ -11,11 +11,12 @@ import "./SessionsView.css";
 export function SessionCard({ session, connected }: { session: ObservedSession; connected: boolean }) {
   const row = session.observation;
   return <article className="session-card" aria-label={`${session.hostId}: ${row.title}`}>
+    {(session.archived || session.pinned) && <p>{session.archived ? "Archived · " : ""}{session.pinned ? "Pinned" : ""}</p>}
     <h3><a href={`?view=sessions&session=${encodeURIComponent(session.id)}`}>{row.title}</a></h3>
     <p>{session.hostId} · {row.provider} · <strong>{row.activity}</strong> · {connected ? "Collector connected" : "Collector disconnected"}</p>
     <p>Last reported model: {row.telemetry?.model ?? "Unreported"} · Context: {row.telemetry?.contextTokens?.toLocaleString() ?? "Unreported"}{row.telemetry?.contextCapacity != null ? ` / ${row.telemetry.contextCapacity.toLocaleString()}` : " / capacity unreported"}</p>
     {row.telemetry && <p>Telemetry as of <time dateTime={row.telemetry.observedAt}>{new Date(row.telemetry.observedAt).toLocaleString()}</time>{row.telemetry.serviceTier ? ` · ${row.telemetry.serviceTier} service` : ""}</p>}
-    {session.usageSummary ? <SessionCostDetails label="Session cost and coverage" cost={{ ...session.usageSummary, coveredTurns: session.usageSummary.turns }} /> : <p>Cost unavailable · No collected usage total</p>}
+    {session.usageSummary ? <SessionCostDetails label="Session cost and coverage" cost={{ ...session.usageSummary, coveredTurns: session.usageSummary.turns }} /> : <p>Cost total unavailable</p>}
     <p className="session-project">{row.projectPath}</p>
     <p>Observed session · Last activity <time dateTime={row.observedAt}>{new Date(row.observedAt).toLocaleString()}</time></p>
     <details><summary>Session identity</summary><code>{row.nativeSessionId}</code></details>
@@ -31,13 +32,15 @@ function SessionList() {
   const [collectors, setCollectors] = useState<CollectorHealth[]>([]);
   const [host, setHost] = useState("");
   const [provider, setProvider] = useState("");
+  const [saved, setSaved] = useState("");
   const [activity, setActivity] = useState("");
   const [search, setSearch] = useState("");
   const [query, setQuery] = useState("");
-  const filters = { host, provider, activity, q: query };
+  const filters = { host, provider, activity, q: query, saved };
   return <ViewLayout header={<ViewHeader icon={Activity} title="Sessions" />}><div className="sessions-view">
     <p>Codex and Claude sessions across your hosts. Observing a session does not schedule a Fusion task.</p>
     <form className="sessions-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()); }}>
+      <label>Saved sessions<select value={saved} onChange={event => setSaved(event.target.value)}><option value="">All sessions</option><option value="archived">Archived</option><option value="pinned">Pinned</option></select></label>
       <label>Host<select value={host} onChange={e => setHost(e.target.value)}><option value="">All hosts</option>{collectors.map(c => <option key={c.hostId}>{c.hostId}</option>)}</select></label>
       <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
       <label>Activity<select value={activity} onChange={e => setActivity(e.target.value)}><option value="">All activity</option>{["working", "waiting", "completed", "error"].map(x => <option key={x}>{x}</option>)}</select></label>

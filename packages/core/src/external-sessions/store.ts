@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, lt, or, sql } from "drizzle-orm";
+import { and, getTableColumns, desc, eq, lt, or, sql } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import { externalSessions, externalSessionTurns, externalSessionDetails, sessionCollectors } from "../postgres/schema/central.js";
+import { parseImportedSessionMetadata } from "./imported-metadata.js";
 import { parseSessionTurn } from "./turn.js";
 import { redactSecrets } from "../secrets/redact-secrets.js";
 import { externalSessionKey, parseSessionObservation, type SessionObservation } from "./observation.js";
@@ -29,9 +30,10 @@ export class ExternalSessionStore {
       .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: now, diagnostics } });
   }
 
-  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false, importedNotes?: string) {
+  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false, importedNotes?: string, importedValue?: unknown) {
     if (!Array.isArray(turnValues) || turnValues.length > 25) throw new Error("Invalid turn batch");
     if (importedNotes !== undefined && (typeof importedNotes !== "string" || importedNotes.length > 32000)) throw new Error("Invalid imported notes");
+    const importedMetadata = historical && importedValue !== undefined ? parseImportedSessionMetadata(importedValue) : undefined;
     const turns = turnValues.map(parseSessionTurn);
     if (historical) for (const turn of turns) turn.provenance = "agentpulse-import";
     const observation = parseSessionObservation(value);
@@ -70,16 +72,23 @@ export class ExternalSessionStore {
         await tx.insert(externalSessionDetails).values({ sessionId: id, notes: redactSecrets(importedNotes), notesRevision: 1 })
           .onConflictDoUpdate({ target: externalSessionDetails.sessionId, set: { notes: redactSecrets(importedNotes), notesRevision: 1 }, setWhere: eq(externalSessionDetails.notesRevision, 0) });
       }
+      if (importedMetadata) {
+        await tx.insert(externalSessionDetails).values({ sessionId: id, importedMetadata, archived: importedMetadata.archived, pinned: importedMetadata.pinned })
+          .onConflictDoUpdate({ target: externalSessionDetails.sessionId, set: { importedMetadata,
+            archived: sql`CASE WHEN ${externalSessionDetails.preferencesRevision}=0 THEN ${importedMetadata.archived} ELSE ${externalSessionDetails.archived} END`,
+            pinned: sql`CASE WHEN ${externalSessionDetails.preferencesRevision}=0 THEN ${importedMetadata.pinned} ELSE ${externalSessionDetails.pinned} END` } });
+      }
       return { id, revision: current.revision, applied: applied.length > 0 };
     });
   }
 
-  async list(query: { hostId?: string; provider?: string; activity?: string; q?: string; before?: string; limit?: number } = {}) {
+  async list(query: { hostId?: string; provider?: string; activity?: string; q?: string; saved?: string; before?: string; limit?: number } = {}) {
     if (query.q && query.q.length > 256) throw new Error("Invalid session search");
     const search = query.q?.trim();
     const limit = Math.max(1, Math.min(100, query.limit ?? 50));
     const before = cursor(query.before);
-    const rows = await this.layer.db.select().from(externalSessions).where(and(
+    const rows = await this.layer.db.select({ ...getTableColumns(externalSessions), archived: externalSessionDetails.archived, pinned: externalSessionDetails.pinned }).from(externalSessions).leftJoin(externalSessionDetails, eq(externalSessionDetails.sessionId, externalSessions.id)).where(and(
+      query.saved === "archived" ? eq(externalSessionDetails.archived, true) : query.saved === "pinned" ? eq(externalSessionDetails.pinned, true) : undefined,
       query.hostId ? eq(externalSessions.hostId, query.hostId) : undefined,
       query.provider ? eq(externalSessions.provider, query.provider) : undefined,
       query.activity ? sql`${externalSessions.observation}->>'activity' = ${query.activity}` : undefined,
@@ -93,18 +102,42 @@ export class ExternalSessionStore {
     return { sessions: rows.slice(0, limit), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].receivedAt, rows[limit - 1].id) : null };
   }
 
+  async preferences(id: string, archived: boolean, pinned: boolean, expectedRevision: number) {
+    if (typeof archived !== "boolean" || typeof pinned !== "boolean" || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("Invalid session preferences");
+    return this.layer.db.transaction(async tx => {
+      await tx.insert(externalSessionDetails).values({ sessionId: id }).onConflictDoNothing();
+      const [row] = await tx.update(externalSessionDetails).set({ archived, pinned, preferencesRevision: expectedRevision + 1 })
+        .where(and(eq(externalSessionDetails.sessionId, id), eq(externalSessionDetails.preferencesRevision, expectedRevision))).returning();
+      if (!row) throw new Error("Session preferences revision conflict");
+      return row;
+    });
+  }
+
   async get(id: string) {
     const [row] = await this.layer.db.select().from(externalSessions).where(eq(externalSessions.id, id));
     return row ?? null;
   }
 
-  async turns(id: string, beforeValue?: string, requestedLimit = 20) {
+  async turn(sessionId: string, turnId: string) {
+    const [row] = await this.layer.db.select().from(externalSessionTurns).where(and(eq(externalSessionTurns.sessionId, sessionId), eq(externalSessionTurns.id, turnId)));
+    return row?.result ?? null;
+  }
+
+  async turns(id: string, beforeValue?: string, requestedLimit = 20, requestedBytes = 8 * 1024 * 1024) {
     const limit = Math.min(50, Math.max(1, requestedLimit));
     const before = cursor(beforeValue);
     const rows = await this.layer.db.select().from(externalSessionTurns).where(and(eq(externalSessionTurns.sessionId, id),
       before ? or(lt(externalSessionTurns.startedAt, before.at), and(eq(externalSessionTurns.startedAt, before.at), lt(externalSessionTurns.id, before.id))) : undefined))
       .orderBy(desc(externalSessionTurns.startedAt), desc(externalSessionTurns.id)).limit(limit + 1);
-    return { turns: rows.slice(0, limit).map(row => row.result), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].startedAt, rows[limit - 1].id) : null };
+    const selected = []; let bytes = 0;
+    const budget = Math.max(1, Math.min(8 * 1024 * 1024, requestedBytes));
+    for (const row of rows.slice(0, limit)) {
+      const size = Buffer.byteLength(JSON.stringify(row.result));
+      if (selected.length && bytes + size > budget) break;
+      selected.push(row); bytes += size;
+    }
+    const last = selected.at(-1);
+    return { turns: selected.map(row => row.result), nextCursor: last && rows.length > selected.length ? nextCursor(last.startedAt, last.id) : null };
   }
 
   async collectors() {

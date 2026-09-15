@@ -4,6 +4,14 @@ Session: **Fusion AgentPulse integration**. Updated 2026-09-15.
 Worktree: `/Users/v/dev/fusion-worktrees/agentpulse-sessions`.
 Branch: `codex/agentpulse-sessions`; plan baseline `801d03c84`; foundation `f435871bf`.
 
+## Current checkpoint
+
+- Native preview: **302 m3 sessions and 293 J sessions**, across Codex and Claude; discovery is rotating and remains incomplete. m5 is unreachable.
+- Historical audit: **70 of 95 source identities verified** (65 m3, 5 J). All **5,374 mapped source turns** delivered and reconciled: 5,319 exact normalized matches, 55 equal-or-newer native results, no missing/unexplained turns. Thirteen identities remain unresolved; twelve more source sessions are on m5.
+- Implemented: PostgreSQL ingestion/history, host authentication, durable collectors, Sessions UI, search, patches, model/context/cost cards, current-rate session/turn rankings and deep links, notes/archive metadata, command queue/opt-in feedback adapter and bounded Qwen summaries.
+- Pending: recorded/effective-dated rate history; Fusion-native linking/task-detail reuse; verified managed launch/stop/prompt adapters; unusually large history state spilling/retention; native-hook latency/control verification; remaining identities/m5; production rollout, 24-hour dual run and rollback rehearsal.
+- Branch only; latest completed commit before this slice is `d0e4c619d`. Push is blocked by unavailable GitHub credentials. AgentPulse services remain running; no main merge, release, model installation or new inference service.
+
 ## Verified deployment and source
 
 - J: live source `/home/ubuntu/agent-panels/agentpulse`, clean at full commit `04f0dcf42d700f60ea3848326ba6d43da80c7a40`, origin https://github.com/flexi767/agentpulse.git. MIT, copyright 2026 Jay Stuart. Read actual shared telemetry/results contracts, observer, and Python turn parser before adapting.
@@ -157,3 +165,13 @@ Symptom verification surfaces: live and historical ingestion, credential probes,
 - Native ids deduplicate repeated prompts/tool completions/patches across both providers; identical steering with distinct native ids is preserved. File-change deduplication is turn-scoped. Regression surfaces include restarts, coalescing, partial/malformed records, byte limits, same/different turn ids, model changes, compacted context and unknown capacities.
 - Verification: 25 Python tests, 6 observation tests, 8 PostgreSQL tests, 6 UI tests, 4 ingestion API tests and 3 pricing tests passed. Root lint has zero errors/four warnings. Serial `verify:fast` passed all 23 steps in 126.8 seconds. Real m3/J v2 passes and subsequent drains both report zero pending/rejected bytes, no parse errors and no resource pauses (300/299 discovered transcript files respectively). Desktop/mobile card output inspected in the browser.
 - Branch checkpoint `6a71fdf8a` could not push: GitHub HTTPS credentials remain unavailable. m5 still returns `No route to host`. Existing AgentPulse services are active and untouched. No hook, inference service, production configuration, release or main merge was performed.
+
+## Older-turn links, rankings and preserved archives (2026-09-15, 18:31 local)
+
+- Added direct lookup and shareable links to older turns, including the real 20-file reference. Browser verification at 390 pixels found the linked turn in view with all 20 files and no horizontal overflow. The shared renderer includes per-turn cost disclosure. History response pages have an 8 MiB budget and keep a valid continuation cursor.
+- Added individual-turn rankings using the same PostgreSQL usage aggregation, date/host/model filters and unknown-price rules as whole-session rankings. Large result sets refuse partial rankings instead of misrepresenting coverage.
+- Migration 0084 preserves imported model, branch, timestamps, archived/pinned labels and reported session usage. Labels have a separate optimistic revision; import replay cannot overwrite operator edits. Reported snapshot totals remain separate from turn analytics. Archive/pin filters and an editable detail panel use existing UI primitives.
+- Native directory audit found 78 Codex archived transcript files on m3 and verified three previously unresolved source identities there. Collector discovery now includes this actual native directory. Audited identities: m3 65/66 explicitly tagged source sessions; J all 5 tagged sessions. Missing evidence remains explicit.
+- Replayed importer v4 metadata and the expanded map through authenticated ingestion. m3: 4,982 source turns, 4,959 exact matches, 23 equal-or-newer native results; J: 392 source turns, 360 exact matches, 32 equal-or-newer native results. Both spools are empty with zero rejections, missing turns or unexplained mismatches. J's one archived source session is visible in Fusion; five other source archives remain on m5/unresolved identities.
+- Validation: 11 PostgreSQL tests, 9 UI tests and 25 Python tests pass. Root lint has zero errors/four control-regex warnings. Serial `verify:fast` passed all 23 steps in 209.1 seconds under peer memory load. Import bookkeeping now clears resolved identities across checkpoint-version upgrades; focused Python verification passed after that repair.
+- Surface enumeration: both provider/native directory layouts, equal/replayed/out-of-order history, bounded pages and direct lookup, session/turn rankings, zero/missing/unknown usage, archive/pin concurrent edits and reimport, desktop/mobile shared cards/detail, and unchanged independent activity/connectivity/task lifecycle.

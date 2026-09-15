@@ -17,7 +17,7 @@ it("keeps the search input mounted while typing and submits filters to all-histo
   expect(screen.getByRole("searchbox")).toBe(input);
   expect(fetchSessions).toHaveBeenCalledTimes(1);
   await user.click(screen.getByRole("button", { name: "Search", exact: true }));
-  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith(undefined, { host: "", provider: "", activity: "", q: "needle" }));
+  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith(undefined, { host: "", provider: "", activity: "", q: "needle", saved: "" }));
   expect(screen.getByRole("searchbox")).toBe(input);
 });
 it("calculates a disclosed UTC range and reports an empty usage result", async () => {
@@ -27,5 +27,5 @@ it("calculates a disclosed UTC range and reports an empty usage result", async (
   fireEvent.change(screen.getByLabelText("To (UTC)"), { target: { value: "2026-09-15" } });
   fireEvent.click(screen.getByRole("button", { name: "Calculate usage" }));
   await screen.findByText("No collected turns match this range.");
-  expect(fetchUsage).toHaveBeenCalledWith({ from: "2026-09-01T00:00:00.000Z", to: "2026-09-15T23:59:59.999Z", host: "", model: "" });
+  expect(fetchUsage).toHaveBeenCalledWith({ from: "2026-09-01T00:00:00.000Z", to: "2026-09-15T23:59:59.999Z", host: "", model: "", groupBy: "session" });
 });

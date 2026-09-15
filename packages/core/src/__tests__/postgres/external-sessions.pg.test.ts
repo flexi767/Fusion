@@ -81,6 +81,17 @@ pgDescribe("External session durable ingestion", () => {
     const result = await externalSessionAnalytics(h.layer(), { host: "m3" }, prices);
     expect((await externalSessionAnalytics(h.layer(), { sessionIds: [id] }, prices)).sessions.map(row => row.id)).toEqual([id]);
     expect((await externalSessionAnalytics(h.layer(), { sessionIds: [] }, prices)).sessions).toHaveLength(0);
+    const ranked = await externalSessionAnalytics(h.layer(), { sessionId: id, groupBy: "turn" }, prices);
+    expect(ranked.sessions).toHaveLength(4);
+    expect(ranked.sessions.find(row => row.turnId === "one")?.usd).toBeCloseTo(0.00022, 12);
+    expect(new Set(ranked.sessions.map(row => row.turnId)).size).toBe(4);
+    expect(await store.turn(id, "one")).toMatchObject({ id: "one" });
+    expect(await store.turn("another-session", "one")).toBeNull();
+    const smallPage = await store.turns(id, undefined, 20, 1);
+    expect(smallPage.turns).toHaveLength(1);
+    const nextPage = await store.turns(id, smallPage.nextCursor!, 20, 1);
+    expect(nextPage.turns).toHaveLength(1);
+    expect(nextPage.turns[0].id).not.toBe(smallPage.turns[0].id);
     expect(result.truncated).toBe(false);
     expect(result.sessions).toHaveLength(1);
     expect(result.sessions[0]).toMatchObject({ id, turns: 4, unreportedTurns: 1, unpricedRows: 1, requests: 3, inputTokens: null, outputTokens: 30 });
@@ -118,6 +129,19 @@ pgDescribe("External session durable ingestion", () => {
       expect((await store.turns(id)).turns[0]).toMatchObject({ response: "Repair failed", completedAt: complete.completedAt, files: [{ path: "../shared.ts", added: 1 }] });
       expect((await store.get(id))?.observation.activity).toBe("working");
     }
+  });
+
+  it("preserves archived snapshot metadata and never overwrites operator labels on replay", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const imported = { snapshot: "a".repeat(64), sourceSessionId: "old", archived: true, pinned: false, model: "fixture", usage: [] };
+    const { id } = await store.ingest("j", "import", observation, [], true, undefined, imported);
+    expect((await store.list({ saved: "archived" })).sessions.map(row => row.id)).toEqual([id]);
+    await store.preferences(id, false, true, 0);
+    await store.ingest("j", "import", observation, [], true, undefined, imported);
+    expect((await store.list({ saved: "archived" })).sessions).toHaveLength(0);
+    expect((await store.list({ saved: "pinned" })).sessions.map(row => row.id)).toEqual([id]);
+    await expect(store.preferences(id, true, false, 0)).rejects.toThrow("revision conflict");
+    expect((await store.get(id))?.observation.activity).toBe("working");
   });
 
 });
