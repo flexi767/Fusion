@@ -38,13 +38,16 @@ function SessionList() {
   const [activity, setActivity] = useState("");
   const [search, setSearch] = useState("");
   const [query, setQuery] = useState("");
-  const filters = { host, provider, activity, q: query, saved };
+  const [projectDraft, setProjectDraft] = useState("");
+  const [projectPath, setProjectPath] = useState("");
+  const filters = { host, provider, activity, q: query, saved, projectPath };
   return <ViewLayout header={<ViewHeader icon={Activity} title="Sessions" />}><div className="sessions-view">
     <p>Codex and Claude sessions across your hosts. Observing a session does not schedule a Fusion task.</p>
     <SessionLaunchPanel />
-    <form className="sessions-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()); }}>
+    <form className="sessions-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()); setProjectPath(projectDraft); }}>
       <label>Saved sessions<select value={saved} onChange={event => setSaved(event.target.value)}><option value="">All sessions</option><option value="archived">Archived</option><option value="pinned">Pinned</option></select></label>
       <label>Host<select value={host} onChange={e => setHost(e.target.value)}><option value="">All hosts</option>{collectors.map(c => <option key={c.hostId}>{c.hostId}</option>)}</select></label>
+      <label>Exact project path<input value={projectDraft} maxLength={4096} onChange={event => setProjectDraft(event.target.value)} placeholder="All projects" /></label>
       <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
       <label>Activity<select value={activity} onChange={e => setActivity(e.target.value)}><option value="">All activity</option>{["working", "waiting", "completed", "error"].map(x => <option key={x}>{x}</option>)}</select></label>
       <label>Search sessions and collected output<input type="search" maxLength={256} value={search} onChange={e => setSearch(e.target.value)} /></label>

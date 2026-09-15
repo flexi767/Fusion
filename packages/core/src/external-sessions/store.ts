@@ -97,7 +97,8 @@ export class ExternalSessionStore {
     });
   }
 
-  async list(query: { taskProjectId?: string; taskId?: string; hostId?: string; provider?: string; activity?: string; q?: string; saved?: string; before?: string; limit?: number } = {}) {
+  async list(query: { taskProjectId?: string; taskId?: string; hostId?: string; projectPath?: string; provider?: string; activity?: string; q?: string; saved?: string; before?: string; limit?: number } = {}) {
+    if (query.projectPath !== undefined && (typeof query.projectPath !== "string" || query.projectPath.length > 4096 || /[\u0000-\u001f]/u.test(query.projectPath))) throw new Error("Invalid project path filter");
     if (query.q && query.q.length > 256) throw new Error("Invalid session search");
     const search = query.q?.trim();
     const limit = Math.max(1, Math.min(100, query.limit ?? 50));
@@ -109,6 +110,7 @@ export class ExternalSessionStore {
       query.taskId ? eq(externalSessionDetails.taskId, query.taskId) : undefined,
       query.saved === "archived" ? eq(externalSessionDetails.archived, true) : query.saved === "pinned" ? eq(externalSessionDetails.pinned, true) : undefined,
       query.hostId ? eq(externalSessions.hostId, query.hostId) : undefined,
+      query.projectPath ? sql`${externalSessions.observation}->>'projectPath' = ${query.projectPath}` : undefined,
       query.provider ? eq(externalSessions.provider, query.provider) : undefined,
       query.activity ? sql`${externalSessions.observation}->>'activity' = ${query.activity}` : undefined,
       search ? sql`(jsonb_to_tsvector('simple', ${externalSessions.observation}, '["string"]'::jsonb) @@ plainto_tsquery('simple', ${search}) OR EXISTS (

@@ -13,9 +13,10 @@ function request(app: express.Express, method: string, path: string, options: { 
 const retentionPreview = vi.fn(); const retentionApply = vi.fn();
 const ingest = vi.fn();
 const heartbeat = vi.fn();
+const collectors = vi.fn(); const analytics = vi.fn();
 const linkTask = vi.fn(); const get = vi.fn(); const list = vi.fn(); const getTask = vi.fn();
 const launchQueue = vi.fn(); const launchList = vi.fn(); const launchAvailable = vi.fn(); const launchCancel = vi.fn();
-vi.mock("@fusion/core", () => ({ ExternalSessionRetention: class { preview = retentionPreview; apply = retentionApply; }, ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; },
+vi.mock("@fusion/core", () => ({ externalSessionAnalytics: (...args: unknown[]) => analytics(...args), ExternalSessionRetention: class { preview = retentionPreview; apply = retentionApply; }, ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; collectors = collectors; },
   ExternalSessionLaunches: class { queue = launchQueue; list = launchList; available = launchAvailable; cancel = launchCancel; } }));
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 function app() {
@@ -23,7 +24,7 @@ function app() {
   vi.stubEnv("FUSION_SESSION_COLLECTORS", JSON.stringify({ m3: createHash("sha256").update("collector-token").digest("hex") }));
   const app = express(); app.use(express.json()); app.use(createAuthMiddleware("dashboard-token"));
   const router = express.Router();
-  registerExternalSessionRoutes({ router, store: { getAsyncLayer: () => ({}) }, getScopedStore: async () => ({ getProjectId: () => "canonical-project", getTask }) } as unknown as ApiRoutesContext);
+  registerExternalSessionRoutes({ router, store: { getAsyncLayer: () => ({}), getGlobalSettingsStore: () => ({ getSettings: async () => ({}) }) }, getScopedStore: async () => ({ getProjectId: () => "canonical-project", getTask }) } as unknown as ApiRoutesContext);
   app.use("/api", router);
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(error instanceof ApiError ? error.statusCode : 500).json({ error: error instanceof Error ? error.message : "Failed" }));
   return app;
@@ -128,4 +129,15 @@ it("requires dashboard authentication and explicit bounded retention intent", as
   expect((await request(server, "POST", "/api/external-session-retention/apply", { headers, body: {} })).status).toBe(400);
   vi.stubEnv("FUSION_SESSIONS", "0");
   expect((await request(server, "POST", "/api/external-session-retention/preview", { headers, body: { retentionDays: 30 } })).status).toBe(404);
+});
+
+
+it("validates and forwards exact project filters through dashboard authentication", async () => {
+  const server = app(); vi.stubEnv("FUSION_SESSIONS", "1"); const headers = { Authorization: "Bearer dashboard-token" };
+  list.mockResolvedValue({ sessions: [], nextCursor: null }); collectors.mockResolvedValue([]); analytics.mockResolvedValue({ sessions: [] });
+  expect((await request(server, "GET", "/api/external-sessions?projectPath=%2Frepo%20with%20spaces&host=m3", { headers })).status).toBe(200);
+  expect(list).toHaveBeenCalledWith(expect.objectContaining({ projectPath: "/repo with spaces", hostId: "m3" }));
+  for (const query of ["projectPath=a&projectPath=b", "projectPath=bad%0Apath", `projectPath=${"x".repeat(4097)}`]) {
+    expect((await request(server, "GET", `/api/external-sessions?${query}`, { headers })).status).toBe(400);
+  }
 });

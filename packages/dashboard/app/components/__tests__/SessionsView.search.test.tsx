@@ -17,7 +17,7 @@ it("keeps the search input mounted while typing and submits filters to all-histo
   expect(screen.getByRole("searchbox")).toBe(input);
   expect(fetchSessions).toHaveBeenCalledTimes(1);
   await user.click(screen.getByRole("button", { name: "Search", exact: true }));
-  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith(undefined, { host: "", provider: "", activity: "", q: "needle", saved: "" }));
+  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith(undefined, { host: "", provider: "", activity: "", q: "needle", saved: "", projectPath: "" }));
   expect(screen.getByRole("searchbox")).toBe(input);
 });
 it("calculates a disclosed UTC range and reports an empty usage result", async () => {
@@ -28,4 +28,20 @@ it("calculates a disclosed UTC range and reports an empty usage result", async (
   fireEvent.click(screen.getByRole("button", { name: "Calculate usage" }));
   await screen.findByText("No collected turns match this range.");
   expect(fetchUsage).toHaveBeenCalledWith({ from: "2026-09-01T00:00:00.000Z", to: "2026-09-15T23:59:59.999Z", host: "", model: "", groupBy: "session", basis: "current" });
+});
+
+
+it("submits an exact project path with stable keyboard input and retains it for older pages", async () => {
+  const user = userEvent.setup();
+  fetchSessions.mockResolvedValue({ enabled: true, sessions: [], collectors: [], nextCursor: "older-page" });
+  render(<SessionsView />); await screen.findByText("No sessions match these filters.");
+  const input = screen.getByRole("textbox", { name: "Exact project path" });
+  await user.type(input, "/repo with spaces"); expect(screen.getByRole("textbox", { name: "Exact project path" })).toBe(input);
+  expect(fetchSessions).toHaveBeenCalledTimes(1);
+  await user.click(screen.getByRole("button", { name: "Search", exact: true }));
+  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith(undefined, expect.objectContaining({ projectPath: "/repo with spaces" })));
+  await user.click(screen.getByRole("button", { name: "Load more sessions" }));
+  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith("older-page", expect.objectContaining({ projectPath: "/repo with spaces" })));
+  await user.clear(input); await user.click(screen.getByRole("button", { name: "Search", exact: true }));
+  await waitFor(() => expect(fetchSessions).toHaveBeenLastCalledWith(undefined, expect.objectContaining({ projectPath: "" })));
 });

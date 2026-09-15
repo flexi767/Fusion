@@ -29,6 +29,22 @@ pgDescribe("External session durable ingestion", () => {
     expect((await store.collectors()).find(row => row.hostId === "m3")?.collectorVersion).toBe("test-2");
     expect((await store.list({ hostId: "m3" })).sessions.every(row => row.observation.activity === "working")).toBe(true);
   });
+  it("filters exact native project paths across hosts/providers without title matching or task enrollment", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    for (const host of ["m3", "m5", "j"]) for (const provider of ["codex", "claude"]) {
+      await store.ingest(host, "test", { ...observation, provider, projectPath: "/repo with spaces" });
+      await store.ingest(host, "test", { ...observation, provider, nativeSessionId: "other", title: "/repo with spaces", projectPath: "/repo with spaces/child" });
+    }
+    const first = await store.list({ projectPath: "/repo with spaces", limit: 3 });
+    const second = await store.list({ projectPath: "/repo with spaces", limit: 3, before: first.nextCursor! });
+    expect(new Set([...first.sessions, ...second.sessions].map(row => row.id)).size).toBe(6);
+    expect((await store.list({ projectPath: "/repo with spaces", hostId: "m5", provider: "claude" })).sessions).toHaveLength(1);
+    expect((await store.list({ projectPath: "/REPO with spaces" })).sessions).toHaveLength(0);
+    expect((await store.list({ projectPath: "" })).sessions).toHaveLength(12);
+    for (const projectPath of ["bad\npath", "x".repeat(4097)]) await expect(store.list({ projectPath })).rejects.toThrow("project path filter");
+    expect(await h.store().listTasks()).toHaveLength(0);
+  });
+
   it("commits history with its acknowledgement and rejects stale patches on replay", async () => {
     const store = new ExternalSessionStore(h.layer());
     const turn = { id: "t", startedAt: observation.observedAt, updatedAt: observation.observedAt, completedAt: null,

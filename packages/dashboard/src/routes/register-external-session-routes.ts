@@ -72,9 +72,10 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     if (process.env.FUSION_SESSIONS !== "1") return res.json({ enabled: false, sessions: [], collectors: [], nextCursor: null });
     if (req.query.capabilities === "1") return res.json({ enabled: true });
     const query = req.query;
-    if ([query.host, query.provider, query.activity, query.q, query.saved, query.before].some((v) => v !== undefined && typeof v !== "string")) throw new ApiError(400, "Invalid session filter");
+    if ([query.host, query.projectPath, query.provider, query.activity, query.q, query.saved, query.before].some((v) => v !== undefined && typeof v !== "string")) throw new ApiError(400, "Invalid session filter");
     if (typeof query.q === "string" && query.q.length > 256) throw new ApiError(400, "Invalid session search");
-    const result = await sessions().list({ saved: query.saved as string | undefined, activity: query.activity as string | undefined, q: query.q as string | undefined, hostId: query.host as string | undefined, provider: query.provider as string | undefined, before: query.before as string | undefined });
+    if (typeof query.projectPath === "string" && (query.projectPath.length > 4096 || /[\u0000-\u001f]/u.test(query.projectPath))) throw new ApiError(400, "Invalid project path filter");
+    const result = await sessions().list({ projectPath: query.projectPath as string | undefined, saved: query.saved as string | undefined, activity: query.activity as string | undefined, q: query.q as string | undefined, hostId: query.host as string | undefined, provider: query.provider as string | undefined, before: query.before as string | undefined });
     const settings = await store.getGlobalSettingsStore().getSettings();
     const totals = await externalSessionAnalytics(layer(), { sessionIds: result.sessions.map(row => row.id) }, settings.modelPricingOverrides);
     const costs = new Map(totals.sessions.map(row => [row.id, row]));

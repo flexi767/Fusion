@@ -17,7 +17,7 @@ export interface ObservedSession {
 }
 export interface CollectorHealth { hostId: string; lastHeartbeatAt: string | null; lastAcknowledgementAt: string | null; collectorVersion: string; diagnostics?: { liveLagSamples?: number; liveLagClockSkewSamples?: number; liveLagP95Ms?: number; liveLagMaxMs?: number; liveQueueP95Ms?: number; oldestLivePendingMs?: number; spoolDepth?: number; rejectedDeliveries?: number; discoveredFiles?: number; parserStateBytes?: number; spoolBytes?: number; resourcePaused?: boolean; parseError?: boolean; deliveryError?: boolean } }
 export interface SessionPage { enabled: boolean; sessions: ObservedSession[]; collectors: CollectorHealth[]; nextCursor: string | null }
-export interface SessionFilters { host?: string; provider?: string; activity?: string; q?: string; saved?: string }
+export interface SessionFilters { projectPath?: string; host?: string; provider?: string; activity?: string; q?: string; saved?: string }
 export const fetchExternalSessions = (before?: string, filters: SessionFilters = {}) => {
   const query = new URLSearchParams();
   if (before) query.set("before", before);
