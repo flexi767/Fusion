@@ -31,7 +31,9 @@ class ParserRetentionTests(unittest.TestCase):
         count=self.db.execute('SELECT records FROM parser_usage WHERE id=1').fetchone()[0]
         self.assertGreater(count,0);self.assertEqual(len(review(self.db,30,self.now)['files']),1)
         self.assertEqual(self.db.execute('SELECT records FROM parser_usage WHERE id=1').fetchone()[0],count)
+        native_bytes=self.path.read_bytes()
         result=prune(self.db,30,self.now);self.assertEqual(result['removedRecords'],count)
+        self.assertEqual(self.path.read_bytes(),native_bytes)
         self.assertEqual(self.db.execute('SELECT sum(revision) FROM revisions').fetchone()[0],before)
         self.assertFalse(scan_file(self.db,self.path,'codex'));self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],0)
         state=json.loads(self.db.execute('SELECT state FROM files').fetchone()[0]);self.assertEqual(state['parserRetained']['size'],self.path.stat().st_size)
@@ -53,6 +55,8 @@ class ParserRetentionTests(unittest.TestCase):
         with patch('parser_retention.MAX_RECORDS',0):self.assertEqual(review(self.db,30,self.now)['files'],[])
         with self.path.open('a') as stream:stream.write('{')
         self.age();self.assertEqual(review(self.db,30,self.now)['files'],[])
+        self.path.unlink();self.assertEqual(review(self.db,30,self.now)['files'],[])
+        self.assertGreater(self.db.execute('SELECT records FROM parser_usage WHERE id=1').fetchone()[0],0)
         for invalid in [0,3651,1.5,True]:
             with self.assertRaises(ValueError):review(self.db,invalid,self.now)
     def test_generation_upgrade_replays_a_retained_prefix(self):
