@@ -79,6 +79,8 @@ pgDescribe("External session durable ingestion", () => {
     await store.ingest("j", "test", observation, [turn]);
     const prices = { "openai:fixture": { inputPer1M: 2, cacheReadPer1M: 1, cacheWritePer1M: 3, outputPer1M: 4, source: "fixture" } };
     const result = await externalSessionAnalytics(h.layer(), { host: "m3" }, prices);
+    expect((await externalSessionAnalytics(h.layer(), { sessionIds: [id] }, prices)).sessions.map(row => row.id)).toEqual([id]);
+    expect((await externalSessionAnalytics(h.layer(), { sessionIds: [] }, prices)).sessions).toHaveLength(0);
     expect(result.truncated).toBe(false);
     expect(result.sessions).toHaveLength(1);
     expect(result.sessions[0]).toMatchObject({ id, turns: 4, unreportedTurns: 1, unpricedRows: 1, requests: 3, inputTokens: null, outputTokens: 30 });

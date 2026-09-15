@@ -62,7 +62,7 @@ python3 scripts/session-collector/import_agentpulse.py \
 ```
 
 Run once per host credential/spool. Import resumes by snapshot SHA-256, identity-map digest and phase/event cursor. It enqueues bounded deliveries; normal collector draining acknowledges
-them. Historical data never overwrites a live snapshot or a live turn. This
+them. Historical data never overwrites a live activity snapshot. Turn results use the newest native timestamp across live and imported data; an older partial backfill cannot replace a newer complete result. This
 importer handles session records, notes and collected turn-result events. Usage-only metadata and other AgentPulse event types still require the parity import extension.
 
 ## Optional feedback hook adapter
@@ -96,3 +96,21 @@ bounded two-second network budget and fail open when Fusion is unavailable.
 Rejected transcript deliveries remain in `pending` with a `rejection` HTTP status.
 Fix the rejected payload/parser before re-enabling a specific delivery; do not
 clear the whole spool. Permanent errors do not prevent other sessions draining.
+
+## Resource bounds and replay
+
+History state is capped at 8 MiB per transcript. Each delivery is capped at 1.5 MB;
+the durable queue is capped at 128 MiB with a 2 MiB live-update reserve and 5,000
+records. Byte accounting is maintained transactionally, including live coalescing
+and exact acknowledgements. A limit rolls back that file's checkpoint and reports
+`resourcePaused`; it never discards an unacknowledged record. A malformed complete
+line also preserves its cursor for repair. History rotates independently of the
+recent live scan, including when a large file is paused. Old transcripts stay the
+source of truth; state spilling/retention for unusually large histories remains
+a follow-up rather than silent eviction.
+
+Reported model/context metadata is separate from lifetime usage. Model changes
+clear prior context; compacted context may shrink. Capacity stays unreported when
+the native format does not provide it. Unsupported reported service tiers remain
+unpriced. Exact native event identities deduplicate retries while preserving
+repeated user steering with distinct event ids.

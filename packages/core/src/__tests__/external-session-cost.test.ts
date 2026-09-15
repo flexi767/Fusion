@@ -12,7 +12,7 @@ it("prices inclusive inputs exactly once and never adds reasoning to output", ()
 });
 it("unknown and unsupported rates or incomplete telemetry stay visibly unpriced", () => {
   expect(priceSessionUsage("codex", usage).usd).toBeNull();
-  for (const patch of [{ fast: true }, { longContext: true }, { cacheWriteHourTokens: 1 }, { inputTokens: null }, { inputTokens: 1 }]) {
+  for (const patch of [{ serviceTier: "unrecognized" }, { fast: true }, { longContext: true }, { cacheWriteHourTokens: 1 }, { inputTokens: null }, { inputTokens: 1 }]) {
     expect(priceSessionUsage("codex", { ...usage, ...patch }, { "openai:fixture": rates }).usd).toBeNull();
   }
 });

@@ -10,12 +10,39 @@ import time
 import urllib.request
 import urllib.error
 import uuid
-from turn_parser import consume
+from turn_parser import consume, known, total
 
-VERSION = "fusion-native-1"
+VERSION = "fusion-native-2"
+PARSER_VERSION = 2
 MAX_READ = 1024 * 1024
 MAX_LINE = 4 * MAX_READ
 LIVE_TAIL = 256 * 1024
+MAX_PARSER_STATE = 8 * 1024 * 1024
+MAX_PENDING_BYTES = 128 * 1024 * 1024
+LIVE_RESERVE_BYTES = 2 * 1024 * 1024
+MAX_DELIVERY_BYTES = 1_500_000
+
+
+class CollectionCapacityError(ValueError):
+    pass
+
+
+def enqueue(db, envelope, live_key=None):
+    body = json.dumps(envelope)
+    size = len(body.encode('utf-8'))
+    if size > MAX_DELIVERY_BYTES: raise CollectionCapacityError('Delivery exceeds byte limit')
+    count, stored = db.execute('SELECT records,bytes FROM spool_usage WHERE id=1').fetchone()
+    previous = db.execute('SELECT length(CAST(body AS BLOB)) FROM pending WHERE live_key=?',(live_key,)).fetchone() if live_key else None
+    budget = MAX_PENDING_BYTES + (LIVE_RESERVE_BYTES if live_key else 0)
+    if (count >= 5000 and not previous) or stored - (previous[0] if previous else 0) + size > budget:
+        raise CollectionCapacityError('Durable spool capacity reached')
+    db.execute('INSERT INTO pending(event_id,body,live_key,priority) VALUES (?,?,?,?) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,rejection=NULL,retry_after=0',
+        (envelope['eventId'], body, live_key, 1 if live_key else 0))
+
+
+def capacity_pause(db, path, reason):
+    with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('capacity:'+str(path), str(reason)))
+
 
 
 def connect(path, timeout=5):
@@ -37,6 +64,13 @@ def connect(path, timeout=5):
     if 'live_key' not in columns: db.execute('ALTER TABLE pending ADD COLUMN live_key TEXT')
     if 'priority' not in columns: db.execute('ALTER TABLE pending ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
     db.execute('CREATE UNIQUE INDEX IF NOT EXISTS pending_live_key ON pending(live_key)')
+    db.executescript("""
+      CREATE TABLE IF NOT EXISTS spool_usage(id INTEGER PRIMARY KEY,records INTEGER NOT NULL,bytes INTEGER NOT NULL);
+      INSERT OR IGNORE INTO spool_usage SELECT 1,count(*),coalesce(sum(length(CAST(body AS BLOB))),0) FROM pending;
+      CREATE TRIGGER IF NOT EXISTS spool_insert AFTER INSERT ON pending BEGIN UPDATE spool_usage SET records=records+1,bytes=bytes+length(CAST(new.body AS BLOB)) WHERE id=1; END;
+      CREATE TRIGGER IF NOT EXISTS spool_delete AFTER DELETE ON pending BEGIN UPDATE spool_usage SET records=records-1,bytes=bytes-length(CAST(old.body AS BLOB)) WHERE id=1; END;
+      CREATE TRIGGER IF NOT EXISTS spool_update AFTER UPDATE OF body ON pending BEGIN UPDATE spool_usage SET bytes=bytes+length(CAST(new.body AS BLOB))-length(CAST(old.body AS BLOB)) WHERE id=1; END;
+    """)
     db.commit()
     return db
 
@@ -58,6 +92,7 @@ def apply(state, event, provider):
     if not isinstance(event, dict): return False
     at = event.get('timestamp')
     if not isinstance(at, str): return False
+    if state.get('observedAt') and at < state['observedAt']: return False
     p = event.get('payload') or {}
     if not isinstance(p, dict): return False
     kind, sub = event.get('type'), p.get('type')
@@ -78,6 +113,22 @@ def apply(state, event, provider):
         blocks = message.get('content') or []
         state['activity'] = 'working' if any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in blocks) else 'waiting'
     if provider == 'claude' and kind == 'system' and event.get('subtype') == 'turn_duration': state['activity'] = 'waiting'
+    telemetry = state.setdefault('telemetry', dict(model=None, contextTokens=None, contextCapacity=None, serviceTier=None, observedAt=at))
+    if provider == 'codex' and kind == 'turn_context':
+        if p.get('model') != telemetry['model']:
+            telemetry.update(contextTokens=None, contextCapacity=None)
+        telemetry.update(model=p.get('model'), serviceTier=p.get('service_tier'), observedAt=at)
+    if provider == 'codex' and sub == 'token_count':
+        info = p.get('info') or {}; usage = info.get('last_token_usage') or {}
+        telemetry.update(contextTokens=known(usage.get('input_tokens')), contextCapacity=known(info.get('model_context_window')), observedAt=at)
+    if provider == 'claude' and kind == 'assistant':
+        usage = message.get('usage') or {}
+        telemetry.update(model=message.get('model'), contextTokens=total(known(usage.get('input_tokens')), known(usage.get('cache_read_input_tokens')), known(usage.get('cache_creation_input_tokens'))), contextCapacity=None, serviceTier=usage.get('speed'), observedAt=at)
+    if provider == 'codex' and sub == 'item_completed':
+        item = p.get('item') or {}
+        if item.get('type') == 'UserMessage':
+            value = text(item.get('content'))
+            if value: state['title'] = ' '.join(value.split())[:512]; state['activity'] = 'working'
     state['observedAt'] = at
     state.setdefault('title', Path(state['projectPath']).name or 'External session')
     state.setdefault('activity', 'waiting')
@@ -85,10 +136,17 @@ def apply(state, event, provider):
 
 
 def scan_live(db, path, provider):
+    try:
+        _scan_live(db, path, provider)
+        with db: db.execute('DELETE FROM health WHERE key=?', ('capacity:live:'+str(path),))
+    except CollectionCapacityError as error: capacity_pause(db, 'live:'+str(path), error)
+
+
+def _scan_live(db, path, provider):
     stat=path.stat();inode=f'{stat.st_dev}:{stat.st_ino}'
     old=db.execute('SELECT inode,offset,state FROM live_files WHERE path=?',(str(path),)).fetchone()
     state=json.loads(old[2]) if old and old[0]==inode else {}
-    if old and old[0]==inode and old[1]==stat.st_size:return
+    if old and old[0]==inode and old[1]==stat.st_size and state.get('telemetry'):return
     chunks=[]
     with path.open('rb') as stream:
         if not state:
@@ -112,18 +170,30 @@ def scan_live(db, path, provider):
         identity=json.dumps([provider,state['nativeSessionId']])
         db.execute('INSERT INTO revisions VALUES (?,1) ON CONFLICT(identity) DO UPDATE SET revision=revision+1',(identity,))
         revision=db.execute('SELECT revision FROM revisions WHERE identity=?',(identity,)).fetchone()[0]
-        observation={k:state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity')}
+        observation={k:state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity','telemetry') if k in state}
         observation.update(version=1,provider=provider,revision=revision)
-        event_id=str(uuid.uuid4());body=json.dumps(dict(version=1,eventId=event_id,collectorVersion=VERSION,observation=observation))
-        db.execute('INSERT INTO pending(event_id,body,live_key,priority) VALUES (?,?,?,1) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,rejection=NULL,retry_after=0',(event_id,body,identity))
+        event_id=str(uuid.uuid4())
+        enqueue(db, dict(version=1,eventId=event_id,collectorVersion=VERSION,observation=observation), identity)
         db.execute('INSERT OR REPLACE INTO live_files VALUES (?,?,?,?)',(str(path),inode,end,json.dumps(state)))
 
 
 def scan_file(db, path, provider, max_pending=5000):
-    if db.execute('SELECT COUNT(*) FROM pending').fetchone()[0] >= max_pending: return False
+    try:
+        result = _scan_file(db, path, provider, max_pending)
+        with db: db.execute('DELETE FROM health WHERE key=?', ('capacity:'+str(path),))
+        return result
+    except CollectionCapacityError as error:
+        capacity_pause(db, path, error)
+        return False
+
+
+def _scan_file(db, path, provider, max_pending=5000):
+    if db.execute('SELECT COUNT(*) FROM pending').fetchone()[0] >= max_pending: raise CollectionCapacityError('Durable spool record limit reached')
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
     old = db.execute('SELECT inode,offset,state FROM files WHERE path=?', (str(path),)).fetchone()
     offset, state = (old[1], json.loads(old[2])) if old and old[0] == inode and old[1] <= stat.st_size else (0, {})
+    if state and state.get('parserVersion') != PARSER_VERSION: offset,state=0,{}
+    state['parserVersion']=PARSER_VERSION
     if offset == stat.st_size and not state.get("turnsState", {}).get("changed"): return False
     with path.open('rb') as stream:
         stream.seek(offset); data = stream.read(MAX_READ)
@@ -139,15 +209,21 @@ def scan_file(db, path, provider, max_pending=5000):
         return False
     changed = False
     for raw in data[:end].splitlines():
+        if len(raw) > MAX_LINE:
+            capacity_pause(db, path, 'Native record exceeds byte limit; cursor preserved')
+            raise CollectionCapacityError('Native record exceeds byte limit; cursor preserved')
         try: event = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
-            with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Malformed complete native record in '+str(path)))
-            continue
+            with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Malformed complete native record; cursor paused in '+str(path)))
+            return False
         try:
             changed = apply(state, event, provider) or changed
             consume(state.setdefault('turnsState', {}), event, 'claude_code' if provider == 'claude' else 'codex_cli')
         except (TypeError, ValueError, AttributeError):
-            with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Unsupported native record in '+str(path)))
+            with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Unsupported native record; cursor paused in '+str(path)))
+            return False
+    if len(json.dumps(state).encode('utf-8')) > MAX_PARSER_STATE:
+        raise CollectionCapacityError('Parser state limit reached; history cursor preserved')
     with db:
         turns_state = state.get('turnsState', {})
         changed_ids = turns_state.get('changed', [])[:25]
@@ -160,7 +236,7 @@ def scan_file(db, path, provider, max_pending=5000):
                 db.execute('INSERT INTO revisions VALUES (?,1) ON CONFLICT(identity) DO UPDATE SET revision=revision+1', (identity,))
                 revision = db.execute('SELECT revision FROM revisions WHERE identity=?', (identity,)).fetchone()[0]
                 event_id = str(uuid.uuid4())
-                observation = {k: live_state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity')}
+                observation = {k: live_state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity','telemetry') if k in live_state}
                 observation.update(version=1, provider=provider, revision=revision)
                 envelope = dict(version=1, eventId=event_id, collectorVersion=VERSION, observation=observation)
                 if turn_id is not None:
@@ -172,7 +248,7 @@ def scan_file(db, path, provider, max_pending=5000):
                             try: file['path'] = str(path_value.relative_to(state['projectPath']))
                             except ValueError: pass
                     envelope['turns'] = [result]
-                db.execute('INSERT INTO pending(event_id,body) VALUES (?,?)', (event_id, json.dumps(envelope)))
+                enqueue(db, envelope)
             turns_state['changed'] = [tid for tid in turns_state.get('changed', []) if tid not in changed_ids]
         db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?)', (str(path), inode, offset+end, json.dumps(state)))
     return True
@@ -222,6 +298,8 @@ def diagnostics(db):
         rejectedDeliveries=db.execute('SELECT count(*) FROM pending WHERE rejection IS NOT NULL').fetchone()[0],
         discoveredFiles=db.execute('SELECT count(*) FROM live_files').fetchone()[0],
         parserStateBytes=db.execute('SELECT coalesce(sum(length(state)),0) FROM files').fetchone()[0],
+        resourcePaused=bool(db.execute("SELECT 1 FROM health WHERE key LIKE 'capacity:%'").fetchone()),
+        spoolBytes=db.execute('SELECT bytes FROM spool_usage WHERE id=1').fetchone()[0],
         parseError=bool(db.execute("SELECT 1 FROM health WHERE key IN ('parse_error','scan_error')").fetchone()),
         deliveryError=bool(db.execute("SELECT 1 FROM health WHERE key='delivery_error'").fetchone()))
 
@@ -260,15 +338,20 @@ def main():
                     with db:db.execute('INSERT OR REPLACE INTO health VALUES (?,?)',('scan_error',type(error).__name__+': '+str(path)))
             # Discovery/live tail and history have independent cursors. Backfill cannot hide live sessions.
             budget=8*MAX_READ
-            for provider,path in selected:
-                if budget<=0:break
+            saved=db.execute("SELECT value FROM health WHERE key='history_cursor'").fetchone()
+            history_cursor=int(saved[0]) if saved else 0
+            visited=0
+            while files and budget>0 and visited<min(200,len(files)):
+                provider,path=files[history_cursor % len(files)]
+                history_cursor=(history_cursor+1) % len(files);visited+=1
                 previous=db.execute('SELECT offset FROM files WHERE path=?',(str(path),)).fetchone()
                 size=max(0,path.stat().st_size-(previous[0] if previous else 0))
-                try:
-                    if scan_file(db,path,provider,max_pending=4500):budget-=min(size,MAX_READ)
+                # Failed/paused work consumes a budget too; one oversized history cannot monopolize discovery.
+                budget-=max(65536,min(size,MAX_READ))
+                try:scan_file(db,path,provider,max_pending=4500)
                 except (OSError,ValueError,TypeError,KeyError) as error:
                     with db:db.execute('INSERT OR REPLACE INTO health VALUES (?,?)',('parse_error',type(error).__name__+': '+str(path)))
-                    budget-=MAX_READ
+            with db:db.execute("INSERT OR REPLACE INTO health VALUES ('history_cursor',?)",(str(history_cursor),))
             with db:db.execute("INSERT OR REPLACE INTO health VALUES ('scan_cursor',?)",(str(cursor+100),))
             # Verify the server credential before sending any session data.
             hello=dict(version=1,eventId=str(uuid.uuid4()),collectorVersion=VERSION,probe=True)

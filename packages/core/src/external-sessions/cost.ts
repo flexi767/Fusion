@@ -10,7 +10,7 @@ export interface SessionUsageCost {
 /** Both adapters expose inclusive input; reasoning stays within output. Never infer tier/TTL prices. */
 export function priceSessionUsage(provider: string, usage: SessionModelUsage, overrides?: ModelPricingOverrides): SessionUsageCost {
   const result: SessionUsageCost = { model: usage.model, usd: null, reason: null, lines: [], source: null, effectiveDate: pricingAsOf, calculation: "current-rates-estimate" };
-  if (usage.fast || usage.longContext || (usage.cacheWriteHourTokens ?? 0) > 0) return { ...result, reason: "Unsupported tier, context band or cache lifetime" };
+  if ((usage.serviceTier && !["standard", "default"].includes(usage.serviceTier)) || usage.fast || usage.longContext || (usage.cacheWriteHourTokens ?? 0) > 0) return { ...result, reason: "Unsupported tier, context band or cache lifetime" };
   const { inputTokens: input, cachedInputTokens: read, cacheWriteTokens: write, outputTokens: output } = usage;
   if (input === null || read === null || write === null || output === null) return { ...result, reason: "Missing token categories" };
   if (provider === "claude" && write > 0 && usage.cacheWriteHourTokens === null) return { ...result, reason: "Cache lifetime unreported" };

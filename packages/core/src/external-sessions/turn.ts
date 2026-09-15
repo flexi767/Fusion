@@ -1,6 +1,7 @@
 import { redactSecrets } from "../secrets/redact-secrets.js";
 
 export interface SessionModelUsage {
+  serviceTier?: string | null;
   model: string; inputTokens: number | null; cachedInputTokens: number | null;
   cacheWriteTokens: number | null; cacheWriteHourTokens: number | null;
   outputTokens: number | null; reasoningTokens: number | null;
@@ -50,7 +51,7 @@ export function parseSessionTurn(value: unknown): SessionTurn {
     }),
     usage: r.usage.map(value => {
       const u = record(value);
-      return { model: text(u.model, 256), inputTokens: count(u.inputTokens), cachedInputTokens: count(u.cachedInputTokens), cacheWriteTokens: count(u.cacheWriteTokens),
+      return { ...(u.serviceTier === undefined ? {} : { serviceTier: u.serviceTier === null ? null : text(u.serviceTier, 64) }), model: text(u.model, 256), inputTokens: count(u.inputTokens), cachedInputTokens: count(u.cachedInputTokens), cacheWriteTokens: count(u.cacheWriteTokens),
         cacheWriteHourTokens: count(u.cacheWriteHourTokens), outputTokens: count(u.outputTokens), reasoningTokens: count(u.reasoningTokens), requests: count(u.requests),
         contextTokens: count(u.contextTokens), longContext: u.longContext === true, fast: u.fast === true };
     }),

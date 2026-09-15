@@ -42,14 +42,14 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
         const health: Record<string, number | boolean> = {};
         if (diagnostics !== undefined) {
           if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return res.status(400).json({ error: "Invalid collector diagnostics" });
-          for (const field of ["spoolDepth", "rejectedDeliveries", "discoveredFiles", "parserStateBytes"]) {
+          for (const field of ["spoolDepth", "rejectedDeliveries", "discoveredFiles", "parserStateBytes", "spoolBytes"]) {
             const value = diagnostics[field];
             if (value !== undefined) {
               if (!Number.isSafeInteger(value) || value < 0) return res.status(400).json({ error: "Invalid collector diagnostics" });
               health[field] = value;
             }
           }
-          for (const field of ["parseError", "deliveryError"]) if (typeof diagnostics[field] === "boolean") health[field] = diagnostics[field];
+          for (const field of ["parseError", "deliveryError", "resourcePaused"]) if (typeof diagnostics[field] === "boolean") health[field] = diagnostics[field];
         }
         await sessions().heartbeat(hostId, collectorVersion, undefined, health);
         return res.json({ eventId, hostId, acknowledged: true });
@@ -71,7 +71,10 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     if ([query.host, query.provider, query.activity, query.q, query.before].some((v) => v !== undefined && typeof v !== "string")) throw new ApiError(400, "Invalid session filter");
     if (typeof query.q === "string" && query.q.length > 256) throw new ApiError(400, "Invalid session search");
     const result = await sessions().list({ activity: query.activity as string | undefined, q: query.q as string | undefined, hostId: query.host as string | undefined, provider: query.provider as string | undefined, before: query.before as string | undefined });
-    res.json({ enabled: true, ...result, collectors: await sessions().collectors() });
+    const settings = await store.getGlobalSettingsStore().getSettings();
+    const totals = await externalSessionAnalytics(layer(), { sessionIds: result.sessions.map(row => row.id) }, settings.modelPricingOverrides);
+    const costs = new Map(totals.sessions.map(row => [row.id, row]));
+    res.json({ enabled: true, ...result, sessions: result.sessions.map(row => ({ ...row, usageSummary: costs.get(row.id) ?? null })), collectors: await sessions().collectors() });
   });
   router.get("/external-session-usage", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");

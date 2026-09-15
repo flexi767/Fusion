@@ -3,6 +3,8 @@
 #!/usr/bin/env python3
 """Incremental native turn results; never inspect a shared checkout for attribution."""
 import difflib
+import hashlib
+import json
 
 FIELDS = {'inputTokens':'input_tokens','cachedInputTokens':'cached_input_tokens','cacheWriteTokens':'cache_write_input_tokens','outputTokens':'output_tokens','reasoningTokens':'reasoning_output_tokens'}
 def known(v): return v if isinstance(v,int) and not isinstance(v,bool) and 0<=v<=9007199254740991 else None
@@ -24,12 +26,19 @@ def consume(state,e,agent):
         state['active']=tid; r=turns[tid]; r['updatedAt']=at
         if tid not in changed: changed.append(tid)
         return r
-    def prompt(value,tid=None):
+    def event_key(native=None):
+        return str(native) if native is not None else hashlib.sha256(json.dumps(e,sort_keys=True).encode()).hexdigest()
+    def prompt(value,tid=None,key=None):
         if not value.strip(): return
+        seen=state.setdefault('promptEvents',{})
+        key=key or event_key(e.get('uuid') or p.get('id'))
+        if key in seen:return
+        seen[key]=True
         r=turn(tid)
-        if value not in r['prompts']: r['prompts'].append(value[:65536])
+        r['prompts'].append(value[:65536])
     def edit(r,path,diff,key):
         seen=state.setdefault('edits',{})
+        key=r['id']+':'+str(key)
         if key in seen: return
         seen[key]=True
         f=next((f for f in r['files'] if f['path']==path),None)
@@ -41,7 +50,7 @@ def consume(state,e,agent):
         combined=f['diff']+'\n'+diff
         f['truncated']=f['truncated'] or len(combined)>65536;f['diff']=combined[:65536]
     if kind=='turn_context':
-        state['model']=p.get('model') or state.get('model');state['fast']=p.get('service_tier') in ('fast','priority');return
+        state['model']=p.get('model') or state.get('model');state['serviceTier']=p.get('service_tier');state['fast']=p.get('service_tier') in ('fast','priority');return
     if kind=='event_msg' and sub=='task_started': turn(p.get('turn_id'));return
     if kind=='event_msg' and sub in ('task_complete','task_completed','turn_aborted'):
         r=turn(p.get('turn_id'));r['completedAt']=at
@@ -59,7 +68,7 @@ def consume(state,e,agent):
         if typ=='UserMessage':
             native=state.setdefault('nativePrompts',{})
             if not native.get(r['id']):r['prompts']=[];native[r['id']]=True
-            prompt(text(i.get('content')),r['id'])
+            prompt(text(i.get('content')),r['id'],key='native:'+r['id']+':'+event_key(i.get('id')))
         elif typ=='AgentMessage' and i.get('phase')=='final':r['response']=text(i.get('content'))[:131072]
         elif typ=='FileChange':
             changes=i.get('changes') or {}
@@ -70,14 +79,17 @@ def consume(state,e,agent):
                         if not diff and isinstance(c.get('content'),str):
                             prefix='-' if c.get('type')=='delete' else '+'
                             diff=f'--- {path}\n+++ {path}\n'+''.join(prefix+line+'\n' for line in c['content'].splitlines())
-                        edit(r,path,diff,str(i.get('id'))+path)
-        elif typ in ('CommandExecution','McpToolCall'):r['toolCalls']+=1
+                        edit(r,path,diff,event_key(i.get('id'))+':'+path)
+        elif typ in ('CommandExecution','McpToolCall'):
+            key=r['id']+':'+event_key(i.get('id'))
+            seen=state.setdefault('toolEvents',{})
+            if key not in seen:r['toolCalls']+=1;seen[key]=True
         return
     if kind=='token_usage_record':
         tid=p.get('turn_id') or state.get('active');r=turn(tid)
-        key=p.get('response_id') or str(e.get('ordinal'))
+        key=str(tid)+':'+event_key(p.get('response_id') or e.get('ordinal'))
         u=p.get('usage') or {};req={k:known(u.get(v)) for k,v in FIELDS.items()};req['cacheWriteTokens']=0
-        req.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(u.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':known(u.get('input_tokens')),'requests':1,'turn':tid})
+        req.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(u.get('input_tokens'))>272000,'fast':state.get('fast',False),'serviceTier':state.get('serviceTier'),'contextTokens':known(u.get('input_tokens')),'requests':1,'turn':tid})
         previous=state.setdefault('requests',{}).get(key)
         if previous:
             for k in FIELDS:req[k]=maximum(req[k],previous[k])
@@ -90,7 +102,7 @@ def consume(state,e,agent):
         delta={k:(max(0,u[v]-num(prev.get(v))) if known(u.get(v)) is not None else None) for k,v in FIELDS.items()}
         delta['cacheWriteTokens']=0
         if not any(value for value in delta.values() if value is not None):return
-        r=turn();last=info.get('last_token_usage') or {};delta.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(last.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':known(last.get('input_tokens')),'requests':1,'turn':r['id']})
+        r=turn();last=info.get('last_token_usage') or {};delta.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(last.get('input_tokens'))>272000,'fast':state.get('fast',False),'serviceTier':state.get('serviceTier'),'contextTokens':known(last.get('input_tokens')),'requests':1,'turn':r['id']})
         state.setdefault('fallback',{}).setdefault(r['id'],[]).append(delta);rebuild_usage(state,r);return
     if agent!='claude_code':return
     m=e.get('message') or {}
@@ -98,7 +110,7 @@ def consume(state,e,agent):
     content=m.get('content') or []
     if kind=='user':
         value=text(content)
-        if value and not e.get('isMeta'):
+        if value and not e.get('isMeta') and event_key(e.get('uuid')) not in state.get('promptEvents',{}):
             # User steering belongs to the active unfinished turn.
             active=turns.get(state.get('active'))
             if not active or active['completedAt']:state['active']=e.get('uuid') or 'claude:'+at
@@ -131,8 +143,8 @@ def consume(state,e,agent):
                 state['calls'][b.get('id')]={'name':b.get('name'),'input':b.get('input') or {},'turn':r['id']}
         u=m.get('usage')
         if isinstance(u,dict):
-            key=m.get('id') or e.get('uuid');cr=known(u.get('cache_read_input_tokens'));cw=known(u.get('cache_creation_input_tokens'));cache=u.get('cache_creation') or {};inclusive=total(known(u.get('input_tokens')),cr,cw)
-            req={'inputTokens':inclusive,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':known(cache.get('ephemeral_1h_input_tokens')) if cw != 0 else 0,'outputTokens':known(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'contextTokens':inclusive,'fast':u.get('speed')=='fast','longContext':(inclusive or 0)>200000}
+            key=r['id']+':'+event_key(m.get('id') or e.get('uuid'));cr=known(u.get('cache_read_input_tokens'));cw=known(u.get('cache_creation_input_tokens'));cache=u.get('cache_creation') or {};inclusive=total(known(u.get('input_tokens')),cr,cw)
+            req={'inputTokens':inclusive,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':known(cache.get('ephemeral_1h_input_tokens')) if cw != 0 else 0,'outputTokens':known(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'contextTokens':inclusive,'fast':u.get('speed')=='fast','serviceTier':u.get('speed'),'longContext':(inclusive or 0)>200000}
             prev=state.setdefault('requests',{}).get(key)
             if prev:
                 for k in FIELDS:req[k]=maximum(req[k],prev[k])
@@ -151,7 +163,7 @@ def rebuild_usage(state,r):
     if not reqs:reqs=state.get('fallback',{}).get(r['id'],[])
     grouped={}
     for u in reqs:
-        key=(u['model'],u['longContext'],u['fast'])
+        key=(u['model'],u['longContext'],u['fast'],u.get('serviceTier'))
         if key not in grouped:grouped[key]={k:v for k,v in u.items() if k!='turn'}
         else:
             g=grouped[key]

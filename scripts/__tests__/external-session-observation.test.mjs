@@ -34,3 +34,13 @@ test("disconnection does not invent a terminal activity", () => {
   assert.equal(collectorConnection(null, Date.now()), "disconnected");
   assert.equal(row.activity, "working");
 });
+
+test("reported telemetry preserves unknowns, validates counters and cannot grant capabilities", () => {
+  const telemetry = { model: "fixture", contextTokens: 0, contextCapacity: null, serviceTier: "priority", observedAt: row.observedAt, capabilities: ["stop"] };
+  const parsed = parseSessionObservation({ ...row, telemetry }).telemetry;
+  assert.equal(parsed.contextTokens, 0); assert.equal(parsed.contextCapacity, null);
+  assert.equal("capabilities" in parsed, false);
+  for (const patch of [{ contextTokens: -1 }, { contextCapacity: 1.5 }, { observedAt: "2026-09-16T12:00:00Z" }]) {
+    assert.throws(() => parseSessionObservation({ ...row, telemetry: { ...telemetry, ...patch } }));
+  }
+});

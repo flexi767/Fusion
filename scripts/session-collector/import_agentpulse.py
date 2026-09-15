@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timezone
-from collector import connect, bind_host
+from collector import connect, bind_host, enqueue, CollectionCapacityError
 
 
 def timestamp(value):
@@ -76,9 +76,13 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
         event_id=hashlib.sha256(f'{digest}:{phase}:{row["event_id"]}'.encode()).hexdigest()
         envelope=dict(version=1,eventId=event_id,collectorVersion='agentpulse-import-1',historical=True,observation=observation,turns=[turn] if turn else [])
         if phase=='sessions' and row['notes']:envelope['importedNotes']=row['notes']
-        with db:
-            db.execute('INSERT OR IGNORE INTO pending(event_id,body) VALUES (?,?)',(event_id,json.dumps(envelope)))
-            checkpoint(phase,row['event_id'])
+        try:
+            with db:
+                db.execute('BEGIN IMMEDIATE')
+                if not db.execute('SELECT 1 FROM pending WHERE event_id=?',(event_id,)).fetchone(): enqueue(db,envelope)
+                checkpoint(phase,row['event_id'])
+        except CollectionCapacityError as error:
+            report['paused']=str(error);break
         report['queued']+=1;report['cursor']=row['event_id']
     if not rows:
         phase='events' if phase=='sessions' else 'done'

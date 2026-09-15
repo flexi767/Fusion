@@ -1,5 +1,5 @@
 import { SessionUsageOverview } from "./SessionUsageOverview";
-import { SessionHistory } from "./SessionHistory";
+import { SessionHistory, SessionCostDetails } from "./SessionHistory";
 import { useEffect, useMemo, useState } from "react";
 import { useExternalSessions } from "../hooks/useExternalSessions";
 import { Activity } from "lucide-react";
@@ -13,6 +13,9 @@ export function SessionCard({ session, connected }: { session: ObservedSession; 
   return <article className="session-card" aria-label={`${session.hostId}: ${row.title}`}>
     <h3><a href={`?view=sessions&session=${encodeURIComponent(session.id)}`}>{row.title}</a></h3>
     <p>{session.hostId} · {row.provider} · <strong>{row.activity}</strong> · {connected ? "Collector connected" : "Collector disconnected"}</p>
+    <p>Last reported model: {row.telemetry?.model ?? "Unreported"} · Context: {row.telemetry?.contextTokens?.toLocaleString() ?? "Unreported"}{row.telemetry?.contextCapacity != null ? ` / ${row.telemetry.contextCapacity.toLocaleString()}` : " / capacity unreported"}</p>
+    {row.telemetry && <p>Telemetry as of <time dateTime={row.telemetry.observedAt}>{new Date(row.telemetry.observedAt).toLocaleString()}</time>{row.telemetry.serviceTier ? ` · ${row.telemetry.serviceTier} service` : ""}</p>}
+    {session.usageSummary ? <SessionCostDetails label="Session cost and coverage" cost={{ ...session.usageSummary, coveredTurns: session.usageSummary.turns }} /> : <p>Cost unavailable · No collected usage total</p>}
     <p className="session-project">{row.projectPath}</p>
     <p>Observed session · Last activity <time dateTime={row.observedAt}>{new Date(row.observedAt).toLocaleString()}</time></p>
     <details><summary>Session identity</summary><code>{row.nativeSessionId}</code></details>
@@ -70,6 +73,7 @@ function SessionResults({ filters, onCollectors }: { filters: SessionFilters; on
     <details className="session-card"><summary>Collector health</summary>{data?.collectors.map(collector => <section key={collector.hostId}>
       <h3>{collector.hostId}</h3><p>Last heartbeat: {collector.lastHeartbeatAt ? new Date(collector.lastHeartbeatAt).toLocaleString() : "No live heartbeat"} · Last acknowledged delivery: {collector.lastAcknowledgementAt ? new Date(collector.lastAcknowledgementAt).toLocaleString() : "None"}</p>
       <p>{collector.diagnostics?.spoolDepth ?? "Unknown"} queued · {collector.diagnostics?.rejectedDeliveries ?? "Unknown"} rejected · {collector.diagnostics?.discoveredFiles ?? "Unknown"} discovered transcripts</p>
+      {collector.diagnostics?.resourcePaused && <p>Collection paused at a resource limit. Acknowledged data and pending checkpoints are preserved; inspect this host’s collector diagnostics.</p>}
       {collector.diagnostics?.parseError && <p>Transcript parsing needs attention. Inspect collector diagnostics on this host.</p>}
       {collector.diagnostics?.deliveryError && <p>Delivery is retrying after a failure.</p>}
     </section>)}</details>

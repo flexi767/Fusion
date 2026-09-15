@@ -26,3 +26,16 @@ it("uses keyboard-operable native cost disclosure and exposes missing price cove
   expect(screen.getByText(/2 unpriced model rows; 1 turns without usage/)).toBeTruthy();
   expect(screen.getByText(/Estimated cost for 3 displayed turns/).tagName).toBe("SUMMARY");
 });
+
+it("displays reported model/context and cost coverage without inventing capacity", () => {
+  const row = { ...session, observation: { ...session.observation, telemetry: { model: "fixture", contextTokens: 123, contextCapacity: null, serviceTier: null, observedAt: session.receivedAt } },
+    usageSummary: { id: "s", host: "m3", provider: "codex", title: "Fix", turns: 5, unreportedTurns: 2, usd: null, unpricedRows: 1, requests: null, inputTokens: null, outputTokens: null, usage: [] } };
+  const { rerender } = render(<SessionCard session={row} connected />);
+  expect(screen.getByText(/Last reported model: fixture.*123.*capacity unreported/)).toBeTruthy();
+  const popup = screen.getByText(/Session cost and coverage/).closest("details")!;
+  fireEvent.click(popup.querySelector("summary")!);
+  rerender(<SessionCard session={{ ...row, revision: 2 }} connected={false} />);
+  expect(screen.getByText(/Session cost and coverage/).closest("details")).toBe(popup);
+  expect(popup.open).toBe(true);
+  expect(screen.getByText(/1 unpriced model rows; 2 turns without usage/)).toBeTruthy();
+});

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main
+from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main, diagnostics, apply
 
 class CollectorTests(unittest.TestCase):
     def setUp(self):
@@ -123,5 +123,56 @@ class CollectorTests(unittest.TestCase):
         with self.path.open('a') as stream:stream.write('\n')
         scan_live(self.db,self.path,'codex')
         self.assertEqual(json.loads(self.db.execute('SELECT body FROM pending').fetchone()[0])['observation']['activity'],'waiting')
+
+    def test_resource_limits_preserve_checkpoint_and_pending_until_capacity_recovers(self):
+        self.write(self.codex())
+        with patch('collector.MAX_PARSER_STATE', 1): self.assertFalse(scan_file(self.db,self.path,'codex'))
+        self.assertIsNone(self.db.execute('SELECT offset FROM files').fetchone())
+        self.assertTrue(diagnostics(self.db)['resourcePaused'])
+        with patch('collector.MAX_PENDING_BYTES', 1): self.assertFalse(scan_file(self.db,self.path,'codex'))
+        self.assertIsNone(self.db.execute('SELECT revision FROM revisions').fetchone())
+        self.assertEqual(diagnostics(self.db)['spoolBytes'],0)
+        self.assertTrue(scan_file(self.db,self.path,'codex'))
+        self.assertFalse(diagnostics(self.db)['resourcePaused'])
+        pending=self.db.execute('SELECT body FROM pending').fetchone()[0]
+        self.assertEqual(diagnostics(self.db)['spoolBytes'],len(pending.encode()))
+        drain(self.db,lambda e:dict(acknowledged=True,eventId=e['eventId']))
+        self.assertEqual(diagnostics(self.db)['spoolBytes'],0)
+
+    def test_live_reserve_and_coalescing_obey_byte_limit_without_losing_checkpoint(self):
+        self.write(self.codex())
+        with patch('collector.MAX_PENDING_BYTES',1): scan_live(self.db,self.path,'codex')
+        before=self.db.execute('SELECT offset,state FROM live_files').fetchone()
+        with self.path.open('a') as f:f.write(json.dumps(dict(type='event_msg',timestamp='2026-09-15T12:01:00Z',payload=dict(type='task_completed')))+'\n')
+        with patch('collector.MAX_PENDING_BYTES',1),patch('collector.LIVE_RESERVE_BYTES',0):scan_live(self.db,self.path,'codex')
+        self.assertEqual(self.db.execute('SELECT offset,state FROM live_files').fetchone(),before)
+        scan_live(self.db,self.path,'codex')
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],1)
+        self.assertEqual(diagnostics(self.db)['spoolBytes'],self.db.execute('SELECT length(CAST(body AS BLOB)) FROM pending').fetchone()[0])
+
+    def test_malformed_complete_record_never_advances_history_cursor(self):
+        self.write(self.codex(),'invalid\n')
+        self.assertFalse(scan_file(self.db,self.path,'codex'))
+        self.assertIsNone(self.db.execute('SELECT offset FROM files').fetchone())
+        self.assertTrue(diagnostics(self.db)['parseError'])
+
+    def test_reported_model_context_and_compaction_for_both_providers(self):
+        state={}
+        for e in self.codex():apply(state,e,'codex')
+        def codex(kind,payload):apply(state,dict(type=kind,payload=payload,timestamp='2026-09-15T12:01:00Z'),'codex')
+        codex('turn_context',dict(model='gpt-5',service_tier='priority'))
+        for context in [1000,100]:
+            codex('event_msg',dict(type='token_count',info=dict(last_token_usage=dict(input_tokens=context),model_context_window=2000)))
+            self.assertEqual(state['telemetry']['contextTokens'],context)
+        self.assertEqual(state['telemetry']['contextCapacity'],2000)
+        codex('turn_context',dict(model='gpt-next'))
+        self.assertIsNone(state['telemetry']['contextTokens'])
+        self.assertIsNone(state['telemetry']['contextCapacity'])
+        codex('event_msg',dict(type='item_completed',item=dict(type='UserMessage',content=[dict(type='input_text',text='Desktop prompt')])) )
+        self.assertEqual(state['title'],'Desktop prompt')
+        claude={}
+        apply(claude,dict(type='assistant',sessionId='c',cwd='/repo',timestamp='2026-09-15T12:00:00Z',message=dict(model='claude',content=[],usage=dict(input_tokens=10,cache_read_input_tokens=20,cache_creation_input_tokens=30))),'claude')
+        self.assertEqual(claude['telemetry']['contextTokens'],60)
+        self.assertIsNone(claude['telemetry']['contextCapacity'])
 
 if __name__ == '__main__': unittest.main()

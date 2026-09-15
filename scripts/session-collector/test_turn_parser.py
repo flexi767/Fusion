@@ -50,4 +50,24 @@ class TurnParserTests(unittest.TestCase):
         self.assertEqual(state['turns']['second']['usage'][0]['outputTokens'],10)
         self.assertIsNone(state['turns']['second']['usage'][0]['cachedInputTokens'])
 
+    def test_duplicate_native_events_do_not_inflate_prompts_tools_or_patches(self):
+        state={}
+        def send(payload):consume(state,dict(type='event_msg',timestamp='2026-09-15T12:00:00Z',payload=payload),'codex_cli')
+        for tid in ['first','second']:
+            send(dict(type='task_started',turn_id=tid))
+            for prompt_id in ['one','two']:
+                event=dict(type='item_completed',turn_id=tid,item=dict(type='UserMessage',id=prompt_id,content='Same steering'))
+                send(event);send(event)
+            for typ in ['CommandExecution','McpToolCall']:
+                event=dict(type='item_completed',turn_id=tid,item=dict(type=typ,id=typ));send(event);send(event)
+            event=dict(type='item_completed',turn_id=tid,item=dict(type='FileChange',changes={'../shared.py':{'diff':'+edit'}}))
+            send(event);send(event)
+            self.assertEqual(state['turns'][tid]['prompts'],['Same steering','Same steering'])
+            self.assertEqual(state['turns'][tid]['toolCalls'],2)
+            self.assertEqual(state['turns'][tid]['files'][0]['added'],1)
+        claude={}
+        def user(uid):consume(claude,dict(type='user',uuid=uid,message=dict(content='Repeat'),timestamp='2026-09-15T12:00:00Z'),'claude_code')
+        user('one');user('one');user('two');user('two')
+        self.assertEqual(claude['turns']['one']['prompts'],['Repeat','Repeat'])
+
 if __name__ == '__main__':unittest.main()

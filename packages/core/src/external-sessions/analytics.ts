@@ -4,7 +4,7 @@ import type { ModelPricingOverrides } from "../ai/model-pricing.js";
 import { priceSessionUsage } from "./cost.js";
 import type { SessionModelUsage } from "./turn.js";
 
-export interface ExternalSessionAnalyticsQuery { from?: string; to?: string; host?: string; model?: string; sessionId?: string }
+export interface ExternalSessionAnalyticsQuery { from?: string; to?: string; host?: string; model?: string; sessionId?: string; sessionIds?: string[] }
 export interface ExternalSessionUsageSummary {
   id: string; host: string; provider: string; title: string; turns: number; unreportedTurns: number;
   usd: number | null; unpricedRows: number; requests: number | null; inputTokens: number | null; outputTokens: number | null;
@@ -20,6 +20,8 @@ export async function externalSessionAnalytics(layer: AsyncDataLayer, query: Ext
   for (const value of [query.from, query.to]) if (value !== undefined && (!Number.isFinite(Date.parse(value)) || value.length > 40)) throw new Error("Invalid analytics date");
   for (const value of [query.host, query.model, query.sessionId]) if (value !== undefined && value.length > 256) throw new Error("Invalid analytics filter");
   if (query.from && query.to && Date.parse(query.from) > Date.parse(query.to)) throw new Error("Invalid analytics range");
+  if (query.sessionIds && (query.sessionIds.length > 100 || query.sessionIds.some(id => !/^[a-f0-9]{64}$/.test(id)))) throw new Error("Invalid analytics session list");
+  if (query.sessionIds?.length === 0) return { from: null, to: null, truncated: false, sessions: [] as ExternalSessionUsageSummary[] };
   const from = query.from ? new Date(query.from).toISOString() : null;
   const to = query.to ? new Date(query.to).toISOString() : null;
   const rows = await layer.db.execute(sql`
@@ -29,13 +31,14 @@ export async function externalSessionAnalytics(layer: AsyncDataLayer, query: Ext
       WHERE true ${from ? sql`AND t.started_at >= ${from}` : sql``} ${to ? sql`AND t.started_at <= ${to}` : sql``}
         ${query.host ? sql`AND s.host_id = ${query.host}` : sql``}
         ${query.sessionId ? sql`AND s.id = ${query.sessionId}` : sql``}
+        ${query.sessionIds ? sql`AND s.id IN (${sql.join(query.sessionIds.map(id => sql`${id}`), sql`, `)})` : sql``}
         ${query.model ? sql`AND EXISTS(SELECT 1 FROM jsonb_array_elements(t.result->'usage') u WHERE u->>'model'=${query.model})` : sql``}
     ), totals AS (
       SELECT id, host_id, provider, title, count(*)::int turns,
         count(*) FILTER(WHERE jsonb_array_length(usage)=0)::int unreported
       FROM selected GROUP BY id, host_id, provider, title
     ), grouped AS (
-      SELECT id, u->>'model' AS model, (u->>'fast')::boolean AS fast, (u->>'longContext')::boolean AS long_context,
+      SELECT id, u->>'model' AS model, u->>'serviceTier' AS service_tier, (u->>'fast')::boolean AS fast, (u->>'longContext')::boolean AS long_context,
         CASE WHEN count(*)=count(u->>'inputTokens') THEN sum((u->>'inputTokens')::numeric) END AS input,
         CASE WHEN count(*)=count(u->>'cachedInputTokens') THEN sum((u->>'cachedInputTokens')::numeric) END AS cache_read,
         CASE WHEN count(*)=count(u->>'cacheWriteTokens') THEN sum((u->>'cacheWriteTokens')::numeric) END AS cache_write,
@@ -44,7 +47,7 @@ export async function externalSessionAnalytics(layer: AsyncDataLayer, query: Ext
         CASE WHEN count(*)=count(u->>'requests') THEN sum((u->>'requests')::numeric) END AS requests
       FROM selected CROSS JOIN LATERAL jsonb_array_elements(usage) u
       WHERE true ${query.model ? sql`AND u->>'model'=${query.model}` : sql``}
-      GROUP BY id, u->>'model', u->>'fast', u->>'longContext',
+      GROUP BY id, u->>'model', u->>'fast', u->>'longContext', u->>'serviceTier',
         (u->>'inputTokens' IS NOT NULL AND u->>'cachedInputTokens' IS NOT NULL AND u->>'cacheWriteTokens' IS NOT NULL AND u->>'outputTokens' IS NOT NULL),
         (u->>'cacheWriteHourTokens' IS NOT NULL), ((u->>'cacheWriteHourTokens')::numeric > 0),
         ((u->>'inputTokens')::numeric >= (u->>'cachedInputTokens')::numeric + (u->>'cacheWriteTokens')::numeric)
@@ -60,7 +63,7 @@ export async function externalSessionAnalytics(layer: AsyncDataLayer, query: Ext
     const values = row.rows as Record<string, unknown>[];
     const normalized = values.map(value => {
       const number = (key: string) => value[key] == null || !Number.isSafeInteger(Number(value[key])) ? null : Number(value[key]);
-      return { model: String(value.model), inputTokens: number("input"), cachedInputTokens: number("cache_read"), cacheWriteTokens: number("cache_write"),
+      return { serviceTier: value.service_tier == null ? null : String(value.service_tier), model: String(value.model), inputTokens: number("input"), cachedInputTokens: number("cache_read"), cacheWriteTokens: number("cache_write"),
         cacheWriteHourTokens: number("cache_hour"), outputTokens: number("output"), requests: number("requests"), fast: value.fast === true, longContext: value.long_context === true,
         reasoningTokens: null, contextTokens: null } satisfies SessionModelUsage;
     });

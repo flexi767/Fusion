@@ -2,9 +2,10 @@ import type { SessionObservation } from "@fusion/core";
 import { api } from "./client/client.js";
 export interface ObservedSession {
   id: string; hostId: string; provider: string; nativeSessionId: string;
+  usageSummary?: import("@fusion/core").ExternalSessionUsageSummary | null;
   revision: number; observation: SessionObservation; receivedAt: string;
 }
-export interface CollectorHealth { hostId: string; lastHeartbeatAt: string | null; lastAcknowledgementAt: string | null; collectorVersion: string; diagnostics?: { spoolDepth?: number; rejectedDeliveries?: number; discoveredFiles?: number; parserStateBytes?: number; parseError?: boolean; deliveryError?: boolean } }
+export interface CollectorHealth { hostId: string; lastHeartbeatAt: string | null; lastAcknowledgementAt: string | null; collectorVersion: string; diagnostics?: { spoolDepth?: number; rejectedDeliveries?: number; discoveredFiles?: number; parserStateBytes?: number; spoolBytes?: number; resourcePaused?: boolean; parseError?: boolean; deliveryError?: boolean } }
 export interface SessionPage { enabled: boolean; sessions: ObservedSession[]; collectors: CollectorHealth[]; nextCursor: string | null }
 export interface SessionFilters { host?: string; provider?: string; activity?: string; q?: string }
 export const fetchExternalSessions = (before?: string, filters: SessionFilters = {}) => {

@@ -16,6 +16,7 @@ export interface SessionObservation {
   activity: ExternalSessionActivity;
   title: string;
   projectPath: string;
+  telemetry?: { model: string | null; contextTokens: number | null; contextCapacity: number | null; serviceTier: string | null; observedAt: string };
 }
 
 export interface ExternalSessionSnapshot extends SessionObservation {
@@ -40,7 +41,22 @@ export function parseSessionObservation(value: unknown): SessionObservation {
   if (!["working", "waiting", "completed", "error"].includes(String(row.activity))) throw new Error("Invalid activity");
   const observedAt = boundedString(row.observedAt, "observedAt", 40);
   if (!/^\d{4}-\d{2}-\d{2}T.*Z$/.test(observedAt) || !Number.isFinite(Date.parse(observedAt))) throw new Error("Invalid observedAt");
+  let telemetry: SessionObservation["telemetry"];
+  if (row.telemetry !== undefined) {
+    if (!row.telemetry || typeof row.telemetry !== "object" || Array.isArray(row.telemetry)) throw new Error("Invalid telemetry");
+    const t = row.telemetry as Record<string, unknown>;
+    const counter = (value: unknown) => {
+      if (value == null) return null;
+      if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error("Invalid telemetry counter");
+      return Number(value);
+    };
+    const at = boundedString(t.observedAt, "telemetry timestamp", 40);
+    if (!Number.isFinite(Date.parse(at)) || Date.parse(at) > Date.parse(observedAt)) throw new Error("Invalid telemetry timestamp");
+    telemetry = { model: t.model == null ? null : boundedString(t.model, "model", 256), contextTokens: counter(t.contextTokens),
+      contextCapacity: counter(t.contextCapacity), serviceTier: t.serviceTier == null ? null : boundedString(t.serviceTier, "service tier", 64), observedAt: new Date(at).toISOString() };
+  }
   return {
+    ...(telemetry ? { telemetry } : {}),
     version: 1,
     provider: row.provider,
     nativeSessionId: boundedString(row.nativeSessionId, "nativeSessionId", 256),
