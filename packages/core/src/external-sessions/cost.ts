@@ -21,7 +21,7 @@ export function priceSessionUsage(provider: string, usage: SessionModelUsage, ov
   if (input === null || read === null || write === null || output === null) return { ...result, reason: "Missing token categories" };
   if (provider === "claude" && write > 0 && usage.cacheWriteHourTokens === null) return { ...result, reason: "Cache lifetime unreported" };
   if (read + write > input) return { ...result, reason: "Inconsistent input counters" };
-  const rates = recorded ? recorded.rates : lookupPricing({ provider: provider === "claude" ? "anthropic" : "openai", model: usage.model }, overrides);
+  const rates = recorded ? recorded.rates : lookupPricing({ provider: provider === "claude" ? "anthropic" : "openai-codex", model: usage.model }, overrides);
   if (!validModelPricing(rates)) return { ...result, reason: recorded ? "No valid price was recorded" : "Model has no valid configured price" };
   if (rates.effectiveUntil) result.effectiveUntil = rates.effectiveUntil;
   const at = recorded ? Date.parse(recorded.turnStartedAt) : Date.now();

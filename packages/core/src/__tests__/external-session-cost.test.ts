@@ -40,3 +40,18 @@ it("keeps immutable recorded rates distinct from current repricing and unknown h
   const before = captureSessionPrice("codex", usage, "2026-09-14T12:00:00Z", at, { "openai:fixture": dated });
   expect(priceSessionUsage("codex", usage, undefined, before).usd).toBeNull();
 });
+it("uses each native provider's exact pricing override for both current costs and newly recorded rates", async () => {
+  const { captureSessionPrice } = await import("../external-sessions/rate-snapshot.js");
+  const wrong = { ...rates, inputPer1M: 200, outputPer1M: 400, source: "another provider" };
+  for (const provider of ["codex", "claude"]) {
+    const exact = provider === "codex" ? "openai-codex" : "anthropic";
+    for (const reverse of [false, true]) {
+      const entries = [["openai:fixture", wrong], [`${exact}:fixture`, rates]] as const;
+      const overrides = Object.fromEntries(reverse ? [...entries].reverse() : entries);
+      expect(priceSessionUsage(provider, usage, overrides).usd).toBeCloseTo(0.00037, 12);
+      const recorded = captureSessionPrice(provider, usage, "2026-09-15T12:00:00Z", "2026-09-15T12:00:01Z", overrides);
+      expect(recorded.rates).toEqual(rates);
+      expect(priceSessionUsage(provider, usage, undefined, recorded).usd).toBeCloseTo(0.00037, 12);
+    }
+  }
+});

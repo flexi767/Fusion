@@ -258,3 +258,10 @@ Final launch cleanup verification: engine rebuild and scoped lint passed; the CL
 - Rollback of this preview is bounded to its own service names: stop/disable `fusion-session-collector-preview` and `fusion-agentpulse-preview` on J, and boot out the two named m3 launchd jobs. Keep their spools/configuration for investigation. Do not replay accepted controls (controls are disabled), delete the AgentPulse snapshot, or stop the existing AgentPulse services.
 
 The J preview archive SHA-256 matches on m3 and J: `5ae63536f09f793460c21aab41be245c2a415931b8d67944b2b23c9ce98b54ea`. At the deployment check, server RSS accounting was approximately 303 MB and the J collector 212 MB, within their unit limits.
+
+
+## Same-rate accounting audit and provider selection (2026-09-15)
+
+The [accounting comparison](agentpulse-accounting-comparison.md) now records all 5,374 mapped source turns. Of 5,351 model groups, 3,595 reconcile exactly under identical supplied rates, with zero arithmetic discrepancies. Baseline differences are documented separately. The audit identifies a used-feature gap: 1,560 Claude groups report one-hour cache writes; 951 also report long context. Explicit configured rates for those surfaces are the next pricing work, rather than guessed multipliers.
+
+Original symptom: an exact OpenAI override could win over a different exact Codex override for observed Codex sessions. Reproduction supplies conflicting OpenAI/Codex rates in both insertion orders; the assertion checks current costs and newly captured immutable rates. Both provider branches pass, old captured snapshots stay unchanged, and unknown/unreported cases remain covered. The focused five-test cost suite and core build pass. Current/history/card/ranking calculations all use the shared pricing function; ingestion capture uses the corrected provider selection as well.

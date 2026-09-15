@@ -14,7 +14,7 @@ export function captureSessionPrice(provider: string, usage: SessionModelUsage, 
   overrides?: ModelPricingOverrides | null, previous?: RecordedSessionPrice): RecordedSessionPrice {
   const usageKey = usagePriceKey(usage);
   if (previous?.usageKey === usageKey) return previous.turnStartedAt === turnStartedAt ? previous : { ...previous, turnStartedAt };
-  const configured = overrides === null ? undefined : lookupPricing({ provider: provider === "claude" ? "anthropic" : "openai", model: usage.model }, overrides);
+  const configured = overrides === null ? undefined : lookupPricing({ provider: provider === "claude" ? "anthropic" : "openai-codex", model: usage.model }, overrides);
   const rates: ModelPricing | null = validModelPricing(configured) ? { inputPer1M: configured.inputPer1M, outputPer1M: configured.outputPer1M,
     cacheReadPer1M: configured.cacheReadPer1M, cacheWritePer1M: configured.cacheWritePer1M, source: redactSecrets(configured.source),
     ...(configured.effectiveFrom ? { effectiveFrom: new Date(configured.effectiveFrom).toISOString() } : {}),
