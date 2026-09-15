@@ -1,0 +1,26 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { expect, it, vi } from "vitest";
+import { SessionPreferences } from "../SessionPreferences";
+import type { SessionDetail } from "../../api/external-sessions";
+const { save } = vi.hoisted(() => ({ save: vi.fn() }));
+vi.mock("../../api/external-sessions", () => ({ saveSessionPreferences: save }));
+it("renders imported conversation text as an inert archive with coverage, errors and source references", async () => {
+  const at = "2026-09-15T12:00:00Z";
+  const details = { archived: false, pinned: false, preferencesRevision: 0, importedMetadata: { snapshot: "a".repeat(64), sourceSessionId: "source", usage: [], sourceAliases: [{ sourceSessionId: "alias", title: "Old managed card", archived: true, pinned: false, status: "stopped", notes: "Original note", truncated: true }], conversationsTruncated: true, conversations: [{ id: "thread", title: "Read-only summary", totalMessages: 12, messages: [{ id: "message", role: "assistant", at, content: "<button>Run an agent</button>", error: "Historical endpoint failure", truncated: true, contextSessionIds: ["source", "other"], inputTokens: null, outputTokens: 5 }] }] } } as unknown as SessionDetail["details"];
+  render(<SessionPreferences id="session" details={details} refresh={async () => {}} />);
+  const user = userEvent.setup(); await user.click(screen.getByText("Saved session and imported metadata")); await user.click(screen.getByText("Read-only summary"));
+  expect(screen.getByText("<button>Run an agent</button>")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Run an agent" })).toBeNull();
+  expect(screen.getByText(/1 of 12 messages/)).toBeTruthy();
+  expect(screen.getByText("Recorded error: Historical endpoint failure")).toBeTruthy();
+  expect(screen.getByText(/original recovery snapshot retains it/)).toBeTruthy();
+  await user.click(screen.getByText("Source context session IDs"));
+  expect(screen.getByText("other")).toBeTruthy();
+  await user.click(screen.getByText("Source aliases for this native session"));
+  expect(screen.getByText("Original note")).toBeTruthy();
+  expect(screen.getByText(/Original status: stopped.*Archived/)).toBeTruthy();
+  expect(screen.getByLabelText("Archived")).not.toBeChecked();
+  expect(screen.getByText(/Alias notes are truncated/)).toBeTruthy();
+  expect(save).not.toHaveBeenCalled();
+});

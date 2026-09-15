@@ -70,6 +70,21 @@ Run once per host credential/spool. Import resumes by snapshot SHA-256, identity
 them. Historical data never overwrites a live activity snapshot. Turn results use the newest native timestamp across live and imported data; an older partial backfill cannot replace a newer complete result. This
 importer handles session records, notes, archived/pinned labels, model/branch/timestamps, reported session usage and collected turn-result events. Reported session totals are retained separately from turn-based accounting to avoid double counting. Other AgentPulse event types still require their mapped replacements.
 
+Import format 5 also preserves read-only Ask conversations whose recorded context
+IDs explicitly mention the mapped source session. The same source thread ID may
+appear under several referenced sessions; this does not create new native turns,
+commands, tasks or billable session usage. Each session archive includes at most
+three threads and the latest ten messages per thread, with 4,000 UTF-16 units per
+message, timestamps, source references and explicit truncation/coverage. The
+original snapshot retains omitted content. Existing content retention keeps these
+conversation archives, like operator notes.
+
+A format change safely restarts the importer scan. Metadata delivery IDs include
+the format so an unacknowledged older envelope cannot suppress the upgrade. The
+server refuses metadata format downgrades, while operator labels and native
+activity keep their existing precedence. Deploy the matching server before
+replaying with the updated importer.
+
 ## Optional feedback hook adapter
 
 `feedback_hook.py` implements the verified AgentPulse `additionalContext` hook
@@ -316,3 +331,12 @@ prefixes follow the stricter inode/size/mtime and parser-generation checks above
 The existing 8 MiB read budget, 200-file visit cap, rotating cursor and durable spool
 limits remain in force. A drained delivery queue does not prove every historical
 file has reached its end.
+
+Verified source aliases may map to one host/provider/native identity. The importer
+keeps up to eight audited source records per identity. It prefers a source record
+whose ID equals the native ID (otherwise stable source-ID order), preserves the
+other source titles/statuses/labels/notes as read-only aliases and merges explicit
+conversation references. A conflicting recorded host/provider is refused. Import
+archives the combined card only if all source records were archived, and preserves
+any pin; existing operator preferences still win. Alias data never grants runtime
+capabilities or creates an extra native session.

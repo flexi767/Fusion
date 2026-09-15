@@ -57,3 +57,10 @@ The private native evidence records content hashes and bounded bytes read, witho
 ## Private evidence locations
 
 Under `/Users/v/.fusion/session-integration-test/`: `native-corroboration-m3.json`, `native-corroboration-j.json`, `native-corroboration-codex.json`, and `native-corroboration-claude-patch.json`. Inputs, exports and detailed prompt investigations are private mode-600 files. The corroboration scripts stream only audited native paths with bounded line/file sizes; no working-tree files are used to reconstruct historical patches.
+
+
+## Post-catch-up export (21:31 UTC)
+
+The fresh export has **5,418 normalized exact turns, 40 later-native turns and 500 equal-time differences**, still zero missing turns or unexplained timestamp/provenance mismatches. m3 is 4,480 / 30 / 472; J remains 354 / 10 / 28; m5 remains 584 exact. All previously corroborated Claude rows are byte-equivalent after canonical normalization. Four Codex later-native rows now match 1,163 raw native requests, all token categories, unique tool counts, patches and completion markers. This adds one corroborated historical completion and advances the current growing session's captured prefix. All 49 substantive rows in this export are accounted for. Earlier exports are preserved privately under `reconciliation-2106/`; they were not overwritten to conceal differences.
+
+The independent managed-session/supervisor/native-thread relations additionally resolve four source aliases to already-mapped native identities. Audit maps now cover 87 source records → 83 unique native sessions; eight metadata-only identities remain unassigned. Alias-label and conversation replay is under verification and is not yet part of the running comparison metadata.

@@ -18,7 +18,7 @@ export function SessionRetentionPanel() {
   };
   return <details className="session-card"><summary>Collected content retention</summary>
     <p>Nothing is removed automatically. Review old inactive sessions across all hosts, then remove collected prompt, response and patch text in small batches. Summaries containing that text are cleared.</p>
-    <p>Pinned and task-linked sessions are protected. Identities, usage, recorded prices, file counts, operator notes and native transcript files are retained. Old replay cannot restore removed text; new activity in a turn can supply fresh content.</p>
+    <p>Pinned and task-linked sessions are protected. Identities, usage, recorded prices, file counts, operator notes, imported conversations and native transcript files are retained. Old replay cannot restore removed text; new activity in a turn can supply fresh content.</p>
     <form className="sessions-filters" onSubmit={event => { event.preventDefault(); void run(false); }}>
       <label>Keep recent content (days)<input type="number" min={1} max={3650} step={1} required value={days} disabled={busy} onChange={event => { setDays(event.target.value); setPreview(undefined); setMessage(""); }} /></label>
       <button className="btn btn-secondary" disabled={busy} type="submit">Review eligible content</button>

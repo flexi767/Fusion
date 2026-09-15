@@ -10,6 +10,51 @@ from pathlib import Path
 import sqlite3
 from datetime import datetime, timezone
 from collector import connect, bind_host, enqueue, CollectionCapacityError
+from turn_parser import bounded_text
+
+IMPORT_FORMAT = 5
+
+
+def canonical_source_session(source, identities, identity):
+    source_ids=sorted(key for key,value in identities.items() if all(value.get(field)==identity.get(field) for field in ('hostId','provider','nativeSessionId')))
+    if not source_ids or len(source_ids)>8:raise ValueError('Invalid or oversized audited source alias group')
+    rows=source.execute('SELECT * FROM sessions WHERE session_id IN ('+','.join('?' for _ in source_ids)+') ORDER BY session_id',source_ids).fetchall()
+    if len(rows)!=len(source_ids):raise ValueError('Audited source alias is absent from snapshot')
+    for row in rows:
+        host=(json.loads(row['metadata'] or '{}') or {}).get('hostName')
+        if host and host!=identity['hostId']:raise ValueError('Audited source alias conflicts with recorded host')
+        provider={'codex_cli':'codex','claude_code':'claude'}.get(row['agent_type'])
+        if provider and provider!=identity['provider']:raise ValueError('Audited source alias conflicts with recorded provider')
+    primary=next((row for row in rows if row['session_id']==identity['nativeSessionId']),rows[0])
+    aliases=[dict(sourceSessionId=row['session_id'],title=bounded_text(row['display_name'] or row['session_id'],512),
+        archived=bool(row['is_archived']),pinned=bool(row['is_pinned']),status=bounded_text(row['status'] or 'unreported',64),
+        notes=bounded_text(row['notes'] or '',32000),truncated=bounded_text(row['notes'] or '',32000)!=(row['notes'] or '')) for row in rows if row['session_id']!=primary['session_id']]
+    return primary,aliases,all(bool(row['is_archived']) for row in rows),any(bool(row['is_pinned']) for row in rows)
+
+
+def conversations_for_session(source, session_id):
+    """Preserve only source-recorded conversation references, as inert archive data."""
+    tables={row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('ask_threads','ask_messages')")}
+    if tables != {'ask_threads','ask_messages'}:return [],False
+    threads=source.execute('''SELECT t.* FROM ask_threads t WHERE EXISTS (
+      SELECT 1 FROM ask_messages m, json_each(m.context_session_ids) c
+      WHERE m.thread_id=t.id AND c.value=?) ORDER BY t.created_at DESC,t.id DESC LIMIT 4''',(session_id,)).fetchall()
+    result=[];truncated=len(threads)>3
+    for thread in threads[:3]:
+        count=source.execute('SELECT count(*) FROM ask_messages WHERE thread_id=?',(thread['id'],)).fetchone()[0]
+        rows=source.execute('SELECT * FROM ask_messages WHERE thread_id=? ORDER BY created_at DESC,id DESC LIMIT 10',(thread['id'],)).fetchall()
+        messages=[];truncated=truncated or count>len(rows)
+        for row in reversed(rows):
+            content=bounded_text(row['content'],4000);contexts=json.loads(row['context_session_ids'] or '[]')
+            if not isinstance(contexts,list) or any(not isinstance(value,str) for value in contexts):raise ValueError('Invalid archived conversation context')
+            clipped=content!=row['content'] or len(contexts)>64
+            messages.append(dict(id=row['id'],role=row['role'],content=content,at=timestamp(row['created_at']),truncated=clipped,
+                contextSessionIds=contexts[:64],error=bounded_text(row['error_message'],1000) if row['error_message'] else None,
+                inputTokens=row['tokens_in'],outputTokens=row['tokens_out']))
+            truncated=truncated or clipped
+        result.append(dict(id=thread['id'],title=bounded_text(thread['title'] or 'Imported conversation',512),createdAt=timestamp(thread['created_at']),
+            archivedAt=timestamp(thread['archived_at']) if thread['archived_at'] else None,totalMessages=count,messages=messages))
+    return result,truncated
 
 
 def timestamp(value):
@@ -26,7 +71,7 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
     # SHA-256 identity keeps imports restartable, independent of pathname or mtime.
     with snapshot.open('rb') as snapshot_file:
         digest=hashlib.file_digest(snapshot_file,'sha256').hexdigest()
-    identity_digest=hashlib.sha256(json.dumps(identities,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    identity_digest=hashlib.sha256(json.dumps({'format':IMPORT_FORMAT,'identities':identities},sort_keys=True,separators=(',',':')).encode()).hexdigest()
     db.executescript('''CREATE TABLE IF NOT EXISTS imports_v4(snapshot TEXT,host TEXT,identity_digest TEXT,phase TEXT,cursor INTEGER NOT NULL,PRIMARY KEY(snapshot,host));
       CREATE TABLE IF NOT EXISTS import_unmapped(snapshot TEXT,host TEXT,phase TEXT,row_id INTEGER,session_id TEXT,PRIMARY KEY(snapshot,host,phase,row_id));''')
     position=db.execute('SELECT identity_digest,phase,cursor FROM imports_v4 WHERE snapshot=? AND host=?',(digest,host_id)).fetchone()
@@ -63,6 +108,8 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
             with db:checkpoint(phase,row['event_id'])
             report['excludedHost']+=1;continue
         with db:db.execute('DELETE FROM import_unmapped WHERE snapshot=? AND host=? AND session_id=?',(digest,host_id,row['session_id']))
+        primary=row;aliases=[];archived=pinned=False
+        if phase=='sessions':primary,aliases,archived,pinned=canonical_source_session(source,identities,identity)
         turn=None
         if phase=='events':
             turn=json.loads(row['raw_payload']);turn['provenance']='agentpulse-import'
@@ -72,15 +119,22 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
                     try:change['path']=str(path.relative_to(row['cwd']))
                     except (TypeError,ValueError):pass
         observation=dict(version=1,provider=provider,nativeSessionId=native,revision=0,
-            observedAt=timestamp(row['last_activity_at']),activity='completed' if row['status'] in ('completed','ended','stopped') else 'working' if row['is_working'] else 'waiting',
-            title=(row['display_name'] or Path(row['cwd'] or '/').name or 'Imported session')[:512],projectPath=row['cwd'] or '(historical project unavailable)')
-        event_id=hashlib.sha256(f'{digest}:{phase}:{row["event_id"]}'.encode()).hexdigest()
-        envelope=dict(version=1,eventId=event_id,collectorVersion='agentpulse-import-1',historical=True,observation=observation,turns=[turn] if turn else [])
+            observedAt=timestamp(primary['last_activity_at']),activity='completed' if primary['status'] in ('completed','ended','stopped') else 'working' if primary['is_working'] else 'waiting',
+            title=(primary['display_name'] or Path(primary['cwd'] or '/').name or 'Imported session')[:512],projectPath=primary['cwd'] or '(historical project unavailable)')
+        phase_key=f'{phase}-v{IMPORT_FORMAT}' if phase=='sessions' else phase
+        event_id=hashlib.sha256(f'{digest}:{phase_key}:{row["event_id"]}'.encode()).hexdigest()
+        envelope=dict(version=1,eventId=event_id,collectorVersion='agentpulse-import-2',historical=True,observation=observation,turns=[turn] if turn else [])
         if phase=='sessions':
-            if row['notes']:envelope['importedNotes']=row['notes']
-            metadata=json.loads(row['metadata'] or '{}')
-            envelope['importedMetadata']=dict(snapshot=digest,sourceSessionId=row['session_id'],archived=bool(row['is_archived']),pinned=bool(row['is_pinned']),model=row['model'],
-                startedAt=timestamp(row['started_at']) if row['started_at'] else None,endedAt=timestamp(row['ended_at']) if row['ended_at'] else None,branch=row['git_branch'],usage=metadata.get('costUsage') or [])
+            if primary['notes']:envelope['importedNotes']=primary['notes']
+            metadata=json.loads(primary['metadata'] or '{}')
+            envelope['importedMetadata']=dict(formatVersion=IMPORT_FORMAT,snapshot=digest,sourceSessionId=primary['session_id'],sourceAliases=aliases,archived=archived,pinned=pinned,model=primary['model'],
+                startedAt=timestamp(primary['started_at']) if primary['started_at'] else None,endedAt=timestamp(primary['ended_at']) if primary['ended_at'] else None,branch=primary['git_branch'],usage=metadata.get('costUsage') or [])
+            conversations={};truncated=False
+            for source_id in [primary['session_id']]+[alias['sourceSessionId'] for alias in aliases]:
+                threads,clipped=conversations_for_session(source,source_id);truncated=truncated or clipped
+                conversations.update((thread['id'],thread) for thread in threads)
+            threads=sorted(conversations.values(),key=lambda thread:(thread['createdAt'],thread['id']),reverse=True)
+            envelope['importedMetadata'].update(conversations=threads[:3],conversationsTruncated=truncated or len(threads)>3)
         try:
             with db:
                 db.execute('BEGIN IMMEDIATE')

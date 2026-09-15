@@ -1,6 +1,6 @@
 # Fusion AgentPulse integration progress
 
-Session: **Fusion AgentPulse integration**. Updated 2026-09-15.
+Session: **Fusion AgentPulse integration**. Updated 2026-09-16 (Berlin).
 Worktree: `/Users/v/dev/fusion-worktrees/agentpulse-sessions`.
 Branch: `codex/agentpulse-sessions`; plan baseline `801d03c84`; foundation `f435871bf`.
 
@@ -8,10 +8,10 @@ Branch: `codex/agentpulse-sessions`; plan baseline `801d03c84`; foundation `f435
 
 - J authenticated comparison server and independent m3/J collectors run frozen `c07f8adf3` (v11), retaining the original preview database/spools. Archive SHA-256: `96ceb9a9ce31852ed497c57a6e16bee17aca51b2177dd15f6169ba9189d559bf`. AgentPulse and its supervisor remain active. Controls, launches and automatic summaries remain disabled in the real comparison.
 - All **5,958 stored snapshot turns** are now present across **83 audited identities**: 70 native-file verified, 13 historical-only with explicit source-host/native-start-ID evidence. The m5 cohort's 584 normalized turns match exactly; its heartbeat remains null. Twelve hostless metadata-only identities, including four archived records, remain unresolved. Both import spools are drained with zero rejections.
-- The captured [reconciliation](agentpulse-reconciliation.md) records 5,419 exact turns, 39 later-native and 500 equal-time differences, with zero missing turns. All 48 substantive changed rows have native corroboration, including usage, tool counts, changed patches and earlier owning prompts. The [same-rate comparison](agentpulse-accounting-comparison.md) covers all 5,746 source-priced groups with zero arithmetic discrepancies. A fresh post-catch-up export remains to run.
+- The captured [reconciliation](agentpulse-reconciliation.md) records 5,419 exact turns, 39 later-native and 500 equal-time differences, with zero missing turns. All 48 substantive changed rows have native corroboration, including usage, tool counts, changed patches and earlier owning prompts. The [same-rate comparison](agentpulse-accounting-comparison.md) covers all 5,746 source-priced groups with zero arithmetic discrepancies. The 21:31 post-catch-up export now records 5,418 exact / 40 later-native / 500 equal-time turns; all 49 substantive differences are corroborated.
 - The v11 scheduler caught up all 65 verified m3 native files to complete-line EOF; only the currently growing session's trailing partial line remained at the check. Stale working reports are explicitly labeled without changing activity or connectivity. Content/parser retention is opt-in and has **not** been applied to real history.
 - Five-minute network outage and preview rollback rehearsals passed with AgentPulse available. Provisional dual observation began **2026-09-15 18:28 UTC**; 24 hours have not elapsed, and fixes during this window prevent treating it as completed parity. Live m5 and native-hook/control acceptance remain open.
-- Expanded inventory found one read-only cross-session Ask summary (one thread/two messages) and 65 successful idle watcher runs with no proposals. A bounded recent-activity overview and correct same-turn summary-staleness display are now under build/gate verification. Ask history and watcher equivalence are explicitly tracked; see the [feature checklist](agentpulse-feature-checklist.md).
+- Expanded inventory found one read-only cross-session Ask summary (one thread/two messages) and 65 successful idle watcher runs with no proposals. A bounded recent-activity overview and correct same-turn summary-staleness display are now under build/gate verification. Read-only Ask/alias import is under final verification. Source evidence shows the watcher successes include no-op wakes; see the [feature checklist](agentpulse-feature-checklist.md).
 - All work remains on `codex/agentpulse-sessions`; no main merge, release, retirement or automatic task enrollment. GitHub pushes remain blocked by unavailable HTTPS credentials. Local commits are retained.
 
 ## Verified deployment and source
@@ -429,3 +429,28 @@ The new recent-activity overview is read-only and returns at most five sessions,
 All 25 serial verification steps passed in 107.8 seconds; the serial gate passed 754 tests and static checks. The recent overview was visually inspected at 1440px and 390px, with exactly five sessions and 390px mobile document width. A synthetic lab summary explicitly labeled “Synthetic browser fixture” exercised same-turn staleness and preservation after an inference failure. No synthetic summaries or metrics were written to J's real comparison cohort. Existing lab engine/provider/allocator warnings remain. The first fixture setup used an unavailable bundled psql path; it was corrected to the installed psql client before the successful browser checks.
 
 Further source inspection resolves the idle-watcher inventory ambiguity: its runner records skipped, unconfigured evaluations as succeeded. Zero configurations, proposals, associated AI events and spend rows are present. These are consistent with no-op wakes, not evidence of 65 generated decisions. The feature checklist records this limitation without enabling autonomous continuation. Historical Ask conversation display is the next migration gap.
+
+
+## Read-only Ask conversation import (under verification)
+
+Source inspection confirms one stored Ask thread with two messages, referring explicitly to five mapped native source identities across m3/m5/J. Import format 5 preserves that conversation under those recorded references as inert archive data, with source IDs/timestamps, original message roles, reported token counts and errors. Conversation usage is not added to native turn/session accounting. No prompt is sent to an agent and no identity is inferred from conversation text.
+
+Bounds: three threads per session, latest ten messages per thread, 4,000 UTF-16 units per message and 64 source context IDs. Truncation and total-message coverage are visible; the immutable snapshot retains omissions. Secret redaction applies at ingestion. The existing content-retention action explicitly retains imported conversations alongside operator notes. No new database table or inference service is needed.
+
+Format upgrades restart an idempotent scan with distinct metadata delivery IDs, preserving unacknowledged old envelopes. PostgreSQL rejects lower-format metadata even if it arrives later; operator labels and native snapshots keep precedence. Surface enumeration covers both providers/all hosts, empty/absent archive tables, exact/unknown/duplicate source references, bounded/oversized messages, errors/unknown usage, delayed legacy delivery, retry/restart, React text escaping and desktop/mobile collapsed history. Current checks: 61 Python tests, 18 PostgreSQL tests and five metadata/turn unit tests pass; UI, lint/build/gate and actual replay are next.
+
+
+### Verified managed aliases
+
+Four formerly hostless source rows are resolved through the actual managed-session records: managed host equals supervisor host, and the recorded provider thread ID equals the native-thread event. Each native ID already exists in the audited cohort. This is explicit relational evidence, not inference from a working directory or loopback URL. The maps now cover 87 source records and 83 unique native identities: m3 68→66, m5 13→12, J 6→5. Eight source identities remain unassigned; seven recorded Claude transcript paths are absent on m3 and m5 remains unreachable. No host is guessed.
+
+Import format 5 now preserves these aliases under the canonical native session, including original archive/pin labels and notes. A group is archived only when every source record was archived; any pin is preserved, and operator preferences still override imports. Primary native metadata, activity and pricing remain authoritative. Aliases with conflicting recorded host/provider evidence are refused. Groups are capped at eight source records and archived notes disclose truncation. The four alias records account for the previously unresolved archived labels; replay/deployment is still pending.
+
+Updated verification: 62 Python tests, 18 PostgreSQL tests and five metadata/turn tests pass, including legacy queued envelopes, format downgrade refusal, exact context references, alias coalescing, label precedence, empty native accounting and zero task creation. The first pre-alias serial build passed; final alias-aware UI/build/gate and actual replay remain next.
+
+### Ask and alias validation completed (2026-09-15 22:01 UTC)
+
+- 62 Python collector/import tests, 18 focused PostgreSQL tests, five core metadata/turn unit tests and five UI tests passed. Scoped lint has zero errors (two ignored-test warnings and one existing control-regex warning).
+- Final alias-aware `verify:fast`: all 25 steps passed in 194.4 seconds, including build/typecheck and real boot smoke. Serial merge gate: static checks plus 754 tests passed; no full suite or parallel workers.
+- Synthetic archive rendered at desktop 1440×1000 and mobile 390×844; screenshots inspected. Both message roles, archive alias labels, coverage and literal HTML-like text are visible. The text creates no button. Existing lab engine/provider/allocator warnings remain; this is not a clean-console claim.
+- Verified implementation is ready for the isolated J server; real format-5 replay has not started. No AgentPulse changes or production cutover.

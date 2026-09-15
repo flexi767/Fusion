@@ -91,7 +91,8 @@ export class ExternalSessionStore {
         await tx.insert(externalSessionDetails).values({ sessionId: id, importedMetadata, archived: importedMetadata.archived, pinned: importedMetadata.pinned })
           .onConflictDoUpdate({ target: externalSessionDetails.sessionId, set: { importedMetadata,
             archived: sql`CASE WHEN ${externalSessionDetails.preferencesRevision}=0 THEN ${importedMetadata.archived} ELSE ${externalSessionDetails.archived} END`,
-            pinned: sql`CASE WHEN ${externalSessionDetails.preferencesRevision}=0 THEN ${importedMetadata.pinned} ELSE ${externalSessionDetails.pinned} END` } });
+            pinned: sql`CASE WHEN ${externalSessionDetails.preferencesRevision}=0 THEN ${importedMetadata.pinned} ELSE ${externalSessionDetails.pinned} END` },
+            setWhere: sql`coalesce((${externalSessionDetails.importedMetadata}->>'formatVersion')::int, 1) <= ${importedMetadata.formatVersion ?? 1}` });
       }
       return { id, revision: current.revision, applied: applied.length > 0 };
     });
