@@ -83,10 +83,10 @@ function SessionSummary({ detail, refresh }: { detail: SessionDetail; refresh: (
   </section>;
 }
 
-export function SessionHistory({ id }: { id: string }) {
+export function SessionHistory({ id, embedded = false }: { id: string; embedded?: boolean }) {
   const [basis, setBasis] = useState<"current" | "recorded">("current");
   const generation = useRef(0);
-  const targetId = new URLSearchParams(window.location.search).get("turn");
+  const targetId = embedded ? null : new URLSearchParams(window.location.search).get("turn");
   const [target, setTarget] = useState<SessionTurn>();
   const [targetCost, setTargetCost] = useState<SessionDetail["cost"]>();
   const [targetError, setTargetError] = useState("");
@@ -140,17 +140,17 @@ export function SessionHistory({ id }: { id: string }) {
     catch { setError("Older history could not be loaded. Please retry."); }
     finally { setBusy(false); }
   };
-  return <ViewLayout header={<ViewHeader title={detail?.session.observation.title ?? "Session history"} backAction={{ label: "Back to sessions", onClick: () => { window.location.search = "?view=sessions"; } }} />}>
-    <div className="sessions-view">
+  const content = <div className="sessions-view">
       <label>Cost basis<select value={basis} onChange={event => setBasis(event.target.value as "current" | "recorded")}><option value="current">Recalculate at current rates</option><option value="recorded">Recorded rate snapshots</option></select></label>
       {targetError && <p role="alert">{targetError}</p>}
       {error && <p role="alert">{error}</p>}
       {!detail && !error && <p role="status">Loading history…</p>}
       {detail?.wholeSessionUsage && <section className="session-card"><h3>Whole session: {formatCost(detail.wholeSessionUsage.usd, detail.wholeSessionUsage.usd === null)}</h3><p>{detail.wholeSessionUsage.turns} collected turns · {detail.wholeSessionUsage.unreportedTurns} turns without usage · {detail.wholeSessionUsage.unpricedRows} unpriced model groups. Estimate at {detail.wholeSessionUsage.basis === "recorded" ? "recorded" : "current"} rates.</p></section>}
       {detail && <><p>{detail.session.hostId} · {detail.session.provider} · {detail.session.observation.activity} · Observed session</p><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} label={`Latest ${detail.cost.coveredTurns} turns`} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /><SessionPreferences id={id} details={detail.details} refresh={refresh} /></>}
+      {detail?.details?.taskId && detail.details.taskProjectId && <p>Explicitly linked to <a href={`?project=${encodeURIComponent(detail.details.taskProjectId)}&task=${encodeURIComponent(detail.details.taskId)}`}>{detail.details.taskId}</a>. Usage remains in Sessions and is not added again to task costs.</p>}
       <div className="sessions-grid">{turns.map(turn => <SessionTurnResult key={turn.id} turn={turn} sessionId={id} cost={detail?.turnCosts?.[turn.id] ?? olderCosts[turn.id] ?? (turn.id === targetId ? targetCost : undefined)} />)}</div>
       {detail && turns.length === 0 && <p>No turn history has been collected yet.</p>}
       {next && <button className="btn btn-secondary" disabled={busy} onClick={() => void more()}>Load older turns</button>}
-    </div>
-  </ViewLayout>;
+    </div>;
+  return embedded ? content : <ViewLayout header={<ViewHeader title={detail?.session.observation.title ?? "Session history"} backAction={{ label: "Back to sessions", onClick: () => { window.location.search = "?view=sessions"; } }} />}>{content}</ViewLayout>;
 }

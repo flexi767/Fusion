@@ -1,0 +1,5 @@
+.task-linked-sessions { margin-block: var(--space-lg); overflow-wrap: anywhere; }
+.task-linked-sessions-actions { display: flex; flex-wrap: wrap; align-items: end; gap: var(--space-sm); margin-block: var(--space-md); }
+.task-linked-sessions-actions label { display: flex; flex-direction: column; gap: var(--space-xs); min-inline-size: 0; max-inline-size: 100%; }
+.task-linked-sessions summary { cursor: pointer; padding-block: var(--space-sm); }
+.task-linked-sessions summary:focus-visible { outline: var(--btn-border-width) solid var(--accent); outline-offset: var(--space-xs); }

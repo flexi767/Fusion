@@ -1,6 +1,7 @@
 import type { SessionObservation } from "@fusion/core";
 import { api } from "./client/client.js";
 export interface ObservedSession {
+  taskProjectId?: string | null; taskId?: string | null; taskLinkRevision?: number | null;
   archived?: boolean | null; pinned?: boolean | null;
   id: string; hostId: string; provider: string; nativeSessionId: string;
   usageSummary?: import("@fusion/core").ExternalSessionUsageSummary | null;
@@ -44,3 +45,9 @@ export const fetchExternalSessionUsage = (filters: { from?: string; to?: string;
 export const fetchExternalSessionTurn = (id: string, turnId: string, basis: "current" | "recorded" = "current") => api<{ turn: import("@fusion/core").SessionTurn; cost: SessionDetail["cost"] }>(`/external-sessions/${encodeURIComponent(id)}/turns/${encodeURIComponent(turnId)}?basis=${basis}`);
 
 export const saveSessionPreferences = (id: string, archived: boolean, pinned: boolean, expectedRevision: number) => api(`/external-sessions/${encodeURIComponent(id)}/preferences`, { method: "PUT", body: JSON.stringify({ archived, pinned, expectedRevision }) });
+
+export const fetchTaskSessions = (taskId: string, projectId?: string, before?: string) => {
+  const query = new URLSearchParams(); if (projectId) query.set("projectId", projectId); if (before) query.set("before", before);
+  return api<Pick<SessionPage, "enabled" | "sessions" | "nextCursor">>(`/tasks/${encodeURIComponent(taskId)}/external-sessions?${query}`);
+};
+export const linkTaskSession = (taskId: string, sessionId: string, linked: boolean, expectedRevision: number, projectId?: string) => api(`/tasks/${encodeURIComponent(taskId)}/external-sessions/${encodeURIComponent(sessionId)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`, { method: "PUT", body: JSON.stringify({ linked, expectedRevision }) });

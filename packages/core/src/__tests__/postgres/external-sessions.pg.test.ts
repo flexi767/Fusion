@@ -181,4 +181,25 @@ pgDescribe("External session durable ingestion", () => {
     expect(turns.sessions.filter(row => row.usd === null).map(row => row.turnId).sort()).toEqual(["0", "3"]);
   });
 
+  it("links explicitly within a project without task enrollment, transfer, replay overwrite or control grants", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const { id } = await store.ingest("m3", "native", observation);
+    expect((await store.list({ taskProjectId: "one", taskId: "FN-1" })).sessions).toHaveLength(0);
+    await store.linkTask(id, "one", "FN-1", true, 0);
+    const restarted = new ExternalSessionStore(h.layer());
+    const linked = await restarted.list({ taskProjectId: "one", taskId: "FN-1" });
+    expect(linked.sessions.map(row => row.id)).toEqual([id]);
+    expect((await store.list({ taskProjectId: "two", taskId: "FN-1" })).sessions).toHaveLength(0);
+    await expect(store.linkTask(id, "two", "FN-1", true, 1)).rejects.toThrow("ownership conflict");
+    await expect(store.linkTask(id, "two", "FN-1", false, 1)).rejects.toThrow("ownership conflict");
+    await expect(store.linkTask(id, "one", "FN-1", false, 0)).rejects.toThrow("revision");
+    await store.ingest("m3", "import", { ...observation, taskId: "FN-2" }, [], true);
+    expect((await store.list({ taskProjectId: "one", taskId: "FN-1" })).sessions).toHaveLength(1);
+    expect(await h.store().listTasks()).toHaveLength(0);
+    expect((await store.get(id))?.observation).not.toHaveProperty("capabilities");
+    await store.linkTask(id, "one", "FN-1", false, 1);
+    expect((await store.list({ taskProjectId: "one", taskId: "FN-1" })).sessions).toHaveLength(0);
+    expect(await store.get(id)).not.toBeNull();
+  });
+
 });

@@ -88,12 +88,16 @@ export class ExternalSessionStore {
     });
   }
 
-  async list(query: { hostId?: string; provider?: string; activity?: string; q?: string; saved?: string; before?: string; limit?: number } = {}) {
+  async list(query: { taskProjectId?: string; taskId?: string; hostId?: string; provider?: string; activity?: string; q?: string; saved?: string; before?: string; limit?: number } = {}) {
     if (query.q && query.q.length > 256) throw new Error("Invalid session search");
     const search = query.q?.trim();
     const limit = Math.max(1, Math.min(100, query.limit ?? 50));
     const before = cursor(query.before);
-    const rows = await this.layer.db.select({ ...getTableColumns(externalSessions), archived: externalSessionDetails.archived, pinned: externalSessionDetails.pinned }).from(externalSessions).leftJoin(externalSessionDetails, eq(externalSessionDetails.sessionId, externalSessions.id)).where(and(
+    const rows = await this.layer.db.select({ ...getTableColumns(externalSessions), archived: externalSessionDetails.archived, pinned: externalSessionDetails.pinned,
+      taskProjectId: externalSessionDetails.taskProjectId, taskId: externalSessionDetails.taskId, taskLinkRevision: externalSessionDetails.taskLinkRevision,
+    }).from(externalSessions).leftJoin(externalSessionDetails, eq(externalSessionDetails.sessionId, externalSessions.id)).where(and(
+      query.taskProjectId ? eq(externalSessionDetails.taskProjectId, query.taskProjectId) : undefined,
+      query.taskId ? eq(externalSessionDetails.taskId, query.taskId) : undefined,
       query.saved === "archived" ? eq(externalSessionDetails.archived, true) : query.saved === "pinned" ? eq(externalSessionDetails.pinned, true) : undefined,
       query.hostId ? eq(externalSessions.hostId, query.hostId) : undefined,
       query.provider ? eq(externalSessions.provider, query.provider) : undefined,
@@ -115,6 +119,21 @@ export class ExternalSessionStore {
       const [row] = await tx.update(externalSessionDetails).set({ archived, pinned, preferencesRevision: expectedRevision + 1 })
         .where(and(eq(externalSessionDetails.sessionId, id), eq(externalSessionDetails.preferencesRevision, expectedRevision))).returning();
       if (!row) throw new Error("Session preferences revision conflict");
+      return row;
+    });
+  }
+
+  /** Explicit metadata association only. Never mutates a task or grants runtime ownership. */
+  async linkTask(id: string, projectId: string, taskId: string, linked: boolean, expectedRevision: number) {
+    if (![projectId, taskId].every(value => typeof value === "string" && value.trim() && value.length <= 256)
+      || typeof linked !== "boolean" || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("Invalid task link");
+    return this.layer.db.transaction(async tx => {
+      await tx.insert(externalSessionDetails).values({ sessionId: id }).onConflictDoNothing();
+      const [row] = await tx.update(externalSessionDetails).set({ taskProjectId: linked ? projectId : null, taskId: linked ? taskId : null, taskLinkRevision: expectedRevision + 1 })
+        .where(and(eq(externalSessionDetails.sessionId, id), eq(externalSessionDetails.taskLinkRevision, expectedRevision),
+          sql`((${externalSessionDetails.taskProjectId} IS NULL AND ${externalSessionDetails.taskId} IS NULL) OR
+            (${externalSessionDetails.taskProjectId}=${projectId} AND ${externalSessionDetails.taskId}=${taskId}))`)).returning();
+      if (!row) throw new Error("Task link revision or ownership conflict");
       return row;
     });
   }

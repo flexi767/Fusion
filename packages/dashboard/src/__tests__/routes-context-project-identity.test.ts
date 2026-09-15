@@ -48,6 +48,19 @@ describe("routes/context central project identity seam", () => {
     vi.spyOn(projectStoreResolver, "getOrCreateProjectStore").mockResolvedValue(boundStore);
   });
 
+  it("reuses an injected PostgreSQL project scope without an engine across HTTP, context and realtime", async () => {
+    const injected = { getProjectId: () => "preview-project" } as unknown as TaskStore;
+    expect(await getScopedStore(makeReq("preview-project"), injected, {})).toBe(injected);
+    expect((await getProjectContext(makeReq("preview-project"), injected, {})).store).toBe(injected);
+    expect(await resolveScopedStore("preview-project", injected, undefined, undefined, {})).toBe(injected);
+    expect(projectStoreResolver.getOrCreateProjectStore).not.toHaveBeenCalled();
+    expect(await getScopedStore(makeReq("other-project"), injected, {})).toBe(boundStore);
+    expect(projectStoreResolver.getOrCreateProjectStore).toHaveBeenCalledWith("other-project");
+    const manager = { getEngine: () => undefined } as unknown as NonNullable<ServerOptions["engineManager"]>;
+    expect(await getScopedStore(makeReq("preview-project"), injected, { engineManager: manager })).toBe(boundStore);
+    expect(projectStoreResolver.getOrCreateProjectStore).toHaveBeenCalledWith("preview-project");
+  });
+
   it("(c) no request id and no engine → raw launch-dir store with a one-time warn (legacy)", async () => {
     const warn = vi.fn();
     const options = { runtimeLogger: { warn, info: vi.fn(), error: vi.fn(), child: vi.fn(), scope: "t" } } as unknown as ServerOptions;

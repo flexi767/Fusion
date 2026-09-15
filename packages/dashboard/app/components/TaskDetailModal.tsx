@@ -70,6 +70,7 @@ import { TaskPlannerChatTab } from "./TaskPlannerChatTab";
 import { TaskReviewTab } from "./TaskReviewTab";
 import { TaskChangesTab } from "./TaskChangesTab";
 import { TaskSummaryTab } from "./TaskSummaryTab";
+import { TaskLinkedSessions } from "./TaskLinkedSessions";
 import { TaskRecommendationsTab } from "./TaskRecommendationsTab";
 import { MergeDetails } from "./MergeDetails";
 import { TaskCostTab } from "./TaskCostTab";
@@ -5756,6 +5757,7 @@ export function TaskDetailContent({
           ) : activeTab === "summary" ? (
             <div className="detail-section detail-section--summary">
               <TaskSummaryTab task={workingTask} results={historyWorkflowResults} loading={workflowResultsLoading} />
+              <TaskLinkedSessions key={`${projectId ?? ""}:${workingTask.id}`} taskId={workingTask.id} projectId={projectId} />
               {hasRecommendations && (
                 <section className="task-summary-section task-summary-section--recommendations">
                   <h3>{t("taskDetail.tabs.recommendations", "Recommendations")}</h3>

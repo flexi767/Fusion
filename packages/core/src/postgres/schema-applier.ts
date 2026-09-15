@@ -86,7 +86,7 @@ touches no data; it must advance in the same change that ships a new migration f
 /* FNXC:PatchnodeLedger 2026-08-28-12:16: the permanent ledger table must exist before TaskStore can commit a completion move atomically with its entry. */
 /* FNXC:ChatSidebarPerf 2026-09-08-04:48: baseline marker includes the chat-message recency index required for index-backed sidebar previews. */
 /* FNXC:OverlapWaitSynchronization 2026-09-13-05:10: the ceiling includes the retired-phase drain, so startup completes it before overlap readers run. */
-export const SCHEMA_BASELINE_VERSION = "0084";
+export const SCHEMA_BASELINE_VERSION = "0085";
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -1697,6 +1697,12 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(join(MIGRATIONS_DIR, "0084_external_session_archive.sql"), "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${"0084"}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    if (!applied.includes("0085")) {
+      const migrationSql = await readFile(join(MIGRATIONS_DIR, "0085_external_session_task_links.sql"), "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${"0085"}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };

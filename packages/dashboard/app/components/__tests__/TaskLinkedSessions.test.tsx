@@ -1,0 +1,53 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, expect, it, vi } from "vitest";
+import { TaskLinkedSessions } from "../TaskLinkedSessions";
+const { list, search, link, detail } = vi.hoisted(() => ({ list: vi.fn(), search: vi.fn(), link: vi.fn(), detail: vi.fn() }));
+vi.mock("../../api/external-sessions", () => ({ fetchTaskSessions: list, fetchExternalSessions: search, linkTaskSession: link, fetchExternalSession: detail }));
+const session = { id: "session", hostId: "m3", provider: "codex", nativeSessionId: "native", taskLinkRevision: 0, observation: { title: "Independent work", activity: "waiting" } };
+beforeEach(() => {
+  window.history.replaceState({}, "", "/?project=project&task=FN-1");
+  list.mockReset().mockResolvedValue({ enabled: true, sessions: [], nextCursor: null });
+  search.mockReset().mockResolvedValue({ enabled: true, sessions: [session], nextCursor: null });
+  link.mockReset().mockResolvedValue({}); detail.mockReset();
+});
+it("links only the selected session, preserves the input node and uses the canonical revision", async () => {
+  const user = userEvent.setup(); render(<TaskLinkedSessions taskId="FN-1" projectId="project" />);
+  await user.click(await screen.findByText("Link a session"));
+  const input = screen.getByRole("textbox", { name: "Search observed sessions" });
+  await user.type(input, "Independent"); expect(screen.getByRole("textbox")).toBe(input);
+  await user.click(screen.getByRole("button", { name: "Search sessions" }));
+  expect(link).not.toHaveBeenCalled();
+  list.mockResolvedValue({ enabled: true, sessions: [{ ...session, taskId: "FN-1", taskLinkRevision: 1 }], nextCursor: null });
+  await user.click(await screen.findByRole("button", { name: "Link to this task" }));
+  await waitFor(() => expect(link).toHaveBeenCalledWith("FN-1", "session", true, 0, "project"));
+  await screen.findByRole("button", { name: "Show history" });
+  await user.click(screen.getByRole("button", { name: "Unlink session" }));
+  await waitFor(() => expect(link).toHaveBeenLastCalledWith("FN-1", "session", false, 1, "project"));
+});
+it("hides disabled integration and prevents an existing task link from being reassigned", async () => {
+  list.mockResolvedValue({ enabled: false, sessions: [], nextCursor: null });
+  const first = render(<TaskLinkedSessions taskId="FN-1" />);
+  await waitFor(() => expect(list).toHaveBeenCalled()); expect(first.container.textContent).toBe(""); first.unmount();
+  list.mockResolvedValue({ enabled: true, sessions: [], nextCursor: null });
+  search.mockResolvedValue({ sessions: [{ ...session, taskId: "FN-2" }] });
+  const user = userEvent.setup(); render(<TaskLinkedSessions taskId="FN-1" />);
+  await user.click(await screen.findByText("Link a session"));
+  await user.click(screen.getByRole("button", { name: "Search sessions" }));
+  await screen.findByText("Linked to FN-2; unlink it there before changing tasks.");
+  expect(screen.queryByRole("button", { name: "Link to this task" })).toBeNull(); expect(link).not.toHaveBeenCalled();
+});
+it.each([390, 1440])("renders the shared prompt/result/patch history at width %i without fetching until opened", async width => {
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+  list.mockResolvedValue({ enabled: true, sessions: [session], nextCursor: null });
+  detail.mockResolvedValue({ session, turns: [{ id: "turn", startedAt: "2026-09-15T12:00:00Z", completedAt: null, durationMs: null, durationSource: "timestamps", prompts: ["Original prompt"], response: "Shared result", usage: [], toolCalls: 0, files: [{ path: "../external.ts", scope: "external", diff: "+fix", added: 1, removed: 0, available: true }] }], nextCursor: null, runtime: null, commands: [], details: null, summariesEnabled: false, cost: { usd: null, usage: [], coveredTurns: 1, unreportedTurns: 1, unpricedRows: 0 } });
+  const user = userEvent.setup(); render(<TaskLinkedSessions taskId="FN-1" />);
+  await screen.findByRole("button", { name: "Show history" }); expect(detail).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "Show history" }));
+  await screen.findByText("Shared result"); expect(screen.getByText("Original prompt")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Back to sessions" })).toBeNull();
+  await user.click(screen.getByText("1 file changes"));
+  await user.click(screen.getByText("../external.ts · outside project · +1/−0"));
+  expect(screen.getByText("+fix")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Link to this turn" }).getAttribute("href")).toContain("session=session&turn=turn");
+});

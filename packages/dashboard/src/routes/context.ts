@@ -187,6 +187,12 @@ export async function resolveStoreForProjectId(
     return store;
   }
 
+  // A dashboard without an engine still has a project-bound PostgreSQL store.
+  // Reuse that exact scope for HTTP and realtime consumers; another project
+  // must continue through the canonical resolver. A manager may own shutdown,
+  // so its absent-engine case retains the existing recovery path.
+  if (!engineManager && store.getProjectId?.() === resolvedId) return store;
+
   return getOrCreateProjectStore(resolvedId);
 }
 

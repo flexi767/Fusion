@@ -5,7 +5,7 @@ import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateSessionCollector } from "./session-collector-auth.js";
 
-export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store, options, registerDispose }) => {
+export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store, options, registerDispose, getScopedStore }) => {
   const layer = () => {
     const layer = options?.centralCore?.asyncLayer ?? store.getAsyncLayer();
     if (!layer) throw new ApiError(503, "Sessions require PostgreSQL");
@@ -85,6 +85,28 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     const settings = await store.getGlobalSettingsStore().getSettings();
     try { return res.json(await externalSessionAnalytics(layer(), { from: from as string | undefined, to: to as string | undefined, host: host as string | undefined, model: model as string | undefined, groupBy: groupBy as "session" | "turn" | undefined, basis: basis as "current" | "recorded" | undefined }, settings.modelPricingOverrides)); }
     catch (error) { if (error instanceof Error && error.message.startsWith("Invalid analytics")) throw new ApiError(400, error.message); throw error; }
+  });
+  const linkedTask = async (req: import("express").Request) => {
+    const scoped = await getScopedStore(req);
+    const projectId = scoped.getProjectId();
+    if (!projectId) throw new ApiError(409, "Task links require a registered project");
+    const taskId = String(req.params.taskId);
+    const task = await scoped.getTask(taskId).catch(() => null);
+    if (!task) throw new ApiError(404, "Task not found in this project");
+    return { projectId, taskId };
+  };
+  router.get("/tasks/:taskId/external-sessions", async (req, res) => {
+    if (process.env.FUSION_SESSIONS !== "1") return res.json({ enabled: false, sessions: [], nextCursor: null });
+    const task = await linkedTask(req);
+    const result = await sessions().list({ taskProjectId: task.projectId, taskId: task.taskId, before: typeof req.query.before === "string" ? req.query.before : undefined });
+    return res.json({ enabled: true, ...result });
+  });
+  router.put("/tasks/:taskId/external-sessions/:sessionId", async (req, res) => {
+    if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
+    const task = await linkedTask(req);
+    if (!await sessions().get(String(req.params.sessionId))) throw new ApiError(404, "Session not found");
+    try { return res.json(await sessions().linkTask(String(req.params.sessionId), task.projectId, task.taskId, req.body?.linked, req.body?.expectedRevision)); }
+    catch { throw new ApiError(409, "Session link changed elsewhere or belongs to another task"); }
   });
   router.get("/external-sessions/:id", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
