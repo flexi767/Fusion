@@ -273,3 +273,10 @@ J's wider native scan reached 6,002 transcript files and 3,450 stored sessions w
 Original symptoms: unchanged transcripts lacking telemetry were re-enqueued because the live skip guard required telemetry to exist; all old discovery snapshots also shared live priority and could occupy the entire record budget. Exact reproduction uses both provider shapes without usage, repeated unchanged/partial-line scans, and a filled background queue followed by fresh native events. Assertions prove stable live revision/cursor on unchanged input, independent fresh-event reserve, newest fresh event delivered first, atomic cold-to-live coalescing, restart preservation and non-destructive priority ageing. All 36 Python tests pass.
 
 Collector v5 adds a live-parser version checkpoint, distinct from the unchanged v4 historical ledger, and reserves 500 queue records plus 2 MiB for fresh native updates. Older discovery/backfill pauses before consuming that reserve. No pending row, parser history or AgentPulse cursor is evicted. The comparison collectors will be upgraded with their existing spools; the J server remains the isolated build described above.
+
+
+### Collector v5 deployed (2026-09-15 18:42 UTC)
+
+Both comparison collectors now report `fusion-native-5` and successful acknowledgements after restarting with their original spools. Frozen code lives in `comparison-collector-v5-885de68fc` on each host. J held 6,600 sessions (6,537 Codex/63 Claude), m3 760 (744 Codex/16 Claude), and the J preview held 2,557 historical turns at this checkpoint. Discovery/backfill continues.
+
+Both background queues correctly pause around the 4,500-record budget with zero rejected deliveries or parsing/delivery errors. The m3 queue simultaneously retained three fresh-priority updates in the reserved capacity. This is an expected backfill capacity signal, not a completed catch-up claim. AgentPulse, its supervisor, the preview server and J comparison collector were all active. The preview server still runs the frozen `62deba2ca` bundle; later source changes will be deployed deliberately.
