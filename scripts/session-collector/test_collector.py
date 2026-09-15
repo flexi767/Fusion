@@ -32,6 +32,21 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT body FROM pending').fetchone()[0], pending)
         drain(self.db, lambda e: dict(acknowledged=True, eventId=e['eventId']))
         self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0], 0)
+    def test_claude_native_ownership_survives_sqlite_restart_and_appended_history_replay(self):
+        first=dict(type='user',uuid='first',sessionId='claude-1',cwd='/repo',timestamp='2026-09-15T12:00:00Z',message=dict(content='First'))
+        answer=dict(type='assistant',uuid='answer',parentUuid='first',timestamp='2026-09-15T12:00:01Z',message=dict(id='request',model='claude',stop_reason='end_turn',content=[dict(type='text',text='Done')],usage=dict(input_tokens=10,cache_read_input_tokens=0,cache_creation_input_tokens=0,output_tokens=2)))
+        second={**first,'uuid':'second','timestamp':'2026-09-15T12:01:00Z','message':dict(content='Second')}
+        self.write([first,answer,second]);scan_file(self.db,self.path,'claude')
+        drain(self.db,lambda body:dict(acknowledged=True,eventId=body['eventId']))
+        self.db.close();self.db=connect(self.root/'spool.sqlite')
+        with self.path.open('a') as stream:stream.write(json.dumps(first)+'\n'+json.dumps(answer)+'\n')
+        scan_file(self.db,self.path,'claude')
+        rows={key:json.loads(value) for key,value in self.db.execute("SELECT key,value FROM parser_records WHERE namespace='turns'")}
+        self.assertEqual(rows['first']['usage'][0]['requests'],1)
+        self.assertIsNone(rows['second']['completedAt']);self.assertEqual(rows['second']['usage'],[])
+        self.assertEqual(rows['second']['prompts'],['Second'])
+        self.assertGreater(self.db.execute("SELECT count(*) FROM parser_records WHERE namespace='claudeOwners'").fetchone()[0],0)
+
     def test_rotation_preserves_session_revision_and_waiting(self):
         self.write(self.codex()); scan_file(self.db, self.path, 'codex')
         self.path.unlink()

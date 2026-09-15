@@ -135,4 +135,51 @@ class TurnParserTests(unittest.TestCase):
         self.assertEqual(state['turns']['first']['response'],'Finished')
         self.assertEqual(state['turns']['second']['response'],'Second result')
 
+
+    def test_replayed_claude_records_keep_native_owners_and_never_complete_a_newer_turn(self):
+        import copy
+        state={}
+        def event(kind,uuid,at,content,**extra):
+            return dict(type=kind,uuid=uuid,timestamp=at,message=dict(content=content,**extra.pop('message',{})),**extra)
+        first=event('user','first','2026-09-15T12:00:00Z','First prompt')
+        answer=event('assistant','answer','2026-09-15T12:00:01Z',[dict(type='text',text='First answer')],parentUuid='first',message=dict(id='request',model='claude',stop_reason='end_turn',usage=dict(input_tokens=10,cache_read_input_tokens=0,cache_creation_input_tokens=0,output_tokens=2)))
+        second=event('user','second','2026-09-15T12:01:00Z','Second prompt',parentUuid='answer')
+        for e in [first,answer,second]:consume(state,e,'claude_code')
+        expected=copy.deepcopy(state['turns']['second'])
+        for e in [first,answer,first,answer]:consume(state,e,'claude_code')
+        self.assertEqual(state['active'],'second')
+        self.assertEqual(state['turns']['second'],expected)
+        # A changed snapshot of the same request still belongs to the first turn.
+        amended=copy.deepcopy(answer);amended['uuid']='answer-amended';amended['message']['usage']['output_tokens']=3
+        consume(state,amended,'claude_code')
+        self.assertEqual(state['turns']['first']['usage'][0]['outputTokens'],3)
+        self.assertEqual(state['turns']['first']['usage'][0]['requests'],1)
+        self.assertEqual(state['turns']['second'],expected)
+        # Delayed provider durations route by native parent, never the current turn.
+        consume(state,dict(type='system',uuid='duration',parentUuid='answer',timestamp='2026-09-15T12:00:02Z',subtype='turn_duration',durationMs=2000),'claude_code')
+        self.assertEqual(state['turns']['first']['durationMs'],2000)
+        self.assertIsNone(state['turns']['second']['completedAt'])
+        self.assertEqual(state['active'],'second')
+
+    def test_late_claude_assistant_cannot_rewind_output_or_current_context(self):
+        state={}
+        consume(state,dict(type='user',uuid='first',timestamp='2026-09-15T12:00:00Z',message=dict(content='Prompt')),'claude_code')
+        for uuid,at,value,tokens,stop in [('new','2026-09-15T12:00:03Z','Latest',20,'end_turn'),('old','2026-09-15T12:00:01Z','Earlier',100,None)]:
+            consume(state,dict(type='assistant',uuid=uuid,parentUuid='first',timestamp=at,message=dict(id=uuid,model='claude',content=[dict(type='text',text=value)],stop_reason=stop,usage=dict(input_tokens=tokens,cache_read_input_tokens=0,cache_creation_input_tokens=0,output_tokens=2))),'claude_code')
+        turn=state['turns']['first']
+        self.assertEqual(turn['response'],'Latest');self.assertEqual(turn['completedAt'],'2026-09-15T12:00:03Z')
+        self.assertEqual(turn['usage'][0]['requests'],2);self.assertEqual(turn['usage'][0]['inputTokens'],120)
+        self.assertEqual(turn['usage'][0]['contextTokens'],20)
+
+
+    def test_partial_claude_request_replay_preserves_its_full_input_band_and_metadata(self):
+        state={}
+        for index,tokens in enumerate([250000,0]):
+            consume(state,dict(type='assistant',uuid=str(index),timestamp='2026-09-15T12:00:00Z',message=dict(id='request',**({'model':'claude'} if index==0 else {}),content=[],usage=dict(input_tokens=tokens,cache_read_input_tokens=0,cache_creation_input_tokens=0,output_tokens=2,**({'speed':'standard'} if index==0 else {})))),'claude_code')
+        usage=next(iter(state['turns'].values()))['usage']
+        self.assertEqual(len(usage),1)
+        self.assertEqual(usage[0]['inputTokens'],250000);self.assertEqual(usage[0]['contextTokens'],250000)
+        self.assertTrue(usage[0]['longContext']);self.assertEqual(usage[0]['model'],'claude')
+        self.assertEqual(usage[0]['requests'],1);self.assertEqual(usage[0]['serviceTier'],'standard')
+
 if __name__ == '__main__':unittest.main()

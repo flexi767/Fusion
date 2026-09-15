@@ -200,3 +200,19 @@ come next, then turn backfill. Discovery/history may occupy at most 4,500 of the
 for fresh live events. Coalescing updates priority atomically with the exact body.
 Old fresh-priority rows age back into discovery priority without deleting data.
 Capacity pressure preserves every unacknowledged row and checkpoint.
+
+
+## Resumed Claude history (collector v6)
+
+Claude transcripts can append earlier native records again. Collector v6 persists
+native event/request ownership in the SQLite parser ledger, routes delayed events
+through their native parent, and ignores exact replay without moving the active
+turn. Changed snapshots of the same request update its original turn. Older
+assistant output cannot rewind a newer response or completion. Partial usage
+snapshots retain the request's known counters, context band and metadata.
+
+Only Claude history advances to parser version 5 and reparses from its native
+file; Codex history remains at parser version 4. Live cursors, monotonically
+increasing delivery revisions and pending acknowledgements are preserved. The
+new ownership namespace is subject to the existing parser byte/record bounds.
+Keep AgentPulse and its independent recovery snapshot throughout comparison.

@@ -6,7 +6,7 @@ request and deduplication records remain durable for late events and replay.
 import json
 from collections.abc import MutableMapping
 
-NAMESPACES = ('turns', 'requests', 'fallback', 'calls', 'edits', 'promptEvents', 'nativePrompts', 'toolEvents')
+NAMESPACES = ('turns', 'requests', 'fallback', 'calls', 'edits', 'promptEvents', 'nativePrompts', 'toolEvents', 'claudeOwners')
 class ParserLedgerCapacity(ValueError):pass
 
 def initialize(db):

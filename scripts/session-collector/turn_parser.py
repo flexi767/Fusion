@@ -124,18 +124,43 @@ def consume(state,e,agent):
     m=e.get('message') or {}
     if not isinstance(m,dict):return
     content=m.get('content') or []
+    # Resumed transcripts append old native records again. Ownership is global to
+    # this transcript, not the currently active turn; changed request snapshots
+    # still merge into their original owner after a restart.
+    owners=state.setdefault('claudeOwners',{})
+    native_key='event:'+event_key(e.get('uuid'))
+    fingerprint=hashlib.sha256(json.dumps(e,sort_keys=True).encode()).hexdigest()
+    previous_owner=owners.get(native_key)
+    if previous_owner and previous_owner.get('fingerprint')==fingerprint:return
+    request_key='request:'+str(m['id']) if kind=='assistant' and m.get('id') else None
+    request_owner=owners.get(request_key) if request_key else None
+    parent=owners.get('event:'+str(e.get('parentUuid'))) if e.get('parentUuid') else None
+    owned=(previous_owner or request_owner or {}).get('turn')
+    def remember(r):
+        owners[native_key]={'turn':r['id'],'fingerprint':fingerprint}
+        if request_key:owners[request_key]={'turn':r['id']}
+    def claude_turn():
+        tid=owned or (parent or {}).get('turn')
+        active=turns.get(state.get('active'))
+        if not tid and active and at<active['startedAt']:tid='inferred:'+at
+        r=turn(tid);remember(r);return r
     if kind=='user':
         value=text(content)
-        if value and not e.get('isMeta') and event_key(e.get('uuid')) not in state.get('promptEvents',{}):
-            # User steering belongs to the active unfinished turn.
+        if value and not e.get('isMeta'):
             active=turns.get(state.get('active'))
-            if not active or active['completedAt']:state['active']=e.get('uuid') or 'claude:'+at
-            prompt(value)
+            tid=owned
+            if not tid:
+                tid=(e.get('uuid') or 'claude:'+at) if not active or active['completedAt'] or at<active['startedAt'] else active['id']
+                if not active or at>=active['startedAt']:
+                    state['active']=tid;state['activeStartedAt']=at
+            r=turn(tid);remember(r)
+            prompt(value,r['id'])
         if isinstance(content,list):
             for b in content:
                 if not isinstance(b,dict) or b.get('type')!='tool_result' or b.get('is_error'):continue
                 call=state.setdefault('calls',{}).get(b.get('tool_use_id'))
                 if not call:continue
+                remember(turn(call['turn']))
                 inp=call['input'];path=inp.get('file_path') or inp.get('path')
                 if path and call['name'] in ('Edit','Write','MultiEdit'):
                     r=turn(call['turn']);patch=e.get('toolUseResult') or {};diff=''
@@ -148,28 +173,39 @@ def consume(state,e,agent):
                             old=change.get('old_string','');new=change.get('new_string',change.get('content',''))
                             diff+=''.join(difflib.unified_diff([line+'\n' for line in old.splitlines()],[line+'\n' for line in new.splitlines()],fromfile=path,tofile=path))
                     edit(r,path,diff,b.get('tool_use_id'))
+        if native_key not in owners and parent:owners[native_key]={'turn':parent['turn'],'fingerprint':fingerprint}
         return
     if kind=='assistant':
-        r=turn();value=text(content)
-        if value:r['response']=bounded_text(value,131072)
-        if claude_turn_finished(m):r['completedAt']=at;r['durationMs']=elapsed(r['startedAt'],at)
-        else:r['completedAt']=None;r['durationMs']=None
+        r=claude_turn();value=text(content)
+        current=at>=r.get('_assistantAt',r['startedAt'])
+        if current:
+            r['_assistantAt']=at
+            if value:r['response']=bounded_text(value,131072)
+            if claude_turn_finished(m):r['completedAt']=at;r['durationMs']=elapsed(r['startedAt'],at)
+            else:r['completedAt']=None;r['durationMs']=None
         for b in content if isinstance(content,list) else []:
             if isinstance(b,dict) and b.get('type')=='tool_use':
-                r['completedAt']=None;r['durationMs']=None
+                if current:r['completedAt']=None;r['durationMs']=None
                 if b.get('id') not in state.setdefault('calls',{}):r['toolCalls']+=1
                 state['calls'][b.get('id')]={'name':b.get('name'),'input':b.get('input') or {},'turn':r['id']}
         u=m.get('usage')
         if isinstance(u,dict):
             key=r['id']+':'+event_key(m.get('id') or e.get('uuid'));cr=known(u.get('cache_read_input_tokens'));cw=known(u.get('cache_creation_input_tokens'));cache=u.get('cache_creation') or {};inclusive=total(known(u.get('input_tokens')),cr,cw)
-            req={'inputTokens':inclusive,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':known(cache.get('ephemeral_1h_input_tokens')) if cw != 0 else 0,'outputTokens':known(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'contextTokens':inclusive,'fast':u.get('speed')=='fast','serviceTier':u.get('speed'),'longContext':(inclusive or 0)>200000}
+            req={'inputTokens':inclusive,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':known(cache.get('ephemeral_1h_input_tokens')) if cw != 0 else 0,'outputTokens':known(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'_at':at,'contextTokens':inclusive,'fast':u.get('speed')=='fast','serviceTier':u.get('speed'),'longContext':(inclusive or 0)>200000}
             prev=state.setdefault('requests',{}).get(key)
             if prev:
                 for k in FIELDS:req[k]=maximum(req[k],prev[k])
                 req['cacheWriteHourTokens']=maximum(req['cacheWriteHourTokens'],prev['cacheWriteHourTokens'])
+                req['_at']=max(at,prev.get('_at',at))
+                req['contextTokens']=maximum(req['contextTokens'],prev.get('contextTokens'))
+                req['longContext']=(req['contextTokens'] or 0)>200000
+                if req['model']=='Unknown':req['model']=prev['model']
+                if req['serviceTier'] is None:req['serviceTier']=prev.get('serviceTier');req['fast']=prev['fast']
             state['requests'][key]=req;rebuild_usage(state,r)
     if kind=='system' and e.get('subtype')=='turn_duration':
-        r=turn();r['durationMs']=num(e.get('durationMs'));r['durationSource']='provider';r['completedAt']=at
+        r=claude_turn()
+        if at>=r.get('_assistantAt',r['startedAt']):
+            r['durationMs']=num(e.get('durationMs'));r['durationSource']='provider';r['completedAt']=at
 
 def elapsed(start,end):
     from datetime import datetime
@@ -180,9 +216,9 @@ def rebuild_usage(state,r):
     reqs=list(turn_requests(state,r['id']))
     if not reqs:reqs=state.get('fallback',{}).get(r['id'],[])
     grouped={}
-    for u in reqs:
+    for u in sorted(reqs,key=lambda value:value.get('_at','')):
         key=(u['model'],u['longContext'],u['fast'],u.get('serviceTier'))
-        if key not in grouped:grouped[key]={k:v for k,v in u.items() if k!='turn'}
+        if key not in grouped:grouped[key]={k:v for k,v in u.items() if k not in ('turn','_at')}
         else:
             g=grouped[key]
             for k in (*FIELDS,'cacheWriteHourTokens','requests'):g[k]=total(g[k],u[k])

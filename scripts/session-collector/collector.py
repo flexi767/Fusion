@@ -14,8 +14,9 @@ from datetime import datetime
 from turn_parser import consume, known, total, claude_turn_finished, bounded_text
 import parser_ledger
 
-VERSION = "fusion-native-5"
+VERSION = "fusion-native-6"
 PARSER_VERSION = 4
+CLAUDE_PARSER_VERSION = 5
 LIVE_PARSER_VERSION = 1
 MAX_READ = 1024 * 1024
 MAX_LINE = 4 * MAX_READ
@@ -218,8 +219,9 @@ def _scan_file(db, path, provider, max_pending=5000):
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
     old = db.execute('SELECT inode,offset,state FROM files WHERE path=?', (str(path),)).fetchone()
     offset, state = (old[1], json.loads(old[2])) if old and old[0] == inode and old[1] <= stat.st_size else (0, {})
-    if state and state.get('parserVersion') != PARSER_VERSION: offset,state=0,{}
-    state['parserVersion']=PARSER_VERSION
+    parser_version=CLAUDE_PARSER_VERSION if provider=='claude' else PARSER_VERSION
+    if state and state.get('parserVersion') != parser_version: offset,state=0,{}
+    state['parserVersion']=parser_version
     state.setdefault('ledgerGeneration',str(uuid.uuid4()))
     if offset == stat.st_size and not state.get("turnsState", {}).get("changed"): return False
     parser_ledger.attach(db,path,state)
