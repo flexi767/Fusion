@@ -16,7 +16,7 @@ import parser_ledger
 import delivery_metrics
 from opaque_records import ignored_header, scan_opaque_tail
 
-VERSION = "fusion-native-10"
+VERSION = "fusion-native-11"
 PARSER_VERSION = 4
 CLAUDE_PARSER_VERSION = 5
 LIVE_PARSER_VERSION = 1
@@ -111,6 +111,36 @@ def connect(path, timeout=5):
     delivery_metrics.initialize(db)
     db.commit()
     return db
+
+
+def history_needs_work(provider, stat, checkpoint):
+    if not checkpoint:return True
+    inode,offset,encoded=checkpoint
+    current_inode=f'{stat.st_dev}:{stat.st_ino}'
+    if inode!=current_inode or offset>stat.st_size:return True
+    try:state=json.loads(encoded)
+    except (ValueError,TypeError):return True
+    version=CLAUDE_PARSER_VERSION if provider=='claude' else PARSER_VERSION
+    retained=state.get('parserRetained')
+    if retained:
+        return not (retained.get('inode')==current_inode and retained.get('size')==stat.st_size and retained.get('mtimeNs')==stat.st_mtime_ns
+                    and retained.get('parserVersion')==version and (provider!='claude' or retained.get('nativeFormatVersion')==1))
+    return (state.get('parserVersion')!=version or offset!=stat.st_size or bool(state.get('turnsState',{}).get('changed'))
+            or (provider=='claude' and state.get('nativeFormatVersion')!=1) or state.get('opaqueRecord',{}).get('position',0)>stat.st_size)
+
+
+def history_work(db, files):
+    """Filter completed prefixes without materializing all serialized states."""
+    paths={str(path):(provider,path) for provider,path in files}
+    pending=set(paths)
+    for path,inode,offset,encoded in db.execute('SELECT path,inode,offset,state FROM files'):
+        candidate=paths.get(path)
+        if not candidate:continue
+        provider,native=candidate
+        try:needed=history_needs_work(provider,native.stat(),(inode,offset,encoded))
+        except OSError:needed=False  # Rediscovery will schedule it if it returns.
+        if not needed:pending.discard(path)
+    return [(provider,path) for provider,path in files if str(path) in pending]
 
 
 def discover(home):
@@ -447,13 +477,14 @@ def main():
                 except (OSError,ValueError,TypeError,KeyError) as error:
                     with db:db.execute('INSERT OR REPLACE INTO health VALUES (?,?)',('scan_error',type(error).__name__+': '+str(path)))
             # Discovery/live tail and history have independent cursors. Backfill cannot hide live sessions.
+            history=history_work(db,files)
             budget=8*MAX_READ
             saved=db.execute("SELECT value FROM health WHERE key='history_cursor'").fetchone()
             history_cursor=int(saved[0]) if saved else 0
             visited=0
-            while files and budget>0 and visited<min(200,len(files)):
-                provider,path=files[history_cursor % len(files)]
-                history_cursor=(history_cursor+1) % len(files);visited+=1
+            while history and budget>0 and visited<min(200,len(history)):
+                provider,path=history[history_cursor % len(history)]
+                history_cursor=(history_cursor+1) % len(history);visited+=1
                 previous=db.execute('SELECT offset FROM files WHERE path=?',(str(path),)).fetchone()
                 size=max(0,path.stat().st_size-(previous[0] if previous else 0))
                 # Failed/paused work consumes a budget too; one oversized history cannot monopolize discovery.

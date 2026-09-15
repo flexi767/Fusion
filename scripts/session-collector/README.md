@@ -53,6 +53,11 @@ First take a consistent AgentPulse snapshot with SQLite's supported backup API;
 do not copy a live WAL database file. Preserve its configuration independently.
 Use an audited JSON map keyed by AgentPulse `session_id`, with `hostId`, `provider`
 (`codex` or `claude`) and `nativeSessionId` proven from the native transcript.
+For an offline host, explicit source-recorded host metadata plus a matching native
+`SessionStart.session_id` may establish a **historical-only** mapping. Record that
+evidence and snapshot hash in the audited map; do not claim transcript verification
+or a live heartbeat. A working directory or managed loopback URL alone cannot
+establish the host or native identity.
 Unknown identities remain in a durable unresolved list and prevent a complete import result. Verified records can advance. Updating the audited identity map restarts a safe idempotent scan so previously unresolved records can be recovered.
 
 ```sh
@@ -300,3 +305,14 @@ The retained marker records the old size, while the ordinary offset is zero so
 older collectors safely reparse instead of trusting missing state. SQLite pages
 are reusable; this operation does not run a blocking VACUUM or promise to shrink
 the physical spool file. Keep the native files and recovery snapshot.
+
+## History scheduling (collector v11)
+
+Live discovery remains independent of backfill. The history scheduler streams saved
+checkpoints and excludes completed unchanged files from its bounded read budget.
+Unfinished files, pending turn publication, native replacement/truncation and parser
+upgrades remain eligible. Appending to a completed file schedules it again; retained
+prefixes follow the stricter inode/size/mtime and parser-generation checks above.
+The existing 8 MiB read budget, 200-file visit cap, rotating cursor and durable spool
+limits remain in force. A drained delivery queue does not prove every historical
+file has reached its end.
