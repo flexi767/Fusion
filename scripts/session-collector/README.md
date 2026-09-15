@@ -268,3 +268,35 @@ snapshot. Unknown or empty latency stays absent. Samples contain no prompts,
 paths or credentials and are committed atomically with deletion of the exact
 acknowledged queue row. Timing is based on the collector host clock; synchronize
 host clocks when comparing these measurements with server timestamps.
+
+
+## Opt-in parser-cache retention (collector v10)
+
+PostgreSQL content retention and this host-local cache maintenance are separate.
+Nothing is pruned automatically. First review the existing spool (read-only):
+
+```sh
+python3 scripts/session-collector/parser_retention.py --state "$HOME/.fusion/session-collector/spool.sqlite" --keep-days 30
+```
+
+To apply, let every pending/rejected delivery be acknowledged while the collector
+is running, then stop only that spool's Fusion collector and use `--apply`. If
+the queue became nonempty before shutdown, restart and resolve/drain it before retrying.
+The command refuses an active collector lock and never stops services itself.
+Restart the same collector with the same spool afterwards. Do not stop AgentPulse.
+
+Each invocation inspects at most 50 file checkpoints and cleans at most five
+files, each with at most 10,000 ledger records. Continue with `--after` and the
+returned `nextCursor` to inspect later paths. Larger files, partial native lines,
+changed/undelivered turns, missing files and files modified within the selected
+period remain protected. The native inode, size and modification time must match
+a complete checkpoint. No native transcript, live cursor, host binding or durable
+revision counter is removed.
+
+An unchanged cleaned prefix is skipped. Append, replacement or parser-generation
+upgrade rebuilds its history from the native file before accepting new history;
+ownership and usage deduplication are never resumed from a partial empty ledger.
+The retained marker records the old size, while the ordinary offset is zero so
+older collectors safely reparse instead of trusting missing state. SQLite pages
+are reusable; this operation does not run a blocking VACUUM or promise to shrink
+the physical spool file. Keep the native files and recovery snapshot.

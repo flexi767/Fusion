@@ -16,7 +16,7 @@ import parser_ledger
 import delivery_metrics
 from opaque_records import ignored_header, scan_opaque_tail
 
-VERSION = "fusion-native-9"
+VERSION = "fusion-native-10"
 PARSER_VERSION = 4
 CLAUDE_PARSER_VERSION = 5
 LIVE_PARSER_VERSION = 1
@@ -236,8 +236,12 @@ def _scan_file(db, path, provider, max_pending=5000):
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
     old = db.execute('SELECT inode,offset,state FROM files WHERE path=?', (str(path),)).fetchone()
     offset, state = (old[1], json.loads(old[2])) if old and old[0] == inode and old[1] <= stat.st_size else (0, {})
-    if state.get('opaqueRecord',{}).get('position',0)>stat.st_size:offset,state=0,{}
     parser_version=CLAUDE_PARSER_VERSION if provider=='claude' else PARSER_VERSION
+    retained=state.get('parserRetained')
+    if retained:
+        if retained['inode']==inode and retained['size']==stat.st_size and retained['mtimeNs']==stat.st_mtime_ns and retained.get('parserVersion')==parser_version and (provider!='claude' or retained.get('nativeFormatVersion')==1):return False
+        offset,state=0,{}
+    if state.get('opaqueRecord',{}).get('position',0)>stat.st_size:offset,state=0,{}
     if state and state.get('parserVersion') != parser_version: offset,state=0,{}
     state['parserVersion']=parser_version
     state.setdefault('ledgerGeneration',str(uuid.uuid4()))
