@@ -16,6 +16,10 @@ def text(content):
     return '\n'.join(b.get('text','') for b in content or [] if isinstance(b,dict) and b.get('type','').lower() in ('text','input_text','output_text'))
 def fresh(tid,at):
     return {'id':tid,'startedAt':at,'completedAt':None,'durationMs':None,'durationSource':'timestamps','prompts':[],'response':'','usage':[],'files':[],'toolCalls':0,'updatedAt':at}
+def claude_turn_finished(message):
+    content=message.get('content') or []
+    if isinstance(content,list) and any(isinstance(block,dict) and block.get('type')=='tool_use' for block in content):return False
+    return message.get('stop_reason') in ('end_turn','stop_sequence','max_tokens')
 def consume(state,e,agent):
     p=e.get('payload') or {}; at=e.get('timestamp')
     if not isinstance(p,dict) or not isinstance(at,str): return
@@ -23,7 +27,8 @@ def consume(state,e,agent):
     def turn(tid=None):
         tid=tid or state.get('active') or ('inferred:'+at)
         if tid not in turns: turns[tid]=fresh(tid,at)
-        state['active']=tid; r=turns[tid]; r['updatedAt']=at
+        if not state.get('active'):state['active']=tid
+        r=turns[tid]; r['updatedAt']=max(r['updatedAt'],at)
         if tid not in changed: changed.append(tid)
         return r
     def event_key(native=None):
@@ -51,7 +56,11 @@ def consume(state,e,agent):
         f['truncated']=f['truncated'] or len(combined)>65536;f['diff']=combined[:65536]
     if kind=='turn_context':
         state['model']=p.get('model') or state.get('model');state['serviceTier']=p.get('service_tier');state['fast']=p.get('service_tier') in ('fast','priority');return
-    if kind=='event_msg' and sub=='task_started': turn(p.get('turn_id'));return
+    if kind=='event_msg' and sub=='task_started':
+        r=turn(p.get('turn_id'))
+        if at>=state.get('activeStartedAt',''):
+            state['active']=r['id'];state['activeStartedAt']=at
+        return
     if kind=='event_msg' and sub in ('task_complete','task_completed','turn_aborted'):
         r=turn(p.get('turn_id'));r['completedAt']=at
         r['durationMs']=num(p.get('duration_ms')) if p.get('duration_ms') is not None else elapsed(r['startedAt'],at)
@@ -135,7 +144,9 @@ def consume(state,e,agent):
         return
     if kind=='assistant':
         r=turn();value=text(content)
-        if value:r['response']=value[:131072];r['completedAt']=at;r['durationMs']=elapsed(r['startedAt'],at)
+        if value:r['response']=value[:131072]
+        if claude_turn_finished(m):r['completedAt']=at;r['durationMs']=elapsed(r['startedAt'],at)
+        else:r['completedAt']=None;r['durationMs']=None
         for b in content if isinstance(content,list) else []:
             if isinstance(b,dict) and b.get('type')=='tool_use':
                 r['completedAt']=None;r['durationMs']=None

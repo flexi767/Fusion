@@ -158,6 +158,23 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNone(self.db.execute('SELECT offset FROM files').fetchone())
         self.assertTrue(diagnostics(self.db)['parseError'])
 
+    def test_live_activity_waits_for_current_turn_completion_for_both_providers(self):
+        state={}
+        for row in self.codex():apply(state,row,'codex')
+        def event(payload):return dict(type='event_msg',timestamp='2026-09-15T12:00:03Z',payload=payload)
+        apply(state,event(dict(type='task_started',turn_id='current')),'codex')
+        for typ in ['task_completed','task_complete','turn_aborted']:
+            apply(state,event(dict(type=typ,turn_id='old')),'codex')
+            self.assertEqual(state['activity'],'working')
+        apply(state,event(dict(type='task_completed',turn_id='current')),'codex')
+        self.assertEqual(state['activity'],'waiting')
+        for stop_reason in ['tool_use',None,'end_turn','stop_sequence','max_tokens']:
+            for block in ['text','thinking','tool_use']:
+                with self.subTest(stop_reason=stop_reason,block=block):
+                    state={}
+                    apply(state,dict(type='assistant',sessionId='c',cwd='/repo',timestamp='2026-09-15T12:00:00Z',message=dict(stop_reason=stop_reason,content=[dict(type=block,text='Interim')])),'claude')
+                    self.assertEqual(state['activity'],'waiting' if stop_reason in ('end_turn','stop_sequence','max_tokens') and block!='tool_use' else 'working')
+
     def test_reported_model_context_and_compaction_for_both_providers(self):
         state={}
         for e in self.codex():apply(state,e,'codex')

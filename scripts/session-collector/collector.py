@@ -10,10 +10,10 @@ import time
 import urllib.request
 import urllib.error
 import uuid
-from turn_parser import consume, known, total
+from turn_parser import consume, known, total, claude_turn_finished
 
-VERSION = "fusion-native-2"
-PARSER_VERSION = 2
+VERSION = "fusion-native-3"
+PARSER_VERSION = 3
 MAX_READ = 1024 * 1024
 MAX_LINE = 4 * MAX_READ
 LIVE_TAIL = 256 * 1024
@@ -104,16 +104,17 @@ def apply(state, event, provider):
         state['nativeSessionId'] = event.get('sessionId') or state.get('nativeSessionId')
         state['projectPath'] = event.get('cwd') or state.get('projectPath')
     if not state.get('nativeSessionId') or not state.get('projectPath'): return False
-    if kind == 'event_msg' and sub in ('task_started', 'user_message'): state['activity'] = 'working'
-    if kind == 'event_msg' and sub in ('task_complete', 'task_completed'): state['activity'] = 'waiting'
-    if kind == 'event_msg' and sub == 'turn_aborted': state['activity'] = 'waiting'
+    if kind == 'event_msg' and sub == 'task_started':
+        state['activeTurnId']=p.get('turn_id');state['activity']='working'
+    current_turn=not p.get('turn_id') or not state.get('activeTurnId') or p['turn_id']==state['activeTurnId']
+    if kind == 'event_msg' and sub == 'user_message' and current_turn: state['activity'] = 'working'
+    if kind == 'event_msg' and sub in ('task_complete', 'task_completed','turn_aborted') and current_turn: state['activity'] = 'waiting'
     if kind == 'event_msg' and sub == 'session_end': state['activity'] = 'completed'
     message = event.get('message') or {}
-    prompt = p.get('message') if sub == 'user_message' else text(message.get('content')) if provider == 'claude' and kind == 'user' and not event.get('isMeta') else ''
+    prompt = p.get('message') if sub == 'user_message' and current_turn else text(message.get('content')) if provider == 'claude' and kind == 'user' and not event.get('isMeta') else ''
     if prompt: state['title'] = ' '.join(str(prompt).split())[:512]; state['activity'] = 'working'
     if provider == 'claude' and kind == 'assistant':
-        blocks = message.get('content') or []
-        state['activity'] = 'working' if any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in blocks) else 'waiting'
+        state['activity'] = 'waiting' if claude_turn_finished(message) else 'working'
     if provider == 'claude' and kind == 'system' and event.get('subtype') == 'turn_duration': state['activity'] = 'waiting'
     telemetry = state.setdefault('telemetry', dict(model=None, contextTokens=None, contextCapacity=None, serviceTier=None, observedAt=at))
     if provider == 'codex' and kind == 'turn_context':
@@ -126,7 +127,7 @@ def apply(state, event, provider):
     if provider == 'claude' and kind == 'assistant':
         usage = message.get('usage') or {}
         telemetry.update(model=message.get('model'), contextTokens=total(known(usage.get('input_tokens')), known(usage.get('cache_read_input_tokens')), known(usage.get('cache_creation_input_tokens'))), contextCapacity=None, serviceTier=usage.get('speed'), observedAt=at)
-    if provider == 'codex' and sub == 'item_completed':
+    if provider == 'codex' and sub == 'item_completed' and current_turn:
         item = p.get('item') or {}
         if item.get('type') == 'UserMessage':
             value = text(item.get('content'))

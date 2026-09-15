@@ -70,4 +70,49 @@ class TurnParserTests(unittest.TestCase):
         user('one');user('one');user('two');user('two')
         self.assertEqual(claude['turns']['one']['prompts'],['Repeat','Repeat'])
 
+    def test_late_explicit_turn_events_never_reassign_following_unscoped_output(self):
+        state={}
+        def send(kind,payload,second):consume(state,dict(type=kind,payload=payload,timestamp=f'2026-09-15T12:00:{second:02}Z'),'codex_cli')
+        send('event_msg',dict(type='task_started',turn_id='old'),0)
+        send('event_msg',dict(type='task_started',turn_id='current'),1)
+        for kind,payload in [
+            ('token_usage_record',dict(turn_id='old',response_id='late',usage=dict(input_tokens=10,output_tokens=2))),
+            ('event_msg',dict(type='item_completed',turn_id='old',item=dict(type='FileChange',changes={'a.py':dict(diff='+old edit')}))),
+            ('event_msg',dict(type='task_completed',turn_id='old')),
+            ('event_msg',dict(type='task_started',turn_id='old')),
+        ]:
+            send(kind,payload,0)
+            self.assertEqual(state['active'],'current')
+        send('response_item',dict(type='message',role='assistant',phase='final',content='Current result'),2)
+        self.assertEqual(state['turns']['current']['response'],'Current result')
+        self.assertEqual(state['turns']['old']['response'],'')
+        self.assertEqual(state['turns']['old']['usage'][0]['inputTokens'],10)
+        self.assertEqual(state['turns']['old']['files'][0]['added'],1)
+
+    def test_claude_text_and_thinking_with_tool_stop_reason_keep_turn_open(self):
+        for stop_reason in ['tool_use',None,'end_turn','stop_sequence','max_tokens']:
+            with self.subTest(stop_reason=stop_reason):
+                state={}
+                def send(kind,message,**extra):consume(state,dict(type=kind,message=message,timestamp='2026-09-15T12:00:00Z',**extra),'claude_code')
+                send('user',dict(content='Start'),uuid='first')
+                send('assistant',dict(content=[dict(type='text',text='Interim output')],stop_reason=stop_reason))
+                finished=stop_reason in ('end_turn','stop_sequence','max_tokens')
+                self.assertEqual(state['turns']['first']['completedAt'] is not None,finished)
+                send('user',dict(content='Steering'),uuid='second')
+                self.assertEqual(state['active'],'second' if finished else 'first')
+                self.assertEqual(state['turns'][state['active']]['prompts'],['Steering'] if finished else ['Start','Steering'])
+
+    def test_late_claude_tool_result_does_not_switch_the_active_turn(self):
+        state={}
+        def send(kind,message,**extra):consume(state,dict(type=kind,message=message,timestamp='2026-09-15T12:00:00Z',**extra),'claude_code')
+        send('user',dict(content='First'),uuid='first')
+        send('assistant',dict(content=[dict(type='tool_use',id='edit',name='Edit',input=dict(file_path='a.py',old_string='a',new_string='b'))]))
+        send('assistant',dict(content=[dict(type='text',text='Finished')],stop_reason='end_turn'))
+        send('user',dict(content='Second'),uuid='second')
+        send('user',dict(content=[dict(type='tool_result',tool_use_id='edit')]))
+        send('assistant',dict(content=[dict(type='text',text='Second result')],stop_reason='end_turn'))
+        self.assertEqual(state['turns']['first']['files'][0]['added'],1)
+        self.assertEqual(state['turns']['first']['response'],'Finished')
+        self.assertEqual(state['turns']['second']['response'],'Second result')
+
 if __name__ == '__main__':unittest.main()
