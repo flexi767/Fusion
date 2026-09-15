@@ -186,3 +186,17 @@ Runtime registration and launch execution currently require the runtime to use
 the same central PostgreSQL data layer as the dashboard. The read-only Python
 collector cannot register a launch runtime or execute launch requests. Deployment
 and real per-host launch/control verification remain part of the parity gate.
+
+### Live updates during initial discovery
+
+Collector v5 keeps the historical parser ledger at v4. It adds a separate live
+parser checkpoint so unchanged transcripts without token telemetry are read once,
+not re-enqueued every scan. Partial records do not generate a new live revision.
+
+Fresh native events (within 90 seconds, allowing 30 seconds of forward clock skew)
+use the highest delivery priority, ordered by event time. Older discovery snapshots
+come next, then turn backfill. Discovery/history may occupy at most 4,500 of the
+5,000 durable queue records; the remaining records and the 2 MiB byte reserve are
+for fresh live events. Coalescing updates priority atomically with the exact body.
+Old fresh-priority rows age back into discovery priority without deleting data.
+Capacity pressure preserves every unacknowledged row and checkpoint.

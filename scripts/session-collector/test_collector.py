@@ -3,8 +3,9 @@ from urllib.error import HTTPError
 from pathlib import Path
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import patch
-from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main, diagnostics, apply, enqueue
+from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main, diagnostics, apply, enqueue, CollectionCapacityError
 
 class CollectorTests(unittest.TestCase):
     def setUp(self):
@@ -143,7 +144,8 @@ class CollectorTests(unittest.TestCase):
 
     def test_live_reserve_and_coalescing_obey_byte_limit_without_losing_checkpoint(self):
         self.write(self.codex())
-        with patch('collector.MAX_PENDING_BYTES',1): scan_live(self.db,self.path,'codex')
+        now=datetime.fromisoformat('2026-09-15T12:01:00+00:00').timestamp()
+        with patch('collector.MAX_PENDING_BYTES',1),patch('collector.time.time',return_value=now): scan_live(self.db,self.path,'codex')
         before=self.db.execute('SELECT offset,state FROM live_files').fetchone()
         with self.path.open('a') as f:f.write(json.dumps(dict(type='event_msg',timestamp='2026-09-15T12:01:00Z',payload=dict(type='task_completed')))+'\n')
         with patch('collector.MAX_PENDING_BYTES',1),patch('collector.LIVE_RESERVE_BYTES',0):scan_live(self.db,self.path,'codex')
@@ -151,6 +153,43 @@ class CollectorTests(unittest.TestCase):
         scan_live(self.db,self.path,'codex')
         self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],1)
         self.assertEqual(diagnostics(self.db)['spoolBytes'],self.db.execute('SELECT length(CAST(body AS BLOB)) FROM pending').fetchone()[0])
+
+    def test_unchanged_and_partial_transcripts_without_usage_do_not_reenqueue_live_snapshots(self):
+        for provider in ['codex','claude']:
+            path=self.root/(provider+'.jsonl')
+            rows=self.codex() if provider=='codex' else [dict(type='user',timestamp='2026-09-15T12:00:00Z',sessionId='claude-native',cwd='/repo',message=dict(content='Inspect'))]
+            path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+            scan_live(self.db,path,provider);drain(self.db,lambda e:dict(acknowledged=True,eventId=e['eventId']))
+            revision=self.db.execute('SELECT sum(revision) FROM revisions').fetchone()[0]
+            scan_live(self.db,path,provider)
+            with path.open('a') as f:f.write('{"type":')
+            scan_live(self.db,path,provider);scan_live(self.db,path,provider)
+            self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],0)
+            self.assertEqual(self.db.execute('SELECT sum(revision) FROM revisions').fetchone()[0],revision)
+
+    def test_fresh_live_updates_keep_reserved_capacity_and_overtake_initial_discovery(self):
+        now=datetime.fromisoformat('2026-09-15T12:01:00+00:00').timestamp()
+        def envelope(event,at):return dict(eventId=event,observation=dict(observedAt=at,title=event))
+        cold=envelope('cold','2026-09-01T00:00:00Z');other=envelope('other','2026-09-01T00:00:01Z')
+        with patch('collector.time.time',return_value=now),patch('collector.MAX_PENDING_RECORDS',4),patch('collector.BACKGROUND_RECORD_LIMIT',2):
+            with self.db:
+                enqueue(self.db,cold,'cold');enqueue(self.db,other,'other')
+            with self.assertRaises(CollectionCapacityError):
+                with self.db:enqueue(self.db,envelope('blocked','2026-09-01T00:00:02Z'),'blocked')
+            with self.db:
+                enqueue(self.db,envelope('older-live','2026-09-15T12:00:10Z'),'live-a')
+                enqueue(self.db,envelope('newest-live','2026-09-15T12:01:00Z'),'live-b')
+            seen=[]
+            drain(self.db,lambda e:(seen.append(e['eventId']) or dict(acknowledged=True,eventId=e['eventId'])),limit=1)
+            self.assertEqual(seen,['newest-live'])
+            self.assertEqual(json.loads(self.db.execute('SELECT body FROM pending WHERE live_key=?',('cold',)).fetchone()[0]),cold)
+            with self.db:enqueue(self.db,envelope('promoted','2026-09-15T12:01:00Z'),'cold')
+            self.assertEqual(self.db.execute('SELECT priority FROM pending WHERE live_key=?',('cold',)).fetchone()[0],2)
+        self.db.close();self.db=connect(self.root/'spool.sqlite')
+        with patch('collector.time.time',return_value=now+91):
+            drain(self.db,lambda e:dict(acknowledged=True,eventId=e['eventId']),limit=0)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending WHERE priority=2').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],3)
 
     def test_malformed_complete_record_never_advances_history_cursor(self):
         self.write(self.codex(),'invalid\n')

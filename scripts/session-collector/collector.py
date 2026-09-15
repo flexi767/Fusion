@@ -10,11 +10,13 @@ import time
 import urllib.request
 import urllib.error
 import uuid
+from datetime import datetime
 from turn_parser import consume, known, total, claude_turn_finished, bounded_text
 import parser_ledger
 
-VERSION = "fusion-native-4"
+VERSION = "fusion-native-5"
 PARSER_VERSION = 4
+LIVE_PARSER_VERSION = 1
 MAX_READ = 1024 * 1024
 MAX_LINE = 4 * MAX_READ
 LIVE_TAIL = 256 * 1024
@@ -24,6 +26,9 @@ MAX_PARSER_RECORDS = 2_000_000
 MAX_PENDING_BYTES = 128 * 1024 * 1024
 LIVE_RESERVE_BYTES = 2 * 1024 * 1024
 MAX_DELIVERY_BYTES = 1_500_000
+MAX_PENDING_RECORDS = 5000
+BACKGROUND_RECORD_LIMIT = 4500
+LIVE_PRIORITY_SECONDS = 90
 
 
 class CollectionCapacityError(ValueError):
@@ -40,11 +45,17 @@ def enqueue(db, envelope, live_key=None):
     if size > MAX_DELIVERY_BYTES: raise CollectionCapacityError('Delivery exceeds byte limit')
     count, stored = db.execute('SELECT records,bytes FROM spool_usage WHERE id=1').fetchone()
     previous = db.execute('SELECT length(CAST(body AS BLOB)) FROM pending WHERE live_key=?',(live_key,)).fetchone() if live_key else None
-    budget = MAX_PENDING_BYTES + (LIVE_RESERVE_BYTES if live_key else 0)
-    if (count >= 5000 and not previous) or stored - (previous[0] if previous else 0) + size > budget:
+    event_at = None
+    if live_key:
+        try: event_at = datetime.fromisoformat(envelope['observation']['observedAt'].replace('Z','+00:00')).timestamp()
+        except (KeyError,TypeError,ValueError,AttributeError,OverflowError): pass
+    priority = 2 if live_key and event_at is not None and -30 <= time.time()-event_at <= LIVE_PRIORITY_SECONDS else 1 if live_key else 0
+    budget = MAX_PENDING_BYTES + (LIVE_RESERVE_BYTES if priority == 2 else 0)
+    record_limit = MAX_PENDING_RECORDS if priority == 2 else BACKGROUND_RECORD_LIMIT
+    if (count >= record_limit and not previous) or stored - (previous[0] if previous else 0) + size > budget:
         raise CollectionCapacityError('Durable spool capacity reached')
-    db.execute('INSERT INTO pending(event_id,body,live_key,priority) VALUES (?,?,?,?) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,rejection=NULL,retry_after=0',
-        (envelope['eventId'], body, live_key, 1 if live_key else 0))
+    db.execute('INSERT INTO pending(event_id,body,live_key,priority,event_at) VALUES (?,?,?,?,?) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,priority=excluded.priority,event_at=excluded.event_at,rejection=NULL,retry_after=0',
+        (envelope['eventId'], body, live_key, priority, event_at))
 
 
 def capacity_pause(db, path, reason):
@@ -71,6 +82,7 @@ def connect(path, timeout=5):
     if 'rejection' not in columns: db.execute('ALTER TABLE pending ADD COLUMN rejection TEXT')
     if 'live_key' not in columns: db.execute('ALTER TABLE pending ADD COLUMN live_key TEXT')
     if 'priority' not in columns: db.execute('ALTER TABLE pending ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
+    if 'event_at' not in columns: db.execute('ALTER TABLE pending ADD COLUMN event_at REAL')
     db.execute('CREATE UNIQUE INDEX IF NOT EXISTS pending_live_key ON pending(live_key)')
     db.executescript("""
       CREATE TABLE IF NOT EXISTS spool_usage(id INTEGER PRIMARY KEY,records INTEGER NOT NULL,bytes INTEGER NOT NULL);
@@ -157,7 +169,8 @@ def _scan_live(db, path, provider):
     stat=path.stat();inode=f'{stat.st_dev}:{stat.st_ino}'
     old=db.execute('SELECT inode,offset,state FROM live_files WHERE path=?',(str(path),)).fetchone()
     state=json.loads(old[2]) if old and old[0]==inode else {}
-    if old and old[0]==inode and old[1]==stat.st_size and state.get('telemetry'):return
+    if state.get('liveParserVersion') != LIVE_PARSER_VERSION: state={}
+    if old and old[0]==inode and old[1]==stat.st_size and state:return
     chunks=[]
     with path.open('rb') as stream:
         if not state:
@@ -167,6 +180,7 @@ def _scan_live(db, path, provider):
         if start:stream.readline(MAX_LINE) # Discard the leading partial record.
         raw=stream.read(LIVE_TAIL);chunks.append(raw)
         end=stream.tell()-(len(raw)-raw.rfind(b'\n')-1) if b'\n' in raw else start
+    if old and old[0]==inode and old[1]==end and state:return
     changed=False
     for chunk in chunks:
         final=chunk.rfind(b'\n')+1
@@ -185,6 +199,7 @@ def _scan_live(db, path, provider):
         observation.update(version=1,provider=provider,revision=revision)
         event_id=str(uuid.uuid4())
         enqueue(db, dict(version=1,eventId=event_id,collectorVersion=VERSION,observation=observation), identity)
+        state['liveParserVersion']=LIVE_PARSER_VERSION
         db.execute('INSERT OR REPLACE INTO live_files VALUES (?,?,?,?)',(str(path),inode,end,json.dumps(state)))
 
 
@@ -298,7 +313,8 @@ def post(url, token, body, timeout=10):
 
 
 def drain(db, send, limit=50):
-    for row_id, event_id, body, priority in db.execute('SELECT id,event_id,body,priority FROM pending WHERE rejection IS NULL AND retry_after<=? ORDER BY priority DESC,id LIMIT ?', (time.time(),limit)).fetchall():
+    with db: db.execute('UPDATE pending SET priority=1 WHERE priority=2 AND event_at<?',(time.time()-LIVE_PRIORITY_SECONDS,))
+    for row_id, event_id, body, priority in db.execute('SELECT id,event_id,body,priority FROM pending WHERE rejection IS NULL AND retry_after<=? ORDER BY priority DESC,CASE WHEN priority=2 THEN event_at END DESC,id LIMIT ?', (time.time(),limit)).fetchall():
         try: result = send(json.loads(body))
         except urllib.error.HTTPError as error:
             if error.code==429:
