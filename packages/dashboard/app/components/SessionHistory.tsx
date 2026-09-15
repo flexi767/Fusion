@@ -20,8 +20,8 @@ export function SessionTurnResult({ turn }: { turn: SessionTurn }) {
   </article>;
 }
 
-export function SessionCostDetails({ cost }: { cost: SessionDetail["cost"] }) {
-  return <details className="session-card"><summary>Estimated cost for {cost.coveredTurns} displayed turns: {formatCost(cost.usd, cost.usd === null)}</summary>
+export function SessionCostDetails({ cost, label }: { cost: SessionDetail["cost"]; label?: string }) {
+  return <details className="session-card"><summary>{label ?? `Estimated cost for ${cost.coveredTurns} displayed turns`}: {formatCost(cost.usd, cost.usd === null)}</summary>
     <p>{cost.unpricedRows} unpriced model rows; {cost.unreportedTurns} turns without usage. Estimates use current configured rates.</p>
     {cost.usage.map((row, index) => <section key={index}><h4>{row.model}</h4>{row.reason ? <p>{row.reason}</p> : <>
       <div className="session-cost-table"><table><thead><tr><th>Category</th><th>Tokens</th><th>USD / million</th><th>Charge USD</th></tr></thead><tbody>{row.lines.map(line => <tr key={line.category}><td>{line.category}</td><td>{line.tokens.toLocaleString()}</td><td>{line.ratePerMillion}</td><td>{line.usd.toFixed(6)}</td></tr>)}</tbody></table></div>
@@ -55,10 +55,11 @@ function SessionControls({ detail }: { detail: SessionDetail }) {
     finally { setBusy(false); }
   };
   return <section className="session-card"><h3>Session controls</h3>{!detail.runtime && <p>This observed session has no connected control adapter.</p>}
+    {detail.runtime && !detail.runtime.connected && <p>Adapter offline. Feedback waits for a supported hook and expires after five minutes.</p>}
     {detail.runtime?.capabilities.includes("feedback") && <><label>Feedback<textarea value={text} maxLength={16000} onChange={e => setText(e.target.value)} /></label><button className="btn btn-secondary" disabled={busy || !text.trim()} onClick={() => void send("feedback")}>Send feedback</button></>}
     {["stop", "resume"].filter(operation => detail.runtime?.capabilities.includes(operation)).map(operation => <button key={operation} className="btn btn-secondary" disabled={busy} onClick={() => void send(operation)}>{operation === "stop" ? "Stop session" : "Resume session"}</button>)}
     {message && <p role="status">{message}</p>}
-    {detail.commands?.map(command => <p key={command.id}>{command.operation} · {command.status} · Expires {new Date(command.expiresAt).toLocaleString()}</p>)}
+    {detail.commands?.map(command => <p key={command.id}>{command.operation} · {command.operation === "feedback" && command.status === "applied" ? "Emitted as provider hook context" : command.status} · Expires {new Date(command.expiresAt).toLocaleString()}</p>)}
   </section>;
 }
 function SessionSummary({ detail, refresh }: { detail: SessionDetail; refresh: () => Promise<void> }) {
@@ -109,6 +110,7 @@ export function SessionHistory({ id }: { id: string }) {
     <div className="sessions-view">
       {error && <p role="alert">{error}</p>}
       {!detail && !error && <p role="status">Loading history…</p>}
+      {detail?.wholeSessionUsage && <section className="session-card"><h3>Whole session: {formatCost(detail.wholeSessionUsage.usd, detail.wholeSessionUsage.usd === null)}</h3><p>{detail.wholeSessionUsage.turns} collected turns · {detail.wholeSessionUsage.unreportedTurns} turns without usage · {detail.wholeSessionUsage.unpricedRows} unpriced model groups. Estimate at current rates.</p></section>}
       {detail && <><p>{detail.session.hostId} · {detail.session.provider} · {detail.session.observation.activity} · Observed session</p><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /></>}
       <div className="sessions-grid">{turns.map(turn => <SessionTurnResult key={turn.id} turn={turn} />)}</div>
       {detail && turns.length === 0 && <p>No turn history has been collected yet.</p>}

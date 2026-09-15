@@ -3186,3 +3186,5 @@ export * from "./external-sessions/turn.js";
 export * from "./external-sessions/cost.js";
 export * from "./external-sessions/controls.js";
 export * from "./external-sessions/summaries.js";
+
+export * from "./external-sessions/analytics.js";

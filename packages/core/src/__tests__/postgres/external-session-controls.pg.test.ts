@@ -21,10 +21,16 @@ pgDescribe("External runtime controls and summaries", () => {
     expect((await controls.claim("m3", id, generation, now))[0].status).toBe("delivered");
     expect(await controls.acknowledge("m5", first.id, generation, "applied", now)).toBe(false);
     expect(await controls.acknowledge("m3", first.id, generation, "applied", now)).toBe(true);
+    expect(await controls.acknowledge("m3", first.id, generation, "applied", now + 1)).toBe(true);
+    expect(await controls.acknowledge("m3", first.id, generation, "failed", now + 1)).toBe(false);
+    expect(await controls.capability(id, now + 90001)).toMatchObject({ connected: false, capabilities: ["feedback"] });
     expect(await controls.claim("m3", id, generation, now)).toHaveLength(0);
     await controls.queue(id, "command-id-123457", "feedback", "Later", now);
     expect(await controls.claim("m3", id, generation, now + 300001)).toHaveLength(0);
     expect((await controls.list(id))[1].status).toBe("expired");
+    await controls.queue(id, "command-id-123458", "feedback", "Old owner", now);
+    await controls.register("m3", id, "replacement-generation-1", ["feedback"], now);
+    expect(await controls.claim("m3", id, generation, now)).toHaveLength(0);
   });
   it("summarizes changed content once and preserves the previous summary on an endpoint failure", async () => {
     const sessions = new ExternalSessionStore(h.layer()); const summaries = new ExternalSessionSummaries(h.layer());

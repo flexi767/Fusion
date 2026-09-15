@@ -46,3 +46,9 @@ it("accepts bounded host diagnostics and discards unrecognized fields", async ()
   expect(heartbeat).toHaveBeenCalledWith("m3", "test", undefined, { spoolDepth: 12, rejectedDeliveries: 1, parseError: true });
   expect((await request(server, "POST", "/api/session-collector", { body: { ...envelope, diagnostics: { spoolDepth: -1 } }, headers })).status).toBe(400);
 });
+
+it("credential probes authenticate without refreshing collector liveness", async () => {
+  const response = await request(app(), "POST", "/api/session-collector", { body: { version: 1, eventId: "probe", collectorVersion: "test", probe: true }, headers: { Authorization: "Bearer collector-token" } });
+  expect(response.status).toBe(200); expect(response.body).toMatchObject({ hostId: "m3", acknowledged: true });
+  expect(heartbeat).not.toHaveBeenCalled(); expect(ingest).not.toHaveBeenCalled();
+});

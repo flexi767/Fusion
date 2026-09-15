@@ -9,7 +9,7 @@ Branch: `codex/agentpulse-sessions`; plan baseline `801d03c84`; foundation `f435
 - J: live source `/home/ubuntu/agent-panels/agentpulse`, clean at full commit `04f0dcf42d700f60ea3848326ba6d43da80c7a40`, origin https://github.com/flexi767/agentpulse.git. MIT, copyright 2026 Jay Stuart. Read actual shared telemetry/results contracts, observer, and Python turn parser before adapting.
 - J: user services `agentpulse`, `agentpulse-supervisor`, `agentpulse-private-relay`, and `fusion-daemon` active. AgentPulse binds loopback 43120; private relay 43121. Fusion works from `/srv/scrapeui-dev`, PostgreSQL database `fusion`, port 4040 (reserved; untouched).
 - m3: `~/.agentpulse/supervisor.js` and `relay.ts` running; independent durable AgentPulse queue forwards to J. Existing native sources include Codex desktop rollouts and Claude project JSONL. Credentials remain private.
-- m5 inventory, supported snapshot backup, counts/usage coverage, exact summary endpoint model, and representative native fixture capture remain to verify.
+- m5 remains unreachable. Snapshot recovery, source counts, the m3 summary endpoint and the real 20-file reference have since been verified; see the dated evidence below.
 - Source inspection identifies search, channels/notifications, launch templates, workspace actions, feedback and AI inbox/gates beyond the initial session list. These need usage inventory and explicit replacement mapping before parity.
 
 ## Contract and ownership
@@ -21,7 +21,9 @@ Native Fusion feature: core owns PostgreSQL observations and normalized history;
 - Foundation validator, host/provider identity, monotonic observation reconciliation, separate collector connectivity; five node tests in the first commit.
 - Source/deployment verification above; no AgentPulse service or configuration changed.
 
-## In progress / remaining
+## Plan workstreams
+
+Dated checkpoints below record progress within these workstreams; the latest checkpoint supersedes earlier intermediate limitations.
 
 1. PostgreSQL persistence, host credential authentication, durable acknowledgements and heartbeat.
 2. Independent durable collectors and Sessions navigation/list for m3/m5/J; live reconciliation with Fusion-owned sessions.
@@ -110,3 +112,39 @@ Surface enumeration: native collector, historical importer, core validation and 
 Remaining gaps still include all-host deployment and latency measurement, full parser-state bounds, native Fusion session reconciliation/task-detail reuse, recorded rate history and complete analytics/rankings, native feedback/control execution adapters, full historical import/reconciliation and the 24-hour dual-run/rollback gates. None of those gates is claimed complete.
 
 J's bounded preview pass succeeded (43 Codex / 7 Claude on its first page, 199 discovered transcripts, 184 queued deliveries, zero reported parse/rejection errors). Its isolated spool is `~/.fusion/session-integration-preview/spool.sqlite`; the temporary loopback SSH tunnel closed after the pass. Updated m3 collection also persists discovery while offline, verified by a focused regression. Latest counts: 14 Python tests, 4 API/worker tests and 4 turn/cost tests pass; root lint and every static gate check pass. Core and dashboard builds pass. The remaining merge-gate lanes are still pending, so this checkpoint is not ready to merge.
+
+## Search and usage slice (in progress)
+
+The prior reliability slice is committed as `1cf594c2a`; push still fails for missing HTTPS credentials. New work adds an indexed PostgreSQL search over session metadata and collected history, with server-side host/provider/activity filtering and duplicate-free paginated matches. Six PostgreSQL tests now pass, including the new search and whole-session accounting cases. The accounting query reads usage only, separates unsupported/incomplete model groups, uses existing Fusion pricing/overrides, and refuses oversized partial rankings. The new UI adds date/host/model rankings and whole-session cost coverage alongside paginated history. Migration 0082 owns the search indexes. Latest typecheck/build/UI validation for this slice is pending.
+
+## Gate and feedback checkpoint (2026-09-15, 17:14 local)
+
+- All merge-gate lanes were run serially: engine 470 tests, PostgreSQL gate 9, core unit gate 203, CLI CI-shape 72; all passed. Static validators passed earlier. Latest search/control edits still require final lint/typecheck/build/boot verification.
+- Added an opt-in Codex/Claude `additionalContext` feedback adapter with an independent, host-bound durable ledger and two-second network budget. Eighteen Python tests pass, covering retry, expiry, ambiguous crashes and both hook formats. It advertises feedback only. No provider settings were changed and no native feedback parity is claimed.
+- Hardened command replay acknowledgements, generation checks, offline feedback capability display and host control allowlist checks. Two targeted PostgreSQL control/summary tests pass. Used stop/launch behavior still needs a verified replacement using Fusion-owned runtimes.
+- Snapshot copied privately to m3 and its SHA-256 independently verified. Used-source inventory is now concrete: 4 launch requests; 4 managed sessions (3 stopped, 1 failed); 7 controls (3 successful prompt actions, 3 successful stop actions, 1 failed stop). Notifications/channels, alert rules/fires and inbox snoozes each have zero records. Six archived sessions still require preservation. This is evidence of stored use, not a claim that every possible feature was unused.
+- Next: final browser/verification pass for search/usage, native identity audit and resumable real import, then remaining pricing history, retention/parser bounds, managed-session linking/controls and native-hook/24-hour parity verification.
+
+## Real import findings (2026-09-15, 17:26 local)
+
+- Verified 62 m3 native identities from actual provider files (51 Codex, 11 Claude), covering 4,776 source turn results. No host conflict was found. The source has another 17 sessions explicitly on J/m5 and 16 unresolved identities for this host-scoped audit (12 hostless, 4 m3 records without native evidence).
+- Import bookkeeping now durably tracks unresolved identities while verified records advance; a changed audited map safely restarts an idempotent scan. Unresolved identities prevent a complete result. The first 62 session records and 573 historical turns reached the preview with no rejected deliveries.
+- Sustained real backfill exposed the shared 600/minute mutation-IP limiter. The remaining spool survived the 429. Added authenticated per-host live/history limits using Fusion's existing limiter, separate from ordinary mutations. Collector `Retry-After` delays history while allowing new live updates. Nineteen limiter/API tests and twenty Python tests pass. Latest rebuild and replay are pending.
+- Full serial `verify:fast` passed all 23 steps in 100.9 seconds before the limiter fix, including CLI build and real boot/health/shutdown. No production service, provider settings, release or default-branch merge was changed.
+
+
+### Import liveness and rate isolation
+
+Real backfill exposed two operator-visible invariants: bulk history must not consume dashboard/live-update rate budgets, and importing history must not make an offline collector appear connected. Both are now fixed. Migration 0083 permits an unknown live heartbeat for historical-only hosts. Credential probes authenticate without changing liveness. Seven PostgreSQL persistence/search/accounting/liveness tests and four ingestion/probe API tests pass; limiter tests passed at the prior checkpoint. Final lint has zero errors and four existing control-regex warnings. The latest serial build/boot verification is finishing.
+
+Symptom verification surfaces: live and historical ingestion, credential probes, same-host and cross-host rate buckets, dashboard mutations, native-hook requests, durable retries, desktop/mobile connectivity labels, and historical-only hosts. Historical and live state remain separate, including null/empty/unreported states. No source path or process identity is used to infer control privileges.
+
+## Reconciled history and search checkpoint (2026-09-15, 17:55 local)
+
+- All 4,776 turn results belonging to the 62 verified m3 source identities are present. Hash comparison uses the same redaction/validation and project-relative normalization as ingestion: 4,754 exact matches, 22 equal-or-newer native results, zero missing and zero unexplained differences. Native replacements remain separately classified; this is not same-date price parity. The private reconciliation report is `.agent-intent/reconciliation-m3.json`.
+- Real reconciliation found five older partial native results that wrongly blocked a newer complete imported result. Ingestion now chooses the newer turn timestamp across origins while keeping live observation state independent. Eight PostgreSQL tests pass, including both providers and both arrival orders; the five exact repairs were replayed through authenticated ingestion and acknowledged.
+- The verified import spool is empty, with zero rejected deliveries. Sixteen unresolved identities remain durable (12 hostless, 4 m3 without native evidence); the overall migration is explicitly incomplete. The other 17 source sessions belong to J/m5 and were excluded from this host-scoped import.
+- Native preview counts are now m3 200 (189 Codex, 11 Claude) and J 193 (130 Codex, 63 Claude). These are bounded discovery passes, not exhaustive-host parity. Both native queues drained without rejected records. AgentPulse continues unchanged on all hosts.
+- Search and cost rankings verified in the actual browser at desktop and 390×844 mobile. The selected 30-day range displayed 4,820 collected turns across 70 sessions, with missing usage/unpriced coverage shown. Desktop page width remained 1,440 at a 1,440 viewport. Screenshots are private artifacts under `output/playwright/usage-{desktop,mobile}.png`.
+- Final lint passed with zero errors/four control-regex warnings; serial `verify:fast` passed all 23 steps in 111.3 seconds after the rate/liveness fixes. The subsequent five-record reconciliation fix passed the eight-test PostgreSQL file and core build. All four merge-gate lanes (754 tests total) passed earlier; no flakes were observed or appeased.
+- Remaining work: parser state/queue byte bounds and duplicate-event invariants; card model/context/cost; recorded/effective-dated rates and turn rankings; Fusion-native reconciliation/task-detail reuse; used managed launch/stop/prompt replacements; archived metadata and retention; remaining host identity/import audit; native hook validation and measured latency; m5 connectivity; 24-hour dual run and rollback rehearsal. No production cutover or retirement is authorized by this checkpoint.

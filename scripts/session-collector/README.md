@@ -53,7 +53,7 @@ First take a consistent AgentPulse snapshot with SQLite's supported backup API;
 do not copy a live WAL database file. Preserve its configuration independently.
 Use an audited JSON map keyed by AgentPulse `session_id`, with `hostId`, `provider`
 (`codex` or `claude`) and `nativeSessionId` proven from the native transcript.
-Unknown identities stop the import and appear in its report.
+Unknown identities remain in a durable unresolved list and prevent a complete import result. Verified records can advance. Updating the audited identity map restarts a safe idempotent scan so previously unresolved records can be recovered.
 
 ```sh
 python3 scripts/session-collector/import_agentpulse.py \
@@ -61,7 +61,38 @@ python3 scripts/session-collector/import_agentpulse.py \
   --host m3 --state ~/.fusion/session-collector/spool.sqlite --limit 100
 ```
 
-Run once per host credential/spool. Import resumes by snapshot SHA-256 and event
-cursor. It enqueues bounded deliveries; normal collector draining acknowledges
+Run once per host credential/spool. Import resumes by snapshot SHA-256, identity-map digest and phase/event cursor. It enqueues bounded deliveries; normal collector draining acknowledges
 them. Historical data never overwrites a live snapshot or a live turn. This
 importer handles session records, notes and collected turn-result events. Usage-only metadata and other AgentPulse event types still require the parity import extension.
+
+## Optional feedback hook adapter
+
+`feedback_hook.py` implements the verified AgentPulse `additionalContext` hook
+contract for Codex and Claude. It is opt-in and does not edit provider settings.
+Configure it only after disposable native-hook verification; retain every existing
+AgentPulse hook throughout comparison. Example command for an installed provider
+hook (supply the actual absolute checkout/install path):
+
+```sh
+python3 /absolute/path/scripts/session-collector/feedback_hook.py \
+  --provider claude --host m3 --url http://wj:4040 \
+  --token-file ~/.fusion/session-collector/token
+```
+
+Supported events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`.
+The native session must already have been observed by Fusion. Server controls and
+the host allowlist must both be enabled. This hook advertises **feedback only**;
+it does not claim stop/resume access. Inactive adapters can receive queued feedback,
+which expires after five minutes and requires another supported native hook event.
+
+The separate mode-600 `feedback.sqlite` ledger binds commands to host, provider,
+native identity and runtime generation. It records intent before emitting output.
+Retries after emission only acknowledge; an ambiguous crash is marked failed and
+never automatically re-emits. This favors avoiding duplicate instructions over
+retrying a possibly delivered message. "Emitted as provider hook context" reports
+adapter output, not proof that the model followed the feedback. Hooks have a
+bounded two-second network budget and fail open when Fusion is unavailable.
+
+Rejected transcript deliveries remain in `pending` with a `rejection` HTTP status.
+Fix the rejected payload/parser before re-enabling a specific delivery; do not
+clear the whole spool. Permanent errors do not prevent other sessions draining.

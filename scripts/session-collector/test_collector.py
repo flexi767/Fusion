@@ -46,6 +46,19 @@ class CollectorTests(unittest.TestCase):
         old=self.root/'.codex/sessions/2020/01/01/rollout-old.jsonl';old.parent.mkdir(parents=True);old.write_text('')
         self.assertIn(('codex',old), list(discover(self.root)))
 
+    def test_rate_limit_delays_history_without_blocking_new_live_updates(self):
+        with self.db:
+            self.db.execute('INSERT INTO pending(event_id,body) VALUES (?,?)',('history',json.dumps(dict(eventId='history'))))
+        with patch('collector.time.time',return_value=100):
+            drain(self.db,lambda _:(_ for _ in ()).throw(HTTPError('local',429,'limited',{'Retry-After':'60'},None)))
+            with self.db:self.db.execute('INSERT INTO pending(event_id,body,priority) VALUES (?,?,1)',('live',json.dumps(dict(eventId='live'))))
+            seen=[]
+            drain(self.db,lambda e:(seen.append(e['eventId']) or dict(acknowledged=True,eventId=e['eventId'])))
+            self.assertEqual(seen,['live'])
+        with patch('collector.time.time',return_value=161):
+            drain(self.db,lambda e:dict(acknowledged=True,eventId=e['eventId']))
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0],0)
+
     def test_offline_pass_still_commits_discovered_data(self):
         native=self.root/'.codex/sessions/2026/09/15/rollout.jsonl';native.parent.mkdir(parents=True)
         native.write_text(''.join(json.dumps(row)+'\n' for row in self.codex()))

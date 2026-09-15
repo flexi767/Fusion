@@ -8,6 +8,8 @@ export interface RateLimitOptions {
   max?: number;
   /** Message returned when rate limited */
   message?: string;
+  /** Trusted identity key; defaults to client IP. */
+  keyGenerator?: (req: Request) => string;
 }
 
 interface ClientRecord {
@@ -25,6 +27,7 @@ export function rateLimit(options: RateLimitOptions = {}) {
     windowMs = 60_000,
     max = 100,
     message = "Too many requests, please try again later.",
+    keyGenerator,
   } = options;
 
   const clients = new Map<string, ClientRecord>();
@@ -45,7 +48,7 @@ export function rateLimit(options: RateLimitOptions = {}) {
   }
 
   return (req: Request, res: Response, next: NextFunction): void => {
-    const key = req.ip ?? req.socket.remoteAddress ?? "unknown";
+    const key = keyGenerator?.(req) ?? req.ip ?? req.socket.remoteAddress ?? "unknown";
     const now = Date.now();
 
     let record = clients.get(key);

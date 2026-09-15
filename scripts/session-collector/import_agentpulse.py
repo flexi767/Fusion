@@ -26,25 +26,41 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
     # SHA-256 identity keeps imports restartable, independent of pathname or mtime.
     with snapshot.open('rb') as snapshot_file:
         digest=hashlib.file_digest(snapshot_file,'sha256').hexdigest()
-    db.execute('CREATE TABLE IF NOT EXISTS imports_v2(snapshot TEXT,host TEXT,phase TEXT,cursor INTEGER NOT NULL,PRIMARY KEY(snapshot,host))')
-    position=db.execute('SELECT phase,cursor FROM imports_v2 WHERE snapshot=? AND host=?',(digest,host_id)).fetchone()
-    phase,cursor=position if position else ('sessions',0)
-    report={'queued':0,'excludedHost':0,'unmapped':[],'snapshot':digest,'phase':phase,'cursor':cursor,'complete':phase=='done'}
+    identity_digest=hashlib.sha256(json.dumps(identities,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    db.executescript('''CREATE TABLE IF NOT EXISTS imports_v3(snapshot TEXT,host TEXT,identity_digest TEXT,phase TEXT,cursor INTEGER NOT NULL,PRIMARY KEY(snapshot,host));
+      CREATE TABLE IF NOT EXISTS import_unmapped(snapshot TEXT,host TEXT,phase TEXT,row_id INTEGER,session_id TEXT,PRIMARY KEY(snapshot,host,phase,row_id));''')
+    position=db.execute('SELECT identity_digest,phase,cursor FROM imports_v3 WHERE snapshot=? AND host=?',(digest,host_id)).fetchone()
+    phase,cursor=(position[1],position[2]) if position and position[0]==identity_digest else ('sessions',0)
+    if position and position[0]!=identity_digest:
+        with db:db.execute('DELETE FROM import_unmapped WHERE snapshot=? AND host=?',(digest,host_id))
+    def checkpoint(current_phase,row_id):
+        db.execute('INSERT OR REPLACE INTO imports_v3 VALUES (?,?,?,?,?)',(digest,host_id,identity_digest,current_phase,row_id))
+    def unresolved():
+        return [row[0] for row in db.execute('SELECT DISTINCT session_id FROM import_unmapped WHERE snapshot=? AND host=? ORDER BY session_id',(digest,host_id))]
+    report={'queued':0,'excludedHost':0,'unmapped':unresolved(),'snapshot':digest,'phase':phase,'cursor':cursor,'complete':phase=='done' and not unresolved()}
     if phase=='done':source.close();return report
     if phase=='sessions':
-        rows=source.execute('SELECT rowid event_id,session_id,agent_type,display_name,cwd,status,is_working,last_activity_at,notes FROM sessions WHERE rowid>? ORDER BY rowid LIMIT ?',(cursor,limit)).fetchall()
+        rows=source.execute('SELECT rowid event_id,session_id,agent_type,display_name,cwd,status,is_working,last_activity_at,notes,metadata FROM sessions WHERE rowid>? ORDER BY rowid LIMIT ?',(cursor,limit)).fetchall()
     else:
-        rows=source.execute("SELECT e.id event_id,e.session_id,e.raw_payload,s.agent_type,s.display_name,s.cwd,s.status,s.is_working,s.last_activity_at FROM events e JOIN sessions s ON s.session_id=e.session_id WHERE e.provider_event_type='agentpulse_turn_result' AND e.id>? ORDER BY e.id LIMIT ?",(cursor,limit)).fetchall()
+        rows=source.execute("SELECT e.id event_id,e.session_id,e.raw_payload,s.agent_type,s.display_name,s.cwd,s.status,s.is_working,s.last_activity_at,s.metadata FROM events e JOIN sessions s ON s.session_id=e.session_id WHERE e.provider_event_type='agentpulse_turn_result' AND e.id>? ORDER BY e.id LIMIT ?",(cursor,limit)).fetchall()
     for row in rows:
         if db.execute('SELECT count(*) FROM pending').fetchone()[0] >= 5000:
             report['paused']='Spool capacity reached';break
         identity=identities.get(row['session_id'])
+        source_host=(json.loads(row['metadata'] or '{}') or {}).get('hostName')
+        if source_host and source_host!=host_id:
+            with db:checkpoint(phase,row['event_id'])
+            report['excludedHost']+=1;report['cursor']=row['event_id'];continue
         if not identity:
-            report['unmapped'].append(row['session_id']);break # Never skip an unmapped identity silently.
+            with db:
+                db.execute('INSERT OR IGNORE INTO import_unmapped VALUES (?,?,?,?,?)',(digest,host_id,phase,row['event_id'],row['session_id']))
+                checkpoint(phase,row['event_id'])
+            report['cursor']=row['event_id'];continue
+
         provider=identity.get('provider');native=identity.get('nativeSessionId')
         if provider not in ('codex','claude') or not native:raise ValueError('Invalid audited identity mapping')
         if identity.get('hostId') != host_id:
-            with db:db.execute('INSERT OR REPLACE INTO imports_v2 VALUES (?,?,?,?)',(digest,host_id,phase,row['event_id']))
+            with db:checkpoint(phase,row['event_id'])
             report['excludedHost']+=1;continue
         turn=None
         if phase=='events':
@@ -62,12 +78,13 @@ def import_snapshot(snapshot, db, identities, host_id, limit=100):
         if phase=='sessions' and row['notes']:envelope['importedNotes']=row['notes']
         with db:
             db.execute('INSERT OR IGNORE INTO pending(event_id,body) VALUES (?,?)',(event_id,json.dumps(envelope)))
-            db.execute('INSERT OR REPLACE INTO imports_v2 VALUES (?,?,?,?)',(digest,host_id,phase,row['event_id']))
+            checkpoint(phase,row['event_id'])
         report['queued']+=1;report['cursor']=row['event_id']
     if not rows:
         phase='events' if phase=='sessions' else 'done'
-        with db:db.execute('INSERT OR REPLACE INTO imports_v2 VALUES (?,?,?,?)',(digest,host_id,phase,0))
+        with db:checkpoint(phase,0)
         report.update(phase=phase,cursor=0,complete=phase=='done')
+    report['unmapped']=unresolved();report['complete']=phase=='done' and not report['unmapped']
     source.close()
     return report
 

@@ -40,8 +40,12 @@ export class ExternalSessionStore {
     const id = sessionId(hostId, observation);
     const receivedAt = new Date().toISOString();
     return this.layer.db.transaction(async (tx) => {
-      await tx.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: receivedAt, lastAcknowledgementAt: receivedAt })
-        .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: receivedAt, lastAcknowledgementAt: receivedAt } });
+      if (historical) {
+        await tx.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: null }).onConflictDoNothing();
+      } else {
+        await tx.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: receivedAt, lastAcknowledgementAt: receivedAt })
+          .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: receivedAt, lastAcknowledgementAt: receivedAt } });
+      }
       const applied = await tx.insert(externalSessions).values({ id, hostId, provider: observation.provider,
         nativeSessionId: observation.nativeSessionId, revision: observation.revision, observation, receivedAt })
         .onConflictDoUpdate({ target: externalSessions.id, set: { revision: observation.revision, observation, receivedAt },
@@ -56,8 +60,11 @@ export class ExternalSessionStore {
           .onConflictDoUpdate({ target: [externalSessionTurns.sessionId, externalSessionTurns.id],
             set: { revision: observation.revision, startedAt: result.startedAt, result },
             setWhere: historical
-              ? sql`${externalSessionTurns.result}->>'provenance' = 'agentpulse-import' AND ${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}`
-              : lt(externalSessionTurns.revision, observation.revision) });
+              ? sql`${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}`
+              : and(lt(externalSessionTurns.revision, observation.revision), sql`(
+                  ${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}
+                  OR (${externalSessionTurns.result}->>'provenance' = 'native-transcript' AND ${externalSessionTurns.result}->>'updatedAt' = ${result.updatedAt})
+                )`) });
       }
       if (historical && importedNotes) {
         await tx.insert(externalSessionDetails).values({ sessionId: id, notes: redactSecrets(importedNotes), notesRevision: 1 })
@@ -67,12 +74,20 @@ export class ExternalSessionStore {
     });
   }
 
-  async list(query: { hostId?: string; provider?: string; before?: string; limit?: number } = {}) {
+  async list(query: { hostId?: string; provider?: string; activity?: string; q?: string; before?: string; limit?: number } = {}) {
+    if (query.q && query.q.length > 256) throw new Error("Invalid session search");
+    const search = query.q?.trim();
     const limit = Math.max(1, Math.min(100, query.limit ?? 50));
     const before = cursor(query.before);
     const rows = await this.layer.db.select().from(externalSessions).where(and(
       query.hostId ? eq(externalSessions.hostId, query.hostId) : undefined,
       query.provider ? eq(externalSessions.provider, query.provider) : undefined,
+      query.activity ? sql`${externalSessions.observation}->>'activity' = ${query.activity}` : undefined,
+      search ? sql`(jsonb_to_tsvector('simple', ${externalSessions.observation}, '["string"]'::jsonb) @@ plainto_tsquery('simple', ${search}) OR EXISTS (
+        SELECT 1 FROM central.external_session_turns AS searched_turn
+        WHERE searched_turn.session_id = ${externalSessions.id}
+        AND jsonb_to_tsvector('simple', searched_turn.result, '["string"]'::jsonb) @@ plainto_tsquery('simple', ${search})
+      ))` : undefined,
       before ? or(lt(externalSessions.receivedAt, before.at), and(eq(externalSessions.receivedAt, before.at), lt(externalSessions.id, before.id))) : undefined,
     )).orderBy(desc(externalSessions.receivedAt), desc(externalSessions.id)).limit(limit + 1);
     return { sessions: rows.slice(0, limit), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].receivedAt, rows[limit - 1].id) : null };

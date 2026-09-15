@@ -18,9 +18,9 @@ MAX_LINE = 4 * MAX_READ
 LIVE_TAIL = 256 * 1024
 
 
-def connect(path):
+def connect(path, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=timeout)
     os.chmod(path, 0o600)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=FULL")
@@ -32,6 +32,7 @@ def connect(path):
       CREATE TABLE IF NOT EXISTS live_files(path TEXT PRIMARY KEY,inode TEXT,offset INTEGER,state TEXT);
     ''')
     columns={row[1] for row in db.execute('PRAGMA table_info(pending)')}
+    if 'retry_after' not in columns: db.execute('ALTER TABLE pending ADD COLUMN retry_after REAL NOT NULL DEFAULT 0')
     if 'rejection' not in columns: db.execute('ALTER TABLE pending ADD COLUMN rejection TEXT')
     if 'live_key' not in columns: db.execute('ALTER TABLE pending ADD COLUMN live_key TEXT')
     if 'priority' not in columns: db.execute('ALTER TABLE pending ADD COLUMN priority INTEGER NOT NULL DEFAULT 0')
@@ -114,7 +115,7 @@ def scan_live(db, path, provider):
         observation={k:state[k] for k in ('nativeSessionId','projectPath','observedAt','title','activity')}
         observation.update(version=1,provider=provider,revision=revision)
         event_id=str(uuid.uuid4());body=json.dumps(dict(version=1,eventId=event_id,collectorVersion=VERSION,observation=observation))
-        db.execute('INSERT INTO pending(event_id,body,live_key,priority) VALUES (?,?,?,1) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,rejection=NULL',(event_id,body,identity))
+        db.execute('INSERT INTO pending(event_id,body,live_key,priority) VALUES (?,?,?,1) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,rejection=NULL,retry_after=0',(event_id,body,identity))
         db.execute('INSERT OR REPLACE INTO live_files VALUES (?,?,?,?)',(str(path),inode,end,json.dumps(state)))
 
 
@@ -188,16 +189,23 @@ def bind_host(db, host):
     with db: db.execute("INSERT OR IGNORE INTO health VALUES ('host_id',?)",(host,))
 
 
-def post(url, token, body):
+def post(url, token, body, timeout=10):
     request = urllib.request.Request(url.rstrip('/')+'/api/session-collector', data=json.dumps(body).encode(), headers={'Content-Type':'application/json', 'Authorization':'Bearer '+token}, method='POST')
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
         return json.loads(response.read(65536))
 
 
 def drain(db, send, limit=50):
-    for row_id, event_id, body in db.execute('SELECT id,event_id,body FROM pending WHERE rejection IS NULL ORDER BY priority DESC,id LIMIT ?', (limit,)).fetchall():
+    for row_id, event_id, body, priority in db.execute('SELECT id,event_id,body,priority FROM pending WHERE rejection IS NULL AND retry_after<=? ORDER BY priority DESC,id LIMIT ?', (time.time(),limit)).fetchall():
         try: result = send(json.loads(body))
         except urllib.error.HTTPError as error:
+            if error.code==429:
+                try:delay=max(1,min(300,int(error.headers.get('Retry-After','5'))))
+                except (ValueError,AttributeError):delay=5
+                with db:
+                    db.execute('UPDATE pending SET retry_after=? WHERE priority=? AND rejection IS NULL',(time.time()+delay,priority))
+                    db.execute("INSERT OR REPLACE INTO health VALUES ('delivery_error','rate_limited')")
+                error.close();break
             error.close()
             if error.code not in (400,409,413):raise
             # Preserve rejected data for repair, but do not let one record block unrelated sessions.
@@ -263,13 +271,14 @@ def main():
                     budget-=MAX_READ
             with db:db.execute("INSERT OR REPLACE INTO health VALUES ('scan_cursor',?)",(str(cursor+100),))
             # Verify the server credential before sending any session data.
-            hello=dict(version=1,eventId=str(uuid.uuid4()),collectorVersion=VERSION,diagnostics=diagnostics(db))
+            hello=dict(version=1,eventId=str(uuid.uuid4()),collectorVersion=VERSION,probe=True)
             acknowledgement=post(args.url,token,hello)
             if acknowledgement.get('hostId') != args.host or acknowledgement.get('eventId') != hello['eventId'] or acknowledgement.get('acknowledged') is not True:
                 raise ValueError('Collector credential is bound to another host')
             send = lambda body: post(args.url, token, body)
             drain(db, send)
-            with db:db.execute("DELETE FROM health WHERE key='delivery_error'")
+            if not db.execute("SELECT 1 FROM pending WHERE retry_after>? LIMIT 1",(time.time(),)).fetchone():
+                with db:db.execute("DELETE FROM health WHERE key='delivery_error'")
             send(dict(version=1, eventId=str(uuid.uuid4()), collectorVersion=VERSION,diagnostics=diagnostics(db)))
             failures = 0
         except (OSError, ValueError, sqlite3.Error) as error:

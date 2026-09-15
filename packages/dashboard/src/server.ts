@@ -32,6 +32,7 @@ import {
 import type { AuthStorageLike, ModelRegistryLike } from "./routes.js";
 import { createApiRoutes } from "./routes.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
+import { createSessionCollectorRateLimit } from "./routes/session-collector-rate-limit.js";
 import { rateLimit, RATE_LIMITS } from "./rate-limit.js";
 import { ApiError, sendErrorResponse } from "./api-error.js";
 import {
@@ -997,6 +998,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   const metricsSampler = createMetricsSampler();
   const runtimeLogger = options?.runtimeLogger ?? createRuntimeLogger("server");
   const mutationRateLimit = rateLimit(RATE_LIMITS.mutation);
+  const sessionCollectorRateLimit = createSessionCollectorRateLimit();
   const setupRateLimit = rateLimit(RATE_LIMITS.api);
   const setupReadRateLimit = rateLimit(RATE_LIMITS.api);
   const sseControlRateLimit = rateLimit({ windowMs: 60_000, max: 300 });
@@ -1519,6 +1521,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // Rate limiting — avoid throttling normal dashboard reads, which are often
   // driven by polling, but keep targeted limits for setup flows, writes, and SSE.
   app.use("/api", (req, res, next) => {
+    if (sessionCollectorRateLimit(req, res, next)) return;
     const isSetupRead =
       req.method === "GET" && (
         req.path === "/browse-directory" ||

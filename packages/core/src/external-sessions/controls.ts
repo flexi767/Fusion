@@ -13,8 +13,10 @@ export class ExternalSessionControls {
       .onConflictDoUpdate({ target: runtimes.sessionId, set: { generation, capabilities: [...new Set(capabilities)], expiresAt: new Date(now + 90_000).toISOString() } });
   }
   async capability(sessionId: string, now = Date.now()) {
-    const [runtime] = await this.layer.db.select().from(runtimes).where(and(eq(runtimes.sessionId, sessionId), gt(runtimes.expiresAt, new Date(now).toISOString())));
-    return runtime ?? null;
+    const [runtime] = await this.layer.db.select().from(runtimes).where(eq(runtimes.sessionId, sessionId));
+    if (!runtime) return null;
+    const connected = Date.parse(runtime.expiresAt) > now;
+    return { ...runtime, connected, capabilities: connected ? runtime.capabilities : runtime.capabilities.filter(operation => operation === "feedback") };
   }
   async queue(sessionId: string, id: string, operation: SessionOperation, text?: string, now = Date.now()) {
     if (!/^[a-zA-Z0-9-]{16,128}$/.test(id) || !["feedback", "stop", "resume"].includes(operation)) throw new Error("Invalid command");
@@ -40,6 +42,8 @@ export class ExternalSessionControls {
   async claim(hostId: string, sessionId: string, generation: string, now = Date.now()) {
     return this.layer.db.transaction(async tx => {
       await tx.update(commands).set({ status: "expired", updatedAt: new Date(now).toISOString() }).where(and(eq(commands.hostId, hostId), inArray(commands.status, ["queued", "delivered"]), lt(commands.expiresAt, new Date(now).toISOString())));
+      const [runtime] = await tx.select().from(runtimes).where(eq(runtimes.sessionId, sessionId));
+      if (runtime?.generation !== generation) return [];
       // Delivered commands are replayed with the same id. The adapter's durable ledger fences application.
       const rows = await tx.select().from(commands).where(and(eq(commands.hostId, hostId), eq(commands.sessionId, sessionId), eq(commands.generation, generation), inArray(commands.status, ["queued", "delivered"]), gt(commands.expiresAt, new Date(now).toISOString()))).orderBy(commands.createdAt).limit(20);
       if (rows.length) await tx.update(commands).set({ status: "delivered", updatedAt: new Date(now).toISOString() }).where(inArray(commands.id, rows.map(row => row.id)));
@@ -49,7 +53,9 @@ export class ExternalSessionControls {
   async acknowledge(hostId: string, id: string, generation: string, status: "applied" | "failed", now = Date.now()) {
     if (status !== "applied" && status !== "failed") throw new Error("Invalid command outcome");
     const rows = await this.layer.db.update(commands).set({ status, updatedAt: new Date(now).toISOString() }).where(and(eq(commands.id, id), eq(commands.hostId, hostId), eq(commands.generation, generation), eq(commands.status, "delivered"), gt(commands.expiresAt, new Date(now).toISOString()))).returning();
-    return rows.length > 0;
+    if (rows.length) return true;
+    const [previous] = await this.layer.db.select().from(commands).where(and(eq(commands.id, id), eq(commands.hostId, hostId), eq(commands.generation, generation), eq(commands.status, status)));
+    return Boolean(previous);
   }
   async list(sessionId: string) { return this.layer.db.select().from(commands).where(eq(commands.sessionId, sessionId)).orderBy(commands.createdAt).limit(100); }
 }

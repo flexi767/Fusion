@@ -1,8 +1,9 @@
+import { SessionUsageOverview } from "./SessionUsageOverview";
 import { SessionHistory } from "./SessionHistory";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useExternalSessions } from "../hooks/useExternalSessions";
 import { Activity } from "lucide-react";
-import { fetchExternalSessions, type ObservedSession } from "../api/external-sessions";
+import { fetchExternalSessions, type ObservedSession, type CollectorHealth, type SessionFilters } from "../api/external-sessions";
 import { ViewHeader } from "./ViewHeader";
 import { ViewLayout } from "./ViewLayout";
 import "./SessionsView.css";
@@ -24,57 +25,65 @@ export function SessionsView() {
 }
 
 function SessionList() {
-  const { data, error, isLoading } = useExternalSessions();
-  const [older, setOlder] = useState<ObservedSession[]>([]);
-  const [cursor, setCursor] = useState<string | null | undefined>();
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [pageError, setPageError] = useState("");
+  const [collectors, setCollectors] = useState<CollectorHealth[]>([]);
   const [host, setHost] = useState("");
   const [provider, setProvider] = useState("");
   const [activity, setActivity] = useState("");
   const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  const filters = { host, provider, activity, q: query };
+  return <ViewLayout header={<ViewHeader icon={Activity} title="Sessions" />}><div className="sessions-view">
+    <p>Codex and Claude sessions across your hosts. Observing a session does not schedule a Fusion task.</p>
+    <form className="sessions-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()); }}>
+      <label>Host<select value={host} onChange={e => setHost(e.target.value)}><option value="">All hosts</option>{collectors.map(c => <option key={c.hostId}>{c.hostId}</option>)}</select></label>
+      <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
+      <label>Activity<select value={activity} onChange={e => setActivity(e.target.value)}><option value="">All activity</option>{["working", "waiting", "completed", "error"].map(x => <option key={x}>{x}</option>)}</select></label>
+      <label>Search sessions and collected output<input type="search" maxLength={256} value={search} onChange={e => setSearch(e.target.value)} /></label>
+      <button className="btn btn-secondary" type="submit">Search</button>
+    </form>
+    <SessionUsageOverview />
+    <SessionResults key={JSON.stringify(filters)} filters={filters} onCollectors={setCollectors} />
+  </div></ViewLayout>;
+}
+
+function SessionResults({ filters, onCollectors }: { filters: SessionFilters; onCollectors: (rows: CollectorHealth[]) => void }) {
+  const { data, error, isLoading } = useExternalSessions(filters);
+  const [older, setOlder] = useState<ObservedSession[]>([]);
+  const [cursor, setCursor] = useState<string | null | undefined>();
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [pageError, setPageError] = useState("");
+  useEffect(() => { if (data) onCollectors(data.collectors); }, [data, onCollectors]);
   const sessions = useMemo(() => {
     const rows = new Map(older.map(row => [row.id, row]));
     for (const row of data?.sessions ?? []) if (!rows.has(row.id) || rows.get(row.id)!.revision <= row.revision) rows.set(row.id, row);
     return [...rows.values()].sort((a, b) => b.observation.observedAt.localeCompare(a.observation.observedAt) || a.id.localeCompare(b.id));
   }, [data, older]);
-  const visible = sessions.filter(row => (!host || row.hostId === host) && (!provider || row.provider === provider)
-    && (!activity || row.observation.activity === activity) && `${row.observation.title} ${row.observation.projectPath}`.toLowerCase().includes(search.toLowerCase()));
   const next = cursor === undefined ? data?.nextCursor : cursor;
   const loadMore = async () => {
     if (!next || loadingMore) return;
     setLoadingMore(true); setPageError("");
-    try { const page = await fetchExternalSessions(next); setOlder(rows => [...rows, ...page.sessions]); setCursor(page.nextCursor); }
+    try { const page = await fetchExternalSessions(next, filters); setOlder(rows => [...rows, ...page.sessions]); setCursor(page.nextCursor); }
     catch { setPageError("Could not load more sessions. Please retry."); }
     finally { setLoadingMore(false); }
   };
-  return <ViewLayout header={<ViewHeader icon={Activity} title="Sessions" />}>
-    <div className="sessions-view">
-      <p>Codex and Claude sessions across your hosts. Observing a session does not schedule a Fusion task.</p>
-      <details className="session-card"><summary>Collector health</summary>{data?.collectors.map(collector => <section key={collector.hostId}>
-        <h3>{collector.hostId}</h3><p>Last heartbeat: {new Date(collector.lastHeartbeatAt).toLocaleString()} · Last acknowledged delivery: {collector.lastAcknowledgementAt ? new Date(collector.lastAcknowledgementAt).toLocaleString() : "None"}</p>
-        <p>{collector.diagnostics?.spoolDepth ?? "Unknown"} queued · {collector.diagnostics?.rejectedDeliveries ?? "Unknown"} rejected · {collector.diagnostics?.discoveredFiles ?? "Unknown"} discovered transcripts</p>
-        {collector.diagnostics?.parseError && <p>Transcript parsing needs attention. Inspect collector diagnostics on this host.</p>}
-        {collector.diagnostics?.deliveryError && <p>Delivery is retrying after a failure.</p>}
-      </section>)}</details>
-      <div className="sessions-filters">
-        <label>Host<select value={host} onChange={e => setHost(e.target.value)}><option value="">All hosts</option>{(data?.collectors ?? []).map(c => <option key={c.hostId}>{c.hostId}</option>)}</select></label>
-        <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
-        <label>Activity<select value={activity} onChange={e => setActivity(e.target.value)}><option value="">All activity</option>{["working", "waiting", "completed", "error"].map(x => <option key={x}>{x}</option>)}</select></label>
-        <label>Project or title<input type="search" value={search} onChange={e => setSearch(e.target.value)} /></label>
-      </div>
-      {isLoading && <p role="status">Loading sessions…</p>}
-      {data?.enabled === false && <p>Sessions are not enabled on this server.</p>}
-      {error && <p role="alert">Session updates are unavailable. Previously loaded sessions remain visible.</p>}
-      {!isLoading && data?.enabled && visible.length === 0 && <p>No sessions match these filters.</p>}
-      <div className="sessions-grid">{visible.map(session => {
-        const heartbeat = data?.collectors.find(c => c.hostId === session.hostId)?.lastHeartbeatAt;
-        const age = heartbeat ? Date.now() - Date.parse(heartbeat) : Infinity;
-        return <SessionCard key={session.id} session={session} connected={age >= 0 && age <= 90_000} />;
-      })}</div>
-      {pageError && <p role="alert">{pageError}</p>}
-      {next && <button className="btn btn-secondary" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more sessions"}</button>}
-      {next && <p>Filters apply to loaded sessions; load more to include older records.</p>}
-    </div>
-  </ViewLayout>;
+  return <>
+    <details className="session-card"><summary>Collector health</summary>{data?.collectors.map(collector => <section key={collector.hostId}>
+      <h3>{collector.hostId}</h3><p>Last heartbeat: {collector.lastHeartbeatAt ? new Date(collector.lastHeartbeatAt).toLocaleString() : "No live heartbeat"} · Last acknowledged delivery: {collector.lastAcknowledgementAt ? new Date(collector.lastAcknowledgementAt).toLocaleString() : "None"}</p>
+      <p>{collector.diagnostics?.spoolDepth ?? "Unknown"} queued · {collector.diagnostics?.rejectedDeliveries ?? "Unknown"} rejected · {collector.diagnostics?.discoveredFiles ?? "Unknown"} discovered transcripts</p>
+      {collector.diagnostics?.parseError && <p>Transcript parsing needs attention. Inspect collector diagnostics on this host.</p>}
+      {collector.diagnostics?.deliveryError && <p>Delivery is retrying after a failure.</p>}
+    </section>)}</details>
+    {isLoading && <p role="status">Loading sessions…</p>}
+    {data?.enabled === false && <p>Sessions are not enabled on this server.</p>}
+    {error && <p role="alert">Session updates are unavailable. Previously loaded sessions remain visible.</p>}
+    {!isLoading && data?.enabled && sessions.length === 0 && <p>No sessions match these filters.</p>}
+    {filters.q && <p>Matching collected words: {filters.q}. Search includes older history.</p>}
+    <div className="sessions-grid">{sessions.map(session => {
+      const heartbeat = data?.collectors.find(c => c.hostId === session.hostId)?.lastHeartbeatAt;
+      const age = heartbeat ? Date.now() - Date.parse(heartbeat) : Infinity;
+      return <SessionCard key={session.id} session={session} connected={age >= 0 && age <= 90_000} />;
+    })}</div>
+    {pageError && <p role="alert">{pageError}</p>}
+    {next && <button className="btn btn-secondary" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more sessions"}</button>}
+  </>;
 }

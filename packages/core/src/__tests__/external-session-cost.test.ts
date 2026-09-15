@@ -18,5 +18,5 @@ it("unknown and unsupported rates or incomplete telemetry stay visibly unpriced"
 });
 
 it("does not assume a five-minute cache write when Claude omits its lifetime", () => {
-  expect(priceSessionUsage("claude", { ...usage, cacheWriteHourTokens: null }, { "anthropic/fixture": rates }).reason).toBe("Cache lifetime unreported");
+  expect(priceSessionUsage("claude", { ...usage, cacheWriteHourTokens: null }, { "anthropic:fixture": rates }).reason).toBe("Cache lifetime unreported");
 });

@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { createSharedPgTaskStoreTestHarness, pgDescribe } from "../../__test-utils__/pg-test-harness.js";
 import { ExternalSessionStore } from "../../external-sessions/store.js";
+import { externalSessionAnalytics } from "../../external-sessions/analytics.js";
 const observation = { version: 1, provider: "codex", nativeSessionId: "native-1", revision: 10, observedAt: "2026-09-15T12:00:00.000Z", activity: "working", title: "Review", projectPath: "/workspace/project" };
 pgDescribe("External session durable ingestion", () => {
   const h = createSharedPgTaskStoreTestHarness({ prefix: "fusion_external_sessions", projectId: "external-session-test" });
@@ -49,6 +50,72 @@ pgDescribe("External session durable ingestion", () => {
     expect((await store.get(id))?.observation.title).toBe("Review");
     expect((await store.turns(id)).turns.find(row => row.id === "live")?.response).toBe("Newer live result");
     expect((await store.turns(id)).turns.find(row => row.id === "archived")?.provenance).toBe("agentpulse-import");
+    await store.ingest("m3", "test", { ...observation, revision: 11 }, [{ ...turn, id: "archived", response: "Partial native backfill", updatedAt: "2026-09-15T11:59:00Z" }]);
+    expect((await store.turns(id)).turns.find(row => row.id === "archived")?.response).toBe("Newer live result");
+    await store.ingest("m3", "test", { ...observation, revision: 12 }, [{ ...turn, id: "archived", response: "Later native result", updatedAt: "2026-09-15T12:01:00Z" }]);
+    expect((await store.turns(id)).turns.find(row => row.id === "archived")?.response).toBe("Later native result");
+  });
+
+  it("searches historical output across pages without duplicate cards and keeps host filters", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const turn = { id: "one", startedAt: observation.observedAt, updatedAt: observation.observedAt, prompts: ["Investigate"], response: "Zebra deployment failed", files: [], usage: [] };
+    const first = await store.ingest("m3", "test", observation, [turn, { ...turn, id: "two" }]);
+    await store.ingest("j", "test", observation, [turn]);
+    await store.ingest("m3", "test", { ...observation, nativeSessionId: "unrelated" }, [{ ...turn, response: "All done" }]);
+    const matches = await store.list({ q: "zebra", limit: 1 });
+    const older = await store.list({ q: "zebra", limit: 1, before: matches.nextCursor! });
+    expect(new Set([...matches.sessions, ...older.sessions].map(row => row.id)).size).toBe(2);
+    expect(older.nextCursor).toBeNull();
+    expect((await store.list({ q: "zebra", hostId: "m3", activity: "working" })).sessions.map(row => row.id)).toEqual([first.id]);
+    expect((await store.list({ q: "zebra", activity: "completed" })).sessions).toHaveLength(0);
+  });
+
+  it("totals every collected turn without replay inflation and separates missing prices", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const usage = { model: "fixture", inputTokens: 100, cachedInputTokens: 20, cacheWriteTokens: 0, cacheWriteHourTokens: 0, outputTokens: 10, requests: 1 };
+    const turn = { id: "one", startedAt: observation.observedAt, updatedAt: observation.observedAt, prompts: [], response: "", files: [], usage: [usage] };
+    const { id } = await store.ingest("m3", "test", observation, [turn, { ...turn, id: "two" }, { ...turn, id: "unknown", usage: [{ ...usage, inputTokens: null }] }, { ...turn, id: "missing", usage: [] }]);
+    await store.ingest("m3", "test", observation, [turn]);
+    await store.ingest("j", "test", observation, [turn]);
+    const prices = { "openai:fixture": { inputPer1M: 2, cacheReadPer1M: 1, cacheWritePer1M: 3, outputPer1M: 4, source: "fixture" } };
+    const result = await externalSessionAnalytics(h.layer(), { host: "m3" }, prices);
+    expect(result.truncated).toBe(false);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0]).toMatchObject({ id, turns: 4, unreportedTurns: 1, unpricedRows: 1, requests: 3, inputTokens: null, outputTokens: 30 });
+    expect(result.sessions[0].usd).toBeCloseTo(0.00044, 12);
+    expect((await externalSessionAnalytics(h.layer(), { from: "2026-09-16T00:00:00Z" }, prices)).sessions).toHaveLength(0);
+    expect((await externalSessionAnalytics(h.layer(), { sessionId: id, model: "fixture" }, prices)).sessions[0].turns).toBe(3);
+  });
+
+  it("historical imports neither invent nor refresh live collector connectivity", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    await store.ingest("archive-only", "import", observation, [], true);
+    expect((await store.collectors()).find(row => row.hostId === "archive-only")?.lastHeartbeatAt).toBeNull();
+    await store.ingest("m3", "native", observation);
+    const heartbeat = (await store.collectors()).find(row => row.hostId === "m3")?.lastHeartbeatAt;
+    await store.ingest("m3", "import", { ...observation, nativeSessionId: "historical" }, [], true);
+    expect((await store.collectors()).find(row => row.hostId === "m3")?.lastHeartbeatAt).toBe(heartbeat);
+  });
+
+  it("keeps the newest turn across native/import arrival order for both providers", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const partial = { id: "partial", startedAt: observation.observedAt, updatedAt: observation.observedAt, prompts: ["Repair"], response: "", files: [], usage: [] };
+    const complete = { ...partial, updatedAt: "2026-09-15T12:01:00.000Z", completedAt: "2026-09-15T12:01:00.000Z", response: "Repair failed", files: [{ path: "../shared.ts", diff: "+repair", added: 1, removed: 0 }] };
+    for (const provider of ["codex", "claude"]) for (const importFirst of [false, true]) {
+      const row = { ...observation, provider, nativeSessionId: `${provider}-${importFirst}` };
+      let id: string;
+      if (importFirst) {
+        ({ id } = await store.ingest("m3", "import", row, [complete], true));
+        await store.ingest("m3", "native", row, [partial]);
+      } else {
+        ({ id } = await store.ingest("m3", "native", row, [partial]));
+        await store.ingest("m3", "import", row, [complete], true);
+      }
+      await store.ingest("m3", "native", { ...row, revision: 11 }, [partial]);
+      expect((await store.turns(id)).turns).toHaveLength(1);
+      expect((await store.turns(id)).turns[0]).toMatchObject({ response: "Repair failed", completedAt: complete.completedAt, files: [{ path: "../shared.ts", added: 1 }] });
+      expect((await store.get(id))?.observation.activity).toBe("working");
+    }
   });
 
 });

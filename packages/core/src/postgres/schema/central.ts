@@ -332,7 +332,7 @@ export const globalRoutines = centralSchema.table("global_routines", {
 export const sessionCollectors = centralSchema.table("session_collectors", {
   hostId: text("host_id").primaryKey(),
   collectorVersion: text("collector_version").notNull(),
-  lastHeartbeatAt: text("last_heartbeat_at").notNull(),
+  lastHeartbeatAt: text("last_heartbeat_at"),
   lastAcknowledgementAt: text("last_acknowledgement_at"),
   diagnostics: jsonb("diagnostics").notNull().default({}),
 });
