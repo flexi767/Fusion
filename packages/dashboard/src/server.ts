@@ -1063,7 +1063,9 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     // Express treats trailing slashes as equivalent, so parser boundaries must do the same;
     // no broader prefix is exempted from the global rawBody-preserving parser.
     if (req.path === "/api/voice/transcribe" || req.path === "/api/voice/transcribe/") return next();
-    const parser = req.path === "/api/planning/start-streaming" || req.path === "/api/planning/start-streaming/"
+    const parser = req.path === "/api/session-collector" || req.path === "/api/session-collector/"
+      ? chatMessageParser
+      : req.path === "/api/planning/start-streaming" || req.path === "/api/planning/start-streaming/"
       ? planningImageCaptureParser
       : ((req.method === "POST" && isChatMessagePath(req.path)) || isTaskMessagePath(req.method, req.path))
         ? chatMessageParser

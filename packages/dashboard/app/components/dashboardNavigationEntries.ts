@@ -30,6 +30,7 @@ export interface DashboardNavigationRegistryOptions {
   onOpenSettings?: () => void | boolean | Promise<void | boolean>;
   pluginDashboardViews?: PluginDashboardViewEntry[];
   showAgents?: boolean;
+  showSessions?: boolean;
   showSkills?: boolean;
   flags?: { memory?: boolean; whiteboard?: boolean; goals?: boolean; insights?: boolean; research?: boolean; ideation?: boolean; evals?: boolean };
   mailboxUnreadCount?: number;
@@ -57,6 +58,7 @@ export function buildDashboardNavigationEntries(options: DashboardNavigationRegi
     return page(`plugin-${entry.pluginId}-${entry.view.viewId}`, entry.view.label, view, getPluginDashboardViewNavIcon(entry));
   });
   const overflow = [
+    ...(options.showSessions ? [page("sessions", "Sessions", "sessions", Bot)] : []),
     ...plugins,
     ...(options.showSkills ? [page("skills", "Skills", "skills", Zap)] : []),
     ...(options.showSkills ? [page("snippets", "Snippets", "snippets", Type)] : []),

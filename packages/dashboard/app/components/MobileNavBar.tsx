@@ -1,3 +1,4 @@
+import { useSessionsEnabled } from "../hooks/useSessionsEnabled";
 import "./MobileNavBar.css";
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
@@ -248,6 +249,7 @@ export function MobileNavBar({
   onAlphaMenuOpenChange,
 }: MobileNavBarProps) {
   const { t } = useTranslation("app");
+  const sessionsEnabled = useSessionsEnabled();
   const mode = useViewportMode();
   const navigationHistory = useContext(NavigationHistoryContext);
   const [isMoreOpen, setIsMoreOpen] = useState(false);
@@ -591,6 +593,7 @@ export function MobileNavBar({
     "github-import": { icon: <GitHubLogo />, labelKey: "nav.importFromGitHub", fallback: "Import from GitHub", moreTestId: "mobile-more-item-github", isActive: false, isAvailable: true, navigate: (surface) => surface === "primary" ? onOpenGitHubImport?.() : handleMoreAction(onOpenGitHubImport) },
     usage: { icon: <Activity />, labelKey: "nav.usage", fallback: "Usage", moreTestId: "mobile-more-item-usage", isActive: false, isAvailable: true, navigate: (surface) => surface === "primary" ? onOpenUsage?.() : handleMoreAction(onOpenUsage) },
     projects: { icon: <Grid3X3 />, labelKey: "nav.projects", fallback: "Projects", moreTestId: "mobile-more-item-projects", isActive: false, isAvailable: true, navigate: (surface) => surface === "primary" ? onViewAllProjects?.() : handleMoreAction(onViewAllProjects) },
+    sessions: { icon: <Bot />, labelKey: "nav.sessions", fallback: "Sessions", moreTestId: "mobile-more-item-sessions", isActive: view === "sessions", isAvailable: sessionsEnabled, navigate: (surface) => surface === "primary" ? onChangeView("sessions") : handleMoreAction(() => onChangeView("sessions")) },
     notes: { icon: <StickyNote />, labelKey: "nav.notes", fallback: "Notes", moreTestId: "mobile-more-item-notes", isActive: view === "notes", isAvailable: true, navigate: (surface) => surface === "primary" ? onChangeView("notes") : handleMoreAction(() => onChangeView("notes")) },
     whiteboard: { icon: <PanelsTopLeft />, labelKey: "nav.whiteboard", fallback: "Whiteboard", moreTestId: "mobile-more-item-whiteboard", isActive: view === "whiteboard", isAvailable: Boolean(experimentalFeatures?.whiteboardView), alpha: true, navigate: (surface) => surface === "primary" ? onChangeView("whiteboard") : handleMoreAction(() => onChangeView("whiteboard")) },
     secrets: { icon: <Lock />, labelKey: "nav.secrets", fallback: "Secrets", moreTestId: "mobile-more-item-secrets", isActive: view === "secrets", isAvailable: true, navigate: (surface) => surface === "primary" ? onChangeView("secrets") : handleMoreAction(() => onChangeView("secrets")) },

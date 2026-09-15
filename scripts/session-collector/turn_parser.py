@@ -1,0 +1,155 @@
+# Adapted from flexi767/agentpulse 04f0dcf42d700f60ea3848326ba6d43da80c7a40.
+# Copyright (c) 2026 Jay Stuart; MIT, see AGENTPULSE-LICENSE.
+#!/usr/bin/env python3
+"""Incremental native turn results; never inspect a shared checkout for attribution."""
+import difflib
+
+FIELDS = {'inputTokens':'input_tokens','cachedInputTokens':'cached_input_tokens','cacheWriteTokens':'cache_write_input_tokens','outputTokens':'output_tokens','reasoningTokens':'reasoning_output_tokens'}
+def num(v): return v if isinstance(v,(int,float)) and not isinstance(v,bool) and v>=0 else 0
+def text(content):
+    if isinstance(content,str): return content
+    return '\n'.join(b.get('text','') for b in content or [] if isinstance(b,dict) and b.get('type','').lower() in ('text','input_text','output_text'))
+def fresh(tid,at):
+    return {'id':tid,'startedAt':at,'completedAt':None,'durationMs':None,'durationSource':'timestamps','prompts':[],'response':'','usage':[],'files':[],'toolCalls':0,'updatedAt':at}
+def consume(state,e,agent):
+    p=e.get('payload') or {}; at=e.get('timestamp')
+    if not isinstance(p,dict) or not isinstance(at,str): return
+    kind=e.get('type'); sub=p.get('type'); turns=state.setdefault('turns',{}); changed=state.setdefault('changed',[])
+    def turn(tid=None):
+        tid=tid or state.get('active') or ('inferred:'+at)
+        if tid not in turns: turns[tid]=fresh(tid,at)
+        state['active']=tid; r=turns[tid]; r['updatedAt']=at
+        if tid not in changed: changed.append(tid)
+        return r
+    def prompt(value,tid=None):
+        if not value.strip(): return
+        r=turn(tid)
+        if value not in r['prompts']: r['prompts'].append(value[:65536])
+    def edit(r,path,diff,key):
+        seen=state.setdefault('edits',{})
+        if key in seen: return
+        seen[key]=True
+        f=next((f for f in r['files'] if f['path']==path),None)
+        if not f:
+            if len(r['files'])>=256:return
+            f={'path':path,'diff':'','added':0,'removed':0,'truncated':False};r['files'].append(f)
+        f['added']+=sum(l.startswith('+') and not l.startswith('+++') for l in diff.splitlines())
+        f['removed']+=sum(l.startswith('-') and not l.startswith('---') for l in diff.splitlines())
+        combined=f['diff']+'\n'+diff
+        f['truncated']=f['truncated'] or len(combined)>65536;f['diff']=combined[:65536]
+    if kind=='turn_context':
+        state['model']=p.get('model') or state.get('model');state['fast']=p.get('service_tier') in ('fast','priority');return
+    if kind=='event_msg' and sub=='task_started': turn(p.get('turn_id'));return
+    if kind=='event_msg' and sub in ('task_complete','task_completed','turn_aborted'):
+        r=turn(p.get('turn_id'));r['completedAt']=at
+        r['durationMs']=num(p.get('duration_ms')) if p.get('duration_ms') is not None else elapsed(r['startedAt'],at)
+        r['durationSource']='provider' if p.get('duration_ms') is not None else 'timestamps'
+        if p.get('last_agent_message'):r['response']=p['last_agent_message'][:131072]
+        return
+    if kind=='response_item' and sub=='message':
+        value=text(p.get('content'))
+        if p.get('role')=='user' and not state.get('nativePrompts',{}).get(state.get('active')):prompt(value)
+        elif p.get('role')=='assistant' and p.get('phase')=='final':turn()['response']=value[:131072]
+        return
+    if kind=='event_msg' and sub=='item_completed':
+        i=p.get('item') or {}; typ=i.get('type');r=turn(p.get('turn_id'))
+        if typ=='UserMessage':
+            native=state.setdefault('nativePrompts',{})
+            if not native.get(r['id']):r['prompts']=[];native[r['id']]=True
+            prompt(text(i.get('content')),r['id'])
+        elif typ=='AgentMessage' and i.get('phase')=='final':r['response']=text(i.get('content'))[:131072]
+        elif typ=='FileChange':
+            changes=i.get('changes') or {}
+            if isinstance(changes,dict):
+                for path,c in changes.items():
+                    if isinstance(c,dict):
+                        diff=c.get('unified_diff') or c.get('diff') or ''
+                        if not diff and isinstance(c.get('content'),str):
+                            prefix='-' if c.get('type')=='delete' else '+'
+                            diff=f'--- {path}\n+++ {path}\n'+''.join(prefix+line+'\n' for line in c['content'].splitlines())
+                        edit(r,path,diff,str(i.get('id'))+path)
+        elif typ in ('CommandExecution','McpToolCall'):r['toolCalls']+=1
+        return
+    if kind=='token_usage_record':
+        tid=p.get('turn_id') or state.get('active');r=turn(tid)
+        key=p.get('response_id') or str(e.get('ordinal'))
+        u=p.get('usage') or {};req={k:num(u.get(v)) for k,v in FIELDS.items()}
+        req.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(u.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':num(u.get('input_tokens')),'requests':1,'turn':tid})
+        previous=state.setdefault('requests',{}).get(key)
+        if previous:
+            for k in FIELDS:req[k]=max(req[k],previous[k])
+        state['requests'][key]=req;state['canonical']=True;rebuild_usage(state,r);return
+    if kind=='event_msg' and sub=='token_count' and not state.get('canonical'):
+        info=p.get('info') or {};u=info.get('total_token_usage')
+        if not isinstance(u,dict):return
+        prev=state.get('previousUsage',{});state['previousUsage']=u
+        delta={k:max(0,num(u.get(v))-num(prev.get(v))) for k,v in FIELDS.items()}
+        if not any(delta.values()):return
+        r=turn();last=info.get('last_token_usage') or {};delta.update({'cacheWriteHourTokens':0,'model':state.get('model') or 'Unknown','longContext':num(last.get('input_tokens'))>272000,'fast':state.get('fast',False),'contextTokens':num(last.get('input_tokens')),'requests':1,'turn':r['id']})
+        state.setdefault('fallback',{}).setdefault(r['id'],[]).append(delta);rebuild_usage(state,r);return
+    if agent!='claude_code':return
+    m=e.get('message') or {}
+    if not isinstance(m,dict):return
+    content=m.get('content') or []
+    if kind=='user':
+        value=text(content)
+        if value and not e.get('isMeta'):
+            # User steering belongs to the active unfinished turn.
+            active=turns.get(state.get('active'))
+            if not active or active['completedAt']:state['active']=e.get('uuid') or 'claude:'+at
+            prompt(value)
+        if isinstance(content,list):
+            for b in content:
+                if not isinstance(b,dict) or b.get('type')!='tool_result' or b.get('is_error'):continue
+                call=state.setdefault('calls',{}).get(b.get('tool_use_id'))
+                if not call:continue
+                inp=call['input'];path=inp.get('file_path') or inp.get('path')
+                if path and call['name'] in ('Edit','Write','MultiEdit'):
+                    r=turn(call['turn']);patch=e.get('toolUseResult') or {};diff=''
+                    if isinstance(patch,dict) and isinstance(patch.get('structuredPatch'),list):
+                        for h in patch['structuredPatch']:
+                            diff+=f"@@ -{h.get('oldStart',0)},{h.get('oldLines',0)} +{h.get('newStart',0)},{h.get('newLines',0)} @@\n"+'\n'.join(h.get('lines') or [])+'\n'
+                    if not diff:
+                        edits=inp.get('edits') or [inp]
+                        for change in edits:
+                            old=change.get('old_string','');new=change.get('new_string',change.get('content',''))
+                            diff+=''.join(difflib.unified_diff([line+'\n' for line in old.splitlines()],[line+'\n' for line in new.splitlines()],fromfile=path,tofile=path))
+                    edit(r,path,diff,b.get('tool_use_id'))
+        return
+    if kind=='assistant':
+        r=turn();value=text(content)
+        if value:r['response']=value[:131072];r['completedAt']=at;r['durationMs']=elapsed(r['startedAt'],at)
+        for b in content if isinstance(content,list) else []:
+            if isinstance(b,dict) and b.get('type')=='tool_use':
+                r['completedAt']=None;r['durationMs']=None
+                if b.get('id') not in state.setdefault('calls',{}):r['toolCalls']+=1
+                state['calls'][b.get('id')]={'name':b.get('name'),'input':b.get('input') or {},'turn':r['id']}
+        u=m.get('usage')
+        if isinstance(u,dict):
+            key=m.get('id') or e.get('uuid');cr=num(u.get('cache_read_input_tokens'));cw=num(u.get('cache_creation_input_tokens'));cache=u.get('cache_creation') or {}
+            req={'inputTokens':num(u.get('input_tokens'))+cr+cw,'cachedInputTokens':cr,'cacheWriteTokens':cw,'cacheWriteHourTokens':num(cache.get('ephemeral_1h_input_tokens')),'outputTokens':num(u.get('output_tokens')),'reasoningTokens':0,'model':m.get('model') or 'Unknown','requests':1,'turn':r['id'],'contextTokens':num(u.get('input_tokens'))+cr+cw,'fast':u.get('speed')=='fast','longContext':num(u.get('input_tokens'))+cr+cw>200000}
+            prev=state.setdefault('requests',{}).get(key)
+            if prev:
+                for k in FIELDS:req[k]=max(req[k],prev[k])
+                req['cacheWriteHourTokens']=max(req['cacheWriteHourTokens'],prev['cacheWriteHourTokens'])
+            state['requests'][key]=req;rebuild_usage(state,r)
+    if kind=='system' and e.get('subtype')=='turn_duration':
+        r=turn();r['durationMs']=num(e.get('durationMs'));r['durationSource']='provider';r['completedAt']=at
+
+def elapsed(start,end):
+    from datetime import datetime
+    try:return max(0,round((datetime.fromisoformat(end.replace('Z','+00:00'))-datetime.fromisoformat(start.replace('Z','+00:00'))).total_seconds()*1000))
+    except ValueError:return None
+
+def rebuild_usage(state,r):
+    reqs=[u for u in state.get('requests',{}).values() if u['turn']==r['id']]
+    if not reqs:reqs=state.get('fallback',{}).get(r['id'],[])
+    grouped={}
+    for u in reqs:
+        key=(u['model'],u['longContext'],u['fast'])
+        if key not in grouped:grouped[key]={k:v for k,v in u.items() if k!='turn'}
+        else:
+            g=grouped[key]
+            for k in (*FIELDS,'cacheWriteHourTokens','requests'):g[k]+=u[k]
+            g['contextTokens']=max(g['contextTokens'],u['contextTokens'])
+    r['usage']=list(grouped.values())

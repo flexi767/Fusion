@@ -1,3 +1,4 @@
+import { useSessionsEnabled } from "../hooks/useSessionsEnabled";
 import "./LeftSidebarNav.css";
 
 /*
@@ -176,6 +177,7 @@ export function LeftSidebarNav({
   footerVisible = false,
 }: LeftSidebarNavProps) {
   const { t } = useTranslation("app");
+  const sessionsEnabled = useSessionsEnabled();
   const [sidebarWidth, setSidebarWidth] = useState(readStoredSidebarWidth);
   const [isCollapsed, setIsCollapsed] = useState(readStoredCollapsed);
   /*
@@ -384,6 +386,7 @@ export function LeftSidebarNav({
     ...(experimentalFeatures?.memoryView
       ? [{ id: "memory", label: t("header.memoryView", getDashboardViewLabel("memory")), view: "memory" as TaskView, isActive: view === "memory", icon: Brain, testId: "sidebar-nav-memory", onSelect: () => onChangeView("memory") }]
       : []),
+    ...(sessionsEnabled ? [{ id: "sessions", label: "Sessions", view: "sessions" as TaskView, isActive: view === "sessions", icon: Bot, testId: "sidebar-nav-sessions", onSelect: () => onChangeView("sessions") }] : []),
     {
       id: "notes",
       label: t("nav.notes", getDashboardViewLabel("notes")),
@@ -447,6 +450,7 @@ export function LeftSidebarNav({
   ];
 
   const sharedRegistry = buildDashboardNavigationEntries({
+    showSessions: sessionsEnabled,
     view,
     onChangeView,
     onNewTask: onNewTask ? () => onNewTask() : undefined,

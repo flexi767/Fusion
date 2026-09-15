@@ -11,7 +11,7 @@ export const CREATE_API_ROUTES_REGISTRAR_MOUNT_SEQUENCE = [
   "registerGitGitHubRoutes", "registerGitLabRoutes", "registerJiraRoutes", "registerFilesTerminalWorkspaceRoutes", "registerAgentsProjectsNodesRoutes",
   "registerPluginsAutomationRoutes", "registerApprovalRoutes", "registerWorktrunkRoutes", "registerConfigMcpPiSettingsRoutes", "registerSystemMaintenanceRoutes", "registerModelRoutes",
   "registerCustomProviderRoutes", "registerAuthRoutes", "registerRuntimeProviderRoutes", "registerFnBinaryRoutes",
-  "registerAiTextAssistantRoutes", "registerUsageRoutes", "registerCommandCenterRoutes", "registerKnowledgeRoutes", "registerReportRoutes",
+  "registerAiTextAssistantRoutes", "registerUsageRoutes", "registerExternalSessionRoutes", "registerCommandCenterRoutes", "registerKnowledgeRoutes", "registerReportRoutes",
   "registerSignalRoutes", "registerMonitorRoutes", "registerUpdateCheckRoutes", "registerVoiceRoutes", "registerDiagnosticsRoutes",
   "registerCliAgentHooksRoute", "registerCliAgentSettingsRoutes", "registerActivityLogRoutes", "registerAgentCoreListCreateRoutes", "registerAgentImportExportRoutes",
   "registerOrgPortabilityRoutes", "registerAgentCoreRoutes", "registerAgentRuntimeRoutes", "registerSystemRoutes",

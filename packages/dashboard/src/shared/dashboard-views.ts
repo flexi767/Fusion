@@ -7,6 +7,7 @@ export const DASHBOARD_VIEW_IDS = [
   "board",
   "list",
   "patchnode",
+  "sessions",
   "graph",
   "agents",
   "missions",
@@ -62,6 +63,7 @@ export const DASHBOARD_VIEWS: readonly DashboardViewMetadata[] = [
   */
   { id: "patchnode", label: "History", labelKey: "nav.patchnode" },
   { id: "graph", label: "Graph" },
+  { id: "sessions", label: "Sessions", labelKey: "nav.sessions" },
   { id: "agents", label: "Agents", labelKey: "nav.agents" },
   { id: "missions", label: "Missions", labelKey: "nav.missions" },
   { id: "chat", label: "Chat", labelKey: "nav.chat" },

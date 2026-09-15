@@ -1,3 +1,4 @@
+import { useSessionsEnabled } from "./hooks/useSessionsEnabled";
 import { useState, useCallback, useEffect, useMemo, useRef, lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -171,6 +172,7 @@ const SecretsView = lazy(() => import("./components/SecretsView").then((m) => ({
 const CommandCenter = lazy(() => import("./components/command-center/CommandCenter").then((m) => ({ default: m.CommandCenter })));
 const DevServerView = lazy(() => import("./components/DevServerView").then((m) => ({ default: m.DevServerView })));
 const GoalsView = lazy(() => import("./components/GoalsView").then((m) => ({ default: m.GoalsView })));
+const SessionsView = lazy(() => import("./components/SessionsView").then((m) => ({ default: m.SessionsView })));
 const PatchnodeView = lazy(() => import("./components/PatchnodeView").then((m) => ({ default: m.PatchnodeView })));
 const PullRequestView = lazy(() => import("./components/PullRequestView").then((m) => ({ default: m.PullRequestView })));
 /*
@@ -2199,6 +2201,7 @@ function AppInner() {
     WhiteboardView,
     EvalsView,
     GoalsView,
+    SessionsView,
     PatchnodeView,
     InsightsView,
     MemoryView,
@@ -2270,7 +2273,9 @@ function AppInner() {
     markGitHubStarPromptShown,
     setShowGitHubStarPrompt,
   };
+  const sessionsEnabled = useSessionsEnabled();
   const alphaDesktopNavigationEntries = buildDashboardNavigationEntries({
+    showSessions: sessionsEnabled,
     view: taskView,
     onChangeView: async (target) => {
       if (!await alphaDesktopWindows.requestCloseAll()) return false;

@@ -1,0 +1,44 @@
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
+import { createSharedPgTaskStoreTestHarness, pgDescribe } from "../../__test-utils__/pg-test-harness.js";
+import { ExternalSessionStore } from "../../external-sessions/store.js";
+import { ExternalSessionControls } from "../../external-sessions/controls.js";
+import { ExternalSessionSummaries } from "../../external-sessions/summaries.js";
+const observation = { version: 1, provider: "codex", nativeSessionId: "n", revision: 1, observedAt: "2026-09-15T12:00:00Z", activity: "working", title: "Fix", projectPath: "/repo" };
+const generation = "runtime-generation-1";
+pgDescribe("External runtime controls and summaries", () => {
+  const h = createSharedPgTaskStoreTestHarness({ prefix: "fusion_external_controls", projectId: "external-control-test" });
+  beforeAll(h.beforeAll); beforeEach(h.beforeEach); afterEach(h.afterEach); afterAll(h.afterAll);
+  it("observation cannot grant controls; registered host, generation, expiry and idempotency fence delivery", async () => {
+    const sessions = new ExternalSessionStore(h.layer()); const controls = new ExternalSessionControls(h.layer());
+    const { id } = await sessions.ingest("m3", "test", observation); const now = Date.now();
+    await expect(controls.queue(id, "command-id-123456", "stop")).rejects.toThrow("does not support");
+    await expect(controls.register("m5", id, generation, ["stop"])).rejects.toThrow("does not belong");
+    await controls.register("m3", id, generation, ["feedback"], now);
+    const [first, replay] = await Promise.all([1,2].map(() => controls.queue(id, "command-id-123456", "feedback", "Please check", now)));
+    expect(first.id).toBe(replay.id); expect(await controls.list(id)).toHaveLength(1);
+    expect(await controls.claim("m5", id, generation, now)).toHaveLength(0);
+    expect(await controls.claim("m3", id, "other-generation-1", now)).toHaveLength(0);
+    expect((await controls.claim("m3", id, generation, now))[0].status).toBe("delivered");
+    expect(await controls.acknowledge("m5", first.id, generation, "applied", now)).toBe(false);
+    expect(await controls.acknowledge("m3", first.id, generation, "applied", now)).toBe(true);
+    expect(await controls.claim("m3", id, generation, now)).toHaveLength(0);
+    await controls.queue(id, "command-id-123457", "feedback", "Later", now);
+    expect(await controls.claim("m3", id, generation, now + 300001)).toHaveLength(0);
+    expect((await controls.list(id))[1].status).toBe("expired");
+  });
+  it("summarizes changed content once and preserves the previous summary on an endpoint failure", async () => {
+    const sessions = new ExternalSessionStore(h.layer()); const summaries = new ExternalSessionSummaries(h.layer());
+    const turn = { id: "turn", startedAt: observation.observedAt, updatedAt: observation.observedAt, completedAt: null, durationMs: null, durationSource: "timestamps", prompts: ["Fix deployment"], response: "Check failed, work unfinished", files: [], usage: [], toolCalls: 1 };
+    const { id } = await sessions.ingest("m3", "test", observation, [turn]);
+    let calls = 0;
+    const send = (async (_url: string, init: RequestInit) => { calls++; const body = JSON.parse(String(init.body)); expect(body.model).toBe("qwen3.5-2b"); expect(body.chat_template_kwargs.enable_thinking).toBe(false); return new Response(JSON.stringify({ choices: [{ message: { content: "Check failed. Deployment is unfinished." } }] }), { status: 200 }); }) as typeof fetch;
+    expect((await summaries.summarize(id, "http://localhost/v1", send)).changed).toBe(true);
+    expect((await summaries.summarize(id, "http://localhost/v1", send)).changed).toBe(false); expect(calls).toBe(1);
+    await sessions.ingest("m3", "test", { ...observation, revision: 2 }, [{ ...turn, response: "Still unfinished; another check failed" }]);
+    await summaries.summarize(id, "http://localhost/v1", (async () => new Response("busy", { status: 503 })) as typeof fetch);
+    expect((await summaries.get(id))?.summary?.text).toBe("Check failed. Deployment is unfinished.");
+    expect((await summaries.get(id))?.summaryFailures).toBe(1);
+    expect((await summaries.notes(id, "Note", 0)).notesRevision).toBe(1);
+    await expect(summaries.notes(id, "Stale", 0)).rejects.toThrow("revision conflict");
+  });
+});

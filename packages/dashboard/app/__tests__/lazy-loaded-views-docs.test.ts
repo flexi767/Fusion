@@ -45,6 +45,7 @@ const EXPECTED_DOCUMENTED_VIEWS = new Set([
   "GoalsView",
   "PullRequestView",
   "PatchnodeView",
+  "SessionsView",
   "SetupWizardModal",
   "SettingsModal",
   "WorkflowNodeEditor",
@@ -70,6 +71,7 @@ const EXPECTED_APP_LEVEL_VIEWS = new Set([
   "GoalsView",
   "PullRequestView",
   "PatchnodeView",
+  "SessionsView",
 ]);
 
 /*
@@ -192,7 +194,7 @@ describe("AGENTS lazy-loaded views inventory", () => {
     const section = extractLazyLoadedSection(agentsDoc);
     const countMatch = section.match(/These\s+(\d+)\s+views\s+are lazy-loaded/);
     expect(countMatch).toBeTruthy();
-    expect(Number(countMatch?.[1])).toBe(22);
+    expect(Number(countMatch?.[1])).toBe(23);
 
     const documentedViews = extractBacktickedNamesFromBullets(section);
     expect(new Set(documentedViews)).toEqual(EXPECTED_DOCUMENTED_VIEWS);

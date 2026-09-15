@@ -1,0 +1,12 @@
+.sessions-view { padding: var(--space-4); overflow: auto; }
+.sessions-filters { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-block: var(--space-4); }
+.sessions-filters label { display: flex; flex-direction: column; gap: var(--space-1); flex: 1; min-width: 0; }
+.sessions-grid { display: flex; flex-direction: column; gap: var(--space-3); }
+.session-card { border: var(--border-width, thin) solid var(--border-color); border-radius: var(--radius-md); padding: var(--space-4); background: var(--bg-secondary); overflow-wrap: anywhere; }
+.session-card h3 { margin: 0; font-size: var(--font-size-md); }
+.session-card p { margin-block: var(--space-2); }
+.session-project { color: var(--text-secondary); }
+.session-output { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); max-width: 100%; }
+.session-cost-table { overflow-x: auto; }
+.session-cost-table th, .session-cost-table td { text-align: left; padding: var(--space-2); }
+.session-card textarea { display: block; width: 100%; min-height: var(--space-16); margin-block: var(--space-2); }

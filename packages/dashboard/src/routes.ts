@@ -76,6 +76,7 @@ import { registerOrgPortabilityRoutes } from "./routes/register-org-portability-
 import { registerAgentSkillsRoutes } from "./routes/register-agent-skills-routes.js";
 import { registerPluginsAutomationRoutes } from "./routes/register-plugins-automation.js";
 import { registerProxyRoutes } from "./routes/register-proxy-routes.js";
+import { registerExternalSessionRoutes } from "./routes/register-external-session-routes.js";
 import { registerPatchnodeRoutes } from "./routes/register-patchnode-routes.js";
 import { registerModelRoutes } from "./routes/register-model-routes.js";
 import { registerCustomProviderRoutes } from "./routes/register-custom-provider-routes.js";
@@ -1279,6 +1280,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   registrarMounter.mount("registerAiTextAssistantRoutes", () => registerAiTextAssistantRoutes(routeContext));
 
   registrarMounter.mount("registerUsageRoutes", () => registerUsageRoutes(routeContext));
+  registrarMounter.mount("registerExternalSessionRoutes", () => registerExternalSessionRoutes(routeContext));
   /*
   FNXC:DashboardRoutes 2026-06-16-09:46:
   PR #1683 wires the Command Center / SDLC registrars into the dashboard router: U9 analytics+live, U14 knowledge index, U11 external-signal webhooks, U13 monitor ingest/metrics. All inherit the server-level daemon bearer auth and getScopedStore project scoping; the signal/monitor ingest paths add their own per-provider/ingest-secret verification on top — none is an unauthenticated task-creation endpoint.

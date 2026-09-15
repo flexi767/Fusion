@@ -1,0 +1,93 @@
+import { createHash } from "node:crypto";
+import { and, desc, eq, lt, or, sql } from "drizzle-orm";
+import type { AsyncDataLayer } from "../postgres/data-layer.js";
+import { externalSessions, externalSessionTurns, sessionCollectors } from "../postgres/schema/central.js";
+import { parseSessionTurn } from "./turn.js";
+import { redactSecrets } from "../secrets/redact-secrets.js";
+import { externalSessionKey, parseSessionObservation, type SessionObservation } from "./observation.js";
+
+export function sessionId(hostId: string, row: Pick<SessionObservation, "provider" | "nativeSessionId">): string {
+  return createHash("sha256").update(externalSessionKey(hostId, row.provider, row.nativeSessionId)).digest("hex");
+}
+
+function cursor(value: string | undefined): { at: string; id: string } | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString());
+    if (typeof parsed.at !== "string" || !Number.isFinite(Date.parse(parsed.at)) || typeof parsed.id !== "string" || parsed.id.length > 256) throw new Error();
+    return parsed;
+  } catch { throw new Error("Invalid history cursor"); }
+}
+function nextCursor(at: string, id: string) { return Buffer.from(JSON.stringify({ at, id })).toString("base64url"); }
+
+/** Acknowledgements are returned only after the transaction commits. */
+export class ExternalSessionStore {
+  constructor(private readonly layer: AsyncDataLayer) {}
+
+  async heartbeat(hostId: string, collectorVersion: string, now = new Date().toISOString()) {
+    await this.layer.db.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: now })
+      .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: now } });
+  }
+
+  async ingest(hostId: string, collectorVersion: string, value: unknown, turnValues: unknown[] = [], historical = false) {
+    if (!Array.isArray(turnValues) || turnValues.length > 25) throw new Error("Invalid turn batch");
+    const turns = turnValues.map(parseSessionTurn);
+    if (historical) for (const turn of turns) turn.provenance = "agentpulse-import";
+    const observation = parseSessionObservation(value);
+    observation.title = redactSecrets(observation.title);
+    if (historical) observation.revision = 0;
+    const id = sessionId(hostId, observation);
+    const receivedAt = new Date().toISOString();
+    return this.layer.db.transaction(async (tx) => {
+      await tx.insert(sessionCollectors).values({ hostId, collectorVersion, lastHeartbeatAt: receivedAt, lastAcknowledgementAt: receivedAt })
+        .onConflictDoUpdate({ target: sessionCollectors.hostId, set: { collectorVersion, lastHeartbeatAt: receivedAt, lastAcknowledgementAt: receivedAt } });
+      const applied = await tx.insert(externalSessions).values({ id, hostId, provider: observation.provider,
+        nativeSessionId: observation.nativeSessionId, revision: observation.revision, observation, receivedAt })
+        .onConflictDoUpdate({ target: externalSessions.id, set: { revision: observation.revision, observation, receivedAt },
+          setWhere: historical ? sql`false` : lt(externalSessions.revision, observation.revision) }).returning({ id: externalSessions.id });
+      const [current] = await tx.select().from(externalSessions).where(eq(externalSessions.id, id));
+      if (!historical && current.revision === observation.revision && JSON.stringify(current.observation) !== JSON.stringify(observation)) {
+        // jsonb reorders keys; compare the validated canonical representation.
+        if (JSON.stringify(parseSessionObservation(current.observation)) !== JSON.stringify(observation)) throw new Error("Observation revision conflict");
+      }
+      for (const result of turns) {
+        await tx.insert(externalSessionTurns).values({ sessionId: id, id: result.id, revision: observation.revision, startedAt: result.startedAt, result })
+          .onConflictDoUpdate({ target: [externalSessionTurns.sessionId, externalSessionTurns.id],
+            set: { revision: observation.revision, startedAt: result.startedAt, result },
+            setWhere: historical
+              ? sql`${externalSessionTurns.result}->>'provenance' = 'agentpulse-import' AND ${externalSessionTurns.result}->>'updatedAt' < ${result.updatedAt}`
+              : lt(externalSessionTurns.revision, observation.revision) });
+      }
+      return { id, revision: current.revision, applied: applied.length > 0 };
+    });
+  }
+
+  async list(query: { hostId?: string; provider?: string; before?: string; limit?: number } = {}) {
+    const limit = Math.max(1, Math.min(100, query.limit ?? 50));
+    const before = cursor(query.before);
+    const rows = await this.layer.db.select().from(externalSessions).where(and(
+      query.hostId ? eq(externalSessions.hostId, query.hostId) : undefined,
+      query.provider ? eq(externalSessions.provider, query.provider) : undefined,
+      before ? or(lt(externalSessions.receivedAt, before.at), and(eq(externalSessions.receivedAt, before.at), lt(externalSessions.id, before.id))) : undefined,
+    )).orderBy(desc(externalSessions.receivedAt), desc(externalSessions.id)).limit(limit + 1);
+    return { sessions: rows.slice(0, limit), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].receivedAt, rows[limit - 1].id) : null };
+  }
+
+  async get(id: string) {
+    const [row] = await this.layer.db.select().from(externalSessions).where(eq(externalSessions.id, id));
+    return row ?? null;
+  }
+
+  async turns(id: string, beforeValue?: string, requestedLimit = 20) {
+    const limit = Math.min(50, Math.max(1, requestedLimit));
+    const before = cursor(beforeValue);
+    const rows = await this.layer.db.select().from(externalSessionTurns).where(and(eq(externalSessionTurns.sessionId, id),
+      before ? or(lt(externalSessionTurns.startedAt, before.at), and(eq(externalSessionTurns.startedAt, before.at), lt(externalSessionTurns.id, before.id))) : undefined))
+      .orderBy(desc(externalSessionTurns.startedAt), desc(externalSessionTurns.id)).limit(limit + 1);
+    return { turns: rows.slice(0, limit).map(row => row.result), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].startedAt, rows[limit - 1].id) : null };
+  }
+
+  async collectors() {
+    return this.layer.db.select().from(sessionCollectors).orderBy(sessionCollectors.hostId);
+  }
+}

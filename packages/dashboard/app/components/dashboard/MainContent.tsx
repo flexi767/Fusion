@@ -62,6 +62,7 @@ const ALPHA_DRAWER_TITLES: Partial<Record<string, string>> = {
   schedules: "Automation",
   "github-import": "Import from GitHub",
   patchnode: "History",
+  sessions: "Sessions",
   "task-detail": "Task detail",
 };
 
@@ -360,6 +361,7 @@ export function MainContent(props: MainContentProps) {
   WhiteboardView,
   EvalsView,
   GoalsView,
+  SessionsView,
   PatchnodeView,
   InsightsView,
   MemoryView,
@@ -986,6 +988,8 @@ export function MainContent(props: MainContentProps) {
       </PageErrorBoundary>
     );
   }
+
+  if (taskView === "sessions") return <PageErrorBoundary><Suspense fallback={null}><SessionsView /></Suspense></PageErrorBoundary>;
 
   if (taskView === "patchnode") {
     return (

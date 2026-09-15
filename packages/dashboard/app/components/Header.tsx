@@ -1,3 +1,4 @@
+import { useSessionsEnabled } from "../hooks/useSessionsEnabled";
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Settings, LayoutGrid, List, Search, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, Brain, Lock, Gauge, Lightbulb, PanelsTopLeft, ChevronDown, ChevronRight, PanelRight, Star } from "lucide-react";
@@ -163,6 +164,7 @@ export function Header({
   shellConnectionControl,
 }: HeaderProps) {
   const { t } = useTranslation("app");
+  const sessionsEnabled = useSessionsEnabled();
   const mode: ViewportMode = useViewportMode();
   const isMobile = mode === "mobile";
   const isTablet = mode === "tablet";
@@ -753,6 +755,7 @@ export function Header({
                 <List size={16} />
               </button>
             ) : null}
+            {sessionsEnabled && <button className={`view-toggle-btn${view === "sessions" ? " active" : ""}`} onClick={() => onChangeView("sessions")} title="Sessions"><Activity size={16} /><span>Sessions</span></button>}
             {showAgentsTab && (
               <button
                 className={`view-toggle-btn${view === "agents" ? " active" : ""}`}

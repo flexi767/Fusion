@@ -17,6 +17,7 @@ import {
   pgSchema,
   text,
   integer,
+  bigint,
   jsonb,
   primaryKey,
   foreignKey,
@@ -327,6 +328,49 @@ export const globalRoutines = centralSchema.table("global_routines", {
   updatedAt: text("updated_at").notNull(),
 });
 
+// External agents never participate in project task lifecycle or project-path matching.
+export const sessionCollectors = centralSchema.table("session_collectors", {
+  hostId: text("host_id").primaryKey(),
+  collectorVersion: text("collector_version").notNull(),
+  lastHeartbeatAt: text("last_heartbeat_at").notNull(),
+  lastAcknowledgementAt: text("last_acknowledgement_at"),
+  diagnostics: jsonb("diagnostics").notNull().default({}),
+});
+export const externalSessions = centralSchema.table("external_sessions", {
+  id: text("id").primaryKey(),
+  hostId: text("host_id").notNull().references(() => sessionCollectors.hostId),
+  provider: text("provider").notNull(),
+  nativeSessionId: text("native_session_id").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  observation: jsonb("observation").$type<import("../../external-sessions/observation.js").SessionObservation>().notNull(),
+  receivedAt: text("received_at").notNull(),
+}, (table) => [unique("external_sessions_host_native").on(table.hostId, table.provider, table.nativeSessionId)]);
+
+export const externalSessionTurns = centralSchema.table("external_session_turns", {
+  sessionId: text("session_id").notNull().references(() => externalSessions.id, { onDelete: "cascade" }),
+  id: text("id").notNull(), revision: bigint("revision", { mode: "number" }).notNull(),
+  startedAt: text("started_at").notNull(),
+  result: jsonb("result").$type<import("../../external-sessions/turn.js").SessionTurn>().notNull(),
+}, (table) => [primaryKey({ columns: [table.sessionId, table.id] })]);
+
+export const externalSessionDetails = centralSchema.table("external_session_details", {
+  sessionId: text("session_id").primaryKey().references(() => externalSessions.id, { onDelete: "cascade" }),
+  notes: text("notes").notNull().default(""), notesRevision: bigint("notes_revision", { mode: "number" }).notNull().default(0),
+  summary: jsonb("summary").$type<{ text: string; at: string; firstTurn: string; lastTurn: string; coveredTurns: number; model: string }>(),
+  summaryHash: text("summary_hash"), summaryLeaseUntil: text("summary_lease_until"), summaryRetryAt: text("summary_retry_at"),
+  summaryFailures: integer("summary_failures").notNull().default(0), lastSummaryError: text("last_summary_error"),
+});
+export const externalSessionCommands = centralSchema.table("external_session_commands", {
+  id: text("id").primaryKey(), sessionId: text("session_id").notNull().references(() => externalSessions.id, { onDelete: "cascade" }),
+  hostId: text("host_id").notNull(), nativeSessionId: text("native_session_id").notNull(), generation: text("generation").notNull(),
+  operation: text("operation").notNull(), text: text("text"), status: text("status").notNull(), createdAt: text("created_at").notNull(),
+  expiresAt: text("expires_at").notNull(), updatedAt: text("updated_at").notNull(), failure: text("failure"),
+});
+export const externalSessionRuntimes = centralSchema.table("external_session_runtimes", {
+  sessionId: text("session_id").primaryKey().references(() => externalSessions.id, { onDelete: "cascade" }),
+  generation: text("generation").notNull(), capabilities: jsonb("capabilities").$type<string[]>().notNull(), expiresAt: text("expires_at").notNull(),
+});
+
 // ── Schema version meta ──────────────────────────────────────────────
 export const centralMeta = centralSchema.table("__meta", {
   key: text("key").primaryKey(),
@@ -342,5 +386,5 @@ export const centralTableNames = [
   "central_activity_log", "central_settings",
   "peer_nodes", "settings_sync_state", "managed_docker_nodes",
   "plugin_installs", "project_plugin_states", "mesh_shared_snapshots",
-  "mesh_write_queue", "secrets_global", "task_claims", "global_routines", "__meta",
+  "mesh_write_queue", "secrets_global", "task_claims", "global_routines", "session_collectors", "external_sessions", "external_session_turns", "external_session_details", "external_session_commands", "external_session_runtimes", "__meta",
 ] as const;
