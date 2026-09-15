@@ -1,15 +1,42 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, isNull, lt, or } from "drizzle-orm";
+import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
-import { externalSessionDetails as details } from "../postgres/schema/central.js";
+import { externalSessionDetails as details, externalSessions } from "../postgres/schema/central.js";
 import { ExternalSessionStore } from "./store.js";
 import { redactSecrets } from "../secrets/redact-secrets.js";
+import type { SessionTurn } from "./turn.js";
+import { sessionActivityStale } from "./observation.js";
+
+function summaryInput(turns: SessionTurn[]) {
+  const ordered = [...turns].filter(turn => !turn.contentPruned).reverse();
+  const input = ordered.map(turn => `[${turn.id}; ${turn.completedAt ? "finished turn" : "unfinished turn"}]\nPrompt: ${turn.prompts.join("\n").slice(0, 1000)}\nResult: ${turn.response.slice(-1800)}`).join("\n\n").slice(-10000);
+  return { ordered, input, hash: createHash("sha256").update(input).digest("hex") };
+}
 
 export class ExternalSessionSummaries {
   constructor(private readonly layer: AsyncDataLayer) {}
   async get(id: string) {
     const [row] = await this.layer.db.select().from(details).where(eq(details.sessionId, id));
     return row ?? null;
+  }
+  async state(id: string) {
+    const row = await this.get(id);
+    if (!row) return null;
+    const page = row.summary ? await new ExternalSessionStore(this.layer).turns(id, undefined, 5) : null;
+    return { ...row, summaryStale: Boolean(row.summary && page && summaryInput(page.turns).hash !== row.summaryHash) };
+  }
+  /** Read-only, bounded overview ordered by native activity, never by import receipt. */
+  async overview() {
+    const rows = await this.layer.db.select().from(externalSessions)
+      .orderBy(desc(sql`(${externalSessions.observation}->>'observedAt')::timestamptz`), desc(externalSessions.id)).limit(5);
+    const result = [];
+    for (const row of rows) {
+      const state = await this.state(row.id);
+      result.push({ id: row.id, hostId: row.hostId, provider: row.provider, observation: row.observation,
+        activityStale: sessionActivityStale(row.observation, Date.now()), summary: state?.summary ?? null,
+        summaryStale: state?.summaryStale ?? false, lastSummaryError: state?.lastSummaryError ?? null });
+    }
+    return result;
   }
   async notes(id: string, notes: string, expectedRevision: number) {
     if (typeof notes !== "string" || notes.length > 32000 || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("Invalid notes");
@@ -24,10 +51,8 @@ export class ExternalSessionSummaries {
     const store = new ExternalSessionStore(this.layer);
     const page = await store.turns(id, undefined, 5);
     if (!page.turns.length) return { changed: false, reason: "No collected turns" };
-    const ordered = [...page.turns].filter(turn => !turn.contentPruned).reverse();
+    const { ordered, input, hash } = summaryInput(page.turns);
     if (!ordered.length) return { changed: false, reason: "Collected content was removed by retention" };
-    const input = ordered.map(turn => `[${turn.id}; ${turn.completedAt ? "finished turn" : "unfinished turn"}]\nPrompt: ${turn.prompts.join("\n").slice(0, 1000)}\nResult: ${turn.response.slice(-1800)}`).join("\n\n").slice(-10000);
-    const hash = createHash("sha256").update(input).digest("hex");
     await this.layer.db.insert(details).values({ sessionId: id }).onConflictDoNothing();
     const previous = await this.get(id);
     if (previous?.summaryHash === hash) return { changed: false, reason: "Content unchanged" };

@@ -1,0 +1,35 @@
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, expect, it, vi } from "vitest";
+import { SessionRecentActivity } from "../SessionRecentActivity";
+const { fetchOverview, poll } = vi.hoisted(() => ({ fetchOverview: vi.fn(), poll: vi.fn() }));
+vi.mock("../../api/external-sessions", () => ({ fetchSessionOverview: fetchOverview }));
+vi.mock("../../hooks/visibilitySuspension", () => ({ useVisibilityAwarePoll: poll }));
+const row = { id: "session", hostId: "m5", provider: "claude", observation: { title: "Review failures", observedAt: "2026-09-15T12:00:00Z", projectPath: "/repo", activity: "working" }, activityStale: true, summary: { text: "Checks failed; fixes remain unfinished.", at: "2026-09-15T12:00:01Z", firstTurn: "a", lastTurn: "b", coveredTurns: 2, model: "qwen3.5-2b" }, summaryStale: true, lastSummaryError: "summary-endpoint-unavailable" };
+beforeEach(() => { fetchOverview.mockReset().mockResolvedValue({ enabled: true, sessions: [row] }); poll.mockReset(); });
+it("loads only when opened and retains coverage, stale state and earlier summaries when refresh fails", async () => {
+  const user = userEvent.setup(); render(<SessionRecentActivity />);
+  expect(fetchOverview).not.toHaveBeenCalled();
+  await user.click(screen.getByText("Recent activity overview"));
+  const link = await screen.findByRole("link", { name: "Review failures" });
+  expect(link).toHaveAttribute("href", "?view=sessions&session=session");
+  expect(screen.getByText("Covered turns: a → b")).toBeTruthy();
+  expect(screen.getByText(/Stale working report/)).toBeTruthy();
+  expect(screen.getByText("Collected content has changed since this summary.")).toBeTruthy();
+  fetchOverview.mockRejectedValueOnce(new Error("offline"));
+  await act(async () => { poll.mock.calls.at(-1)![0](); });
+  await screen.findByRole("alert");
+  expect(screen.getByText("Checks failed; fixes remain unfinished.")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Review failures" })).toBe(link);
+  await user.click(screen.getByText("Recent activity overview"));
+  await waitFor(() => expect(screen.queryByRole("link", { name: "Review failures" })).toBeNull());
+});
+it("discloses missing summaries and empty or disabled data without inventing success", async () => {
+  const user = userEvent.setup(); fetchOverview.mockResolvedValue({ enabled: true, sessions: [{ ...row, summary: null, summaryStale: false, lastSummaryError: null }] });
+  render(<SessionRecentActivity />); await user.click(screen.getByText("Recent activity overview"));
+  await screen.findByText("No stored summary yet. Open the session for its collected history.");
+  fetchOverview.mockResolvedValue({ enabled: true, sessions: [] });
+  await act(async () => { poll.mock.calls.at(-1)![0](); }); await screen.findByText("No observed sessions yet.");
+  fetchOverview.mockResolvedValue({ enabled: false, sessions: [] });
+  await act(async () => { poll.mock.calls.at(-1)![0](); }); await screen.findByText("Sessions are disabled.");
+});

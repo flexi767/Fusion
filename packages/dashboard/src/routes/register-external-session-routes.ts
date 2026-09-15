@@ -81,6 +81,10 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     const costs = new Map(totals.sessions.map(row => [row.id, row]));
     res.json({ enabled: true, ...result, sessions: result.sessions.map(row => ({ ...row, usageSummary: costs.get(row.id) ?? null })), collectors: await sessions().collectors() });
   });
+  router.get("/external-session-overview", async (_req, res) => {
+    if (process.env.FUSION_SESSIONS !== "1") return res.json({ enabled: false, sessions: [] });
+    return res.json({ enabled: true, sessions: await summaries().overview() });
+  });
   router.post("/external-session-retention/:operation", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
     const operation = req.params.operation;
@@ -153,7 +157,7 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     const history = await sessions().turns(session.id, typeof req.query.before === "string" ? req.query.before : undefined);
     const settings = await store.getGlobalSettingsStore().getSettings();
     const wholeSessionUsage = await externalSessionAnalytics(layer(), { sessionId: session.id, basis }, settings.modelPricingOverrides);
-    res.json({ session, ...history, turnCosts: Object.fromEntries(history.turns.map(turn => [turn.id, priceSessionTurns(session.provider, [turn], settings.modelPricingOverrides, basis)])), wholeSessionUsage: wholeSessionUsage.sessions[0] ?? null, summariesEnabled: process.env.FUSION_SESSION_SUMMARIES === "1" && Boolean(process.env.FUSION_SESSION_SUMMARY_URL), details: await summaries().get(session.id), runtime: hostControlsEnabled(session.hostId) ? await controls().capability(session.id) : null, commands: await controls().list(session.id), cost: priceSessionTurns(session.provider, history.turns, settings.modelPricingOverrides, basis) });
+    res.json({ session, ...history, turnCosts: Object.fromEntries(history.turns.map(turn => [turn.id, priceSessionTurns(session.provider, [turn], settings.modelPricingOverrides, basis)])), wholeSessionUsage: wholeSessionUsage.sessions[0] ?? null, summariesEnabled: process.env.FUSION_SESSION_SUMMARIES === "1" && Boolean(process.env.FUSION_SESSION_SUMMARY_URL), details: await summaries().state(session.id), runtime: hostControlsEnabled(session.hostId) ? await controls().capability(session.id) : null, commands: await controls().list(session.id), cost: priceSessionTurns(session.provider, history.turns, settings.modelPricingOverrides, basis) });
   });
   router.get("/external-sessions/:id/turns/:turnId", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");

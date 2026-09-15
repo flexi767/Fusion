@@ -31,7 +31,7 @@ export interface SessionDetail {
   wholeSessionUsage?: import("@fusion/core").ExternalSessionUsageSummary | null;
   turns: import("@fusion/core").SessionTurn[];
   nextCursor: string | null;
-  details: Awaited<ReturnType<import("@fusion/core").ExternalSessionSummaries["get"]>>;
+  details: Awaited<ReturnType<import("@fusion/core").ExternalSessionSummaries["state"]>>;
   runtime: Awaited<ReturnType<import("@fusion/core").ExternalSessionControls["capability"]>>;
   commands: Awaited<ReturnType<import("@fusion/core").ExternalSessionControls["list"]>>;
   summariesEnabled: boolean;
@@ -64,3 +64,6 @@ export const linkTaskSession = (taskId: string, sessionId: string, linked: boole
 export interface SessionRetentionPreview { cutoff: string; eligibleTurns: number; moreAvailable: boolean; batchLimit: number; removedContentTurns?: number }
 export const previewSessionRetention = (retentionDays: number) => api<SessionRetentionPreview>("/external-session-retention/preview", { method: "POST", body: JSON.stringify({ retentionDays }) });
 export const applySessionRetention = (cutoff: string) => api<SessionRetentionPreview>("/external-session-retention/apply", { method: "POST", body: JSON.stringify({ cutoff }) });
+
+export interface SessionOverviewPage { enabled: boolean; sessions: Awaited<ReturnType<import("@fusion/core").ExternalSessionSummaries["overview"]>> }
+export const fetchSessionOverview = () => api<SessionOverviewPage>("/external-session-overview");

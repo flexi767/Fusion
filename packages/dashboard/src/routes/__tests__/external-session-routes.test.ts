@@ -11,13 +11,14 @@ function request(app: express.Express, method: string, path: string, options: { 
   return rawRequest(app, method, path, options.body ? JSON.stringify(options.body) : undefined, { "Content-Type": "application/json", ...options.headers });
 }
 const retentionPreview = vi.fn(); const retentionApply = vi.fn();
+const overview = vi.fn();
 const ingest = vi.fn();
 const heartbeat = vi.fn();
 const collectors = vi.fn(); const analytics = vi.fn();
 const linkTask = vi.fn(); const get = vi.fn(); const list = vi.fn(); const getTask = vi.fn();
 const launchQueue = vi.fn(); const launchList = vi.fn(); const launchAvailable = vi.fn(); const launchCancel = vi.fn();
 vi.mock("@fusion/core", () => ({ externalSessionAnalytics: (...args: unknown[]) => analytics(...args), ExternalSessionRetention: class { preview = retentionPreview; apply = retentionApply; }, ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; collectors = collectors; },
-  ExternalSessionLaunches: class { queue = launchQueue; list = launchList; available = launchAvailable; cancel = launchCancel; } }));
+  ExternalSessionSummaries: class { overview = overview; }, ExternalSessionLaunches: class { queue = launchQueue; list = launchList; available = launchAvailable; cancel = launchCancel; } }));
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 function app() {
   vi.stubEnv("FUSION_SESSION_INGESTION", "1");
@@ -30,6 +31,16 @@ function app() {
   return app;
 }
 const body = { version: 1, eventId: "event-1", collectorVersion: "test", observation: { hostId: "spoofed" } };
+it("serves the read-only overview only through dashboard authentication and the Sessions flag", async () => {
+  const server = app(); const headers = { Authorization: "Bearer dashboard-token" };
+  vi.stubEnv("FUSION_SESSIONS", "0");
+  expect((await request(server, "GET", "/api/external-session-overview", { headers })).body).toEqual({ enabled: false, sessions: [] });
+  expect(overview).not.toHaveBeenCalled();
+  vi.stubEnv("FUSION_SESSIONS", "1"); overview.mockResolvedValue([{ id: "recent" }]);
+  expect((await request(server, "GET", "/api/external-session-overview", { headers: { Authorization: "Bearer collector-token" } })).status).toBe(401);
+  expect((await request(server, "GET", "/api/external-session-overview", { headers })).body).toEqual({ enabled: true, sessions: [{ id: "recent" }] });
+  expect(overview).toHaveBeenCalledTimes(1); expect(ingest).not.toHaveBeenCalled(); expect(launchQueue).not.toHaveBeenCalled();
+});
 it("restricts managed launch to enabled browser-authenticated hosts and refuses arbitrary executable/cwd fields", async () => {
   const server = app(); const headers = { Authorization: "Bearer dashboard-token" };
   vi.stubEnv("FUSION_SESSIONS", "1"); vi.stubEnv("FUSION_SESSION_LAUNCHES", "1"); vi.stubEnv("FUSION_SESSION_CONTROLS", "1"); vi.stubEnv("FUSION_SESSION_CONTROL_HOSTS", "m3");

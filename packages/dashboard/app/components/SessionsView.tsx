@@ -1,4 +1,5 @@
 import { SessionActivityStatus } from "./SessionActivityStatus";
+import { SessionRecentActivity } from "./SessionRecentActivity";
 import { SessionRetentionPanel } from "./SessionRetentionPanel";
 import { SessionUsageOverview } from "./SessionUsageOverview";
 import { SessionLaunchPanel } from "./SessionLaunchPanel";
@@ -55,6 +56,7 @@ function SessionList() {
       <label>Search sessions and collected output<input type="search" maxLength={256} value={search} onChange={e => setSearch(e.target.value)} /></label>
       <button className="btn btn-secondary" type="submit">Search</button>
     </form>
+    <SessionRecentActivity />
     <SessionUsageOverview />
     <SessionRetentionPanel />
     <SessionResults key={JSON.stringify(filters)} filters={filters} onCollectors={setCollectors} />

@@ -80,6 +80,7 @@ function SessionSummary({ detail, refresh }: { detail: SessionDetail; refresh: (
     finally { setBusy(false); }
   };
   return <section className="session-card"><h3>Summary</h3>{summary ? <><p>{summary.text}</p><p>{summary.model} · {summary.coveredTurns} turns · {new Date(summary.at).toLocaleString()}</p><p>Covered turns: {summary.firstTurn} → {summary.lastTurn}</p></> : <p>No summary yet.</p>}
+    {detail.details?.summaryStale && <p>Collected content has changed since this summary. The previous summary is preserved until refresh succeeds.</p>}
     {detail.details?.lastSummaryError && <p>Summary may be stale; the last inference attempt failed.</p>}
     {detail.summariesEnabled && <button className="btn btn-secondary" disabled={busy} onClick={() => void summarize()}>{busy ? "Summarizing…" : "Update summary"}</button>}
     {message && <p role="status">{message}</p>}
