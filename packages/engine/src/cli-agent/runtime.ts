@@ -24,7 +24,9 @@
  * the runtime's own PTYs only — never the dashboard / port 4040).
  */
 
-import { CliSessionStore } from "@fusion/core";
+import { CliSessionStore, ExternalSessionStore, ExternalSessionControls } from "@fusion/core";
+import { dirname } from "node:path";
+import { ExternalSessionRuntimeBridge } from "./external-session-bridge.js";
 import type { AsyncDataLayer } from "@fusion/core";
 import { CliAdapterRegistry } from "./adapter.js";
 import { BUNDLED_CLI_ADAPTERS } from "./adapters/index.js";
@@ -36,6 +38,7 @@ import type { CliAgentRuntime } from "../executor.js";
 
 /** Options for {@link createCliAgentRuntime}. */
 export interface CreateCliAgentRuntimeOptions {
+  sessionObservation?: { hostId: string; controlsEnabled: boolean; onError?: (error: unknown) => void };
   /** The project's `.fusion` dir (scratch root for hook scripts). */
   fusionDir: string;
   /** The project's already-open PostgreSQL data layer (reused, never re-opened). */
@@ -148,6 +151,12 @@ export async function createCliAgentRuntime(
     hookDirRoot: options.hookDirRoot,
   };
 
+  const sessionBridge = options.sessionObservation ? new ExternalSessionRuntimeBridge({
+    ...options.sessionObservation, projectId, projectPath: dirname(options.fusionDir), store, manager,
+    observations: new ExternalSessionStore(asyncLayer), controls: new ExternalSessionControls(asyncLayer),
+  }) : undefined;
+  sessionBridge?.start();
+
   return {
     bundle,
     resumeCoordinator,
@@ -166,6 +175,7 @@ export async function createCliAgentRuntime(
       }
     },
     dispose: async () => {
+      sessionBridge?.stop();
       manager.dispose();
       await store.flush();
     },

@@ -1,22 +1,24 @@
-import { and, eq, gt, inArray, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import { externalSessionCommands as commands, externalSessionRuntimes as runtimes, externalSessions as sessions } from "../postgres/schema/central.js";
 export type SessionOperation = "feedback" | "stop" | "resume";
 export class ExternalSessionControls {
   constructor(private readonly layer: AsyncDataLayer) {}
   /** Only a separately enabled, authenticated owning host adapter calls this; discovery never does. */
-  async register(hostId: string, sessionId: string, generation: string, capabilities: SessionOperation[], now = Date.now()) {
+  async register(hostId: string, sessionId: string, generation: string, capabilities: SessionOperation[], now = Date.now(), controller: "host-adapter" | "fusion-runtime" = "host-adapter") {
     if (!/^[a-zA-Z0-9-]{16,128}$/.test(generation) || !Array.isArray(capabilities) || !capabilities.every(c => ["feedback", "stop", "resume"].includes(c))) throw new Error("Invalid runtime registration");
     const [session] = await this.layer.db.select().from(sessions).where(and(eq(sessions.id, sessionId), eq(sessions.hostId, hostId)));
     if (!session) throw new Error("Session does not belong to this host");
-    await this.layer.db.insert(runtimes).values({ sessionId, generation, capabilities: [...new Set(capabilities)], expiresAt: new Date(now + 90_000).toISOString() })
-      .onConflictDoUpdate({ target: runtimes.sessionId, set: { generation, capabilities: [...new Set(capabilities)], expiresAt: new Date(now + 90_000).toISOString() } });
+    const rows = await this.layer.db.insert(runtimes).values({ sessionId, generation, controller, capabilities: [...new Set(capabilities)], expiresAt: new Date(now + 90_000).toISOString() })
+      .onConflictDoUpdate({ target: runtimes.sessionId, set: { generation, controller, capabilities: [...new Set(capabilities)], expiresAt: new Date(now + 90_000).toISOString() },
+        setWhere: sql`(${runtimes.controller} <> 'fusion-runtime' OR (${runtimes.generation}=${generation} AND ${controller}='fusion-runtime') OR ${runtimes.expiresAt} <= ${new Date(now).toISOString()})` }).returning();
+    return rows.length > 0;
   }
   async capability(sessionId: string, now = Date.now()) {
     const [runtime] = await this.layer.db.select().from(runtimes).where(eq(runtimes.sessionId, sessionId));
     if (!runtime) return null;
     const connected = Date.parse(runtime.expiresAt) > now;
-    return { ...runtime, connected, capabilities: connected ? runtime.capabilities : runtime.capabilities.filter(operation => operation === "feedback") };
+    return { ...runtime, connected, capabilities: connected ? runtime.capabilities : runtime.controller === "fusion-runtime" ? [] : runtime.capabilities.filter(operation => operation === "feedback") };
   }
   async queue(sessionId: string, id: string, operation: SessionOperation, text?: string, now = Date.now()) {
     if (!/^[a-zA-Z0-9-]{16,128}$/.test(id) || !["feedback", "stop", "resume"].includes(operation)) throw new Error("Invalid command");
@@ -30,12 +32,13 @@ export class ExternalSessionControls {
       }
       const [runtime] = await tx.select().from(runtimes).where(and(eq(runtimes.sessionId, sessionId), operation === "feedback" ? undefined : gt(runtimes.expiresAt, new Date(now).toISOString())));
       if (!runtime?.capabilities.includes(operation)) throw new Error("Session does not support this operation");
+      if (runtime.controller === "fusion-runtime" && Date.parse(runtime.expiresAt) <= now) throw new Error("Fusion runtime is disconnected");
       const [session] = await tx.select().from(sessions).where(eq(sessions.id, sessionId));
       if (!session) throw new Error("Session not found");
-      const queued = await tx.select({ id: commands.id }).from(commands).where(and(eq(commands.sessionId, sessionId), inArray(commands.status, ["queued", "delivered"]), gt(commands.expiresAt, new Date(now).toISOString()))).limit(20);
+      const queued = await tx.select({ id: commands.id }).from(commands).where(and(eq(commands.sessionId, sessionId), inArray(commands.status, ["queued", "delivered", "executing"]), gt(commands.expiresAt, new Date(now).toISOString()))).limit(20);
       if (queued.length >= 20) throw new Error("Session command queue is full");
       const [command] = await tx.insert(commands).values({ id, sessionId, hostId: session.hostId, nativeSessionId: session.nativeSessionId, generation: runtime.generation,
-        operation, text: text ?? null, status: "queued", createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), expiresAt: new Date(now + 300_000).toISOString() }).returning();
+        operation, controller: runtime.controller, text: text ?? null, status: "queued", createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), expiresAt: new Date(now + 300_000).toISOString() }).returning();
       return command;
     });
   }
@@ -52,10 +55,22 @@ export class ExternalSessionControls {
   }
   async acknowledge(hostId: string, id: string, generation: string, status: "applied" | "failed", now = Date.now()) {
     if (status !== "applied" && status !== "failed") throw new Error("Invalid command outcome");
-    const rows = await this.layer.db.update(commands).set({ status, updatedAt: new Date(now).toISOString() }).where(and(eq(commands.id, id), eq(commands.hostId, hostId), eq(commands.generation, generation), eq(commands.status, "delivered"), gt(commands.expiresAt, new Date(now).toISOString()))).returning();
+    const rows = await this.layer.db.update(commands).set({ status, updatedAt: new Date(now).toISOString() }).where(and(eq(commands.id, id), eq(commands.hostId, hostId), eq(commands.generation, generation),
+      sql`((${commands.status}='delivered' AND ${commands.expiresAt}>${new Date(now).toISOString()}) OR (${commands.status}='executing' AND ${commands.controller}='fusion-runtime'))`)).returning();
     if (rows.length) return true;
     const [previous] = await this.layer.db.select().from(commands).where(and(eq(commands.id, id), eq(commands.hostId, hostId), eq(commands.generation, generation), eq(commands.status, status)));
     return Boolean(previous);
   }
-  async list(sessionId: string) { return this.layer.db.select().from(commands).where(eq(commands.sessionId, sessionId)).orderBy(commands.createdAt).limit(100); }
+  /** Commit before touching a native runtime. An ambiguous crash is never replayed. */
+  async beginExecution(hostId: string, id: string, generation: string, now = Date.now()) {
+    const [row] = await this.layer.db.update(commands).set({ status: "executing", updatedAt: new Date(now).toISOString() }).where(and(
+      eq(commands.id, id), eq(commands.hostId, hostId), eq(commands.generation, generation), eq(commands.controller, "fusion-runtime"), eq(commands.status, "delivered"), gt(commands.expiresAt, new Date(now).toISOString()),
+      sql`EXISTS (SELECT 1 FROM central.external_session_runtimes r WHERE r.session_id=${commands.sessionId} AND r.generation=${generation} AND r.controller='fusion-runtime' AND r.expires_at>${new Date(now).toISOString()})`,
+    )).returning();
+    return row ?? null;
+  }
+  async list(sessionId: string, now = Date.now()) {
+    const rows = await this.layer.db.select().from(commands).where(eq(commands.sessionId, sessionId)).orderBy(desc(commands.createdAt), desc(commands.id)).limit(100);
+    return rows.map(row => ({ ...row, status: row.status === "executing" && Date.parse(row.expiresAt) <= now ? "unconfirmed after interruption" : row.status }));
+  }
 }

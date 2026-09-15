@@ -27,7 +27,7 @@ pgDescribe("External runtime controls and summaries", () => {
     expect(await controls.claim("m3", id, generation, now)).toHaveLength(0);
     await controls.queue(id, "command-id-123457", "feedback", "Later", now);
     expect(await controls.claim("m3", id, generation, now + 300001)).toHaveLength(0);
-    expect((await controls.list(id))[1].status).toBe("expired");
+    expect((await controls.list(id)).find(row => row.id === "command-id-123457")?.status).toBe("expired");
     await controls.queue(id, "command-id-123458", "feedback", "Old owner", now);
     await controls.register("m3", id, "replacement-generation-1", ["feedback"], now);
     expect(await controls.claim("m3", id, generation, now)).toHaveLength(0);
@@ -46,5 +46,35 @@ pgDescribe("External runtime controls and summaries", () => {
     expect((await summaries.get(id))?.summaryFailures).toBe(1);
     expect((await summaries.notes(id, "Note", 0)).notesRevision).toBe(1);
     await expect(summaries.notes(id, "Stale", 0)).rejects.toThrow("revision conflict");
+  });
+  it("fences native execution durably and refuses takeover or replay after an ambiguous crash", async () => {
+    const sessions = new ExternalSessionStore(h.layer()); const controls = new ExternalSessionControls(h.layer());
+    const { id } = await sessions.ingest("m3", "test", observation); const now = Date.now();
+    expect(await controls.register("m3", id, generation, ["stop", "feedback"], now, "fusion-runtime")).toBe(true);
+    expect(await controls.register("m3", id, generation, ["feedback"], now, "host-adapter")).toBe(false);
+    expect(await controls.register("m3", id, "replacement-generation-1", ["stop"], now, "fusion-runtime")).toBe(false);
+    const command = await controls.queue(id, "native-command-123456", "stop", undefined, now);
+    expect(command.controller).toBe("fusion-runtime");
+    await controls.claim("m3", id, generation, now);
+    expect(await controls.beginExecution("m5", command.id, generation, now)).toBeNull();
+    const begun = await Promise.all([controls, new ExternalSessionControls(h.layer())].map(control => control.beginExecution("m3", command.id, generation, now)));
+    expect(begun.filter(Boolean)).toHaveLength(1);
+    expect(await new ExternalSessionControls(h.layer()).claim("m3", id, generation, now)).toHaveLength(0);
+    expect((await controls.list(id, now + 300001))[0].status).toBe("unconfirmed after interruption");
+    expect(await controls.acknowledge("m3", command.id, generation, "applied", now + 300001)).toBe(true);
+    expect((await controls.list(id))[0].status).toBe("applied");
+    expect(await controls.capability(id, now + 90001)).toMatchObject({ connected: false, capabilities: [] });
+    await expect(controls.queue(id, "native-command-123457", "feedback", "Late", now + 90001)).rejects.toThrow("disconnected");
+    expect(await controls.register("m3", id, "replacement-generation-1", ["stop"], now + 90001, "fusion-runtime")).toBe(true);
+  });
+  it("records verified native associations without overriding explicit operator unlink intent", async () => {
+    const sessions = new ExternalSessionStore(h.layer()); const summaries = new ExternalSessionSummaries(h.layer());
+    const { id } = await sessions.ingest("m3", "test", observation);
+    await sessions.associateNativeRuntime(id, { cliSessionId: "cli-owned", projectId: "project", taskId: "FN-1" });
+    expect(await summaries.get(id)).toMatchObject({ taskId: "FN-1", taskProjectId: "project", taskLinkSource: "native-runtime", nativeRuntime: { cliSessionId: "cli-owned" } });
+    await sessions.linkTask(id, "project", "FN-1", false, 1);
+    await sessions.associateNativeRuntime(id, { cliSessionId: "cli-resumed", projectId: "project", taskId: "FN-1" });
+    expect(await summaries.get(id)).toMatchObject({ taskId: null, taskLinkSource: null, taskLinkRevision: 2, nativeRuntime: { cliSessionId: "cli-resumed" } });
+    expect(await h.store().listTasks()).toHaveLength(0);
   });
 });

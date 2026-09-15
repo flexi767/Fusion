@@ -130,3 +130,27 @@ transcript into that directory preserves its host/provider/native identity.
 AgentPulse archived/pinned labels remain independent of collector connectivity
 and agent activity, and importing a snapshot never overwrites operator-edited
 labels. Import v4 replays earlier checkpoints to add this preserved metadata.
+
+## Fusion-owned runtime reconciliation
+
+When the existing experimental CLI Agent Executor is enabled, its owning Fusion
+process can also set `FUSION_SESSIONS=1` and `FUSION_SESSION_HOST_ID=m3` (or the
+actual stable collector host id). This enables an independent, bounded observer
+of that manager's live Codex/Claude handles. It matches exact native ids, records
+verified runtime provenance and links the owning task without creating tasks.
+Explicit link/unlink decisions remain authoritative. Historical records and
+transcript files alone never grant control ownership.
+
+With `FUSION_SESSION_CONTROLS=1` and that host in `FUSION_SESSION_CONTROL_HOSTS`,
+ready owned terminals support feedback; busy terminals retain queued feedback.
+Independent managed/chat sessions also support stop. Task-owned sessions expose
+a link to Fusion's existing task Pause/Resume controls. This bridge does not start
+agents or inference services and does not advertise unsupported resume actions.
+
+Each owned PTY has a fresh generation, including when its durable session id is
+reused on resume. PostgreSQL commits an execution fence before native side
+effects. A crash after that fence never causes automatic command re-execution;
+an unconfirmed result remains explicit. Injection is cancellable and checks its
+deadline again before writing; acknowledgement means bytes were written to the
+owned terminal, not that the model obeyed them. A connected Fusion owner takes
+precedence over the optional external feedback hook adapter.

@@ -361,6 +361,8 @@ export const externalSessionDetails = centralSchema.table("external_session_deta
   preferencesRevision: bigint("preferences_revision", { mode: "number" }).notNull().default(0),
   taskProjectId: text("task_project_id"), taskId: text("task_id"),
   taskLinkRevision: bigint("task_link_revision", { mode: "number" }).notNull().default(0),
+  taskLinkSource: text("task_link_source"),
+  nativeRuntime: jsonb("native_runtime").$type<{ cliSessionId: string; projectId: string; taskId: string | null; verifiedAt: string }>(),
   notes: text("notes").notNull().default(""), notesRevision: bigint("notes_revision", { mode: "number" }).notNull().default(0),
   summary: jsonb("summary").$type<{ text: string; at: string; firstTurn: string; lastTurn: string; coveredTurns: number; model: string }>(),
   summaryHash: text("summary_hash"), summaryLeaseUntil: text("summary_lease_until"), summaryRetryAt: text("summary_retry_at"),
@@ -371,10 +373,12 @@ export const externalSessionCommands = centralSchema.table("external_session_com
   hostId: text("host_id").notNull(), nativeSessionId: text("native_session_id").notNull(), generation: text("generation").notNull(),
   operation: text("operation").notNull(), text: text("text"), status: text("status").notNull(), createdAt: text("created_at").notNull(),
   expiresAt: text("expires_at").notNull(), updatedAt: text("updated_at").notNull(), failure: text("failure"),
+  controller: text("controller").notNull().default("host-adapter"),
 });
 export const externalSessionRuntimes = centralSchema.table("external_session_runtimes", {
   sessionId: text("session_id").primaryKey().references(() => externalSessions.id, { onDelete: "cascade" }),
   generation: text("generation").notNull(), capabilities: jsonb("capabilities").$type<string[]>().notNull(), expiresAt: text("expires_at").notNull(),
+  controller: text("controller").notNull().default("host-adapter"),
 });
 
 // ── Schema version meta ──────────────────────────────────────────────

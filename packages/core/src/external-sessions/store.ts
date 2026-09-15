@@ -129,12 +129,25 @@ export class ExternalSessionStore {
       || typeof linked !== "boolean" || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("Invalid task link");
     return this.layer.db.transaction(async tx => {
       await tx.insert(externalSessionDetails).values({ sessionId: id }).onConflictDoNothing();
-      const [row] = await tx.update(externalSessionDetails).set({ taskProjectId: linked ? projectId : null, taskId: linked ? taskId : null, taskLinkRevision: expectedRevision + 1 })
+      const [row] = await tx.update(externalSessionDetails).set({ taskProjectId: linked ? projectId : null, taskId: linked ? taskId : null, taskLinkRevision: expectedRevision + 1, taskLinkSource: linked ? "explicit" : null })
         .where(and(eq(externalSessionDetails.sessionId, id), eq(externalSessionDetails.taskLinkRevision, expectedRevision),
           sql`((${externalSessionDetails.taskProjectId} IS NULL AND ${externalSessionDetails.taskId} IS NULL) OR
             (${externalSessionDetails.taskProjectId}=${projectId} AND ${externalSessionDetails.taskId}=${taskId}))`)).returning();
       if (!row) throw new Error("Task link revision or ownership conflict");
       return row;
+    });
+  }
+
+  /** Trusted local runtime evidence only; never exposed through collector input. */
+  async associateNativeRuntime(id: string, runtime: { cliSessionId: string; projectId: string; taskId: string | null }, now = Date.now()) {
+    if (![runtime.cliSessionId, runtime.projectId, ...(runtime.taskId === null ? [] : [runtime.taskId])].every(value => typeof value === "string" && value.trim() && value.length <= 256)) throw new Error("Invalid native runtime identity");
+    const evidence = { ...runtime, verifiedAt: new Date(now).toISOString() };
+    await this.layer.db.transaction(async tx => {
+      await tx.insert(externalSessionDetails).values({ sessionId: id }).onConflictDoNothing();
+      await tx.update(externalSessionDetails).set({ nativeRuntime: evidence }).where(eq(externalSessionDetails.sessionId, id));
+      // An explicit unlink is durable intent too: its revision prevents auto-relink.
+      if (runtime.taskId) await tx.update(externalSessionDetails).set({ taskProjectId: runtime.projectId, taskId: runtime.taskId, taskLinkSource: "native-runtime", taskLinkRevision: 1 })
+        .where(and(eq(externalSessionDetails.sessionId, id), eq(externalSessionDetails.taskLinkRevision, 0)));
     });
   }
 

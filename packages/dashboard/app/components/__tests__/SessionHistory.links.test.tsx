@@ -47,3 +47,20 @@ it("ignores an older cost-basis response after switching to recorded rates", asy
   expect(screen.queryByText("Stale current output")).toBeNull();
   expect(screen.getByText("Recorded output")).toBeTruthy();
 });
+
+it("distinguishes owned Fusion controls from external hooks and keeps task pause on the owning task", async () => {
+  fetchSession.mockResolvedValue({ ...data, details: { taskId: "FN-1", taskProjectId: "project", taskLinkSource: "native-runtime", nativeRuntime: { cliSessionId: "owned", taskId: "FN-1", projectId: "project", verifiedAt: "2026-09-15T12:00:00Z" } }, runtime: { controller: "fusion-runtime", connected: true, capabilities: ["feedback"] }, commands: [{ id: "command", operation: "feedback", controller: "fusion-runtime", status: "applied", expiresAt: "2026-09-15T12:05:00Z" }] });
+  render(<SessionHistory id="session" />);
+  const link = await screen.findByRole("link", { name: "Open FN-1 controls" });
+  expect(link.getAttribute("href")).toBe("?project=project&task=FN-1");
+  expect(screen.queryByRole("button", { name: "Stop session" })).toBeNull();
+  expect(screen.getByText(/Written to the owned Fusion terminal/)).toBeTruthy();
+  expect(screen.getByText(/Verified native link to/)).toBeTruthy();
+});
+it("does not offer queued feedback through a disconnected Fusion runtime", async () => {
+  fetchSession.mockResolvedValue({ ...data, runtime: { controller: "fusion-runtime", connected: false, capabilities: [] } });
+  render(<SessionHistory id="session" />);
+  await screen.findByText("Fusion runtime disconnected. Controls are unavailable until its owner reconnects.");
+  expect(screen.queryByRole("button", { name: "Send feedback" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Stop session" })).toBeNull();
+});

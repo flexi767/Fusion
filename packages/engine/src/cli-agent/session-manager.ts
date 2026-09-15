@@ -28,6 +28,7 @@
  * engine↔dashboard seam stays process-split-credible.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   CliSessionStore,
   type CliAutonomyPosture,
@@ -277,7 +278,7 @@ export interface CliSessionAttachment {
 
 type WriteJob =
   | { kind: "user"; data: string }
-  | { kind: "injection"; text: string; resolve: () => void };
+  | { kind: "injection"; text: string; resolve: () => void; reject: (error: Error) => void; deadlineMs?: number };
 
 // ── Session spawn options ───────────────────────────────────────────────────
 
@@ -320,6 +321,8 @@ export interface SpawnCliSessionOptions {
 
 interface LiveSession {
   id: string;
+  generation: string;
+  endListeners: Set<() => void>;
   adapter: CliAgentAdapter;
   pty: IPty;
   pid: number;
@@ -420,6 +423,15 @@ export class CliSessionManager {
     return this.sessions.has(sessionId);
   }
 
+  /** Fresh for each owned PTY, including in-place resume of a durable session id. */
+  getRuntimeGeneration(sessionId: string): string | undefined { return this.sessions.get(sessionId)?.generation; }
+
+  killOwned(sessionId: string, generation: string): boolean {
+    const live = this.sessions.get(sessionId);
+    if (!live || live.generation !== generation) return false;
+    this.killLive(live, "userExited"); return true;
+  }
+
   // ── Spawn ──────────────────────────────────────────────────────────────
 
   /**
@@ -513,6 +525,7 @@ export class CliSessionManager {
       adapter,
       pty: child,
       pid: child.pid,
+      generation: randomUUID(), endListeners: new Set(),
       scrollback: new ScrollbackRing(this.scrollbackBytes),
       readiness: adapter.createReadinessDetector(),
       ready: false,
@@ -619,13 +632,15 @@ export class CliSessionManager {
     live.terminated = true;
     this.sessions.delete(live.id);
     this.settleExit(live, exitCode, signal);
+    for (const notify of live.endListeners) notify();
+    live.endListeners.clear();
 
     for (const stream of live.streams) stream.close();
     live.streams.clear();
 
     // Reject any pending injection waiters.
     for (const job of live.queue) {
-      if (job.kind === "injection") job.resolve();
+      if (job.kind === "injection") job.reject(new Error("CLI session exited before injection"));
     }
     live.queue = [];
 
@@ -683,14 +698,44 @@ export class CliSessionManager {
    * Injection is deferred until the session is ready, and (if a quiet window is
    * configured) until output has been quiet.
    */
-  async inject(sessionId: string, text: string): Promise<void> {
+  async inject(sessionId: string, text: string, options?: { signal?: AbortSignal; deadlineMs?: number; generation?: string }): Promise<void> {
     const live = this.require(sessionId);
-    if (!live.ready) {
-      await this.waitForReady(sessionId);
-    }
-    await new Promise<void>((resolve) => {
-      live.queue.push({ kind: "injection", text, resolve });
-      void this.drain(live);
+    if (options?.generation && live.generation !== options.generation) throw new Error("CLI runtime generation changed");
+    if (options?.deadlineMs !== undefined && !Number.isFinite(options.deadlineMs)) throw new Error("Invalid injection deadline");
+    await new Promise<void>((resolve, reject) => {
+      let job: Extract<WriteJob, { kind: "injection" }> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        options?.signal?.removeEventListener("abort", abort);
+        live.endListeners.delete(ended);
+        const readyIndex = live.readyWaiters.indexOf(enqueue);
+        if (readyIndex >= 0) live.readyWaiters.splice(readyIndex, 1);
+        if (job) { const index = live.queue.indexOf(job); if (index >= 0) live.queue.splice(index, 1); }
+      };
+      const finish = (error?: Error) => { if (settled) return; settled = true; cleanup(); if (error) reject(error); else resolve(); };
+      const abort = () => finish(new Error("CLI injection cancelled"));
+      const ended = () => finish(new Error("CLI session exited before injection"));
+      const enqueue = () => {
+        if (settled) return;
+        if (live.terminated || this.sessions.get(sessionId) !== live) return ended();
+        if (options?.signal?.aborted) return abort();
+        if (options?.deadlineMs !== undefined && Date.now() >= options.deadlineMs) return finish(new Error("CLI injection expired"));
+        job = { kind: "injection", text, deadlineMs: options?.deadlineMs, resolve: () => finish(), reject: finish };
+        live.queue.push(job); void this.drain(live);
+      };
+      if (options?.signal?.aborted) return abort();
+      options?.signal?.addEventListener("abort", abort, { once: true });
+      live.endListeners.add(ended);
+      const scheduleDeadline = () => {
+        if (settled || options?.deadlineMs === undefined) return;
+        const remaining = options.deadlineMs - Date.now();
+        if (remaining <= 0) return finish(new Error("CLI injection expired"));
+        timer = setTimeout(scheduleDeadline, Math.min(remaining, 2_147_483_647));
+      };
+      scheduleDeadline();
+      if (live.ready) enqueue(); else live.readyWaiters.push(enqueue);
     });
   }
 
@@ -713,6 +758,7 @@ export class CliSessionManager {
       while (live.queue.length > 0 && !live.terminated) {
         const job = live.queue[0];
         if (job.kind === "injection") {
+          if (job.deadlineMs !== undefined && Date.now() >= job.deadlineMs) { job.reject(new Error("CLI injection expired")); continue; }
           // Defer injection while output is actively streaming (quiet window).
           if (this.injectionQuietWindowMs > 0) {
             const sinceOutput = Date.now() - live.lastOutputAt;
@@ -722,8 +768,8 @@ export class CliSessionManager {
             }
           }
           live.queue.shift();
-          this.writeInjection(live, job.text);
-          job.resolve();
+          try { this.writeInjection(live, job.text); job.resolve(); }
+          catch (error) { job.reject(error instanceof Error ? error : new Error("CLI injection failed")); }
         } else {
           live.queue.shift();
           // User keystrokes: write verbatim (deliberate control input).
@@ -858,11 +904,13 @@ export class CliSessionManager {
     this.sessions.delete(live.id);
     // A killed PTY exited via signal — surface a nonzero result to one-shot waiters.
     this.settleExit(live, -1, 9);
+    for (const notify of live.endListeners) notify();
+    live.endListeners.clear();
 
     for (const stream of live.streams) stream.close();
     live.streams.clear();
     for (const job of live.queue) {
-      if (job.kind === "injection") job.resolve();
+      if (job.kind === "injection") job.reject(new Error("CLI session exited before injection"));
     }
     live.queue = [];
 

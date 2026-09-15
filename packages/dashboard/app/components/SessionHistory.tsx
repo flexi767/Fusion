@@ -60,11 +60,12 @@ function SessionControls({ detail }: { detail: SessionDetail }) {
     finally { setBusy(false); }
   };
   return <section className="session-card"><h3>Session controls</h3>{!detail.runtime && <p>This observed session has no connected control adapter.</p>}
-    {detail.runtime && !detail.runtime.connected && <p>Adapter offline. Feedback waits for a supported hook and expires after five minutes.</p>}
+    {detail.runtime && !detail.runtime.connected && <p>{detail.runtime.controller === "fusion-runtime" ? "Fusion runtime disconnected. Controls are unavailable until its owner reconnects." : "Adapter offline. Feedback waits for a supported hook and expires after five minutes."}</p>}
+    {detail.runtime?.controller === "fusion-runtime" && detail.details?.nativeRuntime?.taskId && <p><a href={`?project=${encodeURIComponent(detail.details.nativeRuntime.projectId)}&task=${encodeURIComponent(detail.details.nativeRuntime.taskId)}`}>Open {detail.details.nativeRuntime.taskId} controls</a> to pause or resume its Fusion execution.</p>}
     {detail.runtime?.capabilities.includes("feedback") && <><label>Feedback<textarea value={text} maxLength={16000} onChange={e => setText(e.target.value)} /></label><button className="btn btn-secondary" disabled={busy || !text.trim()} onClick={() => void send("feedback")}>Send feedback</button></>}
     {["stop", "resume"].filter(operation => detail.runtime?.capabilities.includes(operation)).map(operation => <button key={operation} className="btn btn-secondary" disabled={busy} onClick={() => void send(operation)}>{operation === "stop" ? "Stop session" : "Resume session"}</button>)}
     {message && <p role="status">{message}</p>}
-    {detail.commands?.map(command => <p key={command.id}>{command.operation} · {command.operation === "feedback" && command.status === "applied" ? "Emitted as provider hook context" : command.status} · Expires {new Date(command.expiresAt).toLocaleString()}</p>)}
+    {detail.commands?.map(command => <p key={command.id}>{command.operation} · {command.operation === "feedback" && command.status === "applied" ? command.controller === "fusion-runtime" ? "Written to the owned Fusion terminal" : "Emitted as provider hook context" : command.status} · Expires {new Date(command.expiresAt).toLocaleString()}</p>)}
   </section>;
 }
 function SessionSummary({ detail, refresh }: { detail: SessionDetail; refresh: () => Promise<void> }) {
@@ -147,7 +148,8 @@ export function SessionHistory({ id, embedded = false }: { id: string; embedded?
       {!detail && !error && <p role="status">Loading history…</p>}
       {detail?.wholeSessionUsage && <section className="session-card"><h3>Whole session: {formatCost(detail.wholeSessionUsage.usd, detail.wholeSessionUsage.usd === null)}</h3><p>{detail.wholeSessionUsage.turns} collected turns · {detail.wholeSessionUsage.unreportedTurns} turns without usage · {detail.wholeSessionUsage.unpricedRows} unpriced model groups. Estimate at {detail.wholeSessionUsage.basis === "recorded" ? "recorded" : "current"} rates.</p></section>}
       {detail && <><p>{detail.session.hostId} · {detail.session.provider} · {detail.session.observation.activity} · Observed session</p><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} label={`Latest ${detail.cost.coveredTurns} turns`} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /><SessionPreferences id={id} details={detail.details} refresh={refresh} /></>}
-      {detail?.details?.taskId && detail.details.taskProjectId && <p>Explicitly linked to <a href={`?project=${encodeURIComponent(detail.details.taskProjectId)}&task=${encodeURIComponent(detail.details.taskId)}`}>{detail.details.taskId}</a>. Usage remains in Sessions and is not added again to task costs.</p>}
+      {detail?.details?.nativeRuntime && <p>Verified Fusion runtime · {detail.details.nativeRuntime.cliSessionId} · Last verified {new Date(detail.details.nativeRuntime.verifiedAt).toLocaleString()}</p>}
+      {detail?.details?.taskId && detail.details.taskProjectId && <p>{detail.details.taskLinkSource === "native-runtime" ? "Verified native link to" : "Explicitly linked to"} <a href={`?project=${encodeURIComponent(detail.details.taskProjectId)}&task=${encodeURIComponent(detail.details.taskId)}`}>{detail.details.taskId}</a>. Usage remains in Sessions and is not added again to task costs.</p>}
       <div className="sessions-grid">{turns.map(turn => <SessionTurnResult key={turn.id} turn={turn} sessionId={id} cost={detail?.turnCosts?.[turn.id] ?? olderCosts[turn.id] ?? (turn.id === targetId ? targetCost : undefined)} />)}</div>
       {detail && turns.length === 0 && <p>No turn history has been collected yet.</p>}
       {next && <button className="btn btn-secondary" disabled={busy} onClick={() => void more()}>Load older turns</button>}
