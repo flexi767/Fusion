@@ -85,6 +85,15 @@ server refuses metadata format downgrades, while operator labels and native
 activity keep their existing precedence. Deploy the matching server before
 replaying with the updated importer.
 
+Verified source aliases may map to one host/provider/native identity. The importer
+keeps up to eight audited source records per identity. It prefers a source record
+whose ID equals the native ID (otherwise stable source-ID order), preserves the
+other source titles/statuses/labels/notes as read-only aliases and merges explicit
+conversation references. A conflicting recorded host/provider is refused. Import
+archives the combined card only if all source records were archived, and preserves
+any pin; existing operator preferences still win. Alias data never grants runtime
+capabilities or creates an extra native session.
+
 ## Optional feedback hook adapter
 
 `feedback_hook.py` implements the verified AgentPulse `additionalContext` hook
@@ -134,9 +143,11 @@ line also preserves its cursor for repair. History rotates independently of the
 recent live scan, including when a large file is paused. Changed-turn backlogs
 drain before more history is parsed. Disk-state writes, cursor, revision and queued
 delivery commit together; replacement checkpoints remove obsolete parser records
-only in that transaction. Old transcripts remain the source of truth. An
-operator-selected history retention policy remains pending; hitting the disk cap
-pauses collection rather than silently evicting history or deduplication evidence.
+only in that transaction. Old transcripts remain the source of truth. The
+opt-in parser-cache maintenance described below protects complete native sources;
+hitting the disk cap pauses collection rather than silently evicting history or
+deduplication evidence. PostgreSQL content retention is a separate, explicit
+Sessions action and does not clear native transcripts or the collector spool.
 
 Reported model/context metadata is separate from lifetime usage. Model changes
 clear prior context; compacted context may shrink. Capacity stays unreported when
@@ -331,12 +342,3 @@ prefixes follow the stricter inode/size/mtime and parser-generation checks above
 The existing 8 MiB read budget, 200-file visit cap, rotating cursor and durable spool
 limits remain in force. A drained delivery queue does not prove every historical
 file has reached its end.
-
-Verified source aliases may map to one host/provider/native identity. The importer
-keeps up to eight audited source records per identity. It prefers a source record
-whose ID equals the native ID (otherwise stable source-ID order), preserves the
-other source titles/statuses/labels/notes as read-only aliases and merges explicit
-conversation references. A conflicting recorded host/provider is refused. Import
-archives the combined card only if all source records were archived, and preserves
-any pin; existing operator preferences still win. Alias data never grants runtime
-capabilities or creates an extra native session.

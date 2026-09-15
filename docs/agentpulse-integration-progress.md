@@ -4,15 +4,16 @@ Session: **Fusion AgentPulse integration**. Updated 2026-09-16 (Berlin).
 Worktree: `/Users/v/dev/fusion-worktrees/agentpulse-sessions`.
 Branch: `codex/agentpulse-sessions`; plan baseline `801d03c84`; foundation `f435871bf`.
 
-## Current checkpoint (2026-09-15, 21:22 UTC)
+## Current checkpoint (2026-09-15, 22:09 UTC)
 
-- J authenticated comparison server and independent m3/J collectors run frozen `c07f8adf3` (v11), retaining the original preview database/spools. Archive SHA-256: `96ceb9a9ce31852ed497c57a6e16bee17aca51b2177dd15f6169ba9189d559bf`. AgentPulse and its supervisor remain active. Controls, launches and automatic summaries remain disabled in the real comparison.
-- All **5,958 stored snapshot turns** are now present across **83 audited identities**: 70 native-file verified, 13 historical-only with explicit source-host/native-start-ID evidence. The m5 cohort's 584 normalized turns match exactly; its heartbeat remains null. Twelve hostless metadata-only identities, including four archived records, remain unresolved. Both import spools are drained with zero rejections.
-- The captured [reconciliation](agentpulse-reconciliation.md) records 5,419 exact turns, 39 later-native and 500 equal-time differences, with zero missing turns. All 48 substantive changed rows have native corroboration, including usage, tool counts, changed patches and earlier owning prompts. The [same-rate comparison](agentpulse-accounting-comparison.md) covers all 5,746 source-priced groups with zero arithmetic discrepancies. The 21:31 post-catch-up export now records 5,418 exact / 40 later-native / 500 equal-time turns; all 49 substantive differences are corroborated.
-- The v11 scheduler caught up all 65 verified m3 native files to complete-line EOF; only the currently growing session's trailing partial line remained at the check. Stale working reports are explicitly labeled without changing activity or connectivity. Content/parser retention is opt-in and has **not** been applied to real history.
-- Five-minute network outage and preview rollback rehearsals passed with AgentPulse available. Provisional dual observation began **2026-09-15 18:28 UTC**; 24 hours have not elapsed, and fixes during this window prevent treating it as completed parity. Live m5 and native-hook/control acceptance remain open.
-- Expanded inventory found one read-only cross-session Ask summary (one thread/two messages) and 65 successful idle watcher runs with no proposals. A bounded recent-activity overview and correct same-turn summary-staleness display are now under build/gate verification. Read-only Ask/alias import is under final verification. Source evidence shows the watcher successes include no-op wakes; see the [feature checklist](agentpulse-feature-checklist.md).
-- All work remains on `codex/agentpulse-sessions`; no main merge, release, retirement or automatic task enrollment. GitHub pushes remain blocked by unavailable HTTPS credentials. Local commits are retained.
+- J authenticated comparison server runs frozen `023d257e7`; independent m3/J collectors remain v11 `c07f8adf3`. The original preview database/configuration/spools are retained. AgentPulse and its supervisor remain active. Controls, launches and automatic summaries stay disabled in the real comparison.
+- All **5,958 stored snapshot turns** are present across **83 audited native identities**: 70 native-file verified and 13 historical-only. Explicit source relations now map **87 source records** to those 83 identities, preserving four aliases. Eight metadata-only source identities remain unassigned. m5's 584 normalized turns match exactly, but its heartbeat is null and it is unreachable from both m3 and J.
+- [Reconciliation](agentpulse-reconciliation.md) at 21:31 records **5,418 exact / 40 later-native / 500 equal-time** turns, zero missing and all 49 substantive differences corroborated. [Same-rate accounting](agentpulse-accounting-comparison.md) covers all 5,746 source-priced groups with zero arithmetic discrepancies.
+- Read-only Ask conversation and verified-alias display passed focused tests, build/typecheck/boot, the 754-test serial gate and desktop/mobile checks. The new server is deployed; all three format-5 replays completed and drained with zero rejected deliveries. Source-to-PostgreSQL metadata comparison has zero mismatches. All six source archive labels are accounted for by two canonical records and four aliases. No conversation token counts enter native usage accounting.
+- Recent activity overview and summary freshness are implemented. Two real imported-history samples successfully used the existing m3 Qwen endpoint; unchanged repeats made no additional inference call. Full automatic summary and native-control acceptance remains open.
+- Current collector polling p95: m3 9.562 seconds / 2,072 samples, J 5.375 seconds / 161 samples; both queues are empty with zero parse/delivery/capacity errors. Five-minute outage and preview rollback rehearsals passed. Provisional observation began **2026-09-15 18:28 UTC**; 24 hours have not elapsed and fixes during the window prevent a completed-parity claim.
+- Remaining gates: live m5, eight unresolved metadata records, native hooks/controls and other Fusion runtime backends, all-host restart/rollback and the full observation window. Content/parser retention is opt-in and has not been applied to real history. Used-feature mapping is in the [checklist](agentpulse-feature-checklist.md).
+- All work remains local on `codex/agentpulse-sessions`; GitHub HTTPS credentials block pushing. No main merge, release, retirement, automatic task enrollment, model download or new inference server.
 
 ## Verified deployment and source
 
@@ -454,3 +455,26 @@ Updated verification: 62 Python tests, 18 PostgreSQL tests and five metadata/tur
 - Final alias-aware `verify:fast`: all 25 steps passed in 194.4 seconds, including build/typecheck and real boot smoke. Serial merge gate: static checks plus 754 tests passed; no full suite or parallel workers.
 - Synthetic archive rendered at desktop 1440×1000 and mobile 390×844; screenshots inspected. Both message roles, archive alias labels, coverage and literal HTML-like text are visible. The text creates no button. Existing lab engine/provider/allocator warnings remain; this is not a clean-console claim.
 - Verified implementation is ready for the isolated J server; real format-5 replay has not started. No AgentPulse changes or production cutover.
+
+### Deployed archive support and native summary smoke check (2026-09-15 22:05 UTC)
+
+- J comparison server now runs frozen `023d257e7`; archive SHA-256 `fc99edfd50af3801adb3b55e983be7b17a8e13c68ecb73b8c1c642f6767348ad`. Existing configuration, PostgreSQL database and independent collector spools were retained. Collectors remain v11 `c07f8adf3` because their native parser code did not change. Dashboard authentication verified 401 without credentials and 200 with credentials; overview returns five bounded rows.
+- Format-5 replay is progressing sequentially, starting with m3. Its 66 canonical metadata records already preserve two aliases and two Ask references. Both live collectors still report empty queues and zero parse/delivery/capacity errors. Latest rolling native-to-ACK p95: m3 9.562 seconds across 2,072 samples, J 5.375 seconds across 161 samples; m3 maximum retains the earlier deliberate outage. These are polling observations, not hook latency.
+- Two real imported-history samples in the isolated m3 lab successfully called the existing `qwen3.5-2b` endpoint: one Codex turn and five Claude turns. Exactly one inference per sample; the immediate repeat returned `Content unchanged`, with zero additional calls, no errors and correct fresh coverage. Outputs retained the source relay 502 and CI/staging-auth blockers. This is a bounded smoke check, not a guarantee of factual summary quality. Automatic summaries remain off on J.
+- m5 remains unreachable from both m3 (`No route to host`) and J (connection timeout). Its imported history is explicitly historical-only. Push of `023d257e7` failed because GitHub HTTPS credentials are unavailable; the local commit remains intact.
+
+### Format-5 migration reconciliation completed (2026-09-15 22:09 UTC)
+
+All three independent historical spools reached `done`, zero pending and zero rejected deliveries. Exact source-to-PostgreSQL comparison verified:
+
+| Host | Source records | Canonical sessions | Preserved aliases | Ask references | Archived canonical cards |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| m3 | 68 | 66 | 2 | 2 | 0 |
+| m5 | 13 | 12 | 1 | 2 | 1 |
+| J | 6 | 5 | 1 | 1 | 1 |
+
+All canonical IDs, original alias labels/notes, conversation messages/roles/timestamps/context IDs, coverage, truncation flags and unmodified operator preferences match the expected format-5 source projection. Four archived aliases plus two archived canonical cards preserve all six source archive labels. The one Ask thread retains both messages under its five explicitly recorded references. No usage is inferred from archive message counters.
+
+Fresh m5 reconciliation after replay remains **584 of 584 normalized exact turns**, zero missing or changed. The global audit has eight unassigned metadata-only source identities. Per-host spool reports contain 10/11/11 unresolved IDs because those host-specific maps also omit aliases verified on other hosts; the union of all audited maps resolves those cross-host records. This is not a fully resolved global migration, and the retained snapshot remains necessary.
+
+The J comparison database still has zero tasks, commands, launches and generated summaries. This confirms that neither alias/conversation import nor the local Qwen smoke check enrolled or controlled a real observed session. AgentPulse and supervisor remain running; the comparison server and collectors retain their existing state. Private evidence: `format5-metadata-reconciliation.json`, `summary-native-smoke.json` and the host reconciliation reports under the existing private test directory.
