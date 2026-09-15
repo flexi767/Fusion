@@ -10,14 +10,17 @@ import time
 import urllib.request
 import urllib.error
 import uuid
-from turn_parser import consume, known, total, claude_turn_finished
+from turn_parser import consume, known, total, claude_turn_finished, bounded_text
+import parser_ledger
 
-VERSION = "fusion-native-3"
-PARSER_VERSION = 3
+VERSION = "fusion-native-4"
+PARSER_VERSION = 4
 MAX_READ = 1024 * 1024
 MAX_LINE = 4 * MAX_READ
 LIVE_TAIL = 256 * 1024
 MAX_PARSER_STATE = 8 * 1024 * 1024
+MAX_PARSER_BYTES = 1024 * 1024 * 1024
+MAX_PARSER_RECORDS = 2_000_000
 MAX_PENDING_BYTES = 128 * 1024 * 1024
 LIVE_RESERVE_BYTES = 2 * 1024 * 1024
 MAX_DELIVERY_BYTES = 1_500_000
@@ -28,6 +31,10 @@ class CollectionCapacityError(ValueError):
 
 
 def enqueue(db, envelope, live_key=None):
+    if 'observation' in envelope:
+        title=envelope['observation'].get('title','')
+        title=' '.join(''.join(c if ord(c)>=32 else ' ' for c in title).split())
+        envelope={**envelope,'observation':{**envelope['observation'],'title':bounded_text(title,512) or 'External session'}}
     body = json.dumps(envelope)
     size = len(body.encode('utf-8'))
     if size > MAX_DELIVERY_BYTES: raise CollectionCapacityError('Delivery exceeds byte limit')
@@ -58,6 +65,7 @@ def connect(path, timeout=5):
       CREATE TABLE IF NOT EXISTS health(key TEXT PRIMARY KEY, value TEXT);
       CREATE TABLE IF NOT EXISTS live_files(path TEXT PRIMARY KEY,inode TEXT,offset INTEGER,state TEXT);
     ''')
+    parser_ledger.initialize(db)
     columns={row[1] for row in db.execute('PRAGMA table_info(pending)')}
     if 'retry_after' not in columns: db.execute('ALTER TABLE pending ADD COLUMN retry_after REAL NOT NULL DEFAULT 0')
     if 'rejection' not in columns: db.execute('ALTER TABLE pending ADD COLUMN rejection TEXT')
@@ -197,16 +205,22 @@ def _scan_file(db, path, provider, max_pending=5000):
     offset, state = (old[1], json.loads(old[2])) if old and old[0] == inode and old[1] <= stat.st_size else (0, {})
     if state and state.get('parserVersion') != PARSER_VERSION: offset,state=0,{}
     state['parserVersion']=PARSER_VERSION
+    state.setdefault('ledgerGeneration',str(uuid.uuid4()))
     if offset == stat.st_size and not state.get("turnsState", {}).get("changed"): return False
-    with path.open('rb') as stream:
-        stream.seek(offset); data = stream.read(MAX_READ)
-        # An incomplete record is never acknowledged. Bound long-line handling.
-        while b'\n' not in data and len(data) <= MAX_LINE:
-            more = stream.read(MAX_READ)
-            if not more: break
-            data += more
+    parser_ledger.attach(db,path,state)
+    data=b''
+    # Drain changed turns before reading more input; neither list nor snapshots
+    # can grow indefinitely while history delivery is backlogged.
+    if not state['turnsState'].get('changed'):
+        with path.open('rb') as stream:
+            stream.seek(offset); data = stream.read(MAX_READ)
+            # An incomplete record is never acknowledged. Bound long-line handling.
+            while b'\n' not in data and len(data) <= MAX_LINE:
+                more = stream.read(MAX_READ)
+                if not more: break
+                data += more
     end = data.rfind(b'\n') + 1
-    if end == 0 and offset != stat.st_size:
+    if end == 0 and offset != stat.st_size and not state['turnsState'].get('changed'):
         if len(data) > MAX_LINE:
             with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Oversized native record; collection paused for '+str(path)))
         return False
@@ -222,10 +236,13 @@ def _scan_file(db, path, provider, max_pending=5000):
         try:
             changed = apply(state, event, provider) or changed
             consume(state.setdefault('turnsState', {}), event, 'claude_code' if provider == 'claude' else 'codex_cli')
+        except parser_ledger.ParserLedgerCapacity as error:
+            raise CollectionCapacityError(str(error)) from error
         except (TypeError, ValueError, AttributeError):
             with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Unsupported native record; cursor paused in '+str(path)))
             return False
-    if len(json.dumps(state).encode('utf-8')) > MAX_PARSER_STATE:
+    _,_,memory = parser_ledger.prepare(state)
+    if memory > MAX_PARSER_STATE:
         raise CollectionCapacityError('Parser state limit reached; history cursor preserved')
     with db:
         turns_state = state.get('turnsState', {})
@@ -253,7 +270,13 @@ def _scan_file(db, path, provider, max_pending=5000):
                     envelope['turns'] = [result]
                 enqueue(db, envelope)
             turns_state['changed'] = [tid for tid in turns_state.get('changed', []) if tid not in changed_ids]
-        db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?)', (str(path), inode, offset+end, json.dumps(state)))
+        serialized,maps,_=parser_ledger.prepare(state)
+        db.execute('DELETE FROM parser_records WHERE path=? AND generation<>?',(str(path),state['ledgerGeneration']))
+        for mapping,encoded in maps:mapping.flush(encoded)
+        records,bytes_used=db.execute('SELECT records,bytes FROM parser_usage WHERE id=1').fetchone()
+        if records>MAX_PARSER_RECORDS or bytes_used>MAX_PARSER_BYTES:
+            raise CollectionCapacityError('Parser ledger disk limit reached; cursor preserved')
+        db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?)', (str(path), inode, offset+end, serialized))
     return True
 
 
@@ -300,7 +323,7 @@ def diagnostics(db):
     return dict(spoolDepth=db.execute('SELECT count(*) FROM pending WHERE rejection IS NULL').fetchone()[0],
         rejectedDeliveries=db.execute('SELECT count(*) FROM pending WHERE rejection IS NOT NULL').fetchone()[0],
         discoveredFiles=db.execute('SELECT count(*) FROM live_files').fetchone()[0],
-        parserStateBytes=db.execute('SELECT coalesce(sum(length(state)),0) FROM files').fetchone()[0],
+        parserStateBytes=db.execute('SELECT coalesce(sum(length(CAST(state AS BLOB))),0) FROM files').fetchone()[0]+db.execute('SELECT bytes FROM parser_usage WHERE id=1').fetchone()[0],
         resourcePaused=bool(db.execute("SELECT 1 FROM health WHERE key LIKE 'capacity:%'").fetchone()),
         spoolBytes=db.execute('SELECT bytes FROM spool_usage WHERE id=1').fetchone()[0],
         parseError=bool(db.execute("SELECT 1 FROM health WHERE key IN ('parse_error','scan_error')").fetchone()),

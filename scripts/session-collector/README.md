@@ -99,15 +99,24 @@ clear the whole spool. Permanent errors do not prevent other sessions draining.
 
 ## Resource bounds and replay
 
-History state is capped at 8 MiB per transcript. Each delivery is capped at 1.5 MB;
+Parser v4 keeps historical turn, request and deduplication records in the same
+local SQLite spool, loading only the records touched by a bounded input chunk.
+The working state and single-turn request set are capped at 8 MiB; retained parser
+records are capped at 1 GiB / two million records. Install `parser_ledger.py`
+alongside `collector.py` and `turn_parser.py`. Existing parser checkpoints are
+rebuilt from native sources on upgrade, without clearing pending deliveries.
+Each delivery is capped at 1.5 MB;
 the durable queue is capped at 128 MiB with a 2 MiB live-update reserve and 5,000
 records. Byte accounting is maintained transactionally, including live coalescing
 and exact acknowledgements. A limit rolls back that file's checkpoint and reports
 `resourcePaused`; it never discards an unacknowledged record. A malformed complete
 line also preserves its cursor for repair. History rotates independently of the
-recent live scan, including when a large file is paused. Old transcripts stay the
-source of truth; state spilling/retention for unusually large histories remains
-a follow-up rather than silent eviction.
+recent live scan, including when a large file is paused. Changed-turn backlogs
+drain before more history is parsed. Disk-state writes, cursor, revision and queued
+delivery commit together; replacement checkpoints remove obsolete parser records
+only in that transaction. Old transcripts remain the source of truth. An
+operator-selected history retention policy remains pending; hitting the disk cap
+pauses collection rather than silently evicting history or deduplication evidence.
 
 Reported model/context metadata is separate from lifetime usage. Model changes
 clear prior context; compacted context may shrink. Capacity stays unreported when

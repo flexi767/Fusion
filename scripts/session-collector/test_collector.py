@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main, diagnostics, apply
+from collector import connect, scan_file, drain, discover, scan_live, bind_host, NoRedirect, main, diagnostics, apply, enqueue
 
 class CollectorTests(unittest.TestCase):
     def setUp(self):
@@ -174,6 +174,71 @@ class CollectorTests(unittest.TestCase):
                     state={}
                     apply(state,dict(type='assistant',sessionId='c',cwd='/repo',timestamp='2026-09-15T12:00:00Z',message=dict(stop_reason=stop_reason,content=[dict(type=block,text='Interim')])),'claude')
                     self.assertEqual(state['activity'],'waiting' if stop_reason in ('end_turn','stop_sequence','max_tokens') and block!='tool_use' else 'working')
+
+    def test_historical_state_spills_durably_and_late_updates_load_only_their_turn(self):
+        for provider in ['codex','claude']:
+            with self.subTest(provider=provider):
+                path=self.root/(provider+'.jsonl');rows=[]
+                if provider=='codex':rows=self.codex()[:1]
+                for index in range(60):
+                    at=f'2026-09-15T12:{index:02}:00Z'
+                    if provider=='codex':
+                        rows.extend([dict(type='event_msg',timestamp=at,payload=dict(type='task_started',turn_id=str(index))),
+                            dict(type='event_msg',timestamp=at,payload=dict(type='task_completed',turn_id=str(index),last_agent_message='result '+str(index)+'x'*1024))])
+                    else:
+                        rows.extend([dict(type='user',uuid=str(index),sessionId='claude-ledger',cwd='/repo',timestamp=at,message=dict(content='Prompt '+str(index))),
+                            dict(type='assistant',timestamp=at,message=dict(id='request-'+str(index),model='fixture',content=[dict(type='text',text='result '+str(index)+'x'*1024)],stop_reason='end_turn',usage=dict(input_tokens=10,cache_read_input_tokens=0,cache_creation_input_tokens=0,output_tokens=2)))])
+                path.write_text(''.join(json.dumps(row)+'\n' for row in rows));results={}
+                def send(e):
+                    for turn in e.get('turns',[]):results[turn['id']]=turn
+                    return dict(acknowledged=True,eventId=e['eventId'])
+                with patch('collector.MAX_READ',4096),patch('collector.MAX_PARSER_STATE',16*1024):
+                    for step in range(200):
+                        progressed=scan_file(self.db,path,provider);drain(self.db,send)
+                        if step==5:self.db.close();self.db=connect(self.root/'spool.sqlite')
+                        if not progressed:break
+                    self.assertEqual(len(results),60)
+                    offset,wire=self.db.execute('SELECT offset,state FROM files WHERE path=?',(str(path),)).fetchone()
+                    self.assertEqual(offset,path.stat().st_size);self.assertLess(len(wire),2048)
+                    self.assertGreater(diagnostics(self.db)['parserStateBytes'],60*1024)
+                    self.assertFalse(diagnostics(self.db)['resourcePaused'])
+                    if provider=='codex':
+                        with path.open('a') as stream:
+                            stream.write(json.dumps(dict(type='token_usage_record',timestamp='2026-09-15T13:00:00Z',payload=dict(turn_id='0',response_id='late',usage=dict(input_tokens=10,output_tokens=2))))+'\n')
+                        self.assertTrue(scan_file(self.db,path,provider));drain(self.db,send)
+                        self.assertEqual(results['0']['usage'][0]['inputTokens'],10)
+                        self.assertTrue(results['0']['response'].startswith('result 0'))
+                        self.assertEqual(json.loads(self.db.execute('SELECT state FROM files WHERE path=?',(str(path),)).fetchone()[0])['turnsState']['active'],'59')
+
+    def test_ledger_capacity_rolls_back_state_cursor_revision_and_delivery_together(self):
+        self.write(self.codex())
+        with patch('collector.MAX_PARSER_BYTES',1):self.assertFalse(scan_file(self.db,self.path,'codex'))
+        for table in ['files','revisions','pending','parser_records']:
+            self.assertEqual(self.db.execute('SELECT count(*) FROM '+table).fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT records,bytes FROM parser_usage').fetchone(),(0,0))
+        self.assertTrue(scan_file(self.db,self.path,'codex'))
+        self.assertFalse(diagnostics(self.db)['resourcePaused'])
+        self.assertGreater(self.db.execute('SELECT bytes FROM parser_usage').fetchone()[0],0)
+
+    def test_native_and_imported_titles_use_the_servers_utf16_boundary(self):
+        for historical in [False,True]:
+            for provider in ['codex','claude']:
+                event_id=provider+str(historical)
+                with self.db:enqueue(self.db,dict(eventId=event_id,historical=historical,observation=dict(provider=provider,title='😀'+'x'*511+'\x00')))
+                title=json.loads(self.db.execute('SELECT body FROM pending WHERE event_id=?',(event_id,)).fetchone()[0])['observation']['title']
+                self.assertEqual(len(title.encode('utf-16-le'))//2,512)
+                self.assertTrue(title.startswith('😀'));self.assertNotIn('\x00',title)
+
+    def test_changed_turn_backlog_drains_without_reading_ahead(self):
+        rows=self.codex()[:1]+[dict(type='event_msg',timestamp='2026-09-15T12:00:00Z',payload=dict(type='task_started',turn_id=str(i))) for i in range(40)]
+        self.write(rows);self.assertTrue(scan_file(self.db,self.path,'codex'))
+        offset=self.db.execute('SELECT offset FROM files').fetchone()[0]
+        with self.path.open('a') as stream:stream.write(json.dumps(dict(type='event_msg',timestamp='2026-09-15T12:01:00Z',payload=dict(type='task_started',turn_id='later')))+'\n')
+        self.assertTrue(scan_file(self.db,self.path,'codex'))
+        self.assertEqual(self.db.execute('SELECT offset FROM files').fetchone()[0],offset)
+        self.assertTrue(scan_file(self.db,self.path,'codex'))
+        turns=[turn['id'] for (body,) in self.db.execute('SELECT body FROM pending') for turn in json.loads(body).get('turns',[])]
+        self.assertEqual(len(turns),len(set(turns)));self.assertEqual(len(turns),41)
 
     def test_reported_model_context_and_compaction_for_both_providers(self):
         state={}

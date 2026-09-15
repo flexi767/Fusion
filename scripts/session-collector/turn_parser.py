@@ -14,12 +14,19 @@ def maximum(a,b): return max(a,b) if a is not None and b is not None else a if a
 def text(content):
     if isinstance(content,str): return content
     return '\n'.join(b.get('text','') for b in content or [] if isinstance(b,dict) and b.get('type','').lower() in ('text','input_text','output_text'))
+def bounded_text(value,units):
+    # The TypeScript contract counts UTF-16 units, not Python Unicode scalars.
+    return value.encode('utf-16-le',errors='replace')[:units*2].decode('utf-16-le',errors='ignore')
 def fresh(tid,at):
     return {'id':tid,'startedAt':at,'completedAt':None,'durationMs':None,'durationSource':'timestamps','prompts':[],'response':'','usage':[],'files':[],'toolCalls':0,'updatedAt':at}
 def claude_turn_finished(message):
     content=message.get('content') or []
     if isinstance(content,list) and any(isinstance(block,dict) and block.get('type')=='tool_use' for block in content):return False
     return message.get('stop_reason') in ('end_turn','stop_sequence','max_tokens')
+def turn_requests(state,tid):
+    requests=state.get('requests',{})
+    if hasattr(requests,'values_for_turn'):return requests.values_for_turn(tid)
+    return (request for request in requests.values() if request['turn']==tid)
 def consume(state,e,agent):
     p=e.get('payload') or {}; at=e.get('timestamp')
     if not isinstance(p,dict) or not isinstance(at,str): return
@@ -40,7 +47,7 @@ def consume(state,e,agent):
         if key in seen:return
         seen[key]=True
         r=turn(tid)
-        r['prompts'].append(value[:65536])
+        r['prompts'].append(bounded_text(value,65536))
     def edit(r,path,diff,key):
         seen=state.setdefault('edits',{})
         key=r['id']+':'+str(key)
@@ -53,7 +60,7 @@ def consume(state,e,agent):
         f['added']+=sum(l.startswith('+') and not l.startswith('+++') for l in diff.splitlines())
         f['removed']+=sum(l.startswith('-') and not l.startswith('---') for l in diff.splitlines())
         combined=f['diff']+'\n'+diff
-        f['truncated']=f['truncated'] or len(combined)>65536;f['diff']=combined[:65536]
+        f['diff']=bounded_text(combined,65536);f['truncated']=f['truncated'] or f['diff']!=combined
     if kind=='turn_context':
         state['model']=p.get('model') or state.get('model');state['serviceTier']=p.get('service_tier');state['fast']=p.get('service_tier') in ('fast','priority');return
     if kind=='event_msg' and sub=='task_started':
@@ -65,12 +72,12 @@ def consume(state,e,agent):
         r=turn(p.get('turn_id'));r['completedAt']=at
         r['durationMs']=num(p.get('duration_ms')) if p.get('duration_ms') is not None else elapsed(r['startedAt'],at)
         r['durationSource']='provider' if p.get('duration_ms') is not None else 'timestamps'
-        if p.get('last_agent_message'):r['response']=p['last_agent_message'][:131072]
+        if p.get('last_agent_message'):r['response']=bounded_text(p['last_agent_message'],131072)
         return
     if kind=='response_item' and sub=='message':
         value=text(p.get('content'))
         if p.get('role')=='user' and not state.get('nativePrompts',{}).get(state.get('active')):prompt(value)
-        elif p.get('role')=='assistant' and p.get('phase')=='final':turn()['response']=value[:131072]
+        elif p.get('role')=='assistant' and p.get('phase')=='final':turn()['response']=bounded_text(value,131072)
         return
     if kind=='event_msg' and sub=='item_completed':
         i=p.get('item') or {}; typ=i.get('type');r=turn(p.get('turn_id'))
@@ -78,7 +85,7 @@ def consume(state,e,agent):
             native=state.setdefault('nativePrompts',{})
             if not native.get(r['id']):r['prompts']=[];native[r['id']]=True
             prompt(text(i.get('content')),r['id'],key='native:'+r['id']+':'+event_key(i.get('id')))
-        elif typ=='AgentMessage' and i.get('phase')=='final':r['response']=text(i.get('content'))[:131072]
+        elif typ=='AgentMessage' and i.get('phase')=='final':r['response']=bounded_text(text(i.get('content')),131072)
         elif typ=='FileChange':
             changes=i.get('changes') or {}
             if isinstance(changes,dict):
@@ -107,7 +114,7 @@ def consume(state,e,agent):
         info=p.get('info') or {};u=info.get('total_token_usage')
         if not isinstance(u,dict):return
         prev=state.get('previousUsage',{});state['previousUsage']=u
-        if any(request['turn']==state.get('active') for request in state.get('requests',{}).values()):return
+        if any(True for _ in turn_requests(state,state.get('active'))):return
         delta={k:(max(0,u[v]-num(prev.get(v))) if known(u.get(v)) is not None else None) for k,v in FIELDS.items()}
         delta['cacheWriteTokens']=0
         if not any(value for value in delta.values() if value is not None):return
@@ -144,7 +151,7 @@ def consume(state,e,agent):
         return
     if kind=='assistant':
         r=turn();value=text(content)
-        if value:r['response']=value[:131072]
+        if value:r['response']=bounded_text(value,131072)
         if claude_turn_finished(m):r['completedAt']=at;r['durationMs']=elapsed(r['startedAt'],at)
         else:r['completedAt']=None;r['durationMs']=None
         for b in content if isinstance(content,list) else []:
@@ -170,7 +177,7 @@ def elapsed(start,end):
     except ValueError:return None
 
 def rebuild_usage(state,r):
-    reqs=[u for u in state.get('requests',{}).values() if u['turn']==r['id']]
+    reqs=list(turn_requests(state,r['id']))
     if not reqs:reqs=state.get('fallback',{}).get(r['id'],[])
     grouped={}
     for u in reqs:

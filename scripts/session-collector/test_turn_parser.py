@@ -1,6 +1,26 @@
 import unittest
 from turn_parser import consume
 class TurnParserTests(unittest.TestCase):
+    def test_astral_prompts_responses_and_patches_obey_utf16_limits(self):
+        for provider in ['codex_cli','claude_code']:
+            state={};at='2026-09-15T12:00:00Z';large='😀'*70000
+            def send(kind,**values):consume(state,dict(type=kind,timestamp=at,**values),provider)
+            if provider=='codex_cli':
+                send('event_msg',payload=dict(type='task_started',turn_id='t'))
+                send('response_item',payload=dict(type='message',role='user',content=large))
+                send('event_msg',payload=dict(type='item_completed',turn_id='t',item=dict(type='FileChange',changes={'a.py':dict(diff='+'+large)})))
+                send('event_msg',payload=dict(type='task_completed',turn_id='t',last_agent_message=large))
+            else:
+                send('user',uuid='t',message=dict(content=large))
+                send('assistant',message=dict(content=[dict(type='tool_use',id='edit',name='Write',input=dict(file_path='a.py',content=large))]))
+                send('user',message=dict(content=[dict(type='tool_result',tool_use_id='edit')]))
+                send('assistant',message=dict(content=[dict(type='text',text=large)],stop_reason='end_turn'))
+            turn=state['turns']['t']
+            self.assertEqual(len(turn['prompts'][0].encode('utf-16-le'))//2,65536)
+            self.assertEqual(len(turn['response'].encode('utf-16-le'))//2,131072)
+            self.assertLessEqual(len(turn['files'][0]['diff'].encode('utf-16-le'))//2,65536)
+            self.assertTrue(turn['files'][0]['truncated'])
+
     def test_codex_prompt_final_duration_and_canonical_usage_replace_fallback(self):
         state={}
         def send(kind, payload, at='2026-09-15T12:00:00Z'):
