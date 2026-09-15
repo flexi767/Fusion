@@ -337,3 +337,17 @@ Pricing bands committed as `472c6c232`; push failed again (`could not read Usern
 ### Native correction generation verification complete
 
 The v8 contract passed 15 PostgreSQL integration tests, eight turn/pricing unit tests, 46 Python collector tests and scoped lint. Serial `verify:fast` passed all 25 steps in 210.0 seconds; the serial merge gate passed all 754 tests and static validators. The deployment order remains server first, then collectors with their original spools.
+
+
+## Native correction rollout and durable delivery lag
+
+- Isolated J server and both comparison collectors now run frozen `4858a8213` (collector v8). The archive hash matches `9d31909afa56970730fe34464779d61f82ffcd07b33b5e4819498ce27741af9b`. Only the preview server executable path changed; its original configuration, preview database and both collector spools remain in place. Unauthenticated/authenticated checks returned 401/200. AgentPulse and its supervisor remain active. GitHub push still fails for unavailable HTTPS credentials.
+- The next collector version retains up to 10,000 content-free live acknowledgement samples, bounded to a rolling 24-hour diagnostics window. Original live eligibility survives ageing, outages and restart. Exact-ACK deletion and sampling commit together; superseded snapshots, cold discovery and history are excluded. Negative clock skew is visible and omitted from latency percentiles.
+- Symptom verification: a fresh update queued through a simulated outage and SQLite restart records the entire 601-second native-event-to-ACK delay; mismatched ACKs and a replaced in-flight snapshot do not create samples. Surface enumeration covers both shared provider delivery paths, cold/live/history, fresh/aged/rejected/empty queues, coalescing, retries, rollback clocks, restart, sample-cap/age pruning, route validation and the shared desktop/mobile health display. Fifty Python tests, seven route tests and eight UI tests pass; build/lint and deployed measurements remain next.
+
+
+### Delivery lag verification complete
+
+Scoped lint, all 25 serial verification steps (77.7 seconds), all 754 serial gate tests and static checks pass. Desktop (1440px) and mobile (390px) health displays were visually inspected with explicitly synthetic metrics in the separate m3 test preview; mobile content width remained 390px. Existing engine/provider/allocator fixture banners remain unrelated preview limitations. Screenshots are local ignored artifacts under `output/playwright/delivery-lag-*.png`. The real J comparison database received no synthetic latency values.
+
+Fresh v8 mapped reconciliation: J 358 normalized exact, six later native and 28 equal-time service-tier additions; m3 4,483 exact, 30 later native and 469 equal-time differences. No mapped turns are missing. Eight equal-time differences need attribution explanation: the previously verified combined Claude turn plus seven earlier prompts wrongly included in later snapshot turns. All seven prompts exist in earlier stored turns; two native files were directly checked, and remaining native checks are pending. Generation 5 corrected both known substantive turns in PostgreSQL, including `b64070e5-76d8-4ff0-b130-5af9dde9732e` at `2026-09-11T13:31:32.843Z` with 19 tools. This is not full parity: later-native comparisons, all-host access, retention, measured outage/rollback and 24-hour observation remain open.

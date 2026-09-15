@@ -13,9 +13,10 @@ import uuid
 from datetime import datetime
 from turn_parser import consume, known, total, claude_turn_finished, bounded_text
 import parser_ledger
+import delivery_metrics
 from opaque_records import ignored_header, scan_opaque_tail
 
-VERSION = "fusion-native-8"
+VERSION = "fusion-native-9"
 PARSER_VERSION = 4
 CLAUDE_PARSER_VERSION = 5
 LIVE_PARSER_VERSION = 1
@@ -70,8 +71,8 @@ def enqueue(db, envelope, live_key=None):
     record_limit = MAX_PENDING_RECORDS if priority == 2 else BACKGROUND_RECORD_LIMIT
     if (count >= record_limit and not previous) or stored - (previous[0] if previous else 0) + size > budget:
         raise CollectionCapacityError('Durable spool capacity reached')
-    db.execute('INSERT INTO pending(event_id,body,live_key,priority,event_at) VALUES (?,?,?,?,?) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,priority=excluded.priority,event_at=excluded.event_at,rejection=NULL,retry_after=0',
-        (envelope['eventId'], body, live_key, priority, event_at))
+    db.execute('INSERT INTO pending(event_id,body,live_key,priority,event_at,enqueued_at,lag_eligible) VALUES (?,?,?,?,?,?,?) ON CONFLICT(live_key) DO UPDATE SET event_id=excluded.event_id,body=excluded.body,priority=excluded.priority,event_at=excluded.event_at,enqueued_at=excluded.enqueued_at,lag_eligible=excluded.lag_eligible,rejection=NULL,retry_after=0',
+        (envelope['eventId'], body, live_key, priority, event_at, time.time(), int(priority == 2)))
 
 
 def capacity_pause(db, path, reason):
@@ -107,6 +108,7 @@ def connect(path, timeout=5):
       CREATE TRIGGER IF NOT EXISTS spool_delete AFTER DELETE ON pending BEGIN UPDATE spool_usage SET records=records-1,bytes=bytes-length(CAST(old.body AS BLOB)) WHERE id=1; END;
       CREATE TRIGGER IF NOT EXISTS spool_update AFTER UPDATE OF body ON pending BEGIN UPDATE spool_usage SET bytes=bytes+length(CAST(new.body AS BLOB))-length(CAST(old.body AS BLOB)) WHERE id=1; END;
     """)
+    delivery_metrics.initialize(db)
     db.commit()
     return db
 
@@ -373,7 +375,7 @@ def repair_rejected_display(db, limit=50):
 def drain(db, send, limit=50):
     repair_rejected_display(db)
     with db: db.execute('UPDATE pending SET priority=1 WHERE priority=2 AND event_at<?',(time.time()-LIVE_PRIORITY_SECONDS,))
-    for row_id, event_id, body, priority in db.execute('SELECT id,event_id,body,priority FROM pending WHERE rejection IS NULL AND retry_after<=? ORDER BY priority DESC,CASE WHEN priority=2 THEN event_at END DESC,id LIMIT ?', (time.time(),limit)).fetchall():
+    for row_id, event_id, body, priority, event_at, enqueued_at, lag_eligible in db.execute('SELECT id,event_id,body,priority,event_at,enqueued_at,lag_eligible FROM pending WHERE rejection IS NULL AND retry_after<=? ORDER BY priority DESC,CASE WHEN priority=2 THEN event_at END DESC,id LIMIT ?', (time.time(),limit)).fetchall():
         try: result = send(json.loads(body))
         except urllib.error.HTTPError as error:
             if error.code==429:
@@ -390,12 +392,15 @@ def drain(db, send, limit=50):
             continue
         if result.get('acknowledged') is not True or result.get('eventId') != event_id: raise ValueError('Unmatched acknowledgement')
         with db:
-            db.execute('DELETE FROM pending WHERE id=? AND event_id=? AND body=?', (row_id, event_id, body))
-            db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('last_acknowledgement', str(time.time())))
+            deleted=db.execute('DELETE FROM pending WHERE id=? AND event_id=? AND body=?', (row_id, event_id, body)).rowcount
+            acknowledged_at=time.time()
+            if deleted and lag_eligible and event_at is not None and enqueued_at is not None:
+                delivery_metrics.record(db,event_id,event_at,enqueued_at,acknowledged_at)
+            db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('last_acknowledgement', str(acknowledged_at)))
 
 
 def diagnostics(db):
-    return dict(spoolDepth=db.execute('SELECT count(*) FROM pending WHERE rejection IS NULL').fetchone()[0],
+    return dict(**delivery_metrics.diagnostics(db,time.time()),spoolDepth=db.execute('SELECT count(*) FROM pending WHERE rejection IS NULL').fetchone()[0],
         rejectedDeliveries=db.execute('SELECT count(*) FROM pending WHERE rejection IS NOT NULL').fetchone()[0],
         discoveredFiles=db.execute('SELECT count(*) FROM live_files').fetchone()[0],
         parserStateBytes=db.execute('SELECT coalesce(sum(length(CAST(state AS BLOB))),0) FROM files').fetchone()[0]+db.execute('SELECT bytes FROM parser_usage WHERE id=1').fetchone()[0],

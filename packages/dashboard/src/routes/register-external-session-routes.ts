@@ -45,7 +45,7 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
         const health: Record<string, number | boolean> = {};
         if (diagnostics !== undefined) {
           if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return res.status(400).json({ error: "Invalid collector diagnostics" });
-          for (const field of ["spoolDepth", "rejectedDeliveries", "discoveredFiles", "parserStateBytes", "spoolBytes"]) {
+          for (const field of ["spoolDepth", "rejectedDeliveries", "discoveredFiles", "parserStateBytes", "spoolBytes", "liveLagSamples", "liveLagClockSkewSamples", "liveLagP95Ms", "liveLagMaxMs", "liveQueueP95Ms", "oldestLivePendingMs"]) {
             const value = diagnostics[field];
             if (value !== undefined) {
               if (!Number.isSafeInteger(value) || value < 0) return res.status(400).json({ error: "Invalid collector diagnostics" });

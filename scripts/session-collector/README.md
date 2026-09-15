@@ -249,3 +249,22 @@ Deploy the updated server before collector v8. Existing Claude turns are
 republished in durable keyset batches of 25 without rewinding file offsets.
 Codex history is not republished wholesale. Keep the existing spool when updating
 a collector; resetting it would discard the revision and acknowledgement chain.
+
+
+## Delivery lag (collector v9)
+
+Install all Python modules in this directory, including `delivery_metrics.py`.
+The spool retains at most 10,000 content-free acknowledgement samples for a
+rolling 24-hour view. A live snapshot is eligible when first enqueued with a
+fresh native timestamp; eligibility survives queue ageing, outages and restarts.
+Only the exact acknowledged snapshot is sampled. Coalescing supersedes unsent
+snapshots, which are not counted; cold discovery and historical replay are also
+excluded. This measures observed snapshot delivery, not every native event or
+hook latency. Existing pending rows without eligibility metadata are not guessed.
+
+Health reports nearest-rank p95 and maximum native-event-to-ACK delay, queue p95,
+valid sample count, negative-clock-skew exclusions and the oldest queued live
+snapshot. Unknown or empty latency stays absent. Samples contain no prompts,
+paths or credentials and are committed atomically with deletion of the exact
+acknowledged queue row. Timing is based on the collector host clock; synchronize
+host clocks when comparing these measurements with server timestamps.

@@ -69,10 +69,15 @@ it("never acknowledges a failed commit, browser request, invalid envelope or dis
 
 it("accepts bounded host diagnostics and discards unrecognized fields", async () => {
   const server = app(); const headers = { Authorization: "Bearer collector-token" };
-  const envelope = { version: 1, eventId: "health", collectorVersion: "test", diagnostics: { spoolDepth: 12, rejectedDeliveries: 1, parseError: true, secret: "never retained" } };
+  const envelope = { version: 1, eventId: "health", collectorVersion: "test", diagnostics: { spoolDepth: 12, rejectedDeliveries: 1, parseError: true, liveLagSamples: 25, liveLagP95Ms: 13000, liveLagMaxMs: 600000, liveQueueP95Ms: 12000, oldestLivePendingMs: 900000, liveLagClockSkewSamples: 2, secret: "never retained" } };
   expect((await request(server, "POST", "/api/session-collector", { body: envelope, headers })).status).toBe(200);
-  expect(heartbeat).toHaveBeenCalledWith("m3", "test", undefined, { spoolDepth: 12, rejectedDeliveries: 1, parseError: true });
+  expect(heartbeat).toHaveBeenCalledWith("m3", "test", undefined, { spoolDepth: 12, rejectedDeliveries: 1, parseError: true, liveLagSamples: 25, liveLagP95Ms: 13000, liveLagMaxMs: 600000, liveQueueP95Ms: 12000, oldestLivePendingMs: 900000, liveLagClockSkewSamples: 2 });
   expect((await request(server, "POST", "/api/session-collector", { body: { ...envelope, diagnostics: { spoolDepth: -1 } }, headers })).status).toBe(400);
+  for (const field of ["liveLagSamples", "liveLagClockSkewSamples", "liveLagP95Ms", "liveLagMaxMs", "liveQueueP95Ms", "oldestLivePendingMs"]) {
+    for (const value of [-1, 1.5, "100", Number.MAX_SAFE_INTEGER + 1]) {
+      expect((await request(server, "POST", "/api/session-collector", { body: { ...envelope, diagnostics: { [field]: value } }, headers })).status).toBe(400);
+    }
+  }
 });
 
 it("credential probes authenticate without refreshing collector liveness", async () => {

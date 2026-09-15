@@ -78,6 +78,7 @@ function SessionResults({ filters, onCollectors }: { filters: SessionFilters; on
     <details className="session-card"><summary>Collector health</summary>{data?.collectors.map(collector => <section key={collector.hostId}>
       <h3>{collector.hostId}</h3><p>Last heartbeat: {collector.lastHeartbeatAt ? new Date(collector.lastHeartbeatAt).toLocaleString() : "No live heartbeat"} · Last acknowledged delivery: {collector.lastAcknowledgementAt ? new Date(collector.lastAcknowledgementAt).toLocaleString() : "None"}</p>
       <p>{collector.diagnostics?.spoolDepth ?? "Unknown"} queued · {collector.diagnostics?.rejectedDeliveries ?? "Unknown"} rejected · {collector.diagnostics?.discoveredFiles ?? "Unknown"} discovered transcripts</p>
+      <SessionDeliveryLag diagnostics={collector.diagnostics} />
       {collector.diagnostics?.resourcePaused && <p>Collection paused at a resource limit. Acknowledged data and pending checkpoints are preserved; inspect this host’s collector diagnostics.</p>}
       {collector.diagnostics?.parseError && <p>Transcript parsing needs attention. Inspect collector diagnostics on this host.</p>}
       {collector.diagnostics?.deliveryError && <p>Delivery is retrying after a failure.</p>}
@@ -94,5 +95,18 @@ function SessionResults({ filters, onCollectors }: { filters: SessionFilters; on
     })}</div>
     {pageError && <p role="alert">{pageError}</p>}
     {next && <button className="btn btn-secondary" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more sessions"}</button>}
+  </>;
+}
+
+/** Shared across hosts and viewport sizes; unknown latency is never displayed as zero. */
+export function SessionDeliveryLag({ diagnostics: health }: { diagnostics: CollectorHealth["diagnostics"] }) {
+  const seconds = (value: number) => `${(value / 1000).toFixed(1)} s`;
+  return <>
+    {health?.liveLagSamples && health.liveLagP95Ms != null ? <p>Live delivery lag: p95 {seconds(health.liveLagP95Ms)} · maximum {health.liveLagMaxMs != null ? seconds(health.liveLagMaxMs) : "unknown"} · {health.liveLagSamples.toLocaleString()} acknowledged updates</p>
+      : <p>Live delivery lag: no valid measurements yet.</p>}
+    <p>Latest 10,000 acknowledged live updates within 24 hours. Measures native event to collector acknowledgement; superseded snapshots and old backfill are excluded.</p>
+    {health?.liveQueueP95Ms != null && <p>Queue delay p95: {seconds(health.liveQueueP95Ms)}</p>}
+    {health?.oldestLivePendingMs != null && <p>Oldest queued live update: {seconds(health.oldestLivePendingMs)}</p>}
+    {Boolean(health?.liveLagClockSkewSamples) && <p>{health!.liveLagClockSkewSamples} samples excluded because host clocks moved backward or native timestamps were in the future.</p>}
   </>;
 }

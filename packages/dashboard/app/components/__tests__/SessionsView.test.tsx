@@ -1,6 +1,6 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { expect, it } from "vitest";
-import { SessionCard } from "../SessionsView";
+import { SessionCard, SessionDeliveryLag } from "../SessionsView";
 import { SessionCostDetails, SessionTurnResult } from "../SessionHistory";
 import type { SessionTurn } from "@fusion/core";
 const session = { id: "s", hostId: "m3", provider: "codex", nativeSessionId: "n", revision: 1, receivedAt: "2026-09-15T12:00:00Z", observation: { version: 1 as const, provider: "codex" as const, nativeSessionId: "n", revision: 1, observedAt: "2026-09-15T12:00:00Z", activity: "working" as const, title: "Fix", projectPath: "/repo" } };
@@ -53,4 +53,19 @@ it("discloses long-context and separate cache-lifetime charges while retaining u
   expect(screen.getByText("Cache write (5 minutes)")).toBeTruthy();
   expect(screen.getByText("Cache write (1 hour)")).toBeTruthy();
   expect(screen.getByText("No long-context rate was recorded")).toBeTruthy();
+});
+
+
+it("discloses the live latency sample window, queue age and clock exclusions without inventing missing measurements", () => {
+  const { rerender } = render(<SessionDeliveryLag diagnostics={undefined} />);
+  expect(screen.getByText("Live delivery lag: no valid measurements yet.")).toBeTruthy();
+  rerender(<SessionDeliveryLag diagnostics={{ liveLagSamples: 25, liveLagP95Ms: 12500, liveLagMaxMs: 600000, liveQueueP95Ms: 12000, oldestLivePendingMs: 900000, liveLagClockSkewSamples: 2 }} />);
+  expect(screen.getByText(/p95 12.5 s.*maximum 600.0 s.*25 acknowledged updates/)).toBeTruthy();
+  expect(screen.getByText(/Latest 10,000.*24 hours/)).toBeTruthy();
+  expect(screen.getByText("Queue delay p95: 12.0 s")).toBeTruthy();
+  expect(screen.getByText("Oldest queued live update: 900.0 s")).toBeTruthy();
+  expect(screen.getByText(/2 samples excluded/)).toBeTruthy();
+  rerender(<SessionDeliveryLag diagnostics={{ liveLagSamples: 0, liveLagClockSkewSamples: 1 }} />);
+  expect(screen.getByText("Live delivery lag: no valid measurements yet.")).toBeTruthy();
+  expect(screen.queryByText(/Queue delay p95/)).toBeNull();
 });
