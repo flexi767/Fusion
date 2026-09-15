@@ -150,14 +150,11 @@ describe("dependency graph interactions", () => {
         onOpenDetail={vi.fn()}
         addToast={vi.fn()}
         onUpdateTask={vi.fn()}
-        onArchiveTask={vi.fn()}
-        onUnarchiveTask={vi.fn()}
         onDeleteTask={vi.fn()}
         onRetryTask={vi.fn()}
         onOpenDetailWithTab={vi.fn()}
         onMoveTask={vi.fn()}
         onOpenMission={vi.fn()}
-        taskStuckTimeoutMs={1_000}
         lastFetchTimeMs={Date.now()}
         workflowStepNameLookup={new Map()}
       />,

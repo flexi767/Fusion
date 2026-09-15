@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import fs from "fs";
-import path from "path";
+import { readAppFile } from "../../test/cssFixture";
 
-const css = fs.readFileSync(path.resolve(__dirname, "../Header.css"), "utf8");
+const css = readAppFile("components/Header.css");
+const taskSearchCss = readAppFile("components/TaskSearchInput.css");
 
 function extractRuleBlock(source: string, selector: string): string {
   const start = source.indexOf(`${selector} {`);
@@ -29,6 +29,50 @@ describe("Header CSS", () => {
 
     expect(block).toContain("background: var(--surface);");
     expect(block).toContain("border-bottom: none;");
+  });
+
+  it("positions task suggestions above content with token-based paint and mobile touch sizing", () => {
+    const suggestions = extractRuleBlock(taskSearchCss, ".task-search-suggestions");
+    const option = extractRuleBlock(taskSearchCss, ".task-search-suggestion");
+
+    expect(suggestions).toContain("position: absolute;");
+    expect(suggestions).toContain("z-index: var(--z-dropdown);");
+    expect(suggestions).toContain("background: var(--surface);");
+    expect(suggestions).toContain("border: var(--btn-border-width) solid var(--border);");
+    expect(option).toContain("min-height: calc(var(--space-xl) + var(--space-md));");
+    expect(taskSearchCss).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.task-search-suggestion\s*\{[^}]*min-height:\s*calc\(var\(--space-xl\) \+ var\(--space-xl\)\);/);
+  });
+
+  it("anchors Alpha desktop search inline with token-sized dropdown geometry and no overlay selectors", () => {
+    const inline = extractRuleBlock(css, ".header-search--alpha-inline");
+    const suggestions = extractRuleBlock(taskSearchCss, ".task-search-suggestions");
+
+    expect(inline).toContain("flex: 0 1 calc(var(--space-2xl) * 8);");
+    expect(inline).toContain("min-width: calc(var(--space-2xl) * 5);");
+    expect(inline).toContain("max-width: calc(var(--space-2xl) * 10);");
+    expect(suggestions).toContain("inset-block-start: calc(100% + var(--space-xs));");
+    expect(css).not.toContain(".alpha-task-search-overlay");
+  });
+
+  it("keeps desktop workflow and search controls on one shrinkable row", () => {
+    const actions = extractRuleBlock(css, ".header-actions");
+    const slot = extractRuleBlock(css, ".header-workflow-slot");
+    const toolbar = extractRuleBlock(css, ".header-workflow-slot .board-workflow-toolbar,\n.header-workflow-slot .list-workflow-control");
+    const switcher = extractRuleBlock(css, ".header-workflow-slot .board-workflow-selector,\n.header-workflow-slot .workflow-switcher");
+    const trigger = extractRuleBlock(css, ".header-workflow-slot .workflow-switcher-trigger");
+    const fixedAction = extractRuleBlock(css, ".header-actions > .btn-icon");
+
+    expect(actions).toContain("flex-wrap: nowrap;");
+    expect(actions).toContain("flex: 0 1 auto;");
+    expect(actions).toContain("min-width: 0;");
+    expect(slot).toContain("flex: 1 1 auto;");
+    expect(slot).toContain("flex-wrap: nowrap;");
+    expect(toolbar).toContain("flex-wrap: nowrap;");
+    expect(toolbar).toContain("width: 100%;");
+    expect(switcher).toContain("flex: 1 1 auto;");
+    expect(switcher).toContain("max-width: 100%;");
+    expect(trigger).toContain("width: 100%;");
+    expect(fixedAction).toContain("flex: 0 0 auto;");
   });
 
   it("compacts the workflow portal in the mobile top header", () => {

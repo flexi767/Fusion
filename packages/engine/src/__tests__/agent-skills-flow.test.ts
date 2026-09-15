@@ -13,7 +13,7 @@ can call existsSync before const mockFiles initializes (TDZ), same class as skil
 */
 const { mockPiLog, mockFiles, mockDirCounter } = vi.hoisted(() => ({
   mockPiLog: {
-    log: vi.fn(),
+    log: vi.fn(), debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   },
@@ -25,8 +25,8 @@ vi.mock("../logger.js", () => ({
   piLog: mockPiLog,
 }));
 
-import { buildSessionSkillContext } from "../session-skill-context.js";
-import { resolveSessionSkills, createSkillsOverrideFromSelection } from "../skill-resolver.js";
+import { buildSessionSkillContext } from "../cli-runtime/session-skill-context.js";
+import { resolveSessionSkills, createSkillsOverrideFromSelection } from "../cli-runtime/skill-resolver.js";
 import type { Agent, AgentStore } from "@fusion/core";
 
 // ── Mock Setup ───────────────────────────────────────────────────────────────
@@ -105,9 +105,10 @@ describe("agent skills flow - full integration", () => {
 
     // Verify skill source and resolved names
     expect(sessionResult.skillSource).toBe("assigned-agent");
-    expect(sessionResult.resolvedSkillNames).toEqual(["review"]);
+    expect(sessionResult.resolvedSkillNames).toEqual(["fusion"]);
+    expect(sessionResult.forcedSkillNames).toEqual(["review"]);
     expect(sessionResult.skillSelectionContext).toBeDefined();
-    expect(sessionResult.skillSelectionContext?.requestedSkillNames).toEqual(["review"]);
+    expect(sessionResult.skillSelectionContext?.requestedSkillNames).toEqual(["fusion"]);
 
     // Step 5: Resolve session skills from project settings
     const resolvedSkills = resolveSessionSkills(sessionResult.skillSelectionContext!);
@@ -140,19 +141,19 @@ describe("agent skills flow - full integration", () => {
     expect(overrideResult.skills).toHaveLength(1);
     expect(overrideResult.skills[0].name).toBe("review");
 
-    // Step 9: Verify warning diagnostic for disabled lint skill
-    const disabledLintWarning = overrideResult.diagnostics.find(d =>
+    // Step 9: Intentional exclusion is an info diagnostic (debug-gated), not a warning
+    const disabledLintDiagnostic = overrideResult.diagnostics.find(d =>
       d.message.includes("disabled") && d.message.includes("lint")
     );
-    expect(disabledLintWarning).toBeDefined();
-    expect(disabledLintWarning?.type).toBe("warning");
+    expect(disabledLintDiagnostic).toBeDefined();
+    expect(disabledLintDiagnostic?.type).toBe("info");
 
-    // Step 10: Verify structured logger warning was called with disabled skill warning
-    const loggedMessages = mockPiLog.warn.mock.calls.map(c => c[0] as string);
-    const hasDisabledLintWarning = loggedMessages.some(m =>
+    // Step 10: Emission goes to piLog.debug, not warn
+    const loggedMessages = mockPiLog.debug.mock.calls.map(c => c[0] as string);
+    const hasDisabledLintNotice = loggedMessages.some(m =>
       m.includes("disabled") && m.includes("lint")
     );
-    expect(hasDisabledLintWarning).toBe(true);
+    expect(hasDisabledLintNotice).toBe(true);
   });
 
   it("flow with no exclusion pattern - both review and lint requested", async () => {
@@ -183,7 +184,8 @@ describe("agent skills flow - full integration", () => {
     });
 
     expect(sessionResult.skillSource).toBe("assigned-agent");
-    expect(sessionResult.resolvedSkillNames).toEqual(["review", "lint"]);
+    expect(sessionResult.resolvedSkillNames).toEqual(["fusion"]);
+    expect(sessionResult.forcedSkillNames).toEqual(["review", "lint"]);
 
     // Step 4: Resolve session skills from settings
     const resolvedSkills = resolveSessionSkills(sessionResult.skillSelectionContext!);
@@ -240,11 +242,13 @@ describe("agent skills flow - full integration", () => {
     });
 
     expect(sessionResult.skillSource).toBe("assigned-agent");
-    expect(sessionResult.skillSelectionContext?.requestedSkillNames).toEqual(["review/pr", "gamma/SKILL.md"]);
+    expect(sessionResult.skillSelectionContext?.requestedSkillNames).toEqual(["fusion"]);
+    expect(sessionResult.forcedSkillNames).toEqual(["review/pr", "gamma/SKILL.md"]);
 
     const resolvedSkills = resolveSessionSkills(sessionResult.skillSelectionContext!);
     const override = createSkillsOverrideFromSelection(resolvedSkills, {
       requestedSkillNames: sessionResult.skillSelectionContext?.requestedSkillNames,
+      forcedSkillNames: sessionResult.skillSelectionContext?.forcedSkillNames,
       sessionPurpose: sessionResult.skillSelectionContext?.sessionPurpose,
     });
 
@@ -257,7 +261,7 @@ describe("agent skills flow - full integration", () => {
       diagnostics: [],
     });
 
-    expect(result.skills.map((skill) => skill.name)).toEqual(["pr", "gamma"]);
+    expect(result.skills.map((skill) => skill.name)).toEqual(["pr", "gamma", "lint"]);
     expect(result.diagnostics.some((diagnostic) => diagnostic.message.includes("not found"))).toBe(false);
   });
 

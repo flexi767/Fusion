@@ -1,38 +1,35 @@
 /* === Agent Detail Modal === */
-.agent-detail-overlay {
-  position: fixed;
-  inset: 0;
-  background: color-mix(in srgb, var(--bg) 60%, transparent);
-  backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-  padding: var(--space-lg);
-}
+/*
+FNXC:ModalTouchGeometry 2026-07-30-23:55:
+`.agent-detail-overlay` is DELETED — nothing has rendered it since FN-8619 moved Agent Detail onto
+FloatingWindow, whose `modal` host owns the scrim (`.floating-window-overlay--modal`).
+
+It defined a fixed, blurred, flex-centred backdrop, and a mobile rule below reset its padding and
+stretched its alignment. Neither is a lost feature: FloatingWindow's overlay is `position: fixed;
+inset: 0` with no flex context, so those declarations had nothing to act on — it positions the panel
+by geometry instead.
+
+Deleting it was blocked on one real question: two containment guards
+(`dashboard-overflow-containment`, `mobile-horizontal-pan-containment`) pinned a selector list naming
+this class, and if that list were the mechanism keeping modal scrims inside mobile pan containment,
+removing the entry would open a hole. MEASURED: it is not. The lockdown lives on the global mobile
+`html, body` block in styles.css (`overflow-x: hidden`, `overscroll-behavior-x: none`,
+`touch-action: pan-y`); the per-overlay list only reasserts it for overlays that are themselves
+scroll containers. FloatingWindow.css says the same in its own note at the mobile breakpoint.
+*/
 
 .agent-detail-modal {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   width: 100%;
-  min-width: calc(var(--space-xl) * 20);
-  max-width: calc(100vw - var(--space-2xl) - var(--space-xs) * 2);
-  min-height: calc(var(--space-xl) * 13 + var(--space-sm));
-  max-height: calc(100dvh - var(--space-2xl) - var(--space-xs) * 2);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  resize: both;
   box-shadow: var(--shadow-lg);
-}
-
-/* Initial size — applied only when no persisted size has been restored. */
-.agent-detail-modal:not([style*="width"]) {
-  width: min(calc(var(--space-xl) * 37 + var(--space-md)), calc(100vw - var(--space-2xl) - var(--space-xs) * 2));
-}
-.agent-detail-modal:not([style*="height"]) {
-  height: min(85vh, calc(100dvh - var(--space-2xl) - var(--space-xs) * 2));
 }
 
 .agent-detail-inline-shell {
@@ -641,6 +638,18 @@ FNXC:AgentDetailView 2026-06-26-01:00:
   color: var(--text-muted);
 }
 
+/*
+FNXC:AgentLogHistory 2026-07-26-13:46:
+Wrapper for the log window's "Load older" affordance. Sits ABOVE the viewer because a log tail reads
+bottom-up: older entries are reached by walking upward, so the control belongs at the top edge of the
+rendered window. Reuses the shared `.btn .btn-secondary .btn-sm` primitive — no forked variant.
+*/
+.log-window-loader {
+  display: flex;
+  justify-content: center;
+  padding-bottom: var(--space-sm);
+}
+
 .streaming-indicator {
   display: flex;
   align-items: center;
@@ -1054,11 +1063,6 @@ FNXC:AgentDetailView 2026-06-26-01:00:
   background: color-mix(in srgb, var(--done) 18%, transparent);
 }
 
-.agent-task-column.column-archived {
-  color: var(--text-muted);
-  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
-}
-
 .agent-tasks-empty {
   display: flex;
   flex-direction: column;
@@ -1075,16 +1079,89 @@ FNXC:AgentDetailView 2026-06-26-01:00:
 }
 
 /* --- Config Tab --- */
+/*
+FNXC:AgentSettingsTheming 2026-07-23-13:01:
+Agent Settings composes native inputs, buttons, editors, and portaled controls. Scope the complete surface/state contract here so every theme receives readable foregrounds, surfaces, borders, placeholders, focus rings, and disabled treatment without changing configuration behavior.
+*/
 .config-tab {
   display: flex;
   flex-direction: column;
   gap: var(--space-xl);
+  color: var(--text);
 }
 
 .config-section {
   background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   padding: calc(var(--space-md) + var(--space-sm));
+  color: var(--text);
+}
+
+.config-section .input,
+.config-section .select,
+.config-section textarea {
+  background: var(--surface);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.config-section .input::placeholder,
+.config-section textarea::placeholder {
+  color: var(--text-dim);
+}
+
+.config-section .input:hover:not(:disabled):not([readonly]),
+.config-section .select:hover:not(:disabled),
+.config-section textarea:hover:not(:disabled):not([readonly]) {
+  border-color: var(--text-muted);
+}
+
+.config-section .input:focus-visible,
+.config-section .select:focus-visible,
+.config-section textarea:focus-visible,
+.config-section input[type="checkbox"]:focus-visible {
+  outline: none;
+  border-color: var(--todo);
+  box-shadow: var(--focus-ring-strong);
+}
+
+.config-section .input:disabled,
+.config-section .select:disabled,
+.config-section textarea:disabled,
+.config-section .btn:disabled,
+.config-runtime-tab:disabled,
+.agent-avatar-editor-action:disabled {
+  opacity: var(--opacity-disabled, 0.6);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.config-section .input[readonly],
+.config-section textarea[readonly] {
+  background: var(--surface-muted);
+  color: var(--text-muted);
+}
+
+.config-section input[type="checkbox"] {
+  accent-color: var(--todo);
+}
+
+.agent-avatar-editor-actions .agent-avatar-editor-action {
+  background: var(--card);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.agent-avatar-editor-actions .agent-avatar-editor-action:hover:not(:disabled) {
+  background: var(--card-hover);
+  border-color: var(--text-muted);
+}
+
+.agent-avatar-editor-actions .agent-avatar-editor-action:focus-visible {
+  outline: none;
+  border-color: var(--todo);
+  box-shadow: var(--focus-ring-strong);
 }
 
 .config-section h3 {
@@ -1169,6 +1246,20 @@ FNXC:AgentDetailView 2026-06-26-01:00:
 .config-field label {
   font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
   font-weight: 500;
+}
+
+.config-role-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin: 0;
+  padding: var(--space-sm);
+  border: var(--btn-border-width) solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.config-role-tags legend {
+  padding-inline: var(--space-xs);
 }
 
 .agent-avatar-editor {
@@ -1672,27 +1763,57 @@ FNXC:AgentDetailView 2026-06-26-01:00:
     grid-template-columns: 1fr;
   }
 
-  .agent-detail-overlay {
-    padding: 0;
+  .config-runtime-tab {
+    min-height: calc(var(--space-lg) + var(--space-md) + var(--space-xs));
+  }
+
+  .agent-avatar-editor-actions {
+    flex-direction: column;
     align-items: stretch;
   }
 
-  .agent-detail-modal {
-    /* Reset the desktop min-width: 480px / min-height: 320px — otherwise the
-       fullscreen mobile sheet can still overflow narrow viewports. The
-       !important width/height overrides also beat any persisted desktop size. */
-    min-width: 0 !important;
-    min-height: 0 !important;
-    width: 100vw !important;
-    height: 100dvh !important;
-    max-width: 100vw !important;
-    max-height: 100dvh;
-    margin: 0;
-    border-radius: 0;
-    border: none;
-    /* Disable user resize on mobile — modal is fullscreen. The !important on
-       width/height above also overrides any persisted desktop dimensions. */
-    resize: none;
+  .agent-avatar-editor-actions .agent-avatar-editor-action {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .skill-multiselect {
+    width: 100%;
+  }
+
+  .skill-multiselect-filter,
+  .skill-multiselect-list,
+  .skill-multiselect-chips {
+    width: 100%;
+  }
+
+  .skill-chip {
+    max-width: 100%;
+  }
+
+  /*
+  FNXC:ModalTouchGeometry 2026-08-13-12:20:
+  The 768px boundary is tablet-class when FloatingWindow enables touch geometry.
+  Keep its inner modal panel container-sized there; only true phones take over the viewport.
+  */
+  @media (max-width: 767.98px) {
+    .agent-detail-modal {
+      /* Reset the desktop min-width: 480px / min-height: 320px — otherwise the
+         fullscreen mobile sheet can still overflow narrow viewports. The
+         !important width/height overrides also beat any persisted desktop size. */
+      min-width: 0 !important;
+      min-height: 0 !important;
+      width: 100vw !important;
+      height: 100dvh !important;
+      max-width: 100vw !important;
+      max-height: 100dvh;
+      margin: 0;
+      border-radius: 0;
+      border: none;
+      /* Disable user resize on mobile — modal is fullscreen. The !important on
+         width/height above also overrides any persisted desktop dimensions. */
+      resize: none;
+    }
   }
 
   /*
@@ -2053,6 +2174,19 @@ FNXC:AgentDetailView 2026-06-26-01:00:
     align-self: flex-end;
   }
 
+  .config-actions,
+  .agent-avatar-editor-actions {
+    width: 100%;
+  }
+
+  .config-runtime-tabs {
+    gap: var(--space-xs);
+  }
+
+  .skill-multiselect {
+    gap: var(--space-xs);
+  }
+
   .agent-detail-footer .divider,
   .agent-detail-footer .text-muted,
   .agent-detail-footer .link {
@@ -2278,3 +2412,48 @@ the tab into endless page scroll.
 .agent-memory-file-editor .cm-scroller {
   overflow: auto;
 }
+
+.memory-consolidation-history {
+  margin-block: var(--space-md);
+  padding: var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.memory-consolidation-history__heading,
+.memory-consolidation-history__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  justify-content: space-between;
+}
+
+.memory-consolidation-history__heading h4 {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.memory-consolidation-history__list {
+  display: grid;
+  gap: var(--space-sm);
+  margin: var(--space-sm) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.memory-consolidation-history__row {
+  flex-wrap: wrap;
+  padding: var(--space-sm);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--text-muted);
+}
+
+.memory-consolidation-history__row--completed strong { color: var(--color-success); }
+.memory-consolidation-history__row--skipped strong { color: var(--color-warning); }
+.memory-consolidation-history__row--failed strong { color: var(--color-error); }
+
+/* FNXC:AgentSkillsUI 2026-08-16-04:27: Agent badges carry availability text so forced stored IDs do not imply delivery. */
+.dashboard-summary-skill-badge[data-skill-state="disabled"] { border-color: var(--color-warning); }
+.dashboard-summary-skill-badge[data-skill-state="unknown"] { border-color: var(--color-error); }

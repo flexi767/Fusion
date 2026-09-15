@@ -11,6 +11,22 @@ import type { SettingsSearchEntry } from "../search/types";
 export const worktreesSearchEntries: SettingsSearchEntry[] = [
   {
     sectionId: "worktrees",
+    key: "worktreeLimitEnabled",
+    labelKey: "settings.worktrees.worktreeLimitEnabled",
+    labelFallback: "Limit concurrent worktrees",
+    helpKey: "settings.worktrees.worktreeLimitEnabledHelp",
+    helpFallback: "When on, Max Worktrees caps how many tasks may hold a worktree at once. When off, Max Concurrent Tasks is the only limit. Tasks always run in their own git worktree either way — this does not change where work executes. Default: on.",
+    /*
+    FNXC:SettingsSearch 2026-07-28-13:20:
+    An operator reaching for this is asking a CAPACITY question ("why won't more
+    tasks start?"). "isolation" is deliberately NOT a keyword: this setting does
+    not affect isolation, and matching that word would re-create the same false
+    impression the old label gave (PR #2502 review).
+    */
+    keywords: ["capacity", "parallelism", "agents only", "max worktrees", "concurrency", "limit"],
+  },
+  {
+    sectionId: "worktrees",
     key: "maxWorktrees",
     labelKey: "settings.worktrees.maxWorktrees",
     labelFallback: "Max Worktrees",
@@ -33,16 +49,6 @@ export const worktreesSearchEntries: SettingsSearchEntry[] = [
   },
   {
     sectionId: "worktrees",
-    key: "recycleWorktrees",
-    labelKey: "settings.worktrees.recycleWorktrees",
-    labelFallback: " Recycle worktrees ",
-    helpKey: "settings.worktrees.offByDefaultOptInWhenEnabledCompleted",
-    helpFallback:
-      "Off by default (opt-in). When enabled, completed task worktrees are returned to an idle pool instead of being deleted, preserving build caches for faster startup",
-    keywords: ["reuse", "warm pool"],
-  },
-  {
-    sectionId: "worktrees",
     key: "showWorktreeGrouping",
     labelKey: "settings.worktrees.showWorktreeGrouping",
     labelFallback: " Show worktree grouping on the board ",
@@ -50,19 +56,6 @@ export const worktreesSearchEntries: SettingsSearchEntry[] = [
     helpFallback:
       "Off by default. When enabled, WIP and processing columns always group tasks by worktree and show worktree names, including workflow-mode processing columns.",
     keywords: ["group by", "swimlane"],
-  },
-  {
-    sectionId: "worktrees",
-    key: "worktreeNaming",
-    labelKey: "settings.worktrees.worktreeNamingStyle",
-    labelFallback: "Worktree Naming Style",
-    /*
-    FNXC:SettingsSearch 2026-07-15-17:35:
-    Indexed against the enabled help string. The disabled variant ("not applicable when recycling") is a transient state of one checkbox, not a second setting, so indexing it would make search results read as though recycling were on.
-    */
-    helpKey: "settings.worktrees.howToNameFreshWorktreeDirectories",
-    helpFallback: "How to name fresh worktree directories. Only applies when recycling is off. Default: random.",
-    keywords: ["folder name", "directory name", "branch naming"],
   },
   {
     sectionId: "worktrees",

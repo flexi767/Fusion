@@ -9,6 +9,46 @@ import type { SettingsSearchEntry } from "../search/types";
 
 export const generalSearchEntries: SettingsSearchEntry[] = [
   {
+    /*
+    FNXC:SettingsSearch 2026-07-23-22:20:
+    FN-8348 added the Report row (bug/feedback/idea/help entry point) to General
+    without indexing it, so settings search could not find it; the search-index
+    drift guard caught the gap. Labels/help mirror the section's t() copy verbatim.
+    */
+    sectionId: "general",
+    key: "report-action-menu",
+    labelKey: "settings.general.report",
+    labelFallback: "Report",
+    helpKey: "settings.general.reportHelp",
+    helpFallback: "Report a bug, send feedback, share an idea, or get help from Fusion.",
+    keywords: ["bug", "feedback", "idea", "help", "support"],
+  },
+  {
+    /*
+    FNXC:SettingsSearch 2026-08-16-05:07:
+    FN-8829 (d450dbe971) added the recommendations cap descriptor row without an
+    index entry; the search-index drift guard caught the gap. Labels/help mirror
+    the section's t() copy verbatim.
+    */
+    sectionId: "general",
+    key: "maxRecommendationsPerTask",
+    labelKey: "settings.general.maxRecommendationsPerTask",
+    labelFallback: "Maximum recommendations per task",
+    helpKey: "settings.general.maxRecommendationsPerTaskHelp",
+    helpFallback: "Default: 3. Set 0 to disable recommendations; choose a whole number from 1 to 20 to cap each completed task.",
+    keywords: ["suggestions", "follow-up", "cap", "limit"],
+  },
+  {
+    /* FNXC:TaskRecommendations 2026-08-19-13:05: Keep the required completion toggle searchable through the same descriptor index as its shared GeneralSection row. */
+    sectionId: "general",
+    key: "requireTaskRecommendations",
+    labelKey: "settings.general.requireTaskRecommendations",
+    labelFallback: "Require automatic task recommendations",
+    helpKey: "settings.general.requireTaskRecommendationsHelp",
+    helpFallback: "Default: disabled. When enabled, successful completion must explicitly evaluate grounded follow-ups. The executor aims toward the configured maximum, but fewer or [] are correct when relevance does not support more; cap 0 disables capture regardless of this setting.",
+    keywords: ["recommendations", "automatic", "completion", "required", "quality"],
+  },
+  {
     sectionId: "general",
     key: "taskPrefix",
     labelKey: "settings.general.taskPrefix",

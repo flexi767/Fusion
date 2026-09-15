@@ -7,13 +7,13 @@ import { describe, expect, it } from "vitest";
  * User-configured command paths must stay on bounded async execution APIs; this focused registry intentionally excludes git-plumbing execSync call sites so deterministic repository checks can keep using synchronous child-process APIs where appropriate.
  *
  * Protected registry for user-configured commands:
- * - packages/engine/src/verification-utils.ts :: execWithProcessGroup — delegates command execution through the sandbox backend streaming API; caller-owned options must carry bounds.
- * - packages/engine/src/verification-utils.ts :: runVerificationCommand — runs configured test/build commands through execWithProcessGroup with timeout and VERIFICATION_COMMAND_MAX_BUFFER.
- * - packages/engine/src/run-verification-tool.ts :: runVerificationCommand — backs fn_run_verification with superviseSpawn and maxLifetimeMs.
- * - packages/engine/src/executor.ts :: runConfiguredCommand — runs settings.scripts, settings.setupScript, settings.worktreeInitCommand, and workflow script commands through backend.run with timeoutMs and maxBuffer.
+ * - packages/engine/src/execution/verification-utils.ts :: execWithProcessGroup — delegates command execution through the sandbox backend streaming API; caller-owned options must carry bounds.
+ * - packages/engine/src/execution/verification-utils.ts :: runVerificationCommand — runs configured test/build commands through execWithProcessGroup with timeout and VERIFICATION_COMMAND_MAX_BUFFER.
+ * - packages/engine/src/execution/run-verification-tool.ts :: runVerificationCommand — backs fn_run_verification with superviseSpawn and maxLifetimeMs.
+ * - packages/engine/src/executor/configured-command.ts :: runConfiguredCommand — runs settings.scripts, settings.setupScript, settings.worktreeInitCommand, and workflow script commands through backend.run with timeoutMs and maxBuffer.
  * - packages/engine/src/merger.ts :: runConfiguredMergeWorktreeCommand — runs configured merge-worktree commands through backend.run with timeoutMs and maxBuffer.
  * - FNXC:EngineTests 2026-06-27-10:05: U7c removed the legacy merger-side executePostMergeScriptStep path; the static guard must track only live user-configured command surfaces so registry drift fails for real protected functions, not deleted ones.
- * - packages/engine/src/routine-runner.ts :: executeCommand — runs configured automation/routine commands through backend.run with timeoutMs and maxBuffer.
+ * - packages/engine/src/scheduling/routine-runner.ts :: executeCommand — runs configured automation/routine commands through backend.run with timeoutMs and maxBuffer.
  * - packages/engine/src/sandbox/native.ts :: NativeSandboxBackend.run — default sandbox backend uses superviseSpawn with maxLifetimeMs plus timeoutMs/maxBuffer enforcement.
  * - packages/engine/src/sandbox/bubblewrap-backend.ts :: BubblewrapBackend.run — isolating backend delegates to native fallback or runBwrapSpawn; runBwrapSpawn uses spawn with timeoutMs and maxBuffer enforcement.
  * - packages/engine/src/sandbox/bubblewrap-backend.ts :: BubblewrapBackend.runBwrapSpawn — concrete bubblewrap spawn path uses setTimeout(options.timeoutMs) and options.maxBuffer.
@@ -34,7 +34,7 @@ type GuardEntry = {
 
 const protectedCommandPaths: GuardEntry[] = [
   {
-    file: "src/verification-utils.ts",
+    file: "src/execution/verification-utils.ts",
     name: "execWithProcessGroup",
     signature: "export async function execWithProcessGroup(",
     requiredSafeguards: [
@@ -48,7 +48,7 @@ const protectedCommandPaths: GuardEntry[] = [
     command spawn lives in runVerificationCommandUnlocked (execWithProcessGroup + bounds).
     Guard the unlocked body so slot extraction cannot reintroduce unbounded exec.
     */
-    file: "src/verification-utils.ts",
+    file: "src/execution/verification-utils.ts",
     name: "runVerificationCommandUnlocked",
     signature: "async function runVerificationCommandUnlocked(",
     requiredSafeguards: [
@@ -58,7 +58,7 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
-    file: "src/verification-utils.ts",
+    file: "src/execution/verification-utils.ts",
     name: "runVerificationCommand",
     signature: "export async function runVerificationCommand(",
     requiredSafeguards: [
@@ -67,7 +67,8 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
-    file: "src/run-verification-tool.ts",
+    // FNXC:FullSuiteBookkeeping 2026-08-05-00:30: run-verification-tool peels under execution/ with the rest of the session/verification surface.
+    file: "src/execution/run-verification-tool.ts",
     name: "runVerificationCommandUnlocked",
     signature: "async function runVerificationCommandUnlocked(",
     requiredSafeguards: [
@@ -76,7 +77,7 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
-    file: "src/run-verification-tool.ts",
+    file: "src/execution/run-verification-tool.ts",
     name: "runVerificationCommand",
     signature: "export async function runVerificationCommand(",
     requiredSafeguards: [
@@ -85,9 +86,15 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
-    file: "src/executor.ts",
+    /*
+    FNXC:EngineProcessRules 2026-08-23-18:40:
+    runConfiguredCommand was peeled out of executor.ts into executor/configured-command.ts by the
+    package code-organization waves. The registry follows the function, not the old filename; a stale
+    path made this guard fail rather than silently pass, which is the intended failure mode.
+    */
+    file: "src/executor/configured-command.ts",
     name: "runConfiguredCommand",
-    signature: "async function runConfiguredCommand(",
+    signature: "export async function runConfiguredCommand(",
     requiredSafeguards: [
       { label: "sandbox backend.run", pattern: /backend\.run\(/ },
       { label: "timeoutMs option", pattern: /timeoutMs\s*,/ },
@@ -105,7 +112,7 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
-    file: "src/routine-runner.ts",
+    file: "src/scheduling/routine-runner.ts",
     name: "executeCommand",
     signature: "private async executeCommand(",
     requiredSafeguards: [
@@ -294,12 +301,18 @@ describe("user-configured command static execSync guard", () => {
   });
 
   it("does not false-positive on allowed git-plumbing execSync outside protected slices", () => {
-    const executorSource = readSource("src/executor.ts");
-    expect(executorSource, "executor keeps a git-only execSync ancestry check outside the protected configured-command helper").toContain("execSync(`git merge-base --is-ancestor");
+    /*
+    FNXC:EngineProcessRules 2026-08-23-18:40:
+    The audited git-plumbing execSync ancestry check now lives in executor/worktree-git-refs.ts after
+    the executor peels; the point of the assertion is unchanged — an allowed short git plumbing
+    execSync coexists with a protected configured-command body that must stay execSync-free.
+    */
+    const gitRefsSource = readSource("src/executor/worktree-git-refs.ts");
+    expect(gitRefsSource, "executor keeps a git-only execSync ancestry check outside the protected configured-command helper").toContain("execSync(`git merge-base --is-ancestor");
 
-    const configuredCommand = protectedCommandPaths.find((entry) => entry.file === "src/executor.ts" && entry.name === "runConfiguredCommand");
+    const configuredCommand = protectedCommandPaths.find((entry) => entry.file === "src/executor/configured-command.ts" && entry.name === "runConfiguredCommand");
     expect(configuredCommand, "executor runConfiguredCommand registry entry must exist").toBeDefined();
-    const body = sliceFunctionBody(executorSource, configuredCommand!.signature, "src/executor.ts :: runConfiguredCommand");
-    assertGuardInvariants(body, "src/executor.ts :: runConfiguredCommand", configuredCommand!.requiredSafeguards);
+    const body = sliceFunctionBody(readSource(configuredCommand!.file), configuredCommand!.signature, `${configuredCommand!.file} :: runConfiguredCommand`);
+    assertGuardInvariants(body, `${configuredCommand!.file} :: runConfiguredCommand`, configuredCommand!.requiredSafeguards);
   });
 });

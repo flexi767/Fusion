@@ -52,9 +52,12 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   worktree text,
   blocked_by text,
   overlap_blocked_by text,
+  queued_log_episode_signature text,
   paused integer DEFAULT 0,
   user_paused integer DEFAULT 0,
   paused_reason text,
+  -- FNXC:TaskWedgeNotifications 2026-07-22-00:00: Fresh PostgreSQL baselines must include the durable terminal-wedge episode field that upgrade migration 0033 adds to existing databases.
+  wedge_notification text,
   base_branch text,
   branch text,
   auto_merge integer,
@@ -151,6 +154,7 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   source_issue_closed_at text,
   merge_details jsonb,
   workspace_worktrees jsonb,
+  repository_scope jsonb,
   break_into_subtasks integer DEFAULT 0,
   no_commits_expected integer DEFAULT 0,
   enabled_workflow_steps jsonb DEFAULT '[]',
@@ -545,6 +549,12 @@ CREATE TABLE IF NOT EXISTS project.workflow_work_items (
   lease_expires_at text,
   last_error text,
   blocked_reason text,
+  stable_workflow_run_id text,
+  continuation_sequence integer,
+  wait_reason text,
+  source_column text,
+  target_column text,
+  ir_hash text,
   created_at text NOT NULL,
   updated_at text NOT NULL,
   CONSTRAINT workflow_work_items_task_id_fkey
@@ -864,6 +874,8 @@ CREATE TABLE IF NOT EXISTS project.missions (
   branch_strategy text,
   auto_advance integer DEFAULT 0,
   auto_merge integer,
+  -- FNXC:MissionTaskPrefix 2026-07-26-12:00: optional per-mission ticket prefix; NULL inherits project settings.taskPrefix
+  task_prefix text,
   autopilot_enabled integer NOT NULL DEFAULT 0,
   autopilot_state text NOT NULL DEFAULT 'inactive',
   last_autopilot_activity_at text,
@@ -951,6 +963,23 @@ CREATE TABLE IF NOT EXISTS project.goals (
   created_at text NOT NULL,
   updated_at text NOT NULL
 );
+
+-- FNXC:ProjectNotes 2026-09-09-17:08: Fresh installs include project-scoped note storage with optimistic revision fencing.
+CREATE TABLE IF NOT EXISTS project.notes (
+  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  id text NOT NULL,
+  title text NOT NULL,
+  content text NOT NULL DEFAULT '',
+  revision integer NOT NULL DEFAULT 1,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, id),
+  CONSTRAINT notes_title_length CHECK (char_length(title) BETWEEN 1 AND 200),
+  CONSTRAINT notes_content_length CHECK (octet_length(content) <= 1048576),
+  CONSTRAINT notes_revision_positive CHECK (revision >= 1)
+);
+CREATE INDEX IF NOT EXISTS "idxNotesProjectUpdatedAt" ON project.notes (project_id, updated_at DESC);
+ALTER TABLE project.notes ENABLE ROW LEVEL SECURITY;
 CREATE INDEX IF NOT EXISTS "idxGoalsStatus" ON project.goals(status);
 
 CREATE TABLE IF NOT EXISTS project.mission_goals (
@@ -1431,6 +1460,8 @@ CREATE TABLE IF NOT EXISTS project.mission_contract_assertions (
   type text NOT NULL DEFAULT 'static',
   order_index integer NOT NULL DEFAULT 0,
   source_feature_id text,
+  scope text NOT NULL DEFAULT 'feature',
+  origin text NOT NULL DEFAULT 'authored',
   created_at text NOT NULL,
   updated_at text NOT NULL
 );
@@ -1799,6 +1830,8 @@ CREATE INDEX IF NOT EXISTS "idxCentralActivityLogType"
   ON central.central_activity_log(type);
 CREATE INDEX IF NOT EXISTS "idxCentralActivityLogProjectId"
   ON central.central_activity_log(project_id);
+CREATE INDEX IF NOT EXISTS "idxCentralActivityLogTaskIdTimestamp"
+  ON central.central_activity_log(task_id, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS central.global_concurrency (
   id integer PRIMARY KEY,
@@ -2028,4 +2061,3 @@ CREATE INDEX IF NOT EXISTS "idxArchivedTasksCreatedAt"
 -- GIN index on the archive search_vector (VAL-SEARCH-005).
 CREATE INDEX IF NOT EXISTS "idxArchivedTasksSearchVector"
   ON archive.archived_tasks USING gin(search_vector);
-

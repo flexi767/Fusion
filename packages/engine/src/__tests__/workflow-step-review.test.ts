@@ -1,15 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import type { TaskDetail, TaskStep, WorkflowIr, WorkflowIrNode } from "@fusion/core";
 
-import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
+import { WorkflowGraphExecutor } from "../workflows/workflow-graph-executor.js";
 import {
   FOREACH_ACTIVE_CONTEXT_KEY,
   SPLIT_ACTIVE_CONTEXT_KEY,
   type ForeachActiveContext,
   type StepReviewSeamResult,
   type WorkflowLegacySeams,
-} from "../workflow-node-handlers.js";
-import type { WorkflowStepInstanceState } from "../workflow-graph-foreach.js";
+} from "../workflows/workflow-node-handlers.js";
+import type { WorkflowStepInstanceState } from "../workflows/workflow-graph-foreach.js";
 
 /**
  * U5 — step-review node + verdict wiring (KTD-4). These scenarios exercise the
@@ -218,6 +218,20 @@ describe("WorkflowGraphExecutor step-review (U5)", () => {
     expect(reviewCalls).toBe(3);
     // value routed is "unavailable"; the IR has no unavailable edge from review,
     // so the instance exits the template (advisory) and the foreach succeeds.
+    expect(result.outcome).toBe("success");
+  });
+
+  it("deterministic UNAVAILABLE routes unavailable after one attempt without changing the verdict", async () => {
+    const stepReview = vi.fn(async (): Promise<StepReviewSeamResult> => ({ verdict: "UNAVAILABLE", retryable: false }));
+    const seams = baseSeams({
+      stepExecute: async () => ({ outcome: "success", value: "step-done" }),
+      stepReview,
+    });
+    const executor = new WorkflowGraphExecutor({ seams });
+    const result = await executor.run(taskWithSteps(1), settingsOn(), reviewForeachIr());
+
+    expect(stepReview).toHaveBeenCalledTimes(1);
+    // No unavailable edge means template exit, but no authoritative APPROVE marked the step done.
     expect(result.outcome).toBe("success");
   });
 

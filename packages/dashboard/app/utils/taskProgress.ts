@@ -1,3 +1,4 @@
+import { isReviewColumnRole, type ColumnRoleFlags } from "./columnRoles";
 import type { Task, WorkflowStepResult, WorkflowStepPhase, StepStatus } from "@fusion/core";
 
 /*
@@ -14,11 +15,26 @@ Render states (design-lens): the progress model distinguishes
 - `advisory_failure` (non-blocking REVISE — amber, counts as completed; does not block merge)
 - `failed` (blocking gate failure — red)
 - `skipped`
+- `not_run` (terminal and non-blocking, but never painted as a pass)
 Disabled optional steps are simply absent from `enabledWorkflowSteps`, so they never appear in the
 counter/bar. Recorded workflow-node progress is included independently because it represents an actual graph stage that ran, not a toggle placeholder.
+
+FNXC:WorkflowStepNotRun 2026-08-28-14:13:
+The dashboard browser bundle aliases `@fusion/core` to its type-only leaf, unlike dashboard tests.
+Keep this fixed reason tuple local and drift-tested against the Node barrel instead of value-importing
+core workflow helpers that would pass Vitest and fail the production build.
 */
 
-export type UnifiedTaskProgressStatus = StepStatus | "failed" | "advisory_failure" | "running";
+export const WORKFLOW_STEP_NOT_RUN_REASONS = ["not-configured", "tooling-unavailable", "execution-mode-skip", "repository-context-unresolved"] as const;
+const WORKFLOW_STEP_NOT_RUN_REASON_SET: ReadonlySet<string> = new Set(WORKFLOW_STEP_NOT_RUN_REASONS);
+
+export function isWorkflowStepNotRun(result: WorkflowStepResult): boolean {
+  return result.status === "skipped"
+    && typeof result.notRunReason === "string"
+    && WORKFLOW_STEP_NOT_RUN_REASON_SET.has(result.notRunReason);
+}
+
+export type UnifiedTaskProgressStatus = StepStatus | "failed" | "advisory_failure" | "running" | "not_run";
 
 export interface UnifiedTaskProgressItem {
   id: string;
@@ -34,7 +50,7 @@ export interface UnifiedTaskProgress {
   items: UnifiedTaskProgressItem[];
 }
 
-function mapWorkflowStatus(result: WorkflowStepResult): UnifiedTaskProgressStatus {
+export function mapWorkflowStatus(result: WorkflowStepResult): UnifiedTaskProgressStatus {
   switch (result.status) {
     case "passed":
       return "done";
@@ -43,7 +59,7 @@ function mapWorkflowStatus(result: WorkflowStepResult): UnifiedTaskProgressStatu
     case "advisory_failure":
       return "advisory_failure";
     case "skipped":
-      return "skipped";
+      return isWorkflowStepNotRun(result) ? "not_run" : "skipped";
     case "pending":
     default:
       // The graph upserts a `pending` entry when a step starts running. A started-but-not-completed
@@ -56,7 +72,7 @@ function mapWorkflowStatus(result: WorkflowStepResult): UnifiedTaskProgressStatu
 function isCompleted(status: UnifiedTaskProgressStatus): boolean {
   // advisory_failure is non-blocking: the step ran and returned feedback, so it counts as completed
   // (overall progress reads complete when only advisory steps returned REVISE).
-  return status === "done" || status === "skipped" || status === "advisory_failure";
+  return status === "done" || status === "skipped" || status === "not_run" || status === "advisory_failure";
 }
 
 /*
@@ -87,9 +103,40 @@ function resolveWorkflowStepName(workflowStepId: string, result: WorkflowStepRes
   return humanizeWorkflowStepId(workflowStepId);
 }
 
+/*
+FNXC:TaskCardWorkflowProgress 2026-07-21-22:26:
+In-progress progress is WIP implementation only. Built-in Plan Review lives in Todo/planning, Code Review / Browser Verification / post-merge / completion-summary / merge nodes live in In-review (or post-merge), so they must not inflate the in-progress checklist as pending/done segments. Board and list progress for WIP use `scope: "implementation"`; detail and badges keep the full pipeline via the default `scope: "full"`.
+*/
+const NON_IMPLEMENTATION_WORKFLOW_STEP_IDS = new Set([
+  "plan-review",
+  "plan-replan",
+  "code-review",
+  "verification",
+  "documentation-delivery",
+  "browser-verification",
+  "post-merge-verification",
+  "completion-summary",
+]);
+
+function isNonImplementationWorkflowStepId(workflowStepId: string): boolean {
+  return NON_IMPLEMENTATION_WORKFLOW_STEP_IDS.has(workflowStepId) || workflowStepId.startsWith("merge-");
+}
+
+export type UnifiedTaskProgressScope = "full" | "implementation";
+
+export interface GetUnifiedTaskProgressOptions {
+  /**
+   * `full` — entire pipeline (implementation steps + optional gates + recorded nodes).
+   * `implementation` — WIP-only: parsed task steps plus non-lane-gate workflow/node items.
+   */
+  scope?: UnifiedTaskProgressScope;
+}
+
 export function getUnifiedTaskProgress(
   task: Pick<Task, "steps" | "enabledWorkflowSteps" | "workflowStepResults">,
+  options: GetUnifiedTaskProgressOptions = {},
 ): UnifiedTaskProgress {
+  const scope = options.scope ?? "full";
   const stepItems: UnifiedTaskProgressItem[] = (task.steps ?? []).map((step, index) => ({
     id: `step-${index}`,
     name: step.name,
@@ -102,16 +149,18 @@ export function getUnifiedTaskProgress(
     (task.workflowStepResults ?? []).map((result) => [result.workflowStepId, result] as const),
   );
 
-  const workflowItems: UnifiedTaskProgressItem[] = (task.enabledWorkflowSteps ?? []).map((workflowStepId) => {
-    const result = workflowResultsById.get(workflowStepId);
-    return {
-      id: `workflow-${workflowStepId}`,
-      name: resolveWorkflowStepName(workflowStepId, result),
-      status: result ? mapWorkflowStatus(result) : "pending",
-      source: "workflow",
-      phase: result?.phase ?? "pre-merge",
-    };
-  });
+  const workflowItems: UnifiedTaskProgressItem[] = (task.enabledWorkflowSteps ?? [])
+    .filter((workflowStepId) => scope === "full" || !isNonImplementationWorkflowStepId(workflowStepId))
+    .map((workflowStepId) => {
+      const result = workflowResultsById.get(workflowStepId);
+      return {
+        id: `workflow-${workflowStepId}`,
+        name: resolveWorkflowStepName(workflowStepId, result),
+        status: result ? mapWorkflowStatus(result) : "pending",
+        source: "workflow" as const,
+        phase: result?.phase ?? "pre-merge",
+      };
+    });
   const enabledWorkflowStepIds = new Set(task.enabledWorkflowSteps ?? []);
   /*
   FNXC:TaskCardWorkflowProgress 2026-06-29-15:05:
@@ -119,6 +168,7 @@ export function getUnifiedTaskProgress(
   */
   const recordedNodeItems: UnifiedTaskProgressItem[] = (task.workflowStepResults ?? [])
     .filter((result) => result.source === "node" && !enabledWorkflowStepIds.has(result.workflowStepId))
+    .filter((result) => scope === "full" || !isNonImplementationWorkflowStepId(result.workflowStepId))
     .map((result) => ({
       id: `workflow-${result.workflowStepId}`,
       name: resolveWorkflowStepName(result.workflowStepId, result),
@@ -130,9 +180,16 @@ export function getUnifiedTaskProgress(
   /*
   FNXC:TaskCardWorkflowProgress 2026-06-29-00:41:
   Plan Review is a pre-execution optional step in the default stepwise Coding workflow, so task cards must show it before parsed implementation steps. End-of-work optional steps such as Code Review stay after implementation steps so the card order matches workflow execution order.
+
+  FNXC:TaskCardWorkflowProgress 2026-07-21-22:26:
+  Implementation scope omits Plan Review / Code Review and other lane-owned gates, so the pre-execution reorder is only meaningful for the full pipeline view.
   */
-  const preExecutionWorkflowItems = workflowItems.filter((item) => item.id === "workflow-plan-review");
-  const remainingWorkflowItems = workflowItems.filter((item) => item.id !== "workflow-plan-review");
+  const preExecutionWorkflowItems = scope === "full"
+    ? workflowItems.filter((item) => item.id === "workflow-plan-review")
+    : [];
+  const remainingWorkflowItems = scope === "full"
+    ? workflowItems.filter((item) => item.id !== "workflow-plan-review")
+    : workflowItems;
   const items = [...preExecutionWorkflowItems, ...stepItems, ...remainingWorkflowItems, ...recordedNodeItems];
   const total = items.length;
   const completed = items.filter((item) => isCompleted(item.status)).length;
@@ -152,18 +209,137 @@ Returns undefined when nothing is running, leaving the status mapping as the fal
 statuses themselves are unchanged — `needs-replan` remains the graph's durable replan signal; this
 only decides what the operator READS.
 */
+function getRunningWorkflowProgressItem(
+  task: Pick<Task, "steps" | "enabledWorkflowSteps" | "workflowStepResults">,
+): UnifiedTaskProgressItem | undefined {
+  /*
+  FNXC:TaskCardBadgePrecedence 2026-08-06-14:53:
+  A malformed snapshot can transiently contain multiple started workflow results. Progress is already
+  arranged in lifecycle order (Plan Review before implementation and review gates after it), so choose
+  the latest running workflow item rather than its transport-array position. This makes an active Code
+  Review authoritative over stale Planning while preserving Plan Review as the nested planning gate.
+  */
+  return getUnifiedTaskProgress(task).items
+    .filter((item) => item.source === "workflow" && item.status === "running")
+    .at(-1);
+}
+
 export function getRunningWorkflowStepLabel(
   task: Pick<Task, "steps" | "enabledWorkflowSteps" | "workflowStepResults">,
 ): string | undefined {
-  const running = getUnifiedTaskProgress(task).items.find(
-    (item) => item.source === "workflow" && item.status === "running",
-  );
-  return running?.name;
+  return getRunningWorkflowProgressItem(task)?.name;
+}
+
+/*
+FNXC:TaskCardOptionalGateBadge 2026-07-21-22:30:
+Lane-owned optional gates are header badges, not progress bullet-list rows. Code Review and Browser Verification (and post-merge verification) badge on in-review. Each badge reuses the same startedAt-without-completedAt "running" semantics as the progress list.
+
+FNXC:TaskCardOptionalGateBadge 2026-07-27-06:10:
+Plan Review's planning-lane restriction is GONE (see getRunningOptionalGateBadge) — it badges wherever it runs. The badge is keyed on the RUNNING gate rather than the card's column, so it stays correct across every workflow regardless of where that workflow places the node.
+*/
+/*
+FNXC:WorkflowLifecycleColumns 2026-07-31-15:50:
+DELIBERATE-LITERAL — the unresolved-flags default, reviewed 2026-07-31-15:50.
+
+Census-invisible: a `Set` literal is a definition, not a comparison, so nothing in the lifecycle
+backlog pointed at this gate — in a file whose Plan Review badge directly above was already converted
+off its column restriction. One converted badge and one unconverted one, deciding sibling questions.
+
+Keyed on the literal, the code-review / browser-verification / post-merge badges never appeared on a
+renamed board: the gate WAS running and the card simply showed nothing, which reads as an idle card
+rather than a missing badge. Cosmetic in consequence, but it is the surface an operator watches to
+know a review is in flight.
+*/
+const REVIEW_LANE_COLUMNS = new Set(["in-review"]);
+
+export interface RunningOptionalGateBadge {
+  workflowStepId: string;
+  /** Full step name for titles / a11y. */
+  name: string;
+  /** Compact card/list label. */
+  label: string;
+  /** Stable test id fragment after `card-` / `list-`. */
+  testId: string;
+}
+
+function workflowStepIdFromProgressItemId(itemId: string): string {
+  return itemId.startsWith("workflow-") ? itemId.slice("workflow-".length) : itemId;
+}
+
+export function getRunningOptionalGateBadge(
+  task: Pick<Task, "column" | "steps" | "enabledWorkflowSteps" | "workflowStepResults">,
+  /** Resolved trait flags for the card's column; omitted keeps the legacy id. */
+  columnFlags?: ColumnRoleFlags,
+): RunningOptionalGateBadge | undefined {
+  const running = getRunningWorkflowProgressItem(task);
+  if (!running) return undefined;
+
+  const workflowStepId = workflowStepIdFromProgressItemId(running.id);
+  if (!isNonImplementationWorkflowStepId(workflowStepId)) return undefined;
+
+  if (workflowStepId === "plan-review" || workflowStepId === "plan-replan") {
+    /*
+    FNXC:TaskCardOptionalGateBadge 2026-07-27-06:10:
+    Plan Review badges wherever it RUNS. A workflow places this node where its own lane shape calls
+    for it — the built-in coding workflows run it in the planning column, a custom workflow may not —
+    and a lane gate here silently suppressed the badge for every placement it did not anticipate. The
+    gate's own running state is the signal; the card's column is not a second opinion on it. Code
+    Review / Browser Verification keep their in-review lane gate below, because those genuinely DO
+    move the card into the review column when they run.
+    */
+    return {
+      workflowStepId,
+      name: running.name,
+      /*
+      FNXC:TaskCardOptionalGateBadge 2026-07-26-14:05:
+      The badge names the GATE, not a generic activity: the short "Reviewing" copy (FN-7831) read
+      identically to a code-review badge and did not tell the operator which review was running.
+      Plan Review and its replan loop both badge as "Plan Review". The `reviewing` testId is
+      unchanged so existing board/list selectors keep working.
+      */
+      label: "Plan Review",
+      testId: "reviewing",
+    };
+  }
+
+  if (!(columnFlags ? isReviewColumnRole(columnFlags, task.column) : REVIEW_LANE_COLUMNS.has(task.column))) return undefined;
+  /*
+  FNXC:TaskCardOptionalGateBadge 2026-08-25-02:10:
+  Badge whatever review-lane gate is RUNNING, instead of a closed list of three ids. The old test
+  named `code-review`, `browser-verification` and `post-merge-verification` explicitly, so a
+  workflow that adds gates — builtin:coding-ideas-v2 runs Verification and Documentation & Delivery
+  in review — showed no badge at all for them: the operator watched an apparently idle card until
+  "Merging" appeared at the very end. The running gate's own state is the signal; a hardcoded id
+  list can only ever describe the gates that existed when it was written.
+  `isNonImplementationWorkflowStepId` already distinguishes a lane-owned gate from an
+  implementation step, and the review-lane check above bounds this to the right column.
+  */
+  if (!isNonImplementationWorkflowStepId(workflowStepId)) return undefined;
+
+  return {
+    workflowStepId,
+    name: running.name,
+    label: running.name,
+    testId: workflowStepId,
+  };
+}
+
+/**
+ * Whether a rendered optional-gate badge displaces the general Planning status badge.
+ * Plan Review and its replan loop are deliberately excluded because they describe nested planning.
+ */
+export function isNonPlanningOptionalGateBadge(
+  badge: RunningOptionalGateBadge | undefined,
+): boolean {
+  return Boolean(badge && badge.workflowStepId !== "plan-review" && badge.workflowStepId !== "plan-replan");
 }
 
 /*
 FNXC:TaskCardPlanReviewBadge 2026-07-11-12:00:
 FN-7831 requires task cards and list rows to show a distinct "Reviewing" badge only while the optional `plan-review` workflow step is actively running. Reuse the unified progress item status so every board surface follows the same startedAt-without-completedAt semantics as the progress list.
+
+FNXC:TaskCardOptionalGateBadge 2026-07-21-22:30:
+Kept as a thin plan-review predicate for Ready-badge suppression and older call sites; header rendering prefers getRunningOptionalGateBadge for all lane-owned gates.
 */
 export function isPlanReviewRunning(task: Pick<Task, "steps" | "enabledWorkflowSteps" | "workflowStepResults">): boolean {
   return getUnifiedTaskProgress(task).items.some(

@@ -529,6 +529,40 @@
   background: var(--border);
 }
 
+.mobile-project-switch-section-label {
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--text-muted);
+  font-family: var(--font-primary);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.mobile-project-switch-bookmark {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-xs);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.mobile-project-switch-bookmark:hover,
+.mobile-project-switch-bookmark.bookmarked {
+  color: var(--accent);
+}
+
+.mobile-project-switch-bookmark:hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.mobile-project-switch-bookmark:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-strong);
+}
+
 .mobile-project-switch-manage {
   width: 100%;
   display: flex;
@@ -561,6 +595,12 @@
   .mobile-project-switch {
     display: inline-flex;
     align-items: center;
+  }
+}
+
+@media (max-width: 768px) {
+  .mobile-project-switch-bookmark {
+    padding: var(--space-sm);
   }
 }
 
@@ -608,6 +648,11 @@
   min-width: 0;
   width: 100%;
   overflow: hidden;
+  /*
+  FNXC:PlanningKeepAlive 2026-07-22-12:30:
+  Containing block for kept-alive main views (KeepAliveView): their hidden state is position:absolute inset:0 so a hidden Planning subtree consumes no layout space while keeping a real (non-zero) box for xterm-safe geometry.
+  */
+  position: relative;
 }
 
 /**
@@ -652,4 +697,25 @@
   .project-selector {
     display: none;
   }
+}
+
+/*
+FNXC:ViewportChrome 2026-08-03-00:13:
+ProjectSelector.css loads after ExecutorStatusBar.css, so reassert the desktop footer token for tablet/desktop mode after the mobile width override above — otherwise mid-tablet still reserves the taller mobile footer while the bar sits at bottom:0. Also un-hide the project selector for tablet-class ≤768 CSS px (width media hid it with true phones).
+*/
+html:is([data-viewport-mode="tablet"], [data-viewport-mode="desktop"]) .project-content--with-footer,
+html:is([data-viewport-mode="tablet"], [data-viewport-mode="desktop"]) .dashboard-project-shell {
+  --executor-footer-height: 36px;
+}
+
+html:is([data-viewport-mode="tablet"], [data-viewport-mode="desktop"]) .project-selector {
+  display: inline-flex;
+}
+
+html[data-viewport-mode="mobile"] .project-content--with-footer {
+  --executor-footer-height: calc(var(--space-lg) * 2 + var(--space-xs));
+}
+
+html[data-viewport-mode="mobile"] .project-selector {
+  display: none;
 }

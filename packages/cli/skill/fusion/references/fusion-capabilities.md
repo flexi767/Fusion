@@ -25,17 +25,16 @@ All skill/extension tool invocations in this catalog use the public `fn_*` names
 | `fn_task_update` | Update fields on an existing task. Supports modifying the title, description, dependencies, assigned agent, priority, and workflow_id after task creation. Set workflow_id to a workflow ID to select it, or null to clear the workflow selection. |
 | `fn_task_list` | List all tasks on the Fusion board, grouped by column. |
 | `fn_task_show` | Show full details for a task including steps, progress, and log entries. |
-| `fn_task_logs_read` | Read a task's full persisted agent log with pagination and optional type filtering. |
+| `fn_task_logs_read` | Read a task's persisted agent log with pagination and optional type filtering. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response remains bounded. |
 | `fn_task_attach` | Attach a file to a task. Supports images (png, jpg, gif, webp) and text files (txt, log, json, yaml, yml, toml, csv, xml). |
 | `fn_task_pause` | Pause a task for explicit user-requested manual control — stops all automated agent and scheduler interaction. Agents should not pause tasks to handle failures or blockers; use retry, create/delegate follow-up work, or let the task surface as failed instead. |
 | `fn_task_unpause` | Unpause a task — resumes automated agent and scheduler interaction. |
 | `fn_task_retry` | Retry a failed task — clears the error state. Non-review failures move to todo; in-review execution failures move to todo preserving progress; in-review merge failures stay in-place for auto-merge retry. |
 | `fn_task_bypass_review` | Policy-gated escape hatch for an in-review task stranded solely by a failed pre-merge review lane (leading real-world cause: the Runfusion/Fusion#1946 '(no feedback captured)' no-verdict dispatch defect), not a real REVISE. Rewrites the latest failed pre-merge WorkflowStepResult to a terminal non-blocking status with explicit bypass audit metadata (who/when/why/prior status) — it never fabricates a reviewer verdict. Requires a mandatory reason and is audit-logged. Clears ONLY the failed-pre-merge-step merge blocker; paused, incomplete-step, blocking-status, and still-pending conditions still block, and an autoMerge:false task is not force-merged. |
+| `fn_workflow_step_resume` | Resume a stuck pending workflow step on an in-review or in-progress Fusion task (operator-only, mandatory reason, audit-logged). When a prompt node (like code-review) is dispatched but never receives a verdict callback (Runfusion/Fusion#1946), the step stays in 'pending' status indefinitely. This tool transitions it to 'failed', enabling the existing fn_task_bypass_review escape hatch to clear the merge blocker. Requires a mandatory reason and step ID. |
 | `fn_task_duplicate` | Duplicate an existing task, creating a fresh copy in planning. Copies the title and description but resets all execution state. The AI planning agent will replan the new task. |
 | `fn_task_refine` | Request a refinement of a completed or in-review task. Creates a new follow-up task in planning that references the original task as a dependency. Use this when a done or in-review task needs additional work, improvements, or follow-up changes. |
-| `fn_task_archive` | Archive a task from any live column (move to archived). Archived tasks are preserved for historical reference but moved out of the main board view. If the task is still referenced as a lineage parent by another task, archiving is rejected unless removeLineageReferences:true is passed. |
-| `fn_task_unarchive` | Unarchive an archived task (move from archived → its restore column). Restores to the pre-archive column when available, with active execution columns downgraded to todo. |
-| `fn_task_delete` | Soft-delete a task from active Fusion board views. The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. If the task is still referenced as a lineage parent by another task, deletion is rejected unless removeLineageReferences:true is passed. |
+| `fn_task_delete` | Soft-delete a task from active Fusion board views. The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. If live lineage children or dependents still reference the task, deletion is rejected unless the matching explicit reference-removal option is passed. |
 | `fn_task_import_github` | Import GitHub issues as Fusion tasks. Fetches open issues from a repository and creates tasks in the planning column. Each task includes the issue title and body with a link to the source issue. |
 | `fn_task_import_github_issue` | Import a specific GitHub issue as a Fusion task. Fetches the issue by number and creates a single task in the planning column with the issue title and body. |
 | `fn_task_browse_github_issues` | List open GitHub issues from a repository to browse before importing. Returns issue numbers, titles, and URLs for selection. Use with fn_task_import_github_issue to import specific issues by number. |
@@ -45,7 +44,7 @@ All skill/extension tool invocations in this catalog use the public `fn_*` names
 | `fn_task_import_gitlab_group_issues` | Import GitLab group issues as Fusion tasks using each issue's originating project identity. |
 | `fn_task_browse_gitlab_merge_requests` | List GitLab project merge requests from the configured GitLab instance. |
 | `fn_task_import_gitlab_merge_requests` | Import GitLab project merge requests as Fusion review tasks using configured GitLab HTTP API auth. |
-| `fn_task_plan` | Create a task via AI-guided planning mode — interactive conversation to refine your idea into a well-specified task. |
+| `fn_task_plan` | Create a task via AI-guided planning mode — interactive conversation to refine your idea into a well-specified task. Pass resumeSessionId to reopen an existing planning session (even one whose task was already created) and create another task from the evolved plan. |
 | `fn_web_fetch` | Lightweight URL fetch (no JS rendering). Use agent-browser skill for JS-heavy pages. URL to fetch (http/https) Optional extraction hint for downstream summarization Timeout in milliseconds (default: 30000) Max bytes to return (default: 512000) |
 | `fn_secret_get` | Read a secret by key using per-secret access policy. |
 | `fn_experiment_finalize` | Group kept experiment runs into reviewable branches and finalize the session. Use dryRun=true to preview the plan without touching git. |
@@ -65,6 +64,8 @@ All skill/extension tool invocations in this catalog use the public `fn_*` names
 | `fn_mission_unlink_goal` | Unlink a goal from a mission. |
 | `fn_mission_backfill_assertions` | Backfill mission assertions by deriving and linking one store-managed assertion for each feature without linked assertions. Supports dry-run mode. |
 | `fn_mission_delete` | Delete a mission and all its milestones, slices, and features. Cannot be undone. |
+| `fn_mission_set_status` | Set a mission lifecycle status. |
+| `fn_mission_clear_blocked` | Clear a stale mission-level blocked badge without resuming automation. |
 | `fn_mission_update` | Update an existing mission's title or description. Partial patches leave untouched fields intact. |
 | `fn_milestone_add` | Add a milestone to a mission. Milestones represent phases of work. |
 | `fn_slice_add` | Add a slice to a milestone. Slices are work units that can be activated for implementation. |
@@ -73,7 +74,12 @@ All skill/extension tool invocations in this catalog use the public `fn_*` names
 | `fn_slice_delete` | Delete a slice and its features. Rejects deletion when child features link to live tasks unless force=true. |
 | `fn_milestone_delete` | Delete a milestone and all descendant slices/features. Rejects deletion when child features link to live tasks unless force=true. |
 | `fn_slice_activate` | Activate a pending slice for implementation. Sets status to 'active' and enables task linking for its features. |
-| `fn_feature_link_task` | Link a feature to a fn task for implementation. Updates the feature status to 'triaged' and associates it with the task. If the target task is not on the active board (for example archived, deleted, or never created), the tool returns a clear validation error indicating that only active tasks can be linked. |
+| `fn_feature_link_task` | Link a feature to a fn task for implementation. Updates the feature status to 'triaged' and associates it with the task. If the target task is not on the active board (for example deleted, historical, or never created), the tool returns a clear validation error indicating that only active tasks can be linked. |
+| `fn_feature_repoint_task` | Atomically re-point an already-linked feature's single-valued taskId to a different task. Corrects a feature pinned to the wrong task (for example a shared vision doc) without the status-lossy unlink then link two-step. The target task must be live; same-task re-point is an idempotent no-op. |
+| `fn_feature_unlink_task` | Detach a feature from its linked task entirely, clearing its single-valued taskId and demoting its status to 'defined'. Use before the documented safe duplicate-cleanup and reconcile-done flow. Returns a clear error if the feature is not currently linked to any task. |
+| `fn_feature_set_status` | Set a feature lifecycle status. |
+| `fn_mission_reconcile` | Reconcile mission state against deterministic delivery ground truth. |
+| `fn_feature_repair_validation` | Clear a stale validation badge or re-run validation. |
 | `fn_feature_update` | Update an existing feature's title, description, or acceptance criteria. Partial patches leave untouched fields intact. |
 | `fn_milestone_update` | Update an existing milestone's title, description, or acceptance criteria (the structured pass/fail bar, distinct from verification's free-form how-to-confirm notes). Partial patches leave untouched fields intact. |
 | `fn_agent_stop` | Stop a running agent — pauses its execution without changing assigned task pause state. Transitions the agent from running/active to paused state. |
@@ -81,9 +87,11 @@ All skill/extension tool invocations in this catalog use the public `fn_*` names
 | `fn_agent_create` | Create a new non-ephemeral agent. |
 | `fn_agent_update` | Update editable configuration for an existing non-ephemeral agent. Agent callers can only update direct or indirect reports inside their management subtree; user/operator calls are privileged. |
 | `fn_agent_set_instructions` | Set the instructionsText and/or instructionsPath of one of the caller's direct or indirect reports. At least one of instructions_text or instructions_path is required; pass an empty string to clear a field. The change is persisted and recorded as a config revision. |
+| `fn_agent_read_evaluations` | Read ratings, feedback, reflections, and performance data for a direct or indirect report. |
+| `fn_agent_evaluation_followup` | Record a coaching evaluation follow-up for a direct or indirect report to read through its self-improvement loop. |
 | `fn_agent_delete` | Delete a non-ephemeral agent. |
 | `fn_list_agents` | List all available agents in the system. Shows each agent's name, role, state, personality (soul), and current assignment. Use this to discover which agents exist and what they specialize in before delegating work. |
-| `fn_delegate_task` | Create a new task and assign it to a specific agent for execution. The task goes to 'todo' and will be picked up by the target agent on their next heartbeat cycle. Use fn_list_agents first to find available agents and their capabilities. Optionally pass workflow_id to select a workflow at creation time; use fn_workflow_list to discover valid IDs. |
+| `fn_delegate_task` | Create a new task and assign it to a specific agent for execution. The task lands in the selected workflow's ready lane (`todo` on the built-in board, whatever that workflow calls it otherwise) and will be picked up by the target agent on their next heartbeat cycle. Use fn_list_agents first to find available agents and their capabilities. Optionally pass workflow_id to select a workflow at creation time; use fn_workflow_list to discover valid IDs. |
 | `fn_agent_show` | Show detailed information about a single agent, including their role, state, position in the org hierarchy (reports-to, direct reports), skills, and current assignment. |
 | `fn_agent_org_chart` | Show the organizational tree of agents, displaying the role hierarchy. Optionally filter to a subtree rooted at a specific agent. |
 | `fn_skills_search` | Search the skills.sh directory for agent skills. Returns matching skills with names, sources (owner/repo), install counts, and install commands. Use fn_skills_install to install a selected skill. |
@@ -109,7 +117,6 @@ All skill/extension tool invocations in this catalog use the public `fn_*` names
 - `fn task merge FN-001` — Merge an in-review task
 - `fn task duplicate FN-001` — Duplicate a task
 - `fn task refine FN-001 --feedback "..."` — Create refinement task
-- `fn task archive FN-001` / `fn task unarchive FN-001` — Archive/restore tasks
 - `fn task delete FN-001` — Delete a task
 - `fn task retry FN-001` — Retry a failed task
 - `fn task comment FN-001 "..."` — Add a task comment
@@ -155,8 +162,8 @@ Structured runtime metadata is authoritative in PostgreSQL. A retained `fusion.d
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `maxConcurrent` | 2 | Concurrent task execution lanes (executor + merge). Triage/specification is controlled by `maxTriageConcurrent`. |
-| `maxTriageConcurrent` | 2 | Concurrent triage/specification agents. Falls back to `maxConcurrent` when undefined. |
+| `maxConcurrent` | 2 | Per-project cap for top-level working agents across planning, execution, and review/merge. Free slots admit the oldest eligible task; nested helpers are parent-internal. |
+| `maxWorktrees` | 4 | Separate cap for execution worktree holders; it does not define the live Running count. |
 | `autoMerge` | true | Auto-merge completed tasks |
 | `requirePlanApproval` | false | Manual approval for specs |
 | `prCompletionMode` | direct | Completion mode: direct/pr-first |

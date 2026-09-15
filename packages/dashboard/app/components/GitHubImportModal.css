@@ -310,11 +310,15 @@ holds a 36px touch target without claiming a row of its own.
 }
 
 /*
-FNXC:GitHubImport 2026-07-15-18:20:
-The detail panel is the FloatingWindow's only child and owns its own inset — without one the Preview header rendered flush against the window's left edge while FN-8015's resize gutter left a lone gap on the right, so the header read as mis-aligned on both the desktop window and the mobile sheet.
-padding-inline-end is deliberately 0: FN-8015 already reserves var(--space-lg) of inline-end margin on the shared .floating-window__body to hold a hosted scrollbar clear of the east/north-east/south-east resize hot zones, and that gutter supplies this panel's right inset. Matching padding-inline-start to the same token makes the inset symmetric without overriding the shared body (which would push the inner scroller back into the hot zone).
-If that body gutter ever changes token, change padding-inline-start with it.
-Padding lives on the panel rather than the pane content so header, toast, and scrolling body share one inset and the header divider is inset with them.
+FNXC:GitHubImport 2026-08-17-23:47:
+The detail panel is the FloatingWindow's only child and owns its own inset — without one the Preview
+header rendered flush against the window's left edge, so the header read as mis-aligned on both the
+desktop window and the mobile sheet.
+This padding is now symmetric on all four sides. It previously set `padding-inline-end: 0` and
+borrowed its right inset from FN-8015's shared `.floating-window__body` gutter; that gutter is
+deleted, so the panel supplies both insets itself and no longer needs a tablet-specific restore.
+Padding lives on the panel rather than the pane content so header, toast, and scrolling body share
+one inset and the header divider is inset with them.
 */
 .github-import-detail-panel {
   display: flex;
@@ -323,7 +327,6 @@ Padding lives on the panel rather than the pane content so header, toast, and sc
   min-width: 0;
   min-height: 0;
   padding: var(--space-lg);
-  padding-inline-end: 0;
   overflow: hidden;
 }
 
@@ -345,8 +348,16 @@ when the preview is short; the top border separates it from scrolling content.
   border-top: 1px solid var(--border);
 }
 
+/* Keep the composer and its action controls as independently sized flex rows. */
+.github-import-detail-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+}
+
 /* Never let the primary action's label clip when the bar is narrow. */
-.github-import-detail-actions .btn {
+.github-import-detail-action-row .btn {
   flex: 0 0 auto;
   min-width: max-content;
   min-height: 36px;
@@ -558,21 +569,25 @@ idle and auto-translate-off views retain their original layout.
 
 /* Wider modal for two-pane layout */
 .modal.github-import-modal {
-  width: min(90vw, 1200px);
-  max-width: 95vw;
-  min-width: 480px;
-  height: 80vh;
-  min-height: 480px;
-  max-height: calc(100dvh - var(--overlay-padding-top, 10vh) - 16px);
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
-  resize: both;
 }
 
 .github-import-modal__header {
   align-items: flex-start;
 }
 
+.github-import-modal__title-copy {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+}
+
 .github-import-modal__subtitle {
+  display: block;
   margin-top: var(--space-xs);
   color: var(--text-muted);
   font-size: 13px;
@@ -1623,9 +1638,24 @@ counterpart added later cannot silently reintroduce the band.
   }
 
 
+  /*
+  FNXC:GitHubImport 2026-08-16-00:33:
+  Pull-request rows can contain a wrapped title, a branch line, and an Imported badge. They must use
+  their intrinsic height on phones: the former fixed minimum height constrained wrapped content and
+  made consecutive rows paint over one another.
+  */
   .issue-item {
     flex-wrap: wrap;
-    min-height: 36px;
+  }
+
+  /*
+  FNXC:GitHubImport 2026-08-16-00:33:
+  Pull head/base names can be unbroken generated identifiers. Let the branch line shrink and break
+  them inside the shared list row so both dialog and embedded phone presentations stay contained.
+  */
+  .pull-branch-info {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .imported-badge {
@@ -1653,6 +1683,48 @@ counterpart added later cannot silently reintroduce the band.
   }
 
 
+}
+
+/*
+FNXC:GitHubImport 2026-07-23-12:18:
+The selected-issue mobile action row must keep Import as task alongside optional Close issue,
+Plan, and Chat controls. The comment composer remains on its own full-width row, while equal
+shrinkable action tracks preserve every full label by wrapping it inside its own button and the
+shared touch-target token preserves every required target without clipping or scrolling.
+*/
+@media (max-width: 768px) {
+  /*
+  FNXC:GitHubImport 2026-08-16-00:33:
+  The selected pull-request sheet shares this preview branch block with desktop. On narrow and
+  landscape sheets, break unbroken branch names so its scrollable detail content cannot overflow.
+  */
+  .preview-branch {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .github-import-detail-actions {
+    gap: var(--space-xs);
+  }
+
+  .github-import-detail-action-row {
+    flex: 1 1 100%;
+    min-width: 0;
+    align-items: stretch;
+    flex-wrap: nowrap;
+    gap: var(--space-xs);
+  }
+
+  .github-import-detail-action-row .btn {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: var(--touch-target-min-size) !important;
+    padding: var(--space-xs);
+    justify-content: center;
+    text-align: center;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 
 @keyframes github-import-spinner-spin {
@@ -1843,4 +1915,43 @@ lives here) and design tokens for spacing/color so the bar matches the modal's o
   font-size: var(--font-size-sm, 13px);
   padding: var(--space-xs) var(--space-xs) 0;
   text-align: center;
+}
+
+/*
+FNXC:GitHubImport 2026-09-07-05:08:
+The phone import screen must use its available width: wrapped provider and type-tab groups previously
+left a wide right gap, while the embedded header and body retained their desktop 24px inset. Keep this
+block at the end of the file so it wins the later embedded base rules without changing desktop or tablet geometry.
+*/
+@media (max-width: 640px) {
+  .github-import-controls > * {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .github-import-provider {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    min-width: 0;
+  }
+
+  .github-import-tabs {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .github-import-provider .github-import-tab,
+  .github-import-tabs .github-import-tab {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+
+  .github-import-modal__embedded-header {
+    padding: var(--space-lg) var(--space-md);
+  }
+
+  .github-import-modal--embedded .github-import-modal__body {
+    padding: var(--space-md);
+  }
 }

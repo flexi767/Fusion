@@ -19,6 +19,14 @@ type PlanningSession = {
   };
   initialPlan: string;
   history: Array<{ role: string; content: string }>;
+  sourceIssue?: {
+    provider: "github";
+    repository: string;
+    externalIssueId: string;
+    issueNumber: number;
+    url: string;
+    title?: string;
+  };
 };
 
 const sessions = new Map<string, PlanningSession>();
@@ -29,7 +37,50 @@ vi.mock("../planning.js", () => ({
   releaseSession: vi.fn(),
   cleanupSession: vi.fn(),
   formatInterviewQA: vi.fn(() => ""),
-  mergePlanningSubtaskDrafts: vi.fn((_sessionId: string, subtasks: unknown[]) => subtasks),
+  /*
+  FNXC:PlanningRouteTests 2026-08-04-06:29:
+  This direct registrar fixture replaces the whole planning module, so it must expose every
+  create-route contract the production dynamic imports consume. Missing task-handoff formatting
+  turned otherwise valid single and multi-task GitHub tracking requests into synchronous HTTP 500s;
+  retain the epoch-advance seam too so repeated-create and stale-link branches match production.
+  */
+  updatePlanningCreateClaim: vi.fn(async () => undefined),
+  getDurablePlanningSession: vi.fn(async (id: string) => sessions.get(id)),
+  claimPlanningTaskCreation: vi.fn(async (id: string) => sessions.get(id)),
+  finalizePlanningTaskCreation: vi.fn(async () => undefined),
+  reconcilePlanningTaskCreation: vi.fn(async () => undefined),
+  releasePlanningTaskCreation: vi.fn(async () => undefined),
+  advancePlanningTaskCreationEpoch: vi.fn(async (id: string) => sessions.get(id)),
+  formatPlanningTaskHandoff: vi.fn((summary: { description: string }) => summary.description.trim()),
+  // FNXC:PlanningMode 2026-07-23-12:10: create-task terminalizes the session after creation.
+  validateSession: vi.fn(async () => undefined),
+  // FNXC:PlanningMultiTask 2026-07-24-00:20: create-task derives an epoch-scoped proposalClaimId.
+  planningProposalClaimId: (sessionId: string, epoch?: number) =>
+    epoch && epoch > 0 ? `planning-session:${sessionId}#${epoch}` : `planning-session:${sessionId}`,
+  createSessionWithAgent: vi.fn(),
+  startExistingSession: vi.fn(),
+  RateLimitError: class RateLimitError extends Error {},
+  rateLimit: vi.fn(),
+  resolvePlanningSourceIssue: (session: PlanningSession) => session.sourceIssue
+    ? {
+        sourceIssue: session.sourceIssue,
+        sourceMetadata: {
+          issueUrl: session.sourceIssue.url,
+          issueNumber: session.sourceIssue.issueNumber,
+        },
+        markdown: [
+          "## Source Issue",
+          "",
+          `- **Repository:** ${session.sourceIssue.repository}`,
+          `- **Issue:** #${session.sourceIssue.issueNumber} — ${session.sourceIssue.title ?? "Issue"}`,
+          `- **URL:** ${session.sourceIssue.url}`,
+          "",
+          "### Original issue description",
+          "",
+          "Verbatim issue body.",
+        ].join("\n"),
+      }
+    : undefined,
 }));
 
 function deferred<T>() {
@@ -89,6 +140,7 @@ describe("planning routes github tracking background dispatch", () => {
   let createIssueSpy: MockInstance<typeof GitHubClient.prototype.createIssue>;
   let planningWarn: ReturnType<typeof vi.fn>;
   let warnSignal: ReturnType<typeof signalOnCall<unknown[], void>>;
+  let createTaskMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     sessions.clear();
@@ -99,11 +151,10 @@ describe("planning routes github tracking background dispatch", () => {
     const createdTasks = new Map<string, Record<string, unknown>>();
     let storeRef: TaskStore | undefined;
     const store = {
-      createTask: vi.fn(async (input: { title?: string; description: string }) => {
+      createTask: createTaskMock = vi.fn(async (input: { title?: string; description: string; [key: string]: unknown }) => {
         const task = {
+          ...input,
           id: `FN-${idCounter++}`,
-          title: input.title,
-          description: input.description,
           column: "triage",
         };
         createdTasks.set(task.id, task);
@@ -127,9 +178,12 @@ describe("planning routes github tracking background dispatch", () => {
         createdTasks.set(id, next);
         return next;
       }),
+      upsertTaskDocument: vi.fn(async () => undefined),
       logEntry: vi.fn(async () => undefined),
       getTask: vi.fn(async (id: string) => createdTasks.get(id)),
+      listTasks: vi.fn(async () => [...createdTasks.values()]),
       getSettings: vi.fn(async () => ({
+        githubLinkImportedIssuesToTracking: true,
         githubTrackingEnabledByDefault: true,
         githubTrackingDefaultRepo: "o/r",
         githubAuthMode: "token",
@@ -165,7 +219,8 @@ describe("planning routes github tracking background dispatch", () => {
     );
 
     app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      const apiError = err as { statusCode?: number };
+      res.status(apiError.statusCode ?? 500).json({ error: err instanceof Error ? err.message : String(err) });
     });
 
     createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue");
@@ -176,12 +231,52 @@ describe("planning routes github tracking background dispatch", () => {
     setTaskCreatedHook(undefined);
   });
 
+  it("validates and forwards structured GitHub source context when planning starts", async () => {
+    const planning = await import("../planning.js") as { createSessionWithAgent: ReturnType<typeof vi.fn> };
+    planning.createSessionWithAgent.mockResolvedValue("source-session");
+    const sourceIssue = {
+      provider: "github",
+      repository: "owner/repo",
+      issueNumber: 42,
+      url: "https://github.com/owner/repo/issues/42",
+      title: "Imported issue",
+      // An image-bearing body with no policy-allowed URL must still mark this as a post-capture session with an explicit empty list.
+      imageBodies: ["![foreign](https://example.com/not-ours.png)"],
+    };
+
+    const valid = await performRequest(app, "POST", "/planning/start-streaming", JSON.stringify({
+      initialPlan: "Plan this imported issue",
+      sourceIssue,
+    }), { "content-type": "application/json" });
+    expect(valid.status, JSON.stringify(valid)).toBe(201);
+    expect(planning.createSessionWithAgent).toHaveBeenCalledTimes(1);
+    expect(planning.createSessionWithAgent.mock.calls[0]?.at(-1)).toEqual(expect.objectContaining({
+      sourceIssue: expect.objectContaining({
+        provider: "github",
+        repository: "owner/repo",
+        externalIssueId: "42",
+        issueNumber: 42,
+        url: sourceIssue.url,
+        imageUrls: [],
+      }),
+    }));
+
+    const malformed = await performRequest(app, "POST", "/planning/start-streaming", JSON.stringify({
+      initialPlan: "Do not start",
+      sourceIssue: { ...sourceIssue, url: "https://github.com/owner/repo/pull/42" },
+    }), { "content-type": "application/json" });
+    expect(malformed.status).toBe(400);
+    expect(planning.createSessionWithAgent).toHaveBeenCalledTimes(1);
+  });
+
   it("POST /planning/create-task returns before createIssue resolves", async () => {
     const issueDeferred = deferred<{ number: number; htmlUrl: string; createdAt: string }>();
     const createIssue = signalOnCall(() => issueDeferred.promise as never);
     createIssueSpy.mockImplementation(createIssue.wrapped);
 
     sessions.set("plan-1", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Planned task",
         description: "Planned task description",
@@ -218,10 +313,53 @@ describe("planning routes github tracking background dispatch", () => {
     expect(createIssueSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves canonical GitHub source provenance and issue context on a planned task", async () => {
+    sessions.set("github-plan", {
+      validated: true,
+      summary: {
+        title: "Planned GitHub task",
+        description: "Planned task description",
+        suggestedSize: "M",
+        priority: "normal",
+        suggestedDependencies: [],
+        keyDeliverables: [],
+      },
+      initialPlan: "canonical seed",
+      history: [],
+      sourceIssue: {
+        provider: "github",
+        repository: "owner/repo",
+        externalIssueId: "42",
+        issueNumber: 42,
+        url: "https://github.com/owner/repo/issues/42",
+        title: "Original issue",
+      },
+    });
+
+    const response = await performRequest(
+      app,
+      "POST",
+      "/planning/create-task",
+      JSON.stringify({ sessionId: "github-plan" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(201);
+    expect(createTaskMock).toHaveBeenCalledWith(expect.objectContaining({
+      sourceIssue: expect.objectContaining({ provider: "github", repository: "owner/repo", issueNumber: 42 }),
+      source: { sourceType: "github_import", sourceMetadata: { issueUrl: "https://github.com/owner/repo/issues/42", issueNumber: 42 } },
+      githubTracking: { enabled: true },
+      description: expect.stringContaining("## Source Issue\n\n- **Repository:** owner/repo"),
+    }));
+    expect(createTaskMock.mock.calls[0]?.[0]?.description).toContain("Verbatim issue body.");
+  });
+
   it("POST /planning/create-task still returns 201 when createIssue rejects", async () => {
     createIssueSpy.mockRejectedValue(new Error("github down"));
 
     sessions.set("plan-2", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Planned task 2",
         description: "Planned task description 2",
@@ -255,6 +393,8 @@ describe("planning routes github tracking background dispatch", () => {
     });
 
     sessions.set("plan-2-sync", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Planned task 2",
         description: "Planned task description 2",
@@ -272,129 +412,6 @@ describe("planning routes github tracking background dispatch", () => {
       "POST",
       "/planning/create-task",
       JSON.stringify({ sessionId: "plan-2-sync" }),
-      { "content-type": "application/json" },
-    );
-
-    expect(response.status).toBe(201);
-    await warnSignal.calledMatching(
-      (args) => typeof args[0] === "string" && args[0].includes("[github-tracking] Failed to create issue"),
-    );
-    expect(planningWarn).toHaveBeenCalledWith(expect.stringContaining("[github-tracking] Failed to create issue"));
-  });
-
-  it("POST /planning/create-tasks dispatches one createIssue per task without blocking", async () => {
-    const issueDeferred = deferred<{ number: number; htmlUrl: string; createdAt: string }>();
-    const createIssue = signalOnCall(() => issueDeferred.promise as never);
-    createIssueSpy.mockImplementation(createIssue.wrapped);
-
-    sessions.set("plan-3", {
-      summary: {
-        title: "Plan",
-        description: "Plan",
-        suggestedSize: "M",
-        priority: "normal",
-        suggestedDependencies: [],
-        keyDeliverables: [],
-      },
-      initialPlan: "initial",
-      history: [],
-    });
-
-    const response = await performRequest(
-      app,
-      "POST",
-      "/planning/create-tasks",
-      JSON.stringify({
-        planningSessionId: "plan-3",
-        subtasks: [
-          { id: "tmp-1", title: "Subtask 1", description: "D1" },
-          { id: "tmp-2", title: "Subtask 2", description: "D2" },
-        ],
-      }),
-      { "content-type": "application/json" },
-    );
-
-    expect(response.status).toBe(201);
-    await createIssue.calledTimes(2);
-    expect(createIssueSpy).toHaveBeenCalledTimes(2);
-
-    issueDeferred.resolve({
-      number: 2,
-      htmlUrl: "https://github.com/o/r/issues/2",
-      createdAt: new Date().toISOString(),
-    });
-
-    // No third dispatch after the two issues resolve.
-    await Promise.resolve();
-    expect(createIssueSpy).toHaveBeenCalledTimes(2);
-  });
-
-  it("POST /planning/create-tasks still returns 201 when createIssue rejects asynchronously", async () => {
-    createIssueSpy.mockRejectedValue(new Error("github down"));
-
-    sessions.set("plan-3-reject", {
-      summary: {
-        title: "Plan",
-        description: "Plan",
-        suggestedSize: "M",
-        priority: "normal",
-        suggestedDependencies: [],
-        keyDeliverables: [],
-      },
-      initialPlan: "initial",
-      history: [],
-    });
-
-    const response = await performRequest(
-      app,
-      "POST",
-      "/planning/create-tasks",
-      JSON.stringify({
-        planningSessionId: "plan-3-reject",
-        subtasks: [
-          { id: "tmp-1", title: "Subtask 1", description: "D1" },
-          { id: "tmp-2", title: "Subtask 2", description: "D2" },
-        ],
-      }),
-      { "content-type": "application/json" },
-    );
-
-    expect(response.status).toBe(201);
-    await warnSignal.calledMatching(
-      (args) => typeof args[0] === "string" && args[0].includes("[github-tracking] Failed to create issue"),
-    );
-    expect(planningWarn).toHaveBeenCalledWith(expect.stringContaining("[github-tracking] Failed to create issue"));
-  });
-
-  it("POST /planning/create-tasks still returns 201 when createIssue throws synchronously", async () => {
-    createIssueSpy.mockImplementation(() => {
-      throw new Error("sync github crash");
-    });
-
-    sessions.set("plan-3-sync", {
-      summary: {
-        title: "Plan",
-        description: "Plan",
-        suggestedSize: "M",
-        priority: "normal",
-        suggestedDependencies: [],
-        keyDeliverables: [],
-      },
-      initialPlan: "initial",
-      history: [],
-    });
-
-    const response = await performRequest(
-      app,
-      "POST",
-      "/planning/create-tasks",
-      JSON.stringify({
-        planningSessionId: "plan-3-sync",
-        subtasks: [
-          { id: "tmp-1", title: "Subtask 1", description: "D1" },
-          { id: "tmp-2", title: "Subtask 2", description: "D2" },
-        ],
-      }),
       { "content-type": "application/json" },
     );
 

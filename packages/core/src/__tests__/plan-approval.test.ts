@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { computePlanApprovalFingerprint, resolvePlanApprovalRequired, type PlanApprovalMode } from "../plan-approval.js";
-import { applyFrontendUxCriteria } from "../frontend-ux-policy.js";
-import { applyOriginalDescription } from "../original-description-policy.js";
+import { computePlanApprovalFingerprint, isPlanReviewSatisfied, resolvePlanApprovalRequired, type PlanApprovalMode } from "../planner/plan-approval.js";
+import { applyFrontendUxCriteria } from "../tasks/frontend-ux-policy.js";
+import { applyOriginalDescription } from "../tasks/original-description-policy.js";
 
 const workflowValues = [true, false, undefined] as const;
 
@@ -22,6 +22,13 @@ describe("resolvePlanApprovalRequired", () => {
     expect(resolvePlanApprovalRequired({ planApprovalMode: "require-all", requirePlanApproval })).toBe(true);
   });
 
+  it("accepts only settings and resolves each project policy from that single input", () => {
+    expect(resolvePlanApprovalRequired).toHaveLength(1);
+    expect(resolvePlanApprovalRequired({ planApprovalMode: "auto-approve-all", requirePlanApproval: false })).toBe(false);
+    expect(resolvePlanApprovalRequired({ planApprovalMode: "workflow", requirePlanApproval: true })).toBe(true);
+    expect(resolvePlanApprovalRequired({ planApprovalMode: "require-all" })).toBe(true);
+  });
+
   it("falls back to workflow behavior for unknown persisted modes", () => {
     expect(
       resolvePlanApprovalRequired({
@@ -35,6 +42,81 @@ describe("resolvePlanApprovalRequired", () => {
         requirePlanApproval: false,
       }),
     ).toBe(false);
+  });
+});
+
+describe("isPlanReviewSatisfied", () => {
+  it("accepts either a reviewer pass or an explicit operator bypass", () => {
+    expect(isPlanReviewSatisfied({ workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "passed" })).toBe(true);
+    expect(isPlanReviewSatisfied({
+      workflowStepId: "plan-review",
+      workflowStepName: "Plan Review",
+      status: "skipped",
+      bypassedBy: "operator",
+      bypassedAt: "2026-08-03T23:53:04.539Z",
+      bypassReason: "Approved after Plan Review did not converge",
+      bypassedFromStatus: "failed",
+      bypassedFromVerdict: "REVISE",
+    })).toBe(true);
+  });
+
+  it("rejects unrelated, failed, or unaudited skipped results", () => {
+    expect(isPlanReviewSatisfied({ workflowStepId: "code-review", workflowStepName: "Code Review", status: "passed" })).toBe(false);
+    expect(isPlanReviewSatisfied({ workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "failed" })).toBe(false);
+    expect(isPlanReviewSatisfied({ workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "skipped" })).toBe(false);
+    expect(isPlanReviewSatisfied({
+      workflowStepId: "plan-review",
+      workflowStepName: "Plan Review",
+      status: "skipped",
+      bypassedBy: "operator",
+      bypassedAt: "2026-08-03T23:53:04.539Z",
+      bypassReason: "Malformed override",
+      bypassedFromStatus: "passed",
+      bypassedFromVerdict: "REVISE",
+    })).toBe(false);
+  });
+
+  /*
+   * FNXC:ReviewConvergenceEvidence 2026-08-22-17:13:
+   * FN-149 permits an automatic Plan Review release only when the archived failed
+   * attempt carries complete single-gate arbitration provenance. A skipped carrier
+   * without every fence remains unable to open the planning gate.
+   */
+  it("accepts only a fully fenced arbitration release for a failed Plan Review", () => {
+    const release = {
+      workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "skipped" as const,
+      remediationArchivedFromStatus: "failed" as const, arbitrationDecision: "UPHOLD_IMPLEMENTER" as const,
+      arbitratedAttemptAt: "2026-08-22T17:00:00.000Z", arbitratedAt: "2026-08-22T17:01:00.000Z",
+      arbitrationNotes: "The implementation satisfies the requested invariant.", arbitrationBindingFindingCount: 0,
+    };
+    expect(isPlanReviewSatisfied(release)).toBe(true);
+    expect(isPlanReviewSatisfied({ ...release, arbitrationBindingFindingCount: 1 })).toBe(false);
+    expect(isPlanReviewSatisfied({ ...release, arbitrationDecision: "SPLIT", arbitrationBindingFindingCount: 1 })).toBe(false);
+    expect(isPlanReviewSatisfied({ ...release, arbitratedAt: undefined })).toBe(false);
+    expect(isPlanReviewSatisfied({ ...release, supersededAt: "2026-08-22T17:02:00.000Z" })).toBe(false);
+    expect(isPlanReviewSatisfied({ ...release, remediationArchivedFromStatus: undefined })).toBe(false);
+  });
+
+  it("rejects a historical pass or bypass superseded by a later planning episode", () => {
+    expect(isPlanReviewSatisfied({
+      workflowStepId: "plan-review",
+      workflowStepName: "Plan Review",
+      status: "passed",
+      supersededAt: "2026-08-04T02:00:00.000Z",
+      supersededReason: "dependency-change",
+    })).toBe(false);
+    expect(isPlanReviewSatisfied({
+      workflowStepId: "plan-review",
+      workflowStepName: "Plan Review",
+      status: "skipped",
+      bypassedBy: "operator",
+      bypassedAt: "2026-08-04T01:00:00.000Z",
+      bypassReason: "Approved at the old revision cap",
+      bypassedFromStatus: "failed",
+      bypassedFromVerdict: "REVISE",
+      supersededAt: "2026-08-04T02:00:00.000Z",
+      supersededReason: "dependency-change",
+    })).toBe(false);
   });
 });
 
@@ -65,6 +147,15 @@ describe("computePlanApprovalFingerprint", () => {
       computePlanApprovalFingerprint(plannerText),
     );
     expect(computePlanApprovalFingerprint(withAllHygiene)).toBe(
+      computePlanApprovalFingerprint(plannerText),
+    );
+  });
+
+  it("ignores a tracked operator heading when What This Delivers follows the generated region", () => {
+    const plannerText = "# Task: FN-1\n\n## What This Delivers\n\n- Deliver the interface.\n\n## Mission\n\nBuild the interface.\n";
+    const description = "Operator context.\n\n## Do NOT\n\nOperator-owned constraint.";
+
+    expect(computePlanApprovalFingerprint(applyOriginalDescription(plannerText, description))).toBe(
       computePlanApprovalFingerprint(plannerText),
     );
   });

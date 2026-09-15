@@ -14,6 +14,12 @@ import type { SettingsSearchEntry } from "../types";
 
 const SECTIONS_DIR = resolve(__dirname, "../../sections");
 
+/** Dynamic model-lane keys that are rendered from the shared lane catalog rather than literal descriptors. */
+const DYNAMIC_RENDERED_KEYS: Record<string, readonly string[]> = {
+  "GlobalModelsSection.tsx": ["fastCheapGlobalModelId"],
+  "ProjectModelsSection.tsx": ["fastCheapModelId"],
+};
+
 /**
  * Extracts the descriptor keys a section renders. Matches the established
  * `descriptor={{ key: "..." }}` idiom every typed row uses (see GeneralSection
@@ -24,13 +30,16 @@ const SECTIONS_DIR = resolve(__dirname, "../../sections");
  * `htmlFor` → `data-settings-key` (e.g. general.mobileNavPrimaryItems). Those
  * rows are indexed and jumpable but never use the descriptor={{ key }} shape.
  */
-function extractDescriptorKeys(source: string): string[] {
+function extractDescriptorKeys(source: string, filename?: string): string[] {
   const keys = new Set<string>();
   for (const m of source.matchAll(/descriptor=\{\{\s*key:\s*"([^"]+)"/g)) {
     keys.add(m[1]);
   }
   for (const m of source.matchAll(/<SettingsFieldRow\b[\s\S]*?\bhtmlFor="([^"]+)"/g)) {
     keys.add(m[1]);
+  }
+  for (const key of filename ? DYNAMIC_RENDERED_KEYS[filename] ?? [] : []) {
+    keys.add(key);
   }
   return [...keys];
 }
@@ -50,6 +59,8 @@ function sectionFiles(): string[] {
  */
 const SECTION_FILE_TO_ID: Record<string, string> = {
   "AppearanceSection.tsx": "appearance",
+  // FNXC:SettingsSearch 2026-07-24-23:15: anthropicAuthPreference descriptor row requires registration.
+  "AuthenticationSection.tsx": "authentication",
   "BackupsSection.tsx": "backups",
   "DatabaseBackupsSection.tsx": "backups-global",
   "CommandsSection.tsx": "commands",
@@ -66,11 +77,11 @@ const SECTION_FILE_TO_ID: Record<string, string> = {
   "ResearchGlobalSection.tsx": "research-global",
   "ResearchProjectSection.tsx": "research-project",
   "ScheduledEvalsSection.tsx": "scheduled-evals",
-  "SchedulingGlobalSection.tsx": "scheduling-global",
   "SchedulingSection.tsx": "scheduling",
   "SourceControlGlobalSection.tsx": "source-control-global",
   "SourceControlSection.tsx": "source-control",
   "WorktreesSection.tsx": "worktrees",
+  "VoiceInputSection.tsx": "voice-input",
 };
 
 describe("settings search index", () => {
@@ -79,7 +90,7 @@ describe("settings search index", () => {
 
     for (const [file, sectionId] of Object.entries(SECTION_FILE_TO_ID)) {
       const source = readFileSync(join(SECTIONS_DIR, file), "utf8");
-      const rendered = extractDescriptorKeys(source);
+      const rendered = extractDescriptorKeys(source, file);
       expect(rendered.length, `${file} renders no descriptor rows — is it migrated?`).toBeGreaterThan(0);
 
       const indexed = new Set(
@@ -101,7 +112,7 @@ describe("settings search index", () => {
     for (const [file, sectionId] of Object.entries(SECTION_FILE_TO_ID)) {
       const source = readFileSync(join(SECTIONS_DIR, file), "utf8");
       const keys = renderedBySection.get(sectionId) ?? new Set<string>();
-      for (const key of extractDescriptorKeys(source)) keys.add(key);
+      for (const key of extractDescriptorKeys(source, file)) keys.add(key);
       renderedBySection.set(sectionId, keys);
     }
 
@@ -117,7 +128,7 @@ describe("settings search index", () => {
   it("registers a section id for every section that renders descriptor rows", () => {
     const unregistered = sectionFiles()
       .filter((file) => !(file in SECTION_FILE_TO_ID))
-      .filter((file) => extractDescriptorKeys(readFileSync(join(SECTIONS_DIR, file), "utf8")).length > 0);
+      .filter((file) => extractDescriptorKeys(readFileSync(join(SECTIONS_DIR, file), "utf8"), file).length > 0);
 
     /*
     FNXC:SettingsSearch 2026-07-15-17:35:
@@ -201,6 +212,23 @@ describe("settings search ranking", () => {
     expect(results.map((r) => r.key)).toEqual(["aCostThing", "showCostBadgeOnCards"]);
   });
 
+  it("routes escalation model discovery only to Project Models while keeping policy routing in Scheduling", () => {
+    const escalationResults = rankSettingsSearchResults(SETTINGS_SEARCH_ENTRIES, "alternate model", resolveEnglish);
+    expect(escalationResults.map((result) => `${result.sectionId}:${result.key}`)).toContain(
+      "project-models:executorEscalationModel",
+    );
+    expect(escalationResults.some((result) => result.sectionId === "scheduling" && /Escalation (provider|model ID)/.test(result.label))).toBe(false);
+
+    const policyResults = rankSettingsSearchResults(SETTINGS_SEARCH_ENTRIES, "escalate after tool-failure retries", resolveEnglish);
+    expect(policyResults.map((result) => `${result.sectionId}:${result.key}`)).toContain(
+      "scheduling:executorModelEscalationEnabled",
+    );
+    const nodeResults = rankSettingsSearchResults(SETTINGS_SEARCH_ENTRIES, "escalation node", resolveEnglish);
+    expect(nodeResults.map((result) => `${result.sectionId}:${result.key}`)).toContain(
+      "scheduling:executorEscalationNodeId",
+    );
+  });
+
   it("finds the real 'summarize' miss that motivated the rewrite", () => {
     // FN-7907 / 2026-07-14: operators searched "summarize"; the section's
     // keyword list did not carry it, so Project Models did not surface.
@@ -208,7 +236,7 @@ describe("settings search ranking", () => {
       sectionId: "project-models",
       key: "autoSummarizeTitles",
       labelKey: "settings.projectModels.autoSummarizeLongDescriptionsAsTitles",
-      labelFallback: "Auto-summarize long descriptions as titles",
+      labelFallback: "Auto-summarize task titles",
     };
     const results = rankSettingsSearchResults([autoSummarize], "summarize", resolveEnglish);
     expect(results).toHaveLength(1);

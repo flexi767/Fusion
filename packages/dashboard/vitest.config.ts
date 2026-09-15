@@ -93,7 +93,8 @@ const qualityAppFoundationUiTests = [
 const qualityAppHooksAndUtilsTests = [
   // Hooks and utilities are fast, user-visible state/formatting behavior.
   "app/context/**/*.test.tsx",
-  "app/hooks/__tests__/{useAgents,useAgentLogs,useAgentLogs.resume-instrumentation,useAppSettings,useAuthOnboarding,useConfirm,useCurrentProject,useNavigationHistory,useNodes,useNodes.resume-instrumentation,useNodeSettingsSync,useProjects,useProjects.resume-instrumentation,useMeshState.resume-instrumentation,useManagedDockerNodes.resume-instrumentation,usePrChecksStream.resume-instrumentation,useDevServerLogs.resume-instrumentation,useResearch.resume-instrumentation,useBackgroundSessions.resume-instrumentation,useQuickChat,useTasks,useTasks.resume-instrumentation,useChatRooms,useTerminalSessions,useTheme,useToast,useUsageData,useViewportMode,useViewState,useMergeAdvanceNotice}.test.{ts,tsx}",
+  /* FNXC:DashboardTests 2026-09-12-17:32: Shared and Board-specific horizontal mouse-pan contracts belong in the fast hooks/utils shard so delayed capture and consumer exclusions are always collected together. */
+  "app/hooks/__tests__/{useAgents,useAgentLogs,useAgentLogs.resume-instrumentation,useAppSettings,useAuthOnboarding,useConfirm,useCurrentProject,useNavigationHistory,useNodes,useNodes.resume-instrumentation,useNodeSettingsSync,useProjects,useProjects.resume-instrumentation,useMeshState.resume-instrumentation,useManagedDockerNodes.resume-instrumentation,usePrChecksStream.resume-instrumentation,useDevServerLogs.resume-instrumentation,useResearch.resume-instrumentation,useBackgroundSessions.resume-instrumentation,useQuickChat,useTasks,useTasks.resume-instrumentation,useChatRooms,usePoppedOutNotes,useTerminalSessions,useTheme,useToast,useUsageData,useViewportMode,useViewState,useMergeAdvanceNotice,useVirtualizedChatTranscript,useVirtualizedList,useAutoPaginationSentinel,useBoardMousePan,useHorizontalMousePan,listSurfaceInventory}.test.{ts,tsx}",
   "app/utils/**/*.test.{ts,tsx}",
 ];
 
@@ -106,7 +107,7 @@ const qualityAppComponentTests = [
   "AgentReflectionsTab",
   "AgentTokenStatsPanel",
   "App",
-  "AuthTokenRecoveryDialog",
+  "AuthTokenRecoveryPage",
   "Board",
   "Board.canDropTask",
   "auto-merge-toggle-blank.mobile",
@@ -119,7 +120,6 @@ const qualityAppComponentTests = [
   "ChatView.default-model-icon",
   "ChatView.draft",
   "ChatView.hash-mention",
-  "ChatView.rooms",
   "ChatView.scroll-to-top",
   "ChatView.swipe-back",
   "Column",
@@ -243,10 +243,24 @@ velocity). Mirror the SettingsModal split: these 3 files live ONLY here (not in
 qualityAppComponentTests), so they must be spread into backfillAppExclude too — otherwise
 the broad `app/**` backfill glob re-collects them and they run in BOTH projects.
 */
+/*
+FNXC:ChatNavigation 2026-08-19-21:10:
+FN-054 requires the focused Chat lane to collect every suite that protects shared list-to-detail navigation. Keep responsive, history, creation, and mount contracts together so the task command cannot silently omit stale selector or split-pane assertions.
+*/
 const qualityAppChatOnlyTests = [
+  // FNXC:ChatComposerFocus 2026-09-01-01:04: Cross-host composer focus belongs in the shared list-to-detail Chat lane so pointer, touch, and retained Quick Chat ownership regressions run together.
+  "app/components/__tests__/ChatView.composer-focus.test.tsx",
+  "app/components/__tests__/ChatView.content-search.test.tsx",
   "app/components/__tests__/ChatView.core.test.tsx",
-  "app/components/__tests__/ChatView.sessions-rooms.test.tsx",
+  "app/components/__tests__/ChatView.core-contracts.test.tsx",
+  "app/components/__tests__/ChatView.context-window.test.tsx",
   "app/components/__tests__/ChatView.mobile.test.tsx",
+  "app/components/__tests__/ChatView.mobile-render.test.tsx",
+  "app/components/__tests__/ChatView.new-chat-default.test.tsx",
+  "app/components/__tests__/ChatView.open-at-latest.test.tsx",
+  "app/components/__tests__/ChatView.sessions-rooms.test.tsx",
+  "app/components/__tests__/ChatView.swipe-back.test.tsx",
+  "app/components/__tests__/overflowViewRegistry.chat.test.tsx",
   // FNXC:DashboardTests 2026-06-29-14:14: Task-detail chat typography regressions must run in the same chat quality lane as the required FN-7240 targeted command, so CSS-content assertions cannot fall through to broad backfill only.
   "app/components/__tests__/TaskChatTab.test.tsx",
 ];
@@ -337,6 +351,18 @@ The array stays empty; add new entries here only with a matching ledger row.
 FNXC:DashboardTestQuarantine 2026-07-16-09:00:
 FN-8077 removed routes-system.test.ts from this list and the ledger in lockstep. Its test now explicitly advances a fake Date-only clock between CPU samples, so unrelated route clock reads cannot stretch elapsed time under the loaded API lane; assertions and timeout policy are unchanged.
 */
+/*
+FNXC:DashboardTestQuarantine 2026-07-31-00:00:
+FN-8533 restores planning-browser-e2e after its teardown now closes Vite's listening socket,
+HMR channel, watcher, and plugin container deterministically. Browser viewport assertions are a
+required responsive acceptance lane, so the test must not remain excluded from dashboard-api.
+*/
+/*
+FNXC:DashboardTestQuarantine 2026-08-09-10:27:
+FN-8900 resolves the Kimi K3 quarantine before its 2026-08-15 ratchet deadline. The route test now
+uses pi-ai's real bundled catalog behind a no-refresh registry seam, after live refresh reproduced a
+roughly 300-second stall. Its paired ledger entry is removed in the same commit; no timeout or retry changed.
+*/
 const quarantinedDashboardTests: string[] = [
   /*
   FNXC:DashboardTestQuarantine 2026-07-17-16:50:
@@ -352,6 +378,22 @@ const quarantinedDashboardTests: string[] = [
   async-store or applicable mock/non-store contracts. Remove their ledger/exclude
   pairs so dashboard-api-quality-backfill collects the restored coverage.
   */
+];
+
+/*
+FNXC:DashboardTests 2026-08-13-17:10:
+Chromium CDP touch geometry needs its own opt-in project: browser launch is costly and binary-dependent,
+and coordinate hit testing cannot run in jsdom or an API shard. Keep this single spec outside both the
+quality backfill and deep API lanes so Chromium availability produces an explicit lane result, not duplicate coverage.
+*/
+/*
+FNXC:StandardizedViewLayout 2026-09-13-20:32:
+FN-379's rendered geometry (shared rail width, header creation placement, tactile back target, phone pane
+exclusivity) joins the existing touch lane so it is collected exactly once and self-gates without a local Chromium.
+*/
+const browserTouchTests = [
+  "src/__tests__/task-modal-touch-resize-browser.test.ts",
+  "src/__tests__/view-layout-browser.test.ts",
 ];
 
 const qualityApiTests = [
@@ -398,6 +440,7 @@ const qualityAppBackfillTests = ["app/**/*.test.{ts,tsx}"];
 
 const backfillApiExclude = [
   ...qualityApiTests,
+  ...browserTouchTests,
   /*
   FNXC:DashboardDistArtifacts 2026-07-17-15:10:
   FN-8245 reclassified plugin-registry-dist as a curated skip-list build-only
@@ -420,6 +463,7 @@ const qualityApiBackfillTests = ["src/**/*.test.{ts,tsx}"];
 const deepLaneEnabled = process.env.FUSION_DASHBOARD_DEEP === "1";
 const deepAppInclude = deepLaneEnabled ? ["app/**/*.test.{ts,tsx}"] : [];
 const deepApiInclude = deepLaneEnabled ? ["src/**/*.test.{ts,tsx}"] : [];
+const deepApiExclude = [...browserTouchTests, ...quarantinedDashboardTests];
 
 // Footgun guard: with the deep lanes gated off, selecting one explicitly
 // (`vitest run --project dashboard-app`) matches zero files and exits green in
@@ -481,6 +525,10 @@ export const dashboardQualityProjectGlobs = {
     include: qualityApiTests,
     exclude: quarantinedDashboardTests,
   },
+  "dashboard-browser-touch": {
+    include: browserTouchTests,
+    exclude: quarantinedDashboardTests,
+  },
   "dashboard-app-quality-backfill": {
     include: qualityAppBackfillTests,
     exclude: [...backfillAppExclude, ...quarantinedDashboardTests],
@@ -494,12 +542,30 @@ export const dashboardQualityProjectGlobs = {
 export default defineConfig({
   plugins: [react()],
   resolve: {
+    /*
+    FNXC:StandardizedPluginViews 2026-09-13-22:40:
+    Bundled plugin sources are authored as NodeNext ESM and import siblings with an explicit `.js` suffix.
+    Mapping that suffix back to the TypeScript sources lets the dashboard runner mount the REAL plugin
+    destinations for FN-379's shared-chrome proof instead of a stand-in, and it changes no production build.
+    */
+    extensionAlias: {
+      ".js": [".ts", ".tsx", ".js"],
+    },
     alias: {
       /*
       FNXC:GitHubImportTranslate 2026-07-15-09:30:
       Must precede the `@fusion/core` alias: Vite string aliases match by PREFIX, so the broader key would rewrite this subpath to `index.ts/detect-content-language` and fail to resolve.
       */
       "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/detect-content-language.ts"),
+      /*
+      FNXC:VitestAliases 2026-07-26-15:45:
+      Dashboard client tests import the browser-safe delete-attribution leaf through api/client.
+      Keep this exact alias before the broader core alias so Vite does not rewrite the subpath.
+      */
+      "@fusion/core/task-delete-attribution": resolve(__dirname, "../core/src/task-delete-attribution.ts"),
+      "@fusion/core/column-roles": resolve(__dirname, "../core/src/column-roles.ts"),
+      // FNXC:MemoryMcp 2026-08-11-00:19: Route tests use the Node-only factory subpath; browser components remain on the pure descriptor barrel.
+      "@fusion/core/mcp-builtin-servers": resolve(__dirname, "../core/src/config/mcp-builtin-servers.ts"),
       "@fusion/core": resolve(__dirname, "../core/src/index.ts"),
       "@fusion/engine": resolve(__dirname, "../engine/src/index.ts"),
       "@fusion/plugin-sdk": resolve(__dirname, "../plugin-sdk/src/index.ts"),
@@ -507,10 +573,11 @@ export default defineConfig({
       "@fusion/dashboard/app/components/TaskCard": resolve(__dirname, "app/components/TaskCard.tsx"),
       "@fusion/dashboard/app/components/ViewHeader": resolve(__dirname, "app/components/ViewHeader.tsx"),
       // FNXC:Quality 2026-07-19-12:00: Keep the Quality plugin's tokenized artifact-media bridge resolvable under host Vitest just as it is in the production dashboard bundle.
-      "@fusion/dashboard/app/api/task-content": resolve(__dirname, "app/api/task-content.ts"),
+      "@fusion/dashboard/app/api/tasks/task-content": resolve(__dirname, "app/api/tasks/task-content.ts"),
       "@fusion/dashboard/app/plugins/types": resolve(__dirname, "app/plugins/types.ts"),
+      // FNXC:StandardizedPluginViews 2026-09-13-22:40: Bundled plugin destinations adopt the cooperative header; keep that bridge resolvable when the host runner mounts the real plugin component.
+      "@fusion/dashboard/app/plugins/PluginDashboardViewHeader": resolve(__dirname, "app/plugins/PluginDashboardViewHeader.tsx"),
       "@fusion/dashboard/app/utils/projectStorage": resolve(__dirname, "app/utils/projectStorage.ts"),
-      "@fusion/dashboard/app/utils/taskStuck": resolve(__dirname, "app/utils/taskStuck.ts"),
       "@fusion-plugin-examples/droid-runtime/probe": resolve(
         __dirname,
         "../../plugins/fusion-plugin-droid-runtime/src/probe.ts",
@@ -621,6 +688,14 @@ export default defineConfig({
       "@fusion-plugin-examples/omp-runtime": resolve(
         __dirname,
         "../../plugins/fusion-plugin-omp-runtime/src/index.ts",
+      ),
+      "@fusion-plugin-examples/todos/dashboard-view": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-todos/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/todos": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-todos/src/index.ts",
       ),
       "@fusion-plugin-examples/roadmap/roadmap-suggestions": resolve(
         __dirname,
@@ -760,6 +835,18 @@ export default defineConfig({
       {
         extends: true,
         test: {
+          name: "dashboard-browser-touch",
+          environment: "node",
+          include: browserTouchTests,
+          exclude: quarantinedDashboardTests,
+          css: { include: [] },
+          testTimeout: 45_000,
+          hookTimeout: 45_000,
+        },
+      },
+      {
+        extends: true,
+        test: {
           name: "dashboard-api-quality-backfill",
           environment: "node",
           include: qualityApiBackfillTests,
@@ -790,7 +877,7 @@ export default defineConfig({
           // Empty unless FUSION_DASHBOARD_DEEP=1 (deep escape hatch); see the
           // dashboard-app note above.
           include: deepApiInclude,
-          exclude: quarantinedDashboardTests,
+          exclude: deepApiExclude,
           css: { include: [] },
         },
       },

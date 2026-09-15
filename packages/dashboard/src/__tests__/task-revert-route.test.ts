@@ -5,7 +5,7 @@ FNXC:TaskRevert 2026-07-04-00:00:
 API-level coverage for POST /tasks/:id/revert (FN-7523). The real git dry-run/
 classify/apply behavior is proven in packages/engine/src/__tests__/task-revert.real-git.test.ts —
 this suite stubs `performTaskRevert` at the route boundary and asserts:
-  - the done/archived guard (4xx for other columns, before the engine service is even called);
+  - the Done guard (4xx for other columns, before the engine service is even called);
   - the response contract shapes for clean / alreadyReverted / conflicting outcomes;
   - error mapping (TaskRevertError -> 409 for dirty-working-tree, 500 otherwise).
 */
@@ -158,6 +158,14 @@ function createMockStore(
     autoMerge?: boolean;
     aiUndoTaskWorkflowId?: string;
     knownWorkflowIds?: string[];
+    /*
+    FNXC:TaskRevert 2026-07-30-18:05 (PR #2766 review — greptile "cover every changed revert surface"):
+    Opt-in renamed board for the route. Supplying this stubs the two selection readers
+    `resolveWorkflowIrForTask` consults, so `resolveTerminalColumnsForTask` resolves the task's OWN
+    lanes instead of taking the `["done","archived"]` legacy fallback every other test in this file
+    rides on. Only the forwarding tests below pass it, so no existing expectation moves.
+    */
+    workflowIr?: unknown;
     rootDir?: string;
   },
 ): TaskStore {
@@ -180,10 +188,18 @@ function createMockStore(
   // FN-7556: `getWorkflowDefinition` backs the route's validation of a
   // configured (non-builtin) `aiUndoTaskWorkflowId`; default to "unknown" so
   // tests must explicitly declare a custom id as known via `knownWorkflowIds`.
-  const getWorkflowDefinition = vi.fn().mockImplementation(async (id: string) =>
-    (opts?.knownWorkflowIds ?? []).includes(id) ? { id, name: id, ir: {} } : undefined,
-  );
+  const getWorkflowDefinition = vi.fn().mockImplementation(async (id: string) => {
+    if (opts?.workflowIr && id === "wf-renamed") return { id, name: id, ir: opts.workflowIr };
+    return (opts?.knownWorkflowIds ?? []).includes(id) ? { id, name: id, ir: {} } : undefined;
+  });
+  const selectionReaders = opts?.workflowIr
+    ? {
+        getTaskWorkflowSelection: () => ({ workflowId: "wf-renamed", stepIds: [] }),
+        getTaskWorkflowSelectionAsync: async () => ({ workflowId: "wf-renamed", stepIds: [] }),
+      }
+    : {};
   return {
+    ...selectionReaders,
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({
       autoMerge: opts?.autoMerge ?? true,
@@ -195,6 +211,7 @@ function createMockStore(
     getTaskCommitAssociationsByLineageId: vi.fn().mockResolvedValue([]),
     createTask,
     findOpenRevertTaskForSource,
+    recordPatchnodeRevert: vi.fn().mockResolvedValue(null),
     updateTask: vi.fn().mockImplementation(async (_id: string, updates: { sourceMetadataPatch?: Record<string, unknown> }) => {
       if (updates.sourceMetadataPatch) {
         task.sourceMetadata = { ...task.sourceMetadata, ...updates.sourceMetadataPatch };
@@ -204,6 +221,13 @@ function createMockStore(
     updatePrInfo: vi.fn().mockResolvedValue(task),
     addPrInfo: vi.fn().mockResolvedValue(task),
     logEntry: vi.fn().mockResolvedValue(undefined),
+    /*
+    FNXC:PluginMcpServers 2026-07-24-01:25:
+    FN-8491 (3cd023fa4) binds a project-scoped plugin-MCP provider on every getProjectContext.
+    Exposing getProjectScopedPluginMcpServers marks this mock as runtime-owned so the binder
+    short-circuits instead of calling getPluginStore().
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
     on: vi.fn(),
     off: vi.fn(),
   } as unknown as TaskStore;
@@ -240,23 +264,60 @@ describe("POST /tasks/:id/revert", () => {
     const res = await REQUEST(createApp(store), "POST", `/api/tasks/${task.id}/revert`);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ mode: "git", clean: true, revertCommitSha: "abc123" });
+    expect(store.recordPatchnodeRevert as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(task.id, {
+      occurredAt: expect.any(String),
+      revertCommitSha: "abc123",
+    });
     expect(store.updateTask as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(task.id, {
       sourceMetadataPatch: expect.objectContaining({ revertedAt: expect.any(String), revertedCommitSha: "abc123" }),
     });
+    expect((store.recordPatchnodeRevert as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]).toBeLessThan(
+      (store.updateTask as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!,
+    );
     expect(performTaskRevertMock).toHaveBeenCalledTimes(1);
   });
 
   it("returns an alreadyReverted result without invoking a second commit", async () => {
-    const task = makeTask({ column: "archived" });
+    const task = makeTask({ column: "done" });
     const store = createMockStore(task);
     performTaskRevertMock.mockResolvedValue({ mode: "git", clean: true, alreadyReverted: true });
 
     const res = await REQUEST(createApp(store), "POST", `/api/tasks/${task.id}/revert`);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ mode: "git", clean: true, alreadyReverted: true });
+    expect(store.recordPatchnodeRevert as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
     expect(store.updateTask as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(task.id, {
       sourceMetadataPatch: expect.objectContaining({ revertedAt: expect.any(String) }),
     });
+  });
+
+  /*
+  FNXC:TaskRevert 2026-08-28-22:17:
+  Original delivery → revert → re-delivery → already-reverted retry. The retry cancelled nothing new, so it must re-affirm the FIRST cancellation episode pinned to the delivery in effect then, and must NOT restamp the latest-only marker — a fresh marker re-points reconciliation at the live re-delivery and erases shipped work from the day it shipped on.
+  */
+  it("re-affirms the recorded cancellation instead of cancelling a re-delivery on an already-reverted retry", async () => {
+    const firstRevertedAt = "2026-08-28T12:00:00.000Z";
+    const task = makeTask({
+      column: "done",
+      summary: "second delivery",
+      sourceMetadata: { revertedAt: firstRevertedAt, revertedCommitSha: "first-revert" },
+    } as Partial<Task>);
+    const store = createMockStore(task);
+    performTaskRevertMock.mockResolvedValue({ mode: "git", clean: true, alreadyReverted: true });
+
+    const res = await REQUEST(createApp(store), "POST", `/api/tasks/${task.id}/revert`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ mode: "git", clean: true, alreadyReverted: true });
+    expect(store.recordPatchnodeRevert as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(task.id, {
+      occurredAt: firstRevertedAt,
+      revertCommitSha: "first-revert",
+      pairWithDeliveryAtOrBefore: true,
+    });
+    expect(store.updateTask as ReturnType<typeof vi.fn>).not.toHaveBeenCalledWith(
+      task.id,
+      expect.objectContaining({ sourceMetadataPatch: expect.anything() }),
+    );
+    expect(task.sourceMetadata).toMatchObject({ revertedAt: firstRevertedAt, revertedCommitSha: "first-revert" });
   });
 
   it("mode:'git' returns a conflicting result without creating an AI-undo follow-up task (FN-7524: default mode is now 'auto', which DOES fall back to AI on conflict — explicit 'git' is required to preserve the FN-7523 git-only contract)", async () => {
@@ -277,14 +338,14 @@ describe("POST /tasks/:id/revert", () => {
     });
   });
 
-  it("rejects a non-done/archived task with a 4xx guard before invoking the engine service", async () => {
+  it("rejects a non-complete task with a 4xx guard before invoking the engine service", async () => {
     const task = makeTask({ column: "in-progress" });
     const store = createMockStore(task);
 
     const res = await REQUEST(createApp(store), "POST", `/api/tasks/${task.id}/revert`);
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(res.status).toBeLessThan(500);
-    expect(String((res.body as { error?: string }).error ?? "")).toMatch(/done\/archived/i);
+    expect(String((res.body as { error?: string }).error ?? "")).toMatch(/completed/i);
     expect(performTaskRevertMock).not.toHaveBeenCalled();
   });
 
@@ -329,6 +390,77 @@ describe("POST /tasks/:id/revert", () => {
     expect(performTaskRevertMock).not.toHaveBeenCalled();
   });
 
+  /*
+  FNXC:TaskRevert 2026-07-30-18:05 (PR #2766 review — greptile "cover every changed revert surface"):
+
+  THE ROUTE MUST HAND ITS RESOLVED TERMINAL LANES TO THE SERVICE.
+
+  This change made the route resolve terminal lanes by role AND forward that set to the service so
+  the service's defence-in-depth guard answers the same question. Before it, the route admitted a
+  revert on a renamed board and the service refused it with its own hardcoded `done`/`archived` —
+  a dead end reached from an affordance both the UI and the route offer.
+
+  WHY THESE TESTS EXIST. The engine-side tests drive `performTaskRevert`/`revertWorkspaceTask`
+  directly, so they pass their own `revertableColumns` and can never observe whether the ROUTE
+  supplies it. Deleting `revertableColumns: terminalColumns` from either call site left all 26
+  engine tests green and `tsc` clean — measured, not assumed. These are the tests that fail.
+
+  Both call sites are covered because they are separate literals in separate branches: the
+  single-repo one and the workspace one can regress independently.
+  */
+  const RENAMED_TERMINAL_IR = {
+    version: "v2",
+    id: "wf-renamed",
+    name: "renamed",
+    nodes: [],
+    edges: [],
+    columns: [
+      { id: "building", name: "Building", traits: [{ trait: "wip" }] },
+      { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
+    ],
+  };
+
+  it("forwards the route's RESOLVED terminal lanes to performTaskRevert (single-repo, renamed board)", async () => {
+    const task = makeTask({ column: "shipped" });
+    const store = createMockStore(task, { workflowIr: RENAMED_TERMINAL_IR });
+    performTaskRevertMock.mockResolvedValue({ mode: "git", clean: true, revertCommitSha: "abc123" });
+
+    const res = await REQUEST(createApp(store), "POST", `/api/tasks/${task.id}/revert`);
+
+    expect(res.status).toBe(200);
+    expect(performTaskRevertMock).toHaveBeenCalledTimes(1);
+    const forwarded = (performTaskRevertMock.mock.calls[0] as unknown[]).find(
+      (arg): arg is { revertableColumns?: Iterable<string> } =>
+        typeof arg === "object" && arg !== null && "revertableColumns" in arg,
+    );
+    /*
+    The set itself, not merely its presence: forwarding the legacy `done` id would still refuse this card.
+    */
+    expect(forwarded).toBeDefined();
+    expect([...(forwarded?.revertableColumns ?? [])]).toEqual(["shipped"]);
+  });
+
+  it("forwards the route's RESOLVED terminal lanes to revertWorkspaceTask (workspace, renamed board)", async () => {
+    const task = makeWorkspaceTask({ column: "shipped" });
+    const store = createMockStore(task, { workflowIr: RENAMED_TERMINAL_IR });
+    revertWorkspaceTaskMock.mockResolvedValue({
+      mode: "git",
+      clean: true,
+      workspace: { repos: [{ repo: "repo-a", classification: "clean", revertCommitSha: "rev-a" }] },
+    });
+
+    const res = await REQUEST(createApp(store), "POST", `/api/tasks/${task.id}/revert`);
+
+    expect(res.status).toBe(200);
+    expect(revertWorkspaceTaskMock).toHaveBeenCalledTimes(1);
+    const forwarded = (revertWorkspaceTaskMock.mock.calls[0] as unknown[]).find(
+      (arg): arg is { revertableColumns?: Iterable<string> } =>
+        typeof arg === "object" && arg !== null && "revertableColumns" in arg,
+    );
+    expect(forwarded).toBeDefined();
+    expect([...(forwarded?.revertableColumns ?? [])]).toEqual(["shipped"]);
+  });
+
   it("dispatches a done workspace task to revertWorkspaceTask and returns the per-repo breakdown (clean)", async () => {
     const task = makeWorkspaceTask({ column: "done" });
     const store = createMockStore(task);
@@ -358,7 +490,7 @@ describe("POST /tasks/:id/revert", () => {
   });
 
   it("mode:'git' dispatches a workspace task conflict to the per-repo conflict shape without creating an AI-undo task or calling performTaskRevert", async () => {
-    const task = makeWorkspaceTask({ column: "archived" });
+    const task = makeWorkspaceTask({ column: "done" });
     const store = createMockStore(task);
     revertWorkspaceTaskMock.mockResolvedValue({
       mode: "git",
@@ -385,7 +517,7 @@ describe("POST /tasks/:id/revert", () => {
   // FN-7547 + FN-7524: default mode is "auto", which falls back to the AI-undo
   // task on a conflicting WORKSPACE result too, same as the single-repo contract.
   it("auto (default) mode falls back to the AI-undo task on a conflicting workspace result", async () => {
-    const task = makeWorkspaceTask({ id: "FN-950", column: "archived" });
+    const task = makeWorkspaceTask({ id: "FN-950", column: "done" });
     const store = createMockStore(task);
     revertWorkspaceTaskMock.mockResolvedValue({
       mode: "git",
@@ -406,7 +538,7 @@ describe("POST /tasks/:id/revert", () => {
     expect(performTaskRevertMock).not.toHaveBeenCalled();
   });
 
-  it("rejects a non-done/archived workspace task with a 4xx guard before invoking the workspace service", async () => {
+  it("rejects a non-complete workspace task with a 4xx guard before invoking the workspace service", async () => {
     const task = makeWorkspaceTask({ column: "in-progress" });
     const store = createMockStore(task);
 
@@ -763,7 +895,7 @@ describe("POST /tasks/:id/revert — FN-7554 mode:'pr' (autoMerge:false)", () =>
     expect(performTaskRevertMock).toHaveBeenCalledTimes(1);
   });
 
-  it("regression — non-done/archived guard unchanged: still 4xx before any engine/GitHub call", async () => {
+  it("regression — non-complete guard stays 4xx before any engine/GitHub call", async () => {
     process.env.GITHUB_REPOSITORY = "o/r";
     const task = makeTask({ id: "FN-971", column: "in-progress" });
     const store = createMockStore(task, { autoMerge: false });

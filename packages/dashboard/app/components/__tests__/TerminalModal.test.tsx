@@ -15,13 +15,15 @@ import {
   XTERM_FONT_FAMILY,
   resolveTerminalFontFamily,
 } from "../../utils/terminalPreferences";
+import { ConfirmDialogProvider } from "../../hooks/useConfirm";
 import * as useTerminalModule from "../../hooks/useTerminal";
 import * as useTerminalSessionsModule from "../../hooks/useTerminalSessions";
 import * as useWorkspacesModule from "../../hooks/useWorkspaces";
 import * as apiModule from "../../api";
 import { loadAllAppCss } from "../../test/cssFixture";
+import { readAppFile } from "../../test/cssFixture";
 
-const terminalModalCss = readFileSync("app/components/TerminalModal.css", "utf8");
+const terminalModalCss = readAppFile("components/TerminalModal.css");
 
 function splitFontFamilies(stack: string): string[] {
   return stack
@@ -44,6 +46,39 @@ function expectTextSizeAdjustmentDisabledForExactXtermMetrics(cssSource: string)
 
 function defineMetric(element: Element, property: "clientWidth" | "scrollWidth", value: number) {
   Object.defineProperty(element, property, { configurable: true, value });
+}
+
+function expectTerminalDisplayModeControlsBeforeClose(): void {
+  const header = document.querySelector<HTMLElement>(".terminal-header");
+  expect(header).not.toBeNull();
+
+  const pinToggle = screen.getByTestId("terminal-pin-toggle");
+  const popoutToggle = screen.getByTestId("terminal-popout-toggle");
+  const closeButton = screen.getByTestId("terminal-close-btn");
+
+  for (const control of [pinToggle, popoutToggle]) {
+    expect(control.parentElement).toBe(header);
+    expect(control.compareDocumentPosition(closeButton) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+  expect(popoutToggle.nextElementSibling).toBe(closeButton);
+  expect(header!.querySelector(".terminal-actions")).toBeNull();
+}
+
+function expectTerminalCloseAfterNewTerminal(newTerminalTestId: string): void {
+  const header = document.querySelector<HTMLElement>(".terminal-header");
+  expect(header).not.toBeNull();
+
+  const closeButtons = screen.getAllByTestId("terminal-close-btn");
+  expect(closeButtons).toHaveLength(1);
+  const closeButton = closeButtons[0];
+  const newTerminalButton = screen.getByTestId(newTerminalTestId);
+
+  expect(header).toContainElement(closeButton);
+  expect(newTerminalButton.compareDocumentPosition(closeButton) & Node.DOCUMENT_POSITION_FOLLOWING)
+    .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  expect(Array.from(header!.querySelectorAll("button")).at(-1)).toBe(closeButton);
+  expect(header!.querySelector(".terminal-actions")).toBeNull();
 }
 
 // Mock hooks and API
@@ -322,6 +357,26 @@ describe("evaluateTabsOverflow", () => {
   });
 });
 
+/*
+FNXC:TerminalSharing 2026-08-19-04:10:
+Closing a tab now asks which close was meant, because PTYs are shared: "Close in this browser"
+detaches and leaves the session running for other viewers, "End session" kills it for everyone.
+These helpers drive that prompt so the desktop and mobile close controls are both proven to route
+through it — the mobile control was a second, separate call site that an earlier UI change would
+have left on the old always-kill path.
+*/
+function renderWithConfirm(ui: React.ReactElement) {
+  return render(<ConfirmDialogProvider>{ui}</ConfirmDialogProvider>);
+}
+
+async function chooseCloseIntent(intent: "detach" | "end"): Promise<void> {
+  const label = intent === "detach" ? "Close in this browser" : "End session";
+  const button = await screen.findByRole("button", { name: label });
+  await act(async () => {
+    fireEvent.click(button);
+  });
+}
+
 // Default tab state
 const defaultTab = {
   id: "tab-1",
@@ -335,6 +390,7 @@ const defaultSessionState = {
   tabs: [defaultTab],
   activeTab: defaultTab,
   isReady: true,
+  autoCreateDisabled: false,
   bootstrapError: null,
   createTab: vi.fn(),
   closeTab: vi.fn(),
@@ -343,6 +399,9 @@ const defaultSessionState = {
   restartActiveTab: vi.fn(),
   retryBootstrap: vi.fn(),
   replaceActiveTabSession: vi.fn().mockResolvedValue(undefined),
+  detachedSessions: [],
+  refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+  reopenSession: vi.fn(),
 };
 
 describe("TerminalModal", () => {
@@ -457,6 +516,29 @@ describe("TerminalModal", () => {
     expect(container.firstChild).toBeNull();
   });
 
+  /*
+  FNXC:TaskPopupViewGating 2026-07-23-10:40:
+  FN remount-churn fix follow-up (PR #2420 review): kept-alive hosts keep isOpen=true and pass
+  active=false. The terminal must stay mounted (xterm + WS survive) while its auxiliary handlers —
+  here observable via the document Escape keydown — are suspended, then resume on reveal.
+  */
+  it("stays mounted but suspends auxiliary keydown handling while active=false, resuming on reveal", async () => {
+    const { rerender } = render(<TerminalModal isOpen={true} active={false} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-modal")).toBeTruthy();
+    });
+
+    // Suspended: the hidden terminal must not swallow Escape or close itself.
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(mockOnClose).not.toHaveBeenCalled();
+
+    // Reveal: the Escape handler re-registers and behaves exactly as before.
+    rerender(<TerminalModal isOpen={true} active={true} onClose={mockOnClose} />);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(mockOnClose).toHaveBeenCalledTimes(1);
+  });
+
   it("renders embedded mode in-flow without overlay chrome while keeping shell tabs", async () => {
     const { container } = render(
       <TerminalModal
@@ -479,6 +561,9 @@ describe("TerminalModal", () => {
     expect(screen.queryByTestId("terminal-close-btn")).toBeNull();
     expect(screen.queryByTestId("terminal-popout-toggle")).toBeNull();
     expect(screen.queryByTestId("terminal-pin-toggle")).toBeNull();
+    expect(screen.queryByTestId("terminal-drag-grip")).toBeNull();
+    expect(screen.queryByTestId("terminal-actions")).toBeNull();
+    expect(container.querySelector(".terminal-header .terminal-actions")).toBeNull();
     expect(screen.getByTestId("terminal-tabs")).toBeTruthy();
     expect(mockUseTerminalSessions).toHaveBeenCalledWith("proj-123", {
       storageScope: "task:FN-7813",
@@ -687,7 +772,7 @@ describe("TerminalModal", () => {
     const listbox = screen.getByRole("listbox", { name: "Select terminal workspace" });
     expect(listbox.parentElement).toBe(document.body);
     expect(requestAnimationFrameSpy).toHaveBeenCalled();
-    expect(Number.parseFloat(listbox.style.zIndex)).toBeGreaterThan(Number.parseFloat(modal.style.zIndex));
+    expect(Number.parseFloat(listbox.style.zIndex)).toBeGreaterThan(Number.parseFloat(screen.getByTestId("terminal-modal-overlay").style.zIndex));
     expect(listbox.style.top).not.toBe("");
     expect(listbox.style.left).not.toBe("");
     expect(listbox.style.width).not.toBe("");
@@ -934,15 +1019,24 @@ describe("TerminalModal", () => {
 
     const modal = await screen.findByTestId("terminal-modal");
     expect(modal).toHaveClass("terminal-modal--docked");
+    expect(screen.queryByTestId("terminal-drag-grip")).toBeNull();
     expect(screen.getByTestId("terminal-docked-resize-handle")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("terminal-popout-toggle"));
 
     await waitFor(() => {
-      expect(modal).toHaveClass("terminal-modal--floating");
-      expect(modal).not.toHaveClass("terminal-modal--docked");
-      expect(screen.getByTestId("terminal-floating-resize-se")).toBeInTheDocument();
+      expect(screen.getByTestId("terminal-modal")).toHaveClass("terminal-modal--floating");
+      expect(screen.getByTestId("terminal-modal")).not.toHaveClass("terminal-modal--docked");
+      expect(screen.queryByTestId("terminal-drag-grip")).toBeNull();
+      expect(screen.getByTestId("floating-window-resize-se")).toBeInTheDocument();
     });
+
+    const floatingWindow = screen.getByTestId("floating-window-terminal-popout-toggle-test") as HTMLElement & {
+      setPointerCapture: (pointerId: number) => void;
+    };
+    floatingWindow.setPointerCapture = vi.fn();
+    fireEvent.pointerDown(screen.getByTestId("terminal-popout-toggle"), { pointerId: 73, clientX: 100, clientY: 100 });
+    expect(floatingWindow.setPointerCapture).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByTestId("terminal-popout-toggle"));
 
@@ -1180,20 +1274,20 @@ describe("TerminalModal", () => {
   it("exposes floating drag and resize handles and refits after floating resize", async () => {
     const projectId = "floating-resize-test";
     window.localStorage.setItem(`fusion:terminal-display-mode-${projectId}`, "floating");
-    window.localStorage.removeItem(`fusion:terminal-modal-size-${projectId}`);
-    window.localStorage.removeItem(`fusion:terminal-float-pos-${projectId}`);
+    window.localStorage.removeItem(`fusion:terminal-float-geometry-${projectId}`);
+    window.localStorage.removeItem(`fusion:terminal-float-geometry-${projectId}`);
 
     render(<TerminalModal isOpen={true} onClose={mockOnClose} projectId={projectId} />);
 
     const modal = await screen.findByTestId("terminal-modal");
     await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
     expect(modal).toHaveClass("terminal-modal--floating");
-    expect(screen.getByTestId("terminal-floating-resize-n")).toBeInTheDocument();
-    expect(screen.getByTestId("terminal-floating-resize-se")).toBeInTheDocument();
+    expect(screen.getByTestId("floating-window-resize-n")).toBeInTheDocument();
+    expect(screen.getByTestId("floating-window-resize-se")).toBeInTheDocument();
 
     const fitCallBaseline = mockFitAddonFit.mock.calls.length;
     // FNXC:Terminal 2026-06-22-19:50: Floating resize/drag now capture the pointer and listen on the CAPTURED element (not document); fire move/up on that element with the matching pointerId and stub set/releasePointerCapture.
-    const resizeHandle = screen.getByTestId("terminal-floating-resize-se") as HTMLElement & { setPointerCapture: (pointerId: number) => void; releasePointerCapture: (pointerId: number) => void };
+    const resizeHandle = screen.getByTestId("floating-window-resize-se") as HTMLElement & { setPointerCapture: (pointerId: number) => void; releasePointerCapture: (pointerId: number) => void };
     resizeHandle.setPointerCapture = vi.fn();
     resizeHandle.releasePointerCapture = vi.fn();
 
@@ -1202,7 +1296,7 @@ describe("TerminalModal", () => {
     fireEvent.pointerUp(resizeHandle, { pointerId: 1 });
 
     await waitFor(() => {
-      expect(window.localStorage.getItem(`fusion:terminal-modal-size-${projectId}`)).toBe(JSON.stringify({ width: 992, height: 590 }));
+      expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").size).toEqual({ width: 992, height: 590 });
       expect(mockFitAddonFit.mock.calls.length).toBeGreaterThan(fitCallBaseline);
     });
 
@@ -1214,18 +1308,281 @@ describe("TerminalModal", () => {
     fireEvent.pointerUp(header, { pointerId: 2, pointerType: "touch" });
 
     await waitFor(() => {
-      expect(window.localStorage.getItem(`fusion:terminal-float-pos-${projectId}`)).toBeTruthy();
+      expect(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`)).toBeTruthy();
     });
   });
 
-  it("keeps the floating terminal touch-draggable with theme-controlled shadow", () => {
-    const panelRule = terminalModalCss.match(/\.modal\.terminal-modal\.terminal-modal--floating\s*\{([^}]*)\}/)?.[1] ?? "";
-    const headerRule = terminalModalCss.match(/\.terminal-header--draggable\s*\{([^}]*)\}/)?.[1] ?? "";
+  it("keeps a keyboard-shrunken touch tablet floating, movable, and resizable", async () => {
+    const projectId = "touch-tablet-terminal-geometry";
+    const previousInnerWidth = window.innerWidth;
+    const previousInnerHeight = window.innerHeight;
+    const previousScreen = Object.getOwnPropertyDescriptor(window, "screen");
+    const previousMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    const previousVisualViewport = window.visualViewport;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1200 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 900 });
+    Object.defineProperty(window, "screen", { configurable: true, value: { width: 1024, height: 768 } });
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    Object.defineProperty(window, "visualViewport", {
+      configurable: true,
+      value: { width: 900, height: 400, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+    });
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    window.localStorage.setItem(`fusion:terminal-display-mode-${projectId}`, "floating");
 
-    expect(panelRule).toContain("box-shadow: var(--floating-window-shadow, var(--shadow-lg));");
-    expect(headerRule).toContain("touch-action: none;");
-    expect(headerRule).toContain("min-height: 48px;");
-    expect(terminalModalCss).not.toContain("var(--shadow-xl)");
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} projectId={projectId} />);
+      const modal = await screen.findByTestId("terminal-modal");
+      await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+      expect(modal).toHaveClass("terminal-modal--floating");
+      expect(screen.getByTestId("floating-window-resize-se")).toHaveAttribute("aria-label", "Resize floating window");
+
+      const fitCallBaseline = mockFitAddonFit.mock.calls.length;
+      const resizeHandle = screen.getByTestId("floating-window-resize-se") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      resizeHandle.setPointerCapture = vi.fn();
+      resizeHandle.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(resizeHandle, { pointerId: 41, pointerType: "touch", clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(resizeHandle, { pointerId: 99, pointerType: "touch", clientX: 300, clientY: 300 });
+      fireEvent.pointerMove(resizeHandle, { pointerId: 41, pointerType: "touch", clientX: 180, clientY: 170 });
+      fireEvent.pointerUp(resizeHandle, { pointerId: 41, pointerType: "touch" });
+
+      await waitFor(() => {
+        expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").size).toEqual({ width: 1040, height: 630 });
+        expect(mockFitAddonFit.mock.calls.length).toBeGreaterThan(fitCallBaseline);
+      });
+
+      const header = modal.querySelector(".terminal-header") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      header.setPointerCapture = vi.fn();
+      header.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(header, { pointerId: 42, pointerType: "touch", clientX: 300, clientY: 100 });
+      fireEvent.pointerMove(header, { pointerId: 42, pointerType: "touch", clientX: 200, clientY: 140 });
+      fireEvent.pointerUp(header, { pointerId: 42, pointerType: "touch" });
+
+      await waitFor(() => {
+        expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").position.x).toBe(44);
+      });
+
+      fireEvent.pointerDown(header, { pointerId: 43, pointerType: "touch", clientX: 200, clientY: 140 });
+      fireEvent.pointerMove(header, { pointerId: 43, pointerType: "touch", clientX: 100, clientY: 140 });
+      fireEvent.pointerCancel(header, { pointerId: 43, pointerType: "touch" });
+      expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").position.x).toBe(16);
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: previousInnerWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousInnerHeight });
+      if (previousScreen) Object.defineProperty(window, "screen", previousScreen);
+      if (previousMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", previousMaxTouchPoints);
+      Object.defineProperty(window, "visualViewport", { configurable: true, value: previousVisualViewport });
+    }
+  });
+
+  it("keeps a touch tablet at the 768px boundary floating, movable, and resizable", async () => {
+    const projectId = "tablet-boundary-terminal-geometry";
+    const previousInnerWidth = window.innerWidth;
+    const previousInnerHeight = window.innerHeight;
+    const previousScreen = Object.getOwnPropertyDescriptor(window, "screen");
+    const previousMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 768 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 1024 });
+    Object.defineProperty(window, "screen", { configurable: true, value: { width: 768, height: 1024 } });
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: query === "(max-width: 768px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    window.localStorage.setItem(`fusion:terminal-display-mode-${projectId}`, "floating");
+    const styleEl = document.createElement("style");
+    styleEl.textContent = loadAllAppCss();
+    document.head.appendChild(styleEl);
+
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} projectId={projectId} />);
+      const modal = await screen.findByTestId("terminal-modal");
+      await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+      expect(modal).toHaveClass("terminal-modal--tablet", "terminal-modal--floating");
+      expect(modal).not.toHaveClass("terminal-modal--mobile");
+      expect(screen.getByTestId("terminal-drag-grip")).toBeInTheDocument();
+      // The 768px CSS fallback is full-screen only for true phones. A known
+      // tablet must win that cascade with its stored floating geometry.
+      const modalStyle = screen.getByTestId(`floating-window-terminal-${projectId}`).style;
+      expect(modalStyle.width).not.toBe("");
+      expect(modalStyle.height).not.toBe("");
+
+      const resizeHandle = screen.getByTestId("floating-window-resize-se") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      resizeHandle.setPointerCapture = vi.fn();
+      resizeHandle.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(resizeHandle, { pointerId: 51, pointerType: "touch", clientX: 200, clientY: 200 });
+      fireEvent.pointerMove(resizeHandle, { pointerId: 51, pointerType: "touch", clientX: 120, clientY: 180 });
+      fireEvent.pointerUp(resizeHandle, { pointerId: 51, pointerType: "touch" });
+      await waitFor(() => {
+        expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").size).toEqual({ width: 656, height: 540 });
+      });
+
+      const header = modal.querySelector(".terminal-header") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      header.setPointerCapture = vi.fn();
+      header.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(header, { pointerId: 52, pointerType: "touch", clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(header, { pointerId: 52, pointerType: "touch", clientX: 180, clientY: 140 });
+      fireEvent.pointerUp(header, { pointerId: 52, pointerType: "touch" });
+      await waitFor(() => {
+        expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").position.x).toBe(96);
+      });
+    } finally {
+      styleEl.remove();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: previousInnerWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousInnerHeight });
+      if (previousScreen) Object.defineProperty(window, "screen", previousScreen);
+      if (previousMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", previousMaxTouchPoints);
+    }
+  });
+
+  it("gives tablet floating terminals a real touch drag grip without affecting other presentations", async () => {
+    const projectId = "tablet-terminal-drag-grip";
+    const previousInnerWidth = window.innerWidth;
+    const previousInnerHeight = window.innerHeight;
+    const previousScreen = Object.getOwnPropertyDescriptor(window, "screen");
+    const previousMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    const setActiveTab = vi.fn();
+    const tabs = [
+      defaultTab,
+      { ...defaultTab, id: "tab-2", title: "a deliberately long second terminal tab", isActive: false },
+      { ...defaultTab, id: "tab-3", title: "a deliberately long third terminal tab", isActive: false },
+    ];
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 768 });
+    Object.defineProperty(window, "screen", { configurable: true, value: { width: 1024, height: 768 } });
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: query === "(min-width: 769px) and (max-width: 1024px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    window.localStorage.setItem(`fusion:terminal-display-mode-${projectId}`, "floating");
+    mockUseTerminalSessions.mockReturnValue({ ...defaultSessionState, tabs, activeTab: tabs[0], setActiveTab });
+
+    try {
+      const { unmount } = render(<TerminalModal isOpen={true} onClose={mockOnClose} projectId={projectId} />);
+      const modal = await screen.findByTestId("terminal-modal");
+      const panel = screen.getByTestId(`floating-window-terminal-${projectId}`) as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      const grip = screen.getByTestId("terminal-drag-grip");
+      panel.setPointerCapture = vi.fn();
+      panel.releasePointerCapture = vi.fn();
+
+      expect(modal).toHaveClass("terminal-modal--tablet", "terminal-modal--floating");
+      expect(modal).not.toHaveClass("terminal-modal--mobile");
+      expect(grip).toHaveAttribute("aria-hidden", "true");
+      expect(grip.previousElementSibling).toBeNull();
+      expect(grip.tagName).toBe("DIV");
+
+      const initialLeft = panel.style.left;
+      const initialTop = panel.style.top;
+      fireEvent.pointerDown(grip, { pointerId: 63, pointerType: "touch", clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(grip, { pointerId: 63, pointerType: "touch", clientX: 20, clientY: 20 });
+      fireEvent.pointerUp(grip, { pointerId: 63, pointerType: "touch" });
+      await waitFor(() => {
+        expect(panel.setPointerCapture).toHaveBeenCalledWith(63);
+        expect(panel.style.left).not.toBe(initialLeft);
+        expect(panel.style.top).not.toBe(initialTop);
+        expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-geometry-${projectId}`) ?? "{}").position).toEqual({ x: 16, y: 80 });
+      });
+
+      fireEvent.pointerDown(screen.getAllByRole("tab")[1], { pointerId: 64, pointerType: "touch" });
+      fireEvent.click(screen.getAllByRole("tab")[1]);
+      expect(setActiveTab).toHaveBeenCalledWith("tab-2");
+      expect(panel.setPointerCapture).toHaveBeenCalledTimes(1);
+
+      /*
+      FNXC:TerminalModalControls 2026-08-01-03:48:
+      Empty strip space behind the tabs is a drag surface: a press that starts on the
+      `.terminal-tabs` container itself (not inside a `.terminal-tab`) must bubble to the
+      FloatingWindow `.terminal-header` delegated drag handle and move the window.
+      */
+      const tabStrip = screen.getByTestId("terminal-tabs");
+      const preDragLeft = panel.style.left;
+      fireEvent.pointerDown(tabStrip, { pointerId: 65, pointerType: "touch", clientX: 300, clientY: 40 });
+      fireEvent.pointerMove(panel, { pointerId: 65, pointerType: "touch", clientX: 380, clientY: 90 });
+      fireEvent.pointerUp(panel, { pointerId: 65, pointerType: "touch", clientX: 380, clientY: 90 });
+      await waitFor(() => {
+        expect(panel.setPointerCapture).toHaveBeenCalledTimes(2);
+        expect(panel.style.left).not.toBe(preDragLeft);
+      });
+      unmount();
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: previousInnerWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousInnerHeight });
+      if (previousScreen) Object.defineProperty(window, "screen", previousScreen);
+      if (previousMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", previousMaxTouchPoints);
+    }
+  });
+
+  /*
+  FNXC:TerminalModalControls 2026-08-01-03:48:
+  Supersedes the FN-8633 grip-isolation contract: the operator wants the floating terminal
+  draggable from the empty strip space behind the tabs and anywhere in the top toolbar. The
+  tablet floating header AND tab strip hand the whole touch gesture to FloatingWindow's pointer
+  drag (`touch-action: none`); native strip panning is moot because an overflowing strip is
+  replaced by the mobile-tabs dropdown. The grip remains as the visible movability affordance.
+  */
+  it("makes the whole tablet floating header a touch drag surface while keeping the grip affordance", () => {
+    const gripSelector = ".modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-header__drag-grip";
+    const gripSelectorIndex = terminalModalCss.indexOf(gripSelector);
+    const gripRuleEnd = terminalModalCss.indexOf("}", gripSelectorIndex);
+    const gripRule = terminalModalCss.slice(gripSelectorIndex, gripRuleEnd);
+    const headerTouchSelector = ".modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-header,\n.modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-tabs";
+    const headerTouchIndex = terminalModalCss.indexOf(headerTouchSelector);
+    const headerTouchRule = terminalModalCss.slice(headerTouchIndex, terminalModalCss.indexOf("}", headerTouchIndex));
+
+    expect(gripSelectorIndex).toBeGreaterThan(-1);
+    expect(gripRule).toContain("min-block-size: var(--modal-resize-touch-target);");
+    expect(gripRule).toContain("min-inline-size: var(--modal-resize-touch-target);");
+    expect(gripRule).toContain("touch-action: none;");
+    expect(headerTouchIndex).toBeGreaterThan(-1);
+    expect(headerTouchRule).toContain("touch-action: none;");
+    // Grab affordance on the floating header/strip; real tabs keep the base pointer cursor.
+    expect(terminalModalCss).toContain(".modal.terminal-modal.terminal-modal--floating .terminal-header,\n.modal.terminal-modal.terminal-modal--floating .terminal-tabs {\n  cursor: grab;");
+    expect(terminalModalCss.slice(0, gripSelectorIndex)).not.toContain("@media (min-width: 769px)");
+    expect(loadAllAppCss()).toContain(gripSelector);
+  });
+
+  it("keeps the floating terminal touch-draggable with theme-controlled shadow", () => {
+    const floatingWindowCss = readAppFile("components/FloatingWindow.css");
+    expect(floatingWindowCss).toContain("box-shadow: var(--floating-window-shadow, var(--shadow-lg));");
+    expect(floatingWindowCss).toContain(".floating-window__delegated-drag-handle");
+    expect(floatingWindowCss).not.toContain("var(--shadow-xl)");
   });
 
   it("keeps mobile terminal on the full-screen modal path without docked or floating controls", async () => {
@@ -1242,7 +1599,8 @@ describe("TerminalModal", () => {
       expect(modal).not.toHaveClass("terminal-modal--floating");
       expect(screen.queryByTestId("terminal-docked-resize-handle")).toBeNull();
       expect(screen.queryByTestId("terminal-popout-toggle")).toBeNull();
-      expect(screen.queryByTestId("terminal-floating-resize-se")).toBeNull();
+      expect(screen.queryByTestId("terminal-drag-grip")).toBeNull();
+      expect(screen.queryByTestId("floating-window-resize-se")).toBeNull();
     } finally {
       Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
       if (previousOntouchstart === undefined) {
@@ -1253,17 +1611,186 @@ describe("TerminalModal", () => {
     }
   });
 
-  it("shows loading state while sessions are not ready", async () => {
+  it("shows the start-up state when no session exists while validation is incomplete", async () => {
     mockUseTerminalSessions.mockReturnValue({
       ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
       isReady: false,
     });
 
     render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("terminal-loading")).toBeTruthy();
+      expect(screen.getByTestId("terminal-loading")).toHaveTextContent("Starting terminal...");
     });
+    expect(mockTerminalInstance.open).not.toHaveBeenCalled();
+  });
+
+  it("returns to the start-up state after validation prunes the last dead session", () => {
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      isReady: true,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    expect(screen.getByTestId("terminal-loading")).toHaveTextContent("Starting terminal...");
+    expect(mockTerminalInstance.open).not.toHaveBeenCalled();
+  });
+
+  it("keeps isReady as the manual-start gate without delaying the session-less start-up state", async () => {
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      isReady: false,
+      autoCreateDisabled: true,
+    });
+
+    const view = render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    expect(screen.getByTestId("terminal-loading")).toHaveTextContent("Starting terminal...");
+    expect(screen.queryByTestId("terminal-manual-start")).toBeNull();
+
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      isReady: true,
+      autoCreateDisabled: true,
+    });
+    view.rerender(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    expect(await screen.findByTestId("terminal-manual-start")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-loading")).toBeNull();
+  });
+
+  it("ignores a stale bootstrap error once an attachable session exists", async () => {
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      bootstrapError: "Earlier bootstrap failed",
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+    expect(screen.queryByTestId("terminal-loading")).toBeNull();
+    expect(screen.queryByTestId("terminal-manual-start")).toBeNull();
+    expect(screen.queryByTestId("terminal-bootstrap-error")).toBeNull();
+    expect(screen.queryByTestId("terminal-xterm-init-error")).toBeNull();
+  });
+
+  /*
+  FNXC:Terminal 2026-07-23-14:30:
+  GitHub #2121/#2307: Windows browser clients never auto-create the first tab,
+  so an indefinite "Starting terminal..." spinner is a dead end. The modal must
+  render an explicit start action instead.
+  */
+  it("shows a Start terminal action instead of the endless spinner when auto-create is disabled", async () => {
+    const createTab = vi.fn().mockResolvedValue(defaultTab);
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      autoCreateDisabled: true,
+      createTab,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-manual-start")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("terminal-loading")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("terminal-manual-start-btn"));
+    expect(createTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a manual-start failure and re-enables the button instead of silently no-oping", async () => {
+    const createTab = vi.fn().mockRejectedValue(new Error("spawn failed"));
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      autoCreateDisabled: true,
+      createTab,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-manual-start")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("terminal-manual-start-btn"));
+
+    // The Windows bootstrap-failure cohort is exactly where creates fail — a
+    // rejected createTab must render the existing terminal-error banner, not
+    // leave a button that silently does nothing.
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-error").textContent).toContain("spawn failed");
+    });
+    const button = screen.getByTestId("terminal-manual-start-btn") as HTMLButtonElement;
+    await waitFor(() => {
+      expect(button.disabled).toBe(false);
+    });
+  });
+
+  it("ignores rapid Start-terminal clicks while a create is already in flight", async () => {
+    let resolveCreate: (tab: typeof defaultTab) => void = () => {};
+    const createTab = vi.fn().mockImplementation(
+      () => new Promise((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      autoCreateDisabled: true,
+      createTab,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-manual-start")).toBeTruthy();
+    });
+
+    const button = screen.getByTestId("terminal-manual-start-btn") as HTMLButtonElement;
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    // One PTY session per user intent: while the first create is pending the
+    // button is disabled and the handler short-circuits.
+    expect(createTab).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(button.disabled).toBe(true);
+    });
+
+    await act(async () => {
+      resolveCreate(defaultTab);
+      await Promise.resolve();
+    });
+  });
+
+  it("keeps the normal xterm surface when auto-create is disabled but a tab already exists", async () => {
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      autoCreateDisabled: true,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-container")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("terminal-manual-start")).toBeNull();
   });
 
   it("shows error with retry and refresh buttons when bootstrap fails instead of stuck loading", async () => {
@@ -1530,7 +2057,7 @@ describe("TerminalModal", () => {
       closeTab: mockCloseTab,
     });
 
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+    renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
     await waitFor(() => {
       // Find the close button for the zsh tab (second tab)
@@ -1541,7 +2068,91 @@ describe("TerminalModal", () => {
       }
     });
 
-    expect(mockCloseTab).toHaveBeenCalledWith("tab-2");
+    // Detach: the tab goes away here, the PTY keeps running for anyone else attached.
+    await chooseCloseIntent("detach");
+    expect(mockCloseTab).toHaveBeenCalledWith("tab-2", { killSession: false });
+  });
+
+  /*
+  FNXC:TerminalSharing 2026-08-19-04:10:
+  Detaching would be a one-way door without a way back: the footer control lists sessions the server
+  still runs that this browser is not showing (closed here, or opened by someone else) and reattaches
+  to them rather than starting a new PTY.
+  */
+  it("offers detached server sessions in the footer and reopens them", async () => {
+    const mockReopenSession = vi.fn();
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      detachedSessions: [
+        { id: "session-detached", cwd: "/project/api", shell: "/bin/bash", createdAt: "2026-08-19T02:00:00.000Z", lastActivityAt: "2026-08-19T02:30:00.000Z" },
+      ],
+      reopenSession: mockReopenSession,
+    });
+
+    renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    const reopenButton = await screen.findByTestId("terminal-reopen-btn");
+    expect(reopenButton).toHaveTextContent("Reopen (1)");
+
+    fireEvent.click(reopenButton);
+    const menu = await screen.findByTestId("terminal-reopen-menu");
+    const option = menu.querySelector<HTMLButtonElement>(".terminal-reopen-menu-option");
+    expect(option?.textContent).toContain("api");
+
+    fireEvent.click(option!);
+    expect(mockReopenSession).toHaveBeenCalledWith("session-detached");
+  });
+
+  it("hides the reopen control when every server session is already open here", async () => {
+    mockUseTerminalSessions.mockReturnValue({ ...defaultSessionState, detachedSessions: [] });
+
+    renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await screen.findByTestId("terminal-tabs");
+    expect(screen.queryByTestId("terminal-reopen-btn")).toBeNull();
+  });
+
+  it("tab close button can end the session for everyone", async () => {
+    const mockCloseTab = vi.fn();
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [
+        { ...defaultTab, isActive: true },
+        { id: "tab-2", sessionId: "test-session-456", title: "zsh", isActive: false, createdAt: Date.now() },
+      ],
+      closeTab: mockCloseTab,
+    });
+
+    renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    const closeButtons = await screen.findAllByTitle("Close tab");
+    fireEvent.click(closeButtons[1]!);
+
+    await chooseCloseIntent("end");
+    expect(mockCloseTab).toHaveBeenCalledWith("tab-2", { killSession: true });
+  });
+
+  it("cancelling the close prompt leaves the tab alone", async () => {
+    const mockCloseTab = vi.fn();
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [
+        { ...defaultTab, isActive: true },
+        { id: "tab-2", sessionId: "test-session-456", title: "zsh", isActive: false, createdAt: Date.now() },
+      ],
+      closeTab: mockCloseTab,
+    });
+
+    renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    const closeButtons = await screen.findAllByTitle("Close tab");
+    fireEvent.click(closeButtons[1]!);
+
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    await act(async () => {
+      fireEvent.click(cancel);
+    });
+    expect(mockCloseTab).not.toHaveBeenCalled();
   });
 
   it("new tab button creates new tab", async () => {
@@ -1603,7 +2214,7 @@ describe("TerminalModal", () => {
     Object.defineProperty(window, "innerWidth", { value: 1280, configurable: true });
 
     try {
-      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+      renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
       const expandedTabs = await screen.findByTestId("terminal-tabs");
       defineMetric(expandedTabs, "scrollWidth", 360);
@@ -1624,8 +2235,10 @@ describe("TerminalModal", () => {
       expect(mockSetActiveTab).toHaveBeenCalledWith("tab-2");
       fireEvent.click(screen.getByTestId("terminal-mobile-new-tab"));
       expect(mockCreateTab).toHaveBeenCalledWith();
+      expectTerminalCloseAfterNewTerminal("terminal-mobile-new-tab");
       fireEvent.click(screen.getByTestId("terminal-mobile-close-tab"));
-      expect(mockCloseTab).toHaveBeenCalledWith("tab-1");
+      await chooseCloseIntent("detach");
+      expect(mockCloseTab).toHaveBeenCalledWith("tab-1", { killSession: false });
 
       defineMetric(measuringTabs, "scrollWidth", 199);
       defineMetric(measuringTabs, "clientWidth", 200);
@@ -1696,13 +2309,15 @@ describe("TerminalModal", () => {
     Object.defineProperty(window, "innerWidth", { value: 375, configurable: true });
 
     try {
-      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+      renderWithConfirm(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
       fireEvent.click(await screen.findByTestId("terminal-mobile-new-tab"));
       expect(mockCreateTab).toHaveBeenCalledWith();
 
+      // Mobile is a SECOND close call site; it must route through the same prompt as desktop.
       fireEvent.click(screen.getByLabelText("Close current tab"));
-      expect(mockCloseTab).toHaveBeenCalledWith("tab-1");
+      await chooseCloseIntent("end");
+      expect(mockCloseTab).toHaveBeenCalledWith("tab-1", { killSession: true });
     } finally {
       Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
     }
@@ -2269,39 +2884,6 @@ describe("TerminalModal", () => {
       }
     });
 
-    it("sends sticky Ctrl shortcut bytes and clears the modifier after each delivery", async () => {
-      const terminalDiv = document.createElement("div");
-      terminalDiv.setAttribute("data-testid", "terminal");
-      const helperTextarea = document.createElement("textarea");
-      helperTextarea.className = "xterm-helper-textarea";
-      terminalDiv.appendChild(helperTextarea);
-      document.body.appendChild(terminalDiv);
-
-      try {
-        render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-        helperTextarea.focus();
-
-        fireEvent.click(screen.getByTestId("terminal-shortcut-toggle"));
-        const ctrlButton = screen.getByTestId("terminal-modifier-ctrl");
-
-        for (const [label, expected] of [
-          ["C", "\x03"],
-          ["D", "\x04"],
-          ["L", "\x0c"],
-        ] as const) {
-          fireEvent.click(ctrlButton);
-          fireEvent.click(screen.getByRole("button", { name: label }));
-          expect(mockSendInput).toHaveBeenLastCalledWith(expected);
-          expect(ctrlButton.getAttribute("aria-pressed")).toBe("false");
-        }
-
-        expect(mockSendInput.mock.calls.map(([value]) => value)).toEqual(["\x03", "\x04", "\x0c"]);
-        expect(document.activeElement).toBe(helperTextarea);
-      } finally {
-        document.body.removeChild(terminalDiv);
-      }
-    });
-
     it("sends literal ANSI arrow sequences independent of sticky modifiers", async () => {
       render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
@@ -2760,21 +3342,24 @@ describe("TerminalModal", () => {
     });
   });
 
-  it("xterm container is rendered (visible under loading overlay) while loading", async () => {
+  it("keeps the xterm container measurable during a genuine cold start", async () => {
     mockUseTerminalSessions.mockReturnValue({
       ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
       isReady: false,
     });
 
     render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
     await waitFor(() => {
-      // The xterm container is always rendered (no display:none) so that
-      // terminal.open() can measure dimensions even during a tab switch.
-      // The loading overlay visually covers it.
+      // The host remains measurable while the start-up overlay covers it, but
+      // xterm itself waits until a real session id exists.
       const xtermDiv = screen.getByTestId("terminal-xterm");
       expect(xtermDiv.style.display).toBe("");
+      expect(screen.getByTestId("terminal-loading")).toBeInTheDocument();
     });
+    expect(mockTerminalInstance.open).not.toHaveBeenCalled();
   });
 
   it("xterm container remains rendered when ready", async () => {
@@ -4055,6 +4640,9 @@ describe("TerminalModal — mobile layout contract", () => {
     restartActiveTab: vi.fn(),
     retryBootstrap: vi.fn(),
     replaceActiveTabSession: vi.fn().mockResolvedValue(undefined),
+    detachedSessions: [],
+    refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+    reopenSession: vi.fn(),
   };
 
   beforeEach(() => {
@@ -4084,17 +4672,6 @@ describe("TerminalModal — mobile layout contract", () => {
     });
   });
 
-  it("preserves header/footer structure: tabs and title in header, actions in footer", async () => {
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-tabs")).toBeTruthy();
-      expect(screen.getByTestId("terminal-title")).toBeTruthy();
-      expect(screen.getByTestId("terminal-footer-actions")).toBeTruthy();
-      expect(screen.queryByTestId("terminal-actions")).toBeNull();
-    });
-  });
-
   it("close button is clickable with many tabs", async () => {
     render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
@@ -4107,19 +4684,6 @@ describe("TerminalModal — mobile layout contract", () => {
     expect(mockOnClose).toHaveBeenCalled();
   });
 
-  it("clear button is clickable with many tabs", async () => {
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      const clearBtn = screen.getByTestId("terminal-clear-btn");
-      expect(clearBtn).toBeTruthy();
-      fireEvent.click(clearBtn);
-    });
-
-    // Clear calls xtermRef.current?.clear() — just verify button is functional
-    expect(screen.getByTestId("terminal-clear-btn")).toBeTruthy();
-  });
-
   it("reconnect button is clickable with many tabs when disconnected", async () => {
     render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
@@ -4130,33 +4694,6 @@ describe("TerminalModal — mobile layout contract", () => {
     });
 
     expect(mockReconnect).toHaveBeenCalled();
-  });
-
-  it("action buttons have .terminal-action-label spans for mobile CSS targeting", async () => {
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      // The reconnect and clear buttons should have .terminal-action-label spans
-      const reconnectBtn = screen.getByTestId("terminal-reconnect-btn");
-      const labelSpan = reconnectBtn.querySelector(".terminal-action-label");
-      expect(labelSpan).toBeTruthy();
-      expect(labelSpan?.textContent).toBe("Reconnect");
-
-      const clearBtn = screen.getByTestId("terminal-clear-btn");
-      const clearLabel = clearBtn.querySelector(".terminal-action-label");
-      expect(clearLabel).toBeTruthy();
-      expect(clearLabel?.textContent).toBe("Clear");
-    });
-  });
-
-  it("adds the shortcut spacing hook to the shortcuts toggle", async () => {
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-shortcut-toggle").className).toContain(
-        "terminal-clear-btn--shortcut",
-      );
-    });
   });
 
   it("terminal-title section contains the status indicator for connection state", async () => {
@@ -4173,7 +4710,7 @@ describe("TerminalModal — mobile layout contract", () => {
     });
   });
 
-  it("footer actions show connection state on true desktop with no header actions shell", async () => {
+  it("puts desktop display-mode controls immediately before close while footer retains actions", async () => {
     const previousInnerWidth = window.innerWidth;
     Object.defineProperty(window, "innerWidth", { value: 1280, configurable: true });
 
@@ -4194,16 +4731,55 @@ describe("TerminalModal — mobile layout contract", () => {
 
         expect(connectionStatus?.textContent).toBe("Disconnected");
         expect(footer.querySelector(".terminal-shortcuts--header")).toBeNull();
-        for (const control of [clearBtn, shortcutToggle, preferencesToggle, fontSizeValue, pinToggle, popoutToggle]) {
+        for (const control of [clearBtn, shortcutToggle, preferencesToggle, fontSizeValue]) {
           expect(footer.contains(control)).toBe(true);
           expect(header?.contains(control)).toBe(false);
         }
+        for (const control of [pinToggle, popoutToggle]) {
+          expect(footer.contains(control)).toBe(false);
+          expect(header?.contains(control)).toBe(true);
+        }
         expect(screen.queryByTestId("terminal-actions")).toBeNull();
+        expect(screen.queryByTestId("terminal-workspace-picker")).toBeNull();
+        expectTerminalDisplayModeControlsBeforeClose();
         expect(header?.contains(screen.getByTestId("terminal-close-btn"))).toBe(true);
         expect(header?.contains(screen.getByTestId("terminal-tabs"))).toBe(true);
       });
     } finally {
       Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
+    }
+  });
+
+  it.each([
+    ["desktop", 1280],
+    ["tablet", 900],
+  ])("keeps populated %s workspace picker before header display-mode controls", async (_label, width) => {
+    const previousInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: width, configurable: true });
+    fireEvent(window, new Event("resize"));
+    mockUseWorkspaces.mockReturnValue({
+      projectName: "kb",
+      workspaces: [
+        { id: "FN-9026", label: "FN-9026", title: "Terminal toolbar ordering", worktree: "/repo/.worktrees/FN-9026", kind: "task" },
+      ],
+      loading: false,
+      error: null,
+    });
+
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+      await waitFor(() => {
+        const header = document.querySelector<HTMLElement>(".terminal-header");
+        const workspacePicker = screen.getByTestId("terminal-workspace-picker");
+        expect(header?.contains(workspacePicker)).toBe(true);
+        expectTerminalDisplayModeControlsBeforeClose();
+        expect(workspacePicker.compareDocumentPosition(screen.getByTestId("terminal-pin-toggle")) & Node.DOCUMENT_POSITION_FOLLOWING)
+          .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
+      fireEvent(window, new Event("resize"));
     }
   });
 
@@ -4263,6 +4839,7 @@ describe("TerminalModal — mobile layout contract", () => {
 
         // No empty .terminal-actions shell renders in the mobile header, and non-mobile display toggles stay omitted.
         expect(header?.querySelector(".terminal-actions")).toBeNull();
+        expect(screen.queryByTestId("terminal-actions")).toBeNull();
         expect(screen.queryByTestId("terminal-pin-toggle")).toBeNull();
         expect(screen.queryByTestId("terminal-popout-toggle")).toBeNull();
 
@@ -4272,17 +4849,45 @@ describe("TerminalModal — mobile layout contract", () => {
         expect(footer.contains(closeBtn)).toBe(false);
         const mobileTabs = screen.getByTestId("terminal-mobile-tabs");
         expect(header?.contains(mobileTabs)).toBe(true);
+        expectTerminalCloseAfterNewTerminal("terminal-mobile-new-tab");
       });
     } finally {
       Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
     }
   });
 
-  it("renders terminal action controls in a tablet footer, not the header, and keeps pin/pop-out toggles (FN-7684)", async () => {
-    // FN-7684: tablet width (769-1024px) must relocate the same shared
-    // terminalActionControls fragment into the footer, exactly as FN-7560
-    // did for mobile — but unlike mobile, tablet keeps the desktop pin/
-    // pop-out toggles and the desktop tab strip / workspace picker.
+  it("keeps the populated-workspace mobile close control after the new-terminal action", async () => {
+    const previousInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: 390, configurable: true });
+    mockUseWorkspaces.mockReturnValue({
+      projectName: "kb",
+      workspaces: [
+        { id: "FN-8729", label: "FN-8729", title: "Terminal toolbar ordering", worktree: "/repo/.worktrees/FN-8729", kind: "task" },
+      ],
+      loading: false,
+      error: null,
+    });
+
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+      await waitFor(() => {
+        expect(screen.getByTestId("terminal-workspace-picker")).toBeInTheDocument();
+        expectTerminalCloseAfterNewTerminal("terminal-mobile-new-tab");
+      });
+
+      fireEvent.click(screen.getByTestId("terminal-mobile-new-tab"));
+      fireEvent.click(screen.getByTestId("terminal-close-btn"));
+      expect(manyTabsSessionState.createTab).toHaveBeenCalledWith();
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
+    }
+  });
+
+  it("puts tablet display-mode controls immediately before close while footer retains actions", async () => {
+    // Tablets retain the desktop pin/pop-out presentation modes and tab strip,
+    // while their remaining action controls stay in the shared footer fragment.
     const previousInnerWidth = window.innerWidth;
     Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
     fireEvent(window, new Event("resize"));
@@ -4301,27 +4906,26 @@ describe("TerminalModal — mobile layout contract", () => {
         const pinToggle = screen.getByTestId("terminal-pin-toggle");
         const popoutToggle = screen.getByTestId("terminal-popout-toggle");
 
-        // Controls live inside the footer region, including the desktop-only
-        // pin/pop-out toggles (tablet keeps docked/floating/pinned-below modes)...
+        // Footer controls remain in the single shared footer fragment.
         expect(footer.contains(clearBtn)).toBe(true);
         expect(footer.contains(shortcutToggle)).toBe(true);
         expect(footer.contains(preferencesToggle)).toBe(true);
         expect(footer.contains(fontSizeValue)).toBe(true);
-        expect(footer.contains(pinToggle)).toBe(true);
-        expect(footer.contains(popoutToggle)).toBe(true);
 
-        // ...and NOT inside the header.
         const header = document.querySelector(".terminal-header");
         expect(header).toBeTruthy();
-        expect(header?.contains(clearBtn)).toBe(false);
-        expect(header?.contains(shortcutToggle)).toBe(false);
-        expect(header?.contains(preferencesToggle)).toBe(false);
-        expect(header?.contains(fontSizeValue)).toBe(false);
-        expect(header?.contains(pinToggle)).toBe(false);
-        expect(header?.contains(popoutToggle)).toBe(false);
+        for (const control of [clearBtn, shortcutToggle, preferencesToggle, fontSizeValue]) {
+          expect(header?.contains(control)).toBe(false);
+        }
+        for (const control of [pinToggle, popoutToggle]) {
+          expect(footer.contains(control)).toBe(false);
+          expect(header?.contains(control)).toBe(true);
+        }
+        expectTerminalDisplayModeControlsBeforeClose();
 
         // No empty .terminal-actions shell renders in the tablet header.
         expect(header?.querySelector(".terminal-actions")).toBeNull();
+        expect(screen.queryByTestId("terminal-actions")).toBeNull();
 
         // The close button, the desktop tab strip (not the mobile dropdown),
         // and the workspace picker remain in the header.
@@ -4338,10 +4942,42 @@ describe("TerminalModal — mobile layout contract", () => {
         if (workspacePicker) {
           expect(header?.contains(workspacePicker)).toBe(true);
         }
+        expectTerminalCloseAfterNewTerminal("terminal-new-tab");
       });
     } finally {
       Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
       fireEvent(window, new Event("resize"));
+    }
+  });
+
+  it("ferme le terminal Alpha depuis le corps au bord haut et préserve son scroll", async () => {
+    const previousInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: 390, configurable: true });
+    document.documentElement.dataset.alphaMobileDrawers = "true";
+
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+      await waitFor(() => expect(screen.getByTestId("terminal-drawer-handle")).toBeInTheDocument());
+      expect(terminalModalCss).toMatch(/\.terminal-modal-overlay:not\(\.terminal-modal-overlay--docked\) > \.terminal-modal\s*\{[^}]*animation: alpha-mobile-drawer-rise-in/);
+      expect(terminalModalCss).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.terminal-modal-overlay:not\(\.terminal-modal-overlay--docked\) > \.terminal-modal\s*\{[^}]*animation: none/);
+      expect(screen.queryByTestId("terminal-close-btn")).toBeNull();
+      const modal = screen.getByTestId("terminal-modal");
+      fireEvent.pointerDown(modal, { pointerId: 1, clientY: 0, button: 0, isPrimary: true });
+      fireEvent.pointerMove(modal, { pointerId: 1, clientY: 200 });
+      await waitFor(() => expect(modal.style.transform).toContain("200px"));
+      fireEvent.pointerUp(modal, { pointerId: 1, clientY: 200 });
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
+
+      mockOnClose.mockClear();
+      modal.scrollTop = 10;
+      fireEvent.pointerDown(modal, { pointerId: 2, clientY: 0, button: 0, isPrimary: true });
+      fireEvent.pointerMove(modal, { pointerId: 2, clientY: 200 });
+      fireEvent.pointerUp(modal, { pointerId: 2, clientY: 200 });
+      expect(mockOnClose).not.toHaveBeenCalled();
+      expect(modal.style.transform).toBe("");
+    } finally {
+      delete document.documentElement.dataset.alphaMobileDrawers;
+      Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
     }
   });
 
@@ -4391,6 +5027,7 @@ describe("TerminalModal — mobile layout contract", () => {
         const closeBtn = screen.getByTestId("terminal-close-btn");
         expect(closeBtn.parentElement).toBe(header);
         expect(closeBtn.className).toContain("terminal-close--corner");
+        expectTerminalCloseAfterNewTerminal("terminal-mobile-new-tab");
         // Reconnect control lives in the footer, not the header, so it cannot
         // crowd the corner-pinned close button.
         expect(screen.getByTestId("terminal-reconnect-btn").closest(".terminal-header")).toBeNull();
@@ -4418,6 +5055,7 @@ describe("TerminalModal — mobile layout contract", () => {
         const closeBtn = screen.getByTestId("terminal-close-btn");
         expect(closeBtn.parentElement).toBe(header);
         expect(closeBtn.className).toContain("terminal-close--corner");
+        expectTerminalCloseAfterNewTerminal("terminal-mobile-new-tab");
         // Restart control + exit code live in the footer, not the header.
         expect(screen.getByTestId("terminal-restart-btn").closest(".terminal-header")).toBeNull();
       });
@@ -4442,6 +5080,7 @@ describe("TerminalModal — mobile layout contract", () => {
         expect(header?.contains(closeBtn)).toBe(true);
         expect(screen.queryByTestId("terminal-actions")).toBeNull();
         expect(closeBtn.className).not.toContain("terminal-close--corner");
+        expectTerminalCloseAfterNewTerminal("terminal-new-tab");
       });
     } finally {
       Object.defineProperty(window, "innerWidth", { value: previousInnerWidth, configurable: true });
@@ -4994,6 +5633,9 @@ describe("TerminalModal — FN-1234 mobile tab switch with keyboard", () => {
     restartActiveTab: vi.fn(),
     retryBootstrap: vi.fn(),
     replaceActiveTabSession: vi.fn().mockResolvedValue(undefined),
+    detachedSessions: [],
+    refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+    reopenSession: vi.fn(),
   });
 
   const createTerminalInstance = (cols: number, rows: number) => ({
@@ -5008,6 +5650,7 @@ describe("TerminalModal — FN-1234 mobile tab switch with keyboard", () => {
     write: vi.fn(),
     clear: vi.fn(),
     focus: vi.fn(),
+    refresh: vi.fn(),
     options: { fontSize: 14 },
     cols,
     rows,
@@ -5392,6 +6035,9 @@ describe("TerminalModal — virtual keyboard overlap handling", () => {
     restartActiveTab: vi.fn(),
     retryBootstrap: vi.fn(),
     replaceActiveTabSession: vi.fn().mockResolvedValue(undefined),
+    detachedSessions: [],
+    refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+    reopenSession: vi.fn(),
   };
 
   let savedVisualViewport: typeof window.visualViewport;
@@ -5640,17 +6286,6 @@ describe("TerminalModal — virtual keyboard overlap handling", () => {
     expect(mockVV.removeEventListener).toHaveBeenCalledWith("scroll", scrollCalls[0][1]);
   });
 
-  it("zero overlap on mobile with no keyboard does not set CSS variable", async () => {
-    simulateMobileDevice(0); // no keyboard
-
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
-    });
-  });
-
   it("scrolls modal into view when keyboard opens on mobile", async () => {
     const scrollIntoViewSpy = vi.fn();
     const { listeners } = simulateMobileDevice(250);
@@ -5694,17 +6329,6 @@ describe("TerminalModal — virtual keyboard overlap handling", () => {
     });
 
     expect(scrollIntoViewSpy).not.toHaveBeenCalled();
-  });
-
-  it("sets --overlay-padding-top on overlay when keyboard overlap is detected", async () => {
-    simulateMobileDevice(250);
-
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      const overlay = screen.getByTestId("terminal-modal-overlay");
-      expect(overlay.style.getPropertyValue("--overlay-padding-top")).toBe("0px");
-    });
   });
 
   it("clears --overlay-padding-top from overlay when keyboard closes", async () => {
@@ -5914,6 +6538,9 @@ describe("TerminalModal — close and reopen scrollback replay", () => {
     restartActiveTab: vi.fn(),
     retryBootstrap: vi.fn(),
     replaceActiveTabSession: vi.fn().mockResolvedValue(undefined),
+    detachedSessions: [],
+    refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+    reopenSession: vi.fn(),
   };
 
   beforeEach(() => {
@@ -6121,6 +6748,9 @@ describe("TerminalModal — FN-872 real-device keyboard overlap refinement", () 
     restartActiveTab: vi.fn(),
     retryBootstrap: vi.fn(),
     replaceActiveTabSession: vi.fn().mockResolvedValue(undefined),
+    detachedSessions: [],
+    refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+    reopenSession: vi.fn(),
   };
 
   let savedVisualViewport: typeof window.visualViewport;
@@ -7027,9 +7657,16 @@ describe("TerminalModal — FN-872 real-device keyboard overlap refinement", () 
   });
 
   // --- FN-1002: Lowered threshold (150 → 80) with 30px noise filter ---
-  it("detects keyboard with gap of 85px (above new 80px threshold)", async () => {
+  it.each([
     // Previously with the 150px threshold, 85px would NOT be detected.
     // With the new 80px threshold, it should be detected.
+    ["detects keyboard with gap of 85px (above new 80px threshold)", 85, "85px"],
+    // Gap of 20px is below the 30px noise filter — should return 0.
+    ["does not detect keyboard with very small gap of 20px (noise filter)", 20, ""],
+    // 80 is NOT > 80, so should not be detected.
+    ["does not detect keyboard when gap is exactly 80px (boundary, not > 80)", 80, ""],
+    ["detects keyboard when gap is 81px (just above 80px boundary)", 81, "81px"],
+  ] as const)("%s", async (_label, gap, expected) => {
     const { listeners, mockVV } = simulateIOSSafari(false, 667);
 
     render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
@@ -7040,14 +7677,14 @@ describe("TerminalModal — FN-872 real-device keyboard overlap refinement", () 
       expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
     });
 
-    // Simulate keyboard opening with gap of 85px: vv.height = 667 - 85 = 582
+    // Simulate keyboard opening: vv.height = 667 - gap
     Object.defineProperty(window, "innerHeight", {
-      value: 582,
+      value: 667 - gap,
       writable: true,
       configurable: true,
     });
     Object.defineProperty(mockVV, "height", {
-      value: 582,
+      value: 667 - gap,
       writable: true,
       configurable: true,
     });
@@ -7058,105 +7695,7 @@ describe("TerminalModal — FN-872 real-device keyboard overlap refinement", () 
 
     await waitFor(() => {
       const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("85px");
-    });
-  });
-
-  it("does not detect keyboard with very small gap of 20px (noise filter)", async () => {
-    // Gap of 20px is below the 30px noise filter — should return 0.
-    const { listeners, mockVV } = simulateIOSSafari(false, 667);
-
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
-    });
-
-    // Simulate tiny viewport change: gap = 20px, vv.height = 667 - 20 = 647
-    Object.defineProperty(window, "innerHeight", {
-      value: 647,
-      writable: true,
-      configurable: true,
-    });
-    Object.defineProperty(mockVV, "height", {
-      value: 647,
-      writable: true,
-      configurable: true,
-    });
-
-    act(() => {
-      for (const cb of listeners.resize) cb();
-    });
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
-    });
-  });
-
-  it("does not detect keyboard when gap is exactly 80px (boundary, not > 80)", async () => {
-    const { listeners, mockVV } = simulateIOSSafari(false, 667);
-
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
-    });
-
-    // gap = 80px exactly: vv.height = 667 - 80 = 587
-    Object.defineProperty(window, "innerHeight", {
-      value: 587,
-      writable: true,
-      configurable: true,
-    });
-    Object.defineProperty(mockVV, "height", {
-      value: 587,
-      writable: true,
-      configurable: true,
-    });
-
-    act(() => {
-      for (const cb of listeners.resize) cb();
-    });
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      // 80 is NOT > 80, so should not be detected
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
-    });
-  });
-
-  it("detects keyboard when gap is 81px (just above 80px boundary)", async () => {
-    const { listeners, mockVV } = simulateIOSSafari(false, 667);
-
-    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("");
-    });
-
-    // gap = 81px: vv.height = 667 - 81 = 586
-    Object.defineProperty(window, "innerHeight", {
-      value: 586,
-      writable: true,
-      configurable: true,
-    });
-    Object.defineProperty(mockVV, "height", {
-      value: 586,
-      writable: true,
-      configurable: true,
-    });
-
-    act(() => {
-      for (const cb of listeners.resize) cb();
-    });
-
-    await waitFor(() => {
-      const modal = screen.getByTestId("terminal-modal");
-      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("81px");
+      expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe(expected);
     });
   });
 
@@ -7468,19 +8007,99 @@ describe("TerminalModal — xterm focus initialization (FN-1602)", () => {
         expect(terminalDataHandler).not.toBeNull();
       });
 
-      const handled = terminalKeyEventHandler?.(
-        new KeyboardEvent("keydown", { key: "v", ...modifier }),
-      );
+      const pasteEvent = new KeyboardEvent("keydown", { key: "v", ...modifier, cancelable: true });
+      const handled = terminalKeyEventHandler?.(pasteEvent);
 
       expect(handled).toBe(false);
+      // Returning false only skips xterm's key handling; without preventDefault
+      // the browser's own paste fires xterm's helper-textarea paste listener
+      // and the payload reaches the PTY twice.
+      expect(pasteEvent.defaultPrevented).toBe(true);
       await waitFor(() => expect(readText).toHaveBeenCalledTimes(1));
-      expect(mockSendInput).toHaveBeenCalledTimes(1);
-      expect(mockSendInput).toHaveBeenCalledWith("npm test\n");
+      // Delivery must go through terminal.paste() (bracketed-paste wrapping,
+      // \n -> \r normalization), which feeds onData -> sendInput in real xterm —
+      // never through a raw sendInput that bypasses paste semantics.
+      await waitFor(() => expect(mockTerminalInstance.paste).toHaveBeenCalledTimes(1));
+      expect(mockTerminalInstance.paste).toHaveBeenCalledWith("npm test\n");
+      expect(mockSendInput).not.toHaveBeenCalled();
     },
   );
 
   it.each([
-    ["missing clipboard", undefined],
+    ["missing clipboard API", undefined],
+    ["clipboard without readText (Firefox / non-HTTPS)", { writeText: vi.fn() }],
+  ] as const)(
+    "falls back to xterm's native paste path for %s instead of swallowing the shortcut",
+    async (_label, clipboard) => {
+      Object.defineProperty(navigator, "platform", {
+        value: "Win32",
+        configurable: true,
+      });
+      Object.defineProperty(navigator, "clipboard", {
+        value: clipboard,
+        configurable: true,
+      });
+
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+      await waitFor(() => {
+        expect(terminalKeyEventHandler).not.toBeNull();
+      });
+
+      const pasteEvent = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
+      const handled = terminalKeyEventHandler?.(pasteEvent);
+
+      // Without an async clipboard read the browser's native paste into
+      // xterm's helper textarea is the ONLY working paste path. The handler
+      // must return false WITHOUT preventDefault: false skips xterm's key
+      // handling (whose non-mac Ctrl+V path would inject \x16 into the PTY
+      // and cancel the browser paste), while the un-prevented default paste
+      // fires xterm's helper-textarea paste listener exactly once.
+      expect(handled).toBe(false);
+      expect(pasteEvent.defaultPrevented).toBe(false);
+      expect(mockSendInput).not.toHaveBeenCalled();
+      expect(mockTerminalInstance.paste).not.toHaveBeenCalled();
+    },
+  );
+
+  it("routes Ctrl+V through the native paste path after a clipboard permission denial (sticky)", async () => {
+    const readText = vi.fn().mockRejectedValue(new DOMException("denied"));
+    Object.defineProperty(navigator, "platform", {
+      value: "Win32",
+      configurable: true,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      value: { readText },
+      configurable: true,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(terminalKeyEventHandler).not.toBeNull();
+    });
+
+    // First Ctrl+V: custom path preventDefaults, read rejects (denied) — this
+    // one paste is lost, and the denial must be remembered.
+    const firstPaste = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
+    expect(terminalKeyEventHandler?.(firstPaste)).toBe(false);
+    expect(firstPaste.defaultPrevented).toBe(true);
+    await waitFor(() => expect(readText).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Second Ctrl+V: the sticky denial marker must route through the native
+    // helper-textarea paste (no preventDefault, no further readText attempts)
+    // instead of preventDefaulting into a read that will reject again —
+    // otherwise permission-denied users have zero working paste path.
+    const secondPaste = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
+    expect(terminalKeyEventHandler?.(secondPaste)).toBe(false);
+    expect(secondPaste.defaultPrevented).toBe(false);
+    expect(readText).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
     ["rejected clipboard", { readText: vi.fn().mockRejectedValue(new DOMException("denied")) }],
     ["empty clipboard", { readText: vi.fn().mockResolvedValue("") }],
   ] as const)("fails safely for %s physical paste while preserving xterm input", async (_label, clipboard) => {
@@ -7855,6 +8474,9 @@ describe("TerminalModal — project-context propagation (FN-1765)", () => {
       restartActiveTab: vi.fn(),
       retryBootstrap: vi.fn(),
       replaceActiveTabSession: vi.fn(),
+      detachedSessions: [],
+      refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+      reopenSession: vi.fn(),
     });
   });
 
@@ -7910,6 +8532,9 @@ describe("TerminalModal — project-context propagation (FN-1765)", () => {
       restartActiveTab: vi.fn(),
       retryBootstrap: vi.fn(),
       replaceActiveTabSession: vi.fn(),
+      detachedSessions: [],
+      refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+      reopenSession: vi.fn(),
     });
 
     const { rerender } = render(
@@ -7945,6 +8570,9 @@ describe("TerminalModal — project-context propagation (FN-1765)", () => {
       restartActiveTab: vi.fn(),
       retryBootstrap: vi.fn(),
       replaceActiveTabSession: vi.fn(),
+      detachedSessions: [],
+      refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+      reopenSession: vi.fn(),
     });
 
     // Switch project
@@ -7992,6 +8620,9 @@ describe("TerminalModal — project-context propagation (FN-1765)", () => {
       restartActiveTab: vi.fn(),
       retryBootstrap: vi.fn(),
       replaceActiveTabSession: vi.fn(),
+      detachedSessions: [],
+      refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+      reopenSession: vi.fn(),
     });
 
     // Switch to project B
@@ -8040,6 +8671,9 @@ describe("TerminalModal — project-context propagation (FN-1765)", () => {
       restartActiveTab: vi.fn(),
       retryBootstrap: vi.fn(),
       replaceActiveTabSession: vi.fn(),
+      detachedSessions: [],
+      refreshDetachedSessions: vi.fn().mockResolvedValue(undefined),
+      reopenSession: vi.fn(),
     });
 
     // Switch tab (not project)
@@ -9172,5 +9806,51 @@ describe("TerminalModal — FN-7620 mobile blank render (zero-geometry xterm con
       expect(mockTerminalInstance.cols).toBe(Math.max(2, Math.floor(640 / CHAR_WIDTH_PX)));
       expect(mockTerminalInstance.rows).toBe(Math.max(1, Math.floor(400 / CHAR_HEIGHT_PX)));
     });
+  });
+
+  /*
+  FNXC:Terminal 2026-07-23-21:05:
+  Blank-until-keypress recurrence: on some systems the renderer stalls during init while the shell
+  prompt sits in xterm's buffer, and the container's box never CHANGES — so fit() computes the same
+  cols/rows and xterm's internal resize-driven repaint never fires. The observer-driven fit path must
+  therefore ALWAYS follow fit with an explicit full-viewport `refresh(0, rows-1)`; before this fix the
+  only paths that repainted were user input (new PTY output), a manual font-size change (refitTerminal's
+  refresh), or opening a new tab (fresh renderer).
+  */
+  it("repaints (terminal.refresh) on a container notification even when fit() leaves dimensions UNCHANGED (blank-until-keypress stall)", async () => {
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+    await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+
+    const container = screen.getByTestId("terminal-xterm");
+    overrideContainerBox(container, { width: 640, height: 400 });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await Promise.resolve();
+    });
+
+    // Settle geometry once via the container observer.
+    const settledCols = Math.max(2, Math.floor(640 / CHAR_WIDTH_PX));
+    const settledRows = Math.max(1, Math.floor(400 / CHAR_HEIGHT_PX));
+    expect(fireResizeObserverFor("terminal-xterm")).toBe(true);
+    await waitFor(() => {
+      expect(mockTerminalInstance.cols).toBe(settledCols);
+      expect(mockTerminalInstance.rows).toBe(settledRows);
+    });
+
+    // The stalled-renderer scenario: buffer has content, nothing painted, and
+    // a later ResizeObserver notification arrives with the SAME box. fit()
+    // recomputes identical cols/rows — the repair must come from an explicit
+    // refresh, not from a resize side effect.
+    mockTerminalInstance.refresh.mockClear();
+    expect(fireResizeObserverFor("terminal-xterm")).toBe(true);
+
+    await waitFor(() => {
+      expect(mockTerminalInstance.refresh).toHaveBeenCalledWith(0, settledRows - 1);
+    });
+    // Dimensions genuinely unchanged — proving the refresh was not a
+    // consequence of a resize.
+    expect(mockTerminalInstance.cols).toBe(settledCols);
+    expect(mockTerminalInstance.rows).toBe(settledRows);
   });
 });

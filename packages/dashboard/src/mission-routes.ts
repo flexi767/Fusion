@@ -14,11 +14,26 @@
 
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { TaskStore, resolvePlanningSettingsModel, AgentStore, THINKING_LEVELS } from "@fusion/core";
-import type { Goal, Settings, ThinkingLevel } from "@fusion/core";
-import { listEligibleExecutorAgents, resolvePlanningThinkingLevel } from "@fusion/engine";
+import {
+  TaskStore,
+  createLogger,
+  resolvePlanningSettingsModel,
+  THINKING_LEVELS,
+  MissionResumeConflictError,
+  MISSION_BLOCKER_DESCRIPTOR_SCHEMA_VERSION,
+  MissionBlockedClearConflictError,
+  TerminalTaskReconciliationError,
+  featureValidationRepairEligibility,
+  RepairGroundTruthStaleError,
+  RepairNotEligibleError,
+  RepairAssertionsMissingError,
+  RepairValidatorRunInFlightError,
+} from "@fusion/core";
+import type { AsyncMissionStore, Goal, Settings, ThinkingLevel } from "@fusion/core";
+import { hasTerminalReconcileCapability, reconcileMissionState, resolveFeatureRepairTargets, resolvePlanningThinkingLevel } from "@fusion/engine";
 import {
   getScopedStore as resolveScopedRequestStore,
+  resolveRequestProjectId,
   getProjectContext as resolveSharedProjectContext,
 } from "./routes/context.js";
 import type { ServerOptions } from "./server.js";
@@ -38,7 +53,6 @@ import type {
   FeatureStatus,
   InterviewState,
   MissionAssertionStatus,
-  FeatureLoopState,
   ValidatorRunStatus,
   ContractAssertionCreateInput,
   ContractAssertionUpdateInput,
@@ -64,6 +78,8 @@ import {
 import type { AiSessionStore } from "./ai-session-store.js";
 import { resolveBranchAssignmentContext, resolveBranchSelection } from "./routes/branch-selection.js";
 
+const missionRoutesLog = createLogger("dashboard-mission-routes");
+
 /** Resolve the mission-start override through the planning settings hierarchy. */
 export function resolveMissionInterviewThinkingLevel(
   settings: Partial<Settings> | undefined,
@@ -72,7 +88,53 @@ export function resolveMissionInterviewThinkingLevel(
   return resolvePlanningThinkingLevel(settings, thinkingLevel) as ThinkingLevel | undefined;
 }
 
+type MissionTaskHierarchy = {
+  milestones: Array<{
+    slices: Array<{
+      features: Array<{ taskId?: string }>;
+    }>;
+  }>;
+};
+
+export async function pauseMissionTasksForOperatorStop(
+  store: Pick<TaskStore, "pauseTask">,
+  hierarchy: MissionTaskHierarchy,
+): Promise<string[]> {
+  const pausedTaskIds: string[] = [];
+  for (const milestone of hierarchy.milestones) {
+    for (const slice of milestone.slices) {
+      for (const feature of slice.features) {
+        if (!feature.taskId) continue;
+        try {
+          await store.pauseTask(feature.taskId, true, undefined, { userPaused: true });
+          pausedTaskIds.push(feature.taskId);
+        } catch (error) {
+          // Continue stopping the mission if a linked task is already gone, but
+          // keep unexpected pause failures visible to operators.
+          missionRoutesLog.warn(
+            `Failed to pause mission-linked task ${feature.taskId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    }
+  }
+  return pausedTaskIds;
+}
+
 // ── Validation Utilities ────────────────────────────────────────────────────
+
+/*
+FNXC:MissionAutonomyAudit 2026-07-23-14:20:
+Dashboard lifecycle controls represent a human/operator intent. Pass the stable
+actor through the store so status and autopilot transitions are atomically
+attributed instead of relying on unaudited route-local side effects.
+*/
+const DASHBOARD_MISSION_ACTOR = {
+  type: "operator" as const,
+  id: "dashboard",
+  displayName: "Dashboard operator",
+  source: "dashboard",
+};
 
 function validateMissionId(id: string): boolean {
   // Accept generated format: M-{base36timestamp}-{random} (e.g. M-LZ7DN0-A2B5)
@@ -99,10 +161,25 @@ function validateOptionalWorkflowId(workflowId: unknown): string | null | undefi
   throw badRequest("workflowId must be a string or null");
 }
 
+/*
+FNXC:MissionWorkflows 2026-08-15-05:10:
+Structural match on core's TaskIntakeOwnerResolutionError (the class is not exported from
+@fusion/core's index). `workflow-unresolvable` means the client named a workflow whose
+definition does not exist — a 4xx concern for the triage routes; every other reason stays a
+genuine server-side failure.
+*/
+function isUnresolvableWorkflowIntakeError(err: unknown): boolean {
+  return err instanceof Error
+    && (err as { code?: unknown }).code === "task-intake-owner-resolution"
+    && (err as { reason?: unknown }).reason === "workflow-unresolvable";
+}
+
+/*
+FNXC:MissionAssertions 2026-08-01-19:44:
+The assertion guard landed on 2026-04-11 for two-segment IDs, but MissionStore.generateId added its idSequence segment on 2026-05-04. Keep this validator aligned with every dash-separated alphanumeric segment emitted by MissionStore while preserving legacy assertion rows.
+*/
 function validateAssertionId(id: string): boolean {
-  // Assertion IDs follow format: CA-{base36timestamp}-{random}
-  // e.g., CA-A3B7CD-E9F2
-  return /^CA-[A-Z0-9]+-[A-Z0-9]+$/i.test(id);
+  return /^CA-[A-Z0-9]+(?:-[A-Z0-9]+)*$/i.test(id);
 }
 
 function validateGoalId(id: string): boolean {
@@ -190,6 +267,23 @@ function validateMissionBranchStrategy(value: unknown): MissionBranchStrategy | 
     mode,
     branchName: trimmedBranchName,
   };
+}
+
+/*
+FNXC:MissionTaskPrefix 2026-07-26-12:00:
+PATCH/POST accept taskPrefix as a string, empty string, or null. null/empty normalizes to undefined so MissionStore writes NULL and the mission inherits the project-wide prefix. The key must still be present on PATCH (null, not omitted) so clearing is distinct from "leave unchanged" (greptile P1 on PR #1930).
+*/
+function validateTaskPrefix(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw badRequest("taskPrefix must be a string or null");
+  }
+  const trimmed = value.trim().toUpperCase();
+  if (!trimmed) return undefined;
+  if (!/^[A-Z][A-Z0-9]*$/.test(trimmed)) {
+    throw badRequest("taskPrefix must start with a letter and contain only letters and digits");
+  }
+  return trimmed;
 }
 
 function validateOrderedIds(body: unknown): string[] {
@@ -282,6 +376,7 @@ export function createMissionRouter(
   missionExecutionLoop?: {
     recoverActiveMissions(): Promise<{ recoveredCount: number }>;
     isRunning(): boolean;
+    executeManualValidatorRun?(run: { id: string; featureId: string }): Promise<void>;
   },
   engineManager?: import("@fusion/engine").ProjectEngineManager,
   pluginRunner?: Parameters<typeof import("@fusion/engine").buildSessionSkillContextSync>[3],
@@ -292,6 +387,29 @@ export function createMissionRouter(
 
   function getScopedStore(): TaskStore {
     return requestContext.getStore() ?? store;
+  }
+
+  /**
+   * FNXC:MissionValidation 2026-09-07-03:43:
+   * Admit manual work only with its existing project-scoped executor available.
+   * A foreign or stopped engine must not leave an ownerless running row, and a
+   * managed project must never fall back to the launch project's validator.
+   */
+  function requireManualValidator(req: Request) {
+    const projectId = resolveRequestProjectId(req, options);
+    const manager = engineManager ?? options?.engineManager;
+    const engine = projectId && manager ? manager.getEngine(projectId) : undefined;
+    const loop = projectId && manager
+      ? engine?.getTaskStore() === getScopedStore() ? engine.getRuntime().getMissionExecutionLoop() : undefined
+      : getScopedStore() === store ? missionExecutionLoop : undefined;
+    if (!loop?.isRunning() || typeof loop.executeManualValidatorRun !== "function") {
+      throw conflict("Mission validation executor is not available for this project");
+    }
+    return (run: { id: string; featureId: string }) => {
+      void loop.executeManualValidatorRun!(run).catch((error) => {
+        missionRoutesLog.error(`Manual validator dispatch failed for run ${run.id}:`, error);
+      });
+    };
   }
 
   function getScopedMissionStore() {
@@ -397,6 +515,8 @@ export function createMissionRouter(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+  // These PostgreSQL-only repair operations intentionally have no legacy synchronous-store twin.
+  const asyncMissionStore = missionStore as AsyncMissionStore;
 
   router.use(async (req, _res, next) => {
     try {
@@ -450,7 +570,7 @@ export function createMissionRouter(
   router.post(
     "/",
     catchTypedHandler(async (req, res) => {
-      const { title, description, autoAdvance, autoMerge, baseBranch, branchStrategy, goalIds } = req.body;
+      const { title, description, autoAdvance, autoMerge, baseBranch, branchStrategy, taskPrefix, goalIds } = req.body;
 
       const validatedTitle = validateTitle(title);
       const validatedDescription = validateDescription(description);
@@ -461,6 +581,7 @@ export function createMissionRouter(
         description: validatedDescription,
         baseBranch: validateDescription(baseBranch),
         branchStrategy: validateMissionBranchStrategy(branchStrategy),
+        taskPrefix: validateTaskPrefix(taskPrefix),
         ...(autoMerge !== undefined
           ? {
               // FNXC:MissionAutoMerge 2026-07-18-12:00: Create accepts only a real boolean; null is reserved for PATCH clear-to-inherited.
@@ -1102,7 +1223,7 @@ export function createMissionRouter(
     "/:missionId",
     catchTypedHandler(async (req, res) => {
       const { missionId } = req.params;
-      const { title, description, status, autoAdvance, autoMerge, autopilotEnabled, baseBranch, branchStrategy, goalIds } = req.body;
+      const { title, description, status, autoAdvance, autoMerge, autopilotEnabled, baseBranch, branchStrategy, taskPrefix, goalIds } = req.body;
 
       if (!validateMissionId(missionId)) {
         throw badRequest("Invalid mission ID format");
@@ -1143,6 +1264,9 @@ export function createMissionRouter(
       if (branchStrategy !== undefined) {
         updates.branchStrategy = validateMissionBranchStrategy(branchStrategy);
       }
+      if (taskPrefix !== undefined) {
+        updates.taskPrefix = validateTaskPrefix(taskPrefix);
+      }
 
       if (Object.keys(updates).length === 0 && validatedGoalIds === undefined) {
         throw badRequest("No valid fields to update");
@@ -1151,7 +1275,7 @@ export function createMissionRouter(
       try {
         const existingMission = await missionStore.getMission(missionId);
         const mission = Object.keys(updates).length > 0
-          ? await missionStore.updateMission(missionId, updates)
+          ? await missionStore.updateMission(missionId, updates, { actor: DASHBOARD_MISSION_ACTOR })
           : await requireMission(missionId);
         if (missionAutopilot && updates.autopilotEnabled === true && existingMission?.autopilotEnabled !== true) {
           missionAutopilot.watchMission(missionId);
@@ -2355,13 +2479,32 @@ export function createMissionRouter(
         throw badRequest("Feature has no linked assertions. Link assertions before triggering validation.");
       }
 
-      // Transition feature to validating state
-      await missionStore.updateFeature(featureId, {
-        loopState: "validating" as FeatureLoopState,
-      });
-
-      // Start a validator run
-      const run = await missionStore.startValidatorRun(featureId, "manual");
+      /*
+      FNXC:MissionValidation 2026-08-11-03:43:
+      A route pre-check races other tabs and engine validation. The admission transaction owns both
+      the feature mutation and the feature-scoped liveness check, returning this stable 409 contract
+      without touching the feature when a fresh run already exists.
+      */
+      const manualAdmissionStore = missionStore as typeof missionStore & {
+        startManualValidatorRun?: (id: string, input?: { triggerType?: string; taskId?: string }) => Promise<
+          | { outcome: "started"; run: { id: string; featureId: string; status: string; triggerType?: string; implementationAttempt: number; validatorAttempt: number; startedAt: string } }
+          | { outcome: "already-running"; run: { id: string; startedAt: string } }
+        >;
+      };
+      const dispatch = requireManualValidator(req);
+      const admission = typeof manualAdmissionStore.startManualValidatorRun === "function"
+        ? await manualAdmissionStore.startManualValidatorRun(featureId)
+        : { outcome: "started" as const, run: await missionStore.startValidatorRun(featureId, "manual") };
+      if (admission.outcome === "already-running") {
+        throw conflict("Validation is already running for this feature", {
+          code: "VALIDATION_ALREADY_RUNNING",
+          runId: admission.run.id,
+          featureId,
+          startedAt: admission.run.startedAt,
+        });
+      }
+      const run = admission.run;
+      dispatch(run);
 
       res.status(202).json({
         runId: run.id,
@@ -2372,6 +2515,103 @@ export function createMissionRouter(
         validatorAttempt: run.validatorAttempt,
         startedAt: run.startedAt,
       });
+    })
+  );
+
+  /*
+  FNXC:MissionValidationRepair 2026-08-11-02:05:
+  Dashboard repairs resolve targets from the engine and retry a stale fence once. The route never accepts a client-provided target or falls back to an unfenced write, so an operator cannot persist a status derived from obsolete task state. The store also rechecks eligibility after locking; that race is a 409 rather than a server error.
+  */
+  router.post(
+    "/features/:featureId/repair-validation",
+    catchTypedHandler(async (req, res) => {
+      const { featureId } = req.params;
+      if (!validateFeatureId(featureId)) throw badRequest("Invalid feature ID format");
+
+      /*
+      FNXC:MissionValidationRepair 2026-08-11-01:20:
+      Mission routes use a forwarding Proxy, whose target has no own store methods; `in` therefore
+      tests the empty proxy target and falsely rejects every repair. Read the forwarded method so
+      the PostgreSQL capability guard observes the scoped store without bypassing request scope.
+      */
+      const repairMissionStore = missionStore as AsyncMissionStore;
+      if (typeof repairMissionStore.repairFeatureValidationState !== "function") {
+        throw conflict("Validation repair requires the PostgreSQL mission store");
+      }
+      const feature = await missionStore.getFeature(featureId);
+      if (!feature) throw notFound("Feature not found");
+      const { action, reason } = (req.body ?? {}) as { action?: unknown; reason?: unknown };
+      if (action !== "clear" && action !== "re_run") {
+        throw badRequest("action must be 'clear' or 're_run'");
+      }
+      if (reason !== undefined && typeof reason !== "string") {
+        throw badRequest("reason must be a string");
+      }
+
+      const eligibility = featureValidationRepairEligibility(feature);
+      if (!eligibility[action === "clear" ? "clear" : "reRun"]) {
+        throw conflict(`Validation repair '${action}' is not eligible for status '${feature.status}' and loop state '${feature.loopState ?? "idle"}'`);
+      }
+
+      const dispatch = action === "re_run" ? requireManualValidator(req) : undefined;
+      const repair = async () => {
+        if (action === "re_run") {
+          return repairMissionStore.repairFeatureValidationState(featureId, {
+            action,
+            actor: DASHBOARD_MISSION_ACTOR,
+            reason,
+          });
+        }
+        const currentFeature = await missionStore.getFeature(featureId);
+        if (!currentFeature) throw notFound("Feature not found");
+        const targets = await resolveFeatureRepairTargets(getScopedStore(), currentFeature);
+        return repairMissionStore.repairFeatureValidationState(featureId, {
+          action,
+          actor: DASHBOARD_MISSION_ACTOR,
+          reason,
+          resolvedStatus: targets.status,
+          resolvedLoopState: targets.resumeImplementation ? "implementing" : "idle",
+          groundTruth: targets.groundTruth,
+        });
+      };
+
+      let result;
+      try {
+        result = await repair();
+      } catch (error) {
+        if (error instanceof RepairAssertionsMissingError) throw badRequest(error.message);
+        if (error instanceof RepairValidatorRunInFlightError) throw conflict(error.message);
+        if (error instanceof RepairNotEligibleError) throw conflict(error.message);
+        if (!(error instanceof RepairGroundTruthStaleError) || action !== "clear") throw error;
+        try {
+          result = await repair();
+        } catch (retryError) {
+          if (retryError instanceof RepairAssertionsMissingError) throw badRequest(retryError.message);
+          if (retryError instanceof RepairValidatorRunInFlightError) throw conflict(retryError.message);
+          if (retryError instanceof RepairNotEligibleError) throw conflict(retryError.message);
+          if (retryError instanceof RepairGroundTruthStaleError) {
+            throw conflict("Linked task state changed while repairing; refresh and retry");
+          }
+          throw retryError;
+        }
+      }
+
+      if (action === "re_run") {
+        const run = result.run;
+        if (!run) throw new Error("Validation repair did not create a validator run");
+        dispatch!(run);
+        res.status(202).json({
+          runId: run.id,
+          featureId: run.featureId,
+          status: run.status,
+          triggerType: run.triggerType,
+          implementationAttempt: run.implementationAttempt,
+          validatorAttempt: run.validatorAttempt,
+          startedAt: run.startedAt,
+        });
+        return;
+      }
+      res.json(result.feature);
     })
   );
 
@@ -2638,7 +2878,8 @@ export function createMissionRouter(
       }
 
       try {
-        const feature = await missionStore.updateFeature(featureId, updates);
+        /* FNXC:MissionStatusWrites 2026-08-10-12:47: Operator and agent repairs share the attributed status-event contract consumed by mission reconciliation. */
+        const feature = await missionStore.updateFeature(featureId, updates, { actor: DASHBOARD_MISSION_ACTOR });
         res.json(feature);
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -2722,6 +2963,26 @@ export function createMissionRouter(
   );
 
   /**
+   * POST /api/missions/:missionId/reconcile
+   * Reconcile deterministic delivery ground truth without requiring a PostgreSQL-only capability.
+   */
+  router.post(
+    "/:missionId/reconcile",
+    catchTypedHandler(async (req, res) => {
+      const { missionId } = req.params;
+      if (!validateMissionId(missionId)) throw badRequest("Invalid mission ID format");
+      const { store: scopedStore } = await getProjectContext(req);
+      const missionStore = scopedStore.getMissionStore();
+      if (!await missionStore.getMission(missionId)) throw notFound("Mission not found");
+      const result = await reconcileMissionState(
+        { taskStore: scopedStore, missionStore },
+        { missionId, source: "api", actor: DASHBOARD_MISSION_ACTOR, dryRun: req.body?.dryRun === true },
+      );
+      res.json(result);
+    }),
+  );
+
+  /**
    * POST /api/missions/features/:featureId/reconcile-done
    * Reconcile feature completion against a shipped delivery task.
    */
@@ -2735,48 +2996,30 @@ export function createMissionRouter(
         throw badRequest("Invalid feature ID format");
       }
 
-      const existing = await missionStore.getFeature(featureId);
-      if (!existing) {
-        throw notFound("Feature not found");
-      }
-
       if (typeof taskId !== "string" || !taskId.trim()) {
         throw badRequest("taskId is required and must be a non-empty string");
       }
 
       const normalizedTaskId = taskId.trim();
-
-      if (existing.taskId && existing.taskId !== normalizedTaskId) {
-        throw conflict(
-          `Feature ${featureId} is already linked to ${existing.taskId}; cannot reconcile against ${normalizedTaskId}`
-        );
-      }
-
       const { store: scopedStore } = await getProjectContext(req);
-      let task: Awaited<ReturnType<typeof scopedStore.getTask>>;
+      const scopedMissionStore = scopedStore.getMissionStore();
+      if (!hasTerminalReconcileCapability(scopedMissionStore)) {
+        throw internalError("Terminal-task reconciliation requires the PostgreSQL mission store");
+      }
+
+      /*
+      FNXC:MissionReconciliation 2026-07-20-08:34:
+      Route validation stays project-scoped, but all terminal-evidence checks, mismatch guards, linkage, and rollups belong to one store transaction. Never pre-link or move a shipped task here because ordinary lifecycle paths can wake a parked mission.
+      */
       try {
-        task = await scopedStore.getTask(normalizedTaskId);
-      } catch (err: unknown) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errMsg.includes("not found")) {
-          throw notFound("Delivery task not found");
-        }
-        throw err;
+        const feature = await scopedMissionStore.reconcileFeatureDoneWithTerminalTask(featureId, normalizedTaskId);
+        res.json(feature);
+      } catch (error: unknown) {
+        if (!(error instanceof TerminalTaskReconciliationError)) throw error;
+        if (error.code === "FEATURE_NOT_FOUND") throw notFound("Feature not found");
+        if (error.code === "TASK_NOT_FOUND") throw notFound("Delivery task not found");
+        throw conflict(error.message);
       }
-
-      if (task.column !== "done" && task.column !== "archived") {
-        throw conflict(
-          `Delivery task ${normalizedTaskId} must be in done or archived to reconcile feature to done. ` +
-          "Use PATCH /api/missions/features/:featureId or triage/link-task endpoints for active work."
-        );
-      }
-
-      if (!existing.taskId) {
-        await missionStore.linkFeatureToTask(featureId, normalizedTaskId);
-      }
-
-      const feature = await missionStore.updateFeatureStatus(featureId, "done");
-      res.json(feature);
     })
   );
 
@@ -2802,7 +3045,22 @@ export function createMissionRouter(
         throw badRequest("Feature is not linked to a task");
       }
 
-      const feature = await missionStore.unlinkFeatureFromTask(featureId);
+      let feature;
+      try {
+        feature = await missionStore.unlinkFeatureFromTask(featureId);
+      } catch (error) {
+        /*
+        FNXC:MissionFeatureUnlinkRoute 2026-08-19-21:24 (RUFU-134 / PR #3491 CodeRabbit):
+        The pre-check above handles the normal case; the store still throws its not-linked
+        error if a concurrent unlink wins between the check and the write. That is a
+        client-visible precondition (4xx), not a server fault — an uncaught generic Error
+        would surface as a 500 via catchHandler.
+        */
+        if (error instanceof Error && /is not linked to any task/.test(error.message)) {
+          throw badRequest(error.message);
+        }
+        throw error;
+      }
       res.json(feature);
     })
   );
@@ -2854,6 +3112,18 @@ export function createMissionRouter(
         if (errMsg.includes("TaskStore")) {
           throw new ApiError(503, "TaskStore not available for triage operations");
         }
+        /*
+        FNXC:MissionWorkflows 2026-08-15-05:10:
+        Core's intake-ownership boundary (FNXC:IntakeOwnership 2026-08-09) now rejects a
+        client-named missing workflow with the typed TaskIntakeOwnerResolutionError
+        (code "task-intake-owner-resolution", reason "workflow-unresolvable") instead of a
+        "Workflow ... not found" message, so the message-pattern mapping below stopped firing
+        and an unknown workflowId leaked as a 500. Map the typed rejection back to 404: it is
+        client input, not a server fault, and no feature/task link is created.
+        */
+        if (isUnresolvableWorkflowIntakeError(err)) {
+          throw notFound("Workflow not found for triage");
+        }
         if (/workflow/i.test(errMsg) && /not found/i.test(errMsg)) {
           throw notFound(errMsg);
         }
@@ -2899,6 +3169,10 @@ export function createMissionRouter(
         if (errMsg.includes("TaskStore")) {
           throw new ApiError(503, "TaskStore not available for triage operations");
         }
+        // FNXC:MissionWorkflows 2026-08-15-05:10: see the single-feature triage handler above — the typed intake-ownership rejection replaced the "Workflow ... not found" message for a missing client-named workflow.
+        if (isUnresolvableWorkflowIntakeError(err)) {
+          throw notFound("Workflow not found for triage");
+        }
         if (/workflow/i.test(errMsg) && /not found/i.test(errMsg)) {
           throw notFound(errMsg);
         }
@@ -2908,6 +3182,52 @@ export function createMissionRouter(
   );
 
   // ── Mission Pause/Stop/Resume Endpoints ─────────────────────────────────────
+
+  /**
+   * GET /api/missions/:missionId/blocked-diagnostics
+   * Returns the canonical blocker descriptors without changing mission state.
+   */
+  router.get(
+    "/:missionId/blocked-diagnostics",
+    catchTypedHandler(async (req, res) => {
+      const { missionId } = req.params;
+      if (!validateMissionId(missionId)) throw badRequest("Invalid mission ID format");
+      try {
+        res.json(await asyncMissionStore.getMissionBlockedDiagnostics(missionId));
+      } catch (error) {
+        if (error instanceof Error && error.message === `Mission ${missionId} not found`) throw notFound("Mission not found");
+        throw error;
+      }
+    }),
+  );
+
+  /**
+   * FNXC:MissionBlockedRepair 2026-08-11-02:56:
+   * This clear route repairs a stale badge only. Unlike resume it deliberately does not watch the
+   * mission, recover stale work, unpause tasks, or alter lineage stops.
+   */
+  router.post(
+    "/:missionId/clear-blocked",
+    catchTypedHandler(async (req, res) => {
+      const { missionId } = req.params;
+      if (!validateMissionId(missionId)) throw badRequest("Invalid mission ID format");
+      const reason = validateDescription(req.body?.reason);
+      // FNXC:MissionBlockedRepair 2026-08-11-03:15:
+      // Check existence before the mutation so an unknown id is consistently a 404 even when a
+      // store implementation cannot distinguish a missing row from another clear precondition.
+      if (!await missionStore.getMission(missionId)) throw notFound("Mission not found");
+      try {
+        const result = await asyncMissionStore.clearMissionBlockedStatus(missionId, { actor: DASHBOARD_MISSION_ACTOR, reason });
+        res.json(result);
+      } catch (error) {
+        if (error instanceof MissionBlockedClearConflictError) {
+          throw conflict("Mission is not blocked", { code: "MISSION_NOT_BLOCKED", status: error.status });
+        }
+        if (error instanceof Error && error.message === `Mission ${missionId} not found`) throw notFound("Mission not found");
+        throw error;
+      }
+    }),
+  );
 
   /**
    * POST /api/missions/:missionId/pause
@@ -2932,7 +3252,7 @@ export function createMissionRouter(
         throw badRequest("Mission is already paused (blocked)");
       }
 
-      const updated = await missionStore.updateMission(missionId, { status: "blocked" });
+      const updated = await missionStore.updateMission(missionId, { status: "blocked" }, { actor: DASHBOARD_MISSION_ACTOR });
       res.json(updated);
     })
   );
@@ -2959,7 +3279,25 @@ export function createMissionRouter(
         throw badRequest("Mission is not paused (status must be 'blocked' to resume)");
       }
 
-      await missionStore.updateMission(missionId, { status: "active" });
+// FNXC:MissionLineageBudget 2026-07-22-15:45: resumeMission performs the all-or-nothing root-stop classification; generic activation must not clear a lineage stop.
+      try {
+        await missionStore.resumeMission(missionId);
+      } catch (error) {
+        if (error instanceof MissionResumeConflictError) {
+          /*
+          FNXC:MissionLineageBudget 2026-08-11-08:07:
+          blockers gated by blockerSchemaVersion are the sole resume-conflict vocabulary after
+          FN-8979 retired the v0 mirror. Consumers unable to interpret the version must report
+          that resume cannot proceed and ask an operator rather than guessing.
+          */
+          throw conflict("Mission has non-resumable lineage stops", {
+            code: "MISSION_RESUME_CONFLICT",
+            blockerSchemaVersion: MISSION_BLOCKER_DESCRIPTOR_SCHEMA_VERSION,
+            blockers: error.descriptors,
+          });
+        }
+        throw error;
+      }
 
       // Re-engage autopilot if enabled and autopilot instance is available.
       // The autopilot may have been stopped or the mission unwatched during
@@ -2997,24 +3335,10 @@ export function createMissionRouter(
       }
 
       // Set mission status to blocked
-      const updated = await missionStore.updateMission(missionId, { status: "blocked" });
+      const updated = await missionStore.updateMission(missionId, { status: "blocked" }, { actor: DASHBOARD_MISSION_ACTOR });
 
-      // Pause all tasks linked to features in this mission
-      const pausedTaskIds: string[] = [];
-      for (const milestone of hierarchy.milestones) {
-        for (const slice of milestone.slices) {
-          for (const feature of slice.features) {
-            if (feature.taskId) {
-              try {
-                await store.pauseTask(feature.taskId, true);
-                pausedTaskIds.push(feature.taskId);
-              } catch (_err) {
-                // Log but don't fail — task may already be paused or not found
-              }
-            }
-          }
-        }
-      }
+      // Pause all tasks linked to features in this mission.
+      const pausedTaskIds = await pauseMissionTasksForOperatorStop(getScopedStore(), hierarchy);
 
       res.json({ ...updated, pausedTaskIds });
     })
@@ -3045,32 +3369,9 @@ export function createMissionRouter(
         throw conflict("Mission must be in 'planning' status to start");
       }
 
-      const nextSlice = await missionStore.findNextPendingSlice(missionId);
-      if (!nextSlice) {
+      const initialHierarchy = await missionStore.getMissionWithHierarchy(missionId);
+      if (!initialHierarchy?.milestones.some((milestone) => milestone.slices.some((slice) => slice.status === "pending"))) {
         throw badRequest("No pending slices found");
-      }
-
-      // Preflight: when ephemeral agents are disabled, mission tasks can only be
-      // run by a permanent executor agent. Catalog-imported "company" agents land
-      // with role "custom" and are never auto-assigned, so without an executor the
-      // mission's tasks silently queue forever with no error surfaced (issue #1261).
-      // Block the start with an actionable message instead of stalling invisibly.
-      // Mirrors the scheduler's dispatch gate (ephemeralAgentsEnabled===false +
-      // selectPermanentAgentForTask returns null → task queued); both go through
-      // listEligibleExecutorAgents so the preflight can't drift from dispatch.
-      const scopedStore = getScopedStore();
-      const startSettings = await scopedStore.getSettings();
-      if (startSettings.ephemeralAgentsEnabled === false) {
-        const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir(), asyncLayer: scopedStore.getAsyncLayer() ?? undefined });
-        await agentStore.init();
-        const executors = await listEligibleExecutorAgents(agentStore);
-        if (executors.length === 0) {
-          throw badRequest(
-            "Cannot start mission: ephemeral agents are disabled and no executor agent is available to run its tasks. "
-              + "Imported catalog (\"company\") agents have role \"custom\" and are not auto-assigned mission work. "
-              + "Assign at least one agent the \"executor\" role, or re-enable ephemeral agents in settings.",
-          );
-        }
       }
 
       // Enable autopilot (and autoAdvance for backward compat) so the mission
@@ -3079,10 +3380,11 @@ export function createMissionRouter(
         autopilotEnabled: true,
         autoAdvance: true, // kept for backward compat with existing mission data
         status: "active",
-      });
+      }, { actor: DASHBOARD_MISSION_ACTOR });
 
-      // Activate the first pending slice (triggers auto-triage via activateSlice)
-      await missionStore.activateSlice(nextSlice.id);
+      // Atomically admit the first serially eligible slice. A concurrent resume
+      // or recovery winner has already created the only permitted active slice.
+      await missionStore.tryActivateNextPendingSlice(missionId);
 
       // Return updated mission with hierarchy
       const hierarchy = await missionStore.getMissionWithHierarchy(missionId);
@@ -3153,7 +3455,7 @@ export function createMissionRouter(
       }
 
       // Update the mission's autopilotEnabled field
-      await missionStore.updateMission(missionId, { autopilotEnabled: enabled });
+      await missionStore.updateMission(missionId, { autopilotEnabled: enabled }, { actor: DASHBOARD_MISSION_ACTOR });
 
       if (missionAutopilot) {
         if (enabled) {

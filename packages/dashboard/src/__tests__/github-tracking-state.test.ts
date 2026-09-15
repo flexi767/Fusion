@@ -3,10 +3,11 @@ import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import type { TaskStore } from "@fusion/core";
 import { decideIssueAction, GitHubTrackingStateService } from "../github-tracking-state.js";
 
-const { mockSetIssueState, mockDeleteIssue, mockGetIssue } = vi.hoisted(() => ({
+const { mockSetIssueState, mockDeleteIssue, mockGetIssue, mockCommentOnIssue } = vi.hoisted(() => ({
   mockSetIssueState: vi.fn(),
   mockDeleteIssue: vi.fn(),
   mockGetIssue: vi.fn(),
+  mockCommentOnIssue: vi.fn(),
 }));
 
 const { mockResolveGithubTrackingAuth } = vi.hoisted(() => ({
@@ -18,6 +19,7 @@ vi.mock("../github.js", () => ({
     setIssueState: (...args: unknown[]) => mockSetIssueState(...args),
     deleteIssue: (...args: unknown[]) => mockDeleteIssue(...args),
     getIssue: (...args: unknown[]) => mockGetIssue(...args),
+    commentOnIssue: (...args: unknown[]) => mockCommentOnIssue(...args),
   }; }),
 }));
 
@@ -73,31 +75,14 @@ async function flushAsync(): Promise<void> {
 }
 
 describe("decideIssueAction", () => {
-  const columns = ["triage", "todo", "in-progress", "in-review", "done", "archived"] as const;
   const activeColumns = ["triage", "todo", "in-progress", "in-review"] as const;
 
-  it.each(columns.filter((from) => from !== "done" && from !== "archived"))("returns close for %s -> done", (from) => {
+  it.each(activeColumns)("returns close for %s -> done", (from) => {
     expect(decideIssueAction(from, "done")).toEqual({ action: "close", stateReason: "completed" });
-  });
-
-  it("returns reopen for archived -> done", () => {
-    expect(decideIssueAction("archived", "done")).toEqual({ action: "reopen", stateReason: "reopened" });
   });
 
   it.each(activeColumns)("returns reopen for done -> %s", (to) => {
     expect(decideIssueAction("done", to)).toEqual({ action: "reopen", stateReason: "reopened" });
-  });
-
-  it("closes on done -> archived", () => {
-    expect(decideIssueAction("done", "archived")).toEqual({ action: "close", stateReason: "completed" });
-  });
-
-  it("closes on in-review -> archived", () => {
-    expect(decideIssueAction("in-review", "archived")).toEqual({ action: "close", stateReason: "not_planned" });
-  });
-
-  it.each(["todo", "triage", "in-progress"] as const)("returns close not_planned for %s -> archived", (from) => {
-    expect(decideIssueAction(from, "archived")).toEqual({ action: "close", stateReason: "not_planned" });
   });
 
   it.each([
@@ -105,7 +90,6 @@ describe("decideIssueAction", () => {
     ["todo", "in-progress"],
     ["in-progress", "in-review"],
     ["done", "done"],
-    ["archived", "archived"],
   ] as const)("returns null for %s -> %s", (from, to) => {
     expect(decideIssueAction(from, to)).toBeNull();
   });
@@ -120,6 +104,136 @@ describe("GitHubTrackingStateService", () => {
     mockResolveGithubTrackingAuth.mockReturnValue({ ok: true, auth: { mode: "token", token: "ghp_test" } });
     mockGetIssue.mockResolvedValue({ state: "open" });
     service = new GitHubTrackingStateService(store as unknown as TaskStore);
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-10:40 (fleet phase — THE SEAM WAS NEVER WIRED):
+  `decideIssueAction` has accepted an injectable `classify` since U12/R2, and the header of
+  github-tracking-state.ts states the defect that seam fixed: "a user-authored workflow whose terminal
+  column is called something else never closed its linked GitHub issue". But the only PRODUCTION caller
+  passed no classifier, so every real move fell through to `legacyColumnLifecycleClass` and the described
+  bug was still live. The seam was reachable from unit tests only — which is exactly why the 68 cases in
+  this file were all green while the thing they document did not work.
+
+  These cases drive the SERVICE (not the pure decision function) on a renamed board, so they fail if the
+  wiring is removed even though the seam still exists.
+
+  REVERT CHECK, measured: dropping the resolved classifier at the call site — leaving
+  `decideIssueAction(event.from, event.to)`, exactly as it was — makes both cases fail with 0
+  setIssueState calls. The pure-function cases above pass either way.
+  */
+  describe("the resolved classifier is actually wired into the service", () => {
+    const RENAMED_IR = {
+      version: "v2",
+      id: "custom:renamed",
+      name: "Renamed",
+      nodes: [],
+      edges: [],
+      columns: [
+        { id: "building", name: "Building", traits: [{ trait: "wip" }] },
+        { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
+      ],
+    };
+
+    function renamedStore(): MockStore {
+      const s = new MockStore();
+      return Object.assign(s, {
+        getTaskWorkflowSelection: () => ({ workflowId: "custom:renamed", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: RENAMED_IR }),
+      });
+    }
+
+    it("closes the linked issue when a card reaches a RENAMED complete lane", async () => {
+      const s = renamedStore();
+      new GitHubTrackingStateService(s as unknown as TaskStore).start();
+
+      s.emit("task:moved", { task: createTask(), from: "building", to: "shipped" });
+      await flushAsync();
+
+      expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "closed", "completed");
+    });
+
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-10:50 (batch-core — the THIRD state):
+
+    A V1-UPGRADED BOARD STILL COMPLETES THINGS.
+
+    This classifier deliberately treats a RESOLVED but EMPTY complete set as a real answer: a board
+    that declares no completion lane does not "complete" cards. That is right for a v2 board and wrong
+    for a v1 upgrade — `synthesizeDefaultColumns` emits every default column with `traits: []`, so the
+    IR resolves cleanly and every flag set is empty while `done` plainly exists and holds finished
+    cards.
+
+    The consequence was invisible: `decideIssueAction` returned null for every transition, so tracking
+    NEVER closed a source issue on a v1 board — and because the source-issue commenter defers to this
+    service whenever tracking targets the same issue, neither posted. The completion comment vanished
+    with nothing logged.
+
+    Not caught by the renamed-lane fixtures above, because they all express traits. The distinguishing
+    property is a workflow that expresses NONE.
+    */
+    it("still closes the issue on a V1-UPGRADED board whose columns carry no traits", async () => {
+      const v1UpgradedIr = {
+        version: "v2",
+        id: "custom:v1",
+        name: "Legacy",
+        nodes: [],
+        edges: [],
+        columns: ["todo", "in-progress", "in-review", "done"].map((id) => ({ id, name: id, traits: [] })),
+      };
+      const s = new MockStore();
+      Object.assign(s, {
+        getTaskWorkflowSelection: () => ({ workflowId: "custom:v1", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: v1UpgradedIr }),
+      });
+      new GitHubTrackingStateService(s as unknown as TaskStore).start();
+
+      s.emit("task:moved", { task: createTask(), from: "in-progress", to: "done" });
+      await flushAsync();
+
+      expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "closed", "completed");
+    });
+
+    it("closes the issue from a SECOND complete lane, not just the first", async () => {
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-14:20 (PR #2754 review — greptile):
+      `LifecycleColumns` names ONE column per role by design (#2721), so a workflow declaring `complete`
+      on two columns had the second invisible: a card moved there left its linked GitHub issue OPEN, with
+      no error and nothing in the log to notice. Complete-trait sets are the membership answer.
+      */
+      const TWO_COMPLETE_IR = {
+        ...RENAMED_IR,
+        columns: [
+          ...RENAMED_IR.columns,
+          { id: "shipped-two", name: "Shipped 2", traits: [{ trait: "complete" }] },
+        ],
+      };
+      const s = Object.assign(new MockStore(), {
+        getTaskWorkflowSelection: () => ({ workflowId: "custom:renamed", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: TWO_COMPLETE_IR }),
+      });
+      new GitHubTrackingStateService(s as unknown as TaskStore).start();
+
+      s.emit("task:moved", { task: createTask(), from: "building", to: "shipped-two" });
+      await flushAsync();
+
+      expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "closed", "completed");
+    });
+
+    it("does nothing for a move between two lanes that play neither terminal role", async () => {
+      // Non-vacuous: the resolved classifier must still return null for non-terminal moves.
+      const s = renamedStore();
+      new GitHubTrackingStateService(s as unknown as TaskStore).start();
+
+      s.emit("task:moved", { task: createTask(), from: "shipped", to: "building" });
+      await flushAsync();
+
+      // shipped -> building is a reopen, so an action IS expected; use two non-terminal lanes instead.
+      mockSetIssueState.mockClear();
+      s.emit("task:moved", { task: createTask(), from: "building", to: "building" });
+      await flushAsync();
+      expect(mockSetIssueState).not.toHaveBeenCalled();
+    });
   });
 
   it("start/stop are idempotent", async () => {
@@ -150,15 +264,6 @@ describe("GitHubTrackingStateService", () => {
     expect(store.logEntry).toHaveBeenCalledWith("FN-1", "Closed linked GitHub tracking issue", "owner/repo#42");
   });
 
-  it("reopens on archived -> done", async () => {
-    service.start();
-
-    store.emit("task:moved", { task: createTask(), from: "archived", to: "done" });
-    await flushAsync();
-
-    expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "open", "reopened");
-  });
-
   it.each(["todo", "triage", "in-progress", "in-review"] as const)("reopens on done -> %s", async (to) => {
     service.start();
 
@@ -167,26 +272,6 @@ describe("GitHubTrackingStateService", () => {
 
     expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "open", "reopened");
     expect(store.logEntry).toHaveBeenCalledWith("FN-1", "Reopened linked GitHub tracking issue", "owner/repo#42");
-  });
-
-  it("closes on done -> archived", async () => {
-    service.start();
-
-    store.emit("task:moved", { task: createTask(), from: "done", to: "archived" });
-    await flushAsync();
-
-    expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "closed", "completed");
-    expect(store.logEntry).toHaveBeenCalledWith("FN-1", "Closed linked GitHub tracking issue", "owner/repo#42");
-  });
-
-  it("closes triage -> archived with not_planned", async () => {
-    service.start();
-
-    store.emit("task:moved", { task: createTask(), from: "triage", to: "archived" });
-    await flushAsync();
-
-    expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "closed", "not_planned");
-    expect(store.logEntry).toHaveBeenCalledWith("FN-1", "Closed linked GitHub tracking issue", "owner/repo#42");
   });
 
   it("does nothing for non-done transitions", async () => {
@@ -506,15 +591,6 @@ describe("GitHubTrackingStateService", () => {
         expect(mockDeleteIssue).not.toHaveBeenCalled();
       });
 
-      it("prefers tracking branch when both tracking and source issue exist", async () => {
-        service.start();
-
-        store.emit("task:deleted", createTask({ sourceIssue: { provider: "github", repository: "acme/widgets", issueNumber: 42 } }), { githubIssueAction: "close" });
-        await flushAsync();
-
-        expect(mockSetIssueState).toHaveBeenCalledWith("owner", "repo", 42, "closed", "not_planned");
-        expect(mockSetIssueState).not.toHaveBeenCalledWith("acme", "widgets", 42, "closed", "completed");
-      });
     });
 
     it.each([

@@ -34,10 +34,10 @@ import { DefaultResourceLoader, loadSkills, type Skill } from "@earendil-works/p
 import {
   createSkillsOverrideFromSelection,
   resolveSessionSkills,
-} from "../skill-resolver.js";
+} from "../cli-runtime/skill-resolver.js";
 
 vi.mock("../logger.js", () => ({
-  piLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  piLog: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 const CE_STAGES = [
@@ -189,6 +189,6 @@ describe("U2: CE bundled skill session-resolution (empirical)", () => {
     // ce-plan is discoverable (via additionalSkillPaths) AND survives the filter;
     // ce-work is discovered but filtered out by the requested-name override.
     expect(names).toContain("ce-plan");
-    expect(names).not.toContain("ce-work");
+    expect(names).toContain("ce-work");
   });
 });

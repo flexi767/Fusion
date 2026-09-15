@@ -18,8 +18,13 @@ vi.mock("../../sse-bus", () => ({
 
 vi.mock("../../api", async (importOriginal) => {
   const { createDashboardApiMock } = await import("../../test/mockApi");
+  const fetchTasks = vi.fn().mockResolvedValue([]);
   return createDashboardApiMock(() => importOriginal<typeof import("../../api")>(), {
-    fetchTasks: vi.fn().mockResolvedValue([]),
+    fetchTasks,
+    fetchTaskPage: vi.fn(async (_projectId?: string, options?: { query?: string }) => {
+      const tasks = await fetchTasks(undefined, undefined, _projectId, options?.query, options?.query ? false : true);
+      return { tasks, total: tasks.length, hasMore: false, nextCursor: null };
+    }),
   });
 });
 
@@ -83,5 +88,46 @@ describe("useTasks resume instrumentation", () => {
       projectId: "proj-1",
       replayAttempted: false,
     }));
+  });
+
+  it("coalesces visibility, focus, pageshow, and reconnect bursts into one current-context fetch", async () => {
+    const api = await import("../../api");
+    const fetchTasks = vi.mocked(api.fetchTasks);
+    const { useTasks } = await import("../useTasks");
+    renderHook(() => useTasks({ projectId: "proj-current" }));
+    await waitFor(() => expect(subscribeCalls[0]?.onReconnect).toBeTypeOf("function"));
+    await waitFor(() => expect(fetchTasks).toHaveBeenCalled());
+    fetchTasks.mockClear();
+
+    let resolveRefresh: (tasks: never[]) => void = () => {};
+    fetchTasks.mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+      subscribeCalls[0]?.onReconnect?.();
+    });
+
+    expect(fetchTasks).toHaveBeenCalledTimes(1);
+    await act(async () => resolveRefresh([]));
+  });
+
+  describe.each([
+    ["focus", () => window.dispatchEvent(new Event("focus"))],
+    ["pageshow", () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }))],
+  ])("%s resume instrumentation", (trigger, dispatch) => {
+    it("uses the production hook revalidation seam", async () => {
+      const { useTasks } = await import("../useTasks");
+      renderHook(() => useTasks({ projectId: "proj-1", sseEnabled: false }));
+
+      act(dispatch);
+
+      expect(recordResumeEvent).toHaveBeenCalledWith(expect.objectContaining({
+        view: "useTasks",
+        trigger,
+        projectId: "proj-1",
+        replayAttempted: false,
+      }));
+    });
   });
 });

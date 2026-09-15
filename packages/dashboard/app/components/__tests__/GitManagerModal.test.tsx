@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { GitManagerModal } from "../GitManagerModal";
+import { assertModalGeometryRecoveryAndSheetContracts, assertRenderedModalTouchGeometry } from "./floatingWindowMigration.test-helpers";
 import type { Task } from "@fusion/core";
 import { loadAllAppCss } from "../../test/cssFixture";
 
@@ -20,8 +21,9 @@ const mockUseMobileKeyboard = vi.fn(() => ({
 
 vi.mock("../../hooks/useViewportMode", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
-  isFullScreenSheetViewport: () => false,
-  isShortViewport: () => false,
+  isFullScreenSheetViewport: () => window.matchMedia("(max-width: 767.98px)").matches,
+  isShortViewport: () => window.matchMedia("(max-height: 480px)").matches,
+  isTabletTouchViewport: () => false,
   getViewportMode: () => mockUseViewportMode(),
   isMobileViewport: () => mockUseViewportMode() === "mobile",
   useViewportMode: () => mockUseViewportMode(),
@@ -381,14 +383,36 @@ describe("GitManagerModal", () => {
   });
 
   it("renders git-manager overlay class hook for mobile fullscreen CSS", async () => {
-    const { container } = render(
+    const { baseElement } = render(
       <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
     );
     await waitFor(() => {
       expect(screen.getByText("Git Manager")).toBeInTheDocument();
     });
 
-    expect(container.querySelector(".modal-overlay.git-manager-modal-overlay")).toBeTruthy();
+    expect(baseElement.querySelector(".floating-window--git-manager")).toBeTruthy();
+  });
+
+  /*
+  FNXC:StandardizedViewLayout 2026-09-13-22:40:
+  FN-379 classifies Git Manager as a shared-chrome destination: on the desktop window and on the phone sheet it
+  must build exactly one canonical header owning the single exit, with its sections bounded by the content zone.
+  */
+  it.each(["desktop", "mobile"] as const)("keeps Git Manager on one canonical header with a bounded body (%s)", async (mode) => {
+    mockUseViewportMode.mockReturnValue(mode);
+    render(<GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />);
+    await waitFor(() => expect(screen.getByText("Git Manager")).toBeInTheDocument());
+
+    const panel = screen.getByTestId("floating-window-git-manager");
+    const headers = panel.querySelectorAll(".view-header");
+    expect(headers).toHaveLength(1);
+    const closes = panel.querySelectorAll(".modal-close");
+    expect(closes).toHaveLength(1);
+    expect(headers[0].contains(closes[0])).toBe(true);
+
+    const content = panel.querySelector<HTMLElement>('.gm-layout[data-view-layout-zone="content"]');
+    expect(content).toBeTruthy();
+    expect(headers[0].contains(content as HTMLElement)).toBe(false);
   });
 
   it("keeps the sidebar-launched Git Manager overlay transparent and click-through like Files", () => {
@@ -412,14 +436,14 @@ describe("GitManagerModal", () => {
       keyboardOpen: true,
     });
 
-    const { container } = render(
+    const { baseElement } = render(
       <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
     );
     await waitFor(() => {
       expect(screen.getByText("Git Manager")).toBeInTheDocument();
     });
 
-    const modal = container.querySelector(".modal.gm-modal") as HTMLElement;
+    const modal = baseElement.querySelector(".modal.gm-modal") as HTMLElement;
     expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("240px");
     expect(modal.style.getPropertyValue("--vv-height")).toBe("620px");
     expect(modal.style.getPropertyValue("--vv-offset-top")).toBe("18px");
@@ -698,7 +722,7 @@ describe("GitManagerModal", () => {
     });
   });
 
-  it("keeps separate scroll containers for unstaged and staged file lists", async () => {
+  it("keeps separate scroll baseElements for unstaged and staged file lists", async () => {
     (fetchFileChanges as any).mockResolvedValue([
       ...Array.from({ length: 30 }, (_, index) => ({
         file: `src/unstaged-${index}.ts`,
@@ -2189,7 +2213,7 @@ describe("GitManagerModal", () => {
     ]);
 
     const user = userEvent.setup();
-    const { container } = render(
+    const { baseElement } = render(
       <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
     );
     fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
@@ -2200,7 +2224,7 @@ describe("GitManagerModal", () => {
     });
 
     await waitFor(() => {
-      const selectedOrigin = container.querySelector(".gm-remote-selector-item.selected");
+      const selectedOrigin = baseElement.querySelector(".gm-remote-selector-item.selected");
       expect(selectedOrigin).toBeTruthy();
       expect(selectedOrigin?.textContent ?? "").toContain("origin");
     });
@@ -2211,7 +2235,7 @@ describe("GitManagerModal", () => {
     await user.click(upstreamButton as HTMLElement);
 
     await waitFor(() => {
-      const selectedUpstream = container.querySelector(".gm-remote-selector-item.selected");
+      const selectedUpstream = baseElement.querySelector(".gm-remote-selector-item.selected");
       expect(selectedUpstream).toBeTruthy();
       expect(selectedUpstream?.textContent ?? "").toContain("upstream");
     });
@@ -3710,6 +3734,11 @@ describe("GitManagerModal", () => {
   });
 
   describe("CSS regression coverage", () => {
+    /*
+    FNXC:GitManagerMobileSpacing 2026-08-01-19:10:
+    FN-8702 makes Git Manager's standalone sheet rules strictly phone-only. These source
+    assertions protect the 767.98px selector boundary while Chromium verifies the resulting geometry.
+    */
     it("includes remotes layout selectors and mobile rules", () => {
       const css = loadAllAppCss();
       expect(css).toContain(".gm-remotes-layout");
@@ -3717,7 +3746,7 @@ describe("GitManagerModal", () => {
       expect(css).toContain(".gm-remote-detail");
       expect(css).toContain(".gm-remote-sync-card");
       expect(css).toContain(".gm-remote-detail-card");
-      expect(css).toMatch(/@media[^{]*\(max-width: 768px\)[^{]*\{[\s\S]*?\.gm-remotes-layout[\s\S]*?\.gm-remote-selector[\s\S]*?\}/);
+      expect(css).toMatch(/@media[^{]*\(max-width: 767\.98px\)[^{]*\{[\s\S]*?\.gm-remotes-layout[\s\S]*?\.gm-remote-selector[\s\S]*?\}/);
     });
 
     it("keeps remotes-specific status/surface styles tokenized", () => {
@@ -3731,24 +3760,24 @@ describe("GitManagerModal", () => {
     it("includes mobile wrapping rules for changes file rows and section actions", () => {
       const css = loadAllAppCss();
 
-      expect(css).toMatch(/@media[^{]*\(max-width: 768px\)[^{]*\{[\s\S]*?\.gm-file-section-actions\s*\{[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?flex:\s*1 1 100%;/);
-      expect(css).toMatch(/@media[^{]*\(max-width: 768px\)[^{]*\{[\s\S]*?\.gm-file-item\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?flex-wrap:\s*wrap;/);
-      expect(css).toMatch(/@media[^{]*\(max-width: 768px\)[^{]*\{[\s\S]*?\.gm-file-section\s*\{[\s\S]*?max-width:\s*100%;/);
+      expect(css).toMatch(/@media[^{]*\(max-width: 767\.98px\)[^{]*\{[\s\S]*?\.gm-file-section-actions\s*\{[\s\S]*?flex-wrap:\s*wrap;[\s\S]*?flex:\s*1 1 100%;/);
+      expect(css).toMatch(/@media[^{]*\(max-width: 767\.98px\)[^{]*\{[\s\S]*?\.gm-file-item\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?flex-wrap:\s*wrap;/);
+      expect(css).toMatch(/@media[^{]*\(max-width: 767\.98px\)[^{]*\{[\s\S]*?\.gm-file-section\s*\{[\s\S]*?max-width:\s*100%;/);
     });
 
     it("includes commit target and worktree actions in modal mobile and embedded narrow layouts", () => {
       const css = loadAllAppCss();
-      const mobile768 = getMediaBlocks(css, /@media[^{]*\(max-width:\s*768px\)[^{]*\{/g).join("\n");
+      const phone767 = getMediaBlocks(css, /@media[^{]*\(max-width:\s*767\.98px\)[^{]*\{/g).join("\n");
       const embeddedNarrow = getMediaBlocks(css, /@container\s+gm-embedded\s+\(max-width:\s*560px\)\s*\{/g).join("\n");
 
       expect(css).toContain(".gm-commit-target");
       expect(css).toContain(".gm-worktree-actions");
-      expect(mobile768).toContain(".gm-commit-target select");
-      expect(mobile768).toContain(".gm-worktree-actions .btn");
+      expect(phone767).toContain(".gm-commit-target select");
+      expect(phone767).toContain(".gm-worktree-actions .btn");
       expect(embeddedNarrow).toContain(".gm-modal--embedded .gm-commit-target select");
       expect(embeddedNarrow).toContain(".gm-modal--embedded .gm-worktree-actions .btn");
 
-      const mobileTargetRules = getRuleBlocks(mobile768, ".gm-commit-target,\n  .gm-commit-target select,\n  .gm-commit-controls .gm-search-box");
+      const mobileTargetRules = getRuleBlocks(phone767, ".gm-commit-target,\n  .gm-commit-target select,\n  .gm-commit-controls .gm-search-box");
       expect(mobileTargetRules).toHaveLength(1);
       expect(mobileTargetRules[0]).toContain("width: 100%;");
       const embeddedTargetRules = getRuleBlocks(embeddedNarrow, ".gm-modal--embedded .gm-commit-target,\n  .gm-modal--embedded .gm-commit-target select,\n  .gm-modal--embedded .gm-commit-controls .gm-search-box");
@@ -3756,12 +3785,12 @@ describe("GitManagerModal", () => {
       expect(embeddedTargetRules[0]).toContain("width: 100%;");
     });
 
-    it("keeps the mobile Git Manager tab strip non-shrinking at 768px and 720px breakpoints", () => {
+    it("keeps the mobile Git Manager tab strip non-shrinking below 768px and at 720px", () => {
       const css = loadAllAppCss();
-      const mobile768 = getMediaBlocks(css, /@media[^{]*\(max-width:\s*768px\)[^{]*\{/g).join("\n");
+      const phone767 = getMediaBlocks(css, /@media[^{]*\(max-width:\s*767\.98px\)[^{]*\{/g).join("\n");
       const mobile720 = getMediaBlocks(css, /@media[^{]*\(max-width:\s*720px\)[^{]*\{/g).join("\n");
 
-      const sidebarRules = getRuleBlocks(mobile768, ".gm-sidebar");
+      const sidebarRules = getRuleBlocks(phone767, ".gm-sidebar");
       expect(sidebarRules).toHaveLength(1);
       expect(sidebarRules[0]).toContain("flex: 0 0 auto;");
       expect(sidebarRules[0]).toContain("min-height: calc(var(--space-2xl) + var(--space-md));");
@@ -3772,13 +3801,13 @@ describe("GitManagerModal", () => {
       expect(sidebarRules[0]).toContain("-webkit-overflow-scrolling: touch;");
       expect(sidebarRules[0]).toContain("overscroll-behavior-x: contain;");
 
-      const navItemRules = getRuleBlocks(mobile768, ".gm-nav-item");
+      const navItemRules = getRuleBlocks(phone767, ".gm-nav-item");
       expect(navItemRules).toHaveLength(1);
       // Mobile tabs are compact ICON-ONLY in one scrolling row: non-shrinking via flex:0 0 auto + intrinsic width:auto (overrides the base .gm-nav-item width:100% that otherwise made one tab fill the row).
       expect(navItemRules[0]).toContain("flex: 0 0 auto;");
       expect(navItemRules[0]).toContain("width: auto;");
 
-      const refreshRules = getRuleBlocks(mobile768, ".gm-nav-refresh");
+      const refreshRules = getRuleBlocks(phone767, ".gm-nav-refresh");
       expect(refreshRules).toHaveLength(1);
       expect(refreshRules[0]).toContain("flex: 0 0 auto;");
       expect(refreshRules[0]).toContain("width: auto;");
@@ -3786,5 +3815,13 @@ describe("GitManagerModal", () => {
       expect(mobile720).not.toContain(".gm-sidebar");
       expect(mobile720).not.toContain(".gm-nav-item");
     });
+  });
+});
+
+describe("GitManagerModal floating geometry", () => {
+  it("uses its production header for touch drag and resize", () => {
+    render(<GitManagerModal isOpen onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />);
+    assertRenderedModalTouchGeometry("git-manager", screen.getByTestId("floating-window-git-manager").querySelector(".modal-header") as HTMLElement);
+    assertModalGeometryRecoveryAndSheetContracts("git-manager", () => render(<GitManagerModal isOpen onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />));
   });
 });

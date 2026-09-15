@@ -48,6 +48,9 @@ vi.mock("../../api", () => ({
   fetchGitRemotesDetailed: (...args: unknown[]) => mockFetchGitRemotesDetailed(...args),
   fetchDashboardHealth: (...args: unknown[]) => mockFetchDashboardHealth(...args),
   checkForUpdates: (...args: unknown[]) => mockCheckForUpdates(...args),
+  /* FNXC:DashboardTests 2026-08-23-17:45: SettingsModal now pulls the cached update-check hooks, which import the singular `checkForUpdate`; a mock missing it fails the whole module. */
+  checkForUpdate: vi.fn(() => Promise.resolve({ currentVersion: "0.0.0", latestVersion: null, updateAvailable: false })),
+  refreshUpdateCheck: vi.fn(() => Promise.resolve({ currentVersion: "0.0.0", latestVersion: null, updateAvailable: false })),
   fetchRemoteSettings: (...args: unknown[]) => mockFetchRemoteSettings(...args),
   updateRemoteSettings: vi.fn(),
   fetchRemoteStatus: vi.fn(),
@@ -66,6 +69,25 @@ vi.mock("../../api", () => ({
   loginProvider: vi.fn(),
   logoutProvider: vi.fn(),
   fetchProjects: vi.fn(() => Promise.resolve([])),
+  /*
+  FNXC:DashboardMocks 2026-07-28-17:35:
+  The auto-update / restart-supervision work (system-info probe + update install/restart) added new
+  `../api` runtime exports that SettingsModal reads on mount. This hardcoded api mock must expose them
+  or vitest throws "No <export> is defined on the mock" the moment Settings renders. Type-only exports
+  are erased at runtime and intentionally omitted.
+  */
+  fetchSystemInfo: vi.fn(() => Promise.resolve({ supervised: true, restartSupported: true })),
+  installUpdate: vi.fn(() => Promise.resolve({ ok: true })),
+  requestSystemRestart: vi.fn(() => Promise.resolve({ ok: true })),
+  installCloudflared: vi.fn(() => Promise.resolve({ ok: true })),
+  submitProviderManualCode: vi.fn(() => Promise.resolve({ ok: true })),
+  fetchPlugins: vi.fn(() => Promise.resolve({ plugins: [] })),
+  cancelProviderLogin: vi.fn(() => Promise.resolve(undefined)),
+  saveApiKey: vi.fn(() => Promise.resolve({ ok: true })),
+  clearApiKey: vi.fn(() => Promise.resolve({ ok: true })),
+  testNotification: vi.fn(() => Promise.resolve({ ok: true })),
+  fetchGitRemotes: vi.fn(() => Promise.resolve({ remotes: [] })),
+  fetchGitBranches: vi.fn(() => Promise.resolve({ branches: [] })),
 }));
 
 vi.mock("../../hooks/useNodes", () => ({
@@ -106,8 +128,6 @@ const baseSettings = {
   mergeStrategy: "direct",
   pushAfterMerge: false,
   pushRemote: "origin",
-  recycleWorktrees: false,
-  worktreeNaming: "random",
   includeTaskIdInCommit: true,
 };
 
@@ -139,7 +159,7 @@ describe("SettingsModal Node Routing section", () => {
     mockFetchSettingsByScope.mockResolvedValue({ global: baseSettings, project: {} });
     mockFetchAuthStatus.mockResolvedValue({ providers: [] });
     mockFetchModels.mockResolvedValue({ models: [], favoriteProviders: [], favoriteModels: [] });
-    mockFetchBackups.mockResolvedValue({ backups: [], totalSize: 0 });
+    mockFetchBackups.mockResolvedValue({ backups: [], count: 0, totalSize: 0, schedule: { enabled: false, cronExpression: "0 2 * * *", routineRegistered: false } });
     mockFetchMemoryFiles.mockResolvedValue({ files: [] });
     mockFetchMemoryFile.mockResolvedValue({ path: ".fusion/memory/MEMORY.md", content: "" });
     mockFetchGlobalConcurrency.mockResolvedValue({ globalMaxConcurrent: 10 });
@@ -250,7 +270,7 @@ describe("SettingsModal Node Routing section", () => {
   it("removes routing controls from scheduling section", async () => {
     renderModal();
     await ready();
-    fireEvent.click(screen.getByRole("button", { name: "Scheduling · Project" }));
+    fireEvent.click(screen.getByRole("button", { name: "Scheduling" }));
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "Scheduling" })).toBeInTheDocument();
     });

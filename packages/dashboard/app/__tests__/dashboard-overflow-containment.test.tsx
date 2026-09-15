@@ -135,7 +135,7 @@ function assertInViewport(element: Element, viewport: BreakpointCase, label: str
 }
 
 function BoardFixture({ populated }: { populated: boolean }) {
-  const columns = populated ? ["Triage", "Todo", "In Progress", "In Review", "Done", "Archived"] : ["Empty"];
+  const columns = populated ? ["Triage", "Todo", "In Progress", "In Review", "Done"] : ["Empty"];
   return (
     <main data-testid="board-surface" className="board-shell">
       <section className="board" data-testid={populated ? "board-populated" : "board-empty"}>
@@ -292,7 +292,7 @@ describe("dashboard overflow containment shared mobile/tablet net (FN-6385)", ()
     const mobileRootBlock = ruleBlock(mobileCss, "html,\n  body");
     const mobileOverlayBlock = ruleBlock(
       mobileCss,
-      ".modal-overlay:not(.confirm-dialog-overlay),\n  .agent-detail-overlay,\n  .agent-dialog-overlay,\n  .workflow-output-modal-overlay",
+      ".modal-overlay:not(.confirm-dialog-overlay),\n  .agent-dialog-overlay,\n  .workflow-output-modal-overlay",
     );
     const detailBodyBlock = ruleBlock(baseCss, ".detail-body");
     const boardBaseBlock = ruleBlock(baseCss, ".board");

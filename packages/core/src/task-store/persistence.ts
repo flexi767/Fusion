@@ -8,8 +8,8 @@
  * stays in lockstep with the named-column INSERT/UPSERT clauses generated below.
  */
 import type { Task } from "../types.js";
-import { normalizeTaskPriority } from "../task-priority.js";
-import { toJson, toJsonNullable } from "../db.js";
+import { normalizeTaskPriority } from "../tasks/task-priority.js";
+import { toJson, toJsonNullable, fromJson} from "../db/db.js";
 
 /** Database row shape for the tasks table (all columns). */
 export interface TaskRow {
@@ -26,8 +26,10 @@ export interface TaskRow {
   worktree: string | null;
   blockedBy: string | null;
   overlapBlockedBy: string | null;
+  queuedLogEpisodeSignature: string | null;
   paused: number | null;
   pausedReason: string | null;
+  wedgeNotification: string | null;
   userPaused: number | null;
   baseBranch: string | null;
   executionStartBranch: string | null;
@@ -37,14 +39,19 @@ export interface TaskRow {
   baseCommitSha: string | null;
   modelPresetId: string | null;
   modelProvider: string | null;
+  credentialInstanceId: string | null;
   modelId: string | null;
   validatorModelProvider: string | null;
+  validatorCredentialInstanceId: string | null;
   validatorModelId: string | null;
   planningModelProvider: string | null;
+  planningCredentialInstanceId: string | null;
   planningModelId: string | null;
   mergerModelProvider: string | null;
+  mergerCredentialInstanceId: string | null;
   mergerModelId: string | null;
   mergeRetries: number | null;
+  aiMergeReviewReconciliation: string | null;
   workflowStepRetries: number | null;
   stuckKillCount: number | null;
   resumeLimboCount: number | null;
@@ -60,6 +67,8 @@ export interface TaskRow {
   postReviewFixCount: number | null;
   planReviewReplanCount: number | null;
   recoveryRetryCount: number | null;
+  sessionContentionHoldCount: number | null;
+  sessionContentionWaitReason: string | null;
   taskDoneRetryCount: number | null;
   // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker (ISO timestamp / null).
   bulkCompletionRefusalAt: string | null;
@@ -78,9 +87,12 @@ export interface TaskRow {
   branchConflictRecoveryCount: number | null;
   reviewerContextRetryCount: number | null;
   reviewerFallbackRetryCount: number | null;
+  reviewConvergenceStage: number | null;
+  reviewConvergenceEscalationCount: number | null;
   nextRecoveryAt: string | null;
   error: string | null;
   summary: string | null;
+  recommendations: string | null;
   thinkingLevel: string | null;
   validatorThinkingLevel: string | null;
   planningThinkingLevel: string | null;
@@ -117,6 +129,7 @@ export interface TaskRow {
   executionCompletedAt: string | null;
   dependencies: string | null;
   steps: string | null;
+  stepReports: string | null;
   customFields: string | null;
   log: string | null;
   attachments: string | null;
@@ -138,7 +151,9 @@ export interface TaskRow {
   sourceIssueClosedAt: string | null;
   mergeDetails: string | null;
   workspaceWorktrees: string | null;
-  breakIntoSubtasks: number | null;
+  repositoryScope: string | null;
+  externalBlock: string | null;
+  planningFailure: string | null;
   noCommitsExpected: number | null;
   enabledWorkflowSteps: string | null;
   modifiedFiles: string | null;
@@ -182,16 +197,48 @@ export type TaskColumnDescriptor = {
   serialize: (task: Task, context: TaskPersistSerializationContext) => unknown;
 };
 
+/**
+ * FNXC:TaskStateReconciliation 2026-07-29-20:53:
+ * A generic PostgreSQL task write may carry an active wedge snapshot that was read before the live API resolved that episode. Preserve the durable resolution for the same episode so changed-column persistence, task.json projection, and cache publication cannot reactivate an acknowledged operator notification; a genuinely new wedge must use a new episode ID.
+ */
+export function preserveDurableTaskWedgeInvariants(existingRow: Pick<TaskRow, "wedgeNotification">, task: Task): void {
+  const durable = fromJson<Task["wedgeNotification"]>(existingRow.wedgeNotification);
+  const incoming = task.wedgeNotification;
+  // Keep the legacy resolved-episode rule first and byte-for-byte equivalent in behavior.
+  if (
+    durable?.status === "resolved"
+    && incoming?.status === "active"
+    && durable.episodeId === incoming.episodeId
+  ) {
+    task.wedgeNotification = durable;
+    return;
+  }
+  /*
+  FNXC:TaskWedgeNotifications 2026-08-10-18:54:
+  Wedge JSON is persisted wholesale from task snapshots. A newer durable budget revision
+  must win over an ordinary stale writer, including durable absence after a reset, without
+  overwriting the caller's unrelated episode fields.
+  */
+  const durableRevision = durable?.budgetRevision ?? 0;
+  const incomingRevision = incoming?.budgetRevision ?? 0;
+  if (durableRevision > incomingRevision) {
+    task.wedgeNotification = {
+      ...(incoming ?? durable ?? {} as Task["wedgeNotification"]),
+      ...(durable ? { budgetRevision: durableRevision, autoRecovery: durable.autoRecovery } : {}),
+    } as Task["wedgeNotification"];
+  }
+}
+
 /*
 FNXC:TaskLifecyclePersistence 2026-07-14-13:27:
 PostgreSQL task JSONB conversion must use one registry for both descriptor writes and SQLite-shaped row hydration. Separate read/write lists drifted when late lifecycle columns were added, allowing JSON strings or parsed objects to cross the wrong serialization boundary.
 */
 export const TASK_JSONB_COLUMNS: ReadonlySet<string> = new Set([
-  "dependencies", "steps", "customFields", "log", "attachments", "steeringComments",
+  "dependencies", "steps", "stepReports", "customFields", "log", "attachments", "steeringComments",
   "comments", "review", "reviewState", "workflowStepResults", "prInfo", "prInfos",
-  "issueInfo", "githubTracking", "gitlabTracking", "mergeDetails", "workspaceWorktrees", "enabledWorkflowSteps",
+  "issueInfo", "githubTracking", "gitlabTracking", "mergeDetails", "workspaceWorktrees", "repositoryScope", "externalBlock", "planningFailure", "enabledWorkflowSteps",
   "modifiedFiles", "declaredSymbols", "scopeAutoWiden", "sourceMetadata", "tokenUsagePerModel",
-  "tokenBudgetOverride", "columnDwellMs", "workflowTransitionNotification",
+  "tokenBudgetOverride", "columnDwellMs", "workflowTransitionNotification", "recommendations",
 ]);
 
 export function defineTaskColumn(
@@ -226,8 +273,12 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("worktree", (task) => task.worktree ?? null),
   defineTaskColumn("blockedBy", (task) => task.blockedBy ?? null),
   defineTaskColumn("overlapBlockedBy", (task) => task.overlapBlockedBy ?? null),
+  defineTaskColumn("queuedLogEpisodeSignature", (task) => task.queuedLogEpisodeSignature ?? null),
   defineTaskColumn("paused", (task) => task.paused ? 1 : 0),
   defineTaskColumn("pausedReason", (task) => task.pausedReason ?? null),
+  defineTaskColumn("externalBlock", (task) => toJsonNullable(task.externalBlock)),
+  defineTaskColumn("planningFailure", (task) => toJsonNullable(task.planningFailure)),
+  defineTaskColumn("wedgeNotification", (task) => toJsonNullable(task.wedgeNotification)),
   defineTaskColumn("userPaused", (task) => task.userPaused ? 1 : 0),
   defineTaskColumn("baseBranch", (task) => task.baseBranch ?? null),
   defineTaskColumn("branch", (task) => task.branch ?? null),
@@ -237,14 +288,19 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("baseCommitSha", (task) => task.baseCommitSha ?? null),
   defineTaskColumn("modelPresetId", (task) => task.modelPresetId ?? null),
   defineTaskColumn("modelProvider", (task) => task.modelProvider ?? null),
+  defineTaskColumn("credentialInstanceId", (task) => task.credentialInstanceId ?? null),
   defineTaskColumn("modelId", (task) => task.modelId ?? null),
   defineTaskColumn("validatorModelProvider", (task) => task.validatorModelProvider ?? null),
+  defineTaskColumn("validatorCredentialInstanceId", (task) => task.validatorCredentialInstanceId ?? null),
   defineTaskColumn("validatorModelId", (task) => task.validatorModelId ?? null),
   defineTaskColumn("planningModelProvider", (task) => task.planningModelProvider ?? null),
+  defineTaskColumn("planningCredentialInstanceId", (task) => task.planningCredentialInstanceId ?? null),
   defineTaskColumn("planningModelId", (task) => task.planningModelId ?? null),
   defineTaskColumn("mergerModelProvider", (task) => task.mergerModelProvider ?? null),
+  defineTaskColumn("mergerCredentialInstanceId", (task) => task.mergerCredentialInstanceId ?? null),
   defineTaskColumn("mergerModelId", (task) => task.mergerModelId ?? null),
   defineTaskColumn("mergeRetries", (task) => task.mergeRetries ?? null),
+  defineTaskColumn("aiMergeReviewReconciliation", (task) => toJsonNullable(task.aiMergeReviewReconciliation)),
   defineTaskColumn("workflowStepRetries", (task) => task.workflowStepRetries ?? null),
   defineTaskColumn("stuckKillCount", (task) => task.stuckKillCount ?? 0),
   defineTaskColumn("resumeLimboCount", (task) => task.resumeLimboCount ?? 0),
@@ -262,6 +318,8 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("postReviewFixCount", (task) => task.postReviewFixCount ?? 0),
   defineTaskColumn("planReviewReplanCount", (task) => task.planReviewReplanCount ?? 0),
   defineTaskColumn("recoveryRetryCount", (task) => task.recoveryRetryCount ?? null),
+  defineTaskColumn("sessionContentionHoldCount", (task) => task.sessionContentionHoldCount ?? 0),
+  defineTaskColumn("sessionContentionWaitReason", (task) => task.sessionContentionWaitReason ?? null),
   defineTaskColumn("taskDoneRetryCount", (task) => task.taskDoneRetryCount ?? 0),
   // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker persisted as nullable ISO timestamp.
   defineTaskColumn("bulkCompletionRefusalAt", (task) => task.bulkCompletionRefusalAt ?? null),
@@ -281,9 +339,12 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("branchConflictRecoveryCount", (task) => task.branchConflictRecoveryCount ?? 0),
   defineTaskColumn("reviewerContextRetryCount", (task) => task.reviewerContextRetryCount ?? 0),
   defineTaskColumn("reviewerFallbackRetryCount", (task) => task.reviewerFallbackRetryCount ?? 0),
+  defineTaskColumn("reviewConvergenceStage", (task) => task.reviewConvergenceStage ?? 0),
+  defineTaskColumn("reviewConvergenceEscalationCount", (task) => task.reviewConvergenceEscalationCount ?? 0),
   defineTaskColumn("nextRecoveryAt", (task) => task.nextRecoveryAt ?? null),
   defineTaskColumn("error", (task) => task.error ?? null),
   defineTaskColumn("summary", (task) => task.summary ?? null),
+  defineTaskColumn("recommendations", (task) => toJsonNullable(task.recommendations)),
   defineTaskColumn("thinkingLevel", (task) => task.thinkingLevel ?? null),
   // FNXC:Settings-ThinkingLevel 2026-07-13 (merge port): per-task validator/planning reasoning-effort overrides.
   defineTaskColumn("validatorThinkingLevel", (task) => task.validatorThinkingLevel ?? null),
@@ -324,6 +385,7 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("executionCompletedAt", (task) => task.executionCompletedAt ?? null),
   defineTaskColumn("dependencies", (task) => toJson(task.dependencies || [])),
   defineTaskColumn("steps", (task) => toJson(task.steps || [])),
+  defineTaskColumn("stepReports", (task) => toJson(task.stepReports || [])),
   defineTaskColumn("customFields", (task) => toJson(task.customFields ?? {})),
   defineTaskColumn("log", (task) => toJson(task.log || [])),
   defineTaskColumn("attachments", (task) => toJson(task.attachments || [])),
@@ -350,7 +412,7 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("sourceIssueClosedAt", (task) => task.sourceIssue?.closedAt ?? null),
   defineTaskColumn("mergeDetails", (task) => toJsonNullable(task.mergeDetails)),
   defineTaskColumn("workspaceWorktrees", (task) => toJsonNullable(task.workspaceWorktrees)),
-  defineTaskColumn("breakIntoSubtasks", (task) => task.breakIntoSubtasks ? 1 : 0),
+  defineTaskColumn("repositoryScope", (task) => toJsonNullable(task.repositoryScope)),
   defineTaskColumn("noCommitsExpected", (task) => task.noCommitsExpected ? 1 : 0),
   defineTaskColumn("enabledWorkflowSteps", (task) => toJson(task.enabledWorkflowSteps || [])),
   defineTaskColumn("modifiedFiles", (task) => toJson(task.modifiedFiles || [])),

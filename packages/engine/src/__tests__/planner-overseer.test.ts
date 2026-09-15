@@ -4,7 +4,7 @@ import {
   PlannerOverseerMonitor,
   resolveWatchedStage,
   type OverseerTaskRef,
-} from "../planner-overseer.js";
+} from "../overseer/planner-overseer.js";
 
 function taskFixture(overrides: Partial<OverseerTaskRef> = {}): OverseerTaskRef {
   return {
@@ -18,6 +18,54 @@ function taskFixture(overrides: Partial<OverseerTaskRef> = {}): OverseerTaskRef 
     ...overrides,
   } as OverseerTaskRef;
 }
+
+/*
+FNXC:WorkflowLifecycleColumns 2026-07-31-00:20:
+
+THE INVARIANT: the watched stage comes from the column's ROLE, not from its id.
+
+Keyed on the id, `resolveWatchedStage` returned null for every card on a renamed board — and
+`observeTask` returns early on a null stage, so no observation was recorded, no
+`overseer:intervention` was emitted, and `PlannerRecoveryController` had nothing to steer, retry or
+targeted-fix. The whole oversight loop went inert and said nothing about it, which is why this is
+worth a parameter rather than a fallback.
+
+THE REVIEW TEST IS THE THREE-TRAIT UNION. `isReviewColumnRole` checks only `mergeBlocker ||
+humanReview`, so a board whose review lane carries `merge` (mergeOrchestration) — the default's own
+shape — would classify as not-in-review and be skipped. That case is asserted below precisely because
+reaching for the obvious helper would have reintroduced the bug this change removes.
+
+REVERT PROOF, measured: drop the `columnFlags` branch and the three renamed-lane cases fail with
+`expected null to be "executor" / "merger"`.
+*/
+describe("resolveWatchedStage keys on the column role", () => {
+  const wip = { countsTowardWip: true } as never;
+  const mergeLane = { mergeOrchestration: true } as never;
+  const humanReviewLane = { humanReview: true } as never;
+
+  it("classifies a RENAMED wip lane as the executor stage", () => {
+    expect(resolveWatchedStage(taskFixture({ column: "building" }), wip)).toBe("executor");
+  });
+
+  it("classifies a review lane that carries only mergeOrchestration", () => {
+    // The union matters: `isReviewColumnRole` would answer false here and the card would be skipped.
+    expect(resolveWatchedStage(taskFixture({ column: "signoff" }), mergeLane)).toBe("merger");
+  });
+
+  it("classifies a review lane that carries humanReview", () => {
+    expect(resolveWatchedStage(taskFixture({ column: "waiting" }), humanReviewLane)).toBe("merger");
+  });
+
+  it("still returns null for a lane carrying neither role", () => {
+    // The gate must still gate — watching every column would be its own defect.
+    expect(resolveWatchedStage(taskFixture({ column: "shipped" }), { complete: true } as never)).toBeNull();
+  });
+
+  it("falls back to the legacy ids when no flags are supplied", () => {
+    expect(resolveWatchedStage(taskFixture({ column: "in-progress" }))).toBe("executor");
+    expect(resolveWatchedStage(taskFixture({ column: "todo" }))).toBeNull();
+  });
+});
 
 describe("resolveWatchedStage", () => {
   it("resolves an active in-progress task to executor", () => {
@@ -532,5 +580,101 @@ describe("PlannerOverseerMonitor.observeTask — FN-7965 executor failure detect
 
     expect(a?.reason).toBe(b?.reason);
     expect(a?.reason).not.toMatch(/failed:|error/i);
+  });
+});
+
+/*
+FNXC:WorkflowReviewGates 2026-07-26-16:45:
+Before the pre-merge review gates moved into `in-review`, a hung Code Review sat in `in-progress`
+and the FN-7743 executor stall check caught it. After the move it maps to the `reviewer` stage,
+which returned `progressing` unconditionally with no time-based check — so a gate that never posted
+a verdict produced no stall signal at all, however long it hung.
+
+These cases pin the replacement, and specifically pin the thing that makes it safe: the anchor is
+the GATE's own `startedAt` lease, not `columnMovedAt`. Anchoring on the column would fire during a
+legitimate human merge-wait, which is exactly the false positive that would make operators distrust
+the signal — so "settled gates + old card = progressing" is asserted alongside the positive case.
+*/
+describe("PlannerOverseerMonitor.observeTask — review-gate stall detection (in-review gates)", () => {
+  const THRESHOLD_MS = 2 * 60 * 60 * 1000;
+  const NOW = Date.UTC(2026, 6, 26, 12, 0, 0);
+  const isoMsAgo = (ms: number) => new Date(NOW - ms).toISOString();
+
+  const gate = (overrides: Record<string, unknown>) => ({
+    workflowStepId: "code-review",
+    workflowStepName: "Code Review",
+    phase: "pre-merge",
+    ...overrides,
+  });
+
+  it("reports stuck when a pre-merge gate has been pending past the threshold", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({
+      column: "in-review",
+      columnMovedAt: isoMsAgo(THRESHOLD_MS + 60 * 60 * 1000),
+      workflowStepResults: [gate({ status: "pending", startedAt: isoMsAgo(THRESHOLD_MS + 60 * 60 * 1000) })],
+    } as never);
+
+    const observation = await monitor.observeTask(task, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
+
+    // A plain in-review card with no reviewState resolves to the `merger` stage,
+    // not `reviewer` — which is exactly why the check lives on both in-review stages.
+    expect(observation?.signal).toBe("stuck");
+    expect(observation?.stage).toBe("merger");
+    expect(observation?.reason).toMatch(/Review gate running for over \d+h/);
+  });
+
+  it("also reports stuck on the reviewer stage when reviewState is present", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({
+      column: "in-review",
+      reviewState: { items: [], summary: {} },
+      workflowStepResults: [gate({ status: "pending", startedAt: isoMsAgo(THRESHOLD_MS + 60 * 60 * 1000) })],
+    } as never);
+
+    const observation = await monitor.observeTask(task, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
+
+    expect(observation?.stage).toBe("reviewer");
+    expect(observation?.signal).toBe("stuck");
+    expect(observation?.reason).toMatch(/Review gate running for over \d+h/);
+  });
+
+  it("stays progressing while the gate is pending but still within the threshold", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({
+      column: "in-review",
+      workflowStepResults: [gate({ status: "pending", startedAt: isoMsAgo(60 * 1000) })],
+    } as never);
+
+    const observation = await monitor.observeTask(task, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
+
+    expect(observation?.signal).toBe("progressing");
+  });
+
+  it("stays progressing for a long human merge-wait once the gates have settled", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({
+      column: "in-review",
+      // The card has sat in review for days, but no gate is running — a human owes a merge.
+      columnMovedAt: isoMsAgo(72 * 60 * 60 * 1000),
+      updatedAt: isoMsAgo(72 * 60 * 60 * 1000),
+      workflowStepResults: [gate({ status: "passed", completedAt: isoMsAgo(71 * 60 * 60 * 1000) })],
+    } as never);
+
+    const observation = await monitor.observeTask(task, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
+
+    expect(observation?.signal).toBe("progressing");
+  });
+
+  it("degrades to progressing when the pending gate has no usable startedAt", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({
+      column: "in-review",
+      workflowStepResults: [gate({ status: "pending", startedAt: "not-a-date" })],
+    } as never);
+
+    const observation = await monitor.observeTask(task, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
+
+    expect(observation?.signal).toBe("progressing");
   });
 });

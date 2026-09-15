@@ -52,7 +52,7 @@
  * not collide with migrated rows.
  */
 
-import { DatabaseSync } from "../sqlite-adapter.js";
+import { DatabaseSync } from "../db/sqlite-adapter.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
@@ -65,8 +65,8 @@ import {
   CENTRAL_SCHEMA,
   ARCHIVE_SCHEMA,
 } from "./schema/_shared.js";
-import { createLogger } from "../logger.js";
-import { getErrorMessage } from "../error-message.js";
+import { createLogger } from "../process/logger.js";
+import { getErrorMessage } from "../process/error-message.js";
 
 const log = createLogger("sqlite-migrator");
 
@@ -1069,12 +1069,25 @@ function normalizeLegacyJson(value: string | null, fallback: string): string {
   }
 }
 
+/** Build the canonical, path-scoped migration key for retained plugin state. */
+export function projectPluginSqliteMigrationKey(projectPath: string): string {
+  return `project-plugins:${resolve(projectPath)}`;
+}
+
 /** Backfill the split PostgreSQL plugin model once from retained project SQLite. */
 export async function migrateLegacyProjectPluginRows(
   db: PostgresJsDatabase<Record<string, never>>,
   sqlitePath: string,
   projectPath: string,
 ): Promise<void> {
+  const migrationKey = projectPluginSqliteMigrationKey(projectPath);
+  /*
+  FNXC:PostgresMigration 2026-07-22-12:00:
+  Plugin migration is independently terminal. Read its PostgreSQL marker before
+  even probing retained fusion.db so completed backups cannot add startup I/O.
+  The transaction repeats the check under its advisory lock for concurrent boot.
+  */
+  if (await isSqliteMigrationComplete(db, migrationKey)) return;
   await db.transaction(async (tx) => {
     await migrateLegacyProjectPluginRowsOnSession(
       tx as unknown as PostgresJsDatabase<Record<string, never>>,
@@ -1089,23 +1102,18 @@ async function migrateLegacyProjectPluginRowsOnSession(
   sqlitePath: string,
   projectPath: string,
 ): Promise<void> {
-  if (!sqliteTableExists(sqlitePath, "plugins")) return;
-  await acquireSqliteMigrationStateLock(db);
   const canonicalProjectPath = resolve(projectPath);
-  const migrationKey = `project-plugins:${canonicalProjectPath}`;
+  const migrationKey = projectPluginSqliteMigrationKey(projectPath);
+  await acquireSqliteMigrationStateLock(db);
   await ensureMigrationStateTable(db);
   await db.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${migrationKey}, 0))`);
-  const completed = (await db.execute(sql`
-    SELECT 1 AS complete
-    FROM public.${sql.identifier(SQLITE_MIGRATION_STATE_TABLE)}
-    WHERE migration_key = ${migrationKey} AND status = 'complete'
-    LIMIT 1
-  `)) as unknown as Array<{ complete: number }>;
+  const completed = await isSqliteMigrationComplete(db, migrationKey);
   /*
   FNXC:PluginLegacyMigration 2026-07-14-23:51:
   Retained SQLite is immutable cutover evidence, not a recurring authority. Once a project's plugin rows have been split into PostgreSQL install metadata and path-scoped state, a durable marker prevents later edits to fusion.db from changing live plugin behavior on restart.
   */
-  if (completed.length > 0) return;
+  if (completed) return;
+  if (!sqliteTableExists(sqlitePath, "plugins")) return;
   const sqlite = openSqlite(sqlitePath);
   let rows: LegacyProjectPluginMigrationRow[];
   try {
@@ -2014,7 +2022,13 @@ async function insertBatch(
   */
   const replacesCentralSeed =
     plan.pgSchema === CENTRAL_SCHEMA &&
-    (plan.pgTable === "central_settings" || plan.pgTable === "global_concurrency");
+    /*
+    FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
+    `global_concurrency` is no longer a destination: the table is dropped and its
+    drizzle model is gone, so no plan targets it. Only `central_settings` still
+    needs seed-replacing semantics.
+    */
+    plan.pgTable === "central_settings";
   const isSharedSingleton = isSharedSingletonTable(plan.pgSchema, plan.pgTable);
   const conflictClause = replacesCentralSeed
     ? sql.raw(`ON CONFLICT (${quoteIdent("id")}) DO UPDATE SET ${cols

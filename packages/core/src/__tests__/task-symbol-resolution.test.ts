@@ -9,7 +9,7 @@ import {
   resolveCreateDeclaredSymbols,
   resolveTaskSymbolsForTask,
   resolveTaskSymbolsFromSources,
-} from "../task-symbol-resolution.js";
+} from "../tasks/task-symbol-resolution.js";
 import {
   createTaskStoreForTest,
   pgDescribe,
@@ -73,7 +73,7 @@ describe("task symbol declaration resolution", () => {
 });
 
 /**
- * FNXC:SymbolLock 2026-07-31-11:00:
+ * FNXC:SymbolLock 2026-07-20-11:00:
  * SQLite was removed from the runtime, so createTaskStoreTestHarness cannot
  * initialize a non-backend TaskStore. Exercise the retained file-task
  * constructor directly with its filesystem seam instead. This keeps the
@@ -85,13 +85,20 @@ describe("file-task constructor declared symbols", () => {
     const created: unknown[] = [];
     const store = {
       backendMode: false,
+      /*
+      FNXC:SymbolLock 2026-08-23-16:02:
+      Task creation now resolves an initial repository scope from the workspace config, which reads
+      `store.getRootDir()`. Point the seam at the temp root so the (config-less) workspace resolves to
+      no scope instead of throwing on a missing method.
+      */
+      getRootDir: () => root,
       taskDir: (id: string) => join(root, id),
       maybeResolveTombstonedTaskId: async () => undefined,
       assertTaskIdAvailable: async () => undefined,
       atomicCreateTaskJson: async (_dir: string, task: unknown) => { created.push(task); },
       isWatching: false,
       generateSpecifiedPrompt: () => "",
-      _maybeAutoArchiveSameAgentDuplicate: async () => undefined,
+      _resolveSameAgentDuplicateIntake: async () => undefined,
       emitTaskLifecycleEventSafely: () => undefined,
       invokeTaskCreatedHook: async () => undefined,
     } as unknown as TaskStore;
@@ -205,18 +212,4 @@ pgDescribe("TaskStore task symbol declarations", () => {
     }
   });
 
-  it("retains declarations across archive and restore", async () => {
-    const h = await makeHarness();
-    try {
-      const task = await h.store.createTask({
-        description: "archived symbol declaration",
-        declaredSymbols: ["Pkg/File.ts#Foo"],
-      });
-      await h.store.archiveTask(task.id);
-      const restored = await h.store.unarchiveTask(task.id);
-      expect(restored.declaredSymbols).toEqual(["pkg/file.ts#foo"]);
-    } finally {
-      await teardown();
-    }
-  });
 });

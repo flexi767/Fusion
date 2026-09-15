@@ -7,7 +7,7 @@ import {
   clearPreHeldExecutorSlotsForTests,
   hasPreHeldExecutorSlot,
   registerPreHeldExecutorSlot,
-} from "../concurrency.js";
+} from "../concurrency/concurrency.js";
 import { createMockStore, resetExecutorMocks } from "./executor-test-helpers.js";
 
 /*
@@ -75,6 +75,12 @@ function prepareStore(child: TaskDetail, dependencies: TaskDetail[], shadowEnabl
   return store;
 }
 
+/*
+FNXC:EngineTests 2026-07-23-21:25:
+executeCore now claims graphRouting before any await and passes `{ alreadyClaimed: true }`
+into `executeWorkflowGraph` (FN-8471 overseer-thrash fix, commit 6422cb93a). The "allows"
+assertions below match that second positional argument; the gated contract is unchanged.
+*/
 function spyOuterDispatch(executor: TaskExecutor) {
   const graph = vi.spyOn(executor as any, "executeWorkflowGraph").mockResolvedValue(undefined);
   return { graph };
@@ -82,10 +88,18 @@ function spyOuterDispatch(executor: TaskExecutor) {
 
 afterEach(() => {
   clearPreHeldExecutorSlotsForTests();
+  /*
+  FNXC:EngineTests 2026-07-23-21:25:
+  executeCore claims the process-wide graphRouting set before calling executeWorkflowGraph
+  (FN-8471 fix, commit 6422cb93a). With executeWorkflowGraph mocked, its real `finally` never
+  releases the claim, so the shared FN-CHILD id would leak across tests and later dispatches
+  would drop as duplicates. Clear the static set between tests (precedent: executor-prompt.test.ts).
+  */
+  (TaskExecutor as unknown as { processWideGraphRouting: Set<string> }).processWideGraphRouting.clear();
 });
 
 describe("executor outer dispatch dependency gate", () => {
-  it("requeues a live dependency before any execution surface can run", async () => {
+  it("holds a live dependency in place before any execution surface can run", async () => {
     resetExecutorMocks();
     const child = task();
     const parent = task({ id: "FN-PARENT", column: "in-progress", dependencies: [] });
@@ -99,23 +113,15 @@ describe("executor outer dispatch dependency gate", () => {
 
     await executor.execute(child);
 
-    expect(store.moveTask).toHaveBeenCalledWith(child.id, "todo", expect.objectContaining({
-      preserveProgress: true,
-      preserveWorktree: true,
-      preserveResumeState: true,
-      recoveryRehome: true,
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.transitionQueuedEpisode).toHaveBeenCalledWith(child.id, expect.objectContaining({
+      signature: "dependency:FN-PARENT",
+      blockedBy: parent.id,
     }));
-    expect(store.updateTask).toHaveBeenCalledWith(
-      child.id,
-      expect.objectContaining({ status: "queued", blockedBy: parent.id }),
-      undefined,
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      child.id,
-      expect.stringContaining("queued — unmet dependencies: FN-PARENT"),
-      expect.stringContaining("dependency gate blocked"),
-      undefined,
-    );
+    expect(store.transitionQueuedEpisode).toHaveBeenCalledWith(child.id, expect.objectContaining({
+      action: expect.stringContaining("queued — unmet dependencies: FN-PARENT"),
+      outcome: expect.stringContaining("dependency gate blocked"),
+    }));
     expect(graph).not.toHaveBeenCalled();
     // FNXC:DependencyGating 2026-07-16-00:00: A dependency-gated outer return
     // must drop the scheduler's reservation because no downstream owner can take it.
@@ -134,11 +140,10 @@ describe("executor outer dispatch dependency gate", () => {
 
     await executor.execute(child);
 
-    expect(store.updateTask).toHaveBeenCalledWith(
-      child.id,
-      expect.objectContaining({ status: "queued", blockedBy: parent.id }),
-      undefined,
-    );
+    expect(store.transitionQueuedEpisode).toHaveBeenCalledWith(child.id, expect.objectContaining({
+      signature: "dependency:FN-PARENT",
+      blockedBy: parent.id,
+    }));
     expect(graph).not.toHaveBeenCalled();
   });
 
@@ -153,8 +158,8 @@ describe("executor outer dispatch dependency gate", () => {
     await executor.execute(child);
 
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalledWith(child.id, expect.objectContaining({ status: "queued" }), undefined);
-    expect(graph).toHaveBeenCalledWith(child);
+    expect(store.transitionQueuedEpisode).not.toHaveBeenCalled();
+    expect(graph).toHaveBeenCalledWith(child, { alreadyClaimed: true });
   });
 
   it("allows missing or soft-deleted dependency residue past the outer gate", async () => {
@@ -167,7 +172,7 @@ describe("executor outer dispatch dependency gate", () => {
     await executor.execute(child);
 
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(graph).toHaveBeenCalledWith(child);
+    expect(graph).toHaveBeenCalledWith(child, { alreadyClaimed: true });
   });
 
   it("observes an accepted marker in shadow mode without letting it unblock a live dependency", async () => {
@@ -182,11 +187,10 @@ describe("executor outer dispatch dependency gate", () => {
     await executor.execute(child);
 
     expect(store.getCompletionHandoffAcceptedMarker).toHaveBeenCalledWith(parent.id);
-    expect(store.updateTask).toHaveBeenCalledWith(
-      child.id,
-      expect.objectContaining({ status: "queued", blockedBy: parent.id }),
-      undefined,
-    );
+    expect(store.transitionQueuedEpisode).toHaveBeenCalledWith(child.id, expect.objectContaining({
+      signature: "dependency:FN-PARENT",
+      blockedBy: parent.id,
+    }));
     expect(graph).not.toHaveBeenCalled();
   });
 
@@ -203,7 +207,7 @@ describe("executor outer dispatch dependency gate", () => {
 
     expect(store.getCompletionHandoffAcceptedMarker).toHaveBeenCalledWith(parent.id);
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(graph).toHaveBeenCalledWith(child);
+    expect(graph).toHaveBeenCalledWith(child, { alreadyClaimed: true });
   });
 
   it.each([

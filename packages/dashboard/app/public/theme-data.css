@@ -8,6 +8,113 @@
    Theme token translucency uses color-mix(in srgb, var(--token) N%, transparent) or exact literal color-mix values for glass surfaces. Raw RGB alpha color functions are banned outside var() fallbacks by FN-6489.
    ============================================================ */
 
+/* Aurora, Calm, Dawn, Sage, Midnight, Velvet, Factory Dark, and Factory Light swatches stay globally resolvable while a different theme is active. */
+:root {
+  --aurora-swatch-sample-1: #0a1022;
+  --aurora-swatch-sample-2: #162044;
+  --aurora-swatch-sample-3: #65e6c7;
+  --aurora-swatch-sample-4: #8d8cff;
+  --calm-swatch-sample-1: #111d2b;
+  --calm-swatch-sample-2: #1b2a3a;
+  --calm-swatch-sample-3: #8fc9b5;
+  --calm-swatch-sample-4: #7da9c4;
+  --dawn-swatch-sample-1: #151229;
+  --dawn-swatch-sample-2: #2a2248;
+  --dawn-swatch-sample-3: #efb66a;
+  --dawn-swatch-sample-4: #c8a4ff;
+  --sage-swatch-sample-1: #16201a;
+  --sage-swatch-sample-2: #27382e;
+  --sage-swatch-sample-3: #9ab58a;
+  --sage-swatch-sample-4: #8baaa0;
+  --midnight-swatch-sample-1: #0b1026;
+  --midnight-swatch-sample-2: #1b2450;
+  --midnight-swatch-sample-3: #a78bfa;
+  --midnight-swatch-sample-4: #67d4e8;
+  --velvet-swatch-sample-1: #1d1418;
+  --velvet-swatch-sample-2: #2b1d24;
+  --velvet-swatch-sample-3: #c99a89;
+  --velvet-swatch-sample-4: #b66b7d;
+  /* FNXC:DashboardTheming 2026-08-23-01:51: Iceberg preview samples stay global so its selector chip remains accurate even while another persisted theme supplies active tokens. */
+  --iceberg-swatch-sample-1: #161821;
+  --iceberg-swatch-sample-2: #242940;
+  --iceberg-swatch-sample-3: #84a0c6;
+  --iceberg-swatch-sample-4: #a093c7;
+  /* FNXC:DashboardTheming 2026-08-27-04:23: Flexoki preview samples stay global so its selector chip remains accurate even while another persisted theme supplies active tokens. */
+  --flexoki-swatch-sample-1: #100f0f;
+  --flexoki-swatch-sample-2: #282726;
+  --flexoki-swatch-sample-3: #4385be;
+  --flexoki-swatch-sample-4: #8b7ec8;
+  /* FNXC:DashboardTheming 2026-08-28-07:45: Cozy Cartoon previews stay globally resolvable in both modes so its pastel chip remains accurate before selection; keep them synchronized with the persisted theme order and oversized-button theme contract. */
+  --cozy-cartoon-swatch-sample-1: #241d24;
+  --cozy-cartoon-swatch-sample-2: #3a2e39;
+  --cozy-cartoon-swatch-sample-3: #f4a7a3;
+  --cozy-cartoon-swatch-sample-4: #c9b3f0;
+  --medieval-swatch-sample-1: #21170f;
+  --medieval-swatch-sample-2: #392417;
+  --medieval-swatch-sample-3: #d5ad67;
+  --medieval-swatch-sample-4: #8db08b;
+  --factory-dark-swatch-sample-1: #0d0f10;
+  --factory-dark-swatch-sample-2: #1a1d1f;
+  --factory-dark-swatch-sample-3: #e89532;
+  --factory-dark-swatch-sample-4: #7fa6b8;
+  --factory-light-swatch-sample-1: #171716;
+  --factory-light-swatch-sample-2: #292926;
+  --factory-light-swatch-sample-3: #f0a24a;
+  --factory-light-swatch-sample-4: #93a5ad;
+}
+
+[data-theme="light"] {
+  --aurora-swatch-sample-1: #f4f8ff;
+  --aurora-swatch-sample-2: #dfeaf8;
+  --aurora-swatch-sample-3: #197d72;
+  --aurora-swatch-sample-4: #5652b8;
+  --calm-swatch-sample-1: #f4f8fb;
+  --calm-swatch-sample-2: #e1ebf0;
+  --calm-swatch-sample-3: #2f7260;
+  --calm-swatch-sample-4: #396f91;
+  --dawn-swatch-sample-1: #fff8f2;
+  --dawn-swatch-sample-2: #f1ddd7;
+  --dawn-swatch-sample-3: #9b5618;
+  --dawn-swatch-sample-4: #704eaa;
+  --sage-swatch-sample-1: #f5f8f4;
+  --sage-swatch-sample-2: #e2eadf;
+  --sage-swatch-sample-3: #55764d;
+  --sage-swatch-sample-4: #46756b;
+  --midnight-swatch-sample-1: #f5f6ff;
+  --midnight-swatch-sample-2: #e2e6fa;
+  --midnight-swatch-sample-3: #5134a3;
+  --midnight-swatch-sample-4: #16778c;
+  --velvet-swatch-sample-1: #f9f3f2;
+  --velvet-swatch-sample-2: #f0e2e0;
+  --velvet-swatch-sample-3: #8a4a55;
+  --velvet-swatch-sample-4: #a9636f;
+  --iceberg-swatch-sample-1: #f3f5f9;
+  --iceberg-swatch-sample-2: #dfe5f0;
+  --iceberg-swatch-sample-3: #2d539e;
+  --iceberg-swatch-sample-4: #6142a0;
+  --flexoki-swatch-sample-1: #fffcf0;
+  --flexoki-swatch-sample-2: #e6e4d9;
+  --flexoki-swatch-sample-3: #205ea6;
+  --flexoki-swatch-sample-4: #5e409d;
+  /* FNXC:DashboardTheming 2026-08-28-07:45: Light-mode Cozy Cartoon previews expose the flagship cream, coral, and lavender palette globally rather than borrowing whichever theme is active. */
+  --cozy-cartoon-swatch-sample-1: #fff7ef;
+  --cozy-cartoon-swatch-sample-2: #f0d9c6;
+  --cozy-cartoon-swatch-sample-3: #e07a6a;
+  --cozy-cartoon-swatch-sample-4: #8a6fd0;
+  --medieval-swatch-sample-1: #f4ead2;
+  --medieval-swatch-sample-2: #e1ceb0;
+  --medieval-swatch-sample-3: #765125;
+  --medieval-swatch-sample-4: #446b48;
+  --factory-dark-swatch-sample-1: #eceef0;
+  --factory-dark-swatch-sample-2: #d9dde0;
+  --factory-dark-swatch-sample-3: #a95612;
+  --factory-dark-swatch-sample-4: #35687d;
+  --factory-light-swatch-sample-1: #f7f7f5;
+  --factory-light-swatch-sample-2: #e9eae8;
+  --factory-light-swatch-sample-3: #b45309;
+  --factory-light-swatch-sample-4: #476b7a;
+}
+
 /* OCEAN - Deep blues and cyans */
 [data-color-theme="ocean"] {
   --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
@@ -5965,6 +6072,269 @@ body[data-color-theme="terminal"][data-theme="light"]::before {
   -webkit-backdrop-filter: none;
 }
 
+/* LIQUID GLASS - Adaptive functional glass over standard content materials */
+[data-color-theme="liquid-glass"] {
+  /*
+  FNXC:LiquidGlassTheme 2026-09-09-15:50:
+  Apple's web-applicable Liquid Glass guidance makes glass a sparse functional layer for navigation and controls, keeps content on standard materials, and uses the regular variant when text legibility matters. Fusion therefore gives bars, controls, menus, modals, and floating windows adaptive blur, luminosity, restrained lens highlights, concentric rounding, and fluid interaction while cards and board columns remain opaque and unblurred.
+
+  FNXC:LiquidGlassTheme 2026-09-09-15:50:
+  Liquid Glass must adapt rather than merely decorate: reduced motion removes fluid transforms, reduced transparency removes blur, increased contrast strengthens separators, and forced colors returns authority to system colors. The CSS approximation does not claim to reproduce Apple's private native optical compositor.
+  */
+  --bg: oklch(0.18 0.025 255);
+  --surface: color-mix(in oklch, oklch(0.28 0.035 255) 78%, transparent);
+  --surface-solid: oklch(0.25 0.03 255);
+  --card: oklch(0.235 0.025 255);
+  --card-hover: oklch(0.275 0.03 255);
+  --surface-hover: color-mix(in oklch, var(--surface) 88%, oklch(0.92 0.02 250) 12%);
+  --border: color-mix(in oklch, oklch(0.94 0.02 250) 30%, transparent);
+  --text: oklch(0.96 0.012 250);
+  --text-muted: oklch(0.78 0.025 250);
+  --text-dim: oklch(0.64 0.03 250);
+
+  --todo: oklch(0.72 0.16 245);
+  --in-progress: oklch(0.78 0.14 205);
+  --in-progress-rgb: 79, 190, 220;
+  --in-review: oklch(0.78 0.14 155);
+  --triage: oklch(0.82 0.14 85);
+  --done: oklch(0.66 0.035 250);
+  --color-success: var(--in-review);
+  --color-warning: var(--triage);
+  --color-error: oklch(0.72 0.19 25);
+  --color-info: var(--in-progress);
+
+  --font-primary: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --radius-sm: 0.625rem;
+  --radius-md: 0.875rem;
+  --radius-lg: 1.25rem;
+  --radius-xl: 1.75rem;
+  --radius-pill: 999rem;
+  --radius: var(--radius-md);
+
+  --shadow-sm: 0 0.25rem 0.75rem color-mix(in oklch, oklch(0.08 0.02 255) 28%, transparent);
+  --shadow-md: 0 0.75rem 2rem color-mix(in oklch, oklch(0.08 0.02 255) 34%, transparent);
+  --shadow-lg: 0 1.25rem 3rem color-mix(in oklch, oklch(0.06 0.02 255) 42%, transparent);
+  --shadow-glow: 0 0 1rem color-mix(in oklch, var(--accent) 28%, transparent);
+  --shadow: var(--shadow-lg);
+  --focus-ring: 0 0 0 0.125rem color-mix(in oklch, var(--accent) 34%, transparent);
+  --focus-ring-strong: 0 0 0 0.1875rem color-mix(in oklch, var(--accent) 48%, transparent);
+
+  --transition-instant: 80ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  --transition-fast: 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  --transition-normal: 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  --transition-slow: 360ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  --accent: oklch(0.72 0.16 245);
+  --accent-text: oklch(0.99 0.005 250);
+  --cta-bg: color-mix(in oklch, var(--accent) 72%, transparent);
+  --cta-border: color-mix(in oklch, oklch(0.98 0.01 250) 52%, transparent);
+  --cta-text: var(--accent-text);
+  --cta-bg-hover: color-mix(in oklch, var(--accent) 84%, transparent);
+  --cta-border-hover: color-mix(in oklch, oklch(0.98 0.01 250) 68%, transparent);
+  --cta-glow: 0 0.5rem 1.5rem color-mix(in oklch, var(--accent) 30%, transparent);
+  --logo-accent: var(--accent);
+}
+
+[data-color-theme="liquid-glass"][data-theme="light"] {
+  --bg: oklch(0.955 0.012 245);
+  --surface: color-mix(in oklch, oklch(0.995 0.005 245) 74%, transparent);
+  --surface-solid: oklch(0.975 0.009 245);
+  --card: oklch(0.985 0.006 245);
+  --card-hover: oklch(0.96 0.014 245);
+  --surface-hover: color-mix(in oklch, var(--surface) 88%, oklch(0.82 0.04 245) 12%);
+  --border: color-mix(in oklch, oklch(0.38 0.045 250) 28%, transparent);
+  --text: oklch(0.25 0.035 255);
+  --text-muted: oklch(0.43 0.04 255);
+  --text-dim: oklch(0.56 0.035 255);
+
+  --todo: oklch(0.55 0.19 250);
+  --in-progress: oklch(0.55 0.15 215);
+  --in-progress-rgb: 25, 142, 174;
+  --in-review: oklch(0.5 0.14 155);
+  --triage: oklch(0.58 0.15 75);
+  --done: oklch(0.54 0.04 250);
+  --color-success: var(--in-review);
+  --color-warning: var(--triage);
+  --color-error: oklch(0.53 0.2 25);
+  --color-info: var(--in-progress);
+
+  --shadow-sm: 0 0.25rem 0.75rem color-mix(in oklch, oklch(0.3 0.05 250) 12%, transparent);
+  --shadow-md: 0 0.75rem 2rem color-mix(in oklch, oklch(0.3 0.05 250) 16%, transparent);
+  --shadow-lg: 0 1.25rem 3rem color-mix(in oklch, oklch(0.3 0.05 250) 20%, transparent);
+  --accent: oklch(0.55 0.19 250);
+  --accent-text: oklch(0.99 0.005 245);
+  --cta-bg: color-mix(in oklch, var(--accent) 82%, transparent);
+  --cta-border: color-mix(in oklch, var(--accent) 66%, oklch(0.995 0.005 245));
+  --cta-text: var(--accent-text);
+  --cta-bg-hover: color-mix(in oklch, var(--accent) 92%, transparent);
+  --cta-border-hover: var(--accent);
+}
+
+[data-color-theme="liquid-glass"] body {
+  background:
+    radial-gradient(circle at top left, color-mix(in oklch, var(--accent) 12%, transparent), transparent 38%),
+    radial-gradient(circle at bottom right, color-mix(in oklch, var(--in-progress) 10%, transparent), transparent 42%),
+    var(--bg);
+}
+
+[data-color-theme="liquid-glass"] :is(.column, .card) {
+  background: var(--card);
+  border-color: var(--border);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-color-theme="liquid-glass"] :is(.column, .card):hover {
+  background: var(--card-hover);
+}
+
+[data-color-theme="liquid-glass"] :is(
+  .header,
+  .left-sidebar-nav,
+  .mobile-nav-bar,
+  .view-header,
+  .modal,
+  .floating-window,
+  .theme-dropdown-popover,
+  .task-context-menu,
+  [role="menu"],
+  [role="listbox"]
+) {
+  background: linear-gradient(
+    145deg,
+    color-mix(in oklch, var(--surface) 86%, var(--text) 14%),
+    color-mix(in oklch, var(--surface) 96%, transparent)
+  );
+  border-color: var(--border);
+  box-shadow:
+    inset 0 0.0625rem 0 color-mix(in oklch, var(--text) 28%, transparent),
+    var(--shadow-md);
+  backdrop-filter: blur(var(--space-lg)) saturate(1.35) brightness(1.04);
+  -webkit-backdrop-filter: blur(var(--space-lg)) saturate(1.35) brightness(1.04);
+}
+
+[data-color-theme="liquid-glass"] :is(.btn, .input, .select, button:not(:disabled)) {
+  border-color: color-mix(in oklch, var(--border) 82%, var(--text) 18%);
+  background: color-mix(in oklch, var(--surface) 88%, transparent);
+  box-shadow: inset 0 0.0625rem 0 color-mix(in oklch, var(--text) 24%, transparent);
+  backdrop-filter: blur(var(--space-sm)) saturate(1.2);
+  -webkit-backdrop-filter: blur(var(--space-sm)) saturate(1.2);
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+[data-color-theme="liquid-glass"] :is(.btn, button:not(:disabled)):hover {
+  background: color-mix(in oklch, var(--surface) 76%, var(--accent) 24%);
+  box-shadow:
+    inset 0 0.0625rem 0 color-mix(in oklch, var(--text) 34%, transparent),
+    var(--shadow-sm);
+  transform: translateY(-0.0625rem);
+}
+
+[data-color-theme="liquid-glass"] :is(.btn, .input, .select, button):focus-visible {
+  outline: medium solid var(--accent);
+  outline-offset: var(--space-3xs);
+  box-shadow: var(--focus-ring-strong);
+}
+
+[data-color-theme="liquid-glass"] .modal-overlay:not(.floating-window-overlay--modal),
+[data-color-theme="liquid-glass"] .floating-window-overlay:not(.floating-window-overlay--modal) {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+@media (max-width: 768px) {
+  [data-color-theme="liquid-glass"] :is(.header, .mobile-nav-bar, .view-header, .modal, .floating-window) {
+    backdrop-filter: blur(var(--space-md)) saturate(1.25);
+    -webkit-backdrop-filter: blur(var(--space-md)) saturate(1.25);
+  }
+
+  [data-color-theme="liquid-glass"] .modal {
+    border: thin solid var(--border);
+    box-shadow: inset 0 0.0625rem 0 color-mix(in oklch, var(--text) 28%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-color-theme="liquid-glass"] :is(.btn, .input, .select, button, .modal, .floating-window) {
+    animation: none;
+    transition: none;
+  }
+
+  [data-color-theme="liquid-glass"] :is(.btn, button):hover {
+    transform: none;
+  }
+}
+
+/*
+FNXC:LiquidGlassTheme 2026-09-09-16:20:
+Reduced-transparency and forced-colors preferences neutralize every functional surface that receives Liquid Glass, including specialized enabled buttons that do not use the shared .btn class.
+*/
+@media (prefers-reduced-transparency: reduce) {
+  [data-color-theme="liquid-glass"] :is(
+    .header,
+    .left-sidebar-nav,
+    .mobile-nav-bar,
+    .view-header,
+    .btn,
+    .input,
+    .select,
+    button:not(:disabled),
+    .modal,
+    .floating-window,
+    .theme-dropdown-popover,
+    .task-context-menu,
+    [role="menu"],
+    [role="listbox"]
+  ) {
+    background: var(--surface-solid);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  [data-color-theme="liquid-glass"] {
+    --border: color-mix(in oklch, var(--text) 68%, transparent);
+  }
+
+  [data-color-theme="liquid-glass"] :is(.btn, .input, .select, button, .modal, .floating-window) {
+    border-color: var(--text);
+  }
+}
+
+@media (forced-colors: active) {
+  [data-color-theme="liquid-glass"] :is(
+    .header,
+    .left-sidebar-nav,
+    .mobile-nav-bar,
+    .view-header,
+    .btn,
+    .input,
+    .select,
+    button:not(:disabled),
+    .modal,
+    .floating-window,
+    .theme-dropdown-popover,
+    .task-context-menu,
+    [role="menu"],
+    [role="listbox"]
+  ) {
+    forced-color-adjust: auto;
+    color: CanvasText;
+    background: Canvas;
+    border-color: ButtonText;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
 /* HORIZON - Warm sunset-inspired palette */
 [data-color-theme="horizon"] {
   --bg: #1c1e26;
@@ -7367,4 +7737,941 @@ FN-8151 adds Cobalt, Clay, and Moss with complete dark and light token ramps. Ke
   --accent: #557a35;
   --accent-text: #ffffff;
   --logo-accent: var(--accent);
+}
+
+/*
+FNXC:DashboardTheming 2026-07-20-00:00:
+Aurora gives operators navy/teal/violet dark surfaces and misty light surfaces. Literal palette values stay in these canonical tokens, while globally defined swatch variables keep the unselected option accurate in either mode.
+*/
+/*
+FNXC:DashboardTheming 2026-08-20-00:29:
+Operator feedback supersedes the original oversized pixel choice because its apparent UI size harmed readability. Medieval keeps a locally bundled Pixelify Sans face for ordinary UI while code and terminal surfaces retain --font-mono; paper and wood paints stay CSS backgrounds rather than interaction overlays.
+*/
+[data-color-theme="medieval"] {
+  --bg: #21170f;
+  --surface: #302116;
+  --card: #3b2a1c;
+  --card-hover: #4a3523;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #795735;
+  --text: #fff1ce;
+  --text-muted: #ddc79e;
+  --text-dim: #aa926c;
+  --todo: #d5ad67;
+  --in-progress: #79afaa;
+  --in-progress-rgb: 121, 175, 170;
+  --in-review: #c79ad4;
+  --triage: #e5ba6a;
+  --done: #8db08b;
+  --color-success: #9dca8c;
+  --color-warning: #e5ba6a;
+  --color-error: #ef8e75;
+  --color-info: #82b9c4;
+  --cta-bg: #80512c;
+  --cta-border: #d5ad67;
+  --cta-text: #fff8e5;
+  --cta-bg-hover: #9a6637;
+  --cta-border-hover: #ecd093;
+  --cta-glow: 0 0 var(--space-md) color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #d5ad67;
+  --accent-text: #21170f;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 var(--space-lg) color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 var(--btn-border-width) color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 var(--btn-border-width) color-mix(in srgb, var(--accent) 36%, transparent);
+  --font-primary: "Pixelify Sans", system-ui, sans-serif;
+  --medieval-paper-fiber: color-mix(in srgb, var(--text) 6%, transparent);
+  --medieval-paper-mottle: color-mix(in srgb, var(--border) 18%, transparent);
+  --medieval-wood-light: color-mix(in srgb, var(--accent) 68%, var(--card));
+  --medieval-wood-dark: color-mix(in srgb, var(--border) 76%, var(--bg));
+}
+
+[data-color-theme="medieval"][data-theme="light"] {
+  --bg: #f4ead2;
+  --surface: #ead9b8;
+  --card: #fff8e5;
+  --card-hover: #f0dfc0;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #a77b4a;
+  --text: #302116;
+  --text-muted: #674e31;
+  --text-dim: #896f4d;
+  --todo: #8a612b;
+  --in-progress: #2e7473;
+  --in-progress-rgb: 46, 116, 115;
+  --in-review: #704c87;
+  --triage: #8a612b;
+  --done: #446b48;
+  --color-success: #3d7544;
+  --color-warning: #8a612b;
+  --color-error: #a94335;
+  --color-info: #2f6f89;
+  --cta-bg: #765125;
+  --cta-border: #61401e;
+  --cta-text: #fff8e5;
+  --cta-bg-hover: #5f3e1c;
+  --cta-border-hover: #4b3015;
+  --cta-glow: 0 0 var(--space-md) color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #765125;
+  --accent-text: #fff8e5;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 var(--space-lg) color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 var(--btn-border-width) color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 var(--btn-border-width) color-mix(in srgb, var(--accent) 28%, transparent);
+  --font-primary: "Pixelify Sans", system-ui, sans-serif;
+  --medieval-paper-fiber: color-mix(in srgb, var(--text) 5%, transparent);
+  --medieval-paper-mottle: color-mix(in srgb, var(--border) 16%, transparent);
+  --medieval-wood-light: color-mix(in srgb, var(--accent) 64%, var(--card));
+  --medieval-wood-dark: color-mix(in srgb, var(--border) 78%, var(--bg));
+}
+
+[data-color-theme="medieval"] body {
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(ellipse at top left, var(--medieval-paper-fiber), transparent var(--space-2xl)),
+    radial-gradient(ellipse at bottom right, var(--medieval-paper-mottle), transparent calc(var(--space-2xl) * 2)),
+    repeating-linear-gradient(0deg, transparent 0, transparent var(--space-lg), var(--medieval-paper-fiber) calc(var(--space-lg) + var(--btn-border-width))),
+    repeating-linear-gradient(90deg, transparent 0, transparent var(--space-2xl), var(--medieval-paper-mottle) calc(var(--space-2xl) + var(--btn-border-width)));
+}
+/*
+FNXC:MidnightTheme 2026-08-03-02:05:
+Midnight gives operators deep-navy surfaces with restrained violet/indigo accents in dark mode and a cool pale counterpart in light mode. These complete token blocks preserve distinct semantic statuses, AA-readable text and CTA pairs, and globally resolvable swatch previews for unselected selector options.
+*/
+[data-color-theme="midnight"] {
+  --bg: #0b1026;
+  --surface: #131a38;
+  --card: #1b2450;
+  --card-hover: #273164;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #3b477e;
+  --text: #f0f2ff;
+  --text-muted: #bdc5ea;
+  --text-dim: #8490bc;
+
+  --todo: #98adff;
+  --in-progress: #67d4e8;
+  --in-progress-rgb: 103, 212, 232;
+  --in-review: #b69cff;
+  --triage: #f3bd66;
+  --done: #8b9bc7;
+  --color-success: #72d6ad;
+  --color-warning: #f3bd66;
+  --color-error: #fa8499;
+  --color-info: #76b9ff;
+
+  --cta-bg: #6648c5;
+  --cta-border: #a78bfa;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #795dd5;
+  --cta-border-hover: #c4b4ff;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #a78bfa;
+  --accent-text: #171035;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="midnight"][data-theme="light"] {
+  --bg: #f5f6ff;
+  --surface: #e9ecfa;
+  --card: #ffffff;
+  --card-hover: #dde2f6;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #b9c2e2;
+  --text: #172044;
+  --text-muted: #4e5d87;
+  --text-dim: #7381a9;
+
+  --todo: #425cae;
+  --in-progress: #16778c;
+  --in-progress-rgb: 22, 119, 140;
+  --in-review: #6246ad;
+  --triage: #946015;
+  --done: #68789f;
+  --color-success: #247856;
+  --color-warning: #946015;
+  --color-error: #bd4058;
+  --color-info: #266eb1;
+
+  --cta-bg: #5134a3;
+  --cta-border: #412887;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #432989;
+  --cta-border-hover: #341f70;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #5134a3;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-08-18-05:45:
+Velvet gives operators deep plum and burgundy surfaces with rose-gold actions in dark mode, plus a warm blush-white light counterpart. Keep complete semantic and interaction token sets in both modes so persisted theme selection never inherits colors from another theme.
+*/
+[data-color-theme="velvet"] {
+  --bg: #1d1418;
+  --surface: #241a20;
+  --card: #2b1d24;
+  --card-hover: #382631;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #5c414c;
+  --text: #fff4f0;
+  --text-muted: #dfc4be;
+  --text-dim: #aa8b90;
+
+  --todo: #d4a5a5;
+  --in-progress: #d89a82;
+  --in-progress-rgb: 216, 154, 130;
+  --in-review: #c493b7;
+  --triage: #e1b66f;
+  --done: #a99a9d;
+  --color-success: #9fc79b;
+  --color-warning: #e1b66f;
+  --color-error: #ed8c95;
+  --color-info: #d89a82;
+
+  --cta-bg: #c99a89;
+  --cta-border: #e5bbab;
+  --cta-text: #1d1418;
+  --cta-bg-hover: #d9aa99;
+  --cta-border-hover: #f3d0c3;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #c99a89;
+  --accent-text: #1d1418;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="velvet"][data-theme="light"] {
+  --bg: #f9f3f2;
+  --surface: #f3e8e6;
+  --card: #fffaf8;
+  --card-hover: #f0e2e0;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #d9bfc0;
+  --text: #321d25;
+  --text-muted: #704d57;
+  --text-dim: #98757b;
+
+  --todo: #93616b;
+  --in-progress: #a65348;
+  --in-progress-rgb: 166, 83, 72;
+  --in-review: #81578a;
+  --triage: #8a611e;
+  --done: #816b70;
+  --color-success: #4d7951;
+  --color-warning: #8a611e;
+  --color-error: #ad4050;
+  --color-info: #9c544a;
+
+  --cta-bg: #8a4a55;
+  --cta-border: #713a45;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #743c47;
+  --cta-border-hover: #5d2f38;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #8a4a55;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-08-23-01:51:
+Iceberg is a persisted navy-slate palette with a pale blue-gray light counterpart. Keep its id/order synchronized across the core union, selector metadata, web/Electron first-paint validators, token blocks, and swatch CSS so saved selections never flash or fall back.
+*/
+[data-color-theme="iceberg"] {
+  --bg: #161821;
+  --surface: #1e2132;
+  --card: #242940;
+  --card-hover: #2e3450;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #3d4363;
+  --text: #e8eaf5;
+  --text-muted: #b4bbd6;
+  --text-dim: #838aa8;
+
+  --todo: #a6accd;
+  --in-progress: #84a0c6;
+  --in-progress-rgb: 132, 160, 198;
+  --in-review: #a093c7;
+  --triage: #e2a478;
+  --done: #8b93b0;
+  --color-success: #b4be82;
+  --color-warning: #e2a478;
+  --color-error: #e27878;
+  --color-info: #89b8c2;
+
+  --cta-bg: #84a0c6;
+  --cta-border: #a3bcdf;
+  --cta-text: #161821;
+  --cta-bg-hover: #94b0d6;
+  --cta-border-hover: #c2d4ee;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #84a0c6;
+  --accent-text: #161821;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="iceberg"][data-theme="light"] {
+  --bg: #f3f5f9;
+  --surface: #e8ecf4;
+  --card: #ffffff;
+  --card-hover: #dfe5f0;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #c6cee0;
+  --text: #1f2233;
+  --text-muted: #4c5470;
+  --text-dim: #767e99;
+
+  --todo: #5b6486;
+  --in-progress: #2d539e;
+  --in-progress-rgb: 45, 83, 158;
+  --in-review: #6142a0;
+  --triage: #8a5216;
+  --done: #6b7290;
+  --color-success: #4d6b1f;
+  --color-warning: #8a5216;
+  --color-error: #b0413e;
+  --color-info: #276a80;
+
+  --cta-bg: #2d539e;
+  --cta-border: #24437f;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #24437f;
+  --cta-border-hover: #1b3363;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #2d539e;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-08-27-04:23:
+Flexoki is a persisted warm inky palette with a cream paper light counterpart. Keep its id/order synchronized across the core union, selector metadata, web/Electron first-paint validators, token blocks, and swatch CSS so saved selections never flash or fall back.
+*/
+[data-color-theme="flexoki"] {
+  --bg: #100f0f;
+  --surface: #1c1b1a;
+  --card: #282726;
+  --card-hover: #343331;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #403e3c;
+  --text: #cecdc3;
+  --text-muted: #b7b5ac;
+  --text-dim: #878580;
+
+  --todo: #878580;
+  --in-progress: #4385be;
+  --in-progress-rgb: 67, 133, 190;
+  --in-review: #8b7ec8;
+  --triage: #da702c;
+  --done: #6f6e69;
+  --color-success: #879a39;
+  --color-warning: #d0a215;
+  --color-error: #d14d41;
+  --color-info: #3aa99f;
+
+  --cta-bg: #4385be;
+  --cta-border: #6ba3d4;
+  --cta-text: #100f0f;
+  --cta-bg-hover: #5b96cb;
+  --cta-border-hover: #8fbde0;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #4385be;
+  --accent-text: #100f0f;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="flexoki"][data-theme="light"] {
+  --bg: #fffcf0;
+  --surface: #f2f0e5;
+  --card: #ffffff;
+  --card-hover: #e6e4d9;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #dad8ce;
+  --text: #100f0f;
+  --text-muted: #6f6e69;
+  --text-dim: #878580;
+
+  --todo: #6f6e69;
+  --in-progress: #205ea6;
+  --in-progress-rgb: 32, 94, 166;
+  --in-review: #5e409d;
+  --triage: #bc5215;
+  --done: #878580;
+  --color-success: #66800b;
+  --color-warning: #ad8301;
+  --color-error: #af3029;
+  --color-info: #24837b;
+
+  --cta-bg: #205ea6;
+  --cta-border: #1a4c88;
+  --cta-text: #fffcf0;
+  --cta-bg-hover: #1a4c88;
+  --cta-border-hover: #143a68;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #205ea6;
+  --accent-text: #fffcf0;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-08-28-07:45:
+Cozy Cartoon pairs a flagship light pastel palette with a warm cozy-night dark counterpart and oversized rounded controls. Keep its id, ordered registries, token blocks, and swatch mappings synchronized so saved selections paint correctly before hydration.
+*/
+[data-color-theme="cozy-cartoon"] {
+  --bg: #241d24;
+  --surface: #2e2530;
+  --card: #3a2e39;
+  --card-hover: #453548;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #4c3d4c;
+  --text: #f6e8e0;
+  --text-muted: #cdb8b0;
+  --text-dim: #a08d88;
+
+  --todo: #f2cf8f;
+  --in-progress: #8fc9f2;
+  --in-progress-rgb: 143, 201, 242;
+  --in-review: #c9b3f0;
+  --triage: #f2b19c;
+  --done: #9c8f97;
+  --color-success: #a8d8b0;
+  --color-warning: #f2d59a;
+  --color-error: #f2a1a1;
+  --color-info: #9fd8d2;
+
+  --cta-bg: #f4a7a3;
+  --cta-border: #f9c2bf;
+  --cta-text: #2b1a1c;
+  --cta-bg-hover: #f9bcb8;
+  --cta-border-hover: #ffd6d3;
+  --cta-glow: 0 0 10px color-mix(in srgb, var(--cta-border) 40%, transparent);
+  --accent: #f4a7a3;
+  --accent-text: #2b1a1c;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 14px color-mix(in srgb, var(--accent) 30%, transparent);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring-strong: 0 0 0 3px color-mix(in srgb, var(--accent) 42%, transparent);
+
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-xl: 26px;
+  --radius-pill: 999px;
+  --btn-padding: 12px 22px;
+  --btn-border-width: 2px;
+  --icon-size-md: 18px;
+  --cozy-cartoon-btn-font-size: 15px;
+  --cozy-cartoon-btn-font-weight: 600;
+}
+
+[data-color-theme="cozy-cartoon"][data-theme="light"] {
+  --bg: #fff7ef;
+  --surface: #fffdf9;
+  --card: #ffffff;
+  --card-hover: #fdeadd;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #f0d9c6;
+  --text: #43312b;
+  --text-muted: #7a655c;
+  --text-dim: #9a857b;
+
+  --todo: #e8a33d;
+  --in-progress: #4a9fd4;
+  --in-progress-rgb: 74, 159, 212;
+  --in-review: #8a6fd0;
+  --triage: #e0705f;
+  --done: #9a857b;
+  --color-success: #4f9d69;
+  --color-warning: #c98a1e;
+  --color-error: #d1544c;
+  --color-info: #3f97a8;
+
+  --cta-bg: #ffb3ab;
+  --cta-border: #f79a90;
+  --cta-text: #4a2326;
+  --cta-bg-hover: #ffc2b8;
+  --cta-border-hover: #f7a9a0;
+  --cta-glow: 0 0 10px color-mix(in srgb, var(--cta-border) 45%, transparent);
+  --accent: #e07a6a;
+  --accent-text: #3a1f1c;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 22%, transparent);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  --focus-ring-strong: 0 0 0 3px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+[data-color-theme="aurora"] {
+  --bg: #0a1022;
+  --surface: #101a35;
+  --card: #162044;
+  --card-hover: #202d58;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #2b3b6b;
+  --text: #eaf5ff;
+  --text-muted: #b2c5e4;
+  --text-dim: #7891ba;
+
+  --todo: #7aa7ff;
+  --in-progress: #65d8e6;
+  --in-progress-rgb: 101, 216, 230;
+  --in-review: #9b8cff;
+  --triage: #f2bc67;
+  --done: #8295b7;
+  --color-success: #65e6c7;
+  --color-warning: #f2bc67;
+  --color-error: #fb7e96;
+  --color-info: #65b9ff;
+
+  --cta-bg: #2a9d91;
+  --cta-border: #65e6c7;
+  --cta-text: #07171c;
+  --cta-bg-hover: #3db9a8;
+  --cta-border-hover: #98f2dc;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #65e6c7;
+  --accent-text: #07171c;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="aurora"][data-theme="light"] {
+  --bg: #f4f8ff;
+  --surface: #e9f1fb;
+  --card: #ffffff;
+  --card-hover: #dce9f8;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #bdcde2;
+  --text: #102644;
+  --text-muted: #48617f;
+  --text-dim: #7087a1;
+
+  --todo: #366cb7;
+  --in-progress: #197d8c;
+  --in-progress-rgb: 25, 125, 140;
+  --in-review: #5a4fb1;
+  --triage: #9a6515;
+  --done: #617a98;
+  --color-success: #197d72;
+  --color-warning: #9a6515;
+  --color-error: #bd3e59;
+  --color-info: #246fae;
+
+  --cta-bg: #197d72;
+  --cta-border: #12675e;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #126b62;
+  --cta-border-hover: #0e554e;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #197d72;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-07-20-00:00:
+Calm provides low-stimulation slate-and-sage dark surfaces and misty light surfaces. Literal palette values stay in canonical theme tokens here, while global preview values keep the unselected option accurate in either mode.
+*/
+[data-color-theme="calm"] {
+  --bg: #111d2b;
+  --surface: #172536;
+  --card: #1b2a3a;
+  --card-hover: #26394a;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #34495a;
+  --text: #e8f0f2;
+  --text-muted: #b3c5c8;
+  --text-dim: #819aa3;
+
+  --todo: #8aaed0;
+  --in-progress: #79b9bb;
+  --in-progress-rgb: 121, 185, 187;
+  --in-review: #a79bc9;
+  --triage: #d5af6c;
+  --done: #8b9daa;
+  --color-success: #8fc9b5;
+  --color-warning: #d5af6c;
+  --color-error: #d98798;
+  --color-info: #7da9c4;
+
+  --cta-bg: #5b9984;
+  --cta-border: #8fc9b5;
+  --cta-text: #10241f;
+  --cta-bg-hover: #70ad98;
+  --cta-border-hover: #b1dfce;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 28%, transparent);
+  --accent: #8fc9b5;
+  --accent-text: #10241f;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+[data-color-theme="calm"][data-theme="light"] {
+  --bg: #f4f8fb;
+  --surface: #e9f1f5;
+  --card: #ffffff;
+  --card-hover: #dce8ee;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #bfd0d8;
+  --text: #193242;
+  --text-muted: #4e6773;
+  --text-dim: #728994;
+
+  --todo: #396f91;
+  --in-progress: #2f726f;
+  --in-progress-rgb: 47, 114, 111;
+  --in-review: #665b91;
+  --triage: #8e641d;
+  --done: #647c89;
+  --color-success: #2f7260;
+  --color-warning: #8e641d;
+  --color-error: #ad4357;
+  --color-info: #396f91;
+
+  --cta-bg: #2f7260;
+  --cta-border: #245b4d;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #265f51;
+  --cta-border-hover: #1d493e;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #2f7260;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-07-20-00:00:
+Dawn pairs deep indigo and plum dark surfaces with muted peach, amber, and violet accents; its light mode uses dawn-white surfaces, plum text, and readable deep amber actions. Global preview values above remain independent of the active theme so unselected Dawn rows retain all four swatch colors.
+*/
+[data-color-theme="dawn"] {
+  --bg: #151229;
+  --surface: #201a38;
+  --card: #2a2248;
+  --card-hover: #352a57;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #4b3d6e;
+  --text: #fff1e4;
+  --text-muted: #d7c0c3;
+  --text-dim: #9f8498;
+
+  --todo: #8ea8ff;
+  --in-progress: #8dbde8;
+  --in-progress-rgb: 141, 189, 232;
+  --in-review: #c8a4ff;
+  --triage: #efb66a;
+  --done: #a391aa;
+  --color-success: #a7d49b;
+  --color-warning: #efb66a;
+  --color-error: #f18a9c;
+  --color-info: #8dbde8;
+
+  --cta-bg: #d88745;
+  --cta-border: #f3be7b;
+  --cta-text: #29150f;
+  --cta-bg-hover: #e89a57;
+  --cta-border-hover: #ffdaa3;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #efb66a;
+  --accent-text: #29150f;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-07-31-21:28:
+Sage uses soft green-gray surfaces with a muted olive accent, preserving readable neutral text ramps in dark and light modes. Global previews remain independent of the active theme so unselected Sage rows retain all four swatch colors.
+*/
+[data-color-theme="sage"] {
+  --bg: #16201a;
+  --surface: #1e2b23;
+  --card: #27382e;
+  --card-hover: #33463a;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #4c6254;
+  --text: #edf3e9;
+  --text-muted: #bdcbbd;
+  --text-dim: #869a8b;
+
+  --todo: #9bb9b2;
+  --in-progress: #8bbdb0;
+  --in-progress-rgb: 139, 189, 176;
+  --in-review: #b1c58b;
+  --triage: #d0b676;
+  --done: #91a198;
+  --color-success: #9fc48e;
+  --color-warning: #d0b676;
+  --color-error: #de8f88;
+  --color-info: #8bbdb0;
+
+  --cta-bg: #9ab58a;
+  --cta-border: #b8cba8;
+  --cta-text: #16201a;
+  --cta-bg-hover: #aec49e;
+  --cta-border-hover: #d2dfc7;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #9ab58a;
+  --accent-text: #16201a;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="sage"][data-theme="light"] {
+  --bg: #f5f8f4;
+  --surface: #eaf0e8;
+  --card: #ffffff;
+  --card-hover: #e2eadf;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #b9c9b6;
+  --text: #253529;
+  --text-muted: #526957;
+  --text-dim: #788f7d;
+
+  --todo: #46756b;
+  --in-progress: #3f776b;
+  --in-progress-rgb: 63, 119, 107;
+  --in-review: #617d47;
+  --triage: #896d31;
+  --done: #687d70;
+  --color-success: #4d7a45;
+  --color-warning: #896d31;
+  --color-error: #ac4f49;
+  --color-info: #3f776b;
+
+  --cta-bg: #55764d;
+  --cta-border: #405f3a;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #46663f;
+  --cta-border-hover: #355330;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #55764d;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-07-31-20:39:
+Factory Dark is the low-ambient-light industrial sibling of Factory: graphite and steel surfaces, cool gunmetal borders, and restrained safety-orange actions. Its concrete-gray light counterpart keeps the same visual identity with readable dark text; global previews remain independent of the active theme.
+*/
+[data-color-theme="factory-dark"] {
+  --bg: #0d0f10;
+  --surface: #141719;
+  --card: #1a1d1f;
+  --card-hover: #252a2d;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #3b454a;
+  --text: #f2f3f2;
+  --text-muted: #b6bec1;
+  --text-dim: #7d898e;
+
+  --todo: #8db6ca;
+  --in-progress: #6eb2ca;
+  --in-progress-rgb: 110, 178, 202;
+  --in-review: #a8b8c0;
+  --triage: #e89532;
+  --done: #89969a;
+  --color-success: #8fbf9a;
+  --color-warning: #e89532;
+  --color-error: #e47a6e;
+  --color-info: #6eb2ca;
+
+  --cta-bg: #d77b20;
+  --cta-border: #f1ad5a;
+  --cta-text: #1a1007;
+  --cta-bg-hover: #e89532;
+  --cta-border-hover: #ffd08c;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #e89532;
+  --accent-text: #1a1007;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="factory-dark"][data-theme="light"] {
+  --bg: #eceef0;
+  --surface: #e2e5e7;
+  --card: #f7f8f8;
+  --card-hover: #d9dde0;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #aeb8bd;
+  --text: #20282c;
+  --text-muted: #536168;
+  --text-dim: #738087;
+
+  --todo: #35687d;
+  --in-progress: #24728c;
+  --in-progress-rgb: 36, 114, 140;
+  --in-review: #526871;
+  --triage: #a95612;
+  --done: #68767b;
+  --color-success: #386c48;
+  --color-warning: #a95612;
+  --color-error: #ad403a;
+  --color-info: #24728c;
+
+  --cta-bg: #a95612;
+  --cta-border: #85430d;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #8f480e;
+  --cta-border-hover: #6f370a;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #a95612;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/*
+FNXC:DashboardTheming 2026-07-31-23:51:
+Factory Light is the daylight industrial sibling of Factory and Factory Dark: warm graphite stays readable in dark mode, while poured-concrete and warm-white surfaces, steel-gray borders, and contrast-safe safety orange serve bright environments in light mode. Its globally resolved preview tokens intentionally do not bind to the active theme.
+*/
+[data-color-theme="factory-light"] {
+  --bg: #171716;
+  --surface: #20201e;
+  --card: #292926;
+  --card-hover: #343431;
+  --surface-hover: color-mix(in srgb, var(--surface) 90%, var(--text) 10%);
+  --border: #4d5555;
+  --text: #f6f4ef;
+  --text-muted: #c2c4bd;
+  --text-dim: #8e938c;
+
+  --todo: #9ab8c4;
+  --in-progress: #78b4c8;
+  --in-progress-rgb: 120, 180, 200;
+  --in-review: #b7b9b2;
+  --triage: #f0a24a;
+  --done: #9da69d;
+  --color-success: #9dc09a;
+  --color-warning: #f0a24a;
+  --color-error: #eb8374;
+  --color-info: #78b4c8;
+
+  --cta-bg: #d98225;
+  --cta-border: #f4b968;
+  --cta-text: #1d1308;
+  --cta-bg-hover: #f0a24a;
+  --cta-border-hover: #ffd494;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
+  --accent: #f0a24a;
+  --accent-text: #1d1308;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 12px color-mix(in srgb, var(--accent) 28%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 36%, transparent);
+}
+
+[data-color-theme="factory-light"][data-theme="light"] {
+  --bg: #f7f7f5;
+  --surface: #efefec;
+  --card: #ffffff;
+  --card-hover: #e5e6e3;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #aab2b3;
+  --text: #202523;
+  --text-muted: #4f5b5b;
+  --text-dim: #737d7d;
+
+  --todo: #476b7a;
+  --in-progress: #236d86;
+  --in-progress-rgb: 35, 109, 134;
+  --in-review: #5d6968;
+  --triage: #b45309;
+  --done: #68736e;
+  --color-success: #3d7147;
+  --color-warning: #b45309;
+  --color-error: #af3e37;
+  --color-info: #236d86;
+
+  --cta-bg: #b45309;
+  --cta-border: #8f4108;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #954207;
+  --cta-border-hover: #713205;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #b45309;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+[data-color-theme="dawn"][data-theme="light"] {
+  --bg: #fff8f2;
+  --surface: #faeee8;
+  --card: #ffffff;
+  --card-hover: #f1ddd7;
+  --surface-hover: color-mix(in srgb, var(--surface) 92%, var(--text) 8%);
+  --border: #d9bec4;
+  --text: #382137;
+  --text-muted: #6e5265;
+  --text-dim: #967987;
+
+  --todo: #4969ae;
+  --in-progress: #326d94;
+  --in-progress-rgb: 50, 109, 148;
+  --in-review: #704eaa;
+  --triage: #9b5618;
+  --done: #806d7b;
+  --color-success: #397447;
+  --color-warning: #9b5618;
+  --color-error: #b23d58;
+  --color-info: #326d94;
+
+  --cta-bg: #9b5618;
+  --cta-border: #7b4212;
+  --cta-text: #ffffff;
+  --cta-bg-hover: #7f4614;
+  --cta-border-hover: #63350f;
+  --cta-glow: 0 0 8px color-mix(in srgb, var(--cta-border) 24%, transparent);
+  --accent: #9b5618;
+  --accent-text: #ffffff;
+  --logo-accent: var(--accent);
+  --shadow-glow: 0 0 10px color-mix(in srgb, var(--accent) 20%, transparent);
+  --focus-ring: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  --focus-ring-strong: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
 }

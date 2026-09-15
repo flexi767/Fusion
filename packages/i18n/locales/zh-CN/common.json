@@ -38,6 +38,7 @@
       "guardRejected": "",
       "mergeBlocked": "",
       "unknownColumn": "",
+      "unplannedForExecution": "",
       "workflowMismatch": ""
     }
   },
@@ -165,6 +166,7 @@
       "ollama": "",
       "openai": "",
       "openrouter": "",
+      "orcarouter": "",
       "zai": ""
     },
     "apiKeyPlaceholder": {
@@ -181,6 +183,7 @@
       "ollama": "",
       "openai": "",
       "openrouter": "",
+      "orcarouter": "",
       "zai": ""
     },
     "apiKeyUsage": {
@@ -190,6 +193,7 @@
       "ollama": "",
       "openai": "",
       "openrouter": "",
+      "orcarouter": "",
       "zai": ""
     },
     "providerDesc": {
@@ -205,6 +209,7 @@
       "openai": "",
       "openaiCodex": "",
       "openrouter": "",
+      "orcarouter": "",
       "zai": ""
     }
   },

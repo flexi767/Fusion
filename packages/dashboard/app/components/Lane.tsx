@@ -1,9 +1,8 @@
 import "./Lane.css";
 import { memo, useCallback, useEffect, useMemo, useRef, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
-import type { Task, TaskDetail, Column as ColumnType, ColumnId, TaskCreateInput, GithubIssueAction } from "@fusion/core";
+import { sortTasksForDisplayColumn, type Task, type TaskDetail, type Column as ColumnType, type ColumnId, type TaskCreateInput, type GithubIssueAction } from "@fusion/core";
 import { Column } from "./Column";
-import { sortTasksForDisplayColumn } from "./taskSorting";
 import type { ModelInfo, BoardWorkflowDefinition, RevertTaskOptions, RevertTaskResult } from "../api";
 import type { ToastType } from "../hooks/useToast";
 import type { BlockerFanoutEntry } from "../hooks/useBlockerFanout";
@@ -14,7 +13,7 @@ import type { BlockerFanoutEntry } from "../hooks/useBlockerFanout";
  * Column.tsx in workflow mode). The header shows the workflow name, the card
  * count, and a collapse toggle (collapse state persisted by the parent Board).
  *
- * Archived / hidden-from-board columns are hidden. Hold columns render the
+ * Hidden-from-board columns are hidden. Hold columns render the
  * per-card promote affordance. Cross-lane drag is rejected by the drag
  * pre-check the Board threads through (drag never switches workflows).
  *
@@ -31,12 +30,9 @@ export interface LaneProps {
   onToggleCollapse: (workflowId: string) => void;
   projectId?: string;
   maxConcurrent: number;
+  maxWorktrees: number;
   showWorktreeGrouping?: boolean;
-  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
-  onPromote: (taskId: string) => Promise<void>;
-  /** Drag pre-check: null = allowed, else an i18n messageKey (R17). */
-  canDropTask: (taskId: string, targetColumnId: string, workflowId: string) => string | null;
-  getDraggingTaskId: () => string | null;
+  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
   onPauseTask?: (id: string) => Promise<Task>;
   onOpenDetail: (task: Task | TaskDetail) => void;
   onOpenGroupModal?: (groupId: string) => void;
@@ -48,9 +44,6 @@ export interface LaneProps {
   globalPaused?: boolean;
   onUpdateTask?: (id: string, updates: { title?: string; description?: string; dependencies?: string[] }) => Promise<Task>;
   onRetryTask?: (id: string) => Promise<Task>;
-  onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  onUnarchiveTask?: (id: string) => Promise<Task>;
-  /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside onArchiveTask/onUnarchiveTask. */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   onDeleteTask?: (id: string, options?: {
     removeDependencyReferences?: boolean;
@@ -59,14 +52,12 @@ export interface LaneProps {
   }) => Promise<Task>;
   availableModels?: ModelInfo[];
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   onOpenDetailWithTab?: (task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => void;
   favoriteProviders?: string[];
   favoriteModels?: string[];
   onToggleFavorite?: (provider: string) => void;
   onToggleModelFavorite?: (modelId: string) => void;
   isSearchActive?: boolean;
-  taskStuckTimeoutMs?: number;
   onOpenMission?: (missionId: string) => void;
   lastFetchTimeMs?: number;
   /** Per-task card-placed custom field definitions (U13/KTD-14). */
@@ -80,9 +71,9 @@ function LaneComponent(props: LaneProps) {
   const { t } = useTranslation("app");
   const laneRef = useRef<HTMLDivElement | null>(null);
 
-  // Visible columns: archived / hidden-from-board columns are hidden per lane.
+  // Visible columns exclude only explicit workflow-hidden destinations.
   const visibleColumns = useMemo(
-    () => workflow.columns.filter((col) => !col.flags.archived && !col.flags.hiddenFromBoard),
+    () => workflow.columns.filter((col) => !col.flags.hiddenFromBoard),
     [workflow.columns],
   );
   const contextMenuColumns = useMemo(
@@ -92,8 +83,8 @@ function LaneComponent(props: LaneProps) {
     [workflow.columns],
   );
   const createColumnId = useMemo(() => (
-    visibleColumns.find((col) => col.flags.intake && !col.flags.archived)?.id
-      ?? visibleColumns.find((col) => !col.flags.archived)?.id
+    visibleColumns.find((col) => col.flags.intake)?.id
+      ?? visibleColumns[0]?.id
   ), [visibleColumns]);
 
   // Group + sort tasks by column id (stable per render).
@@ -104,7 +95,9 @@ function LaneComponent(props: LaneProps) {
       (grouped[task.column] ??= []).push(task);
     }
     for (const col of workflow.columns) {
-      grouped[col.id] = sortTasksForDisplayColumn(grouped[col.id] ?? [], task_legacyKey(col.id));
+      grouped[col.id] = sortTasksForDisplayColumn(grouped[col.id] ?? [], col.id, {
+        columnFlags: col.flags,
+      });
     }
     return grouped;
   }, [tasks, workflow.columns]);
@@ -148,10 +141,6 @@ function LaneComponent(props: LaneProps) {
     handleToggle();
   }, [handleToggle]);
 
-  const makeCanDrop = useCallback(
-    (targetColumnId: string) => (taskId: string) => props.canDropTask(taskId, targetColumnId, workflow.id),
-    [props, workflow.id],
-  );
 
   return (
     <section className="lane" data-lane={workflow.id} aria-label={workflow.name}>
@@ -187,11 +176,9 @@ function LaneComponent(props: LaneProps) {
               allTasks={tasks}
               projectId={props.projectId}
               maxConcurrent={props.maxConcurrent}
+              maxWorktrees={props.maxWorktrees}
               showWorktreeGrouping={props.showWorktreeGrouping === true}
               onMoveTask={props.onMoveTask}
-              onPromote={props.onPromote}
-              canDropTask={makeCanDrop(col.id)}
-              getDraggingTaskId={props.getDraggingTaskId}
               onPauseTask={props.onPauseTask}
               onOpenDetail={props.onOpenDetail}
               onOpenGroupModal={props.onOpenGroupModal}
@@ -199,8 +186,6 @@ function LaneComponent(props: LaneProps) {
               globalPaused={props.globalPaused}
               onUpdateTask={props.onUpdateTask}
               onRetryTask={props.onRetryTask}
-              onArchiveTask={props.onArchiveTask}
-              onUnarchiveTask={props.onUnarchiveTask}
               onRevertTask={props.onRevertTask}
               onDeleteTask={props.onDeleteTask}
               availableModels={props.availableModels}
@@ -210,14 +195,13 @@ function LaneComponent(props: LaneProps) {
               onToggleFavorite={props.onToggleFavorite}
               onToggleModelFavorite={props.onToggleModelFavorite}
               isSearchActive={props.isSearchActive}
-              taskStuckTimeoutMs={props.taskStuckTimeoutMs}
               onOpenMission={props.onOpenMission}
               lastFetchTimeMs={props.lastFetchTimeMs}
               taskCardFieldDefs={props.taskCardFieldDefs}
               blockerFanoutMap={props.blockerFanoutMap}
               prAuthAvailable={props.prAuthAvailable}
               autoMerge={props.autoMerge}
-              {...(isCreateColumn ? { onQuickCreate: props.onQuickCreate, onNewTask: props.onNewTask, onPlanningMode: props.onPlanningMode, onSubtaskBreakdown: props.onSubtaskBreakdown } : {})}
+              {...(isCreateColumn ? { onQuickCreate: props.onQuickCreate, onNewTask: props.onNewTask, onPlanningMode: props.onPlanningMode } : {})}
               {...((col.flags.mergeBlocker || col.flags.humanReview) && props.onToggleAutoMerge ? { onToggleAutoMerge: props.onToggleAutoMerge } : {})}
             />
             );
@@ -226,13 +210,6 @@ function LaneComponent(props: LaneProps) {
       )}
     </section>
   );
-}
-
-/** Custom column ids are not in the legacy ColumnType enum; sortTasksForDisplayColumn
- *  only special-cases the legacy literals, so any unknown id falls through to the
- *  generic priority sort. Cast through unknown for the typed call. */
-function task_legacyKey(columnId: string): ColumnType {
-  return columnId as ColumnType;
 }
 
 export const Lane = memo(LaneComponent);

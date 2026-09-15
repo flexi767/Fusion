@@ -19,6 +19,8 @@ Create a new task on the Fusion task board. The task enters the planning column 
 | `agentId` | string | — | Agent ID to assign this task to (e.g. 'agent-abc123') |
 | `priority` | string(enum) | — | Task priority (low, normal, high, urgent) |
 | `workflow_id` | string | — | Workflow ID to select for the new task (e.g. 'WF-003' or 'builtin:coding'). Omit to inherit the project default workflow. Use fn_workflow_list to discover valid IDs. |
+| `github_tracking` | boolean | — | Per-task GitHub issue tracking override. true links a tracking issue to this task; false disables tracking even when the project/global default enables it. Omit to inherit the project/global default. |
+| `github_repo` | string | — | "owner/repo" override for the GitHub tracking issue's repository. Omit to use the project/global default repo. |
 
 ### fn_task_update
 
@@ -54,7 +56,7 @@ Show full details for a task including steps, progress, and log entries.
 
 ### fn_task_logs_read
 
-Read a task's full persisted agent log with pagination and optional type filtering.
+Read a task's persisted agent log with pagination and optional type filtering. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response remains bounded.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -62,6 +64,7 @@ Read a task's full persisted agent log with pagination and optional type filteri
 | `limit` | number | — | Maximum matching entries to return (default 100). |
 | `offset` | number | — | Number of matching entries to skip from newest (default 0). |
 | `type` | union | — | Only return entries of this agent-log type. |
+| `detail` | union | — | Tool-detail mode. Preview (default) bounds each detail row; full lifts that row preview while the whole response remains bounded. |
 
 ### fn_task_attach
 
@@ -122,32 +125,16 @@ Request a refinement of a completed or in-review task. Creates a new follow-up t
 | `id` | string | ✓ | Task ID to refine (e.g. FN-001). Must be in 'done' or 'in-review' column. |
 | `feedback` | string | ✓ | Description of what needs to be refined or improved |
 
-### fn_task_archive
-
-Archive a task from any live column (move to archived). Archived tasks are preserved for historical reference but moved out of the main board view. If the task is still referenced as a lineage parent by another task, archiving is rejected unless removeLineageReferences:true is passed.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string | ✓ | Task ID to archive from any live column (e.g. FN-001). |
-| `removeLineageReferences` | boolean | — | When true, clear incoming lineage-parent references (child sourceParentTaskId) before archiving, so a task still referenced as a lineage parent can be archived. |
-
-### fn_task_unarchive
-
-Unarchive an archived task (move from archived → its restore column). Restores to the pre-archive column when available, with active execution columns downgraded to todo.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string | ✓ | Task ID to unarchive (e.g. FN-001). Must be in 'archived' column. |
-
 ### fn_task_delete
 
-Soft-delete a task from active Fusion board views. The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. If the task is still referenced as a lineage parent by another task, deletion is rejected unless removeLineageReferences:true is passed.
+Soft-delete a task from active Fusion board views. The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. If live lineage children or dependents still reference the task, deletion is rejected unless the matching explicit reference-removal option is passed.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | ✓ | Task ID to delete (e.g. FN-001) |
 | `allowResurrection` | boolean | — | When true, mark this tombstone as explicitly reusable for future recreation. |
 | `removeLineageReferences` | boolean | — | When true, clear incoming lineage-parent references (child sourceParentTaskId) before deleting, so a task still referenced as a lineage parent can be removed. |
+| `removeDependencyReferences` | boolean | — | When true, remove incoming dependency edges before soft deletion. Omit or pass false to retain the dependent-conflict refusal. |
 
 ### fn_task_browse_gitlab_project_issues
 
@@ -211,7 +198,7 @@ Import GitLab project merge requests as Fusion review tasks using configured Git
 
 ### fn_task_plan
 
-Create a task via AI-guided planning mode — interactive conversation to refine your idea into a well-specified task.
+Create a task via AI-guided planning mode — interactive conversation to refine your idea into a well-specified task. Pass resumeSessionId to reopen an existing planning session (even one whose task was already created) and create another task from the evolved plan.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -304,6 +291,16 @@ Assign a workflow definition to a task by workflow ID.
 |-----------|------|----------|-------------|
 | `workflow_id` | string | ✓ | The workflow definition ID to select (e.g. 'WF-003', or a 'builtin:*' id). Use fn_workflow_list to discover available IDs. |
 | `task_id` | string | — | Task to assign the workflow to. Defaults to the current task. |
+
+### fn_workflow_step_resume
+
+Resume a stuck pending workflow step on an in-review or in-progress Fusion task (operator-only, mandatory reason, audit-logged). When a prompt node (like code-review) is dispatched but never receives a verdict callback (Runfusion/Fusion#1946), the step stays in 'pending' status indefinitely. This tool transitions it to 'failed', enabling the existing fn_task_bypass_review escape hatch to clear the merge blocker. Requires a mandatory reason and step ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | ✓ | Task ID (e.g. FN-001) |
+| `stepId` | string | ✓ | Workflow step ID to resume (e.g. 'code-review', 'plan-review') |
+| `reason` | string | ✓ | Mandatory justification for resuming the step (audit-logged) |
 
 ## GitHub Tools
 
@@ -410,6 +407,25 @@ Delete a mission and all its milestones, slices, and features. Cannot be undone.
 |-----------|------|----------|-------------|
 | `id` | string | ✓ | Mission ID to delete (e.g., M-001) |
 
+### fn_mission_set_status
+
+Set a mission lifecycle status.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | ✓ |  |
+| `status` | union | ✓ |  |
+| `reason` | string | — |  |
+
+### fn_mission_clear_blocked
+
+Clear a stale mission-level blocked badge without resuming automation.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | ✓ | Mission ID (e.g., M-001) |
+| `reason` | string | — | Why the badge is stale (audit-logged) |
+
 ### fn_mission_update
 
 Update an existing mission's title or description. Partial patches leave untouched fields intact.
@@ -488,12 +504,58 @@ Activate a pending slice for implementation. Sets status to 'active' and enables
 
 ### fn_feature_link_task
 
-Link a feature to a fn task for implementation. Updates the feature status to 'triaged' and associates it with the task. If the target task is not on the active board (for example archived, deleted, or never created), the tool returns a clear validation error indicating that only active tasks can be linked.
+Link a feature to a fn task for implementation. Updates the feature status to 'triaged' and associates it with the task. If the target task is not on the active board (for example deleted, historical, or never created), the tool returns a clear validation error indicating that only active tasks can be linked.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `featureId` | string | ✓ | Feature ID to link (e.g., F-001) |
 | `taskId` | string | ✓ | Task ID to link to (e.g., FN-001) |
+
+### fn_feature_repoint_task
+
+Atomically re-point an already-linked feature's single-valued taskId to a different task. Corrects a feature pinned to the wrong task (for example a shared vision doc) without the status-lossy unlink then link two-step. The target task must be live; same-task re-point is an idempotent no-op.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `featureId` | string | ✓ | Feature ID to re-point (e.g., F-001) |
+| `taskId` | string | ✓ | Task ID to re-point to (e.g., FN-001) |
+
+### fn_feature_unlink_task
+
+Detach a feature from its linked task entirely, clearing its single-valued taskId and demoting its status to 'defined'. Use before the documented safe duplicate-cleanup and reconcile-done flow. Returns a clear error if the feature is not currently linked to any task.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `featureId` | string | ✓ | Feature ID to unlink (e.g., F-001) |
+
+### fn_feature_set_status
+
+Set a feature lifecycle status.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | ✓ |  |
+| `status` | union | ✓ |  |
+| `reason` | string | — |  |
+
+### fn_mission_reconcile
+
+Reconcile mission state against deterministic delivery ground truth.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | — |  |
+| `dryRun` | boolean | — |  |
+
+### fn_feature_repair_validation
+
+Clear a stale validation badge or re-run validation.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | ✓ |  |
+| `action` | union | ✓ |  |
+| `reason` | string | — |  |
 
 ### fn_feature_update
 
@@ -577,7 +639,8 @@ Create a new non-ephemeral agent.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | ✓ | Agent name |
-| `role` | union | ✓ | Agent role/capability |
+| `role` | union | — | Deprecated singular role; use roles for multi-role agents. |
+| `roles` | array | — | Canonical permanent-agent role tags. |
 | `soul` | string | — | Agent personality/identity text |
 | `instructions_text` | string | — | Inline custom instructions |
 | `instructions_path` | string | — | Path to instructions markdown |
@@ -585,6 +648,7 @@ Create a new non-ephemeral agent.
 | `heartbeat_interval_ms` | number | — |  |
 | `heartbeat_timeout_ms` | number | — |  |
 | `max_concurrent_runs` | number | — |  |
+| `max_workflow_sessions` | number | — | Max concurrent workflow sessions, independent of heartbeat runs |
 | `message_response_mode` | union | — |  |
 
 ### fn_agent_update
@@ -595,7 +659,8 @@ Update editable configuration for an existing non-ephemeral agent. Agent callers
 |-----------|------|----------|-------------|
 | `agent_id` | string | ✓ | Target agent ID or name to update |
 | `name` | string | — | New display name |
-| `role` | union | — | Agent role/capability |
+| `role` | union | — | Deprecated singular role; replaces roles for compatibility. |
+| `roles` | array | — | Canonical permanent-agent role tags. |
 | `title` | string | — | Optional title shown for the agent |
 | `icon` | string | — | Optional compact icon/emoji |
 | `soul` | string | — | Agent personality/identity text |
@@ -606,6 +671,7 @@ Update editable configuration for an existing non-ephemeral agent. Agent callers
 | `heartbeat_interval_ms` | number | — | Heartbeat polling interval in ms |
 | `heartbeat_timeout_ms` | number | — | Heartbeat timeout in ms |
 | `max_concurrent_runs` | number | — | Max concurrent heartbeat runs |
+| `max_workflow_sessions` | number | — | Max concurrent workflow sessions, independent of heartbeat runs |
 | `message_response_mode` | union | — | How agent responds to messages |
 
 ### fn_agent_set_instructions
@@ -617,6 +683,28 @@ Set the instructionsText and/or instructionsPath of one of the caller's direct o
 | `agent_id` | string | ✓ | Target agent whose instructions to set |
 | `instructions_text` | string | — | Inline instructions. Pass an empty string to clear. |
 | `instructions_path` | string | — | Path to a markdown instructions file. Pass an empty string to clear. |
+
+### fn_agent_read_evaluations
+
+Read ratings, feedback, reflections, and performance data for a direct or indirect report.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | ✓ | Target agent ID or resolvable name |
+| `rating_limit` | number | — | Maximum ratings to return (default 10) |
+| `reflection_limit` | number | — | Maximum reflections to return (default 5) |
+
+### fn_agent_evaluation_followup
+
+Record a coaching evaluation follow-up for a direct or indirect report to read through its self-improvement loop.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | ✓ | Target agent ID or resolvable name |
+| `score` | number | ✓ | Evaluation score from 1 to 5 |
+| `comment` | string | ✓ | Coaching or follow-up note |
+| `category` | string | — | Optional evaluation category |
+| `task_id` | string | — | Optional related task ID |
 
 ### fn_agent_delete
 
@@ -640,7 +728,7 @@ List all available agents in the system. Shows each agent's name, role, state, p
 
 ### fn_delegate_task
 
-Create a new task and assign it to a specific agent for execution. The task goes to 'todo' and will be picked up by the target agent on their next heartbeat cycle. Use fn_list_agents first to find available agents and their capabilities. Optionally pass workflow_id to select a workflow at creation time; use fn_workflow_list to discover valid IDs.
+Create a new task and assign it to a specific agent for execution. The task lands in the selected workflow's ready lane (`todo` on the built-in board, whatever that workflow calls it otherwise) and will be picked up by the target agent on their next heartbeat cycle. Use fn_list_agents first to find available agents and their capabilities. Optionally pass workflow_id to select a workflow at creation time; use fn_workflow_list to discover valid IDs.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

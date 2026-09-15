@@ -1,11 +1,11 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ViewHeader } from "./ViewHeader";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { createPortal } from "react-dom";
 import { fetchAgents } from "../api";
 import type { Agent } from "@fusion/core";
 import { AgentAvatar } from "./AgentAvatar";
 import { LoadingSpinner } from "./LoadingSpinner";
-import { nextFloatingZ } from "./floatingWindowStack";
+import { FloatingWindow } from "./FloatingWindow";
 import "./CreateRoomModal.css";
 
 export interface RoomDraft {
@@ -46,34 +46,53 @@ export function CreateRoomModal({ isOpen, onClose, onCreate, projectId, existing
   const [agents, setAgents] = useState<Agent[]>([]);
   const [search, setSearch] = useState("");
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
-  const [loadingAgents, setLoadingAgents] = useState(false);
+  const [agentLoadPhase, setAgentLoadPhase] = useState<"idle" | "loading" | "loaded" | "failed">("idle");
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const modalRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const agentLoadEpochRef = useRef(0);
   /*
-  FNXC:ChatRoomModal 2026-07-17-15:56:
-  Create Room is a blocking dialog launched from Quick Chat's non-blocking FloatingWindow. Because
-  both surfaces portal to body, claim a fresh shared top-layer z-index on every open so the dialog
-  stays above its parent on desktop and the mobile full-screen Chat sheet, including after reopen.
+  FNXC:ModalTouchGeometry 2026-07-26-19:25:
+  Create Room is a blocking child of Quick Chat. The shared utility layer now claims its fresh
+  portal z-index on every mount, keeping this dialog above Chat without a bespoke overlay counter.
   */
-  const [overlayZ, setOverlayZ] = useState<number | undefined>(undefined);
-  useLayoutEffect(() => {
-    if (isOpen) setOverlayZ(nextFloatingZ());
-  }, [isOpen]);
 
   useEffect(() => {
+    const requestEpoch = ++agentLoadEpochRef.current;
     if (!isOpen) return;
+
     previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    setLoadingAgents(true);
+    setAgents([]);
+    setAgentLoadPhase("loading");
     setSubmitError(null);
-    fetchAgents(undefined, projectId)
-      .then((result) => setAgents(result))
-      .catch(() => {
-        setAgents([]);
-        setSubmitError(t("createRoom.failedLoadAgents", "Failed to load agents."));
+    let cancelled = false;
+    const isCurrentRequest = () => !cancelled && agentLoadEpochRef.current === requestEpoch;
+
+    /*
+    FNXC:CreateRoomModal 2026-08-16-08:11:
+    The modal stays mounted while Chat toggles it and can switch projects mid-request. Only the
+    latest open request may publish its roster, error, or phase; cleanup fences close, unmount,
+    and project-change completions before they can overwrite the current picker.
+    */
+    void fetchAgents(undefined, projectId)
+      .then((result) => {
+        if (!isCurrentRequest()) return;
+        setAgents(result);
+        setSelectedAgentIds((selected) => selected.filter((id) => result.some((agent) => agent.id === id)));
+        setAgentLoadPhase("loaded");
       })
-      .finally(() => setLoadingAgents(false));
+      .catch(() => {
+        if (!isCurrentRequest()) return;
+        setAgents([]);
+        setAgentLoadPhase("failed");
+      });
+
+    return () => {
+      cancelled = true;
+      ++agentLoadEpochRef.current;
+    };
   }, [isOpen, projectId]);
 
   useEffect(() => {
@@ -81,14 +100,30 @@ export function CreateRoomModal({ isOpen, onClose, onCreate, projectId, existing
       setRawName("");
       setSearch("");
       setSelectedAgentIds([]);
+      setAgents([]);
+      setAgentLoadPhase("idle");
       setSubmitError(null);
       setIsSubmitting(false);
       return;
     }
-    const frame = window.requestAnimationFrame(() => nameInputRef.current?.focus());
+    /*
+    FNXC:CreateRoomModal 2026-08-16-09:20:
+    A late open-time animation frame must not yank focus from a field the user already selected
+    inside this dialog. Otherwise member-search keystrokes can be swallowed by the room-name field.
+    */
+    const frame = window.requestAnimationFrame(() => {
+      const activeElement = document.activeElement;
+      if (activeElement instanceof HTMLElement && modalRef.current?.contains(activeElement)) return;
+      nameInputRef.current?.focus();
+    });
     return () => window.cancelAnimationFrame(frame);
   }, [isOpen]);
 
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-19:25:
+  FloatingWindow owns the modal focus boundary but not Escape dismissal. Retain this dialog's
+  existing Escape and explicit prior-focus restoration behavior while moving its presentation.
+  */
   useEffect(() => {
     if (!isOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -116,7 +151,7 @@ export function CreateRoomModal({ isOpen, onClose, onCreate, projectId, existing
     [agents, selectedAgentIds],
   );
 
-  const canSubmit = validation.ok && selectedAgentIds.length > 0 && !isSubmitting && !loadingAgents;
+  const canSubmit = validation.ok && selectedAgentIds.length > 0 && !isSubmitting && agentLoadPhase === "loaded";
 
   if (!isOpen) return null;
 
@@ -150,13 +185,39 @@ export function CreateRoomModal({ isOpen, onClose, onCreate, projectId, existing
     }
   };
 
-  return createPortal(
-    <div className="modal-overlay open" onClick={(event) => event.target === event.currentTarget && onClose()} style={overlayZ ? { zIndex: overlayZ } : undefined}>
-      <div className="modal modal-lg create-room-modal" role="dialog" aria-modal="true" aria-label={t("createRoom.title", "Create room")} onClick={(event) => event.stopPropagation()}>
-        <div className="modal-header">
-          <h3>{t("createRoom.title", "Create room")}</h3>
-          <button type="button" className="modal-close" aria-label={t("actions.close", "Close")} onClick={onClose}>×</button>
-        </div>
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-19:25:
+  This former portal dialog uses the shared FloatingWindow for clamped, persisted desktop and
+  tablet-touch geometry. It explicitly opts into outside pointer-down because its former backdrop
+  closed the dialog; FloatingWindow defaults that behavior off for durable utility windows.
+  */
+  return (
+    <FloatingWindow
+      windowKey="create-room"
+      title={t("createRoom.title", "Create room")}
+      ariaLabel={t("createRoom.title", "Create room")}
+      onClose={onClose}
+      modal
+      hideHeader
+      dragHandleSelector=".modal-header"
+      className="floating-window--create-room"
+      defaultSize={{ width: 640, height: 640 }}
+      minSize={{ width: 360, height: 400 }}
+      persistGeometryKey="floating-window:create-room"
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+      closeOnOutsidePointerDown
+      layer="utility"
+    >
+      <div ref={modalRef} className="modal create-room-modal">
+        {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: Shared dialog chrome; `.modal-header` stays for the drag handle selector. */}
+        <ViewHeader
+          className="modal-header"
+          headingLevel={3}
+          title={t("createRoom.title", "Create room")}
+          onClose={onClose}
+          closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+        />
 
         <div className="form-group create-room-modal-name-group">
           <label htmlFor="create-room-name">{t("createRoom.nameLabel", "Room name")}</label>
@@ -205,9 +266,21 @@ export function CreateRoomModal({ isOpen, onClose, onCreate, projectId, existing
           </div>
         )}
 
+        {/*
+        FNXC:ModalTouchGeometry 2026-07-26-19:25:
+        The picker, not FloatingWindow's body, remains the nested scroll owner so long member
+        lists preserve their independent scroll behavior inside the movable dialog.
+        */}
         <div className="create-room-modal-member-list" data-testid="create-room-member-list">
-          {loadingAgents ? (
+          {/*
+          FNXC:CreateRoomModal 2026-08-16-08:11:
+          Empty copy is meaningful only after the current request has settled. Until then show the
+          loading status, and distinguish a failed request from an actually empty project roster.
+          */}
+          {agentLoadPhase === "idle" || agentLoadPhase === "loading" ? (
             <div className="create-room-modal-empty"><LoadingSpinner label={t("createRoom.loadingAgents", "Loading agents...")} /></div>
+          ) : agentLoadPhase === "failed" ? (
+            <div className="create-room-modal-empty">{t("createRoom.failedLoadAgents", "Failed to load agents.")}</div>
           ) : filteredAgents.length === 0 ? (
             <div className="create-room-modal-empty">
               {agents.length === 0 ? t("createRoom.noAgents", "No agents in this project yet.") : t("createRoom.noMatch", "No agents match your search.")}
@@ -241,7 +314,6 @@ export function CreateRoomModal({ isOpen, onClose, onCreate, projectId, existing
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </FloatingWindow>
   );
 }

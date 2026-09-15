@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync } from "node:fs";
 import type { NodeStatus, OwningNodeHandoffPolicy, Task, TaskStore } from "@fusion/core";
 import { TaskStore as CoreTaskStore } from "@fusion/core";
-import { MeshLeaseManager } from "../../mesh-lease-manager.js";
+import { MeshLeaseManager } from "../../project/mesh-lease-manager.js";
 import { Scheduler } from "../../scheduler.js";
 import { hasGit, hasPg, makePgTaskStore } from "./_helpers.js";
 
@@ -27,11 +27,27 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
+/*
+FNXC:PlanReviewStep 2026-07-26-17:10:
+The default workflow is plan-in-place: a `todo` card releases only after Plan Review passed, so these
+scheduler fixtures model a card that already cleared the gate (the state every real card is in when
+the capacity sweep sees it). Holding an unreviewed card is the gate working — that path is owned by
+`pre-release-plan-review.test.ts`.
+*/
+const PASSED_PLAN_REVIEW = {
+  workflowStepId: "plan-review",
+  workflowStepName: "Plan Review",
+  status: "passed" as const,
+  source: "node" as const,
+  phase: "pre-merge" as const,
+};
+
 function createMockTask(overrides: Partial<Task> = {}): Task {
   return {
     id: "FN-200",
     description: "scheduler handoff",
     column: "todo",
+    workflowStepResults: [PASSED_PLAN_REVIEW],
     dependencies: [],
     steps: [],
     currentStep: 0,
@@ -44,6 +60,7 @@ function createMockTask(overrides: Partial<Task> = {}): Task {
 }
 
 function createMockStore(task: Task, settings: Record<string, unknown> = {}): TaskStore {
+  const moveTask = vi.fn().mockResolvedValue(undefined);
   return {
     listTasks: vi.fn().mockResolvedValue([task]),
     getSettings: vi.fn().mockResolvedValue(settings),
@@ -54,7 +71,18 @@ function createMockStore(task: Task, settings: Record<string, unknown> = {}): Ta
     updateSettings: vi.fn().mockResolvedValue(settings),
     getTask: vi.fn().mockResolvedValue(task),
     updateTask: vi.fn().mockResolvedValue(undefined),
-    moveTask: vi.fn().mockResolvedValue(undefined),
+    moveTask,
+    /*
+    FNXC:EngineTests 2026-07-23-21:20:
+    Scheduler dispatch now goes through the atomic `moveTaskIf` (user-paused dispatch fix, commit 0818fc1da).
+    The fake delegates to the mock `moveTask` after the predicate passes so existing dispatch assertions on `store.moveTask` stay meaningful.
+    */
+    moveTaskIf: vi.fn(async (id: string, column: Task["column"], predicate: (live: Task) => boolean | Promise<boolean>, opts?: Record<string, unknown>) => {
+      if (!(await predicate(task)) || task.column === column) return { task, moved: false };
+      await moveTask(id, column, opts);
+      task.column = column;
+      return { task, moved: true };
+    }),
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
     logEntry: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/tmp/test"),
@@ -67,7 +95,7 @@ function createMockStore(task: Task, settings: Record<string, unknown> = {}): Ta
 function createMockHealthMonitor(statusMap: Record<string, NodeStatus | undefined>) {
   return {
     getNodeHealth: vi.fn((id: string) => statusMap[id]),
-  } as unknown as import("../../node-health-monitor.js").NodeHealthMonitor;
+  } as unknown as import("../../project/node-health-monitor.js").NodeHealthMonitor;
 }
 
 describeIfGit("reliability interactions: owning-node unavailable handoff", () => {
@@ -91,6 +119,7 @@ describeIfGit("reliability interactions: owning-node unavailable handoff", () =>
     const created = await taskStore.createTask({ description: "FN-4813 owning-node handoff" });
     return taskStore.updateTask(created.id, {
       column: "todo",
+      workflowStepResults: [PASSED_PLAN_REVIEW],
       checkedOutBy: "agent-1",
       checkedOutAt: new Date().toISOString(),
       checkoutNodeId: "node-a",

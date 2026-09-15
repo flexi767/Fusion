@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Task } from "@fusion/core";
-import { RestartRecoveryCoordinator } from "../../restart-recovery-coordinator.js";
+import { RestartRecoveryCoordinator } from "../../healing/restart-recovery-coordinator.js";
 
 function task(overrides: Partial<Task>): Task {
   return {
@@ -34,7 +34,10 @@ describe("reliability interactions: auto-revive + watchdog", () => {
     const rc = new RestartRecoveryCoordinator(store, executor);
     await rc.recoverInterruptedRuns();
     expect(store.moveTask).toHaveBeenCalledTimes(1);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-1", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.objectContaining({
+      moveSource: "engine",
+      lifecycleReason: "self-healing-session-recovery",
+    }));
   });
 
   it("Case 8: recovery coordinator skips resume when no in-progress candidates", async () => {
@@ -51,6 +54,9 @@ describe("reliability interactions: auto-revive + watchdog", () => {
     const rc = new RestartRecoveryCoordinator(store, executor);
     await rc.recoverInterruptedRuns();
     expect(store.updateTask).toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith("FN-3", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-3", "todo", expect.objectContaining({
+      moveSource: "engine",
+      lifecycleReason: "self-healing-session-recovery",
+    }));
   });
 });

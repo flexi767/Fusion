@@ -18,6 +18,22 @@ function getMissionMobileSection(css: string): string {
 }
 
 describe("MissionManager mobile styles", () => {
+  it("keeps repair controls touch-sized on feature and generated-fix surfaces", () => {
+    const section = getMissionMobileSection(loadAllAppCss());
+    expect(section).toContain(".mission-feature__actions .mission-icon-btn,");
+    expect(section).toContain(".mission-fix-feature__actions .mission-icon-btn");
+    expect(section).toContain("min-width: 36px;");
+    expect(section).toContain("min-height: 36px;");
+  });
+
+  it("keeps reconcile preview controls touch-sized", () => {
+    const section = getMissionMobileSection(loadAllAppCss());
+    expect(section).toContain('.mission-detail__run-controls > [data-testid="mission-reconcile-now"]');
+    expect(section).toContain(".mission-detail__reconcile-actions .mission-btn");
+    expect(section).toContain("min-width: 36px;");
+    expect(section).toContain("min-height: 36px;");
+  });
+
   it("adds responsive tab and activity layout rules", () => {
     const css = loadAllAppCss();
     const section = getMissionMobileSection(css);
@@ -90,15 +106,14 @@ describe("MissionManager mobile styles", () => {
     expect(section).toContain("display: block;");
   });
 
-  it("keeps the mobile bottom mission CTA full-width and primary-styled", () => {
+  it("keeps the mobile top mission CTA full-width, primary-styled, and tokenized", () => {
     const css = loadAllAppCss();
+    const ctaRule = css.match(/\.mission-list__primary-cta\s*\{[^}]*\}/)?.[0];
 
-    expect(css).not.toContain(".mission-list__top-action");
-
-    const topCtaRule = css.match(/\.mission-list__primary-cta\s*\{[^}]*\}/)?.[0];
-    expect(topCtaRule).toContain("width: 100%;");
-    expect(topCtaRule).toContain("justify-content: center;");
-    expect(topCtaRule).toContain("gap: var(--space-sm);");
+    expect(ctaRule).toContain("width: 100%;");
+    expect(ctaRule).toContain("min-height: calc(var(--space-lg) * 2 + var(--space-sm));");
+    expect(ctaRule).toContain("justify-content: center;");
+    expect(ctaRule).toContain("gap: var(--space-sm);");
   });
 
   it("hides back button on desktop and restores it on mobile", () => {
@@ -161,16 +176,16 @@ describe("desktop two-panel split CSS", () => {
     expect(css).toContain("overflow-y: auto;");
   });
 
-  it("anchors desktop Plan New Mission CTA in a sidebar footer with tokenized height", () => {
+  it("removes obsolete mission CTA wrappers, local rail geometry, and empty-state styling", () => {
     const css = loadAllAppCss();
 
-    const footerRule = css.match(/\.mission-manager__sidebar-footer\s*\{[^}]*\}/)?.[0];
-    expect(footerRule).toContain("border-top: var(--btn-border-width) solid var(--border);");
-
-    const ctaRule = css.match(/\.mission-manager__sidebar-cta\s*\{[^}]*\}/)?.[0];
-    expect(ctaRule).toContain("width: 100%;");
-    expect(ctaRule).toContain("min-height: calc(var(--space-lg) * 2 + var(--space-xs));");
-    expect(ctaRule).toContain("justify-content: center;");
+    expect(css).not.toContain(".mission-manager__sidebar-footer");
+    expect(css).not.toContain(".mission-manager__sidebar-cta-bar");
+    expect(css).not.toContain(".mission-manager__sidebar-cta ");
+    expect(css).not.toContain(".mission-manager__sidebar-resize-handle");
+    expect(css).not.toContain(".mission-list__footer");
+    expect(css).not.toContain(".mission-list__footer-actions");
+    expect(css).not.toContain(".mission-manager__empty-cta");
   });
 
   it("defines split container as flex row", () => {
@@ -242,5 +257,13 @@ describe("Mission view overscroll containment", () => {
 
     expect(bodyRule).toContain("-webkit-overflow-scrolling: touch;");
     expect(eventsRule).toContain("-webkit-overflow-scrolling: touch;");
+  });
+});
+
+describe("MissionManager blocked repair mobile styles", () => {
+  it("keeps the blocked diagnostics usable in stacked layout", () => {
+    const css = loadAllAppCss();
+    expect(css).toContain(".mission-manager__body--stacked .mission-blocked-repair");
+    expect(css).toContain("inline-size: 100%;");
   });
 });

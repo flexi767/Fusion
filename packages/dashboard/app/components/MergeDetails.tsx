@@ -1,7 +1,10 @@
 import { useTranslation } from "react-i18next";
+import { isCompleteColumnRole } from "../utils/columnRoles";
 import type { Task } from "@fusion/core";
 
 interface MergeDetailsProps {
+  /** Resolved column flags for this task, from the tab that renders it. */
+  columnFlags?: Parameters<typeof isCompleteColumnRole>[0];
   task: Task;
 }
 
@@ -10,9 +13,20 @@ function shortSha(sha?: string, t?: (key: string, defaultValue: string) => strin
   return sha.slice(0, 7);
 }
 
-export function MergeDetails({ task }: MergeDetailsProps) {
+/*
+FNXC:TaskDetailSummary 2026-08-29-05:45:
+Summary is the sole task-detail home for landed commit facts and renders this panel last. Keep every
+recorded target, resolution, and no-op field here rather than rebuilding a partial synthetic merge
+report in History or duplicating it beside Changes diffs.
+*/
+export function MergeDetails({ task, columnFlags }: MergeDetailsProps) {
   const { t } = useTranslation("app");
-  if (task.column !== "done" || !task.mergeDetails) {
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-15:20 (batch-dashboard-app):
+  COMPLETE role, resolved. This panel shows the merge commit for finished work; keyed on the literal
+  it rendered NOTHING on a renamed board, so an operator could not see what had actually landed.
+  */
+  if (!isCompleteColumnRole(columnFlags, task.column) || !task.mergeDetails) {
     return null;
   }
 
@@ -61,6 +75,38 @@ export function MergeDetails({ task }: MergeDetailsProps) {
             <div className="detail-log-header">
               <span className="detail-log-action">{t("merge.mergedAt", "Merged at")}</span>
               <span className="detail-log-outcome">{new Date(details.mergedAt).toLocaleString()}</span>
+            </div>
+          </div>
+        ) : null}
+        {details.mergeTargetBranch ? (
+          <div className="detail-log-entry">
+            <div className="detail-log-header">
+              <span className="detail-log-action">{t("merge.targetBranch", "Target branch")}</span>
+              <span className="detail-log-outcome">{details.mergeTargetBranch}</span>
+            </div>
+          </div>
+        ) : null}
+        {details.resolutionStrategy ? (
+          <div className="detail-log-entry">
+            <div className="detail-log-header">
+              <span className="detail-log-action">{t("merge.strategy", "Strategy")}</span>
+              <span className="detail-log-outcome">{details.resolutionStrategy}</span>
+            </div>
+          </div>
+        ) : null}
+        {details.resolutionMethod ? (
+          <div className="detail-log-entry">
+            <div className="detail-log-header">
+              <span className="detail-log-action">{t("merge.method", "Method")}</span>
+              <span className="detail-log-outcome">{details.resolutionMethod}</span>
+            </div>
+          </div>
+        ) : null}
+        {details.noOpReason ? (
+          <div className="detail-log-entry">
+            <div className="detail-log-header">
+              <span className="detail-log-action">{t("merge.noOpReason", "No-op reason")}</span>
+              <span className="detail-log-outcome">{details.noOpReason}</span>
             </div>
           </div>
         ) : null}

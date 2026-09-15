@@ -20,14 +20,30 @@ describe("TaskDetailModal CSS contract", () => {
     expect(css).toMatch(/\.detail-source-header\s*\{[^}]*align-items\s*:\s*flex-start\s*;/);
   });
 
+  it("garde la barre d'onglets plane et matérialise uniquement la sélection", async () => {
+    const css = await loadAllAppCssBaseOnly();
+    const strip = getCssRuleBlock(css, '[data-alpha-surface="true"] .detail-tabs');
+    const tab = getCssRuleBlock(css, '[data-alpha-surface="true"] .detail-tab');
+    const active = getCssRuleBlock(css, '[data-alpha-surface="true"] .detail-tab-active');
+
+    expect(strip).toContain("border: 0;");
+    expect(strip).toContain("background: transparent;");
+    expect(tab).toContain("background: transparent !important;");
+    expect(active).toContain("border-block-end-color: var(--alpha-accent-background);");
+    expect(active).not.toContain("background: var(--alpha-neutral-foreground)");
+  });
+
   it("FN-5879/FN-6864 keeps the base detail tab strip horizontally scrollable and touch-pannable without shrinking tabs", async () => {
     const css = await loadAllAppCssBaseOnly();
 
     expect(css).toMatch(/\.detail-tabs\s*\{[^}]*overflow-x\s*:\s*auto\s*;/);
     expect(css).toMatch(/\.detail-tabs\s*\{[^}]*touch-action\s*:\s*pan-x\s+pan-y\s*;/);
     expect(css).toMatch(/\.detail-tab\s*\{[^}]*flex-shrink\s*:\s*0\s*;/);
+    expect(css).toMatch(/\.detail-tabs\.is-mouse-panning[\s\S]*?cursor\s*:\s*grabbing\s*!important\s*;/);
+    expect(css).toMatch(/\.detail-tabs\.is-mouse-panning[\s\S]*?user-select\s*:\s*none\s*;/);
   });
 
+  /* FNXC:TaskDetailPadding 2026-09-12-03:19: The active tab now renders directly in the single `.detail-body` scroller, which owns the canonical inset without a generic child wrapper. */
   it("FN-7408 keeps task-detail tab body padding canonical across Activity, planner Chat, and Plan surfaces", async () => {
     const css = await loadAllAppCssBaseOnly();
     const detailBodyBlock = getCssRuleBlock(css, ".detail-body");
@@ -44,14 +60,35 @@ describe("TaskDetailModal CSS contract", () => {
     expect(planBlock).toContain("max-width: 100%;");
   });
 
+  it("FN-8787 uses a reduced shared title inset while preserving task-detail side and bottom insets on desktop and mobile", async () => {
+    const baseCss = await loadAllAppCssBaseOnly();
+    const css = await loadAllAppCss();
+    const baseDetailBodyBlock = getCssRuleBlock(baseCss, ".detail-body");
+    const taskDetailCss = css.slice(css.indexOf("/* === Detail Modal === */"));
+    const mobileCss = taskDetailCss.slice(taskDetailCss.indexOf("@media (max-width: 768px)"));
+    const mobileDetailBodyBlock = getCssRuleBlock(mobileCss, ".detail-body");
+    const basePadding = "padding: calc(var(--space-lg) + var(--space-xs));";
+    const mobilePadding = "padding: calc(var(--space-md) + var(--space-xs) / 2);";
+
+    expect(baseDetailBodyBlock).toContain(basePadding);
+    expect(baseDetailBodyBlock).toContain("padding-block-start: var(--space-md);");
+    expect(baseDetailBodyBlock.indexOf(basePadding)).toBeLessThan(
+      baseDetailBodyBlock.indexOf("padding-block-start: var(--space-md);"),
+    );
+    expect(mobileDetailBodyBlock).toContain(mobilePadding);
+    expect(mobileDetailBodyBlock).toContain("padding-block-start: var(--space-sm);");
+    expect(mobileDetailBodyBlock.indexOf(mobilePadding)).toBeLessThan(
+      mobileDetailBodyBlock.indexOf("padding-block-start: var(--space-sm);"),
+    );
+  });
+
   /*
-  FNXC:TaskDetailActivity 2026-07-18-07:25:
-  FN-8166 zeroed mobile `.detail-activity` padding-inline-end (equal insets from
-  `.detail-body`); overlay clearance lives only on first-row selectors. Keep the
-  contract aligned with TaskDetailModal.css so full-suite does not assert the
-  pre-8166 `var(--space-md)` residual inset.
+  FNXC:TaskDetailActivity 2026-07-27-02:15:
+  FN-8624 extends FN-8166's symmetric Activity container inset from mobile to
+  desktop and tablet. Only possible overlay-covered first rows may reserve tokenized
+  clearance, so modal, pop-out, and embedded task-detail renders share this CSS contract.
   */
-  it("FN-8154 keeps the mobile Feed inset narrow while clearing its overlay toggle from first rows", async () => {
+  it("FN-8624 keeps Activity container insets symmetric while clearing the overlay from first rows", async () => {
     const css = await loadAllAppCss();
     const baseCss = await loadAllAppCssBaseOnly();
     const mobileCss = css.slice(css.indexOf("@media (max-width: 768px)"));
@@ -63,13 +100,13 @@ describe("TaskDetailModal CSS contract", () => {
       ".detail-activity:not(.detail-activity--interventions) > .detail-activity-list > .detail-log-entry:first-child",
     ];
 
-    expect(baseCss).toContain(".detail-activity {\n  position: relative;\n  padding-inline-end: calc(var(--space-2xl) + var(--space-md));\n}");
-    expect(mobileCss).toContain("  .detail-activity {\n    padding-inline-end: 0;\n  }");
-    expect(mobileCss).not.toContain("  .detail-activity {\n    padding-inline-end: calc(var(--space-2xl) + var(--space-lg));\n  }");
-    expect(mobileCss).not.toContain("  .detail-activity {\n    padding-inline-end: var(--space-md);\n  }");
-    expect(mobileCss).toContain("  .detail-activity--interventions {\n    padding-inline-end: 0;\n  }");
+    expect(baseCss).toContain(".detail-activity {\n  position: relative;\n  padding-inline-end: 0;\n}");
+    expect(baseCss).toContain(".detail-activity--interventions {\n  padding-inline-end: 0;\n}");
+    expect(baseCss).not.toContain(".detail-activity {\n  position: relative;\n  padding-inline-end: calc(var(--space-2xl) + var(--space-md));\n}");
+    expect(mobileCss).not.toContain("  .detail-activity {\n    padding-inline-end:");
     for (const selector of firstRowSelectors) {
       const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      expect(baseCss, selector).toMatch(new RegExp(`${escapedSelector}(?:\\s*,\\s*[^{}]+)*\\s*\\{[^}]*padding-inline-end: calc\\(var\\(--space-2xl\\) \\+ var\\(--space-md\\)\\);`));
       expect(mobileCss, selector).toMatch(new RegExp(`${escapedSelector}(?:\\s*,\\s*[^{}]+)*\\s*\\{[^}]*padding-inline-end: calc\\(var\\(--space-2xl\\) \\+ var\\(--space-sm\\)\\);`));
     }
   });

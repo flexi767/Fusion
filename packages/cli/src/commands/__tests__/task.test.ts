@@ -1,5 +1,28 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+/*
+FNXC:CliQuietMode 2026-07-25-09:05:
+Task create/link success lines use `result()` so they survive quiet mode.
+Capture that seam for assertions that previously spied console.log.
+*/
+const resultSpy = vi.hoisted(() => vi.fn());
+const requiredTaskStoreCapabilities = vi.hoisted(() => () => ({
+  getSettings: vi.fn().mockResolvedValue({}),
+  getGlobalSettingsStore: vi.fn().mockReturnValue({
+    getSettings: vi.fn().mockResolvedValue({}),
+  }),
+  resetTerminalFailureAutoRecoveryBudget: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../../output.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../output.js")>();
+  return {
+    ...actual,
+    result: (text: string) => {
+      resultSpy(text);
+    },
+  };
+});
+
 // Mock node:readline/promises before importing the module under test
 vi.mock("node:readline/promises", () => ({
   createInterface: vi.fn(),
@@ -51,7 +74,13 @@ vi.mock("@fusion/core", async (importActual) => {
   const taskStoreMockImplementation = TaskStoreMock.mockImplementation.bind(TaskStoreMock);
   TaskStoreMock.mockImplementation = ((impl: (...args: any[]) => unknown) =>
     taskStoreMockImplementation(function (this: unknown, ...args: any[]) {
-      return impl(...args);
+      const instance = impl(...args);
+      if (typeof instance === "object" && instance !== null) {
+        for (const [name, capability] of Object.entries(requiredTaskStoreCapabilities())) {
+          if (!(name in instance)) Object.assign(instance, { [name]: capability });
+        }
+      }
+      return instance;
     })) as typeof TaskStoreMock.mockImplementation;
 
   const CentralCoreMock = vi.fn(function () {});
@@ -97,10 +126,15 @@ vi.mock("@fusion/core", async (importActual) => {
 
 // Mock @fusion/engine
 vi.mock("@fusion/engine", () => ({
-  installBaselineArchiveWorktreeDisposer: vi.fn(),
   aiMergeTask: vi.fn(),
   runAiMerge: vi.fn(),
   landWorkspaceTask: vi.fn(),
+  admitTaskToWip: vi.fn(),
+  isFirstPlanningToWipAdmission: vi.fn(() => false),
+  planTaskWorktreePath: vi.fn(),
+  withWorkspaceMergeDispatchLease: vi.fn(async (_store: unknown, _taskId: string, body: (handle?: unknown) => unknown) => body(undefined)),
+  clearOwnedMergeStamp: vi.fn().mockResolvedValue(false),
+  reconcileUnownedStaleMergeStamp: vi.fn().mockResolvedValue(false),
   // FNXC:CliTests 2026-07-12-07:10: task.ts imports isInReviewMissingWorktreeSessionStartFailure from @fusion/engine (FN-7798 in-review stale worktree guard); the hand-written engine mock must surface it.
   isInReviewMissingWorktreeSessionStartFailure: vi.fn(() => false),
 }));
@@ -131,6 +165,21 @@ vi.mock("@fusion/dashboard", () => ({
 vi.mock("@fusion/dashboard/planning", () => ({
   createSession: vi.fn(),
   submitResponse: vi.fn(),
+  // 0412113de: fn task plan now ensures a durable planning-session store
+  // before creating the session so resume is honestly reported.
+  ensureDurablePlanningSessionStore: vi.fn(async () => true),
+  // fdd120232: fn task plan creates through the claim-aware shared path
+  // (idempotency + session linkage) instead of a raw store.createTask.
+  createTaskFromPlanSession: vi.fn(async () => ({
+    task: {
+      id: "FN-042",
+      title: "planned task",
+      description: "planned task",
+      column: "triage",
+      dependencies: [],
+    },
+    alreadyCreated: false,
+  })),
   RateLimitError: class RateLimitError extends Error {},
   SessionNotFoundError: class SessionNotFoundError extends Error {},
   InvalidSessionStateError: class InvalidSessionStateError extends Error {},
@@ -153,9 +202,25 @@ vi.mock("@fusion/core/gh-cli", () => ({
 }));
 
 // Mock project-context
-vi.mock("../../project-context.js", () => ({
+vi.mock("../../project-context.js", () => {
+  const resolveProjectMock = vi.fn();
+  const withRequiredStoreCapabilities = (context: any) => {
+    for (const [name, capability] of Object.entries(requiredTaskStoreCapabilities())) {
+      if (!(name in context.store)) Object.assign(context.store, { [name]: capability });
+    }
+    return context;
+  };
+  const mockResolvedValue = resolveProjectMock.mockResolvedValue.bind(resolveProjectMock);
+  const mockResolvedValueOnce = resolveProjectMock.mockResolvedValueOnce.bind(resolveProjectMock);
+  resolveProjectMock.mockResolvedValue = ((context: any) =>
+    mockResolvedValue(withRequiredStoreCapabilities(context))) as typeof resolveProjectMock.mockResolvedValue;
+  resolveProjectMock.mockResolvedValueOnce = ((context: any) =>
+    mockResolvedValueOnce(withRequiredStoreCapabilities(context))) as typeof resolveProjectMock.mockResolvedValueOnce;
+  resolveProjectMock.mockRejectedValue(new Error("No project context"));
+
+  return {
   resolveProjectPathOnly: vi.fn(async () => process.cwd()),
-  resolveProject: vi.fn().mockRejectedValue(new Error("No project context")),
+  resolveProject: resolveProjectMock,
   getStore: vi.fn().mockResolvedValue({}),
   getDefaultProject: vi.fn().mockResolvedValue(undefined),
   setDefaultProject: vi.fn().mockResolvedValue(undefined),
@@ -191,13 +256,14 @@ vi.mock("../../project-context.js", () => ({
     isRegistered: false,
     store,
   })),
-}));
+  };
+});
 
 import { createInterface } from "node:readline/promises";
-import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate } from "@fusion/core";
+import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, MAX_TASK_MESSAGE_LENGTH, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate } from "@fusion/core";
 import { watchFile, unwatchFile, statSync, existsSync, readFileSync } from "node:fs";
 import { exec } from "node:child_process";
-import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskArchive, runTaskUnarchive, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, type LogsOptions } from "../task.js";
+import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, type LogsOptions } from "../task.js";
 import {
   getCurrentRepo,
   isGhAuthenticated,
@@ -207,7 +273,7 @@ import {
 import { GitHubClient, generatePrMetadata, isGitHubIssueAlreadyImported } from "@fusion/dashboard";
 import { createSession, submitResponse } from "@fusion/dashboard/planning";
 import { resolveProject, createLocalStore } from "../../project-context.js";
-import { aiMergeTask, runAiMerge, landWorkspaceTask } from "@fusion/engine";
+import { admitTaskToWip, aiMergeTask, isFirstPlanningToWipAdmission, planTaskWorktreePath, runAiMerge, landWorkspaceTask, reconcileUnownedStaleMergeStamp, clearOwnedMergeStamp } from "@fusion/engine";
 
 const mockedExec = vi.mocked(exec);
 
@@ -228,6 +294,8 @@ function makeTask(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(isFirstPlanningToWipAdmission).mockReturnValue(false);
+  vi.mocked(admitTaskToWip).mockReset();
   vi.mocked(resolveProject).mockRejectedValue(new Error("No project context"));
   vi.mocked(runDeterministicDuplicateGuard).mockResolvedValue({
     action: "proceed",
@@ -486,7 +554,7 @@ describe("task node overrides", () => {
     const updateTask = vi.fn().mockResolvedValue(makeTask({ nodeId: "node-123" }));
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: vi.fn().mockResolvedValue(makeTask({ id: "FN-900", column: "triage" })),
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: vi.fn().mockResolvedValue(makeTask({ id: "FN-900", column: "triage" })),
       updateTask,
     }));
     (CentralCore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
@@ -506,6 +574,13 @@ vi.mock("node:fs/promises", () => ({
   readFile: vi.fn(),
 }));
 
+/*
+FNXC:OriginWorkflowSelection 2026-08-15-01:12:
+Every partial TaskStore mock below stubs `resolveOriginWorkflowOverrideId`; the central constructor and project-context wrappers also preserve the global-settings and retry-budget capabilities now required by CLI creation and manual retry. `undefined` keeps the unchanged project-default workflow path.
+
+FNXC:CliTests 2026-08-15-01:12:
+CLI create fixture assertions must include `{ invokeTaskCreatedHook: false }`; the command synchronously owns post-create tracking work and suppresses the deferred store hook to avoid duplicate or lost issue creation.
+*/
 describe("project-aware task command behavior", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -601,7 +676,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, addAttachment: mockAddAttachment, getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, addAttachment: mockAddAttachment, getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("test task", undefined, undefined, "demo-project");
@@ -611,7 +686,7 @@ describe("project-aware task command behavior", () => {
       description: "test task",
       dependencies: undefined,
       source: { sourceType: "cli", sourceMetadata: { contentFingerprint: "fp-1" } },
-    });
+    }, { invokeTaskCreatedHook: false });
     expect(logSpy.mock.calls.some((call) => String(call[0]).includes("Project: demo-project"))).toBe(true);
 
     logSpy.mockRestore();
@@ -627,13 +702,16 @@ describe("project-aware task command behavior", () => {
       projectPath: "/default/project",
       projectName: "default-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/default/project") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/default/project") } as unknown as TaskStore,
     });
 
     await runTaskCreate("default task");
 
     expect(resolveProject).toHaveBeenCalledWith(undefined);
-    expect(mockCreateTask).toHaveBeenCalledWith({ description: "default task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: undefined } });
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      { description: "default task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: undefined } },
+      { invokeTaskCreatedHook: false },
+    );
   });
 
   it("runTaskCreate without project flag falls back to TaskStore(process.cwd()) when resolution fails", async () => {
@@ -649,8 +727,9 @@ describe("project-aware task command behavior", () => {
     );
 
     vi.mocked(createLocalStore).mockResolvedValueOnce({
+      ...requiredTaskStoreCapabilities(),
       init,
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       addAttachment: vi.fn(),
       getRootDir: vi.fn().mockReturnValue("/current/project"),
       projectPath: "/current/project",
@@ -660,14 +739,17 @@ describe("project-aware task command behavior", () => {
 
     expect(resolveProject).toHaveBeenCalledWith(undefined);
     expect(createLocalStore).toHaveBeenCalledWith("/current/project");
-    expect(mockCreateTask).toHaveBeenCalledWith({ description: "local task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: { contentFingerprint: "fp-local" } } });
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      { description: "local task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: { contentFingerprint: "fp-local" } } },
+      { invokeTaskCreatedHook: false },
+    );
     cwdSpy.mockRestore();
   });
 
   it("runTaskCreate links existing task on deterministic duplicate", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const existing = makeTask({ id: "FN-777", description: "same task", column: "todo" });
     const mockCreateTask = vi.fn();
+    resultSpy.mockClear();
 
     vi.mocked(runDeterministicDuplicateGuard).mockResolvedValue({
       action: "duplicate",
@@ -681,14 +763,13 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("same task");
 
     expect(mockCreateTask).not.toHaveBeenCalled();
-    expect(logSpy.mock.calls.some((call) => String(call[0]).includes("Linked existing FN-777"))).toBe(true);
-    logSpy.mockRestore();
+    expect(resultSpy.mock.calls.some((call) => String(call[0]).includes("Linked existing FN-777"))).toBe(true);
   });
 
   it("runTaskCreate proceeds when no high-signal tokens are present", async () => {
@@ -700,7 +781,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("plain task");
@@ -739,7 +820,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await expect(runTaskCreate("Investigate /pr/options /pr/preflight flow")).rejects.toThrow("exit:1");
@@ -787,18 +868,21 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("Investigate /pr/options /pr/preflight flow");
 
-    expect(mockCreateTask).toHaveBeenCalledWith(expect.objectContaining({
-      source: expect.objectContaining({
-        sourceMetadata: expect.objectContaining({
-          intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({
+          sourceMetadata: expect.objectContaining({
+            intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+          }),
         }),
       }),
-    }));
+      { invokeTaskCreatedHook: false },
+    );
     expect(close).toHaveBeenCalled();
 
     Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: originalInTTY });
@@ -837,7 +921,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await expect(runTaskCreate("Investigate /pr/options /pr/preflight flow")).rejects.toThrow("exit:0");
@@ -869,7 +953,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks: vi.fn(), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks: vi.fn(), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("same task", undefined, undefined, undefined, undefined, true);
@@ -877,14 +961,17 @@ describe("project-aware task command behavior", () => {
     expect(runDeterministicDuplicateGuard).toHaveBeenCalledWith(expect.anything(), { description: "same task" }, expect.objectContaining({ bypass: true }));
     expect(findNearDuplicates).not.toHaveBeenCalled();
     expect(extractIntentSignature).toHaveBeenCalledWith({ description: "same task" });
-    expect(mockCreateTask).toHaveBeenCalledWith(expect.objectContaining({
-      source: expect.objectContaining({
-        sourceMetadata: expect.objectContaining({
-          contentFingerprint: "fp-no-dedup",
-          intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({
+          sourceMetadata: expect.objectContaining({
+            contentFingerprint: "fp-no-dedup",
+            intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+          }),
         }),
       }),
-    }));
+      { invokeTaskCreatedHook: false },
+    );
   });
 
   it("runTaskCreate fails open when listTasks throws during near-duplicate checking", async () => {
@@ -902,7 +989,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks: vi.fn().mockRejectedValue(new Error("list boom")), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks: vi.fn().mockRejectedValue(new Error("list boom")), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("Investigate /pr/options /pr/preflight flow");
@@ -924,7 +1011,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, listTasks: vi.fn(), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, listTasks: vi.fn(), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("Investigate /pr/options /pr/preflight flow");
@@ -949,7 +1036,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: vi.fn(), listTasks: vi.fn(), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: vi.fn(), listTasks: vi.fn(), addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("same task");
@@ -976,7 +1063,7 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { createTask: mockCreateTask, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
+      store: { resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask, addAttachment: vi.fn(), getRootDir: vi.fn().mockReturnValue("/test") } as unknown as TaskStore,
     });
 
     await runTaskCreate("task a");
@@ -1070,7 +1157,7 @@ describe("project-aware task command behavior", () => {
     };
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
     }));
     vi.mocked(resolveProject).mockResolvedValue({
       projectId: "proj_test",
@@ -1078,7 +1165,7 @@ describe("project-aware task command behavior", () => {
       projectName: "demo-project",
       isRegistered: true,
       store: {
-        createTask: mockCreateTask,
+        resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       } as unknown as TaskStore,
     });
     vi.mocked(createSession).mockResolvedValue({
@@ -1126,6 +1213,7 @@ describe("project-aware task command behavior", () => {
   });
 
   it("runTaskMove uses resolved project store when project name is provided", async () => {
+    const current = makeTask({ id: "FN-123", column: "review" });
     const mockMoveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "done" }));
 
     vi.mocked(resolveProject).mockResolvedValue({
@@ -1133,13 +1221,164 @@ describe("project-aware task command behavior", () => {
       projectPath: "/test",
       projectName: "demo-project",
       isRegistered: true,
-      store: { moveTask: mockMoveTask } as unknown as TaskStore,
+      store: {
+        getTask: vi.fn().mockResolvedValue(current),
+        getTaskWorkflowSelection: vi.fn(() => undefined),
+        moveTask: mockMoveTask,
+      } as unknown as TaskStore,
     });
 
     await runTaskMove("FN-123", "done", "demo-project");
 
     expect(resolveProject).toHaveBeenCalledWith("demo-project");
-    expect(mockMoveTask).toHaveBeenCalledWith("FN-123", "done");
+    // FNXC:TaskMovement 2026-07-26-12:35: `fn task move` is a human board action and
+    // must carry the user move source so user-move semantics (hard cancel) apply.
+    expect(mockMoveTask).toHaveBeenCalledWith("FN-123", "done", { moveSource: "user" });
+  });
+
+  it("routes a legacy-named custom WIP column through premise admission", async () => {
+    const current = makeTask({ id: "FN-375-C", column: "planning" });
+    const moved = makeTask({ id: current.id, column: "review" });
+    const moveTask = vi.fn();
+    const store = {
+      getTask: vi.fn().mockResolvedValue(current),
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "custom-legacy-wip", stepIds: [] })),
+      getWorkflowDefinition: vi.fn().mockResolvedValue({
+        id: "custom-legacy-wip",
+        ir: {
+          version: "v2",
+          columns: [
+            { id: "planning", name: "Planning", traits: [{ trait: "hold", config: { release: "manual" } }] },
+            { id: "review", name: "Build", traits: [{ trait: "wip" }] },
+          ],
+          nodes: [],
+          edges: [],
+        },
+      }),
+      getSettings: vi.fn().mockResolvedValue({}),
+      getRootDir: vi.fn(() => "/test"),
+      moveTask,
+    };
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
+      store: store as unknown as TaskStore,
+    });
+    vi.mocked(isFirstPlanningToWipAdmission).mockReturnValue(true);
+    vi.mocked(admitTaskToWip).mockResolvedValue({ released: true, task: moved } as never);
+
+    await runTaskMove(current.id, "review", "demo-project");
+
+    expect(admitTaskToWip).toHaveBeenCalledWith(
+      store,
+      expect.objectContaining({ now: expect.any(Function), allocateWorktree: expect.any(Function) }),
+      current,
+      "review",
+      expect.objectContaining({ version: "v2" }),
+      expect.objectContaining({ expectedColumn: "planning", moveSource: "user", workflowMoveSource: "cli-plan-premise-release" }),
+    );
+    expect(moveTask).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before move or allocation when a selected workflow definition is unavailable", async () => {
+    const current = makeTask({ id: "FN-375-U", column: "planning" });
+    const moveTask = vi.fn();
+    const getSettings = vi.fn().mockResolvedValue({});
+    const store = {
+      getTask: vi.fn().mockResolvedValue(current),
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "custom-unavailable", stepIds: [] })),
+      getWorkflowDefinition: vi.fn().mockRejectedValue(new Error("temporary definition read failure")),
+      getSettings,
+      getRootDir: vi.fn(() => "/test"),
+      moveTask,
+    };
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
+      store: store as unknown as TaskStore,
+    });
+
+    await expect(runTaskMove(current.id, "review", "demo-project")).rejects.toThrow(
+      "The task workflow is temporarily unavailable. Retry this move.",
+    );
+
+    expect(moveTask).not.toHaveBeenCalled();
+    expect(admitTaskToWip).not.toHaveBeenCalled();
+    expect(getSettings).not.toHaveBeenCalled();
+    expect(planTaskWorktreePath).not.toHaveBeenCalled();
+  });
+
+  it("does not raw-move when canonical premise admission rejects a stale plan", async () => {
+    const current = makeTask({ id: "FN-375-S", column: "specified" });
+    const moveTask = vi.fn();
+    const store = {
+      getTask: vi.fn().mockResolvedValue(current),
+      getTaskWorkflowSelection: vi.fn(() => undefined),
+      getWorkflowDefinition: vi.fn(),
+      getSettings: vi.fn().mockResolvedValue({}),
+      getRootDir: vi.fn(() => "/test"),
+      moveTask,
+    };
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
+      store: store as unknown as TaskStore,
+    });
+    vi.mocked(isFirstPlanningToWipAdmission).mockReturnValue(true);
+    vi.mocked(admitTaskToWip).mockResolvedValue({
+      released: false,
+      task: current,
+      rejection: "plan-premise-stale",
+      detail: "Plan premise is no longer true",
+    } as never);
+
+    await expect(runTaskMove(current.id, "in-progress", "demo-project")).rejects.toThrow("Plan premise is no longer true");
+
+    expect(admitTaskToWip).toHaveBeenCalledOnce();
+    expect(moveTask).not.toHaveBeenCalled();
+  });
+
+  it("runTaskMove passes the user source through to the task-move disposer seam (hard cancel)", async () => {
+    /*
+    FNXC:TaskMovement 2026-07-26-12:35:
+    Regression coverage for the moveSource hard-cancel gap: only user-source
+    in-progress → todo moves run disposeTaskBeforeMove. The fake store forwards
+    the CLI-provided moveSource into the REAL core disposer seam (the from/todo
+    columns are pinned by the harness because this file's @fusion/core mock
+    replaces COLUMNS with a fixture list that has no "todo"), so this fails if
+    runTaskMove ever drops `moveSource: "user"` again — the disposer would not
+    fire and the agent session would keep running behind a Todo card.
+    */
+    const { disposeTaskBeforeMove, registerTaskMoveDisposer } = await import("@fusion/core");
+    const disposer = vi.fn().mockResolvedValue(undefined);
+    const fakeStore = {
+      getTask: vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "in-progress" })),
+      getTaskWorkflowSelection: vi.fn(() => undefined),
+      moveTask: vi.fn(
+        async (id: string, column: string, options?: { moveSource?: "user" | "engine" | "scheduler" }) => {
+          const task = makeTask({ id, column: "in-progress" });
+          await disposeTaskBeforeMove(fakeStore as unknown as TaskStore, {
+            task: task as never,
+            from: "in-progress",
+            to: "todo",
+            // Mirrors moves.ts: an absent moveSource defaults to "engine".
+            source: options?.moveSource ?? "engine",
+          });
+          return makeTask({ id, column });
+        },
+      ),
+    };
+    registerTaskMoveDisposer(fakeStore as unknown as TaskStore, disposer);
+
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: fakeStore as unknown as TaskStore,
+    });
+
+    await runTaskMove("FN-123", "done", "demo-project");
+
+    expect(disposer).toHaveBeenCalledOnce();
+    expect(disposer).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-123" }));
   });
 
   it("runTaskAttach uses resolved project store when project name is provided", async () => {
@@ -1180,27 +1419,8 @@ describe("project-aware task command behavior", () => {
     await runTaskPause("FN-123", "demo-project");
     await runTaskUnpause("FN-123", "demo-project");
 
-    expect(pauseTask).toHaveBeenNthCalledWith(1, "FN-123", true);
+    expect(pauseTask).toHaveBeenNthCalledWith(1, "FN-123", true, undefined, { userPaused: true });
     expect(pauseTask).toHaveBeenNthCalledWith(2, "FN-123", false);
-  });
-
-  it("runTaskArchive and runTaskUnarchive use resolved project store", async () => {
-    const archiveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "archived" }));
-    const unarchiveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "done" }));
-
-    vi.mocked(resolveProject).mockResolvedValue({
-      projectId: "proj_test",
-      projectPath: "/test",
-      projectName: "demo-project",
-      isRegistered: true,
-      store: { archiveTask, unarchiveTask } as unknown as TaskStore,
-    });
-
-    await runTaskArchive("FN-123", "demo-project");
-    await runTaskUnarchive("FN-123", "demo-project");
-
-    expect(archiveTask).toHaveBeenCalledWith("FN-123");
-    expect(unarchiveTask).toHaveBeenCalledWith("FN-123");
   });
 
   it("runTaskRetry uses resolved project store", async () => {
@@ -1311,20 +1531,231 @@ describe("project-aware task command behavior", () => {
     expect(logEntry).toHaveBeenCalled();
     // FNXC:GrokCliRouting 2026-07-15-10:17: bare `fn task merge` has no ProjectEngine and does not invent a PluginRunner.
     expect(runAiMerge).toHaveBeenCalledWith(
-      resolvedStore,
+      expect.any(Object),
       "/test",
       "FN-123",
       expect.objectContaining({
         onAgentText: expect.any(Function),
+        signal: expect.any(AbortSignal),
       }),
     );
     const mergeOpts = vi.mocked(runAiMerge).mock.calls.at(-1)?.[3] as { pluginRunner?: unknown } | undefined;
     expect(mergeOpts?.pluginRunner).toBeUndefined();
     expect(landWorkspaceTask).not.toHaveBeenCalled();
     expect(aiMergeTask).not.toHaveBeenCalled();
+    expect(reconcileUnownedStaleMergeStamp).toHaveBeenCalledWith(resolvedStore, "FN-123");
+    expect(process.listenerCount("SIGINT")).toBe(0);
+    expect(process.listenerCount("SIGTERM")).toBe(0);
+    expect(process.listenerCount("SIGHUP")).toBe(0);
     expect(exitSpy).not.toHaveBeenCalled();
     expect(duplicateTask).toHaveBeenCalledWith("FN-123");
     expect(refineTask).toHaveBeenCalledWith("FN-123", "more tests");
+  });
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+    ["SIGHUP", 129],
+  ] as const)("%s aborts the body, clears its owned stamp, and keeps the signal exit", async (signal, exitCode) => {
+    const task = makeTask({ id: `FN-${signal}`, column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockImplementation(async () => task);
+    const updateTask = vi.fn().mockImplementation(async (_id: string, patch: { status?: string | null }) => {
+      if (patch.status !== undefined) task.status = patch.status;
+    });
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, updateTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    // Model the helper's independently tested authorization-B mutation so this door test
+    // proves the command wires its abort, cleanup, close, and exit paths together.
+    vi.mocked(clearOwnedMergeStamp).mockImplementation(async () => {
+      task.status = null;
+      return true;
+    });
+    let bodySignal: AbortSignal | undefined;
+    vi.mocked(runAiMerge).mockImplementation((async (_store, _path, taskId, options) => {
+      // A completed local transient write is the authorization-B proof required before cleanup.
+      await _store.updateTask(taskId, { status: "merging" });
+      return await new Promise((_resolve, reject) => {
+        bodySignal = options.signal;
+        options.signal?.addEventListener("abort", () => reject(new Error("merge aborted")), { once: true });
+      });
+    }) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    const pending = runTaskMerge(task.id, "demo-project");
+    await vi.waitFor(() => expect(process.listenerCount(signal)).toBeGreaterThan(0));
+    process.emit(signal, signal);
+    // A terminal close arriving after Ctrl-C (or vice versa) must share the same cleanup.
+    process.emit("SIGHUP", "SIGHUP");
+    await pending;
+
+    expect(bodySignal?.aborted).toBe(true);
+    expect(task.status).toBeNull();
+    expect(clearOwnedMergeStamp).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(exitCode);
+    expect(process.listenerCount(signal)).toBe(0);
+    exitSpy.mockRestore();
+  });
+
+  it("does not clear a stamp it never wrote when a merge body rejects before claiming", async () => {
+    const task = makeTask({ id: "FN-MERGE-ERROR", column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockImplementation(async () => task);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(runAiMerge).mockRejectedValue(new Error("merge failed"));
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as unknown) as (code?: string | number | null | undefined) => never);
+
+    await expect(runTaskMerge(task.id, "demo-project")).rejects.toThrow("process.exit:1");
+
+    expect(task.status).toBe("merging");
+    expect(clearOwnedMergeStamp).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalled();
+    exitSpy.mockRestore();
+  });
+
+  it("waits for the owned clear before signal exit", async () => {
+    const task = makeTask({ id: "FN-CLEAR-ORDER", column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockResolvedValue(task);
+    const updateTask = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, updateTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    let resolveClear!: () => void;
+    vi.mocked(clearOwnedMergeStamp).mockImplementation(() => new Promise<boolean>((resolve) => {
+      resolveClear = () => resolve(true);
+    }));
+    vi.mocked(runAiMerge).mockImplementation((async (candidateStore, _path, taskId, options) => {
+      await candidateStore.updateTask(taskId, { status: "merging" });
+      return await new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("merge aborted")), { once: true });
+      });
+    }) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    const pending = runTaskMerge(task.id, "demo-project");
+    await vi.waitFor(() => expect(process.listenerCount("SIGINT")).toBeGreaterThan(0));
+    process.emit("SIGINT", "SIGINT");
+    await vi.waitFor(() => expect(clearOwnedMergeStamp).toHaveBeenCalledOnce());
+    expect(exitSpy).not.toHaveBeenCalled();
+    resolveClear();
+    await pending;
+
+    expect(exitSpy).toHaveBeenCalledWith(130);
+    exitSpy.mockRestore();
+  });
+
+  it.each([
+    ["clears aged residue", "merging", 6 * 60_000, true],
+    ["preserves fresh residue", "merging", 60_000, false],
+    ["does nothing for a clean row", null, 0, false],
+  ])("%s through the manual-door pre-claim reconcile", async (_label, status, ageMs, shouldClear) => {
+    const task = makeTask({
+      id: `FN-PRECLAIM-${String(status ?? "clean")}`,
+      column: "in-review",
+      status,
+      updatedAt: new Date(Date.now() - ageMs).toISOString(),
+    });
+    const getTask = vi.fn().mockResolvedValue(task);
+    const resolvedStore = { getTask } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockImplementation(async (candidateStore) => {
+      expect(candidateStore).toBe(resolvedStore);
+      if (shouldClear) task.status = null;
+      return shouldClear;
+    });
+    vi.mocked(runAiMerge).mockResolvedValue({
+      merged: true, task, branch: "fusion/preclaim", worktreeRemoved: true, branchDeleted: true,
+    } as never);
+
+    await runTaskMerge(task.id, "demo-project");
+
+    expect(reconcileUnownedStaleMergeStamp).toHaveBeenCalledWith(resolvedStore, task.id);
+    expect(task.status).toBe(shouldClear ? null : status);
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+  });
+
+  it("does not clear a pre-existing stamp when interrupted before the body claims it", async () => {
+    const task = makeTask({ id: "FN-NO-LOCAL-CLAIM", column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockResolvedValue(task);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    vi.mocked(runAiMerge).mockImplementation(((_store, _path, _id, options) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener("abort", () => reject(new Error("merge aborted before claim")), { once: true });
+    })) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    const pending = runTaskMerge(task.id, "demo-project");
+    await vi.waitFor(() => expect(process.listenerCount("SIGINT")).toBeGreaterThan(0));
+    process.emit("SIGINT", "SIGINT");
+    await pending;
+
+    expect(clearOwnedMergeStamp).not.toHaveBeenCalled();
+    expect(task.status).toBe("merging");
+    expect(close).toHaveBeenCalledOnce();
+    expect(exitSpy).toHaveBeenCalledWith(130);
+    exitSpy.mockRestore();
+  });
+
+  it("exits non-zero when a workspace finalize is blocked after all repos landed", async () => {
+    const getTask = vi.fn().mockResolvedValue(makeTask({
+      id: "FN-WS-BLOCKED",
+      column: "in-review",
+      workspaceWorktrees: { "repo-a": { worktreePath: "/tmp/a", branch: "fusion/fn-ws-blocked" } },
+    }));
+    const resolvedStore = { getTask } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    vi.mocked(landWorkspaceTask).mockResolvedValue({
+      allLanded: true,
+      finalized: false,
+      finalizeBlockedReason: "operator review required",
+      repos: [{ repo: "repo-a", status: "empty", integrationBranch: "main" }],
+    } as never);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as unknown) as (code?: string | number | null | undefined) => never);
+
+    let output = "";
+    try {
+      await expect(runTaskMerge("FN-WS-BLOCKED", "demo-project")).rejects.toThrow("process.exit:1");
+      output = logSpy.mock.calls.flat().join(" ");
+    } finally {
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+
+    expect(output).toContain("Merge blocked — operator review required");
+    expect(output).not.toContain("task finalized to done");
+    expect(landWorkspaceTask).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      "/test",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("routes GitHub import commands through the resolved project store", async () => {
@@ -1422,7 +1853,7 @@ describe("runTaskCreate with --attach", () => {
 
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: vi.fn().mockResolvedValue({
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: vi.fn().mockResolvedValue({
         id: "FN-002",
         description: "test task",
         column: "triage",
@@ -1532,7 +1963,7 @@ describe("runTaskCreate with --depends", () => {
 
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
     }));
   });
 
@@ -1546,8 +1977,8 @@ describe("runTaskCreate with --depends", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       description: "test task",
       dependencies: ["FN-124"],
-      source: { sourceType: "cli" },
-    });
+      source: { sourceType: "cli", sourceMetadata: undefined },
+    }, { invokeTaskCreatedHook: false });
   });
 
   it("passes multiple dependencies correctly", async () => {
@@ -1556,8 +1987,8 @@ describe("runTaskCreate with --depends", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       description: "test task",
       dependencies: ["FN-124", "FN-100"],
-      source: { sourceType: "cli" },
-    });
+      source: { sourceType: "cli", sourceMetadata: undefined },
+    }, { invokeTaskCreatedHook: false });
 
     const depsLine = logSpy.mock.calls.find(
       (call) => typeof call[0] === "string" && call[0].includes("Dependencies:"),
@@ -1573,8 +2004,8 @@ describe("runTaskCreate with --depends", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       description: "test task",
       dependencies: undefined,
-      source: { sourceType: "cli" },
-    });
+      source: { sourceType: "cli", sourceMetadata: undefined },
+    }, { invokeTaskCreatedHook: false });
   });
 });
 
@@ -1610,7 +2041,7 @@ describe("runTaskImportGitHubInteractive", () => {
 
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       listTasks: mockListTasks,
       getSettings: vi.fn().mockResolvedValue({}),
       getGlobalSettingsStore: vi.fn().mockReturnValue({ getSettings: vi.fn().mockResolvedValue({}) }),
@@ -1651,7 +2082,16 @@ describe("runTaskImportGitHubInteractive", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       title: "First Issue",
       description: "Description 1\n\nSource: https://github.com/owner/repo/issues/1",
-      column: "triage",
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-31-02:10:
+      NO `column` HERE — the import deliberately stopped choosing one. #2603 (U11) removed the
+      hardcoded `column: "triage"` from the GitHub/GitLab import writes so `createTaskImpl`
+      resolves the WORKFLOW'S intake column instead; passing `column` would override that
+      resolution and, post-U11, name a lane the default workflow no longer declares. This
+      assertion still required the removed literal, so a correct product change read as five CLI
+      failures. The mock RETURN values elsewhere in this file keep their column: what a created
+      task comes back as is a different question from what the import asks for.
+      */
       dependencies: [],
       sourceIssue: {
         provider: "github",
@@ -1665,7 +2105,6 @@ describe("runTaskImportGitHubInteractive", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       title: "Third Issue",
       description: "Description 3\n\nSource: https://github.com/owner/repo/issues/3",
-      column: "triage",
       dependencies: [],
       sourceIssue: {
         provider: "github",
@@ -1681,7 +2120,7 @@ describe("runTaskImportGitHubInteractive", () => {
   it("marks interactive imports as tracked when tracking defaults are on", async () => {
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       listTasks: mockListTasks,
       getSettings: vi.fn().mockResolvedValue({ githubTrackingEnabledByDefault: true }),
       getGlobalSettingsStore: vi.fn().mockReturnValue({ getSettings: vi.fn().mockResolvedValue({}) }),
@@ -1705,7 +2144,7 @@ describe("runTaskImportGitHubInteractive", () => {
   it("marks interactive imports as tracked when import linking is on and new-task defaults are off", async () => {
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       listTasks: mockListTasks,
       getSettings: vi.fn().mockResolvedValue({
         githubTrackingEnabledByDefault: false,
@@ -1784,7 +2223,6 @@ describe("runTaskImportGitHubInteractive", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       title: "Second Issue",
       description: "Description 2\n\nSource: https://github.com/owner/repo/issues/2",
-      column: "triage",
       dependencies: [],
       sourceIssue: {
         provider: "github",
@@ -2007,7 +2445,7 @@ describe("runTaskImportFromGitHub", () => {
 
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       listTasks: mockListTasks,
       getSettings: vi.fn().mockResolvedValue({}),
       getGlobalSettingsStore: vi.fn().mockReturnValue({ getSettings: vi.fn().mockResolvedValue({}) }),
@@ -2040,7 +2478,6 @@ describe("runTaskImportFromGitHub", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       title: "First Issue",
       description: "Description 1\n\nSource: https://github.com/owner/repo/issues/1",
-      column: "triage",
       dependencies: [],
       sourceIssue: {
         provider: "github",
@@ -2061,7 +2498,7 @@ describe("runTaskImportFromGitHub", () => {
   it("marks non-interactive imports as tracked when tracking defaults are on", async () => {
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
-      createTask: mockCreateTask,
+      resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       listTasks: mockListTasks,
       getSettings: vi.fn().mockResolvedValue({}),
       getGlobalSettingsStore: vi.fn().mockReturnValue({
@@ -2162,7 +2599,6 @@ describe("runTaskImportFromGitHub", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       title: "No Body Issue",
       description: "(no description)\n\nSource: https://github.com/owner/repo/issues/1",
-      column: "triage",
       dependencies: [],
       sourceIssue: {
         provider: "github",
@@ -2184,7 +2620,6 @@ describe("runTaskImportFromGitHub", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       title: "A".repeat(200),
       description: expect.stringContaining("Body"),
-      column: "triage",
       dependencies: [],
       sourceIssue: {
         provider: "github",
@@ -2276,7 +2711,7 @@ describe("runTaskRefine", () => {
     mockRefineTask = vi.fn().mockResolvedValue({
       id: "FN-002",
       description: "Refinement of FN-001",
-      column: "triage",
+      column: "todo",
       dependencies: ["FN-001"],
       steps: [],
       currentStep: 0,
@@ -2311,6 +2746,13 @@ describe("runTaskRefine", () => {
     expect(successLine).toBeDefined();
     expect(successLine![0]).toContain("FN-002");
     expect(successLine![0]).toContain("FN-001");
+
+    const columnLine = logSpy.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("Column:"),
+    );
+    expect(columnLine).toBeDefined();
+    expect(columnLine![0]).toContain("Column: todo");
+    expect(columnLine![0]).not.toContain("triage");
 
     // Check that dependency is printed
     const depLine = logSpy.mock.calls.find(
@@ -2353,24 +2795,26 @@ describe("runTaskRefine", () => {
     exitSpy.mockRestore();
   });
 
-  it("exits when feedback exceeds 2000 characters", async () => {
+  it("exits when feedback exceeds the shared task-message limit", async () => {
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as (code?: number) => never);
 
-    await runTaskRefine("FN-001", "A".repeat(2001));
+    await runTaskRefine("FN-001", "A".repeat(MAX_TASK_MESSAGE_LENGTH + 1));
 
-    expect(errorSpy).toHaveBeenCalledWith("Feedback must be 2000 characters or less");
+    expect(errorSpy).toHaveBeenCalledWith(`Feedback must be ${MAX_TASK_MESSAGE_LENGTH} characters or less`);
     expect(exitSpy).toHaveBeenCalledWith(1);
 
     exitSpy.mockRestore();
   });
 
-  it("allows feedback at exactly 2000 characters", async () => {
-    const longFeedback = "A".repeat(2000);
+  it("allows feedback above the former limit and at the shared boundary", async () => {
+    const overFormerLimit = "A".repeat(2001);
+    const atSharedLimit = "B".repeat(MAX_TASK_MESSAGE_LENGTH);
 
-    await runTaskRefine("FN-001", longFeedback);
+    await runTaskRefine("FN-001", overFormerLimit);
+    await runTaskRefine("FN-001", atSharedLimit);
 
-    expect(mockRefineTask).toHaveBeenCalledOnce();
-    expect(mockRefineTask).toHaveBeenCalledWith("FN-001", longFeedback);
+    expect(mockRefineTask).toHaveBeenNthCalledWith(1, "FN-001", overFormerLimit);
+    expect(mockRefineTask).toHaveBeenNthCalledWith(2, "FN-001", atSharedLimit);
   });
 
   it("throws when task not in done or in-review", async () => {
@@ -2573,6 +3017,21 @@ describe("runTaskComment", () => {
     expect(logSpy).toHaveBeenCalledWith("  ✓ Comment added to FN-001");
   });
 
+  it("forwards comments above the former limit without truncation", async () => {
+    const longComment = "A".repeat(5_000);
+    const addTaskComment = vi.fn().mockResolvedValue(makeTask({
+      comments: [{ id: "c1", text: longComment, author: "alice", createdAt: new Date().toISOString() }],
+    }));
+    (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      init: vi.fn(),
+      addTaskComment,
+    }));
+
+    await runTaskComment("FN-001", longComment, "alice");
+
+    expect(addTaskComment).toHaveBeenCalledWith("FN-001", longComment, "alice");
+  });
+
   it("lists task comments", async () => {
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
@@ -2637,9 +3096,11 @@ describe("runTaskRetry", () => {
       error: null,
       worktree: null,
       branch: null,
+      branchWriteOrigin: "engine",
       baseBranch: null,
       baseCommitSha: null,
       nextRecoveryAt: null,
+      sessionContentionWaitReason: null,
       /*
       FNXC:CliTests 2026-07-17-10:57:
       The exact manual retry reset contract now clears bulk-completion refusal
@@ -2654,6 +3115,7 @@ describe("runTaskRetry", () => {
       planReviewReplanCount: 0,
       stuckKillCount: 0,
       recoveryRetryCount: 0,
+      sessionContentionHoldCount: 0,
       taskDoneRetryCount: 0,
       worktreeSessionRetryCount: 0,
       workflowStepRetries: 0,
@@ -2663,6 +3125,9 @@ describe("runTaskRetry", () => {
       branchConflictRecoveryCount: 0,
       reviewerContextRetryCount: 0,
       reviewerFallbackRetryCount: 0,
+      // FNXC:TaskRetry 2026-08-23-15:59: FN-149 added review-convergence stage/escalation counters to MANUAL_RETRY_RESET_FIELDS; manual retry must zero them with the other recovery budgets.
+      reviewConvergenceStage: 0,
+      reviewConvergenceEscalationCount: 0,
       completionHandoffLimboRecoveryCount: 0,
       // FNXC:TaskRetry 2026-07-13-08:15: executeRequeueLoopCount added to TaskResetField set; retry must zero it alongside other recovery counters.
       executeRequeueLoopCount: 0,
@@ -2726,9 +3191,11 @@ describe("runTaskRetry", () => {
       error: null,
       worktree: null,
       branch: null,
+      branchWriteOrigin: "engine",
       baseBranch: null,
       baseCommitSha: null,
       nextRecoveryAt: null,
+      sessionContentionWaitReason: null,
       /*
       FNXC:CliTests 2026-07-17-10:57:
       The exact manual retry reset contract now clears bulk-completion refusal
@@ -2743,6 +3210,7 @@ describe("runTaskRetry", () => {
       planReviewReplanCount: 0,
       stuckKillCount: 0,
       recoveryRetryCount: 0,
+      sessionContentionHoldCount: 0,
       taskDoneRetryCount: 0,
       worktreeSessionRetryCount: 0,
       workflowStepRetries: 0,
@@ -2752,6 +3220,9 @@ describe("runTaskRetry", () => {
       branchConflictRecoveryCount: 0,
       reviewerContextRetryCount: 0,
       reviewerFallbackRetryCount: 0,
+      // FNXC:TaskRetry 2026-08-23-15:59: FN-149 added review-convergence stage/escalation counters to MANUAL_RETRY_RESET_FIELDS; manual retry must zero them with the other recovery budgets.
+      reviewConvergenceStage: 0,
+      reviewConvergenceEscalationCount: 0,
       completionHandoffLimboRecoveryCount: 0,
       // FNXC:TaskRetry 2026-07-13-08:15: executeRequeueLoopCount added to TaskResetField set; retry must zero it alongside other recovery counters.
       executeRequeueLoopCount: 0,
@@ -2984,6 +3455,55 @@ describe("runTaskLogs", () => {
     expect(calls[4]).toContain("[ERROR]");
   });
 
+  it("renders multiline tool arguments as one indented terminal block", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({
+        type: "tool",
+        text: "fn_run_verification",
+        detail: "command=pnpm lint\nallowFullSuite=false",
+      }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const formatted = logSpy.mock.calls[0]?.[0] as string;
+    expect(formatted).toContain("[TOOL] fn_run_verification");
+    expect(formatted).toContain("\n\x1b[2m\x1b[90m    command=pnpm lint\n    allowFullSuite=false");
+  });
+
+  it("renders multiline results and errors as indented blocks while retaining the red error header", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({ type: "tool_result", text: "bash", detail: "stdout line one\nstdout line two" }),
+      makeAgentLogEntry({ type: "tool_error", text: "bash", detail: "stderr line one\nstderr line two" }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    const [result, error] = logSpy.mock.calls.map((call) => call[0] as string);
+    expect(result).toContain("[RESULT] bash\n\x1b[2m\x1b[90m    stdout line one");
+    expect(error).toMatch(/^\x1b\[31m.*\[ERROR] bash/);
+    expect(error).toContain("\n\x1b[2m\x1b[90m    stderr line one");
+  });
+
+  it("keeps short single-line tool detail inline and omits an empty detail block", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({ type: "tool", text: "read", detail: "path/to/file.ts" }),
+      makeAgentLogEntry({ type: "tool_result", text: "read" }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    const [tool, result] = logSpy.mock.calls.map((call) => call[0] as string);
+    expect(tool).toContain("[TOOL] read (path/to/file.ts)");
+    expect(tool).not.toContain("\n");
+    expect(result).toContain("[RESULT] read");
+    expect(result).not.toContain("\n");
+  });
+
   it("displays agent role when present", async () => {
     mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
     mockGetAgentLogs.mockResolvedValueOnce([
@@ -3169,6 +3689,31 @@ describe("runTaskLogs", () => {
     sigintHandlers.forEach((handler) => handler());
   });
 
+  it("formats multiline tool detail from follow-mode JSONL through the shared formatter", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([]);
+    mockStatSync.mockReturnValue({ size: 0 });
+
+    runTaskLogs("FN-001", { follow: true });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const watchCallback = mockWatchFile.mock.calls[0]?.[2] as () => void;
+    mockStatSync.mockReturnValueOnce({ size: 200 });
+    mockReadFileSync.mockReturnValueOnce(`${JSON.stringify(makeAgentLogEntry({
+      type: "tool_result",
+      text: "fn_run_verification",
+      detail: "result line one\nresult line two",
+    }))}\n`);
+    watchCallback();
+
+    const followed = logSpy.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("[RESULT] fn_run_verification"),
+    )?.[0] as string | undefined;
+    expect(followed).toContain("\n\x1b[2m\x1b[90m    result line one");
+
+    sigintHandlers.forEach((handler) => handler());
+  });
+
   it("applies type filter in follow mode", async () => {
     mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
     mockGetAgentLogs.mockResolvedValueOnce([]);
@@ -3292,6 +3837,56 @@ describe("runTaskPrCreate", () => {
   afterEach(() => {
     process.env = originalEnv;
     vi.restoreAllMocks();
+  });
+
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-07-30-22:05 (#2775 review — "legacy review lane rejected"):
+
+  A V1 WORKFLOW MUST STILL BE ABLE TO OPEN A PR FROM ITS `in-review` COLUMN.
+
+  `synthesizeDefaultColumns` (workflow-ir.ts:158-159) upgrades a v1 graph by emitting every default
+  column id with `traits: []`. So a v1-upgraded workflow resolves to an EMPTY review set while its
+  `in-review` column plainly exists and is where its cards live. A guard that reads empty as "this
+  board declares no review lane" refuses `fn pr create` on every pre-v2 project.
+
+  This is the ratchet for that: the store resolves a real v1-shaped workflow, and the command must get
+  past the review guard rather than refusing. No v2 fixture can catch this — a v2 board expresses its
+  traits, so its set is never empty.
+  */
+  it("does NOT refuse a v1-upgraded workflow whose synthesized columns carry no traits", async () => {
+    const v1UpgradedIr = {
+      version: "v2",
+      id: "wf-v1-upgraded",
+      name: "legacy",
+      nodes: [],
+      edges: [],
+      // Exactly what synthesizeDefaultColumns emits: every column, NO traits.
+      columns: ["todo", "in-progress", "in-review", "done"].map((id) => ({ id, name: id, traits: [] })),
+    };
+    const selection = { workflowId: "wf-v1-upgraded", stepIds: [] };
+    (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      init: vi.fn(),
+      getTask: mockGetTask,
+      updatePrInfo: mockUpdatePrInfo,
+      ensurePrEntityForSource: vi.fn(() => ({ id: "pr-entity-1" })),
+      updatePrEntity: vi.fn(),
+      logEntry: mockLogEntry,
+      getTaskWorkflowSelection: () => selection,
+      getTaskWorkflowSelectionAsync: async () => selection,
+      getWorkflowDefinition: async () => ({ id: "wf-v1-upgraded", ir: v1UpgradedIr }),
+    }));
+
+    const task = makeInReviewTask();
+    mockGetTask.mockResolvedValueOnce(task);
+    mockCreatePr.mockResolvedValueOnce(makePrInfo({ number: 77, url: "https://github.com/owner/repo/pull/77" }));
+
+    await runTaskPrCreate("FN-001", {});
+
+    /*
+    The witness is that the command reached PR creation at all. Asserting on the absence of an error
+    message would also pass if the guard refused for some other reason and exited quietly.
+    */
+    expect(mockCreatePr).toHaveBeenCalled();
   });
 
   it("creates PR successfully with all options", async () => {

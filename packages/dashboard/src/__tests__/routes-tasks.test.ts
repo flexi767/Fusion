@@ -25,8 +25,6 @@ import { __resetBatchImportRateLimiter, __setCreateFnAgentForRefine } from "../r
 import * as agentGenerationModule from "../agent-generation.js";
 import { __resetPlanningState, __setCreateFnAgent, planningStreamManager } from "../planning.js";
 import * as planningModule from "../planning.js";
-import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
-import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
@@ -196,6 +194,7 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
   return {
     getTask: vi.fn(),
     listTasks: vi.fn().mockResolvedValue([]),
+    listCurrentTasksPage: vi.fn().mockResolvedValue({ tasks: [], total: 0, hasMore: false, nextCursor: null }),
     searchTasks: vi.fn().mockResolvedValue([]),
     findRecentTasksByContentFingerprint: vi.fn().mockResolvedValue([]),
     createTask: vi.fn(),
@@ -207,8 +206,6 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     setTaskBranchGroup: vi.fn().mockResolvedValue(undefined),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({}),
     updateSettings: vi.fn(),
@@ -236,6 +233,16 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     recordActivity: vi.fn().mockResolvedValue(undefined),
     getFusionDir: vi.fn().mockReturnValue("/fake/root/.fusion"),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    /*
+    FNXC:PluginMcpServers 2026-07-23-23:40:
+    FN-8491 (3cd023fa4) made resolveProjectContext bind a project-scoped plugin
+    MCP provider on every getProjectContext call. A store that already exposes
+    getProjectScopedPluginMcpServers is treated as runtime-owned and skips the
+    binder (which would otherwise call getPluginStore()); declare it here so the
+    route contracts under test stay isolated from plugin-loader bootstrapping.
+    Same alignment as remote-access-routes.test.ts (d7752931b).
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
     // FNXC:PostgresCutover 2026-07-05-16:20: routes borrow the AsyncDataLayer
     // from the scoped store (e.g. triggerCommentWakeForAssignedAgent builds a
     // backend AgentStore). null = legacy mode for this mock.
@@ -405,6 +412,31 @@ describe("GET /tasks", () => {
       slim: true,
       includeArchived: false,
     });
+  });
+
+  it.each(["52", ".txt"])("forwards literal search query %s to shared task search", async (query) => {
+    (store.searchTasks as ReturnType<typeof vi.fn>).mockResolvedValueOnce([FAKE_TASK_DETAIL]);
+
+    const res = await GET(buildApp(), `/api/tasks?q=${encodeURIComponent(query)}`);
+
+    expect(res.status).toBe(200);
+    expect(store.searchTasks).toHaveBeenCalledWith(query, {
+      limit: undefined,
+      offset: undefined,
+      slim: true,
+      includeArchived: false,
+    });
+  });
+
+  it.each(["52", ".txt"])("forwards literal paginated query %s without normalization", async (query) => {
+    (store.listCurrentTasksPage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      tasks: [FAKE_TASK_DETAIL], total: 1, hasMore: false, nextCursor: null,
+    });
+
+    const res = await GET(buildApp(), `/api/tasks/page?q=${encodeURIComponent(query)}&limit=8`);
+
+    expect(res.status).toBe(200);
+    expect(store.listCurrentTasksPage).toHaveBeenCalledWith({ limit: 8, query });
   });
 
   it("returns tasks for search query with limit", async () => {
@@ -711,39 +743,70 @@ describe("POST /tasks", () => {
     return app;
   }
 
-  it("creates a task and forwards breakIntoSubtasks", async () => {
-    const createdTask = {
-      ...FAKE_TASK_DETAIL,
-      column: "triage",
-      breakIntoSubtasks: true,
-    };
+  it("attaches automatic title summarization for short descriptions when the project option is enabled", async () => {
+    const createdTask = { ...FAKE_TASK_DETAIL, title: undefined, description: "short request" };
+    (store.getSettingsFast as ReturnType<typeof vi.fn>).mockResolvedValue({ autoSummarizeTitles: true });
     (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue(createdTask);
 
     const res = await REQUEST(
       buildApp(),
       "POST",
       "/api/tasks",
+      JSON.stringify({ description: "short request" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    const [createInput, options] = (store.createTask as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(createInput).toMatchObject({ description: "short request", summarize: false });
+    expect(options.onSummarize).toEqual(expect.any(Function));
+  });
+
+  it("forwards no-workflow and explicit owner inputs but drops public exemption-shaped fields", async () => {
+    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      assignedAgentId: "executor-1",
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
       JSON.stringify({
-        description: "Big initiative",
-        breakIntoSubtasks: true,
+        description: "No workflow still needs an executor owner",
+        workflowId: null,
+        agentId: "executor-1",
+        ownershipExemption: true,
       }),
       { "Content-Type": "application/json" },
     );
 
     expect(res.status).toBe(201);
-    expect(store.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: undefined,
-        description: "Big initiative",
-        column: undefined,
-        dependencies: undefined,
-        breakIntoSubtasks: true,
-        summarize: false,
-      }),
-      expect.objectContaining({
-        settings: { autoSummarizeTitles: undefined },
-      }),
+    const createInput = (store.createTask as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(createInput).toMatchObject({
+      description: "No workflow still needs an executor owner",
+      workflowId: null,
+      assignedAgentId: "executor-1",
+    });
+    expect(createInput).not.toHaveProperty("ownershipExemption");
+  });
+
+  it("returns a typed client failure when the universal owner resolver rejects an explicit owner", async () => {
+    (store.createTask as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("Task intake owner resolution failed: explicit-assignee-ineligible"),
     );
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Reject a triage-only owner", assignedAgentId: "triage-agent" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ error: "Task intake owner resolution failed: explicit-assignee-ineligible" });
+    expect(store.createTask).toHaveBeenCalledTimes(1);
   });
 
   it("does not synchronously create tracking issues in POST /tasks route", async () => {
@@ -996,8 +1059,13 @@ describe("POST /tasks", () => {
     );
 
     expect(res.status).toBe(201);
+    /*
+    FNXC:BranchSelection 2026-08-23-23:30:
+    A `branch` write must declare its origin. Both branches here are DERIVED by the route from the task id/title, never typed by the operator, so they are stamped "engine"; only a name the operator supplied writes "operator".
+    */
     expect(store.updateTask).toHaveBeenCalledWith("FN-5671", {
       branch: "fusion/fn-5671-branch-strategy-dropdown",
+      branchWriteOrigin: "engine",
     });
     expect(res.body.branch).toBe("fusion/fn-5671-branch-strategy-dropdown");
   });
@@ -1051,6 +1119,7 @@ describe("POST /tasks", () => {
     expect(store.setTaskBranchGroup).toHaveBeenCalledWith("FN-7001", "BG-001");
     expect(store.updateTask).toHaveBeenCalledWith("FN-7001", {
       branch: "feature/shared/shared-group-branch-task",
+      branchWriteOrigin: "engine",
     });
     expect(res.body.branch).toBe("feature/shared/shared-group-branch-task");
   });
@@ -1115,90 +1184,6 @@ describe("POST /tasks", () => {
     expect(store.createTask).not.toHaveBeenCalled();
   });
 
-  it("forwards model overrides when both provider and id are supplied", async () => {
-    const createdTask = {
-      ...FAKE_TASK_DETAIL,
-      column: "triage",
-      modelProvider: "anthropic",
-      modelId: "claude-sonnet-4-5",
-      validatorModelProvider: "openai",
-      validatorModelId: "gpt-4o",
-    };
-    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue(createdTask);
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/tasks",
-      JSON.stringify({
-        description: "Use explicit models",
-        modelProvider: "anthropic",
-        modelId: "claude-sonnet-4-5",
-        validatorModelProvider: "openai",
-        validatorModelId: "gpt-4o",
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(store.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: undefined,
-        description: "Use explicit models",
-        column: undefined,
-        dependencies: undefined,
-        breakIntoSubtasks: undefined,
-        modelProvider: "anthropic",
-        modelId: "claude-sonnet-4-5",
-        validatorModelProvider: "openai",
-        validatorModelId: "gpt-4o",
-        summarize: false,
-      }),
-      expect.objectContaining({
-        settings: { autoSummarizeTitles: undefined },
-      }),
-    );
-  });
-
-  it("normalizes partial model overrides back to defaults", async () => {
-    const createdTask = {
-      ...FAKE_TASK_DETAIL,
-      column: "triage",
-    };
-    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue(createdTask);
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/tasks",
-      JSON.stringify({
-        description: "Ignore partial model selection",
-        modelProvider: "anthropic",
-        validatorModelId: "gpt-4o",
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(store.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: undefined,
-        description: "Ignore partial model selection",
-        column: undefined,
-        dependencies: undefined,
-        breakIntoSubtasks: undefined,
-        modelProvider: undefined,
-        modelId: undefined,
-        validatorModelProvider: undefined,
-        validatorModelId: undefined,
-        summarize: false,
-      }),
-      expect.objectContaining({
-        settings: { autoSummarizeTitles: undefined },
-      }),
-    );
-  });
-
   it("returns 400 when model fields are not strings", async () => {
     const res = await REQUEST(
       buildApp(),
@@ -1216,39 +1201,11 @@ describe("POST /tasks", () => {
     expect(store.createTask).not.toHaveBeenCalled();
   });
 
-  it("returns 400 when description is missing", async () => {
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/tasks",
-      JSON.stringify({ breakIntoSubtasks: true }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("description is required");
-    expect(store.createTask).not.toHaveBeenCalled();
-  });
-
-  it("returns 400 when breakIntoSubtasks is not a boolean", async () => {
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/tasks",
-      JSON.stringify({ description: "Big initiative", breakIntoSubtasks: "yes" }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("breakIntoSubtasks must be a boolean");
-    expect(store.createTask).not.toHaveBeenCalled();
-  });
-
-  it("forwards xhigh thinkingLevel when provided", async () => {
+  it("forwards max thinkingLevel when provided", async () => {
     const createdTask = {
       ...FAKE_TASK_DETAIL,
       column: "triage",
-      thinkingLevel: "xhigh",
+      thinkingLevel: "max",
     };
     (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue(createdTask);
 
@@ -1258,7 +1215,7 @@ describe("POST /tasks", () => {
       "/api/tasks",
       JSON.stringify({
         description: "Deep reasoning task",
-        thinkingLevel: "xhigh",
+        thinkingLevel: "max",
       }),
       { "Content-Type": "application/json" },
     );
@@ -1267,7 +1224,7 @@ describe("POST /tasks", () => {
     expect(store.createTask).toHaveBeenCalledWith(
       expect.objectContaining({
         description: "Deep reasoning task",
-        thinkingLevel: "xhigh",
+        thinkingLevel: "max",
       }),
       expect.objectContaining({
         settings: { autoSummarizeTitles: undefined },
@@ -1375,6 +1332,20 @@ describe("POST /tasks", () => {
       expect.objectContaining({ autoMerge: true }),
       expect.any(Object),
     );
+  });
+
+  it("rejects client-supplied autoMerge provenance via POST", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Test task", autoMerge: false, autoMergeProvenance: "mission" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("autoMergeProvenance is server-managed");
+    expect(store.createTask).not.toHaveBeenCalled();
   });
 
   it("returns 400 for invalid autoMerge value via POST", async () => {
@@ -1918,6 +1889,39 @@ describe("PATCH /tasks/:id branch fields", () => {
     }));
   });
 
+  it("rejects client-supplied autoMerge provenance while preserving server-owned task updates", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-001",
+      JSON.stringify({ autoMerge: false, autoMergeProvenance: "mission" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("autoMergeProvenance is server-managed");
+    expect(store.updateTask).not.toHaveBeenCalled();
+  });
+
+  it("forwards a null autoMerge patch so TaskStore clears the user override and provenance", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      autoMerge: undefined,
+      autoMergeProvenance: undefined,
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-001",
+      JSON.stringify({ autoMerge: null }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({ autoMerge: null }));
+  });
+
   it("returns 400 for invalid branch payload types", async () => {
     const res = await REQUEST(
       buildApp(),
@@ -1930,759 +1934,6 @@ describe("PATCH /tasks/:id branch fields", () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toContain("branch must be a string or null");
     expect(store.updateTask).not.toHaveBeenCalled();
-  });
-});
-
-describe("POST /subtasks/*", () => {
-  let store: TaskStore;
-
-  beforeEach(() => {
-    store = createMockStore();
-    __resetPlanningState();
-    __resetSubtaskBreakdownState();
-  });
-
-  function buildApp() {
-    const app = express();
-    app.use(express.json());
-    app.use("/api", createApiRoutes(store));
-    return app;
-  }
-
-  it("starts a subtask streaming session and returns sessionId", async () => {
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(typeof res.body.sessionId).toBe("string");
-  });
-
-  it("accepts projectId query param without error", async () => {
-    // Mock getOrCreateProjectStore for projectId scoping
-    vi.spyOn(projectStoreResolver, "getOrCreateProjectStore").mockResolvedValue(store);
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming?projectId=test-project-123",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    // Should return 201 without throwing an error (projectId is forwarded)
-    expect(res.status).toBe(201);
-    expect(typeof res.body.sessionId).toBe("string");
-  });
-
-  it("retries a failed subtask session", async () => {
-    const retrySpy = vi.spyOn(subtaskBreakdownModule, "retrySubtaskSession").mockResolvedValue();
-
-    const res = await REQUEST(buildApp(), "POST", "/api/subtasks/session-123/retry");
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, sessionId: "session-123" });
-    expect(retrySpy).toHaveBeenCalledWith("session-123", "/fake/root", undefined, store);
-  });
-
-  it("returns 404 when subtask retry session does not exist", async () => {
-    vi.spyOn(subtaskBreakdownModule, "retrySubtaskSession").mockRejectedValueOnce(
-      new subtaskBreakdownModule.SessionNotFoundError("Subtask session not found"),
-    );
-
-    const res = await REQUEST(buildApp(), "POST", "/api/subtasks/session-404/retry");
-
-    expect(res.status).toBe(404);
-    expect(res.body.error).toContain("Subtask session not found");
-  });
-
-  it("returns 400 when subtask retry session is not in error state", async () => {
-    vi.spyOn(subtaskBreakdownModule, "retrySubtaskSession").mockRejectedValueOnce(
-      new subtaskBreakdownModule.InvalidSessionStateError("Session is not in error state"),
-    );
-
-    const res = await REQUEST(buildApp(), "POST", "/api/subtasks/session-400/retry");
-
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("not in error state");
-  });
-
-  it("replays buffered subtask events using lastEventId query param", async () => {
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Replay buffered subtask stream" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const sessionId = start.body.sessionId as string;
-
-    // Reset any initial stream manager state from background generation.
-    subtaskStreamManager.cleanupSession(sessionId);
-
-    subtaskStreamManager.broadcast(sessionId, { type: "thinking", data: "first" });
-    subtaskStreamManager.broadcast(sessionId, { type: "thinking", data: "second" });
-
-    setTimeout(() => {
-      subtaskStreamManager.broadcast(sessionId, { type: "complete" });
-    }, 0);
-
-    const streamRes = await REQUEST(
-      buildApp(),
-      "GET",
-      `/api/subtasks/${sessionId}/stream?lastEventId=1`,
-    );
-
-    expect(streamRes.status).toBe(200);
-    expect(streamRes.body).toContain("id: 2");
-    expect(streamRes.body).toContain("event: thinking");
-    expect(streamRes.body).toContain("event: complete");
-    expect(streamRes.body).not.toContain("id: 1\nevent: thinking");
-  });
-
-  it("replays buffered subtask events using Last-Event-ID header", async () => {
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Replay buffered subtask stream from header" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const sessionId = start.body.sessionId as string;
-
-    subtaskStreamManager.cleanupSession(sessionId);
-    subtaskStreamManager.broadcast(sessionId, { type: "thinking", data: "first" });
-    subtaskStreamManager.broadcast(sessionId, { type: "thinking", data: "second" });
-
-    setTimeout(() => {
-      subtaskStreamManager.broadcast(sessionId, { type: "complete" });
-    }, 0);
-
-    const streamRes = await REQUEST(
-      buildApp(),
-      "GET",
-      `/api/subtasks/${sessionId}/stream`,
-      undefined,
-      { "Last-Event-ID": "1" },
-    );
-
-    expect(streamRes.status).toBe(200);
-    expect(streamRes.body).toContain("id: 2");
-    expect(streamRes.body).toContain("event: thinking");
-    expect(streamRes.body).toContain("event: complete");
-    expect(streamRes.body).not.toContain("id: 1\nevent: thinking");
-  });
-
-  it("skips subtask replay when Last-Event-ID is missing", async () => {
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "No subtask replay without header" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const sessionId = start.body.sessionId as string;
-
-    subtaskStreamManager.cleanupSession(sessionId);
-    subtaskStreamManager.broadcast(sessionId, { type: "thinking", data: "first" });
-
-    setTimeout(() => {
-      subtaskStreamManager.broadcast(sessionId, { type: "complete" });
-    }, 0);
-
-    const streamRes = await REQUEST(
-      buildApp(),
-      "GET",
-      `/api/subtasks/${sessionId}/stream`,
-    );
-
-    expect(streamRes.status).toBe(200);
-    expect(streamRes.body).not.toContain("id: 1\nevent: thinking");
-    expect(streamRes.body).toContain("id: 2");
-    expect(streamRes.body).toContain("event: complete");
-  });
-
-  it("gracefully ignores invalid Last-Event-ID values for subtask streams", async () => {
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Invalid subtask last event id" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const sessionId = start.body.sessionId as string;
-
-    subtaskStreamManager.cleanupSession(sessionId);
-    subtaskStreamManager.broadcast(sessionId, { type: "thinking", data: "first" });
-
-    setTimeout(() => {
-      subtaskStreamManager.broadcast(sessionId, { type: "complete" });
-    }, 0);
-
-    const streamRes = await REQUEST(
-      buildApp(),
-      "GET",
-      `/api/subtasks/${sessionId}/stream`,
-      undefined,
-      { "Last-Event-ID": "not-a-number" },
-    );
-
-    expect(streamRes.status).toBe(200);
-    expect(streamRes.body).not.toContain("id: 1\nevent: thinking");
-    expect(streamRes.body).toContain("id: 2");
-    expect(streamRes.body).toContain("event: complete");
-  });
-
-  it("creates tasks from a breakdown and resolves dependencies", async () => {
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-101", title: "First", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-102", title: "Second", column: "triage" });
-    (store.updateTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-101", title: "First", column: "triage", size: "S" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-102", title: "Second", column: "triage", size: "M" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-102", title: "Second", column: "triage", dependencies: ["FN-101"] });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        subtasks: [
-          { tempId: "subtask-1", title: "First", description: "Do first", size: "S", dependsOn: [] },
-          { tempId: "subtask-2", title: "Second", description: "Do second", size: "M", dependsOn: ["subtask-1"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(createRes.body.tasks).toHaveLength(2);
-    expect(store.createTask).toHaveBeenNthCalledWith(1, expect.objectContaining({ title: "First", dependencies: undefined }));
-    expect(store.createTask).toHaveBeenNthCalledWith(2, expect.objectContaining({ title: "Second", dependencies: undefined }));
-    expect(store.updateTask).toHaveBeenCalledWith("FN-102", { dependencies: ["FN-101"] });
-  });
-
-  it("checks for a parent-scoped duplicate before persisting a planned task", async () => {
-    const existing = {
-      ...FAKE_TASK_DETAIL,
-      id: "FN-EXISTING",
-      title: "Existing child",
-      column: "triage",
-      sourceParentTaskId: "FN-PARENT",
-    };
-    vi.mocked(createAgentTask).mockResolvedValueOnce({ task: existing, wasDuplicate: true });
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_TASK_DETAIL, id: "FN-PARENT" });
-
-    const start = await REQUEST(buildApp(), "POST", "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }), { "Content-Type": "application/json" });
-    const createRes = await REQUEST(buildApp(), "POST", "/api/subtasks/create-tasks", JSON.stringify({
-      sessionId: start.body.sessionId,
-      parentTaskId: "fn-parent",
-      subtasks: [{ tempId: "subtask-1", title: "Existing child", description: "Do existing work", size: "L" }],
-    }), { "Content-Type": "application/json" });
-
-    expect(createRes.status).toBe(201);
-    expect(createRes.body.tasks[0].id).toBe("FN-EXISTING");
-    expect(createAgentTask).toHaveBeenCalledWith(store, expect.objectContaining({
-      source: expect.objectContaining({ sourceParentTaskId: "FN-PARENT" }),
-    }), expect.objectContaining({ sourceTaskId: "FN-PARENT" }));
-    expect(store.createTask).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalled();
-    expect(store.logEntry).not.toHaveBeenCalled();
-  });
-
-  it("keeps updates for the created sibling when a later input reuses it", async () => {
-    const canonical = {
-      ...FAKE_TASK_DETAIL,
-      id: "FN-CANONICAL",
-      title: "Canonical child",
-      column: "triage",
-      sourceParentTaskId: "FN-PARENT",
-    };
-    vi.mocked(createAgentTask)
-      .mockResolvedValueOnce({ task: canonical, wasDuplicate: false })
-      .mockResolvedValueOnce({ task: canonical, wasDuplicate: true });
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_TASK_DETAIL, id: "FN-PARENT" });
-    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...canonical, size: "S" });
-
-    const start = await REQUEST(buildApp(), "POST", "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }), { "Content-Type": "application/json" });
-    const createRes = await REQUEST(buildApp(), "POST", "/api/subtasks/create-tasks", JSON.stringify({
-      sessionId: start.body.sessionId,
-      parentTaskId: "FN-PARENT",
-      subtasks: [
-        { tempId: "subtask-1", title: "Canonical child", description: "Do the work", size: "S" },
-        { tempId: "subtask-2", title: "Canonical child rewritten", description: "Do the same work", size: "L" },
-      ],
-    }), { "Content-Type": "application/json" });
-
-    expect(createRes.status).toBe(201);
-    expect(store.updateTask).toHaveBeenCalledTimes(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-CANONICAL", { size: "S" });
-    expect(store.logEntry).toHaveBeenCalledTimes(1);
-  });
-
-  it("subtask batch creation succeeds without explicit tracking issue creation", async () => {
-    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
-      owner: "task",
-      repo: "repo",
-      number: 55,
-      htmlUrl: "https://github.com/task/repo/issues/55",
-      createdAt: "2026-01-01T00:00:00.000Z",
-    });
-
-    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-      githubTrackingDefaultRepo: "task/repo",
-      githubAuthMode: "token",
-      githubAuthToken: "tok",
-    });
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-103", title: "First", column: "triage", githubTracking: { enabled: true } });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(createIssueSpy).not.toHaveBeenCalled();
-    expect(store.linkGithubIssue).not.toHaveBeenCalled();
-    expect(store.recordActivity).not.toHaveBeenCalled();
-    createIssueSpy.mockRestore();
-  });
-
-  it("subtask batch creation remains successful even if GitHub client would fail", async () => {
-    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockRejectedValue(new Error("boom"));
-
-    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-      githubTrackingDefaultRepo: "task/repo",
-      githubAuthMode: "token",
-      githubAuthToken: "tok",
-    });
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-104", title: "First", column: "triage", githubTracking: { enabled: true } });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(createRes.body.tasks).toHaveLength(1);
-    expect(createIssueSpy).not.toHaveBeenCalled();
-    createIssueSpy.mockRestore();
-  });
-
-  it("subtask batch creation does not recreate tracking issue when task is already linked", async () => {
-    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue");
-
-    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-      githubTrackingDefaultRepo: "task/repo",
-      githubAuthMode: "token",
-      githubAuthToken: "tok",
-    });
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({
-        ...FAKE_TASK_DETAIL,
-        id: "FN-105",
-        title: "First",
-        column: "triage",
-        githubTracking: {
-          enabled: true,
-          issue: { owner: "task", repo: "repo", number: 9, url: "https://github.com/task/repo/issues/9" },
-        },
-      });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(createIssueSpy).not.toHaveBeenCalled();
-    createIssueSpy.mockRestore();
-  });
-
-  it("applies explicit branch selection to created subtasks", async () => {
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-201", title: "First", column: "triage" });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        branchSelection: { mode: "custom-new", branchName: "feature/planning", baseBranch: "main" },
-        subtasks: [
-          { tempId: "subtask-1", title: "First", description: "Do first" },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
-      branch: "feature/planning/first",
-      baseBranch: "main",
-      // groupId is stamped only when a real branch group was ensured; this
-      // mock store has no ensureBranchGroupForSource, so no group exists and
-      // the synthetic `planning:<sessionId>` string is no longer used.
-      branchContext: {
-        source: "planning",
-        assignmentMode: "shared",
-        inheritedBaseBranch: "main",
-      },
-    }));
-  });
-
-  it("derives per-task branches when requested", async () => {
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-301", title: "First", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-302", title: "Second", column: "triage" });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        branchSelection: { mode: "custom-new", branchName: "feature/planning" },
-        branchAssignment: { mode: "per-task-derived" },
-        subtasks: [
-          { tempId: "subtask-1", title: "First Task", description: "Do first" },
-          { tempId: "subtask-2", title: "Second Task", description: "Do second" },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(store.createTask).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      branch: "feature/planning/first-task",
-      // Non-shared members carry NO groupId — a synthetic planning:<id> would
-      // let the legacy membership fallback sweep them into a shared group.
-      branchContext: expect.objectContaining({
-        source: "planning",
-        assignmentMode: "per-task-derived",
-      }),
-    }));
-    expect(
-      (store.createTask as ReturnType<typeof vi.fn>).mock.calls[0][0].branchContext.groupId,
-    ).toBeUndefined();
-    expect(store.createTask).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      branch: "feature/planning/second-task",
-      branchContext: expect.objectContaining({
-        source: "planning",
-        assignmentMode: "per-task-derived",
-      }),
-    }));
-    expect(
-      (store.createTask as ReturnType<typeof vi.fn>).mock.calls[1][0].branchContext.groupId,
-    ).toBeUndefined();
-  });
-
-  it("returns 404 for invalid subtask session during batch creation", async () => {
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: "missing-session",
-        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(404);
-    expect(res.body.error).toContain("not found");
-  });
-
-  it("inherits parent task model settings when creating subtasks", async () => {
-    const parentTask = {
-      ...FAKE_TASK_DETAIL,
-      id: "FN-100",
-      title: "Parent Task",
-      column: "triage",
-      modelProvider: "anthropic",
-      modelId: "claude-sonnet-4-5",
-      validatorModelProvider: "openai",
-      validatorModelId: "gpt-4o",
-    };
-
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(parentTask);
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-101", title: "First", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-102", title: "Second", column: "triage" });
-    (store.updateTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-101", title: "First", column: "triage", size: "S" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-102", title: "Second", column: "triage", size: "M" });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        parentTaskId: "FN-100",
-        subtasks: [
-          { tempId: "subtask-1", title: "First", description: "Do first", size: "S", dependsOn: [] },
-          { tempId: "subtask-2", title: "Second", description: "Do second", size: "M", dependsOn: ["subtask-1"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(store.getTask).toHaveBeenCalledWith("FN-100");
-    expect(store.createTask).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      title: "First",
-      modelProvider: "anthropic",
-      modelId: "claude-sonnet-4-5",
-      validatorModelProvider: "openai",
-      validatorModelId: "gpt-4o",
-    }));
-    expect(store.createTask).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      title: "Second",
-      modelProvider: "anthropic",
-      modelId: "claude-sonnet-4-5",
-      validatorModelProvider: "openai",
-      validatorModelId: "gpt-4o",
-    }));
-  });
-
-  it("handles missing parent task gracefully when creating subtasks", async () => {
-    (store.getTask as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Task not found"));
-    (store.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-101", title: "First", column: "triage" });
-    (store.updateTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-101", title: "First", column: "triage", size: "S" });
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        parentTaskId: "FN-NONEXISTENT",
-        subtasks: [
-          { tempId: "subtask-1", title: "First", description: "Do first", size: "S", dependsOn: [] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(store.getTask).toHaveBeenCalledWith("FN-NONEXISTENT");
-    // Subtask created without model inheritance (undefined values)
-    expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
-      title: "First",
-      modelProvider: undefined,
-      modelId: undefined,
-      validatorModelProvider: undefined,
-      validatorModelId: undefined,
-    }));
-  });
-
-  it("drops a subtask dependency that references the parent task being split", async () => {
-    // Regression: the AI/UI sometimes emits `dependsOn: ["<parentId>"]` on a
-    // child. Previously the child was created with a reference to the
-    // parent id (via an existing-task lookup), then the parent was deleted,
-    // leaving the child permanently blocked. We now drop parent-id deps and
-    // surface them in the response.
-    const parentTask = {
-      ...FAKE_TASK_DETAIL,
-      id: "FN-PARENT",
-      title: "Parent",
-      column: "triage",
-    };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(parentTask);
-    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-      ...FAKE_TASK_DETAIL,
-      id: "FN-CHILD",
-      title: "Child",
-      column: "triage",
-    });
-    (store.deleteTask as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        parentTaskId: "fn-parent",
-        subtasks: [
-          { tempId: "subtask-1", title: "Child", description: "Do it", dependsOn: ["fn-parent"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    // Dependencies must NOT contain the parent id.
-    // updateTask either isn't called for deps, or is called with an empty array.
-    const depUpdateCalls = (store.updateTask as ReturnType<typeof vi.fn>).mock.calls
-      .filter((args: unknown[]) => {
-        const patch = args[1] as { dependencies?: string[] } | undefined;
-        return patch?.dependencies !== undefined;
-      });
-    for (const call of depUpdateCalls) {
-      expect((call[1] as { dependencies: string[] }).dependencies).not.toContain("FN-PARENT");
-      expect((call[1] as { dependencies: string[] }).dependencies).not.toContain("fn-parent");
-    }
-    // The response surfaces the dropped dep instead of silently swallowing it.
-    expect(createRes.body.droppedDependencies).toEqual([
-      { taskId: "FN-CHILD", dropped: ["fn-parent"] },
-    ]);
-  });
-
-  it("surfaces parent close errors when deleteTask refuses due to live dependents", async () => {
-    // If a child still references the parent after the drop step (shouldn't
-    // happen post-fix, but could via race or caller mistake), store.deleteTask
-    // throws. The endpoint must not swallow that silently — parentTaskClosed
-    // is false AND parentTaskCloseError names the reason.
-    const parentTask = {
-      ...FAKE_TASK_DETAIL,
-      id: "FN-STUBBORN",
-      title: "Parent",
-      column: "triage",
-    };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(parentTask);
-    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-      ...FAKE_TASK_DETAIL,
-      id: "FN-CHILD",
-      title: "Child",
-      column: "triage",
-    });
-    (store.deleteTask as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error("Cannot delete task FN-STUBBORN: still referenced as a dependency by FN-OTHER."),
-    );
-
-    const start = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/start-streaming",
-      JSON.stringify({ description: "Break this feature into subtasks" }),
-      { "Content-Type": "application/json" },
-    );
-
-    const createRes = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: start.body.sessionId,
-        parentTaskId: "FN-STUBBORN",
-        subtasks: [
-          { tempId: "subtask-1", title: "Child", description: "Do it", dependsOn: [] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(createRes.status).toBe(201);
-    expect(createRes.body.parentTaskClosed).toBe(false);
-    expect(createRes.body.parentTaskCloseError).toContain("FN-OTHER");
   });
 });
 
@@ -2703,6 +1954,27 @@ describe("POST /tasks/:id/review/address", () => {
     app.use(express.json());
     app.use("/api", createApiRoutes(store));
     return app;
+  }
+
+  function authorizeMarkedTopLevelReviewNodes(...nodes: Array<{ id: string; kind?: "prompt" | "gate" | "script" | "optional-group" }>) {
+    const workflowId = "WF-review-kind";
+    const workflowIr = {
+      version: "v1" as const,
+      name: "Marked review nodes",
+      nodes: [
+        { id: "start", kind: "start" as const },
+        ...nodes.map(({ id, kind = "prompt" }) => ({ id, kind, config: { reviewKind: "code" } })),
+        { id: "end", kind: "end" as const },
+      ],
+      edges: [
+        { from: "start", to: nodes[0]?.id ?? "end" },
+        ...nodes.slice(0, -1).map((node, index) => ({ from: node.id, to: nodes[index + 1]!.id })),
+        ...(nodes.length > 0 ? [{ from: nodes[nodes.length - 1]!.id, to: "end" }] : []),
+      ],
+    };
+    store.getTaskWorkflowSelection = vi.fn().mockReturnValue({ workflowId, stepIds: [] });
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue({ workflowId, stepIds: [] });
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({ ir: workflowIr });
   }
 
   function mockReviewerBlockLogs() {
@@ -2739,6 +2011,253 @@ describe("POST /tasks/:id/review/address", () => {
     });
   }
 
+  it("normalizes current workflow review results into stable canonical items", async () => {
+    const taskWithWorkflowReviews = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-009",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      workflowStepResults: [
+        { workflowStepId: "code-review", workflowStepName: "Code Review", phase: "pre-merge", status: "passed", verdict: "APPROVE_WITH_NOTES", output: "1. Keep the assertion focused.", completedAt: "2026-01-02T00:00:00.000Z" },
+        { workflowStepId: "plan-review", workflowStepName: "Plan Review", phase: "pre-merge", status: "failed", verdict: "REVISE", notes: "Clarify the rollback plan.", startedAt: "2026-01-03T00:00:00.000Z" },
+        { workflowStepId: "code-review", workflowStepName: "Code Review", phase: "pre-merge", status: "advisory_failure", verdict: "APPROVE", completedAt: "2026-01-04T00:00:00.000Z" },
+        { workflowStepId: "code-review", workflowStepName: "Invalid marked builtin", source: "optional-group", status: "advisory_failure", verdict: "REVISE", reviewKind: "invalid" as unknown as "code", output: "Invalid marker must not become legacy compatibility.", completedAt: "2026-01-04T01:00:00.000Z" },
+        { workflowStepId: "custom-review", workflowStepName: "Custom Review", status: "passed", verdict: "REVISE", output: "Must not be inferred." },
+        { workflowStepId: "custom-plan", workflowStepName: "Custom Plan", source: "node", status: "failed", reviewKind: "plan", notes: "Persisted marker qualifies this feedback.", completedAt: "2026-01-05T00:00:00.000Z" },
+        { workflowStepId: "code-review", workflowStepName: "Code Review", status: "pending", verdict: "REVISE" },
+        { workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "skipped", verdict: "REVISE" },
+        { workflowStepId: "code-review", workflowStepName: "Code Review", status: "passed", verdict: "REVISE", supersededAt: "2026-01-05T00:00:00.000Z" },
+        { workflowStepId: "superseded-custom", workflowStepName: "Superseded Custom", source: "node", status: "failed", reviewKind: "code", output: "Must be excluded even when only the reason remains.", supersededReason: "replaced" },
+        { workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "failed", verdict: "REVISE", bypassedAt: "2026-01-05T00:00:00.000Z" },
+      ],
+      log: [{ timestamp: reviewerBlockTimestamp, action: "code review Step 1: REVISE - legacy fallback must not duplicate structured data" }],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(taskWithWorkflowReviews);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([{ agent: "reviewer", type: "text", text: "## Code Review:\\n### Verdict: REVISE" }]);
+    authorizeMarkedTopLevelReviewNodes({ id: "custom-plan" });
+
+    const first = await REQUEST(buildApp(), "GET", "/api/tasks/FN-009/review");
+    const refreshed = await REQUEST(buildApp(), "POST", "/api/tasks/FN-009/review/refresh");
+
+    expect(first.status).toBe(200);
+    expect(refreshed.status).toBe(200);
+    expect(first.body.items).toHaveLength(4);
+    expect(first.body.items.map((item: { body: string; reviewType: string }) => [item.body, item.reviewType])).toEqual(expect.arrayContaining([
+      ["1. Keep the assertion focused.", "code"],
+      ["Clarify the rollback plan.", "plan"],
+      ["Persisted marker qualifies this feedback.", "plan"],
+      ["No written feedback was provided by this review step.", "code"],
+    ]));
+    expect(first.body.summary).toEqual({ summary: "Custom Plan failed" });
+    expect(first.body.items.map((item: { itemId: string }) => item.itemId)).toEqual(refreshed.body.items.map((item: { itemId: string }) => item.itemId));
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
+  });
+
+  it("projects resolution and rejects resolved workflow findings from revision requests", async () => {
+    const task = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-8956",
+      column: "in-review",
+      status: "awaiting-user-review",
+      assignedAgentId: null,
+      sessionFile: null,
+      workflowStepResults: [{
+        workflowStepId: "custom-code-review",
+        workflowStepName: "Code review",
+        source: "node",
+        status: "failed",
+        reviewKind: "code",
+        verdict: "REVISE",
+        output: "Structured review findings",
+        findings: [
+          { id: "receipt", title: "Receipt", body: "Fixed in review", resolution: "resolved-in-review" },
+          { id: "stale", title: "Stale", body: "Fixed later", resolution: "superseded" },
+          { id: "upheld", title: "Upheld", body: "Dispute adjudicated against implementer", resolution: "dispute-upheld" },
+          { id: "open", title: "Open", body: "Still needs work" },
+        ],
+      }],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    authorizeMarkedTopLevelReviewNodes({ id: "custom-code-review" });
+    (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-8956" });
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...task, column: "in-progress", status: null });
+
+    const review = await REQUEST(buildApp(), "GET", "/api/tasks/FN-8956/review");
+    expect(review.status).toBe(200);
+    expect(review.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resolution: "resolved-in-review" }),
+      expect.objectContaining({ resolution: "superseded" }),
+      expect.objectContaining({ resolution: "dispute-upheld" }),
+      expect.not.objectContaining({ resolution: expect.anything() }),
+    ]));
+    const byBody = new Map(review.body.items.map((item: { itemId: string; body: string }) => [item.body, item.itemId]));
+    const resolved = await REQUEST(buildApp(), "POST", "/api/tasks/FN-8956/review/address", JSON.stringify({
+      selectedItems: [{ id: byBody.get("Fixed in review"), source: "reviewer-agent" }],
+    }), { "Content-Type": "application/json" });
+    expect(resolved.status).toBe(400);
+
+    const upheld = await REQUEST(buildApp(), "POST", "/api/tasks/FN-8956/review/address", JSON.stringify({
+      selectedItems: [{ id: byBody.get("Dispute adjudicated against implementer"), source: "reviewer-agent" }],
+    }), { "Content-Type": "application/json" });
+    expect(upheld.status).toBe(400);
+
+    const open = await REQUEST(buildApp(), "POST", "/api/tasks/FN-8956/review/address", JSON.stringify({
+      selectedItems: [{ id: byBody.get("Still needs work"), source: "reviewer-agent" }],
+    }), { "Content-Type": "application/json" });
+    expect(open.status).toBe(200);
+  });
+
+  it("does not expose materialized template identities even when manually marked", async () => {
+    const taskWithMaterializedResult = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-011",
+      workflowStepResults: [{
+        workflowStepId: "steps#0:step-execute",
+        workflowStepName: "Template review",
+        source: "node",
+        status: "passed",
+        reviewKind: "code",
+        output: "A manually persisted template result must not be addressable.",
+      }],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(taskWithMaterializedResult);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    const review = await REQUEST(buildApp(), "GET", "/api/tasks/FN-011/review");
+    expect(review.status).toBe(200);
+    expect(review.body.items).toEqual([]);
+
+    const address = await REQUEST(buildApp(), "POST", "/api/tasks/FN-011/review/address", JSON.stringify({
+      selectedItems: [{ id: "workflow-review-forged", source: "reviewer-agent" }],
+    }), { "Content-Type": "application/json" });
+    expect(address.status).toBe(400);
+  });
+
+  it("accepts marked top-level review node ids containing template-like delimiters", async () => {
+    const task = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-011-delimiters",
+      column: "in-review",
+      status: "awaiting-user-review",
+      assignedAgentId: null,
+      sessionFile: null,
+      workflowStepResults: [
+        { workflowStepId: "architecture::review", workflowStepName: "Architecture review", source: "node", status: "passed", reviewKind: "plan", output: "Exact top-level identity is authoritative." },
+        { workflowStepId: "review#12:code", workflowStepName: "Code review", source: "optional-group", status: "failed", reviewKind: "code", notes: "Punctuation does not imply a template instance." },
+      ],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    authorizeMarkedTopLevelReviewNodes(
+      { id: "architecture::review", kind: "prompt" },
+      { id: "review#12:code", kind: "optional-group" },
+    );
+    (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-delimiter" });
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...task, column: "in-progress", status: null });
+
+    const review = await REQUEST(buildApp(), "GET", "/api/tasks/FN-011-delimiters/review");
+    expect(review.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "Architecture review passed", reviewType: "plan" }),
+      expect.objectContaining({ title: "Code review failed", reviewType: "code" }),
+    ]));
+
+    const address = await REQUEST(buildApp(), "POST", "/api/tasks/FN-011-delimiters/review/address", JSON.stringify({
+      selectedItems: [{ id: review.body.items[0].itemId, source: "reviewer-agent" }],
+    }), { "Content-Type": "application/json" });
+    expect(address.status).toBe(200);
+  });
+
+  it("addresses a marked custom review with a server-owned canonical snapshot", async () => {
+    const task = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-012",
+      column: "in-review",
+      status: "awaiting-user-review",
+      assignedAgentId: null,
+      sessionFile: null,
+      reviewState: undefined,
+      workflowStepResults: [{
+        workflowStepId: "custom-code-check",
+        workflowStepName: "Custom code check",
+        source: "node",
+        status: "failed",
+        reviewKind: "code",
+        output: "Use the authoritative persisted feedback.",
+        completedAt: "2026-01-06T00:00:00.000Z",
+      }],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    authorizeMarkedTopLevelReviewNodes({ id: "custom-code-check" });
+    (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-custom" });
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...task, column: "in-progress", status: null });
+
+    const review = await REQUEST(buildApp(), "GET", "/api/tasks/FN-012/review");
+    expect(review.body.items).toEqual([expect.objectContaining({
+      title: "Custom code check failed",
+      body: "Use the authoritative persisted feedback.",
+      reviewType: "code",
+      sourceMode: "reviewer-agent",
+    })]);
+    const itemId = review.body.items[0].itemId;
+    const address = await REQUEST(buildApp(), "POST", "/api/tasks/FN-012/review/address", JSON.stringify({
+      selectedItems: [{ id: itemId, source: "reviewer-agent", body: "FORGED" }],
+    }), { "Content-Type": "application/json" });
+
+    expect(address.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-012", expect.objectContaining({
+      reviewState: expect.objectContaining({
+        addressing: [expect.objectContaining({ itemId, snapshot: expect.objectContaining({ body: "Use the authoritative persisted feedback." }) })],
+      }),
+    }));
+  });
+
+  it.each([
+    ["unmarked", { workflowStepId: "review-by-name", workflowStepName: "Review", source: "node", status: "failed", verdict: "REVISE", output: "lookalike" }],
+    ["pending", { workflowStepId: "pending", workflowStepName: "Pending", source: "node", status: "pending", reviewKind: "plan", output: "not terminal" }],
+    ["skipped", { workflowStepId: "skipped", workflowStepName: "Skipped", source: "node", status: "skipped", reviewKind: "code", output: "not current" }],
+    ["bypassed", { workflowStepId: "bypassed", workflowStepName: "Bypassed", source: "node", status: "failed", reviewKind: "code", output: "not current", bypassReason: "operator" }],
+    ["superseded", { workflowStepId: "superseded", workflowStepName: "Superseded", source: "node", status: "passed", reviewKind: "plan", output: "not current", supersededReason: "retry" }],
+    ["prior attempt only", { workflowStepId: "prior", workflowStepName: "Prior", source: "node", status: "skipped", priorAttempts: [{ workflowStepId: "prior", workflowStepName: "Prior", source: "node", status: "failed", reviewKind: "code", output: "history only" }] }],
+    ["blank", { workflowStepId: "blank", workflowStepName: "Blank", source: "optional-group", status: "passed", reviewKind: "code", output: "   ", notes: "" }],
+    ["template instance", { workflowStepId: "group::child", workflowStepName: "Template", source: "node", status: "passed", reviewKind: "code", output: "not addressable" }],
+  ])("rejects GET and canonical address for excluded marked custom %s results", async (_state, result) => {
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-013", workflowStepResults: [result], reviewState: undefined };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    const review = await REQUEST(buildApp(), "GET", "/api/tasks/FN-013/review");
+    const refreshed = await REQUEST(buildApp(), "POST", "/api/tasks/FN-013/review/refresh");
+    expect(review.body.items).toEqual([]);
+    expect(refreshed.body.items).toEqual([]);
+    const address = await REQUEST(buildApp(), "POST", "/api/tasks/FN-013/review/address", JSON.stringify({
+      selectedItems: [{ id: "workflow-review-forged", source: "reviewer-agent" }],
+    }), { "Content-Type": "application/json" });
+    expect(address.status).toBe(400);
+  });
+
+  it("uses legacy activity review feedback when workflow results are absent or unsupported", async () => {
+    const taskWithUnsupportedWorkflowReview = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-010",
+      workflowStepResults: [{ workflowStepId: "custom-review", workflowStepName: "Custom Review", status: "passed", verdict: "REVISE", output: "not a current built-in review node" }],
+      log: [{ timestamp: fallbackTimestamp, action: "plan review Step 2: RETHINK - revise the approach" }],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(taskWithUnsupportedWorkflowReview);
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/tasks/FN-010/review");
+
+    expect(res.status).toBe(200);
+    expect(res.body.items).toEqual([expect.objectContaining({
+      itemId: fallbackItemId,
+      title: "plan review RETHINK",
+      body: "plan review Step 2: RETHINK - revise the approach",
+      verdict: "RETHINK",
+      reviewType: "plan",
+    })]);
+    expect(store.getAgentLogs).toHaveBeenCalledWith("FN-010");
+  });
+
   it("resumes reviewer-agent in-review tasks using canonical log-derived review ids when reviewState is absent", async () => {
     const taskWithoutPersistedItems = {
       ...FAKE_TASK_DETAIL,
@@ -2773,6 +2292,68 @@ describe("POST /tasks/:id/review/address", () => {
     expect(store.addSteeringComment).toHaveBeenCalledWith("FN-001", expect.stringContaining("Fix tests before merge."), "user");
     expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { preserveProgress: true });
     expect(store.updateStep).toHaveBeenCalledWith("FN-001", 0, "pending");
+  });
+
+  it("addresses workflow review items by canonical id without trusting forged client feedback", async () => {
+    const taskWithWorkflowReview = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-009",
+      column: "in-review",
+      status: "awaiting-user-review",
+      assignedAgentId: null,
+      sessionFile: null,
+      workflowStepResults: [{
+        workflowStepId: "code-review",
+        workflowStepName: "Code Review",
+        phase: "pre-merge",
+        status: "passed",
+        verdict: "APPROVE_WITH_NOTES",
+        output: "Canonical advisory: preserve this text.",
+        completedAt: "2026-01-05T00:00:00.000Z",
+      }],
+      reviewState: undefined,
+    };
+    const movedTask = { ...taskWithWorkflowReview, column: "in-progress", status: null };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(taskWithWorkflowReview);
+    (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
+
+    const review = await REQUEST(buildApp(), "GET", "/api/tasks/FN-009/review");
+    const itemId = review.body.items[0].itemId;
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-009/review/address", JSON.stringify({
+      selectedItems: [{
+        id: itemId,
+        source: "reviewer-agent",
+        summary: "FORGED summary",
+        body: "FORGED body",
+        author: "attacker",
+        filePath: "forged.ts",
+        lineNumber: 999,
+        url: "https://invalid.example/forged",
+      }],
+    }), { "Content-Type": "application/json" });
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-009", {
+      reviewState: expect.objectContaining({
+        addressing: [expect.objectContaining({
+          itemId,
+          snapshot: expect.objectContaining({
+            summary: "Code Review APPROVE_WITH_NOTES",
+            body: "Canonical advisory: preserve this text.",
+            authorLogin: "reviewer-agent",
+            filePath: undefined,
+            lineNumber: undefined,
+            url: undefined,
+          }),
+        })],
+      }),
+    });
+    const steering = (store.addSteeringComment as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(steering).toContain("Canonical advisory: preserve this text.");
+    expect(steering).not.toContain("FORGED");
+    expect(steering).not.toContain("invalid.example");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-009", "in-progress", { preserveProgress: true });
   });
 
   it("accepts reviewer-agent fallback log review ids when no reviewer text block exists", async () => {
@@ -2905,7 +2486,19 @@ describe("POST /tasks/:id/pr/address-feedback", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/pr/address-feedback", "{}", { "Content-Type": "application/json" });
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toContain("in-review or in-progress");
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-08-03-03:00 (red on main from my own #2723):
+    THE MESSAGE NOW NAMES THE BOARD'S RESOLVED COLUMNS. #2723 changed this 400 from
+    "PR feedback can only be addressed for in-review or in-progress tasks" to
+    "... for tasks in '<review>' or '<wip>'" — because telling an operator their card must be `in-review` on a
+    board with no such column sends them looking for something that was deleted.
+
+    The assertion checked the OLD prose. Asserting the resolved column NAMES instead of the sentence keeps the
+    case pinned to what matters (the refusal identifies the lanes the operator can actually use) and stops it
+    breaking again the next time the wording is improved.
+    */
+    expect(res.body.error).toContain("in-review");
+    expect(res.body.error).toContain("in-progress");
     expect(store.addSteeringComment).not.toHaveBeenCalled();
     expect(store.logEntry).not.toHaveBeenCalled();
   });

@@ -4,7 +4,13 @@ import { act, render, screen, fireEvent, waitFor, within } from "@testing-librar
 import { buildIssuePlanningSeed, GitHubImportModal } from "../GitHubImportModal";
 import { buildIssueChatPrefill } from "../ChatView";
 import { ConfirmDialogProvider } from "../../hooks/useConfirm";
+import { ModalDismissPreferenceProvider } from "../../hooks/useOverlayDismiss";
 import { NavigationHistoryProvider, useNavigationHistory } from "../../hooks/useNavigationHistory";
+import {
+  assertModalGeometryRecoveryAndSheetContracts,
+  assertRenderedModalTouchGeometry,
+  expectFloatingWindowStructure,
+} from "./floatingWindowMigration.test-helpers";
 import {
   apiFetchGitHubIssues,
   apiImportGitHubIssue,
@@ -25,6 +31,8 @@ import {
   fetchGitRemotes,
   createTask,
   translateImportContent,
+  getTranslateErrorMessage,
+  fetchCachedImportTranslation,
   autoTranslateImportIssues,
 } from "../../api";
 import type { Task } from "@fusion/core";
@@ -56,9 +64,12 @@ vi.mock("../../api", async (importOriginal) => {
     fetchGitRemotes: vi.fn(),
     createTask: vi.fn(),
     translateImportContent: vi.fn(),
+    fetchCachedImportTranslation: vi.fn(),
     autoTranslateImportIssues: vi.fn(),
   };
 });
+
+const floatingWindowCss = readFileSync(resolve(__dirname, "../FloatingWindow.css"), "utf8");
 
 const mockTask: Task = {
   id: "FN-001",
@@ -109,12 +120,29 @@ describe("GitHubImportModal", () => {
   const onClose = vi.fn();
   const onImport = vi.fn();
 
+  /*
+  FNXC:GitHubImport 2026-08-17-23:47:
+  FN-8722 gave the standalone importer sheet a local `margin-inline-end: 0` to undo the shared
+  FloatingWindow body gutter that otherwise shifted every shell region left. That shared gutter is
+  deleted outright, so the override is gone with it and this guard inverts: the importer must NOT
+  carry any body-gutter rule of its own, and the detail panel now owns a symmetric inset directly
+  instead of borrowing the gutter for its right side (it previously set `padding-inline-end: 0`).
+  */
+  it("carries no body gutter override and owns a symmetric detail-panel inset", () => {
+    expect(floatingWindowCss).not.toContain(".floating-window--github-import .floating-window__body");
+
+    const importCss = readFileSync(resolve(__dirname, "../GitHubImportModal.css"), "utf8");
+    const detailPanel = importCss.match(/\.github-import-detail-panel\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(detailPanel).toContain("padding: var(--space-lg);");
+    expect(detailPanel).not.toMatch(/padding-inline-end\s*:/);
+    expect(importCss).not.toContain(".floating-window--tablet-viewport .github-import-detail-panel");
+  });
+
   it("uses color-mix tokens for focus and selection surfaces", () => {
     const source = readFileSync(resolve(__dirname, "../GitHubImportModal.css"), "utf8");
     expect(source).not.toContain("rgba(var(--color-primary-rgb)");
     expect(source).not.toContain("rgba(var(--in-progress-rgb)");
     expect(source).toContain("color-mix(in srgb, var(--in-progress) 12%, transparent)");
-    expect(source).toContain("Some hardcoded colors below");
   });
 
 
@@ -171,6 +199,72 @@ describe("GitHubImportModal", () => {
   });
 
   /*
+  FNXC:GitHubImport 2026-09-07-05:08:
+  Phone import controls must distribute leftover row width and embedded Import Tasks must use the
+  compact inset. These source-structure assertions protect the required cascade ordering because
+  jsdom does not reliably evaluate mobile media queries.
+  */
+  it("keeps phone import controls wide and embedded insets compact after their base rules", () => {
+    const source = readFileSync(resolve(__dirname, "../GitHubImportModal.css"), "utf8");
+    const phoneStyles = source.slice(source.lastIndexOf("@media (max-width: 640px)"));
+    const baseControls = source.match(/\.github-import-controls > \*\s*\{[^}]*\}/)?.[0] ?? "";
+    const baseEmbeddedHeader = source.match(/\.github-import-modal__embedded-header\s*\{[^}]*\}/)?.[0] ?? "";
+    const baseEmbeddedBody = source.match(/\.github-import-modal--embedded \.github-import-modal__body\s*\{[^}]*\}/)?.[0] ?? "";
+
+    expect(source.lastIndexOf("@media (max-width: 640px)")).toBeGreaterThan(
+      source.indexOf(".github-import-modal--embedded .github-import-modal__body {"),
+    );
+    expect(phoneStyles).toContain(".github-import-controls > * {");
+    expect(phoneStyles).toContain("flex: 1 1 auto;");
+    expect(phoneStyles).toContain(".github-import-provider {");
+    expect(phoneStyles).toContain("display: flex;");
+    expect(phoneStyles).toContain("gap: var(--space-sm);");
+    expect(phoneStyles).toContain(".github-import-tabs {");
+    expect(phoneStyles).toContain("flex-wrap: wrap;");
+    expect(phoneStyles).toContain(".github-import-provider .github-import-tab,");
+    expect(phoneStyles).toContain(".github-import-tabs .github-import-tab {");
+    expect(phoneStyles).toContain("justify-content: center;");
+    expect(phoneStyles).toContain(".github-import-modal__embedded-header {");
+    expect(phoneStyles).toContain("padding: var(--space-lg) var(--space-md);");
+    expect(phoneStyles).toContain(".github-import-modal--embedded .github-import-modal__body {");
+    expect(phoneStyles).toContain("padding: var(--space-md);");
+    expect(phoneStyles).not.toMatch(/padding:\s*[^;]*(?:\d+px|#|rgba\()/);
+    expect(phoneStyles).not.toContain("!important");
+
+    expect(baseControls).toContain("flex: 0 0 auto;");
+    expect(baseEmbeddedHeader).toContain("padding: var(--space-lg) var(--space-xl);");
+    expect(baseEmbeddedBody).toContain("padding: var(--space-lg) var(--space-xl) var(--space-lg);");
+  });
+
+  it("keeps labeled GitHub and GitLab controls available in modal and embedded presentations", async () => {
+    vi.mocked(fetchSettings).mockResolvedValue({ gitlabEnabled: true } as never);
+    for (const presentation of ["modal", "embedded"] as const) {
+      vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+      const result = render(
+        <GitHubImportModal
+          isOpen
+          onClose={onClose}
+          onImport={onImport}
+          tasks={[]}
+          presentation={presentation}
+        />,
+      );
+
+      expect(await screen.findByRole("group", { name: "Import provider" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "GitHub" }));
+      expect(await screen.findByRole("tab", { name: "Issues" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Load issues from repository" })).toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("button", { name: "GitLab" }));
+      expect(await screen.findByRole("tablist", { name: "GitLab resource type" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Project issues" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Group issues" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Merge requests" })).toBeInTheDocument();
+      result.unmount();
+    }
+  });
+
+  /*
    * FNXC:GitHubImport 2026-07-07-00:00:
    * FN-7657 introduced per-project persistence for the import view (provider/tab/labels/remote/selection) under
    * `kb-dashboard-github-import-state` (unscoped when no projectId is passed, `kb:{projectId}:...` otherwise). Most
@@ -208,6 +302,8 @@ describe("GitHubImportModal", () => {
     vi.mocked(fetchSettings).mockReset();
     vi.mocked(createTask).mockReset();
     vi.mocked(autoTranslateImportIssues).mockReset();
+    vi.mocked(fetchCachedImportTranslation).mockReset();
+    vi.mocked(fetchCachedImportTranslation).mockResolvedValue(null);
     vi.mocked(createTask).mockResolvedValue(mockTask);
     vi.mocked(fetchSettings).mockResolvedValue({ gitlabEnabled: true } as never);
     vi.mocked(autoTranslateImportIssues).mockImplementation(async (_owner, _repo, items) => ({
@@ -398,7 +494,166 @@ describe("GitHubImportModal", () => {
     expect(sequence).toEqual(["board", "planning"]);
     expect(destination).toBe("planning");
     expect(onPlanningMode).toHaveBeenCalledTimes(1);
+    expect(onPlanningMode).toHaveBeenCalledWith(
+      buildIssuePlanningSeed(issue),
+      undefined,
+      {
+        provider: "github",
+        repository: "dustinbyrne/kb",
+        issueNumber: issue.number,
+        url: issue.html_url,
+        title: issue.title,
+        commentsUnavailable: true,
+      },
+    );
     expect(apiImportGitHubIssue).not.toHaveBeenCalled();
+  });
+
+  it("passes structured GitHub source context from the modal Plan action", async () => {
+    const issue = { number: 45, title: "Modal plan", body: "Keep this issue context.", html_url: "https://github.com/dustinbyrne/kb/issues/45", labels: [], state: "open" };
+    const onPlanningMode = vi.fn();
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+    vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce([issue]);
+
+    render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} onPlanningMode={onPlanningMode} tasks={[]} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Select issue #45/i }));
+    fireEvent.click(screen.getByTestId("github-import-action-plan"));
+
+    expect(onPlanningMode).toHaveBeenCalledWith(
+      buildIssuePlanningSeed(issue),
+      undefined,
+      {
+        provider: "github",
+        repository: "dustinbyrne/kb",
+        issueNumber: issue.number,
+        url: issue.html_url,
+        title: issue.title,
+        commentsUnavailable: true,
+      },
+    );
+  });
+
+  /*
+  FNXC:GitHubPlanningSourceIssue 2026-08-09-14:31:
+  Planning must never capture a prior issue's visible detail while a newly selected issue's detail request is pending.
+  The per-issue cache is the provenance source; absent selected-issue cache records the L1 partial-capture marker.
+  */
+  it("does not capture stale selected-issue comments while the next issue detail loads", async () => {
+    const firstIssue = { number: 46, title: "First issue", body: "![first body](https://github.com/user-attachments/assets/first-body)", html_url: "https://github.com/dustinbyrne/kb/issues/46", labels: [], state: "open" };
+    const secondIssue = { number: 47, title: "Second issue", body: "![second body](https://github.com/user-attachments/assets/second-body)", html_url: "https://github.com/dustinbyrne/kb/issues/47", labels: [], state: "open" };
+    const onPlanningMode = vi.fn();
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+    vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce([firstIssue, secondIssue]);
+    vi.mocked(apiFetchGitHubIssueDetail)
+      .mockResolvedValueOnce({ comments: [{ author: "octocat", body: "![first comment](https://github.com/user-attachments/assets/first-comment)", createdAt: "2026-08-09T00:00:00Z", authorIsBot: false }] })
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} onPlanningMode={onPlanningMode} tasks={[]} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Select issue #46/i }));
+    await waitFor(() => expect(apiFetchGitHubIssueDetail).toHaveBeenCalledWith("dustinbyrne/kb", 46));
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /Select issue #47/i }));
+    fireEvent.click(screen.getByTestId("github-import-action-plan"));
+
+    expect(onPlanningMode).toHaveBeenCalledWith(
+      buildIssuePlanningSeed(secondIssue),
+      undefined,
+      expect.objectContaining({
+        provider: "github",
+        issueNumber: secondIssue.number,
+        imageBodies: [secondIssue.body],
+        commentsUnavailable: true,
+      }),
+    );
+    expect(onPlanningMode.mock.calls[0]?.[2]).not.toEqual(expect.objectContaining({
+      imageBodies: expect.arrayContaining([expect.stringContaining("first-comment")]),
+    }));
+  });
+
+  /*
+  FNXC:GitHubPlanningSourceIssue 2026-08-09-16:05:
+  Planning's desktop and mobile action rows must transport identical body-plus-comment image context.
+  The client deliberately sends all image-bearing bodies; the server alone applies the policy-resolved image cap.
+  */
+  it.each([["desktop", 1200], ["mobile", 480]] as const)("captures every loaded image-bearing comment at the %s breakpoint without a client image budget", async (_breakpoint, width) => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { writable: true, configurable: true, value: width });
+    window.dispatchEvent(new Event("resize"));
+    try {
+      const issue = { number: 48, title: "Comment screenshots", body: "![body](https://github.com/user-attachments/assets/body)", html_url: "https://github.com/dustinbyrne/kb/issues/48", labels: [], state: "open" };
+      const unresolved = Array.from({ length: 12 }, (_, index) => `![bad-${index}](https://example.com/${index}.png)`).join("\n");
+      const later = "![later](https://github.com/user-attachments/assets/later)";
+      const onPlanningMode = vi.fn();
+      vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+      vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce([issue]);
+      vi.mocked(apiFetchGitHubIssueDetail).mockResolvedValueOnce({ comments: [
+        { author: "one", body: "plain prose only", createdAt: "2026-08-09T00:00:00Z", authorIsBot: false },
+        { author: "two", body: unresolved, createdAt: "2026-08-09T00:01:00Z", authorIsBot: false },
+        { author: "three", body: later, createdAt: "2026-08-09T00:02:00Z", authorIsBot: false },
+      ] });
+
+      render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} onPlanningMode={onPlanningMode} tasks={[]} />);
+      fireEvent.click(await screen.findByRole("button", { name: /Select issue #48/i }));
+      await waitFor(() => expect(apiFetchGitHubIssueDetail).toHaveBeenCalledWith("dustinbyrne/kb", 48));
+      await act(async () => { await Promise.resolve(); });
+      fireEvent.click(screen.getByTestId("github-import-action-plan"));
+
+      expect(onPlanningMode.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+        provider: "github",
+        imageBodies: [issue.body, unresolved, later],
+      }));
+    } finally {
+      Object.defineProperty(window, "innerWidth", { writable: true, configurable: true, value: originalInnerWidth });
+      window.dispatchEvent(new Event("resize"));
+    }
+  });
+
+  /*
+  FNXC:GitHubPlanningSourceIssue 2026-08-09-14:59:
+  Issue numbers are repository-local. Switching remotes before Plan must not reuse the first
+  repository's cached comments for an identically numbered issue.
+  */
+  it("keeps captured comment bodies isolated when repositories reuse an issue number", async () => {
+    const originIssue = { number: 48, title: "Origin screenshot", body: "![origin](https://github.com/user-attachments/assets/origin-body)", html_url: "https://github.com/dustinbyrne/kb/issues/48", labels: [], state: "open" };
+    const upstreamIssue = { number: 48, title: "Upstream screenshot", body: "![upstream](https://github.com/user-attachments/assets/upstream-body)", html_url: "https://github.com/upstream/kb/issues/48", labels: [], state: "open" };
+    const onPlanningMode = vi.fn();
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce(multipleRemotes);
+    vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce([originIssue]).mockResolvedValueOnce([upstreamIssue]);
+    vi.mocked(apiFetchGitHubIssueDetail)
+      .mockResolvedValueOnce({ comments: [{ author: "origin", body: "![origin comment](https://github.com/user-attachments/assets/origin-comment)", createdAt: "2026-08-09T00:00:00Z", authorIsBot: false }] })
+      .mockResolvedValueOnce({ comments: [{ author: "upstream", body: "![upstream comment](https://github.com/user-attachments/assets/upstream-comment)", createdAt: "2026-08-09T00:01:00Z", authorIsBot: false }] });
+
+    render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} onPlanningMode={onPlanningMode} tasks={[]} />);
+    await screen.findByText("Origin screenshot");
+    fireEvent.click(screen.getByRole("button", { name: /Select issue #48/i }));
+    await waitFor(() => expect(apiFetchGitHubIssueDetail).toHaveBeenCalledWith("dustinbyrne/kb", 48));
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "upstream" } });
+    await screen.findByText("Upstream screenshot");
+    fireEvent.click(screen.getByRole("button", { name: /Select issue #48/i }));
+    await waitFor(() => expect(apiFetchGitHubIssueDetail).toHaveBeenCalledWith("upstream/kb", 48));
+    fireEvent.click(screen.getByTestId("github-import-action-plan"));
+
+    expect(onPlanningMode.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+      repository: "upstream/kb",
+      imageBodies: [upstreamIssue.body, "![upstream comment](https://github.com/user-attachments/assets/upstream-comment)"],
+    }));
+    expect(onPlanningMode.mock.calls[0]?.[2]?.imageBodies).not.toEqual(expect.arrayContaining([expect.stringContaining("origin-comment")]));
+  });
+
+  it("drops an oversized image-bearing body whole and records the partial capture", async () => {
+    const oversized = `![large](https://github.com/user-attachments/assets/large)${"x".repeat(256_000)}`;
+    const issue = { number: 49, title: "Large screenshot", body: oversized, html_url: "https://github.com/dustinbyrne/kb/issues/49", labels: [], state: "open" };
+    const onPlanningMode = vi.fn();
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+    vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce([issue]);
+
+    render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} onPlanningMode={onPlanningMode} tasks={[]} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Select issue #49/i }));
+    fireEvent.click(screen.getByTestId("github-import-action-plan"));
+
+    expect(onPlanningMode.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ droppedBodyCount: 1, commentsUnavailable: true }));
+    expect(onPlanningMode.mock.calls[0]?.[2]).not.toEqual(expect.objectContaining({ imageBodies: expect.any(Array) }));
   });
 
   it("renders Plan only for selectable GitHub issues with Planning Mode", async () => {
@@ -931,8 +1186,60 @@ describe("GitHubImportModal", () => {
   });
 
   it("does not render when isOpen is false", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
     render(<GitHubImportModal isOpen={false} onClose={onClose} onImport={onImport} tasks={[]} />);
     expect(screen.queryByText("Import from GitHub")).toBeNull();
+    expect(setItem).not.toHaveBeenCalledWith("floating-window:github-import", expect.any(String));
+    setItem.mockRestore();
+  });
+
+  it("covers root importer FloatingWindow touch geometry, recovery, and sheet suspension", async () => {
+    const originalWidth = window.innerWidth;
+    const originalHeight = window.innerHeight;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1600 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 1000 });
+    const mountModal = () => {
+      vi.mocked(fetchGitRemotes).mockResolvedValueOnce([]);
+      return render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} tasks={[]} />);
+    };
+    try {
+      const rendered = mountModal();
+      await waitFor(() => expect(rendered.baseElement.querySelector(".github-import-modal__header")).not.toBeNull());
+      expectFloatingWindowStructure("github-import");
+      assertRenderedModalTouchGeometry(
+        "github-import",
+        rendered.baseElement.querySelector(".github-import-modal__header")!,
+      );
+      rendered.unmount();
+
+      assertModalGeometryRecoveryAndSheetContracts("github-import", mountModal);
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: originalWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: originalHeight });
+    }
+  });
+
+  it("uses the shared FloatingWindow outside-pointer contract only when the preference is enabled", async () => {
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce([]);
+    const disabled = render(
+      <ModalDismissPreferenceProvider enabled={false}>
+        <GitHubImportModal isOpen onClose={onClose} onImport={onImport} tasks={[]} />
+      </ModalDismissPreferenceProvider>,
+    );
+    await waitFor(() => expect(disabled.baseElement.querySelector("[data-testid='floating-window-github-import']")).not.toBeNull());
+    fireEvent.pointerDown(document.body);
+    expect(onClose).not.toHaveBeenCalled();
+    disabled.unmount();
+
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce([]);
+    const enabled = render(
+      <ModalDismissPreferenceProvider enabled>
+        <GitHubImportModal isOpen onClose={onClose} onImport={onImport} tasks={[]} />
+      </ModalDismissPreferenceProvider>,
+    );
+    await waitFor(() => expect(enabled.baseElement.querySelector("[data-testid='floating-window-github-import']")).not.toBeNull());
+    fireEvent.pointerDown(document.body);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   // FNXC:EmbeddedPresentation 2026-06-22-12:00:
@@ -976,15 +1283,15 @@ describe("GitHubImportModal", () => {
 
     it("keeps the modal overlay and Escape-to-close in modal mode", async () => {
       vi.mocked(fetchGitRemotes).mockResolvedValueOnce([]);
-      const { container } = render(
+      const { baseElement } = render(
         <GitHubImportModal isOpen={true} onClose={onClose} onImport={onImport} tasks={[]} />,
       );
 
       await waitFor(() => {
         expect(screen.getByText("Import from GitHub")).toBeTruthy();
       });
-      expect(container.querySelector(".modal-overlay")).not.toBeNull();
-      expect(container.querySelector(".github-import-modal--embedded")).toBeNull();
+      expect(baseElement.querySelector("[data-testid='floating-window-overlay-github-import']")).not.toBeNull();
+      expect(baseElement.querySelector(".github-import-modal--embedded")).toBeNull();
       fireEvent.keyDown(document, { key: "Escape" });
       expect(onClose).toHaveBeenCalled();
     });
@@ -1092,6 +1399,43 @@ describe("GitHubImportModal", () => {
     expect(within(previewCard).getByText(/Problème d'aperçu d'importation/)).toBeTruthy();
     // Toggling back to the original must revert the bar too, not strand it on the translation.
     expect(titleBar.textContent).toContain("#7 — Problème d'aperçu d'importation");
+  });
+
+  it("hydrates a persisted manual translation on reselect without another Translate click", async () => {
+    const frenchBody = "Cette issue contient assez de texte français pour déclencher la traduction dans le panneau d'importation.";
+    const issues = [
+      { number: 70, title: "Problème traduit", body: frenchBody, html_url: "https://github.com/owner/repo/issues/70", labels: [] },
+      { number: 71, title: "Autre problème", body: frenchBody, html_url: "https://github.com/owner/repo/issues/71", labels: [] },
+    ];
+    vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+    vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce(issues);
+    vi.mocked(fetchCachedImportTranslation).mockImplementation(async (fields, _locale, identity) =>
+      identity.issueNumber === 70 ? { title: "Persisted translation", body: fields.body } : null,
+    );
+
+    render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} tasks={[]} />);
+    await screen.findByText("Problème traduit");
+    fireEvent.click(screen.getByRole("button", { name: /Select issue #70/i }));
+    await waitFor(() => expect(screen.getByText("Persisted translation")).toBeTruthy());
+    expect(translateImportContent).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /Select issue #71/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Select issue #70/i }));
+    await waitFor(() => expect(screen.getByText("Persisted translation")).toBeTruthy());
+    expect(translateImportContent).not.toHaveBeenCalled();
+    expect(fetchCachedImportTranslation).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Problème traduit" }),
+      "en",
+      expect.objectContaining({ provider: "github", issueNumber: 70 }),
+      undefined,
+    );
+  });
+
+  it("maps rate-limit, validation, and service failures to distinct translation banner copy", () => {
+    const withStatus = (message: string, status: number) => Object.assign(new Error(message), { status });
+    expect(getTranslateErrorMessage(withStatus("TRANSLATE_RATE_LIMIT", 429))).toBe("Too many translation requests. Please wait an hour.");
+    expect(getTranslateErrorMessage(withStatus("TRANSLATE_VALIDATION_ERROR", 400))).toBe("Translation request is invalid. Check the selected content and try again.");
+    expect(getTranslateErrorMessage(withStatus("TRANSLATE_SERVICE_ERROR", 503))).toBe("Translation service is temporarily unavailable. Please try again shortly.");
   });
 
   it("does not show translate controls for English content when dashboard language is English", async () => {
@@ -2424,6 +2768,38 @@ describe("GitHubImportModal", () => {
 
 
 
+    it.each(["modal", "embedded"] as const)("retains long pull rows, imported state, and the detail sheet in the %s presentation", async (presentation) => {
+      const longBranch = "branch-".repeat(24);
+      const longPull = {
+        number: 31,
+        title: "A deliberately long pull-request title that remains available to the mobile list row",
+        body: "PR body",
+        html_url: "https://github.com/owner/repo/pull/31",
+        headBranch: longBranch,
+        baseBranch: longBranch,
+      };
+      const importedTask: Task = {
+        ...mockPRTask,
+        description: "Review and address any issues in this pull request.\n\nPR: https://github.com/owner/repo/pull/31",
+      };
+      vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+      vi.mocked(apiFetchGitHubPulls).mockResolvedValueOnce([longPull, mockPulls[0]]);
+
+      render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} tasks={[importedTask]} presentation={presentation} />);
+      fireEvent.click(screen.getByRole("tab", { name: /Pull Requests/i }));
+
+      const longRow = await screen.findByRole("button", { name: /Select pull request #31/i });
+      expect(longRow).toHaveTextContent(longPull.title);
+      expect(longRow).toHaveTextContent(`${longBranch} → ${longBranch}`);
+      expect(longRow).toBeDisabled();
+      expect(within(longRow).getByText("Imported")).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: /Select pull request #1/i }));
+      const detail = await screen.findByTestId("floating-window-github-import-detail");
+      expect(detail.querySelector(".github-import-detail-panel")).toBeTruthy();
+      expect(within(detail).getByTestId("github-import-detail-actions")).toBeTruthy();
+    });
+
     it("calls apiImportGitHubPull when Import is clicked on PRs tab", async () => {
       vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
       vi.mocked(apiFetchGitHubPulls).mockResolvedValueOnce(mockPulls);
@@ -2849,16 +3225,84 @@ describe("GitHubImportModal", () => {
     expect(actionRowRule).toContain("gap: var(--space-sm);");
   });
 
+  /*
+  FNXC:GitHubImport 2026-08-09-06:48:
+  FN-8766 gives desktop Task Detail visible overflow, and that selector also matches phones.
+  Its phone sheet therefore reasserts clipping with `!important`; all sheet hosts share geometry,
+  while Chat and GitHub Import inherit clipping from the base FloatingWindow rule rather than
+  requiring identical rule text. Any `overflow: visible` override, including `!important`, breaks
+  that inherited clipping and is forbidden.
+  */
   it("scopes the import detail FloatingWindow as the shared mobile full-screen sheet", () => {
     const source = readFileSync(resolve(__dirname, "../FloatingWindow.css"), "utf8");
-    const chatSheetRule = source.match(/\.floating-window--chat\s*\{([^}]*)\}/)?.[1] ?? "";
-    const importSheetRule = source.match(/\.floating-window--github-import-detail\s*\{([^}]*)\}/)?.[1] ?? "";
-    const taskSheetRule = source.match(/\.floating-window--task-detail\s*\{([^}]*)\}/)?.[1] ?? "";
+    /*
+     * FNXC:GitHubImport 2026-08-17-23:47:
+     * Terminate on the media block's OWN closing brace (a `}` at column 0 — every rule inside is
+     * indented) rather than on a following `@media`. The old pattern assumed another at-rule came
+     * next, so deleting the phone-only block that followed it (it held nothing but a
+     * `margin-inline-end: 0` undo of the retired shared gutter) made this match fail and the whole
+     * sheet-geometry contract silently unverifiable.
+     */
+    const phoneSheetMedia = source.match(/@media \(max-width: 767\.98px\), \(max-height: 480px\) \{([\s\S]*?)\n\}\n/)?.[1];
+    expect(phoneSheetMedia, "phone-sheet media query must exist").toBeTruthy();
+    const declarationList = (ruleBody: string) => ruleBody.split(";").map((declaration) => declaration.trim()).filter(Boolean);
+    const ruleDeclarations = (css: string, selector: RegExp, name: string) => {
+      const ruleBody = css.match(selector)?.[1];
+      expect(ruleBody, `${name} rule must exist`).toBeTruthy();
+      return declarationList(ruleBody!);
+    };
+    const sheetRule = (selector: RegExp, name: string) => ruleDeclarations(phoneSheetMedia!, selector, `${name} phone-sheet`);
+    const sharedGeometry = [
+      "inset: 0 !important",
+      "width: 100vw !important",
+      "height: 100dvh !important",
+      "min-width: 0 !important",
+      "min-height: 0 !important",
+      "max-width: 100vw !important",
+      "max-height: 100dvh !important",
+      "border: none",
+      "border-radius: 0",
+      "box-shadow: none",
+    ];
+    const chatSheetDeclarations = sheetRule(/\.floating-window--chat\s*\{([^}]*)\}/, "Quick Chat");
+    const importSheetDeclarations = sheetRule(/\.floating-window--github-import-detail\s*\{([^}]*)\}/, "GitHub Import detail");
+    const taskSheetDeclarations = sheetRule(/\.floating-window--task-detail\s*\{([^}]*)\}/, "Task Detail");
 
-    expect(importSheetRule).toBe(chatSheetRule);
-    expect(importSheetRule).toBe(taskSheetRule);
-    expect(importSheetRule).toContain("inset: 0 !important;");
-    expect(source).toMatch(/@media \(max-width: 768px\)[\s\S]*\.floating-window--github-import-detail \.floating-window__resize-handle\s*\{\s*display: none;/);
+    for (const [name, declarations] of [
+      ["Quick Chat", chatSheetDeclarations],
+      ["GitHub Import detail", importSheetDeclarations],
+      ["Task Detail", taskSheetDeclarations],
+    ]) {
+      for (const declaration of sharedGeometry) {
+        expect(declarations, `${name} must retain shared phone-sheet geometry`).toContain(declaration);
+      }
+    }
+
+    const baseDeclarations = ruleDeclarations(source, /(?:^|\n)\s*\.floating-window\s*\{([^}]*)\}/, "base FloatingWindow");
+    expect(baseDeclarations, "base FloatingWindow must provide inherited sheet clipping").toContain("overflow: hidden");
+    expect(taskSheetDeclarations, "Task Detail must override its desktop visible-overflow rule on phones").toContain("overflow: hidden !important");
+
+    /*
+     * FNXC:FloatingWindow 2026-08-18-00:26:
+     * The visible-overflow host that phone sheets must re-clip is now the SHARED desktop rule, not
+     * a task-detail-scoped one: FN-8766's outboard east targets were promoted to every window when
+     * FN-8015's body gutter was deleted. Chat and GitHub Import still must not carry an override of
+     * their own (asserted below) — they inherit the shared desktop rule and the phone reassertion.
+     */
+    const desktopVisibleOverflowHost = ruleDeclarations(
+      source,
+      /\n\.floating-window:not\(\.floating-window--tablet-viewport\)\s*\{([^}]*)\}/,
+      "shared desktop window",
+    );
+    expect(desktopVisibleOverflowHost, "the phone clipping reassertion needs a desktop visible-overflow host").toContain("overflow: visible");
+
+    const visibleOverflowSheetHosts = [...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter(([, selector, body]) => /overflow\s*:\s*visible(?:\s*!important)?\s*(?:;|$)/.test(body))
+      .map(([, selector]) => selector)
+      .filter((selector) => /\.floating-window--(?:chat|github-import-detail)(?:\b|\s|[.:#\[])/.test(selector));
+    expect(visibleOverflowSheetHosts, "Chat and GitHub Import must inherit base clipping without a visible-overflow override").toEqual([]);
+
+    expect(source).toMatch(/@media \(max-width: 767\.98px\), \(max-height: 480px\)[\s\S]*\.floating-window--github-import-detail \.floating-window__resize-handle\s*\{\s*display: none;/);
     expect(source).toContain(".floating-window:not(.floating-window--chat):not(.floating-window--github-import-detail)");
   });
 
@@ -3158,6 +3602,56 @@ describe("GitHubImportModal — detail actions sit at the bottom (operator repor
     await waitFor(() => {
       expect(screen.queryByTestId("github-import-issue-close")).toBeNull();
     });
+  });
+
+  it("keeps the four populated issue actions uniquely ordered in the shared mobile bar", async () => {
+    vi.mocked(apiFetchGitHubIssues).mockResolvedValueOnce([
+      { number: 44, title: "Four actions", body: "Body", html_url: "https://github.com/dustinbyrne/kb/issues/44", labels: [], state: "open" },
+    ]);
+    render(
+      <GitHubImportModal
+        isOpen
+        onClose={onClose}
+        onImport={onImport}
+        onPlanningMode={vi.fn()}
+        onOpenChatWithPrefill={vi.fn()}
+        tasks={[]}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Select issue #44/i }));
+
+    const bar = await screen.findByTestId("github-import-detail-actions");
+    const actionRow = within(bar).getByTestId("github-import-detail-action-row");
+    const composer = within(bar).getByTestId("github-import-issue-comment-input");
+    const actions = [
+      within(actionRow).getByTestId("github-import-issue-close"),
+      within(actionRow).getByTestId("github-import-action-plan"),
+      within(actionRow).getByTestId("github-import-action-chat"),
+      within(actionRow).getByTestId("github-import-action-top"),
+    ];
+    expect(actions.map((action) => action.textContent?.trim())).toEqual(["Close issue", "Plan", "Chat", "Import as task"]);
+    expect(composer.closest(".github-import-detail-actions")).toBe(bar);
+    expect(actionRow.previousElementSibling).toBe(composer.closest("form"));
+    expect(within(actionRow).getAllByRole("button", { name: /^Close issue$/i })).toHaveLength(1);
+    expect(within(actionRow).getAllByRole("button", { name: /^Plan$/i })).toHaveLength(1);
+    expect(within(actionRow).getAllByRole("button", { name: /^Chat$/i })).toHaveLength(1);
+    expect(within(actionRow).getAllByRole("button", { name: /^Import as task$/i })).toHaveLength(1);
+  });
+
+  it("uses shrinkable, non-wrapping mobile action tracks while retaining desktop behavior", () => {
+    const source = readFileSync(resolve(__dirname, "../GitHubImportModal.css"), "utf8");
+    const mobileRule = source.match(/@media\s\(max-width:\s768px\)\s\{[\s\S]*?\.github-import-detail-action-row\s\.btn\s\{[\s\S]*?\n\s{2}\}/)?.[0] ?? "";
+
+    expect(mobileRule).toContain(".github-import-detail-action-row {");
+    expect(mobileRule).toContain("flex-wrap: nowrap;");
+    expect(mobileRule).toContain("flex: 1 1 100%;");
+    expect(mobileRule).toContain("gap: var(--space-xs);");
+    expect(mobileRule).toContain("flex: 1 1 0;");
+    expect(mobileRule).toContain("min-width: 0;");
+    expect(mobileRule).toContain("min-height: var(--touch-target-min-size) !important;");
+    expect(mobileRule).toContain("white-space: normal;");
+    expect(mobileRule).toContain("overflow-wrap: anywhere;");
+    expect(source.match(/\.github-import-detail-actions\s*\{[^}]*flex-wrap: wrap;/)?.[0]).toBeTruthy();
   });
 
 

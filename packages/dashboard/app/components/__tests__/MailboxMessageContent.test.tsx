@@ -1,8 +1,12 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, cleanup, screen, waitFor } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { render, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FileBrowserProvider } from "../../context/FileBrowserContext";
-import { MailboxMessageContent } from "../MailboxMessageContent";
+import { MailboxMessageContent, parseInAppTaskHref } from "../MailboxMessageContent";
+
+const mailboxModalCss = readFileSync(resolve(__dirname, "../MailboxModal.css"), "utf8");
 
 // FNXC:Markdown 2026-06-23-03:15: Mock the heavy `mermaid` library so the mermaid
 // rendering tests do not pull in the real parser/renderer bundle. The component
@@ -14,8 +18,17 @@ vi.mock("mermaid", () => ({
   },
 }));
 
+function stubMobileViewport(matches: boolean) {
+  vi.stubGlobal("matchMedia", vi.fn().mockImplementation(() => ({ matches })));
+}
+
+beforeEach(() => {
+  stubMobileViewport(false);
+});
+
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 describe("MailboxMessageContent", () => {
@@ -61,15 +74,110 @@ describe("MailboxMessageContent", () => {
     expect(pre?.textContent).toContain("npm install");
   });
 
-  it("renders links with target=_blank and noopener noreferrer", () => {
-    render(
-      <MailboxMessageContent content="See [docs](https://example.com/docs)." />,
+  it("themes markdown links consistently across inline, autolink, list, and table content", () => {
+    const content = [
+      "See [inline docs](https://example.com/inline).",
+      "Visit https://example.com/autolink.",
+      "- [list docs](https://example.com/list)",
+      "",
+      "| docs |",
+      "| --- |",
+      "| [table docs](https://example.com/table) |",
+      "",
+      "See packages/dashboard/app/App.tsx for context.",
+    ].join("\n");
+    const { container } = render(
+      <FileBrowserProvider openFile={vi.fn()}>
+        <MailboxMessageContent content={content} />
+      </FileBrowserProvider>,
     );
-    const link = screen.getByRole("link", { name: "docs" });
-    expect(link.getAttribute("href")).toBe("https://example.com/docs");
-    expect(link.getAttribute("target")).toBe("_blank");
-    expect(link.getAttribute("rel")).toContain("noopener");
-    expect(link.getAttribute("rel")).toContain("noreferrer");
+
+    const links = screen.getAllByRole("link");
+    expect(links).toHaveLength(4);
+    for (const link of links) {
+      expect(link.closest(".mailbox-markdown")).not.toBeNull();
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    }
+    expect(screen.getByRole("button", { name: "packages/dashboard/app/App.tsx" }))
+      .toHaveClass("file-path-link");
+    expect(container.querySelector("a.file-path-link")).toBeNull();
+  });
+
+  describe("in-app task links", () => {
+    it("parses only same-origin hrefs with valid dashboard task ids", () => {
+      expect(parseInAppTaskHref("/?task=FN-1234")).toBe("FN-1234");
+      expect(parseInAppTaskHref("/?project=project-1&task=KB-002")).toBe("KB-002");
+      expect(parseInAppTaskHref(`${window.location.origin}/?task=FN-1234`)).toBe("FN-1234");
+      expect(parseInAppTaskHref("https://example.com/?task=FN-1234")).toBeNull();
+      expect(parseInAppTaskHref("mailto:operator@example.com?task=FN-1234")).toBeNull();
+      expect(parseInAppTaskHref("/?task=invalid")).toBeNull();
+      expect(parseInAppTaskHref("/?project=project-1")).toBeNull();
+      expect(parseInAppTaskHref("http://[invalid")).toBeNull();
+    });
+
+    it("opens a desktop task link through onOpenTask without navigating", async () => {
+      const onOpenTask = vi.fn();
+      const user = userEvent.setup();
+      const recordDefaultPrevention = vi.fn((event: MouseEvent) => event.defaultPrevented);
+      document.addEventListener("click", recordDefaultPrevention);
+      render(<MailboxMessageContent content="See [FN-1234](/?task=FN-1234)." onOpenTask={onOpenTask} />);
+
+      const link = screen.getByTestId("mailbox-task-link");
+      expect(link).not.toHaveAttribute("target");
+      expect(link).not.toHaveAttribute("rel");
+      await user.click(link);
+      document.removeEventListener("click", recordDefaultPrevention);
+
+      expect(onOpenTask).toHaveBeenCalledTimes(1);
+      expect(onOpenTask).toHaveBeenCalledWith("FN-1234");
+      expect(recordDefaultPrevention).toHaveBeenCalledWith(expect.objectContaining({ defaultPrevented: true }));
+    });
+
+    it("keeps mobile task links in the existing tab through onOpenTask", async () => {
+      stubMobileViewport(true);
+      const onOpenTask = vi.fn();
+      const user = userEvent.setup();
+      render(<MailboxMessageContent content="See [FN-1234](/?task=FN-1234)." onOpenTask={onOpenTask} />);
+
+      const link = screen.getByTestId("mailbox-task-link");
+      expect(link).not.toHaveAttribute("target", "_blank");
+      await user.click(link);
+      expect(onOpenTask).toHaveBeenCalledWith("FN-1234");
+    });
+
+    it("keeps task links as ordinary same-tab anchors without onOpenTask", () => {
+      render(<MailboxMessageContent content="See [FN-1234](/?task=FN-1234)." />);
+      const link = screen.getByRole("link", { name: "FN-1234" });
+      expect(link).not.toHaveAttribute("target");
+      expect(link).not.toHaveAttribute("data-testid");
+    });
+
+    it("keeps external and same-origin non-task links in new tabs", () => {
+      render(<MailboxMessageContent content="[external](https://example.com) [dashboard](/settings)" />);
+      for (const link of screen.getAllByRole("link")) {
+        expect(link).toHaveAttribute("target", "_blank");
+        expect(link).toHaveAttribute("rel", "noopener noreferrer");
+      }
+    });
+
+    it("preserves modified-click behavior for task links", () => {
+      const onOpenTask = vi.fn();
+      render(<MailboxMessageContent content="See [FN-1234](/?task=FN-1234)." onOpenTask={onOpenTask} />);
+
+      fireEvent.click(screen.getByTestId("mailbox-task-link"), { ctrlKey: true });
+      expect(onOpenTask).not.toHaveBeenCalled();
+    });
+  });
+
+  it("defines token-only mailbox markdown anchor styles", () => {
+    const anchorRule = mailboxModalCss.match(/\.mailbox-markdown a\s*\{([^}]*)\}/)?.[1];
+    expect(mailboxModalCss).toMatch(/\.mailbox-markdown a\b/);
+    expect(anchorRule).toBeDefined();
+    expect(anchorRule).not.toMatch(/#[0-9a-f]{3,8}\b|rgba\(/i);
+    expect(mailboxModalCss).toMatch(/\.mailbox-markdown a:visited\s*\{/);
+    expect(mailboxModalCss).toMatch(/\.mailbox-markdown a:hover\s*\{/);
+    expect(mailboxModalCss).toMatch(/\.mailbox-markdown a:focus-visible\s*\{/);
   });
 
   it("renders GFM tables with the mailbox-scoped class", () => {

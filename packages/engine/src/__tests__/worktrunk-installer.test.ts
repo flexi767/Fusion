@@ -1,14 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { WorktrunkSettings } from "@fusion/core";
-import type { AgentActionGateContext } from "../agent-action-gate.js";
-import type { RunAuditor } from "../run-audit.js";
+import type { AgentActionGateContext } from "../agents/agent-action-gate.js";
+import type { RunAuditor } from "../util/run-audit.js";
 
 vi.mock("node:child_process", () => ({
   exec: vi.fn(),
 }));
 
 const loggerMock = {
-  log: vi.fn(),
+  log: vi.fn(), debug: vi.fn(),
   warn: vi.fn(),
   error: vi.fn(),
 };
@@ -32,7 +32,7 @@ const {
   WORKTRUNK_PINNED_RELEASE,
   WorktrunkInstallDeniedError,
   WorktrunkInstallFailedError,
-} = await import("../worktrunk-installer.js");
+} = await import("../worktree/worktrunk-installer.js");
 
 function mockExecSequence(responses: Array<{ stdout?: string; error?: Error }>): void {
   let i = 0;

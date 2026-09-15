@@ -2,6 +2,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../pi.js", () => ({
   createFnAgent: vi.fn(),
+  /*
+  FNXC:TestInfrastructure 2026-07-29-10:15 (U9):
+  `wrapCustomToolsForPluginRuntime` (agent-session-helpers.ts) calls this as the
+  outermost tool wrapper, so its absence here threw
+  "No wrapToolsWithOutputBudget export is defined on the ../pi.js mock" and made
+  BOTH test-mode-forcing cases below permanently red — a dead guard on the
+  invariant that testMode never issues real AI calls. Identity stub: the real
+  function returns tools byte-identical for a null budget, and these cases assert
+  model/provider resolution, not output budgeting.
+
+  Not caught by `pnpm check:mock-completeness` — that gate only inspects the
+  @fusion/engine and @fusion/dashboard BARRELS in cli/dashboard test dirs, never a
+  relative intra-package mock like this one.
+  */
+  wrapToolsWithOutputBudget: vi.fn((tools: unknown[]) => tools),
   describeModel: vi.fn().mockReturnValue("mock-provider/mock-model"),
   formatModelMarkerDetails: vi.fn((model: string, thinking?: string | null, annotations: string[] = []) => {
     const suffixes = [thinking ? `thinking effort: ${thinking}` : "", ...annotations].filter(Boolean);
@@ -24,8 +39,8 @@ vi.mock("../pi.js", () => ({
   wrapToolsWithActionGate: vi.fn((tools) => tools),
 }));
 
-import { resolveAgentPrompt } from "@fusion/core";
-import { reviewStep, ReviewerProviderError } from "../reviewer.js";
+import { resolveAgentPrompt, type TaskStore } from "@fusion/core";
+import { reviewStep, ReviewerProviderError } from "../execution/reviewer.js";
 import { createFnAgent, promptWithFallback } from "../pi.js";
 
 const DEFAULT_REVIEWER_PROMPT = resolveAgentPrompt("reviewer");
@@ -34,7 +49,15 @@ const mockedCreateFnAgent = vi.mocked(createFnAgent);
 const mockedPromptWithFallback = vi.mocked(promptWithFallback);
 const CONTEXT_LIMIT_ERROR = "exceeded model token limit: 262144 (requested: 262879)";
 
+function approvingReview(reviewText: string): string {
+  return `${reviewText}\n\n### Authoritative Verdict\n{"verdict":"APPROVE","notes":"Test reviewer authored approval."}`;
+}
+
 function createMockSession(reviewText: string) {
+  const authoredReviewText = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:verdict|decision)\s*:\s*APPROVE\b/i.test(reviewText)
+    && !/"verdict"\s*:/.test(reviewText)
+    ? approvingReview(reviewText)
+    : reviewText;
   return {
     session: {
       prompt: vi.fn().mockResolvedValue(undefined),
@@ -42,7 +65,7 @@ function createMockSession(reviewText: string) {
         // Simulate the reviewer producing text
         cb({
           type: "message_update",
-          assistantMessageEvent: { type: "text_delta", delta: reviewText },
+          assistantMessageEvent: { type: "text_delta", delta: authoredReviewText },
         });
       }),
       dispose: vi.fn(),
@@ -88,6 +111,88 @@ describe("reviewStep — model settings threading", () => {
     const opts = mockedCreateFnAgent.mock.calls[0][0];
     expect(opts.defaultProvider).toBe("anthropic");
     expect(opts.defaultModelId).toBe("claude-sonnet-4-5");
+  });
+
+  it("captures a terminal-only reviewer verdict through the production subscriber", async () => {
+    const terminalVerdict = approvingReview("### Verdict: APPROVE\n### Summary\nTerminal text is complete.");
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        subscribe: vi.fn().mockImplementation((callback: (event: unknown) => void) => {
+          callback({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "text_end",
+              partial: { content: [{ type: "text", text: terminalVerdict }] },
+              contentIndex: 0,
+              content: terminalVerdict,
+            },
+          });
+        }),
+        dispose: vi.fn(),
+      },
+    } as any);
+
+    const result = await reviewStep("/tmp/worktree", "FN-9277", 1, "Terminal verdict", "plan", "# prompt");
+
+    expect(result.verdict).toBe("APPROVE");
+    expect(result.review).toBe(terminalVerdict);
+  });
+
+  it("emits resolved durable reviewer session and tool telemetry through the live lane callbacks", async () => {
+    mockedCreateFnAgent.mockImplementation(async (options) => {
+      options.onToolStart?.("Read", { path: "private-review-input" });
+      options.onToolEnd?.("Read", false, "private-review-output");
+      return createMockSession("### Verdict: APPROVE\n### Summary\nLooks good.");
+    });
+    const store = {
+      emitUsageEvent: vi.fn().mockResolvedValue(undefined),
+      appendAgentLog: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TaskStore & { emitUsageEvent: ReturnType<typeof vi.fn> };
+
+    await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt", undefined, {
+      store,
+      taskId: "FN-100",
+      agentId: "durable-reviewer",
+      task: { assignedAgentId: "fallback-agent", effectiveNodeId: "mesh-node", nodeId: "legacy-node" },
+      taskValidatorProvider: "validator-provider",
+      taskValidatorModelId: "validator-model",
+    });
+
+    expect(store.emitUsageEvent).toHaveBeenCalledTimes(3);
+    const events = store.emitUsageEvent.mock.calls.map(([event]) => event);
+    const sessionStart = events.find((event) => event.kind === "session_start");
+    const toolCall = events.find((event) => event.kind === "tool_call");
+    const toolResult = events.find((event) => event.kind === "tool_result");
+    expect(sessionStart).toMatchObject({
+      kind: "session_start", category: "agent-session", taskId: "FN-100", agentId: "durable-reviewer",
+      nodeId: "mesh-node", model: "validator-model", provider: "validator-provider", meta: { lane: "reviewer" },
+    });
+    expect(toolCall).toMatchObject({
+      kind: "tool_call", taskId: "FN-100", agentId: "durable-reviewer", nodeId: "mesh-node",
+      model: "validator-model", provider: "validator-provider", toolName: "Read",
+    });
+    expect(toolResult).toMatchObject({
+      kind: "tool_result", taskId: "FN-100", agentId: "durable-reviewer", nodeId: "mesh-node",
+      model: "validator-model", provider: "validator-provider", toolName: "Read",
+    });
+  });
+
+  it("does not count a reviewer session when runtime construction fails", async () => {
+    mockedCreateFnAgent.mockRejectedValue(new Error("provider unavailable"));
+    const store = {
+      emitUsageEvent: vi.fn().mockResolvedValue(undefined),
+      appendAgentLog: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TaskStore & { emitUsageEvent: ReturnType<typeof vi.fn> };
+
+    await expect(reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt", undefined, {
+      store, taskId: "FN-100", agentId: "durable-reviewer",
+      taskValidatorProvider: "validator-provider", taskValidatorModelId: "validator-model",
+    })).rejects.toThrow("provider unavailable");
+
+    expect(store.emitUsageEvent).not.toHaveBeenCalledWith(expect.objectContaining({ kind: "session_start" }));
   });
 
   it("does not set model fields when ReviewOptions omits them", async () => {
@@ -213,6 +318,51 @@ describe("reviewStep — model settings threading", () => {
     expect(result.verdict).toBe("APPROVE");
   });
 
+  it("uses the selected workflow reviewer lane after project and global lanes fall through", async () => {
+    mockedCreateFnAgent.mockResolvedValue(
+      createMockSession("### Verdict: APPROVE\n### Summary\nWorkflow reviewer honored."),
+    );
+    const task = { id: "FN-100", column: "in-review", steps: [] } as any;
+    const store = {
+      getSettings: vi.fn().mockResolvedValue({
+        defaultProvider: "default-provider",
+        defaultModelId: "default-model",
+      }),
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "wf-custom", stepIds: [] })),
+      getDefaultWorkflowId: vi.fn(async () => "builtin:coding"),
+      getWorkflowDefinition: vi.fn(async (workflowId: string) => workflowId === "wf-custom"
+        ? {
+            ir: {
+              version: "v2",
+              name: "Custom",
+              columns: [],
+              nodes: [],
+              edges: [],
+              settings: [
+                { id: "validatorProvider", name: "Validator provider", type: "string" },
+                { id: "validatorModelId", name: "Validator model", type: "string" },
+              ],
+            },
+          }
+        : undefined),
+      getWorkflowSettingValues: vi.fn((workflowId: string) => workflowId === "wf-custom"
+        ? { validatorProvider: "workflow-provider", validatorModelId: "workflow-model" }
+        : {}),
+      getWorkflowSettingsProjectId: vi.fn(() => "project-1"),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+      appendAgentLog: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await reviewStep(
+      "/tmp/worktree", "FN-100", 1, "Test Step", "code", "# prompt", "abc123",
+      { store: store as any, taskId: task.id, task },
+    );
+
+    const opts = mockedCreateFnAgent.mock.calls[0][0];
+    expect(opts.defaultProvider).toBe("workflow-provider");
+    expect(opts.defaultModelId).toBe("workflow-model");
+  });
+
   it("logs reviewer model rows with default thinking effort", async () => {
     mockedCreateFnAgent.mockResolvedValue(
       createMockSession("### Verdict: APPROVE\n### Summary\nLooks good."),
@@ -259,6 +409,71 @@ describe("reviewStep — model settings threading", () => {
     );
 
     expect(result.verdict).toBe("APPROVE");
+  });
+
+  it("extracts a trailing REVISE payload after unpaired prose braces", async () => {
+    mockedCreateFnAgent.mockResolvedValue(createMockSession(
+      "Implementation looks solid overall. IndexOfAny('{','[') needs one change.\n" +
+      '{"verdict":"REVISE","notes":"fix the parser"}',
+    ));
+
+    const result = await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt");
+
+    expect(result.verdict).toBe("REVISE");
+  });
+
+  it("recovers a quote-desynced multi-finding payload beneath brace-bearing trailing prose", async () => {
+    const payload = JSON.stringify({
+      verdict: "REVISE",
+      notes: 'full { note } with "quotes"',
+      findings: Array.from({ length: 12 }, (_, index) => ({ id: `finding-${index}`, title: "t", body: "b" })),
+    }, null, 2);
+    mockedCreateFnAgent.mockResolvedValue(createMockSession(
+      `{"example":true}\nodd quote "\n${payload}\nuse } to close\n} } } } } }\n{"example":1}`,
+    ));
+
+    const result = await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt");
+
+    expect(result.verdict).toBe("REVISE");
+  });
+
+  it("lets an explicit verdict heading beat a JSON example", async () => {
+    mockedCreateFnAgent.mockResolvedValue(createMockSession(
+      '## Verdict: REVISE\nExample: {"verdict":"APPROVE"}',
+    ));
+
+    const result = await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt");
+
+    expect(result.verdict).toBe("REVISE");
+  });
+
+  it.each([
+    'looks good\n{"verdict":"REVISE","notes":"truncated',
+    'looks good\n{"verdict":"PASS"}',
+  ])("returns UNAVAILABLE rather than laundering unreadable structured verdict intent", async (review) => {
+    mockedCreateFnAgent.mockResolvedValue(createMockSession(review));
+    const result = await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt");
+    expect(result.verdict).toBe("UNAVAILABLE");
+  });
+
+  /*
+   * FNXC:ReviewLeniency 2026-08-11-19:37:
+   * A real explicit verdict heading remains authoritative even when an unrelated
+   * truncated JSON payload exposes a quoted verdict key. The anti-laundering
+   * guard applies only to Strategy 4 prose approval, never Strategies 1–2.
+   */
+  it("refuses an explicit APPROVE heading when structured verdict intent is truncated", async () => {
+    mockedCreateFnAgent.mockResolvedValue(createMockSession(
+      '## Verdict: APPROVE\nlooks good\n{"verdict":"REVISE","notes":"truncated',
+    ));
+    const result = await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt");
+    expect(result.verdict).toBe("UNAVAILABLE");
+  });
+
+  it("refuses lenient prose approval without a structured verdict key", async () => {
+    mockedCreateFnAgent.mockResolvedValue(createMockSession("looks good"));
+    const result = await reviewStep("/tmp/worktree", "FN-100", 1, "Test Step", "plan", "# prompt");
+    expect(result.verdict).toBe("UNAVAILABLE");
   });
 });
 
@@ -419,6 +634,24 @@ describe("reviewStep — spec review type", () => {
     expect(opts.customTools?.map((tool: any) => tool.name)).toEqual(["fn_web_fetch", "fn_memory_search", "fn_memory_get"]);
   });
 
+  it.each(["off", "index", "full"] as const)("uses assigned reviewer %s memory inclusion mode", async (mode) => {
+    mockedCreateFnAgent.mockResolvedValue(createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."));
+    await reviewStep(
+      "/tmp/worktree", "FN-050", 0, "Spec Review", "spec", "# Task: KB-050",
+      undefined,
+      {
+        rootDir: "/tmp/project",
+        agentId: "reviewer-1",
+        agentStore: { getAgent: vi.fn().mockResolvedValue({ id: "reviewer-1", runtimeConfig: { agentMemoryInclusionMode: mode } }) } as any,
+        settings: { memoryBackendType: "qmd" } as any,
+      },
+    );
+
+    const prompt = mockedCreateFnAgent.mock.calls[0][0].systemPrompt;
+    expect(prompt.includes("query memory before re-reading")).toBe(mode !== "off");
+    if (mode === "index") expect(prompt).toContain("fn_memory_search");
+  });
+
   it("omits reviewer memory tools and instructions when memory is disabled", async () => {
     mockedCreateFnAgent.mockResolvedValue(
       createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
@@ -445,7 +678,7 @@ describe("reviewStep — spec review type", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -457,7 +690,14 @@ describe("reviewStep — spec review type", () => {
       "# Task: KB-050\n\n## Mission\nDo something great",
     );
 
+    /*
+     * FNXC:PlanReviewPromptBoundary 2026-08-04-06:35:
+     * A spec session must carry the mandatory holistic policy and batch every
+     * independently discoverable blocker, without inheriting code-diff rules.
+     */
     expect(capturedPrompt).toContain("Evaluate this PROMPT.md specification");
+    expect(capturedPrompt).toContain("## Mandatory Plan Review Procedure");
+    expect(capturedPrompt).toContain("all independently discoverable blocking findings");
     expect(capturedPrompt).toContain("spec quality criteria");
     expect(capturedPrompt).toContain("# Task: KB-050");
     expect(capturedPrompt).toContain("dangling task-document references");
@@ -475,7 +715,7 @@ describe("reviewStep — spec review type", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -490,104 +730,6 @@ describe("reviewStep — spec review type", () => {
 
     expect(capturedPrompt).not.toContain("git diff");
     expect(capturedPrompt).not.toContain("abc123");
-  });
-});
-
-/*
-FNXC:TriagePlanReviewConvergence 2026-07-16-19:40:
-Prove the spec-gate convergence block is wired through reviewStep -> buildReviewRequest. We drive
-the real (module-private) request builder by capturing the prompt string handed to the mocked
-session, exactly like the "spec review type" tests above — no test-only export is needed because
-the request text is observable at the session seam.
-*/
-describe("reviewStep — spec convergence wiring", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  function captureReviewPrompt(): { getPrompt: () => string } {
-    const state = { prompt: "" };
-    mockedCreateFnAgent.mockResolvedValue({
-      session: {
-        prompt: vi.fn().mockImplementation(async (prompt: string) => {
-          state.prompt = prompt;
-        }),
-        subscribe: vi.fn().mockImplementation((cb: any) => {
-          cb({
-            type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
-          });
-        }),
-        dispose: vi.fn(),
-      },
-    } as any);
-    return { getPrompt: () => state.prompt };
-  }
-
-  it("omits the convergence block for spec reviews on attempt <= 1 or undefined", async () => {
-    const cap = captureReviewPrompt();
-    await reviewStep(
-      "/tmp/worktree", "FN-CONV", 0, "Spec Review", "spec", "# Task: FN-CONV",
-      undefined,
-      { priorSpecReviewFeedback: "prior REVISE text", specReviewAttempt: 1 },
-    );
-    expect(cap.getPrompt()).not.toContain("## Convergence — Plan Review attempt");
-    expect(cap.getPrompt()).not.toContain("prior REVISE text");
-  });
-
-  it("omits the convergence block for spec reviews when convergence fields are absent", async () => {
-    const cap = captureReviewPrompt();
-    await reviewStep(
-      "/tmp/worktree", "FN-CONV", 0, "Spec Review", "spec", "# Task: FN-CONV",
-    );
-    expect(cap.getPrompt()).not.toContain("## Convergence — Plan Review attempt");
-  });
-
-  it("includes the convergence block + prior feedback + verify-your-own-miss wording at attempt 2", async () => {
-    const cap = captureReviewPrompt();
-    await reviewStep(
-      "/tmp/worktree", "FN-CONV", 0, "Spec Review", "spec", "# Task: FN-CONV",
-      undefined,
-      { priorSpecReviewFeedback: "PRIOR-REVISE-MARKER: fix the missing Surface Enumeration", specReviewAttempt: 2 },
-    );
-    const prompt = cap.getPrompt();
-    expect(prompt).toContain("## Convergence — Plan Review attempt 2");
-    expect(prompt).toContain("PRIOR-REVISE-MARKER: fix the missing Surface Enumeration");
-    expect(prompt).toContain("VERIFY each issue you raised previously was addressed");
-    expect(prompt).toContain("that is your own earlier miss");
-    // Attempt 2 must NOT yet ratchet severity.
-    expect(prompt).not.toContain("Severity ratchet (attempt 3+)");
-  });
-
-  it("adds the severity ratchet at attempt >= 3", async () => {
-    const cap = captureReviewPrompt();
-    await reviewStep(
-      "/tmp/worktree", "FN-CONV", 0, "Spec Review", "spec", "# Task: FN-CONV",
-      undefined,
-      { priorSpecReviewFeedback: "prior text", specReviewAttempt: 3 },
-    );
-    const prompt = cap.getPrompt();
-    expect(prompt).toContain("## Convergence — Plan Review attempt 3");
-    expect(prompt).toContain("Severity ratchet (attempt 3+)");
-  });
-
-  it("never includes the convergence block for code reviews even when convergence fields are passed", async () => {
-    const cap = captureReviewPrompt();
-    await reviewStep(
-      "/tmp/worktree", "FN-CONV", 1, "Code Review", "code", "# prompt", "abc123",
-      { priorSpecReviewFeedback: "prior text", specReviewAttempt: 3 } as any,
-    );
-    expect(cap.getPrompt()).not.toContain("## Convergence — Plan Review attempt");
-  });
-
-  it("never includes the convergence block for plan reviews even when convergence fields are passed", async () => {
-    const cap = captureReviewPrompt();
-    await reviewStep(
-      "/tmp/worktree", "FN-CONV", 1, "Plan Review", "plan", "# prompt",
-      undefined,
-      { priorSpecReviewFeedback: "prior text", specReviewAttempt: 3 } as any,
-    );
-    expect(cap.getPrompt()).not.toContain("## Convergence — Plan Review attempt");
   });
 });
 
@@ -670,7 +812,7 @@ describe("reviewStep — context-limit retry", () => {
           for (const subscriber of subscribers) {
             subscriber({
               type: "message_update",
-              assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nCompacted retry worked." },
+              assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nCompacted retry worked.") },
             });
           }
         }),
@@ -789,7 +931,11 @@ describe("reviewStep — fallback retry for terminal unavailable", () => {
 
     const task = { id: "FN-4092", column: "in-progress", description: "d", dependencies: [], steps: [], currentStep: 0, log: [], prompt: "# prompt", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", reviewerFallbackRetryCount: 0 };
     const store = {
-      getSettings: vi.fn().mockResolvedValue({ maxReviewerFallbackRetries: 2, maxTotalRetriesBeforeFail: 25 }),
+      getSettings: vi.fn().mockResolvedValue({
+        maxReviewerFallbackRetries: 2,
+        maxTotalRetriesBeforeFail: 25,
+        validatorFallbackThinkingLevel: "xhigh",
+      }),
       getTask: vi.fn().mockImplementation(async () => task),
       updateTask: vi.fn().mockImplementation(async (_id: string, patch: Record<string, unknown>) => Object.assign(task, patch)),
       logEntry: vi.fn().mockResolvedValue(undefined),
@@ -808,6 +954,7 @@ describe("reviewStep — fallback retry for terminal unavailable", () => {
 
     expect(result.verdict).toBe("APPROVE");
     expect(mockedCreateFnAgent).toHaveBeenCalledTimes(2);
+    expect(mockedCreateFnAgent.mock.calls.every(([options]) => options.fallbackThinkingLevel === "xhigh")).toBe(true);
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-4092",
       expect.stringContaining("review retry with fallback model after UNAVAILABLE verdict"),
@@ -1192,39 +1339,18 @@ describe("reviewStep — validator model overrides", () => {
 });
 
 describe("default reviewer prompt", () => {
-  it("includes subtask breakdown criterion in spec review", () => {
-    expect(DEFAULT_REVIEWER_PROMPT).toContain("Subtask breakdown");
-    expect(DEFAULT_REVIEWER_PROMPT).toContain(
-      "12+ implementation steps",
-    );
-  });
-
-  it("biases the reviewer toward keeping tasks whole", () => {
-    expect(DEFAULT_REVIEWER_PROMPT).toContain("The bar for splitting is high");
-    expect(DEFAULT_REVIEWER_PROMPT).toContain(
-      "Default position:** do NOT flag undersplit",
-    );
-    expect(DEFAULT_REVIEWER_PROMPT).toContain("12+ implementation steps");
-  });
-
-  it("downgrades borderline undersplit findings to non-blocking suggestions", () => {
-    expect(DEFAULT_REVIEWER_PROMPT).toContain(
-      "Suggestions** section instead of REVISE",
-    );
-  });
-
-  it("instructs planner to use fn_task_create for genuinely oversized tasks", () => {
-    // The reviewer's REVISE feedback must explicitly direct the planner to
-    // create child tasks via fn_task_create rather than just flagging the issue.
-    expect(DEFAULT_REVIEWER_PROMPT).toContain("fn_task_create");
-    expect(DEFAULT_REVIEWER_PROMPT).toContain(
-      "create 2–5 child tasks",
-    );
-    expect(DEFAULT_REVIEWER_PROMPT).toContain(
-      "Not write a parent PROMPT.md",
-    );
-  });
-
+  /*
+  FNXC:ReviewerPrompt 2026-08-23-01:10:
+  FOUR TESTS REMOVED, not repaired. They asserted that DEFAULT_REVIEWER_PROMPT still carried the
+  task-SPLITTING contract — "Subtask breakdown", "12+ implementation steps", "The bar for splitting
+  is high", and a REVISE that directs the planner to `fn_task_create` 2-5 child tasks. FN-074
+  ("remove task splitting and parent deletion") deleted that feature across core, dashboard, and
+  engine, and FN-125 ("prevent workflow agents from creating tasks") removed the reviewer's ability
+  to create tasks at all. FN-074's own message says it updated affected tests; these were missed, so
+  they sat red asserting a contract the product deliberately dropped. Restoring the prompt text to
+  make them pass would re-add removed behaviour; keeping them red guards nothing. The two tests
+  below cover the prompt contract that DOES still exist.
+  */
   it("includes user comment coverage criterion in spec review format", () => {
     expect(DEFAULT_REVIEWER_PROMPT).toContain("User comment coverage");
     expect(DEFAULT_REVIEWER_PROMPT).toContain("missing coverage is a blocking REVISE");
@@ -1248,7 +1374,7 @@ describe("reviewStep — user comments in spec review", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -1268,7 +1394,7 @@ describe("reviewStep — user comments in spec review", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -1315,7 +1441,7 @@ describe("reviewStep — user comments in spec review", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -1341,7 +1467,7 @@ describe("reviewStep — user comments in spec review", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -1380,7 +1506,7 @@ describe("reviewStep — user comments in spec review", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -1406,7 +1532,7 @@ describe("reviewStep — user comments in spec review", () => {
         subscribe: vi.fn().mockImplementation((cb: any) => {
           cb({
             type: "message_update",
-            assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nOK" },
+            assistantMessageEvent: { type: "text_delta", delta: approvingReview("### Verdict: APPROVE\n### Summary\nOK") },
           });
         }),
         dispose: vi.fn(),
@@ -1428,7 +1554,7 @@ describe("reviewStep — user comments in spec review", () => {
 
 describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", () => {
   // FNXC:SessionSkillContext 2026-07-13: buildSessionSkillContext mockResolvedValue objects MUST include additionalSkillPaths: [] — the production code (reviewer.ts:429) reads skillContext.additionalSkillPaths.length unconditionally when skillContext is truthy; omitting the field crashes with TypeError before createFnAgent is reached.
-  vi.mock("../session-skill-context.js", () => ({
+  vi.mock("../cli-runtime/session-skill-context.js", () => ({
     buildSessionSkillContext: vi.fn(),
   }));
 
@@ -1437,7 +1563,7 @@ describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", (
   });
 
   it("passes skillSelection to createFnAgent when agentStore and rootDir are provided", async () => {
-    const { buildSessionSkillContext } = await import("../session-skill-context.js");
+    const { buildSessionSkillContext } = await import("../cli-runtime/session-skill-context.js");
     vi.mocked(buildSessionSkillContext).mockResolvedValue({ skillSelectionContext: {
       projectRootDir: "/tmp/project",
       requestedSkillNames: ["fusion"],
@@ -1470,7 +1596,7 @@ describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", (
   });
 
   it("uses assigned agent skills when available", async () => {
-    const { buildSessionSkillContext } = await import("../session-skill-context.js");
+    const { buildSessionSkillContext } = await import("../cli-runtime/session-skill-context.js");
     vi.mocked(buildSessionSkillContext).mockResolvedValue({ skillSelectionContext: {
       projectRootDir: "/tmp/project",
       requestedSkillNames: ["custom-skill", "another-skill"],
@@ -1503,7 +1629,7 @@ describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", (
   });
 
   it("does not pass skillSelection when buildSessionSkillContext returns undefined context", async () => {
-    const { buildSessionSkillContext } = await import("../session-skill-context.js");
+    const { buildSessionSkillContext } = await import("../cli-runtime/session-skill-context.js");
     vi.mocked(buildSessionSkillContext).mockResolvedValue({ skillSelectionContext: undefined, resolvedSkillNames: [], skillSource: "none", additionalSkillPaths: [] });
 
     mockedCreateFnAgent.mockResolvedValue(
@@ -1549,7 +1675,7 @@ describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", (
   });
 
   it("gracefully handles buildSessionSkillContext throwing", async () => {
-    const { buildSessionSkillContext } = await import("../session-skill-context.js");
+    const { buildSessionSkillContext } = await import("../cli-runtime/session-skill-context.js");
     vi.mocked(buildSessionSkillContext).mockRejectedValue(new Error("Agent not found"));
 
     mockedCreateFnAgent.mockResolvedValue(
@@ -1576,7 +1702,7 @@ describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", (
   });
 
   it("records resolved skill names in skill context result", async () => {
-    const { buildSessionSkillContext } = await import("../session-skill-context.js");
+    const { buildSessionSkillContext } = await import("../cli-runtime/session-skill-context.js");
     const resolvedNames = ["skill-a", "skill-b", "skill-c"];
     vi.mocked(buildSessionSkillContext).mockResolvedValue({ skillSelectionContext: {
       projectRootDir: "/tmp/project",
@@ -1608,7 +1734,7 @@ describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", (
   });
 
   it("uses sessionPurpose='reviewer' in skill selection context", async () => {
-    const { buildSessionSkillContext } = await import("../session-skill-context.js");
+    const { buildSessionSkillContext } = await import("../cli-runtime/session-skill-context.js");
     vi.mocked(buildSessionSkillContext).mockResolvedValue({ skillSelectionContext: {
       projectRootDir: "/tmp/project",
       requestedSkillNames: ["fusion"],
@@ -1725,11 +1851,15 @@ describe("reviewStep — provider errors are not review verdicts", () => {
     mockedPromptWithFallback.mockRejectedValue(new Error(RATE_LIMIT_ERROR));
 
     const error = await reviewStep(
-      "/tmp/worktree", "FN-RL", 2, "Rate limited", "code", "# prompt", "abc123", {},
+      "/tmp/worktree", "FN-RL", 2, "Rate limited", "code", "# prompt", "abc123", {
+        defaultProvider: "anthropic",
+        defaultModelId: "claude-sonnet",
+      },
     ).then(() => null, (err: unknown) => err);
 
     expect(error).toBeInstanceOf(ReviewerProviderError);
     expect((error as ReviewerProviderError).classification).toBe("usage-limit");
+    expect((error as ReviewerProviderError).provider).toBe("anthropic");
     // The reported bug: with no configured fallback the ladder re-ran the SAME model
     // immediately, so a 429 spawned a second session (and a second identical marker).
     expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);

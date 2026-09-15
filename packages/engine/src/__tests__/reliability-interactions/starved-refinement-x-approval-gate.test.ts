@@ -13,7 +13,13 @@ function task(overrides: Partial<Task> & Pick<Task, "id">): Task {
     title: overrides.id,
     description: overrides.id,
     priority: "normal",
-    column: "triage",
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-22:00:
+    The INTAKE column post-U11 is `todo` (the merged Planning column). `triage` is no longer declared
+    on any workflow, and the starved-refinement sweep filters by ROLE — so a card seeded in `triage`
+    carried no intake role, the filter found no candidates, and the sweep reported 0 escalations.
+    */
+    column: "todo",
     dependencies: [],
     steps: [],
     currentStep: 0,
@@ -63,12 +69,27 @@ describe("reliability interaction: starved refinement x approval gate", () => {
 
       const taskDir = join(root, ".fusion", "tasks", "FN-RA");
       await mkdir(taskDir, { recursive: true });
-      await writeFile(join(taskDir, "PROMPT.md"), "# FN-RA\n\n## File Scope\n- packages/engine/src/self-healing.ts\n", "utf8");
+      /*
+      FNXC:EngineTests 2026-07-21-00:20:
+      Finalize needs executable steps + getTask/moveTaskIf/withTaskLock for planning CAS.
+      */
+      const spec = "# FN-RA\n\n## File Scope\n- packages/engine/src/self-healing.ts\n\n## Steps\n\n### Step 0: Implement\n- [ ] do the work\n";
+      await writeFile(join(taskDir, "PROMPT.md"), spec, "utf8");
+      store.getTask = vi.fn().mockImplementation(async (id: string) => (id === "FN-RA" ? refinement : undefined));
+      store.parseFileScopeFromPrompt = vi.fn().mockResolvedValue([]);
+      store.withTaskLock = vi.fn(async (_id: string, fn: () => Promise<unknown>) => fn());
+      store.readTaskForMove = vi.fn(async (id: string) => store.getTask(id));
+      store.moveTaskIf = vi.fn(async (id: string, column: string, predicate: (t: any) => boolean) => {
+        const live = await store.getTask(id);
+        if (live && !predicate(live)) return { moved: false, task: live };
+        await store.moveTask(id, column);
+        return { moved: true, task: live };
+      });
 
       const triage = new TriageProcessor(store, root);
       await (triage as any).finalizeApprovedTask(
         refinement,
-        "# FN-RA\n\n## File Scope\n- packages/engine/src/self-healing.ts\n",
+        spec,
         { requirePlanApproval: true },
       );
 

@@ -5,10 +5,15 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentLogEntry, Task } from "@fusion/core";
 import { TaskChatTab } from "../TaskChatTab";
+import { ChatMessageLayoutProvider } from "../../context/ChatMessageLayoutContext";
+import { AlphaProvider, AlphaBoundary } from "../../context/AlphaContext";
 import { isCliSessionLive, type CliSessionSummaryRecord } from "../TaskDetailModal";
 import { useAgentLogs } from "../../hooks/useAgentLogs";
-import { addSteeringComment, refineTask } from "../../api";
+import { addSteeringComment, fetchGlobalSettings, refineTask, updateGlobalSettings } from "../../api";
+import { __test_resetChatSnippetsCache } from "../../hooks/useChatSnippetsCache";
 import { readBoardWorkflowSelection, removeBoardWorkflowSelection, writeBoardWorkflowSelection } from "../../utils/boardWorkflowSelection";
+import { clampChatInputHeight, getChatInputAutomaticMaxHeight, getChatInputBoxMetrics } from "../../utils/chatInputAutosize";
+import { readAppFile } from "../../test/cssFixture";
 
 vi.mock("../../hooks/useAgentLogs", () => ({
   useAgentLogs: vi.fn(),
@@ -17,11 +22,15 @@ vi.mock("../../hooks/useAgentLogs", () => ({
 vi.mock("../../api", () => ({
   addSteeringComment: vi.fn(),
   refineTask: vi.fn(),
+  fetchGlobalSettings: vi.fn(),
+  updateGlobalSettings: vi.fn(),
 }));
 
 const mockedUseAgentLogs = vi.mocked(useAgentLogs);
 const mockedAddSteeringComment = vi.mocked(addSteeringComment);
 const mockedRefineTask = vi.mocked(refineTask);
+const mockedFetchGlobalSettings = vi.mocked(fetchGlobalSettings);
+const mockedUpdateGlobalSettings = vi.mocked(updateGlobalSettings);
 const originalScrollTopDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
 const originalScrollHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
 const originalClientHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
@@ -352,7 +361,10 @@ function mockRequestAnimationFrame() {
 
 describe("TaskChatTab", () => {
   beforeEach(() => {
+    __test_resetChatSnippetsCache();
     vi.clearAllMocks();
+    mockedFetchGlobalSettings.mockReturnValue(new Promise(() => {}));
+    mockedUpdateGlobalSettings.mockResolvedValue({ chatSnippets: [] } as never);
     mockLogs();
   });
 
@@ -379,6 +391,23 @@ describe("TaskChatTab", () => {
     }
   });
 
+  it("renders its production composer with homemade Alpha only inside the Alpha surface", () => {
+    const view = render(
+      <AlphaProvider enabled>
+        <AlphaBoundary><TaskChatTab task={makeTask()} active addToast={vi.fn()} /></AlphaBoundary>
+      </AlphaProvider>,
+    );
+    expect(screen.getByLabelText("Message active agent session")).toHaveAttribute("data-alpha-ui", "textarea");
+    expect(view.container.querySelector('[data-alpha-ui="button"]')).not.toBeNull();
+
+    view.rerender(
+      <AlphaProvider enabled={false}>
+        <AlphaBoundary><TaskChatTab task={makeTask()} active addToast={vi.fn()} /></AlphaBoundary>
+      </AlphaProvider>,
+    );
+    expect(screen.getByLabelText("Message active agent session")).not.toHaveAttribute("data-alpha-ui");
+  });
+
   it("subscribes to live agent logs only when active", () => {
     render(<TaskChatTab task={makeTask()} active={false} projectId="project-1" addToast={vi.fn()} />);
     expect(mockedUseAgentLogs).toHaveBeenCalledWith("FN-001", false, "project-1");
@@ -390,8 +419,11 @@ describe("TaskChatTab", () => {
     const transcript = screen.getByTestId("task-chat-transcript");
     expect(within(transcript).getByText(/No agent output yet/)).toBeTruthy();
     expect(within(transcript).queryByTestId("task-chat-group-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-group-time-precise")).not.toBeInTheDocument();
     expect(within(transcript).queryByTestId("task-chat-user-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-user-time-precise")).not.toBeInTheDocument();
     expect(within(transcript).queryByTestId("task-chat-block-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-block-time-precise")).not.toBeInTheDocument();
     expect(transcript).not.toHaveTextContent(/NaN|Invalid Date/);
   });
 
@@ -405,8 +437,11 @@ describe("TaskChatTab", () => {
     act(() => vi.advanceTimersByTime(150));
     expect(within(transcript).getByText("Loading agent output…")).toBeTruthy();
     expect(within(transcript).queryByTestId("task-chat-group-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-group-time-precise")).not.toBeInTheDocument();
     expect(within(transcript).queryByTestId("task-chat-user-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-user-time-precise")).not.toBeInTheDocument();
     expect(within(transcript).queryByTestId("task-chat-block-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-block-time-precise")).not.toBeInTheDocument();
     expect(transcript).not.toHaveTextContent(/NaN|Invalid Date/);
   });
 
@@ -555,7 +590,7 @@ describe("TaskChatTab", () => {
 
   it("uses status and text runtime markers before static overrides for reviewer, executor, and planner icons", () => {
     mockLogs([
-      makeEntry({ agent: "triage", type: "text", text: "Triage using model: openai/gpt-4o" }),
+      makeEntry({ agent: "triage", type: "text", text: "Planning using model: openai/gpt-4o" }),
       makeEntry({ agent: "executor", type: "status", text: "Executor using model: openai/gpt-4o" }),
       makeEntry({ agent: "reviewer", type: "status", text: "Reviewer using model: openai-codex/gpt-5.6-terra" }),
     ]);
@@ -710,6 +745,65 @@ describe("TaskChatTab", () => {
     expect(screen.getByTestId("task-chat-group-time")).toHaveTextContent("just now");
   });
 
+  it("renders a precise clock beside group, user, and block relative timestamps", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 17, 14, 32, 30, 0));
+    const agentTimestamp = new Date(2026, 5, 17, 14, 32, 7, 482).toISOString();
+    const userTimestamp = new Date(2026, 5, 17, 14, 32, 8, 913).toISOString();
+    mockLogs([
+      makeEntry({ agent: "executor", text: "timestamped response", timestamp: agentTimestamp }),
+    ]);
+
+    render(
+      <TaskChatTab
+        task={makeTask({
+          steeringComments: [makeSteeringComment({ id: "precise-user", text: "timestamped guidance", createdAt: userTimestamp })],
+        })}
+        active
+        addToast={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("task-chat-group-time")).toHaveTextContent("just now");
+    expect(screen.getByTestId("task-chat-group-time-precise")).toHaveTextContent("14:32:07.482");
+    expect(screen.getByTestId("task-chat-user-time")).toHaveTextContent("just now");
+    expect(screen.getByTestId("task-chat-user-time-precise")).toHaveTextContent("14:32:08.913");
+    expect(within(screen.getByTestId("task-chat-entry-text")).getByTestId("task-chat-block-time-precise")).toHaveTextContent("14:32:07.482");
+  });
+
+  it("keeps other-day precise timestamps complete at mobile width", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 17, 14, 32, 30, 0));
+    mockMatchMedia(true);
+    const timestamp = new Date(2026, 4, 18, 14, 32, 7, 482).toISOString();
+    const expected = "2026-05-18 14:32:07.482";
+    mockLogs([
+      makeEntry({ agent: "executor", text: "dated text", timestamp }),
+      makeEntry({ agent: "executor", type: "tool", text: "bash", detail: "dated tool", timestamp }),
+      makeEntry({ agent: "executor", type: "thinking", text: "dated thought", timestamp }),
+    ]);
+
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+
+    expect(screen.getByTestId("task-chat-group-time-precise")).toHaveTextContent(expected);
+    const blockPreciseTimes = screen.getAllByTestId("task-chat-block-time-precise");
+    expect(blockPreciseTimes.length).toBeGreaterThanOrEqual(3);
+    for (const preciseTime of blockPreciseTimes) {
+      expect(preciseTime).toHaveTextContent(expected);
+      expect(preciseTime).toHaveAttribute("title", expected);
+    }
+
+    const mobileCss = getCssAfter(readAppFile("components/TaskChatTab.css"), "@media (max-width: 768px)");
+    const preciseRule = getCssRuleBlock(mobileCss, ".task-chat-entry-meta .task-chat-precise-timestamp,");
+    expect(preciseRule).toContain("max-inline-size: 100%");
+    expect(preciseRule).toContain("overflow: visible");
+    expect(preciseRule).toContain("overflow-wrap: anywhere");
+    expect(preciseRule).not.toContain("overflow: hidden");
+    expect(preciseRule).not.toContain("text-overflow: ellipsis");
+    expect(mobileCss).toMatch(/\.task-chat-entry-label-row,\s*\.task-chat-entry-meta\s*\{[^}]*flex-wrap:\s*wrap;/);
+    expect(mobileCss).toMatch(/\.task-chat-tool-group-summary\s*\{[^}]*flex-wrap:\s*wrap;/);
+  });
+
   it("renders the latest-entry relative timestamp alongside multi-entry group meta", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-17T15:00:00.000Z"));
@@ -756,6 +850,24 @@ describe("TaskChatTab", () => {
     expect(screen.getByLabelText("Tool invocation timestamp")).toHaveTextContent("3m ago");
     expect(screen.getByLabelText("Thinking block timestamp")).toHaveTextContent("5m ago");
     expect(screen.getByLabelText("User message block timestamp")).toHaveTextContent("8m ago");
+  });
+
+  it("keeps tool-entry precise timestamps distinct at millisecond resolution", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 17, 14, 33, 0, 0));
+    mockLogs([
+      makeEntry({ agent: "executor", type: "tool", text: "first", detail: "first detail", timestamp: new Date(2026, 5, 17, 14, 32, 7, 482).toISOString() }),
+      makeEntry({ agent: "executor", type: "tool", text: "second", detail: "second detail", timestamp: new Date(2026, 5, 17, 14, 32, 7, 913).toISOString() }),
+    ]);
+
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+
+    const toolEntries = document.querySelector(".task-chat-tool-group-entries") as HTMLElement;
+    expect(toolEntries).toBeTruthy();
+    expect(within(toolEntries).getAllByTestId("task-chat-block-time-precise").map((element) => element.textContent)).toEqual([
+      "14:32:07.482",
+      "14:32:07.913",
+    ]);
   });
 
   it("keeps agent and user timestamp parity in the inline chat surface", () => {
@@ -937,8 +1049,8 @@ describe("TaskChatTab", () => {
   it("counts a tool call plus result as one collapsed invocation and shows the tool name", async () => {
     const user = userEvent.setup();
     mockLogs([
-      makeEntry({ agent: "executor", type: "tool", text: "bash", detail: "pnpm test" }),
-      makeEntry({ agent: "executor", type: "tool_result", text: "bash", detail: "ok" }),
+      makeEntry({ agent: "executor", type: "tool", text: "fn_run_verification", detail: "command=pnpm test, allowFullSuite=false" }),
+      makeEntry({ agent: "executor", type: "tool_result", text: "fn_run_verification", detail: "ok" }),
     ]);
 
     render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
@@ -951,10 +1063,10 @@ describe("TaskChatTab", () => {
     expect(toolGroup).not.toHaveAttribute("open");
     expect(within(summary as HTMLElement).getByText("1 tool call")).toHaveClass("task-chat-tool-group-count");
     expect(within(summary as HTMLElement).getByText("1 tool call")).toBeVisible();
-    expect(within(summary as HTMLElement).getByText("bash")).toHaveClass("task-chat-tool-group-names");
-    expect(within(summary as HTMLElement).getByText("bash")).toBeVisible();
+    expect(within(summary as HTMLElement).getByText("fn_run_verification")).toHaveClass("task-chat-tool-group-names");
+    expect(within(summary as HTMLElement).getByText("fn_run_verification")).toBeVisible();
     expect(screen.queryByText("2 tool calls")).not.toBeInTheDocument();
-    expect(screen.getByText("pnpm test")).not.toBeVisible();
+    expect(screen.getByText("command=pnpm test, allowFullSuite=false")).not.toBeVisible();
     expect(screen.getByText("ok")).not.toBeVisible();
 
     await user.click(within(summary as HTMLElement).getByText("1 tool call"));
@@ -967,8 +1079,73 @@ describe("TaskChatTab", () => {
     expect(kicker).toBeVisible();
     expect(screen.getByText("Arguments")).toBeVisible();
     expect(screen.getByText("Result")).toBeVisible();
-    expect(screen.getByText("pnpm test")).toBeVisible();
+    expect(screen.getByText("command=pnpm test, allowFullSuite=false")).toBeVisible();
     expect(screen.getByText("ok")).toBeVisible();
+  });
+
+  it("shows the complete long task activity payload after expanding its tool group", async () => {
+    const user = userEvent.setup();
+    const longCommand = `bash ${"argument ".repeat(12)}TASK_ACTIVITY_COMMAND_SUFFIX`;
+    const longResult = `result\n${"output ".repeat(45)}TASK_ACTIVITY_RESULT_SUFFIX`;
+    mockLogs([
+      makeEntry({ agent: "executor", type: "tool", text: "bash", detail: longCommand }),
+      makeEntry({ agent: "executor", type: "tool_result", text: "bash", detail: longResult }),
+    ]);
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+
+    await user.click(screen.getByText("1 tool call"));
+    const invocation = screen.getByTestId("task-chat-tool-invocation");
+    expect(invocation).toHaveTextContent("TASK_ACTIVITY_COMMAND_SUFFIX");
+    expect(invocation).toHaveTextContent("TASK_ACTIVITY_RESULT_SUFFIX");
+  });
+
+  it("previews a long task tool payload and reveals its complete value on request", async () => {
+    const user = userEvent.setup();
+    const longResult = `line one\nline two\nline three\nline four\nline five\nline six\nline seven\n${"x".repeat(601)}`;
+    mockLogs([
+      makeEntry({ agent: "executor", type: "tool", text: "bash", detail: "pnpm test" }),
+      makeEntry({ agent: "executor", type: "tool_result", text: "bash", detail: longResult }),
+    ]);
+
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+    await user.click(screen.getByText("1 tool call"));
+
+    const preview = document.querySelector(".tool-call-details-value--clamped");
+    expect(preview).toHaveTextContent("line seven");
+    const reveal = screen.getByRole("button", { name: "Show more (8 lines)" });
+    expect(reveal).toHaveAttribute("aria-expanded", "false");
+    expect(reveal).toHaveAttribute("aria-controls");
+
+    await user.click(reveal);
+
+    expect(document.querySelector(".tool-call-details-value--clamped")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show less" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("shows one host-level missing-detail hint for historical tool entries", async () => {
+    const user = userEvent.setup();
+    mockLogs([
+      makeEntry({ agent: "executor", type: "tool", text: "bash", detail: undefined }),
+      makeEntry({ agent: "executor", type: "tool_result", text: "bash", detail: undefined }),
+    ]);
+
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+    await user.click(screen.getByText("1 tool call"));
+
+    expect(screen.getByTestId("task-chat-tool-details-missing")).toHaveTextContent("may have been recorded while detail saving was disabled");
+  });
+
+  it("keeps task tool preview clamping and its mobile host spacing tokenized", () => {
+    const detailCss = readFileSync(resolve(__dirname, "../ToolCallDetails.css"), "utf8");
+    const chatCss = readFileSync(resolve(__dirname, "../TaskChatTab.css"), "utf8");
+
+    const clampedRule = getCssRuleBlock(detailCss, ".tool-call-details-value--clamped");
+    expect(clampedRule).toContain("max-block-size");
+    expect(clampedRule).toContain("overflow: hidden");
+    expect(clampedRule).not.toContain("display: none");
+    expect(getCssRuleBlock(detailCss, ".tool-call-details-reveal")).toContain("margin-top: var(--space-xs)");
+    expect(chatCss).toContain(".task-chat-tool-details-missing");
+    expect(chatCss.slice(chatCss.indexOf("@media (max-width: 768px)"))).toContain(".task-chat-tool-details-missing");
   });
 
   it("shows Bash tool duration in the expanded invocation and omits legacy timing labels", async () => {
@@ -1133,12 +1310,34 @@ describe("TaskChatTab", () => {
     expect(within(standaloneEntry).getByLabelText("Tool entry timestamp")).toHaveTextContent(expectedTime);
   });
 
-  it("renders thinking in a collapsed-by-default expandable block for inactive tasks", async () => {
+  it.each([
+    ["WIP", "in-progress"],
+    ["review", "in-review"],
+    ["idle", "todo"],
+    ["planning", "triage"],
+    ["terminal", "done"],
+  ] as const)("defaults thinking blocks collapsed for %s tasks", (_state, column) => {
+    mockLogs([
+      makeEntry({ agent: "executor", type: "thinking", text: "Immediately readable reasoning" }),
+    ]);
+
+    render(<TaskChatTab task={makeTask({ column })} active addToast={vi.fn()} />);
+
+    const thinking = screen.getByTestId("task-chat-thinking");
+    expect(thinking).not.toHaveAttribute("open");
+    expect(screen.getByText("Immediately readable reasoning")).not.toBeVisible();
+  });
+
+  it.each([
+    ["desktop", false],
+    ["mobile", true],
+  ] as const)("lets users dismiss and reopen thinking blocks from the body on %s", async (_viewport, matchesMobile) => {
     const user = userEvent.setup();
     mockLogs([
       makeEntry({ agent: "triage", type: "thinking", text: "I am considering options" }),
     ]);
 
+    mockMatchMedia(matchesMobile);
     render(<TaskChatTab task={makeTask({ column: "done" })} active addToast={vi.fn()} />);
 
     const thinking = screen.getByTestId("task-chat-thinking");
@@ -1148,51 +1347,51 @@ describe("TaskChatTab", () => {
     expect(within(thinking).getAllByTestId("task-chat-entry-thinking")).toHaveLength(1);
 
     await user.click(within(thinking).getByText("Thinking"));
-
     expect(thinking).toHaveAttribute("open");
     expect(screen.getByText("I am considering options")).toBeVisible();
 
-    await user.click(within(thinking).getByText("Thinking"));
-
+    await user.click(within(thinking).getByText("I am considering options"));
     expect(thinking).not.toHaveAttribute("open");
     expect(screen.getByText("I am considering options")).not.toBeVisible();
-  });
-
-  it.each(["in-progress", "in-review"] as const)("defaults thinking blocks open for %s tasks", (column) => {
-    mockLogs([
-      makeEntry({ agent: "executor", type: "thinking", text: "Live reasoning" }),
-    ]);
-
-    render(<TaskChatTab task={makeTask({ column })} active addToast={vi.fn()} />);
-
-    expect(screen.getByTestId("task-chat-thinking")).toHaveAttribute("open");
-  });
-
-  it.each(["todo", "done", "triage", "archived"] as const)("keeps thinking blocks collapsed for %s tasks", (column) => {
-    mockLogs([
-      makeEntry({ agent: "executor", type: "thinking", text: "Historical reasoning" }),
-    ]);
-
-    render(<TaskChatTab task={makeTask({ column })} active addToast={vi.fn()} />);
-
-    expect(screen.getByTestId("task-chat-thinking")).not.toHaveAttribute("open");
-  });
-
-  it("lets users collapse auto-expanded thinking blocks", async () => {
-    const user = userEvent.setup();
-    mockLogs([
-      makeEntry({ agent: "executor", type: "thinking", text: "Active reasoning" }),
-    ]);
-
-    render(<TaskChatTab task={makeTask({ column: "in-progress" })} active addToast={vi.fn()} />);
-
-    const thinking = screen.getByTestId("task-chat-thinking");
-    expect(thinking).toHaveAttribute("open");
 
     await user.click(within(thinking).getByText("Thinking"));
+    expect(thinking).toHaveAttribute("open");
+    expect(screen.getByText("I am considering options")).toBeVisible();
+  });
 
-    expect(thinking).not.toHaveAttribute("open");
-    expect(screen.getByText("Active reasoning")).not.toBeVisible();
+  it("sections titled Task Activity thinking independently after the host disclosure opens", () => {
+    const trace = "**Ensuring Docker build includes dev dependencies for tests**\n\nDocker tests need development dependencies.\n\n**Planning deployment commit structure**\n\nDeployment commits remain independently reviewable.\n\n**Editing README content**\n\nREADME edits remain visible in their own section.";
+    mockLogs([makeEntry({ agent: "executor", type: "thinking", text: trace })]);
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+
+    const host = screen.getByTestId("task-chat-thinking");
+    fireEvent.click(host.querySelector("summary")!);
+    const sections = host.querySelectorAll<HTMLElement>("[data-testid='thinking-trace-section']");
+    expect(sections).toHaveLength(3);
+    const deployment = [...sections].find((section) => section.textContent?.includes("Planning deployment commit structure"))!;
+    expect(deployment).toHaveTextContent("Deployment commits remain independently reviewable.");
+    fireEvent.click(deployment.querySelector("summary")!);
+    expect(deployment).not.toHaveAttribute("open");
+    expect([...sections].find((section) => section.textContent?.includes("README edits"))).toHaveAttribute("open");
+  });
+
+  it.each([
+    ["desktop", false],
+    ["mobile", true],
+  ] as const)("keeps titles-only thinking raw-toggle interactions inside the host on %s", (_viewport, matchesMobile) => {
+    const titlesOnly = "**One**\n\n**Two**\n\n**Three**";
+    mockLogs([makeEntry({ agent: "executor", type: "thinking", text: titlesOnly })]);
+    mockMatchMedia(matchesMobile);
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+
+    const host = screen.getByTestId("task-chat-thinking");
+    fireEvent.click(host.querySelector("summary")!);
+    expect(host).toHaveAttribute("open");
+    expect(host.querySelectorAll("[data-testid='thinking-trace-section']")).toHaveLength(0);
+    expect(within(host).queryAllByText("No reasoning captured for this step")).toHaveLength(0);
+    fireEvent.click(within(host).getByTestId("thinking-trace-raw-toggle"));
+    expect(within(host).getByTestId("thinking-trace-raw")).toHaveTextContent("**One**");
+    expect(host).toHaveAttribute("open");
   });
 
   it("renders consecutive thinking entries as one continuous section", () => {
@@ -1204,6 +1403,7 @@ describe("TaskChatTab", () => {
     render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
 
     const thinking = screen.getByTestId("task-chat-thinking");
+    expect(thinking).not.toHaveAttribute("open");
     const summary = thinking.querySelector("summary");
     expect(summary).toBeTruthy();
     expect(within(summary as HTMLElement).getByText("Thinking")).toBeVisible();
@@ -1212,6 +1412,63 @@ describe("TaskChatTab", () => {
     expect(thinkingBlocks).toHaveLength(1);
     expect(thinkingBlocks[0]).toHaveTextContent("FirstSecond");
     expect(thinkingBlocks[0].nextElementSibling).toBeNull();
+  });
+
+  /*
+  FNXC:TaskChatSegmentKey 2026-07-22-12:00:
+  Segment keys must be kind + startIndex only. Embedding entries.length remounted the actively streaming segment on every appended entry, collapsing an expanded thinking block mid-stream.
+  */
+  it("keeps a user-collapsed thinking block collapsed while entries stream into the same segment", async () => {
+    const user = userEvent.setup();
+    mockLogs([
+      makeEntry({ agent: "executor", type: "thinking", text: "First streamed thought" }),
+    ]);
+
+    const { rerender } = render(<TaskChatTab task={makeTask({ column: "todo" })} active addToast={vi.fn()} />);
+
+    const thinking = screen.getByTestId("task-chat-thinking");
+    expect(thinking).not.toHaveAttribute("open");
+    await user.click(within(thinking).getByText("Thinking"));
+    expect(thinking).toHaveAttribute("open");
+    await user.click(within(thinking).getByText("First streamed thought"));
+    expect(thinking).not.toHaveAttribute("open");
+
+    mockLogs([
+      makeEntry({ agent: "executor", type: "thinking", text: "First streamed thought" }),
+      makeEntry({ agent: "executor", type: "thinking", text: "Second streamed thought", timestamp: "2026-06-12T00:00:01.000Z" }),
+    ]);
+    rerender(<TaskChatTab task={makeTask({ column: "todo" })} active addToast={vi.fn()} />);
+
+    expect(screen.getByTestId("task-chat-thinking")).not.toHaveAttribute("open");
+    expect(screen.getByText(/Second streamed thought/)).not.toBeVisible();
+  });
+
+  it("gives a genuinely new thinking segment a fresh collapsed instance", async () => {
+    const user = userEvent.setup();
+    mockLogs([
+      makeEntry({ agent: "executor", type: "thinking", text: "Original reasoning" }),
+    ]);
+
+    const { rerender } = render(<TaskChatTab task={makeTask({ column: "in-progress" })} active addToast={vi.fn()} />);
+
+    const firstThinking = screen.getByTestId("task-chat-thinking");
+    expect(firstThinking).not.toHaveAttribute("open");
+    await user.click(within(firstThinking).getByText("Thinking"));
+    expect(firstThinking).toHaveAttribute("open");
+    await user.click(within(firstThinking).getByText("Original reasoning"));
+    expect(firstThinking).not.toHaveAttribute("open");
+
+    mockLogs([
+      makeEntry({ agent: "executor", type: "thinking", text: "Original reasoning" }),
+      makeEntry({ agent: "executor", text: "interleaved response", timestamp: "2026-06-12T00:00:01.000Z" }),
+      makeEntry({ agent: "executor", type: "thinking", text: "Later reasoning", timestamp: "2026-06-12T00:00:02.000Z" }),
+    ]);
+    rerender(<TaskChatTab task={makeTask({ column: "in-progress" })} active addToast={vi.fn()} />);
+
+    const thinkingBlocks = screen.getAllByTestId("task-chat-thinking");
+    expect(thinkingBlocks).toHaveLength(2);
+    expect(thinkingBlocks[0]).not.toHaveAttribute("open");
+    expect(thinkingBlocks[1]).not.toHaveAttribute("open");
   });
 
   it("creates distinct tool segments when text or thinking entries are interleaved", () => {
@@ -1674,6 +1931,88 @@ describe("TaskChatTab", () => {
     expect(sendButton).toHaveTextContent("");
   });
 
+  it("offers chat snippets in the composer and inserts pointer and keyboard selections without sending", async () => {
+    const prompt = "lance toujours les tests avec chrome devtool mcp";
+    mockedFetchGlobalSettings.mockResolvedValue({ chatSnippets: [{ name: "test", prompt }] });
+    const user = userEvent.setup();
+    render(<TaskChatTab task={makeTask()} projectId="project-1" active addToast={vi.fn()} />);
+    const input = screen.getByLabelText("Message active agent session");
+
+    await user.type(input, "/te");
+    await user.click(await screen.findByRole("option", { name: /\/test/i }));
+    expect(input).toHaveValue(prompt);
+    expect(input).toHaveFocus();
+    expect(mockedAddSteeringComment).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "/test" } });
+    await screen.findByRole("option", { name: /\/test/i });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue(prompt);
+    expect(mockedAddSteeringComment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["steering", makeTask({ column: "in-progress" }), mockedAddSteeringComment],
+    ["refinement", makeTask({ column: "done" }), mockedRefineTask],
+  ] as const)("expands a standalone snippet before optimistic %s submission", async (_label, task, submitMock) => {
+    const prompt = "lance toujours les tests avec chrome devtool mcp";
+    mockedFetchGlobalSettings.mockResolvedValue({ chatSnippets: [{ name: "test", prompt }] });
+    let resolveSubmit!: (value: Task) => void;
+    submitMock.mockReturnValue(new Promise<Task>((resolve) => { resolveSubmit = resolve; }) as never);
+    render(<TaskChatTab task={task} projectId="project-1" active addToast={vi.fn()} />);
+    const input = screen.getByLabelText("Message active agent session");
+    const send = screen.getByRole("button", { name: "Send" });
+
+    fireEvent.change(input, { target: { value: "/test" } });
+    await screen.findByRole("option", { name: /\/test/i });
+    fireEvent.click(send);
+    await waitFor(() => expect(input).toHaveValue(prompt));
+    expect(submitMock).not.toHaveBeenCalled();
+
+    fireEvent.click(send);
+    await waitFor(() => expect(submitMock).toHaveBeenCalledWith("FN-001", prompt, "project-1"));
+    expect(within(screen.getByTestId("task-chat-transcript")).getByText(prompt)).toBeInTheDocument();
+    resolveSubmit(makeTask());
+    await waitFor(() => expect(input).toHaveValue(""));
+  });
+
+  it.each([
+    ["active steering", makeTask({ column: "in-progress" })],
+    ["done-task refinement", makeTask({ column: "done" })],
+  ] as const)("caps the %s composer, ignores pointer resizing, and collapses after clear", async (_label, task) => {
+    const user = userEvent.setup();
+    mockedAddSteeringComment.mockResolvedValue(task);
+    mockedRefineTask.mockResolvedValue(makeTask({ id: "FN-024-refinement", column: "todo" }));
+    render(<TaskChatTab task={task} projectId="project-1" active addToast={vi.fn()} />);
+
+    const input = screen.getByLabelText("Message active agent session") as HTMLTextAreaElement;
+    Object.defineProperty(input, "scrollHeight", {
+      configurable: true,
+      get: () => input.value.length > 0 ? 500 : 24,
+    });
+
+    await user.type(input, "one\ntwo\nthree\nfour\nfive\nsix");
+    const automaticHeight = clampChatInputHeight(500, getChatInputAutomaticMaxHeight(getChatInputBoxMetrics(input)));
+    expect(input.style.height).toBe(`${automaticHeight}px`);
+    expect(input.style.overflowY).toBe("auto");
+    expect(screen.getByTestId("task-chat-transcript")).toBeInTheDocument();
+
+    const pointer = (type: string, clientY: number) => input.dispatchEvent(Object.assign(
+      new Event(type, { bubbles: true, cancelable: true }), { clientY, pointerId: 1, pointerType: "mouse" },
+    ));
+    pointer("pointerdown", 0);
+    pointer("pointermove", -200);
+    pointer("pointerup", -200);
+    expect(Number.parseInt(input.style.height, 10)).toBe(automaticHeight);
+
+    fireEvent.change(input, { target: { value: "" } });
+    await waitFor(() => {
+      expect(input).toHaveValue("");
+      expect(input.style.height).toBe(`${clampChatInputHeight(24, getChatInputAutomaticMaxHeight(getChatInputBoxMetrics(input)))}px`);
+      expect(input.style.overflowY).toBe("hidden");
+    });
+  });
+
   it("posts composer text through addSteeringComment and clears on success", async () => {
     const user = userEvent.setup();
     const onTaskUpdated = vi.fn();
@@ -1694,6 +2033,38 @@ describe("TaskChatTab", () => {
     expect(mockedRefineTask).not.toHaveBeenCalled();
     expect(onTaskUpdated).toHaveBeenCalledWith(updatedTask);
     expect(input).toHaveValue("");
+  });
+
+  it("submits a long Activity steering draft without the former message-length error", async () => {
+    const user = userEvent.setup();
+    const longText = "a".repeat(5_000);
+    const addToast = vi.fn();
+    mockedAddSteeringComment.mockResolvedValue(makeTask());
+    render(<TaskChatTab task={makeTask()} projectId="project-1" active addToast={addToast} />);
+
+    fireEvent.change(screen.getByLabelText("Message active agent session"), { target: { value: longText } });
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(mockedAddSteeringComment).toHaveBeenCalledWith("FN-001", longText, "project-1");
+    });
+    expect(addToast.mock.calls.some(([message]) => typeof message === "string" && message.includes("Unable to send message"))).toBe(false);
+  });
+
+  it("submits a long done-task refinement draft without the former message-length error", async () => {
+    const user = userEvent.setup();
+    const longText = "a".repeat(5_000);
+    const addToast = vi.fn();
+    mockedRefineTask.mockResolvedValue(makeTask({ id: "FN-257-refinement", column: "todo" }));
+    render(<TaskChatTab task={makeTask({ column: "done" })} projectId="project-1" active addToast={addToast} />);
+
+    fireEvent.change(screen.getByLabelText("Message active agent session"), { target: { value: longText } });
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(mockedRefineTask).toHaveBeenCalledWith("FN-001", longText, "project-1");
+    });
+    expect(addToast.mock.calls.some(([message]) => typeof message === "string" && message.includes("Unable to send message"))).toBe(false);
   });
 
   it("sends Activity steering exactly once on the first mobile tap while the textarea is focused", async () => {
@@ -1757,6 +2128,7 @@ describe("TaskChatTab", () => {
     const user = userEvent.setup();
     const addToast = vi.fn();
     const onTaskUpdated = vi.fn();
+    const onRefinementCreated = vi.fn();
     const refinementTask = makeTask({ id: "FN-222", column: "todo" });
     mockedRefineTask.mockResolvedValue(refinementTask);
     render(
@@ -1766,6 +2138,7 @@ describe("TaskChatTab", () => {
         active
         addToast={addToast}
         onTaskUpdated={onTaskUpdated}
+        onRefinementCreated={onRefinementCreated}
       />,
     );
 
@@ -1784,6 +2157,8 @@ describe("TaskChatTab", () => {
     expect(addToast).toHaveBeenCalledWith("Refinement task created: FN-222", "success");
     expect(onTaskUpdated).not.toHaveBeenCalledWith(refinementTask);
     expect(onTaskUpdated).not.toHaveBeenCalled();
+    expect(onRefinementCreated).toHaveBeenCalledTimes(1);
+    expect(onRefinementCreated).toHaveBeenCalledWith(refinementTask);
   });
 
   it("preserves durable non-default workflow context after done-task refinement success", async () => {
@@ -1946,7 +2321,6 @@ describe("TaskChatTab", () => {
     ["in-review", makeTask({ column: "in-review", assignedAgentId: "agent-1", status: "reviewing" })],
     ["todo", makeTask({ column: "todo", assignedAgentId: undefined, checkedOutBy: undefined })],
     ["triage", makeTask({ column: "triage", assignedAgentId: undefined, checkedOutBy: undefined })],
-    ["archived", makeTask({ column: "archived", assignedAgentId: undefined, checkedOutBy: undefined })],
   ])("keeps %s sends routed to addSteeringComment", async (_label, task) => {
     const user = userEvent.setup();
     mockedAddSteeringComment.mockResolvedValue(task);
@@ -2146,8 +2520,11 @@ describe("TaskChatTab", () => {
     expect(within(transcript).getByText("invalid agent timestamp")).toBeVisible();
     expect(within(transcript).getByText("invalid user timestamp")).toBeVisible();
     expect(within(transcript).queryByTestId("task-chat-group-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-group-time-precise")).not.toBeInTheDocument();
     expect(within(transcript).queryByTestId("task-chat-user-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-user-time-precise")).not.toBeInTheDocument();
     expect(within(transcript).queryByTestId("task-chat-block-time")).not.toBeInTheDocument();
+    expect(within(transcript).queryByTestId("task-chat-block-time-precise")).not.toBeInTheDocument();
     expect(transcript).not.toHaveTextContent(/NaN|Invalid Date/);
   });
 
@@ -2513,7 +2890,6 @@ describe("TaskChatTab", () => {
     ["todo task", makeTask({ column: "todo", assignedAgentId: "agent-1", status: undefined }), false],
     ["triage task", makeTask({ column: "triage", assignedAgentId: "agent-1", status: undefined }), true],
     ["done task", makeTask({ column: "done", assignedAgentId: "agent-1", status: undefined }), false],
-    ["archived task", makeTask({ column: "archived", assignedAgentId: "agent-1", status: undefined }), false],
   ])("keeps the composer sendable for %s column", (_label, task, _previouslyShowedActiveCopy) => {
     render(<TaskChatTab task={task} active addToast={vi.fn()} sessionLive={false} />);
 
@@ -2776,6 +3152,24 @@ describe("TaskChatTab", () => {
     expect(css).not.toContain("62vh");
   });
 
+  it("matches the Activity Live composer radius to its transcript on desktop and mobile", () => {
+    const css = readFileSync(resolve(__dirname, "../TaskChatTab.css"), "utf8");
+    const sharedStyles = readFileSync(resolve(__dirname, "../../styles.css"), "utf8");
+    const transcriptRule = getCssRuleBlock(css, ".task-chat-transcript");
+    const inputRule = getCssRuleBlock(css, ".task-chat-input");
+    const mobileCss = getCssAfter(css, "@media (max-width: 768px)");
+    const mobileInputRule = getCssRuleBlock(mobileCss, ".task-chat-input");
+    const globalInputRule = getCssRuleBlock(sharedStyles, ".input,");
+
+    expect(getCssDeclaration(transcriptRule, "border-radius")).toBe("var(--radius-lg)");
+    expect(getCssDeclaration(inputRule, "border-radius")).toBe("var(--radius-lg)");
+    expect(getCssDeclaration(inputRule, "resize")).toBe("none");
+    expect(inputRule).not.toContain("resize: vertical");
+    expect(getCssDeclaration(mobileInputRule, "resize")).toBe("none");
+    expect(mobileInputRule).not.toMatch(/border-radius\s*:/);
+    expect(getCssDeclaration(globalInputRule, "border-radius")).toBe("var(--radius-sm)");
+  });
+
   it("positions the icon-only expand toggle as a tokenized chat-view overlay with no toolbar shell", () => {
     const css = readFileSync(resolve(__dirname, "../TaskChatTab.css"), "utf8");
     const tabRule = getCssRuleBlock(css, ".task-chat-tab");
@@ -2909,6 +3303,36 @@ describe("TaskChatTab", () => {
     expect(mobileGroupRule).toContain("grid-template-columns: 1fr");
   });
 
+  it("applies full-width layout to Activity agent and user blocks while preserving the default modifier", () => {
+    mockLogs([
+      makeEntry({ agent: "executor", text: "streamed agent output", type: "text" }),
+    ]);
+    const task = makeTask({
+      steeringComments: [makeSteeringComment({ id: "layout-user", text: "user steering" })],
+    });
+
+    render(
+      <ChatMessageLayoutProvider value="full-width">
+        <TaskChatTab task={task} active addToast={vi.fn()} />
+      </ChatMessageLayoutProvider>,
+    );
+
+    expect(screen.getByTestId("task-chat-tab")).toHaveClass("task-chat-tab--full-width");
+    expect(screen.getByTestId("task-chat-entry-user")).toBeInTheDocument();
+    expect(screen.getByTestId("task-chat-entry-text")).toBeInTheDocument();
+
+    const css = readFileSync(resolve(__dirname, "../TaskChatTab.css"), "utf8");
+    expect(css).toContain(".task-chat-tab--full-width .task-chat-group");
+    expect(css).toContain(".task-chat-tab--full-width .task-chat-entry,");
+    expect(css).toContain("max-width: 100%");
+  });
+
+  it("keeps Activity bubbles when no full-width context is provided", () => {
+    mockLogs([makeEntry({ agent: "executor", text: "default output" })]);
+    render(<TaskChatTab task={makeTask()} active addToast={vi.fn()} />);
+    expect(screen.getByTestId("task-chat-tab")).not.toHaveClass("task-chat-tab--full-width");
+  });
+
   it("stacks agent headers only inside the List View split-detail chat host", () => {
     const css = readFileSync(resolve(__dirname, "../TaskChatTab.css"), "utf8");
     const desktopGroupRule = getCssRuleBlock(css, ".task-chat-group");
@@ -2926,12 +3350,15 @@ describe("TaskChatTab", () => {
   it("keeps List View as the only split-pane host for compact task chat", () => {
     const listSource = readFileSync(resolve(__dirname, "../ListView.tsx"), "utf8");
     const mainContentSource = readFileSync(resolve(__dirname, "../dashboard/MainContent.tsx"), "utf8");
+    const hostSource = readFileSync(resolve(__dirname, "../TaskDetailHostBoundaries.tsx"), "utf8");
 
-    expect(listSource).toContain('className="list-split-detail-content"');
-    expect(listSource).toContain("<TaskDetailContent");
-    expect(listSource).toContain("embedded");
-    expect(mainContentSource).toContain('className="task-detail-main-panel-body"');
-    expect(mainContentSource).toContain("<TaskDetailContent");
+    // FN-382: List delegates to its host's detail layer instead of mounting a split host of its own.
+    expect(listSource).not.toContain("<ListSplitTaskDetailHost");
+    expect(hostSource).toContain('className="list-split-detail-content"');
+    expect(hostSource).toContain("<TaskDetailContent");
+    expect(hostSource).toContain("embedded");
+    expect(mainContentSource).toContain("<MainPanelTaskDetailHost");
+    expect(hostSource).toContain('className="task-detail-main-panel-body"');
   });
 
   it("keeps task detail chat block inner padding tokenized across text, tool, and thinking surfaces", () => {
@@ -2947,7 +3374,7 @@ describe("TaskChatTab", () => {
     const thinkingRule = getCssRuleBlock(compactThinkingCss, ".task-chat-thinking");
     const thinkingSummaryRule = getCssRuleBlock(getCssAfter(css, ".task-chat-thinking {\n  border-color"), ".task-chat-thinking-summary");
     const thinkingBodyRule = getCssRuleBlock(getCssAfter(css, ".task-chat-tool-group-entries {\n  gap: var(--space-xs);\n  padding: 0 var(--space-xs) var(--space-xs);\n}"), ".task-chat-thinking-body");
-    const toolDetailRule = getCssRuleBlock(getCssAfter(css, ".task-chat-tool-detail {"), ".task-chat-tool-detail");
+    const toolDetailRule = getCssRuleBlock(readFileSync(resolve(__dirname, "../ToolCallDetails.css"), "utf8"), ".tool-call-details-value");
     const mobileCss = getCssAfter(css, "@media (max-width: 768px)");
     const mobileStandardBlockRule = getCssRuleBlock(mobileCss, ".task-chat-entry,\n  .task-chat-tool-group");
     const mobileThinkingRule = getCssRuleBlock(getCssAfter(mobileCss, ".task-chat-thinking {\n    padding"), ".task-chat-thinking");
@@ -2967,8 +3394,8 @@ describe("TaskChatTab", () => {
     expect(thinkingBodyRule).toContain("padding: 0 var(--space-sm) var(--space-sm)");
     expect(toolEntryRule).toContain("box-sizing: border-box");
     expect(toolEntryRule).toContain("padding: var(--space-sm)");
-    expect(toolDetailRule).toContain("box-sizing: border-box");
-    expect(toolDetailRule).toContain("padding: var(--space-xs)");
+    expect(toolDetailRule).toContain("max-inline-size: 100%");
+    expect(toolDetailRule).toContain("overflow-x: auto");
     expect(mobileStandardBlockRule).toContain("padding: var(--space-sm)");
     expect(mobileThinkingRule).toContain("padding: var(--space-xs)");
     expect(mobileToolEntryRule).toContain("padding: var(--space-xs)");
@@ -2983,6 +3410,7 @@ describe("TaskChatTab", () => {
     const groupMetaRule = getCssRuleBlock(css, ".task-chat-group-meta");
     const userHeaderRule = getCssRuleBlock(css, ".task-chat-user-header");
     const timestampRule = getCssRuleBlock(css, ".task-chat-timestamp");
+    const preciseTimestampRule = getCssRuleBlock(css, ".task-chat-precise-timestamp");
     const blockTimestampRule = getCssRuleBlock(css, ".task-chat-entry-meta .task-chat-timestamp,");
     const blockTimestampMetaRule = getCssRuleBlock(getCssAfter(css, ".task-chat-entry-meta .task-chat-timestamp {"), ".task-chat-entry-meta .task-chat-timestamp");
     const summaryTimestampRule = getCssRuleBlock(getCssAfter(css, ".task-chat-entry-meta .task-chat-timestamp {\n  margin-left: auto;\n}\n\n"), ".task-chat-entry-label-row .task-chat-timestamp,");
@@ -2997,6 +3425,10 @@ describe("TaskChatTab", () => {
     expect(timestampRule).toContain("font-size: calc(var(--space-md) - (var(--space-xs) / 2))");
     expect(timestampRule).not.toContain("px");
     expect(timestampRule).not.toContain("#");
+    expect(preciseTimestampRule).toContain("color: var(--text-muted)");
+    expect(preciseTimestampRule).toContain("font-size: calc(var(--space-md) - (var(--space-xs) / 2))");
+    expect(preciseTimestampRule).not.toContain("px");
+    expect(preciseTimestampRule).not.toContain("#");
     expect(blockTimestampRule).toContain("display: inline-flex");
     expect(blockTimestampRule).toContain("flex: 0 0 auto");
     expect(blockTimestampRule).toContain("font-size: calc(var(--space-md) - (var(--space-xs) / 2))");
@@ -3013,6 +3445,7 @@ describe("TaskChatTab", () => {
     expect(userHeaderRule).toContain("flex-wrap: wrap");
     expect(mobileUserHeaderRule).toContain("justify-content: flex-end");
     expect(mobileTimestampRule).toContain("white-space: normal");
+    expect(mobileCss).toContain(".task-chat-precise-timestamp");
   });
 
   it("keeps task-chat tool summaries compact and tool text readable on desktop and mobile", () => {
@@ -3026,8 +3459,9 @@ describe("TaskChatTab", () => {
     const entriesRule = getCssRuleBlock(getCssAfter(css, ".task-chat-tool-group-entries {\n  gap"), ".task-chat-tool-group-entries");
     const entryRule = getCssRuleBlock(css, ".task-chat-tool-entry");
     const kickerRule = getCssRuleBlock(css, ".task-chat-entry-kicker");
-    const detailLabelRule = getCssRuleBlock(css, ".task-chat-tool-detail-label");
-    const detailRule = getCssRuleBlock(getCssAfter(css, ".task-chat-tool-detail {"), ".task-chat-tool-detail");
+    const detailCss = readFileSync(resolve(__dirname, "../ToolCallDetails.css"), "utf8");
+    const detailLabelRule = getCssRuleBlock(detailCss, ".tool-call-details-label");
+    const detailRule = getCssRuleBlock(detailCss, ".tool-call-details-value");
     const chatSummaryRule = getCssRuleBlock(chatCss, ".chat-tool-calls-group-summary");
     const chatNamesRule = getCssRuleBlock(chatCss, ".chat-tool-calls-names");
     const mobileCss = getCssAfter(css, "@media (max-width: 768px)");
@@ -3057,17 +3491,17 @@ describe("TaskChatTab", () => {
     for (const [selector, readableToolTextRule] of [
       [".task-chat-tool-group-summary", summaryRule],
       [".task-chat-entry-kicker", kickerRule],
-      [".task-chat-tool-detail-label", detailLabelRule],
-      [".task-chat-tool-detail", detailRule],
+      [".tool-call-details-label", detailLabelRule],
+      [".tool-call-details-value", detailRule],
     ] as const) {
-      expect(readableToolTextRule, `${selector} uses readable tool-call typography`).toContain(READABLE_TASK_TOOL_FONT_SIZE);
+      expect(readableToolTextRule, `${selector} uses tokenized tool-call typography`).toMatch(/font-size: var\(--(?:space-md|font-size-xs)\)/);
       expect(readableToolTextRule, `${selector} does not restore the too-small calc`).not.toContain(TOO_SMALL_TASK_TOOL_FONT_SIZE);
     }
     expect(chatSummaryRule).toContain("padding: var(--space-xs)");
     expect(chatSummaryRule).toContain("border-radius: var(--radius-sm)");
     expect(chatNamesRule).toContain("text-overflow: ellipsis");
     expect(mobileSummaryRule).toContain("flex-direction: row");
-    expect(mobileSummaryRule).toContain("flex-wrap: nowrap");
+    expect(mobileSummaryRule).toContain("flex-wrap: wrap");
     expect(mobileCss).not.toContain(TOO_SMALL_TASK_TOOL_FONT_SIZE);
     expect(mobileNamesRule).toContain("width: auto");
     expect(mobileErrorRule).toContain("width: auto");

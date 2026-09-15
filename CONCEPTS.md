@@ -11,10 +11,10 @@ One of Fusion's user-facing frontends — the browser dashboard and the terminal
 User-level settings persisted server-side that apply across all Surfaces and all projects, as opposed to per-project settings. Values are validated at the write boundary — an invalid value is dropped rather than persisted — so every reader can trust what it loads.
 
 ### Workflow Setting
-A typed setting declared by a workflow in its IR (id, type, default, options), mirroring the custom-task-field shape. Declarations describe the schema; *values* persist per workflow + project through a single validating store authority, so built-in workflows can carry values without their IR being editable. The engine consumes **effective settings** — stored value falling back to declaration default, with values that no longer validate against the current declaration dropped (never fed to execution).
+A typed setting declared by a workflow in its IR (id, type, default, options), mirroring the custom-task-field shape. Declarations describe the schema; *values* persist per workflow + project through a single validating store authority, so built-in workflows can carry values without their IR being editable. The active default workflow's model-lane values also serve as the Project workflow-model baseline inherited by every workflow. The engine consumes **effective settings** — stored value falling back to declaration default, with values that no longer validate against the current declaration dropped (never fed to execution).
 
 ### Effective Settings
-The per-task, flat `Partial<Settings>`-shaped value map the engine reads at executor entry, composed from the task's resolved workflow: for each declared Workflow Setting, the stored `(workflowId, projectId)` value falls back to the declaration default, with stored values that no longer validate against the current declaration dropped. Resolution never throws — a missing or corrupt workflow degrades to the built-in coding declarations — so every read site receives a usable value. Because built-in declaration defaults are byte-equal to the legacy project-settings defaults, an untuned project resolves to identical behavior across the settings hard-move.
+The per-task `Partial<Settings>`-shaped value map the engine reads at runtime entry. Workflow policy comes from the task's selected workflow: each stored `(workflowId, projectId)` value falls back to its declaration default, with invalid values dropped. Model lanes resolve separately as task override -> Project workflow-model baseline -> Global lane -> selected-workflow value -> project/global default model; the lower-priority selected-workflow lanes are retained in runtime-only provenance rather than flattened over the Project baseline. Resolution never throws — a missing or corrupt workflow degrades to the built-in coding declarations — so every read site receives a usable value.
 
 ### Moved Settings Keys
 The tombstone allowlist (`MOVED_SETTINGS_KEYS`) of the step-execution, review/approval, and per-phase model-lane keys that the one-time hard-move migration relocated from project/global settings into Workflow Settings. It is the single record of the old names and shields every surface that can encounter a legacy payload — cross-node sync diffs, v1 settings imports, and stale writers — from resurrecting a moved key. A consistency test enforces that a key lives in exactly one regime (project settings *or* the tombstone list, never both).
@@ -57,9 +57,10 @@ A registered workspace that Fusion can operate on: it has a canonical local path
 A **workspace** is a special Project variant where the registered path is not
 itself a Git repository, but contains multiple Git repositories as direct
 sub-directories. Fusion discovers sub-repos at init time and records them in
-`.fusion/workspace.json`. In workspace mode, task execution does not require a
-single root-level worktree; instead, the agent acquires per-repo worktrees
-on demand via `fn_acquire_repo_worktree`.
+`.fusion/workspace.json`. In workspace mode, task start creates one private
+child worktree for every configured repository beneath a task-ID-derived task
+directory. Agents work only in those prepared paths; repository membership is
+not selected or acquired on demand.
 
 Workspace-task merges are **non-atomic**: each sub-repo lands on its own local
 integration ref independently, so a partial-land window (some sub-repos merged,
@@ -88,7 +89,7 @@ A Feature's position in the execution loop (being implemented, awaiting or under
 ## Merge lifecycle
 
 ### Task
-The core board entity: a unit of work that moves through columns (triage, todo, in-progress, in-review, done, archived) and is executed by agents. A Task carries its own per-task settings that can override project-level defaults.
+The core board entity: a unit of work that moves through the columns its **workflow declares**, and is executed by agents. A Task's board position is a column id validated against its resolved workflow, not a fixed set — a workflow may rename, reorder, add or omit columns, and two Tasks on the same board may have entirely different column sets. The Default workflow declares five columns (`triage`, `todo`, `in-progress`, `in-review`, `done`); completed history remains in `done`. A Task carries its own per-task settings that can override project-level defaults.
 
 ### Workflow Runtime
 The authoritative task lifecycle runtime. It resolves a Task to workflow IR, walks the graph, routes node outcomes, and invokes runtime primitives for side effects. The engine substrate still owns scheduling, routing claims, persistence, concurrency, process supervision, storage, and audit plumbing; lifecycle policy lives in workflow nodes and built-in workflow IR.
@@ -97,7 +98,14 @@ The authoritative task lifecycle runtime. It resolves a Task to workflow IR, wal
 A per-machine mutual-exclusion guard ensuring only one fusion process runs the engine for a given project, combining a lockfile in the project's `.fusion/` directory with a per-project loopback socket. Failure to acquire it (`EngineAlreadyRunningError`) is **positive proof an engine is already running** for that project elsewhere on the machine — not an error to swallow and not "no engine." A process refused the lock keeps that as a fact: it reports the engine as available (so UI surfaces don't claim it's down) while reconciliation keeps retrying, so it takes over if the current owner exits.
 
 ### Active-session lease
-A path-keyed, in-memory claim that a given worktree path is held by a specific Task's running session (executor, step, workflow-step, AI-merge, or a workspace sub-repo acquire/land). It serves two jobs at once: mutual exclusion (a second Task may not register a path already held by a different Task — the foreign-task guard) and liveness (self-healing treats a held path as proof the Task is actively running and must not be rebounded). The key is the path, so the registry is only as correct as the path chosen: a path uniquely owned by one Task gives real exclusivity, but a path shared across Tasks (e.g. a workspace's browse-only root) must be made Task-scoped before registration or the guard will reject every concurrent sibling. Re-registration by the same Task is idempotent; cleanup must unregister the exact key that was registered.
+A path-keyed, in-memory claim that a given worktree path is held by a specific Task's running session (planning, executor, step, workflow-step, AI-merge, or a workspace sub-repo acquire/land). It serves two jobs at once: mutual exclusion (a second Task may not register a path already held by a different Task — the foreign-task guard) and liveness (self-healing treats a held path as proof the Task is actively running and must not be rebounded). The key is the path, so the registry is only as correct as the path chosen: a path uniquely owned by one Task gives real exclusivity, but a path shared across Tasks (e.g. a workspace's browse-only root) must be made Task-scoped before registration or the guard will reject every concurrent sibling. Re-registration by the same Task is idempotent; cleanup must unregister the exact key that was registered.
+
+The liveness job cuts both ways, and the converse is the dangerous direction: an unheld path is taken as proof that **nothing** is running there, so a session that occupies a worktree without taking a lease is invisible to every removal and reclaim guard that consults the registry — the guard cannot be blamed for destroying work it was never told about. Any new kind of session that comes to own a worktree must therefore take a lease, and must take it through the reclaiming acquire path rather than a bare write, so a lease leaked by a dead holder can be recovered instead of permanently blocking the path. Release must be ownership-checked rather than keyed on path alone: a session's teardown is not atomic, so a later session may legitimately have taken the path over by the time the earlier one unwinds, and a blind release would strip a live holder's lease.
+
+### Top-level agent slot
+A unit of a Project's concurrent-agent capacity, drawn from one shared pool by every top-level lane — planning, execution, and merge alike — so a Project cannot exceed its operator-facing limit by spending capacity in a different lane. Distinct from the separate limit on how many Task worktrees may exist at once: the two are commonly conflated, but a Task can hold a worktree without holding a slot, and planning holds a slot without the Task having reached a working column.
+
+Helper runs nested inside an agent deliberately do not consume slots, since they are internal to a parent that already holds one. Slots are claimed oldest-first across all lanes rather than by lane priority, so age, not lane, decides who is admitted next; a lane that cannot start the work it was offered must return the slot rather than hold it, or the pool silently shrinks.
 
 ### ACP Ask Path
 A one-turn read-only model ask routed through the ACP runtime rather than a CLI print mode. The runner accumulates streamed prose, may recover a trailing JSON object for structured seams, and treats abnormal ACP stop reasons as incomplete answers for validator use.
@@ -250,12 +258,12 @@ An advisory checklist of what to verify for a Task, generated from the task prom
 A first-class, workflow-defined unit of task state: an id, a display name, and a set of Trait configurations. A Task's board position is its current column, persisted in `tasks."column"`. Column validity is workflow-scoped — the legacy closed enum widens to a string validated against the Task's resolved workflow. The Default workflow's column ids are byte-identical to the legacy enum values, so no task row is ever rewritten.
 
 ### Trait
-Composable column configuration: declarative flags (e.g. `complete`, `archived`, `countsTowardWip`) plus optional lifecycle hooks (`guard`, `gate`, `onEnter`, `onExit`, `releaseCondition`). Built-in and plugin-contributed traits register through one registry. Sync `guard` hooks and the `complete`/`archived` flags are built-in-only; plugin traits get async hook points only. A column's effective flags are the merged flags of its traits; conflicting compositions are rejected at save (server-side and in the editor).
+Composable column configuration: declarative flags (for example `complete` and `countsTowardWip`) plus optional lifecycle hooks (`guard`, `gate`, `onEnter`, `onExit`, `releaseCondition`). Built-in and plugin-contributed traits register through one registry. Sync `guard` hooks and the `complete` flag are built-in-only; plugin traits get async hook points only. A column's effective flags are the merged flags of its traits; conflicting compositions are rejected at save (server-side and in the editor).
 
 ### Column agent
 A permanent agent binding on a workflow-defined column — a registry agent plus a mode — staffing all session-running work attributable to that column (custom nodes, the execute seam's coding session, per-step sessions; foreach template nodes inherit the enclosing foreach's column unless they declare their own). `defer` makes the column agent the default, applying only when the work carries no own agent identity and no complete model pair; `override` supersedes node- and task-level agent/model settings wholesale.
 
-Requires both the workflow-columns and graph-executor flags; with either off, bindings are inert at execution time. A missing or deleted agent degrades to normal resolution without aborting a live session. Binding an agent whose permission policy is broader than the project default requires explicit confirmation at save time on every write surface.
+Participates in every graph run. It used to require the workflow-columns and graph-executor flags, and was inert with either off; that kill switch was removed, so a stale persisted `workflowColumns: false` cannot silently disable custom-node, seam or watcher bindings. A missing or deleted agent degrades to normal resolution without aborting a live session. Binding an agent whose permission policy is broader than the project default requires explicit confirmation at save time on every write surface.
 
 ### Effective agent (execution principal)
 The agent identity that actually runs a piece of work after column-agent precedence resolves — and the principal every identity-keyed subsystem must consult: permission gating, heartbeat serialization in both directions, resume re-dispatch, and mid-flight change detection. It may differ from the task's assigned agent under an override binding, and one task may have multiple effective agents across concurrent branch sessions.
@@ -288,7 +296,7 @@ A workflow node kind expressing passive dwell — a card rests in its column unt
 Parallel-branch node kinds. A `split` launches its outgoing edges concurrently; a `join` synchronizes them with `mode: all | any | quorum(n)` and `onBranchFailure: fail-fast | collect`. During the parallel window the card stays in the split's column (its board position never forks); on join resolution it advances to the join's column. `execute`/`merge` seam nodes are forbidden inside branches (one worktree/session per task; merge is exclusive). Per-branch run state persists in PostgreSQL so a crashed branch resumes where it died.
 
 ### Default workflow
-The built-in workflow (`builtin:coding`) that reproduces the legacy pipeline verbatim: six columns whose ids equal the legacy enum values, with traits matching legacy semantics (`triage`=intake, `todo`=hold+reset-on-entry, `in-progress`=wip+abort-on-exit+timing, `in-review`=merge-blocker+stall-detection+merge, `done`=complete, `archived`=archived). A null workflow selection resolves to it at read time. Non-editable, non-deletable.
+The built-in workflow (`builtin:coding`) has five columns with lifecycle traits (`triage`=intake, `todo`=hold+reset-on-entry, `in-progress`=wip+abort-on-exit+timing, `in-review`=merge-blocker+stall-detection+merge, `done`=complete). A null workflow selection resolves to it at read time. It is non-editable and non-deletable.
 
 ### transitionPending
 A persisted crash-safe marker (`tasks.transitionPending`) written in the same PostgreSQL transaction as a column change, recording the post-commit hooks (`hooksRemaining`) that still owe idempotent execution. Cleared once they complete. Recovery reads it from the authoritative PostgreSQL task row; a crash mid-transition re-runs the idempotent hooks. A throwing or missing hook degrades (audit) and clears its entry — it never strands the card or wedges the task lock.
@@ -355,3 +363,6 @@ A second quarantine in the same subsystem is a product-race smell: the flake may
 ## Flagged ambiguities
 
 - "Merging" a shared-branch-group Task had been used for both member integration and group promotion — these are distinct steps with independent gating and must not be conflated.
+
+- **Workflow principal:** the durable agent fenced on one agent-executed workflow node. It is distinct from task ownership and exists only while a live work item/session lease is active.
+- **Role tag:** a normalized permanent-agent capability label used for workflow pool routing; agents may have multiple tags.

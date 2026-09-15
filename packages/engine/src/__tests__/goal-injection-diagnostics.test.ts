@@ -5,13 +5,13 @@ const { warnSpy } = vi.hoisted(() => ({
 }));
 
 vi.mock("../logger.js", () => ({
-  createLogger: () => ({ warn: warnSpy, log: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({ warn: warnSpy, log: vi.fn(), debug: vi.fn(), error: vi.fn() }),
 }));
 
 import {
   emitGoalInjectionDiagnostic,
   type GoalInjectionDiagnosticInput,
-} from "../goal-injection-diagnostics.js";
+} from "../goals/goal-injection-diagnostics.js";
 
 function buildInput(overrides: Partial<GoalInjectionDiagnosticInput> = {}): GoalInjectionDiagnosticInput {
   return {

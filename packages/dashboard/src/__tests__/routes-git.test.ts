@@ -26,8 +26,6 @@ import { collectRecentMergeAdvances, pullGitBranch } from "../routes/register-gi
 import * as agentGenerationModule from "../agent-generation.js";
 import { __resetPlanningState, __setCreateFnAgent, planningStreamManager } from "../planning.js";
 import * as planningModule from "../planning.js";
-import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
-import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
@@ -181,8 +179,6 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({}),
     updateSettings: vi.fn(),
@@ -207,6 +203,16 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updatePrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    /*
+    FNXC:PluginMcpServers 2026-07-23-23:40:
+    FN-8491 (3cd023fa4) made resolveProjectContext bind a project-scoped plugin
+    MCP provider on every getProjectContext call. A store that already exposes
+    getProjectScopedPluginMcpServers is treated as runtime-owned and skips the
+    binder (which would otherwise call getPluginStore()); declare it here so the
+    route contracts under test stay isolated from plugin-loader bootstrapping.
+    Same alignment as remote-access-routes.test.ts (d7752931b).
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),

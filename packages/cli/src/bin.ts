@@ -13,11 +13,12 @@
  */
 import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
-import { fileURLToPath } from "node:url";
+import { readOwnCliVersion } from "./cli-version.js";
+import { installQuietGate, resolveQuietMode, setQuietMode, uninstallQuietGate } from "./output.js";
 
 // @ts-expect-error -- Bun-only global; undefined in Node
 const isBunBinary = typeof Bun !== "undefined" && !!Bun.embeddedFiles;
@@ -121,22 +122,31 @@ async function loadCommandHandlers() {
   const { runServe } = await import("./commands/serve.js");
   const { runDaemon } = await import("./commands/daemon.js");
   const { runDesktop } = await import("./commands/desktop.js");
-  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = await import("./commands/task.js");
+  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = await import("./commands/task.js");
   const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = await import("./commands/pr.js");
   const { runSettingsShow, runSettingsSet } = await import("./commands/settings.js");
   const { runSettingsExport } = await import("./commands/settings-export.js");
   const { runSettingsImport } = await import("./commands/settings-import.js");
   const { runMcpList, runMcpAdd, runMcpEdit, runMcpRemove, runMcpEnable, runMcpDisable, runMcpImport, runMcpExport, runMcpValidate } = await import("./commands/mcp.js");
+  const { runMcpMemoryServer } = await import("./commands/mcp-memory-server.js");
   const { runWorkflowValidate } = await import("./commands/workflow.js");
   const { runGitStatus, runGitFetch, runGitPull, runGitPush } = await import("./commands/git.js");
   const { runBranchGroupList, runBranchGroupShow, runBranchGroupPromote, runBranchGroupAbandon } = await import("./commands/branch-group.js");
   const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = await import("./commands/backup.js");
   const { runDbVacuum, runDbMigrate } = await import("./commands/db.js");
   const { runMemoryBackupCreate, runMemoryBackupList, runMemoryBackupRestore } = await import("./commands/memory-backup.js");
+  const { runKnowledgeGraphBuild } = await import("./commands/knowledge-graph.js");
   const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice, runMissionLinkGoal, runMissionUnlinkGoal, runMissionGoals } = await import("./commands/mission.js");
   const { runGoalsList, runGoalsCreate, runGoalsArchive, runGoalsCitations } = await import("./commands/goals.js");
   const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = await import("./commands/project.js");
   const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = await import("./commands/node.js");
+  const {
+    runCloudPairStart,
+    runCloudPairComplete,
+    runCloudHeartbeat,
+    runCloudStatus,
+    runCloudUnlink,
+  } = await import("./commands/cloud.js");
   const { runInit } = await import("./commands/init.js");
   const { runOnboard } = await import("./commands/onboard.js");
   const { runAgentStop, runAgentStart } = await import("./commands/agent.js");
@@ -150,10 +160,11 @@ async function loadCommandHandlers() {
   const { runPluginCreate, runPluginNew } = await import("./commands/plugin-scaffold.js");
   const { runPluginDev } = await import("./commands/plugin-dev.js");
   const { runPluginPublish } = await import("./commands/plugin-publish.js");
-  const { runSkillsSearch, runSkillsInstall } = await import("./commands/skills.js");
+  const { runSkillsSearch, runSkillsInstall, runSkillsGet } = await import("./commands/skills.js");
+  const { runComputer } = await import("./commands/computer.js");
   const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
   const { runExperimentFinalize } = await import("./commands/experiment-finalize.js");
-  const { runUpdate } = await import("./commands/update.js");
+  const { dispatchUpdateCliArgs } = await import("./commands/update.js");
 
   return {
     runDashboard,
@@ -175,8 +186,6 @@ async function loadCommandHandlers() {
     runTaskImportFromGitHub,
     runTaskImportFromGitLab,
     runTaskDuplicate,
-    runTaskArchive,
-    runTaskUnarchive,
     runTaskRefine,
     runTaskPlan,
     runTaskDelete,
@@ -209,6 +218,7 @@ async function loadCommandHandlers() {
     runMcpImport,
     runMcpExport,
     runMcpValidate,
+    runMcpMemoryServer,
     runWorkflowValidate,
     runGitStatus,
     runGitFetch,
@@ -227,6 +237,7 @@ async function loadCommandHandlers() {
     runMemoryBackupCreate,
     runMemoryBackupList,
     runMemoryBackupRestore,
+    runKnowledgeGraphBuild,
     runMissionCreate,
     runMissionList,
     runMissionShow,
@@ -252,6 +263,11 @@ async function loadCommandHandlers() {
     runNodeShow,
     runNodeHealth,
     runMeshStatus,
+    runCloudPairStart,
+    runCloudPairComplete,
+    runCloudHeartbeat,
+    runCloudStatus,
+    runCloudUnlink,
     runInit,
     runOnboard,
     runAgentStop,
@@ -282,6 +298,8 @@ async function loadCommandHandlers() {
     runPluginPublish,
     runSkillsSearch,
     runSkillsInstall,
+    runSkillsGet,
+    runComputer,
     runResearchCreate,
     runResearchList,
     runResearchShow,
@@ -289,7 +307,7 @@ async function loadCommandHandlers() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
-    runUpdate,
+    dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
   };
@@ -309,7 +327,7 @@ Usage:
   fn dashboard --dev                  Start dashboard in development mode
   fn dashboard --no-engine            Start web UI only (no AI engine)
   fn dashboard --interactive          Start with interactive port selection
-  fn serve [--port <port>] [--host <host>] [--paused] [--daemon] [--project <id|name>] [--no-auto-register]
+  fn serve [--port <port>] [--host <host>] [--paused] [--daemon] [--no-auth] [--project <id|name>] [--no-auto-register]
                                       Start Fusion as a headless node (API + engine, no UI)
                                       Auto-registers cwd project on first run (use --no-auto-register to disable)
   fn daemon [--port <port>] [--host <host>] [--token <token>] [--paused] [--token-only] [--project <id|name>] [--no-auto-register]
@@ -322,7 +340,7 @@ Usage:
                                        Update Fusion on the selected release channel
   fn upgrade                           Alias for fn update
   fn task create [desc] [opts]         Create a new task (goes to triage; supports --node <name>, --no-dedup)
-  fn task plan [description] [opts]    Create task via AI-guided planning
+  fn task plan [description] [opts]    Create task via AI-guided planning (--resume <sessionId> continues a plan to create another task)
   fn task list                        List all tasks
   fn task show <id>                   Show task details, steps, log
   fn task logs <id> [--follow] [--limit <n>] [--type <type>]
@@ -334,8 +352,6 @@ Usage:
   fn task merge <id>                  Merge an in-review task and close it
   fn task duplicate <id>              Duplicate a task (creates copy in triage)
   fn task refine <id> [opts]          Create a refinement task from done/in-review
-  fn task archive <id>                Archive a task (from any column)
-  fn task unarchive <id>              Unarchive an archived task
   fn task delete <id> [--force] [--allow-resurrection]
                                       Delete a task (use --force to skip confirmation; --allow-resurrection permits intentional ID recreation)
   fn task attach <id> <file>          Attach a file to a task
@@ -405,6 +421,14 @@ PR:
   fn node show | info [name] [--json] Show node details
   fn node health <name>               Health check a node
   fn mesh status [--json]              Show full mesh state
+  fn cloud pair-start [--http <url>] [--name <name>]
+                                      Start cloud-link pairing (prints code)
+  fn cloud pair-complete [--http <url>] [--code <code>]
+                                      Finish pairing after console claim (pending file, or FUSION_CLOUD_PENDING_SECRET)
+  fn cloud heartbeat [--url <origin>] [--port <n>] [--no-tunnel]
+                                      One-shot publish. Without --url, start a Cloudflare tunnel until Ctrl+C. --no-tunnel publishes LAN only.
+  fn cloud status [--json]             Show local cloud-link state
+  fn cloud unlink                      Clear ~/.fusion/cloud-link.json
   fn settings                          Show current Fusion configuration
   fn settings set <key> <value>        Update a configuration setting
   fn settings set defaultNodeId <node-id>
@@ -465,6 +489,8 @@ PR:
   fn memory-backup --list    List all memory backups
   fn memory-backup --restore <dir>
                              Restore memory from a backup directory snapshot
+  fn knowledge-graph build [--force] [--dir <path>] [--json]
+                             Build the deterministic knowledge graph
   fn plugin list | ls                List installed plugins
   fn plugin install <path-or-package> [--ai-scan] Install a plugin from path or package
   fn plugin add <path-or-package>     Alias for plugin install
@@ -488,31 +514,38 @@ PR:
   fn skills install <owner/repo>      Install skills from a source
   fn skills install <owner/repo> --skill <name>
                                       Install a specific skill
+  fn skills get <skill-name>           Print a built-in version-matched guide
+  fn computer <subcommand> [--json]  Inspect and automate supported desktop applications
+                                      See fn computer --help for snapshot → act → snapshot commands
 
 Options:
   --project, -P <name>       Target a specific project (bypasses CWD detection)
   --port, -p <port>          Dashboard/serve port (default: 4040)
   --host <host>              Serve host (default: 127.0.0.1 — localhost only; pass 0.0.0.0 to expose)
   --token <token>            Dashboard/daemon bearer token. Default: $FUSION_DASHBOARD_TOKEN, $FUSION_DAEMON_TOKEN, or auto-generated.
-  --no-auth                  Disable dashboard bearer-token auth for dashboard/desktop (local-only; not recommended on 0.0.0.0)
+  --no-auth                  Disable bearer-token auth for dashboard/desktop/serve (local-only; not recommended on 0.0.0.0)
   --interactive              Interactive mode (port selection for dashboard, issue selection for import)
   --paused                   Start with engine paused (automation disabled)
   --dev                      Start dashboard in development mode
   --no-engine                Start dashboard only (no AI engine)
   --supervise                (default) Run with auto-restart on crash and System-panel restart support
   --no-supervise             Run the dashboard without the supervising parent process
-  --lang <locale>            Terminal-UI locale for this run (en, zh-CN, zh-TW, fr, es, ko); the browser dashboard resolves its own language
+  --lang <locale>            Terminal-UI locale for this run (en, zh-CN, zh-TW, fr, es, ko, pt-BR); the browser dashboard resolves its own language
   --attach <file>            Attach file(s) on task create (repeatable)
   --depends <id>             Declare dependency on task create (repeatable)
   --no-dedup                 Bypass deterministic duplicate guard on task create
+  --github                   Enable GitHub issue tracking for the created task
+  --no-github                Disable GitHub issue tracking (overrides project default)
+  --github-repo <owner/repo> Repository override for the task's tracking issue
   --feedback <text>          Refinement feedback (non-interactive mode)
   --yes                      Skip confirmation prompts (planning mode)
   --limit, -l <n>            Max issues to import (default: 30, max: 100)
   --labels, -L <labels>      Comma-separated label filter for import
   --interactive, -i          Interactive mode for issue selection
   --help, -h                 Show this help
+  --quiet, -q                Suppress informational stdout output
 
-Columns: triage, todo, in-progress, in-review, done, archived
+Columns: triage, todo, in-progress, in-review, done
 Supported file types: png, jpg, gif, webp, txt, log, json, yaml, yml, toml, csv, xml
 `.trim();
 
@@ -520,18 +553,29 @@ export function extractGlobalProjectFlag(argv: string[]): {
   cleanedArgs: string[];
   projectName?: string;
   skipOnboarding: boolean;
+  quiet?: boolean;
 } {
-  const command = argv[0];
-  if (command === "serve" || command === "daemon") {
-    return { cleanedArgs: [...argv], skipOnboarding: false };
-  }
-
+  // FNXC:CliQuietMode 2026-07-16-01:00: Serve/daemon keep their legacy
+  // pass-through argv contract even when a global quiet flag precedes them.
+  const command = argv.find((arg) => arg !== "--quiet" && arg !== "-q");
+  const isServeOrDaemon = command === "serve" || command === "daemon";
   const cleanedArgs: string[] = [];
   let projectName: string | undefined;
   let skipOnboarding = false;
+  // FNXC:CliQuietMode 2026-07-16-00:00: `undefined` preserves flag absence so
+  // FUSION_QUIET can participate in resolution; never collapse it to false.
+  let quiet: boolean | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "--quiet" || arg === "-q") {
+      quiet = true;
+      continue;
+    }
+    if (isServeOrDaemon) {
+      cleanedArgs.push(arg);
+      continue;
+    }
     if (arg === "--project" || arg === "-P") {
       if (projectName) {
         throw new Error("Duplicate --project flag. Specify a project only once.");
@@ -551,7 +595,7 @@ export function extractGlobalProjectFlag(argv: string[]): {
     cleanedArgs.push(arg);
   }
 
-  return { cleanedArgs, projectName, skipOnboarding };
+  return { cleanedArgs, projectName, skipOnboarding, quiet };
 }
 
 function getFlagValue(args: string[], flag: string): string | undefined {
@@ -619,50 +663,29 @@ function parsePrCreateOptions(args: string[]) {
   };
 }
 
-/**
- * Locate `@runfusion/fusion`'s own version by walking up from the running
- * `bin.js`. Mirrors `packages/dashboard/src/cli-package-version.ts` but is
- * inlined here to avoid pulling the dashboard barrel into the bin's static
- * import graph (bin keeps app imports dynamic until env bootstrap is done).
- */
-function readOwnCliVersion(): string | undefined {
-  let currentDir: string;
-  try {
-    currentDir = dirname(fileURLToPath(import.meta.url));
-  } catch {
-    return undefined;
-  }
-  for (let i = 0; i < 8; i += 1) {
-    const pkgPath = resolve(currentDir, "package.json");
-    if (existsSync(pkgPath)) {
-      try {
-        const parsed = JSON.parse(readFileSync(pkgPath, "utf-8")) as {
-          name?: string;
-          version?: string;
-        };
-        if (parsed.name === "@runfusion/fusion" && typeof parsed.version === "string") {
-          return parsed.version;
-        }
-      } catch {
-        // Ignore malformed manifest and keep walking.
-      }
-    }
-    const parentDir = resolve(currentDir, "..");
-    if (parentDir === currentDir) break;
-    currentDir = parentDir;
-  }
-  return undefined;
-}
-
 async function main() {
-  const { cleanedArgs: args, projectName, skipOnboarding } = extractGlobalProjectFlag(process.argv.slice(2));
+  const { cleanedArgs: args, projectName, skipOnboarding, quiet } = extractGlobalProjectFlag(process.argv.slice(2));
+  const hasJsonFlag = args.includes("--json");
+  const hasHelpOrVersionFlag = args.some((arg) => ["--help", "-h", "--version", "-v"].includes(arg));
+  const selectedCommand = !args[0] || args[0].startsWith("-") ? "dashboard" : args[0];
+  const isExemptCommand = ["serve", "daemon", "dashboard", "desktop", "chat"].includes(selectedCommand);
+  // FNXC:CliQuietMode 2026-07-16-00:00: Recompute effective state on every
+  // invocation. JSON and help/version are requested results; live commands,
+  // including the bare/dashboard Ink TUI path, must retain their UI output.
+  const effectiveQuiet = resolveQuietMode({ flag: quiet, env: process.env.FUSION_QUIET })
+    && !hasJsonFlag && !hasHelpOrVersionFlag && !isExemptCommand;
+  setQuietMode(effectiveQuiet);
+  if (effectiveQuiet) installQuietGate();
+  else uninstallQuietGate();
 
-  // Print version and exit before any application imports. This is what the
+  // Print version and exit before any application imports. The leaf resolver
+// keeps this static graph built-ins-only rather than importing the dashboard
+// resolver. This is what the
   // dashboard's CLI Binary panel probes via `<bin> --version`; without an
   // early exit, the flag falls through to the default `dashboard` command and
   // boots the full server.
   if (args.includes("--version") || args.includes("-v")) {
-    console.log(readOwnCliVersion() ?? "unknown");
+    console.log(readOwnCliVersion(import.meta.url) ?? "unknown");
     process.exit(0);
   }
 
@@ -702,8 +725,6 @@ async function main() {
     runTaskImportFromGitHub,
     runTaskImportFromGitLab,
     runTaskDuplicate,
-    runTaskArchive,
-    runTaskUnarchive,
     runTaskRefine,
     runTaskPlan,
     runTaskDelete,
@@ -736,6 +757,7 @@ async function main() {
     runMcpImport,
     runMcpExport,
     runMcpValidate,
+    runMcpMemoryServer,
     runWorkflowValidate,
     runGitStatus,
     runGitFetch,
@@ -754,6 +776,7 @@ async function main() {
     runMemoryBackupCreate,
     runMemoryBackupList,
     runMemoryBackupRestore,
+    runKnowledgeGraphBuild,
     runMissionCreate,
     runMissionList,
     runMissionShow,
@@ -779,6 +802,11 @@ async function main() {
     runNodeShow,
     runNodeHealth,
     runMeshStatus,
+    runCloudPairStart,
+    runCloudPairComplete,
+    runCloudHeartbeat,
+    runCloudStatus,
+    runCloudUnlink,
     runInit,
     runOnboard,
     runAgentStop,
@@ -809,6 +837,8 @@ async function main() {
     runPluginPublish,
     runSkillsSearch,
     runSkillsInstall,
+    runSkillsGet,
+    runComputer,
     runResearchCreate,
     runResearchList,
     runResearchShow,
@@ -816,7 +846,7 @@ async function main() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
-    runUpdate,
+    dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
   } = await loadCommandHandlers();
@@ -903,9 +933,12 @@ async function main() {
         const hostIdx = args.indexOf("--host");
         const host = hostIdx !== -1 && hostIdx + 1 < args.length ? args[hostIdx + 1] : undefined;
         const daemon = args.includes("--daemon");
+        // FNXC:ServeSecureByDefault 2026-07-26-17:00: `fn serve` is authenticated by
+        // default; `--no-auth` is the explicit local-trust opt-out (mirrors dashboard).
+        const noAuth = args.includes("--no-auth");
         const project = getFlagValue(args, "--project");
         const noAutoRegister = args.includes("--no-auto-register");
-        await runServe(port, { paused, interactive, host, daemon, project, noAutoRegister });
+        await runServe(port, { paused, interactive, host, daemon, noAuth, project, noAutoRegister });
         break;
       }
 
@@ -938,24 +971,7 @@ async function main() {
 
       case "update":
       case "upgrade": {
-        // FNXC:UpdateChannels 2026-07-19-13:05: --channel <stable|beta> selects
-        // and persists the release track; --force installs the channel target
-        // even when not newer (the explicit beta → stable downgrade path).
-        // A bare trailing --channel (or one followed by another flag) errors
-        // instead of being silently ignored (PR #2345 review).
-        const channelFlagIndex = args.indexOf("--channel");
-        const channelValue = channelFlagIndex !== -1 ? args[channelFlagIndex + 1] : undefined;
-        if (channelFlagIndex !== -1 && (channelValue === undefined || channelValue.startsWith("--"))) {
-          console.error("Error: --channel requires a value: stable or beta.");
-          process.exit(1);
-        }
-        await runUpdate({
-          check: args.includes("--check"),
-          global: args.includes("--global") ? true : undefined,
-          json: args.includes("--json"),
-          channel: channelValue,
-          force: args.includes("--force"),
-        });
+        await dispatchUpdateCliArgs(args.slice(1));
         break;
       }
 
@@ -1156,6 +1172,69 @@ async function main() {
         break;
       }
 
+      case "cloud": {
+        /*
+        FNXC:CloudLink 2026-08-24-02:17:
+        Thin client for cloud-link Mode A pairing and presence. pair-complete
+        takes the pending secret from the 0600 pending file or FUSION_CLOUD_PENDING_SECRET, never argv.
+        */
+        const subcommand = args[1];
+        switch (subcommand) {
+          case "pair-start": {
+            await runCloudPairStart({
+              http: getFlagValue(args, "--http"),
+              name: getFlagValue(args, "--name"),
+            });
+            break;
+          }
+          case "pair-complete": {
+            /*
+             * FNXC:CloudLink 2026-09-04-03:44:
+             * `--pending-secret` is a hard error in space and equals forms, so a copied
+             * command cannot leak the credential through process listings or shell history.
+             * getFlagValue is index-based and silently ignores --flag=value; without this
+             * token-form guard, an equals-form credential would leak while appearing to work.
+             */
+            if (args.some((arg) => arg === "--pending-secret" || arg.startsWith("--pending-secret="))) {
+              console.error(
+                "Do not pass --pending-secret (it appears in process listings). Run fn cloud pair-start first, or set FUSION_CLOUD_PENDING_SECRET.",
+              );
+              process.exit(1);
+            }
+            const pendingFromEnv = process.env.FUSION_CLOUD_PENDING_SECRET?.trim();
+            await runCloudPairComplete({
+              http: getFlagValue(args, "--http"),
+              code: getFlagValue(args, "--code"),
+              pendingSecret: pendingFromEnv || undefined,
+            });
+            break;
+          }
+          case "heartbeat": {
+            await runCloudHeartbeat({
+              url: getFlagValue(args, "--url"),
+              port: getFlagValueNumber(args, "--port"),
+              tunnel: !args.includes("--no-tunnel"),
+            });
+            break;
+          }
+          case "status": {
+            await runCloudStatus({ json: args.includes("--json") });
+            break;
+          }
+          case "unlink": {
+            await runCloudUnlink();
+            break;
+          }
+          default:
+            console.error(`Unknown subcommand: cloud ${subcommand || ""}`);
+            console.log(
+              "Try: fn cloud pair-start | pair-complete | heartbeat | status | unlink",
+            );
+            process.exit(1);
+        }
+        break;
+      }
+
       case "research": {
         const subcommand = args[1];
         switch (subcommand) {
@@ -1272,6 +1351,8 @@ async function main() {
             const dependsIds: string[] = [];
             let nodeName: string | undefined;
             let noDedup = false;
+            let github: boolean | undefined;
+            let githubRepo: string | undefined;
             const descParts: string[] = [];
             for (let i = 0; i < createArgs.length; i++) {
               if (createArgs[i] === "--attach" && i + 1 < createArgs.length) {
@@ -1285,18 +1366,27 @@ async function main() {
                 i++; // skip the value
               } else if (createArgs[i] === "--no-dedup") {
                 noDedup = true;
+              } else if (createArgs[i] === "--github") {
+                github = true;
+              } else if (createArgs[i] === "--no-github") {
+                github = false;
+              } else if (createArgs[i] === "--github-repo" && i + 1 < createArgs.length) {
+                githubRepo = createArgs[i + 1];
+                i++; // skip the value
               } else {
                 descParts.push(createArgs[i]);
               }
             }
             const title = descParts.join(" ");
-            await runTaskCreate(title || undefined, attachFiles.length > 0 ? attachFiles : undefined, dependsIds.length > 0 ? dependsIds : undefined, projectName, nodeName, noDedup);
+            await runTaskCreate(title || undefined, attachFiles.length > 0 ? attachFiles : undefined, dependsIds.length > 0 ? dependsIds : undefined, projectName, nodeName, noDedup, github !== undefined || githubRepo !== undefined ? { github, githubRepo } : undefined);
             break;
           }
           case "plan": {
             const planArgs = args.slice(2);
             const yesFlag = planArgs.includes("--yes");
             let baseBranch: string | undefined;
+            // FNXC:PlanningMultiTask 2026-07-24-02:30: --resume reopens an existing planning session (even a validated one whose task exists) to keep refining and create another task.
+            let resumeSessionId: string | undefined;
             const descParts: string[] = [];
             for (let i = 0; i < planArgs.length; i++) {
               if (planArgs[i] === "--yes") {
@@ -1304,12 +1394,15 @@ async function main() {
               } else if (planArgs[i] === "--base-branch" && i + 1 < planArgs.length) {
                 baseBranch = planArgs[i + 1];
                 i++;
+              } else if (planArgs[i] === "--resume" && i + 1 < planArgs.length) {
+                resumeSessionId = planArgs[i + 1];
+                i++;
               } else {
                 descParts.push(planArgs[i]);
               }
             }
             const initialPlan = descParts.join(" ");
-            await runTaskPlan(initialPlan || undefined, yesFlag, projectName, baseBranch);
+            await runTaskPlan(initialPlan || undefined, yesFlag, projectName, baseBranch, resumeSessionId);
             break;
           }
           case "list":
@@ -1408,18 +1501,6 @@ async function main() {
               ? args[feedbackIdx + 1]
               : undefined;
             await runTaskRefine(id, feedback, projectName);
-            break;
-          }
-          case "archive": {
-            const id = args[2];
-            if (!id) { console.error("Usage: fn task archive <id>"); process.exit(1); }
-            await runTaskArchive(id, projectName);
-            break;
-          }
-          case "unarchive": {
-            const id = args[2];
-            if (!id) { console.error("Usage: fn task unarchive <id>"); process.exit(1); }
-            await runTaskUnarchive(id, projectName);
             break;
           }
           case "delete": {
@@ -1776,6 +1857,9 @@ async function main() {
           secretScope,
         };
         switch (subcommand) {
+          case "serve-memory":
+            await runMcpMemoryServer(getFlagValue(args, "--project-root") ?? process.cwd());
+            break;
           case "list":
           case "ls":
             await runMcpList({ projectName, json: args.includes("--json") });
@@ -1987,6 +2071,20 @@ async function main() {
           console.error("Usage: fn backup --create | --list | --cleanup | --restore <filename>");
           process.exit(1);
         }
+        break;
+      }
+
+      case "knowledge-graph": {
+        const usage = "Usage: fn knowledge-graph build [--force] [--dir <path>] [--json]";
+        const dirIndex = args.indexOf("--dir");
+        const allowed = new Set(["build", "--force", "--dir", "--json"]);
+        const hasUnknownArgument = args.slice(1).some((arg, index) => !allowed.has(arg)
+          && !(dirIndex >= 0 && index === dirIndex));
+        if (args[1] !== "build" || hasUnknownArgument || (dirIndex >= 0 && !args[dirIndex + 1])) {
+          console.error(usage);
+          process.exit(1);
+        }
+        await runKnowledgeGraphBuild({ projectName, force: args.includes("--force"), json: args.includes("--json"), dir: dirIndex >= 0 ? args[dirIndex + 1] : undefined });
         break;
       }
 
@@ -2251,6 +2349,12 @@ async function main() {
         break;
       }
 
+      case "computer": {
+        const exitCode = await runComputer(args.slice(1), { projectRoot: process.cwd() });
+        if (exitCode !== 0) process.exit(exitCode);
+        break;
+      }
+
       case "skills": {
         const subcommand = args[1];
 
@@ -2262,6 +2366,7 @@ async function main() {
           console.log("  fn skills install <owner/repo>      Install skills from a source");
           console.log("  fn skills install <owner/repo> --skill <name>");
           console.log("                                      Install a specific skill");
+          console.log("  fn skills get <skill-name>           Print a built-in version-matched guide");
           console.log("\nExamples:");
           console.log("  fn skills search react");
           console.log("  fn skills search firebase --limit 5");
@@ -2313,8 +2418,14 @@ async function main() {
           break;
         }
 
+        if (subcommand === "get") {
+          const exitCode = await runSkillsGet(args.slice(2));
+          if (exitCode !== 0) process.exit(exitCode);
+          break;
+        }
+
         console.error(`Unknown subcommand: skills ${subcommand}`);
-        console.log("Try: fn skills search | install");
+        console.log("Try: fn skills search | install | get");
         process.exit(1);
         break;
       }
@@ -2333,6 +2444,12 @@ async function main() {
   }
 }
 
+/*
+ * FNXC:CliAwaitLiveness 2026-08-11-09:17:
+ * Preserve this await and the skip-main build/test guard. A forced success exit
+ * would mask a non-settling command promise and could terminate long-running
+ * CLI modes before their intended shutdown path completes.
+ */
 if (process.env.FUSION_CLI_SKIP_MAIN !== "1") {
   await main();
 }

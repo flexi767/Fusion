@@ -1,17 +1,21 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { AlphaButton, AlphaListBox, AlphaListBoxItem, AlphaPopoverSurface } from "./alpha-ui";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { Bot, Brain } from "lucide-react";
 import { THINKING_LEVELS } from "@fusion/core";
+import { Bot, Brain } from "lucide-react";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import type { ModelInfo } from "../api";
 import { FN_AGENT_ID } from "../hooks/useChat";
+import { computeFixedMenuPosition, getLayoutViewportSize, type FixedMenuPosition } from "../utils/fixedMenuPosition";
+import { isInsidePortaledModelMenu } from "../utils/portalSurfaces";
 
 /*
-FNXC:Chat-ThinkingLevel 2026-07-12-19:30:
+FNXC:Chat-ThinkingLevel 2026-08-18-23:38:
 FN-7775 only let a user pick a direct chat session's thinking (reasoning-effort) level once, at
 session creation, via the New Chat dialog's model-mode picker (CustomModelDropdown's inline
 selector). FN-7898 closes that gap with a small `Brain`-icon trigger next to the composer's
-attach button that opens a popup listing the six THINKING_LEVELS plus a "Default" (clear/inherit)
+attach button that opens a popup listing the canonical THINKING_LEVELS plus a "Default" (clear/inherit)
 option; selecting one persists immediately via PATCH /api/chat/sessions/:id and takes effect on
 the session's next send. This mirrors ThemeDropdown.tsx's small-popover interaction pattern
 (rootRef + pointerdown outside-close, Escape, aria-haspopup listbox) and reuses
@@ -21,8 +25,8 @@ introducing a parallel thinking-level list.
 FNXC:Chat-ThinkingLevel 2026-07-12-20:08:
 The Default entry must describe the resolved project/global default supplied by ChatView, while omitted props preserve the legacy isolated fallback label `Default (off)`.
 
-FNXC:Chat-ModelSwitch 2026-07-12-00:00:
-The same brain-icon popup now owns active direct-session targeting too: model-loop sessions can switch provider/model via CustomModelDropdown, and agent sessions can switch to a real agent from the existing list. Selecting either closes the popup and persists immediately through useChat.setSessionModel, while CLI composers stay gated in ChatView.
+FNXC:Chat-ModelSwitch 2026-09-06-21:10:
+Task Chat reuses this one brain-icon popover with model-only targeting, so selecting its model can never impersonate a durable agent. Direct Chat retains the agent lane; hosts that opt out of it render only the model picker and the shared thinking-level list. Chat hosts also pass the shared favorite-provider and favorite-model actions through this control so the existing dropdown renders the same persistent star affordance on desktop and mobile.
 
 FNXC:Chat-ThinkingLevel 2026-07-16-00:34:
 FN-8030 lets room composers reuse this control with showTargetSection={false}. A room's thinking effort is the default reasoning effort for every responder, and rooms have no per-composer model or agent target to switch.
@@ -43,9 +47,21 @@ export interface ChatThinkingLevelControlProps {
   defaultThinkingLevel?: string;
   /** Show direct-chat model/agent targeting controls; rooms render only the thinking-level list. */
   showTargetSection?: boolean;
+  /** Keep the direct-chat agent lane visible; model-only hosts never render agent controls. */
+  showAgentTarget?: boolean;
+  /** Optional accessible label forwarded to the embedded model picker. */
+  modelPickerLabel?: string;
+  /** Optional inherited/default entry label forwarded to the embedded model picker. */
+  modelDefaultOptionLabel?: string;
+  /** Conversation identity; omitted and null are both a stable legacy identity. */
+  targetKey?: string | null;
+  /** Concrete target that this host applies when the picker chooses its default entry. */
+  defaultModelValue?: string;
   models?: ModelInfo[];
   favoriteProviders?: string[];
+  onToggleFavorite?: (provider: string) => void;
   favoriteModels?: string[];
+  onToggleModelFavorite?: (modelId: string) => void;
   agents?: ChatThinkingLevelControlAgent[];
   agentId?: string | null;
   modelProvider?: string | null;
@@ -54,17 +70,26 @@ export interface ChatThinkingLevelControlProps {
   disabled?: boolean;
 }
 
-const THINKING_LEVEL_OPTIONS = ["", ...THINKING_LEVELS] as const;
 type TargetMode = "model" | "agent";
+
+type TargetExpectation = { agent: string; model: string };
+type TargetSnapshot = TargetExpectation & { key: string | null; level: string };
 
 export function ChatThinkingLevelControl({
   level,
   onChange,
   defaultThinkingLevel = "off",
   showTargetSection = true,
+  showAgentTarget = true,
+  modelPickerLabel,
+  modelDefaultOptionLabel,
+  targetKey,
+  defaultModelValue,
   models = [],
   favoriteProviders = [],
+  onToggleFavorite,
   favoriteModels = [],
+  onToggleModelFavorite,
   agents = [],
   agentId,
   modelProvider,
@@ -74,40 +99,133 @@ export function ChatThinkingLevelControl({
 }: ChatThinkingLevelControlProps) {
   const { t } = useTranslation("app");
   const [open, setOpen] = useState(false);
-  const [targetMode, setTargetMode] = useState<TargetMode>(() => (agentId && agentId !== FN_AGENT_ID ? "agent" : "model"));
+  const [targetMode, setTargetMode] = useState<TargetMode>(() => (showAgentTarget && agentId && agentId !== FN_AGENT_ID ? "agent" : "model"));
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const [popoverPosition, setPopoverPosition] = useState<FixedMenuPosition | null>(null);
   const normalizedLevel = level ?? "";
   const currentModelValue = modelProvider && modelId ? `${modelProvider}/${modelId}` : "";
   const selectedAgentId = agentId && agentId !== FN_AGENT_ID ? agentId : "";
+  const normalizedTargetKey = targetKey ?? null;
+  const pendingTargetRef = useRef<TargetExpectation | null>(null);
+  const lastTargetSnapshotRef = useRef<TargetSnapshot>({
+    key: normalizedTargetKey,
+    level: normalizedLevel,
+    agent: selectedAgentId,
+    model: currentModelValue,
+  });
+  const selectedModel = useMemo(() => {
+    if (!showTargetSection || selectedAgentId || !currentModelValue) return undefined;
+    const slashIdx = currentModelValue.indexOf("/");
+    return models.find((model) => model.provider === currentModelValue.slice(0, slashIdx) && model.id === currentModelValue.slice(slashIdx + 1));
+  }, [currentModelValue, models, selectedAgentId, showTargetSection]);
+  const thinkingLevelOptions = useMemo(() => ["", ...(selectedModel?.supportedThinkingLevels ?? THINKING_LEVELS)], [selectedModel]);
+  const hasStaleThinkingLevel = Boolean(normalizedLevel) && !thinkingLevelOptions.includes(normalizedLevel);
   const isActive = normalizedLevel !== "" || (showTargetSection && (Boolean(currentModelValue) || Boolean(selectedAgentId)));
   const listboxId = "chat-thinking-level-listbox";
 
   useEffect(() => {
     if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
+    const handleOutsidePress = (event: PointerEvent | TouchEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
       /*
       FNXC:Chat-ModelSwitch 2026-07-12-22:35:
       FN-7916: CustomModelDropdown renders its option list in a document.body portal outside rootRef. Treat that portaled menu as inside this popup so tablet/touch pointerdown does not dismiss the brain popup before the option onClick can persist the model selection.
+
+      FNXC:ModelDropdown 2026-08-15-12:27:
+      Use the shared portal predicate for pointer and touch origins. Mobile outside-close handlers can receive touchstart before a re-anchored menu's synthesized click lands on the popup backdrop.
       */
-      const clickedInsideRoot = rootRef.current?.contains(target);
-      const clickedInsidePortaledModelMenu = target instanceof Element && Boolean(target.closest(".model-combobox-dropdown--portal"));
-      if (!clickedInsideRoot && !clickedInsidePortaledModelMenu) {
+      const clickedInsideControl = rootRef.current?.contains(target) || popoverRef.current?.contains(target);
+      if (!clickedInsideControl && !isInsidePortaledModelMenu(target)) {
+        pendingTargetRef.current = null;
         setOpen(false);
       }
     };
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("pointerdown", handleOutsidePress);
+    document.addEventListener("touchstart", handleOutsidePress);
+    return () => {
+      document.removeEventListener("pointerdown", handleOutsidePress);
+      document.removeEventListener("touchstart", handleOutsidePress);
+    };
   }, [open]);
 
-  // Close the popup whenever the underlying level or target changes out from under us
-  // (e.g. the active session switched) so it never leaks open across a
-  // session switch showing the previous session's options.
+  const updatePopoverPosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger || typeof document === "undefined") return;
+    const viewport = getLayoutViewportSize();
+    const rootStyles = getComputedStyle(document.documentElement);
+    const readToken = (name: string, fallback: number) => Number.parseFloat(rootStyles.getPropertyValue(name)) || fallback;
+    const spaceXs = readToken("--space-xs", 4);
+    const spaceLg = readToken("--space-lg", 16);
+    const spaceXl = readToken("--space-xl", 32);
+    const rect = trigger.getBoundingClientRect();
+    setPopoverPosition(computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      preferredWidth: spaceXl * 15,
+      preferredHeight: spaceXl * 24,
+      minWidth: rect.width,
+      horizontalPadding: spaceLg,
+      verticalPadding: spaceLg,
+      gap: spaceXs,
+    }));
+  }, []);
+
+  /*
+  FNXC:Chat-ModelSwitch 2026-09-06-21:10:
+  The Brain panel is a fixed body portal, just like its nested model list. Measuring from the trigger in layout-viewport coordinates keeps both layers overlaid above the composer/footer on narrow and mobile chats; resize and capture-phase scroll re-anchor it without letting either portal enlarge a scroll container.
+  */
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    window.addEventListener("resize", updatePopoverPosition);
+    window.addEventListener("scroll", updatePopoverPosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePopoverPosition);
+      window.removeEventListener("scroll", updatePopoverPosition, true);
+    };
+  }, [open, updatePopoverPosition]);
+
+  /*
+  FNXC:Chat-ModelSwitch 2026-08-27-12:03:
+  Drop stale options when a host changes the conversation or target underneath an open popover.
+  Conversation identity is structural rather than inferred from target values because another
+  conversation can carry the exact target just selected. Within one identity, only an exact,
+  single-use target echo remains open; every other prop change closes it. Thinking-level picks
+  are the only deliberate selection that dismisses the popover.
+  */
   useEffect(() => {
-    setOpen(false);
-    setTargetMode(selectedAgentId ? "agent" : "model");
-  }, [normalizedLevel, selectedAgentId, currentModelValue]);
+    const previous = lastTargetSnapshotRef.current;
+    const next: TargetSnapshot = {
+      key: normalizedTargetKey,
+      level: normalizedLevel,
+      agent: selectedAgentId,
+      model: currentModelValue,
+    };
+    const targetKeyMoved = previous.key !== next.key;
+    const targetMoved = previous.agent !== next.agent || previous.model !== next.model;
+    const levelMoved = previous.level !== next.level;
+
+    if (targetKeyMoved) {
+      pendingTargetRef.current = null;
+      setOpen(false);
+    } else if (targetMoved) {
+      const pending = pendingTargetRef.current;
+      pendingTargetRef.current = null;
+      if (!pending || pending.agent !== next.agent || pending.model !== next.model) {
+        setOpen(false);
+      }
+    } else if (levelMoved) {
+      pendingTargetRef.current = null;
+      setOpen(false);
+    }
+
+    lastTargetSnapshotRef.current = next;
+    setTargetMode(showAgentTarget && selectedAgentId ? "agent" : "model");
+  }, [currentModelValue, normalizedLevel, normalizedTargetKey, selectedAgentId, showAgentTarget]);
 
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.id === selectedAgentId),
@@ -122,32 +240,54 @@ export function ChatThinkingLevelControl({
   };
 
   const chooseLevel = (value: string) => {
+    pendingTargetRef.current = null;
     setOpen(false);
     void onChange(value);
   };
 
+  const armTargetExpectation = (candidate: TargetExpectation) => {
+    if (!onChangeModel || (candidate.agent === selectedAgentId && candidate.model === currentModelValue)) return;
+    pendingTargetRef.current = candidate;
+  };
+
   const chooseModel = (value: string) => {
     const slashIdx = value.indexOf("/");
-    if (slashIdx <= 0) return;
-    setOpen(false);
-    void onChangeModel?.({ modelProvider: value.slice(0, slashIdx), modelId: value.slice(slashIdx + 1) });
+    if (value !== "" && (slashIdx <= 0 || slashIdx === value.length - 1)) return;
+    armTargetExpectation({ agent: "", model: value === "" ? defaultModelValue ?? "" : value });
+    void onChangeModel?.(value === ""
+      ? { modelProvider: null, modelId: null }
+      : { modelProvider: value.slice(0, slashIdx), modelId: value.slice(slashIdx + 1) });
   };
 
   const chooseAgent = (nextAgentId: string) => {
     if (!nextAgentId) return;
-    setOpen(false);
+    armTargetExpectation({ agent: nextAgentId, model: "" });
     void onChangeModel?.({ agentId: nextAgentId });
+  };
+
+  /*
+  FNXC:Chat-ModelSwitch 2026-07-24-00:00:
+  Windows Electron can show the Agent toggle's pressed feedback after primary pointerdown while
+  its host prevents the following click. Commit the visual mode switch on primary pointerdown so
+  the available-agent list deterministically replaces the model picker; preserve click handling
+  only for keyboard/synthetic activation (`detail === 0`) so one pointer gesture does not reset
+  the local mode twice. `aria-pressed` makes the selected target observable to assistive tech.
+  */
+  const activateTargetMode = (mode: TargetMode) => {
+    setTargetMode(mode);
   };
 
   const handleTriggerKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (event.key === "Escape") {
+      pendingTargetRef.current = null;
       setOpen(false);
     }
   };
 
-  const handleOptionKeyDown = (event: KeyboardEvent<HTMLButtonElement>, value: string) => {
+  const handleOptionKeyDown = (event: KeyboardEvent<HTMLElement>, value: string) => {
     if (event.key === "Escape") {
       event.preventDefault();
+      pendingTargetRef.current = null;
       setOpen(false);
       return;
     }
@@ -160,6 +300,7 @@ export function ChatThinkingLevelControl({
   const handleAgentKeyDown = (event: KeyboardEvent<HTMLButtonElement>, nextAgentId: string) => {
     if (event.key === "Escape") {
       event.preventDefault();
+      pendingTargetRef.current = null;
       setOpen(false);
       return;
     }
@@ -171,7 +312,8 @@ export function ChatThinkingLevelControl({
 
   return (
     <div className="chat-thinking-level-root" ref={rootRef}>
-      <button
+      <AlphaButton
+        ref={triggerRef}
         type="button"
         className={`btn-icon chat-thinking-btn${isActive ? " chat-thinking-btn--active" : ""}`}
         data-testid="chat-thinking-btn"
@@ -181,47 +323,84 @@ export function ChatThinkingLevelControl({
         aria-label={t("chat.thinkingLevelButton", "Thinking level")}
         title={t("chat.thinkingLevelButton", "Thinking level")}
         disabled={disabled}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => setOpen((value) => {
+          if (value) pendingTargetRef.current = null;
+          return !value;
+        })}
         onKeyDown={handleTriggerKeyDown}
       >
         <Brain size={16} />
-      </button>
+      </AlphaButton>
 
-      {open ? (
-        <div className="chat-thinking-popover" role="presentation" data-testid="chat-thinking-popover">
+      {open && popoverPosition && typeof document !== "undefined" ? createPortal(
+        <AlphaPopoverSurface
+          ref={popoverRef}
+          triggerRef={triggerRef}
+          onClose={() => setOpen(false)}
+          className="chat-thinking-popover"
+          role="presentation"
+          data-testid="chat-thinking-popover"
+          data-portal-surface="chat-thinking"
+          data-open-direction={popoverPosition.openUpward ? "up" : "down"}
+          style={{
+            position: "fixed",
+            top: popoverPosition.top ?? undefined,
+            bottom: popoverPosition.bottom ?? undefined,
+            left: popoverPosition.left,
+            width: popoverPosition.width,
+            maxHeight: popoverPosition.maxHeight,
+          }}
+        >
           {showTargetSection ? (
-          <section className="chat-thinking-target-section" aria-label={t("chat.modelAgentSection", "Model / Agent")}>
-            <div className="chat-thinking-section-title">{t("chat.modelAgentSection", "Model / Agent")}</div>
-            <div className="chat-thinking-mode-toggle" data-testid="chat-thinking-mode-toggle">
-              <button
-                type="button"
-                className={`chat-thinking-mode-btn${targetMode === "model" ? " chat-thinking-mode-btn--active" : ""}`}
-                data-testid="chat-thinking-mode-model"
-                onClick={() => setTargetMode("model")}
-              >
-                {t("chat.newChatModeModel", "Model")}
-              </button>
-              <button
-                type="button"
-                className={`chat-thinking-mode-btn${targetMode === "agent" ? " chat-thinking-mode-btn--active" : ""}`}
-                data-testid="chat-thinking-mode-agent"
-                onClick={() => setTargetMode("agent")}
-              >
-                {t("chat.newChatModeAgent", "Agent")}
-              </button>
-            </div>
+          <section className="chat-thinking-target-section" aria-label={showAgentTarget ? t("chat.modelAgentSection", "Model / Agent") : t("chat.newChatModeModel", "Model")}>
+            <div className="chat-thinking-section-title">{showAgentTarget ? t("chat.modelAgentSection", "Model / Agent") : t("chat.newChatModeModel", "Model")}</div>
+            {showAgentTarget ? (
+              <div className="chat-thinking-mode-toggle" data-testid="chat-thinking-mode-toggle">
+                <AlphaButton
+                  type="button"
+                  className={`chat-thinking-mode-btn${targetMode === "model" ? " chat-thinking-mode-btn--active" : ""}`}
+                  data-testid="chat-thinking-mode-model"
+                  aria-pressed={targetMode === "model"}
+                  onPointerDown={(event) => {
+                    if (event.button === 0) activateTargetMode("model");
+                  }}
+                  onClick={(event) => {
+                    if (event.detail === 0) activateTargetMode("model");
+                  }}
+                >
+                  {t("chat.newChatModeModel", "Model")}
+                </AlphaButton>
+                <AlphaButton
+                  type="button"
+                  className={`chat-thinking-mode-btn${targetMode === "agent" ? " chat-thinking-mode-btn--active" : ""}`}
+                  data-testid="chat-thinking-mode-agent"
+                  aria-pressed={targetMode === "agent"}
+                  onPointerDown={(event) => {
+                    if (event.button === 0) activateTargetMode("agent");
+                  }}
+                  onClick={(event) => {
+                    if (event.detail === 0) activateTargetMode("agent");
+                  }}
+                >
+                  {t("chat.newChatModeAgent", "Agent")}
+                </AlphaButton>
+              </div>
+            ) : null}
 
-            {targetMode === "model" ? (
+            {targetMode === "model" || !showAgentTarget ? (
               <div className="chat-thinking-model-picker" data-testid="chat-thinking-model-picker">
                 <CustomModelDropdown
                   models={models}
                   value={currentModelValue}
                   onChange={chooseModel}
-                  label={t("chat.newChatModeModel", "Model")}
+                  label={modelPickerLabel ?? t("chat.newChatModeModel", "Model")}
                   placeholder={t("chat.selectModel", "Select a model")}
+                  defaultOptionLabel={modelDefaultOptionLabel}
                   disabled={!onChangeModel || models.length === 0}
                   favoriteProviders={favoriteProviders}
+                  onToggleFavorite={onToggleFavorite}
                   favoriteModels={favoriteModels}
+                  onToggleModelFavorite={onToggleModelFavorite}
                   menuWidth="readable"
                 />
                 {models.length === 0 ? (
@@ -240,7 +419,7 @@ export function ChatThinkingLevelControl({
                   agents.map((agent) => {
                     const selected = selectedAgentId === agent.id;
                     return (
-                      <button
+                      <AlphaButton
                         key={agent.id}
                         type="button"
                         className={`chat-thinking-agent-item${selected ? " chat-thinking-agent-item--selected" : ""}`}
@@ -253,13 +432,13 @@ export function ChatThinkingLevelControl({
                         <Bot size={16} />
                         <span className="chat-thinking-agent-name">{agent.name || agent.id}</span>
                         {agent.role ? <span className="chat-thinking-agent-role">{agent.role}</span> : null}
-                      </button>
+                      </AlphaButton>
                     );
                   })
                 )}
               </div>
             )}
-            {selectedAgent ? (
+            {showAgentTarget && selectedAgent ? (
               <div className="chat-thinking-current-target" data-testid="chat-thinking-current-agent">
                 {t("chat.currentAgentTarget", "Current agent: {{name}}", { name: selectedAgent.name || selectedAgent.id })}
               </div>
@@ -277,19 +456,32 @@ export function ChatThinkingLevelControl({
 
           <section className="chat-thinking-level-section" aria-label={t("chat.thinkingLevelButton", "Thinking level")}>
             <div className="chat-thinking-section-title">{t("chat.thinkingLevelSection", "Thinking level")}</div>
-            <div
+            <AlphaListBox
               id={listboxId}
               className="chat-thinking-popover-list"
-              role="listbox"
               aria-label={t("chat.thinkingLevelButton", "Thinking level")}
             >
-              {THINKING_LEVEL_OPTIONS.map((value) => {
+              {hasStaleThinkingLevel ? (
+                <AlphaListBoxItem
+                  legacyAs="button"
+                  id={`stale-${normalizedLevel}`}
+                  textValue={normalizedLevel}
+                  aria-selected
+                  isDisabled
+                  className="chat-thinking-popover-option"
+                  data-testid={`chat-thinking-option-${normalizedLevel}`}
+                >
+                  {t("models.options.unavailable", "Unavailable: {{level}}", { level: normalizedLevel })}
+                </AlphaListBoxItem>
+              ) : null}
+              {thinkingLevelOptions.map((value) => {
                 const selected = normalizedLevel === value;
                 return (
-                  <button
+                  <AlphaListBoxItem
                     key={value || "default"}
-                    type="button"
-                    role="option"
+                    id={value || "default"}
+                    textValue={optionLabel(value)}
+                    legacyAs="button"
                     aria-selected={selected}
                     className={`chat-thinking-popover-option${selected ? " active" : ""}`}
                     data-testid={`chat-thinking-option-${value || "default"}`}
@@ -297,12 +489,13 @@ export function ChatThinkingLevelControl({
                     onKeyDown={(event) => handleOptionKeyDown(event, value)}
                   >
                     {optionLabel(value)}
-                  </button>
+                  </AlphaListBoxItem>
                 );
               })}
-            </div>
+            </AlphaListBox>
           </section>
-        </div>
+        </AlphaPopoverSurface>,
+        document.body,
       ) : null}
     </div>
   );

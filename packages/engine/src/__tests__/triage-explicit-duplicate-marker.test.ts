@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 
 import { TriageProcessor } from "../triage.js";
@@ -54,11 +57,12 @@ describe("triage explicit duplicate marker short-circuit", () => {
 
   it("deletes the duplicate task and records explicit-marker activity", async () => {
     const canonical = createTask({ id: "FN-001", title: "Canonical task", column: "todo" });
+    const task = createTask();
     const store = createMockStore({
-      getTask: vi.fn().mockImplementation(async (id: string) => (id === canonical.id ? canonical : null)),
+      getTask: vi.fn().mockImplementation(async (id: string) => (id === canonical.id ? canonical : task)),
     });
 
-    await expect(runExplicitDuplicateMarker(store, createTask(), "DUPLICATE: FN-001\n", { ...settings, triageDuplicateResolution: "delete" })).resolves.toBe(true);
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n", { ...settings, triageDuplicateResolution: "delete" })).resolves.toBe(true);
 
     expect((store as any).deleteTaskIf).toHaveBeenCalledWith("FN-002", expect.any(Function), expect.objectContaining({
       removeLineageReferences: true,
@@ -67,21 +71,54 @@ describe("triage explicit duplicate marker short-circuit", () => {
         runId: expect.stringMatching(/^triage-delete-FN-002-/),
       }),
     }));
-    expect(store.recordActivity).toHaveBeenCalledWith(expect.objectContaining({
-      type: "task:auto-archived-duplicate",
-      taskId: "FN-002",
-      metadata: expect.objectContaining({ canonicalTaskId: "FN-001", source: "explicit-marker" }),
-    }));
+    expect(store.recordActivity).not.toHaveBeenCalled();
   });
 
 
+  it("resolves an exact title redirect before starting a planner session", async () => {
+    const canonical = createTask({ id: "KB-123", title: "Canonical task", column: "todo" });
+    const task = createTask({ title: "DUPLICATE: KB-123", status: null });
+    const onSpecifyStart = vi.fn();
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+    });
+    const processor = new TriageProcessor(store, rootDir, { onSpecifyStart });
+
+    await processor.specifyTask(task);
+
+    expect(onSpecifyStart).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      paused: true,
+      pausedReason: "duplicate-decision-required",
+      sourceMetadataPatch: expect.objectContaining({ nearDuplicateOf: "KB-123" }),
+    }));
+  });
+
   it("flags and system-pauses duplicates by default instead of deleting", async () => {
     const canonical = createTask({ id: "FN-001", column: "todo" });
-    const store = createMockStore({ getTask: vi.fn().mockResolvedValue(canonical) });
-    await expect(runExplicitDuplicateMarker(store, createTask(), "DUPLICATE: FN-001\n")).resolves.toBe(true);
+    const task = createTask();
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+    });
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
     expect(store.deleteTask).not.toHaveBeenCalled();
     expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: true, pausedReason: "duplicate-decision-required" }));
     expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({ sourceMetadataPatch: expect.objectContaining({ nearDuplicateOf: "FN-001", duplicateSource: "triage-marker" }) }));
+  });
+
+  it("still pauses a user-authored task when the duplicate target is active", async () => {
+    const canonical = createTask({ id: "FN-001", column: "in-progress" });
+    const task = createTask({ sourceType: "dashboard_ui" });
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+    });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      paused: true,
+      pausedReason: "duplicate-decision-required",
+    }));
   });
 
   it("keeps a marker duplicate by clearing its system pause for replanning", async () => {
@@ -94,7 +131,47 @@ describe("triage explicit duplicate marker short-circuit", () => {
     });
     await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n", { ...settings, triageDuplicateResolution: "keep" })).resolves.toBe(true);
     expect(store.deleteTask).not.toHaveBeenCalled();
-    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: false, pausedReason: null, status: null }));
+    // Must leave needs-replan (not status:null) so the scheduler does not wake on a prompt-less card.
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      paused: false,
+      pausedReason: null,
+      status: "needs-replan",
+      sourceMetadataPatch: expect.objectContaining({ nearDuplicateOf: "FN-001", nearDuplicateDismissed: true }),
+    }));
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-002",
+      "Duplicate marker cleared for re-specification",
+      expect.stringContaining("FN-001"),
+    );
+  });
+
+  it("keeps an executable prompt when clearing a title-only redirect", async () => {
+    const task = createTask({ title: "DUPLICATE: KB-123" });
+    const canonical = createTask({ id: "KB-123", title: "Canonical task", column: "todo" });
+    const root = await mkdtemp(join(tmpdir(), "fusion-title-redirect-"));
+    const promptPath = join(root, ".fusion", "tasks", task.id, "PROMPT.md");
+    await mkdir(join(root, ".fusion", "tasks", task.id), { recursive: true });
+    await writeFile(promptPath, "# Complete operator-authored plan\n", "utf8");
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+      withTaskLock: vi.fn().mockImplementation(async (_id: string, operation: () => Promise<unknown>) => await operation()),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
+    });
+
+    try {
+      const processor = new TriageProcessor(store, root);
+      await expect((processor as any).tryFinalizeExplicitDuplicateMarker(
+        task,
+        "# Complete operator-authored plan\n",
+        { ...settings, triageDuplicateResolution: "keep" },
+        {},
+      )).resolves.toBe(true);
+
+      await expect(readFile(promptPath, "utf8")).resolves.toBe("# Complete operator-authored plan\n");
+      expect(store.updateTask).toHaveBeenCalledWith(task.id, { title: "Duplicate redirect cleared: KB-123" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("does not re-pause a same-canonical Keep acknowledgement after marker reprocessing", async () => {
@@ -113,7 +190,8 @@ describe("triage explicit duplicate marker short-circuit", () => {
     expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
       paused: false,
       pausedReason: null,
-      sourceMetadataPatch: { nearDuplicateDismissed: true },
+      status: "needs-replan",
+      sourceMetadataPatch: expect.objectContaining({ nearDuplicateOf: "FN-001", nearDuplicateDismissed: true }),
     }));
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: true }));
   });
@@ -123,7 +201,9 @@ describe("triage explicit duplicate marker short-circuit", () => {
     const task = createTask({
       sourceMetadata: { nearDuplicateOf: "FN-003", duplicateSource: "triage-marker", nearDuplicateDismissed: true },
     });
-    const store = createMockStore({ getTask: vi.fn().mockResolvedValue(canonical) });
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+    });
 
     await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
 
@@ -143,19 +223,27 @@ describe("triage explicit duplicate marker short-circuit", () => {
       sourceMetadata: { nearDuplicateOf: "FN-001", duplicateSource: "triage-marker", nearDuplicateDismissed: true },
     });
     const store = createMockStore({
-      getTask: vi.fn().mockResolvedValue(canonical),
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
       readTaskForMove: vi.fn().mockResolvedValue(task),
     });
 
     await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
 
-    expect(store.updateTask).not.toHaveBeenCalled();
+    /*
+     * FNXC:DuplicateIntake 2026-08-23-18:30:
+     * FN-9273 made the duplicate branch clear engine-owned planningFailure before any decision, so
+     * "no write at all" is no longer the contract. The invariant this test owns is the PAUSE: a
+     * user pause must survive marker reprocessing untouched, so the only permitted write is that
+     * planningFailure cleanup — never `paused`, `pausedReason`, `userPaused`, or source metadata.
+     */
+    for (const [, patch] of (store.updateTask as ReturnType<typeof vi.fn>).mock.calls as [string, Record<string, unknown>][]) {
+      expect(Object.keys(patch)).toEqual(["planningFailure"]);
+    }
   });
   it.each([
     ["missing", null],
     ["soft-deleted", createTask({ id: "FN-001", deletedAt: new Date().toISOString() })],
     ["done", createTask({ id: "FN-001", column: "done" })],
-    ["archived", createTask({ id: "FN-001", column: "archived" })],
   ])("clears an inactive %s canonical marker instead of pausing for a hidden decision", async (_state, canonical) => {
     const task = createTask();
     const store = createMockStore({
@@ -165,13 +253,79 @@ describe("triage explicit duplicate marker short-circuit", () => {
 
     await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-002", {
+    // needs-replan + dismissal + feedback — never status:null (FN-8704 replan storm)
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
       paused: false,
       pausedReason: null,
-      status: null,
-    });
+      status: "needs-replan",
+      sourceMetadataPatch: expect.objectContaining({
+        nearDuplicateOf: "FN-001",
+        nearDuplicateDismissed: true,
+        duplicateSource: "triage-marker",
+        duplicateMarkerClearCount: 1,
+      }),
+    }));
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-002",
+      "Duplicate marker cleared for re-specification",
+      expect.stringMatching(/FN-001.*do not re-emit/i),
+    );
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: true }));
     expect(store.deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("replans programmatic work when an inactive DUPLICATE is re-emitted after dismissal", async () => {
+    const task = createTask({
+      sourceMetadata: {
+        nearDuplicateOf: "FN-001",
+        duplicateSource: "triage-marker",
+        nearDuplicateDismissed: true,
+        duplicateMarkerClearCount: 1,
+      },
+    });
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) =>
+        id === "FN-001" ? createTask({ id: "FN-001", column: "done" }) : task,
+      ),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
+    });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      status: "needs-replan",
+      error: null,
+      sourceMetadataPatch: expect.objectContaining({ duplicateMarkerClearCount: 2 }),
+    }));
+  });
+
+  it("replans a user-authored task when the planner re-emits a completed duplicate", async () => {
+    const task = createTask({
+      sourceType: "dashboard_ui",
+      sourceMetadata: {
+        nearDuplicateOf: "FN-001",
+        duplicateSource: "triage-marker",
+        nearDuplicateDismissed: true,
+        duplicateMarkerClearCount: 1,
+      },
+    });
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) =>
+        id === "FN-001" ? createTask({ id: "FN-001", column: "done" }) : task,
+      ),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
+    });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      status: "needs-replan",
+      error: null,
+      sourceMetadataPatch: expect.objectContaining({ duplicateMarkerClearCount: 2 }),
+    }));
+    expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      status: "failed",
+    }));
   });
 
   it.each([

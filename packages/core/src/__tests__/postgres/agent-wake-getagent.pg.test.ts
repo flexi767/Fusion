@@ -17,13 +17,16 @@ import {
   createSharedPgTaskStoreTestHarness,
   type SharedPgTaskStoreHarness,
 } from "../../__test-utils__/pg-test-harness.js";
-import { AgentStore } from "../../agent-store.js";
+import { AgentStore } from "../../agents/agent-store.js";
 
 const pgTest = pgDescribe;
 
 pgTest("AgentStore.getAgent backs the async wake hook (PostgreSQL)", () => {
+  // FNXC:WorkflowAgentRouting 2026-08-07-18:40: bind a real projectId so FN-8764 built-in
+  // workflow-owner provisioning in AgentStore.init() has a partition.
   const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_agent_wake_getagent",
+    projectId: "proj_agent_wake",
   });
 
   let agentStore: AgentStore;
@@ -64,13 +67,13 @@ pgTest("AgentStore.getAgent backs the async wake hook (PostgreSQL)", () => {
   it("async getAgent returns null for an unknown recipient (hook early-returns)", async () => {
     expect(await agentStore.getAgent("agent-does-not-exist")).toBeNull();
   });
-  it("getCachedAgent returns null in PG backend mode (sync SQLite fallback)", async () => {
+  it("getCachedAgent returns the agent after getAgent warms the PG memory cache", async () => {
     const created = await agentStore.createAgent({ name: "cached-null-target", role: "executor" });
 
-    // Sync read has no DB handle in PG mode — degrades to null by design.
-    // Async callers route through getAgent() instead (proven by the test above).
+    // FNXC:IncompletePgPorts 2026-07-26-20:45: cold cache is null until getAgent loads PG.
     expect(agentStore.getCachedAgent(created.id)).toBeNull();
-    // The async path resolves the same agent the sync path cannot reach.
     expect((await agentStore.getAgent(created.id))?.id).toBe(created.id);
+    // Warm cache serves sync heartbeat resolveAgentConfig without SQLite.
+    expect(agentStore.getCachedAgent(created.id)?.id).toBe(created.id);
   });
 });

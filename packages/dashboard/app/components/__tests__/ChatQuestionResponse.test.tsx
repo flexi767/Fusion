@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ChatQuestionResponse } from "../ChatQuestionResponse";
 import type { ParsedQuestionToolCall } from "../../utils/parseQuestionToolCall";
+import { clampChatInputHeight, getChatInputAutomaticMaxHeight, getChatInputBoxMetrics } from "../../utils/chatInputAutosize";
+
+const chatQuestionResponseCss = readFileSync(resolve(__dirname, "../ChatQuestionResponse.css"), "utf8");
 
 const parsed: ParsedQuestionToolCall = {
   questions: [
@@ -35,6 +40,68 @@ describe("ChatQuestionResponse", () => {
       "> Q: Pick one\nAlpha\n\n> Q: Pick many\nX\n\n> Q: Explain\nNeed the safe path\n\n> Q: Proceed?\nYes",
       { single: "a", multi: ["x"], text: "Need the safe path", confirm: true },
     );
+  });
+
+  it("submits after required select is answered with optional text left blank", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(<ChatQuestionResponse parsed={{ questions: [
+      { id: "path", type: "single_select", question: "Which path?", options: [{ id: "a", label: "Alpha" }] },
+      { id: "notes", type: "text", question: "Anything else?", optional: true },
+    ] }} onSubmit={onSubmit} />);
+
+    const submit = screen.getByTestId("chat-question-response-submit");
+    expect(submit).toBeDisabled();
+    await user.click(screen.getByTestId("chat-question-response-option-path-a"));
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+    expect(onSubmit).toHaveBeenCalledWith("> Q: Which path?\nAlpha\n\n> Q: Anything else?\n(no answer — optional)", { path: "a" });
+  });
+
+  it("accepts blank optional multi-selects and all-optional cards", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const { rerender } = render(<ChatQuestionResponse parsed={{ questions: [
+      { id: "many", type: "multi_select", question: "Choose extras", optional: true, options: [{ id: "x", label: "X" }] },
+      { id: "confirm", type: "confirm", question: "Proceed?" },
+    ] }} onSubmit={onSubmit} />);
+
+    expect(screen.getByTestId("chat-question-response-submit")).toBeDisabled();
+    await user.click(screen.getByTestId("chat-question-response-option-confirm-no"));
+    expect(screen.getByTestId("chat-question-response-submit")).toBeEnabled();
+
+    rerender(<ChatQuestionResponse key="all-optional" parsed={{ questions: [{ id: "notes", type: "text", question: "Notes", optional: true }] }} onSubmit={onSubmit} />);
+    const submit = screen.getByTestId("chat-question-response-submit");
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+    expect(onSubmit).toHaveBeenLastCalledWith("> Q: Notes\n(no answer — optional)", {});
+  });
+
+  it("shows optional affordances only on live cards containing optional questions", () => {
+    const optionalParsed: ParsedQuestionToolCall = {
+      questions: [
+        { id: "optional", type: "text", question: "Notes", optional: true },
+        { id: "required", type: "text", question: "Required" },
+      ],
+    };
+    const { rerender } = render(<ChatQuestionResponse parsed={optionalParsed} onSubmit={vi.fn()} />);
+    expect(screen.getByTestId("chat-question-response-optional-optional")).toHaveTextContent("Optional");
+    expect(screen.queryByTestId("chat-question-response-optional-required")).not.toBeInTheDocument();
+    expect(screen.getByText("Answer all required questions to continue the chat.")).toBeInTheDocument();
+
+    rerender(<ChatQuestionResponse parsed={{ questions: [{ id: "required", type: "text", question: "Required" }] }} onSubmit={vi.fn()} />);
+    expect(screen.getByText("Answer all questions to continue the chat.")).toBeInTheDocument();
+
+    rerender(<ChatQuestionResponse parsed={optionalParsed} answered onSubmit={vi.fn()} />);
+    expect(screen.queryByTestId("chat-question-response-optional-optional")).not.toBeInTheDocument();
+  });
+
+  it("keeps optional cards enabled in compact mode but honors disabled", () => {
+    const optionalParsed: ParsedQuestionToolCall = { questions: [{ id: "notes", type: "text", question: "Notes", optional: true }] };
+    const { rerender } = render(<ChatQuestionResponse parsed={optionalParsed} compact onSubmit={vi.fn()} />);
+    expect(screen.getByTestId("chat-question-response-submit")).toBeEnabled();
+    rerender(<ChatQuestionResponse parsed={optionalParsed} disabled onSubmit={vi.fn()} />);
+    expect(screen.getByTestId("chat-question-response-submit")).toBeDisabled();
   });
 
   it("renders an answered read-only summary without leftover live controls", () => {
@@ -84,6 +151,39 @@ describe("ChatQuestionResponse", () => {
     expect(yesButton).not.toHaveClass("chat-question-response__confirm--selected");
     expect(noButton).toHaveAttribute("aria-pressed", "true");
     expect(yesButton).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("autosizes independent text answers through five lines and returns each cleared answer to its minimum", async () => {
+    const user = userEvent.setup();
+    const twoTextQuestions: ParsedQuestionToolCall = {
+      questions: [
+        { id: "short", type: "text", question: "Short answer" },
+        { id: "long", type: "text", question: "Long answer" },
+      ],
+    };
+    render(<ChatQuestionResponse parsed={twoTextQuestions} onSubmit={vi.fn()} />);
+
+    const short = screen.getByTestId("chat-question-response-text-short") as HTMLTextAreaElement;
+    const long = screen.getByTestId("chat-question-response-text-long") as HTMLTextAreaElement;
+    Object.defineProperty(short, "scrollHeight", { configurable: true, get: () => short.value ? 60 : 24 });
+    Object.defineProperty(long, "scrollHeight", { configurable: true, get: () => long.value ? 500 : 24 });
+
+    await user.type(short, "brief");
+    await user.type(long, "one\ntwo\nthree\nfour\nfive\nsix");
+    expect(short.style.height).toBe(`${clampChatInputHeight(60, getChatInputAutomaticMaxHeight(getChatInputBoxMetrics(short)))}px`);
+    expect(long.style.height).toBe(`${clampChatInputHeight(500, getChatInputAutomaticMaxHeight(getChatInputBoxMetrics(long)))}px`);
+    expect(long.style.overflowY).toBe("auto");
+
+    await user.clear(long);
+    expect(long.style.height).toBe(`${clampChatInputHeight(24, getChatInputAutomaticMaxHeight(getChatInputBoxMetrics(long)))}px`);
+    expect(short.style.height).toBe(`${clampChatInputHeight(60, getChatInputAutomaticMaxHeight(getChatInputBoxMetrics(short)))}px`);
+  });
+
+  it("uses controller-owned overflow instead of a native resize grip", () => {
+    const textareaRule = chatQuestionResponseCss.match(/\.chat-question-response__textarea\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(textareaRule).toContain("resize: none");
+    expect(textareaRule).toContain("overflow-y: hidden");
+    expect(textareaRule).not.toContain("resize: vertical");
   });
 
   it("supports compact mode", () => {

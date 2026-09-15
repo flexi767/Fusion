@@ -20,6 +20,7 @@ import type {
   Task,
   TaskAttachment,
 } from "../types.js";
+import { taskDocumentContentHash } from "../task-document-concurrency.js";
 import type {
   ArtifactRow,
   BranchGroupRow,
@@ -28,9 +29,10 @@ import type {
   TaskDocumentRow,
 } from "./row-types.js";
 import type { TaskRow } from "./persistence.js";
-import { fromJson } from "../db.js";
-import { generateTaskLineageId } from "../task-lineage.js";
-import { normalizeTaskPriority } from "../task-priority.js";
+import { fromJson } from "../db/db.js";
+import { generateTaskLineageId } from "../tasks/task-lineage.js";
+import { normalizeTaskPriority } from "../tasks/task-priority.js";
+import { pickArchiveRestorableTaskFields } from "./archive-restoration-contract.js";
 import { normalizeTaskReviewState } from "./review-state.js";
 import {
   parseTaskBranchContextFromSourceMetadata,
@@ -75,14 +77,18 @@ export function rowToTask(row: TaskRow): Task {
     worktree: row.worktree || undefined,
     blockedBy: row.blockedBy || undefined,
     overlapBlockedBy: row.overlapBlockedBy || undefined,
+    queuedLogEpisodeSignature: row.queuedLogEpisodeSignature || undefined,
     paused: row.paused ? true : undefined,
     pausedReason: row.pausedReason || undefined,
+    externalBlock: fromJson<Task["externalBlock"]>(row.externalBlock) ?? undefined,
+    planningFailure: fromJson<Task["planningFailure"]>(row.planningFailure) ?? undefined,
+    wedgeNotification: fromJson<Task["wedgeNotification"]>(row.wedgeNotification) ?? undefined,
     userPaused: row.userPaused ? true : undefined,
     baseBranch: row.baseBranch || undefined,
     executionStartBranch: row.executionStartBranch || undefined,
     branch: row.branch || undefined,
     autoMerge: row.autoMerge === null ? undefined : row.autoMerge === 1,
-    autoMergeProvenance: row.autoMergeProvenance === "user" || row.autoMergeProvenance === "legacy-stamp"
+    autoMergeProvenance: row.autoMergeProvenance === "user" || row.autoMergeProvenance === "mission" || row.autoMergeProvenance === "legacy-stamp"
       ? row.autoMergeProvenance
       : undefined,
     baseCommitSha: row.baseCommitSha || undefined,
@@ -91,14 +97,21 @@ export function rowToTask(row: TaskRow): Task {
     scopeAutoWiden: fromJson<string[]>(row.scopeAutoWiden) ?? [],
     modelPresetId: row.modelPresetId || undefined,
     modelProvider: row.modelProvider || undefined,
+    // FNXC:CredentialInstanceSelection 2026-08-01-05:53: database NULL means omitted,
+    // not an own `undefined` key, so legacy task reads stay byte-identical in this inert slice.
+    ...(row.credentialInstanceId ? { credentialInstanceId: row.credentialInstanceId } : {}),
     modelId: row.modelId || undefined,
     validatorModelProvider: row.validatorModelProvider || undefined,
+    ...(row.validatorCredentialInstanceId ? { validatorCredentialInstanceId: row.validatorCredentialInstanceId } : {}),
     validatorModelId: row.validatorModelId || undefined,
     planningModelProvider: row.planningModelProvider || undefined,
+    ...(row.planningCredentialInstanceId ? { planningCredentialInstanceId: row.planningCredentialInstanceId } : {}),
     planningModelId: row.planningModelId || undefined,
     mergerModelProvider: row.mergerModelProvider || undefined,
+    ...(row.mergerCredentialInstanceId ? { mergerCredentialInstanceId: row.mergerCredentialInstanceId } : {}),
     mergerModelId: row.mergerModelId || undefined,
     mergeRetries: row.mergeRetries ?? undefined,
+    aiMergeReviewReconciliation: fromJson<Task["aiMergeReviewReconciliation"]>(row.aiMergeReviewReconciliation) ?? undefined,
     workflowStepRetries: row.workflowStepRetries ?? undefined,
     stuckKillCount: row.stuckKillCount ?? undefined,
     resumeLimboCount: row.resumeLimboCount ?? undefined,
@@ -114,6 +127,8 @@ export function rowToTask(row: TaskRow): Task {
     postReviewFixCount: row.postReviewFixCount ?? undefined,
     planReviewReplanCount: row.planReviewReplanCount ?? undefined,
     recoveryRetryCount: row.recoveryRetryCount ?? undefined,
+    sessionContentionHoldCount: row.sessionContentionHoldCount ?? undefined,
+    sessionContentionWaitReason: row.sessionContentionWaitReason ?? undefined,
     taskDoneRetryCount: row.taskDoneRetryCount ?? undefined,
     // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker; empty/null → undefined (no taint).
     bulkCompletionRefusalAt: row.bulkCompletionRefusalAt || undefined,
@@ -132,9 +147,12 @@ export function rowToTask(row: TaskRow): Task {
     branchConflictRecoveryCount: row.branchConflictRecoveryCount ?? undefined,
     reviewerContextRetryCount: row.reviewerContextRetryCount ?? undefined,
     reviewerFallbackRetryCount: row.reviewerFallbackRetryCount ?? undefined,
+    reviewConvergenceStage: row.reviewConvergenceStage ?? undefined,
+    reviewConvergenceEscalationCount: row.reviewConvergenceEscalationCount ?? undefined,
     nextRecoveryAt: row.nextRecoveryAt || undefined,
     error: row.error || undefined,
     summary: row.summary || undefined,
+    recommendations: fromJson<Task["recommendations"]>(row.recommendations) ?? undefined,
     thinkingLevel: (row.thinkingLevel || undefined) as Task["thinkingLevel"],
     validatorThinkingLevel: (row.validatorThinkingLevel || undefined) as Task["validatorThinkingLevel"],
     planningThinkingLevel: (row.planningThinkingLevel || undefined) as Task["planningThinkingLevel"],
@@ -160,6 +178,7 @@ export function rowToTask(row: TaskRow): Task {
     executionCompletedAt: row.executionCompletedAt || undefined,
     dependencies: fromJson<string[]>(row.dependencies) || [],
     steps: fromJson<import("../types.js").TaskStep[]>(row.steps) || [],
+    stepReports: (() => { const reports = fromJson<import("../types.js").TaskStepReport[]>(row.stepReports); return reports && reports.length > 0 ? reports : undefined; })(),
     customFields: fromJson<Record<string, unknown>>(row.customFields) ?? undefined,
     log: fromJson<import("../types.js").TaskLogEntry[]>(row.log) || [],
     tokenBudgetSoftAlertedAt: row.tokenBudgetSoftAlertedAt || undefined,
@@ -171,20 +190,28 @@ export function rowToTask(row: TaskRow): Task {
         || row.tokenUsageOutputTokens === null
         || row.tokenUsageCachedTokens === null
         || row.tokenUsageTotalTokens === null
-        || row.tokenUsageFirstUsedAt === null
-        || row.tokenUsageLastUsedAt === null
       ) {
         return undefined;
       }
 
+      /*
+      FNXC:TaskCardCostBadge 2026-07-19-08:55:
+      Legacy task rows can have NULL usage timestamps and cache-write totals even when their
+      positive token totals are durable. Board list requests use this reconstruction before
+      TaskCard derives its opt-in spend badge, so timestamp metadata must not erase valid usage.
+      Fall back to the task timestamp only to retain the non-null usage contract; cost derivation
+      reads token totals and model identity, never these fallback timestamps.
+      */
+      const firstUsedAt = row.tokenUsageFirstUsedAt ?? row.tokenUsageLastUsedAt ?? row.createdAt;
+      const lastUsedAt = row.tokenUsageLastUsedAt ?? row.tokenUsageFirstUsedAt ?? row.createdAt;
       return {
         inputTokens: row.tokenUsageInputTokens,
         outputTokens: row.tokenUsageOutputTokens,
         cachedTokens: row.tokenUsageCachedTokens,
         cacheWriteTokens: row.tokenUsageCacheWriteTokens ?? 0,
         totalTokens: row.tokenUsageTotalTokens,
-        firstUsedAt: row.tokenUsageFirstUsedAt,
-        lastUsedAt: row.tokenUsageLastUsedAt,
+        firstUsedAt,
+        lastUsedAt,
         modelProvider: row.tokenUsageModelProvider ?? undefined,
         modelId: row.tokenUsageModelId ?? undefined,
         perModel: fromJson<import("../types.js").TaskTokenUsagePerModel[]>(row.tokenUsagePerModel) ?? undefined,
@@ -248,13 +275,14 @@ export function rowToTask(row: TaskRow): Task {
       const w = fromJson<import("../types.js").Task["workspaceWorktrees"]>(row.workspaceWorktrees);
       return w && Object.keys(w).length > 0 ? w : undefined;
     })(),
-    breakIntoSubtasks: row.breakIntoSubtasks ? true : undefined,
+    // FNXC:RepositoryScope 2026-08-20-23:07: legacy null remains absent; hydration must not convert acquired worktrees into intent.
+    repositoryScope: fromJson<import("../types.js").Task["repositoryScope"]>(row.repositoryScope) ?? undefined,
     noCommitsExpected: row.noCommitsExpected ? true : undefined,
     // FNXC:WorkflowOptionalSteps 2026-06-29-02:55: an explicit empty optional-step
     // selection must hydrate back as [], not undefined — "all disabled" and "not
     // materialized" are different states (mirrors main's SQLite-path fix).
     enabledWorkflowSteps: (() => { const e = fromJson<string[]>(row.enabledWorkflowSteps); return Array.isArray(e) ? e : undefined; })(),
-    modifiedFiles: (() => { const m = fromJson<string[]>(row.modifiedFiles); return m && m.length > 0 ? m : undefined; })(),
+    modifiedFiles: (() => { const m = fromJson<string[]>(row.modifiedFiles); return Array.isArray(m) ? m : undefined; })(),
     declaredSymbols: (() => { const v = fromJson<string[]>(row.declaredSymbols); return v && v.length > 0 ? v : undefined; })(),
     missionId: row.missionId || undefined,
     sliceId: row.sliceId || undefined,
@@ -362,38 +390,24 @@ export function archiveEntryToTask(
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     columnMovedAt: entry.columnMovedAt,
-    firstExecutionAt: entry.firstExecutionAt,
-    cumulativeActiveMs: entry.cumulativeActiveMs,
-    // FNXC:TaskTiming 2026-08-01-13:00: archive/restore must retain both
-    // planning fields so archived tasks neither lose accumulated AI time nor
-    // revive without the live segment anchor needed for exactly-once finalize.
-    cumulativePlanningMs: entry.cumulativePlanningMs,
-    planningStartedAt: entry.planningStartedAt,
-    executionStartedAt: entry.executionStartedAt,
-    executionCompletedAt: entry.executionCompletedAt,
-    modelPresetId: entry.modelPresetId,
-    modelProvider: entry.modelProvider,
-    modelId: entry.modelId,
-    validatorModelProvider: entry.validatorModelProvider,
-    validatorModelId: entry.validatorModelId,
-    planningModelProvider: entry.planningModelProvider,
-    planningModelId: entry.planningModelId,
-    mergerModelProvider: entry.mergerModelProvider,
-    mergerModelId: entry.mergerModelId,
-    mergerThinkingLevel: entry.mergerThinkingLevel,
-    breakIntoSubtasks: entry.breakIntoSubtasks,
-    noCommitsExpected: entry.noCommitsExpected,
-    branchContext: entry.branchContext,
-    autoMerge: entry.autoMerge,
-    modifiedFiles: slim ? undefined : entry.modifiedFiles,
-    declaredSymbols: entry.declaredSymbols,
-    missionId: entry.missionId,
-    sliceId: entry.sliceId,
-    assigneeUserId: entry.assigneeUserId,
-    mergeDetails: slim ? undefined : entry.mergeDetails,
+    ...pickArchiveRestorableTaskFields(entry),
+    /*
+    FNXC:ArchiveLifecycle 2026-07-24-11:02:
+    FN-8561 needs archived TaskCard completion fallback to use the immutable
+    archive transition, not the pre-archive columnMovedAt snapshot or updatedAt.
+    Preserve archivedAt on every slim and full archive read without changing
+    restore persistence semantics.
+    */
+    archivedAt: entry.archivedAt,
   };
 }
 
+/*
+FNXC:ArchiveSummary 2026-08-29-05:17:
+FN-253 makes tool detail default-populated. The former detail-first snippet silently replaced every
+identifying tool name with arguments, so archive summaries now keep text first inside the existing
+160-character clamp and append available detail only after it.
+*/
 export function summarizeAgentLog(entries: AgentLogEntry[], totalCount: number): string | undefined {
   if (totalCount === 0) {
     return undefined;
@@ -418,7 +432,10 @@ export function summarizeAgentLog(entries: AgentLogEntry[], totalCount: number):
     .slice(-5)
     .map((entry) => {
       const source = entry.agent ? `${entry.agent}/${entry.type}` : entry.type;
-      const text = (entry.detail || entry.text || "").replace(/\s+/g, " ").trim();
+      const content = entry.text
+        ? entry.detail ? `${entry.text} — ${entry.detail}` : entry.text
+        : entry.detail || "";
+      const text = content.replace(/\s+/g, " ").trim();
       const snippet = text.length > ARCHIVE_AGENT_LOG_SNIPPET_LIMIT
         ? `${text.slice(0, ARCHIVE_AGENT_LOG_SNIPPET_LIMIT)}...`
         : text;
@@ -444,6 +461,7 @@ export function rowToTaskDocument(row: TaskDocumentRow): import("../types.js").T
     key: row.key,
     content: row.content,
     revision: row.revision,
+    contentHash: taskDocumentContentHash(row.content),
     author: row.author,
     metadata: fromJson<Record<string, unknown>>(row.metadata),
     createdAt: row.createdAt,

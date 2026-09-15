@@ -54,6 +54,7 @@ vi.mock("../../hooks/useViewportMode", () => ({
   isShortViewport: () => false,
   getViewportMode: () => "mobile",
   isMobileViewport: () => true,
+  isTabletTouchViewport: (mode?: string) => mode === "tablet",
   useViewportMode: () => "mobile",
 }));
 vi.mock("lucide-react", () => ({
@@ -271,7 +272,7 @@ describe("MilestoneSliceInterviewModal", () => {
         targetTitle="Milestone 1"
       />,
     );
-    const modal = container.querySelector(".planning-modal");
+    const modal = document.querySelector(".planning-modal");
 
     expect(mockUseMobileKeyboard).toHaveBeenCalledWith({ enabled: true });
     expect(modal?.getAttribute("style")).toContain("--keyboard-overlap: 250px");
@@ -505,13 +506,12 @@ describe("MilestoneSliceInterviewModal", () => {
         }
       });
 
-      // Give React time to update
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      // FNXC:MissionInterview 2026-09-11-00:04: poll for the summary render with
+      // waitFor instead of a fixed 100ms sleep so the assertion resolves as soon
+      // as React flushes the onSummary update (faster, and never masks slowness).
+      await waitFor(() => {
+        expect(screen.getByText("Refined Scope")).toBeDefined();
       });
-
-      // Summary should show Refined Scope header
-      expect(screen.getByText("Refined Scope")).toBeDefined();
     });
   });
 
@@ -971,7 +971,8 @@ describe("MilestoneSliceInterviewModal", () => {
     });
 
     it("reconnects to stream for generating session when resumeSessionId is provided", async () => {
-      mockFetchAiSession.mockResolvedValue(mockSessionGenerating);
+      const trace = "**Ensuring Docker build includes dev dependencies for tests**\n\nDocker tests need development dependencies.\n\n**Planning deployment commit structure**\n\nDeployment commits remain independently reviewable.";
+      mockFetchAiSession.mockResolvedValue({ ...mockSessionGenerating, thinkingOutput: trace });
 
       render(
         <MilestoneSliceInterviewModal
@@ -991,9 +992,37 @@ describe("MilestoneSliceInterviewModal", () => {
         expect(mockConnectMilestoneInterviewStream).toHaveBeenCalled();
       });
 
-      await waitFor(() => {
-        expect(screen.getByText(/AI is thinking/)).toBeDefined();
-      });
+      const output = await screen.findByText("Deployment commits remain independently reviewable.");
+      const container = output.closest(".planning-thinking-output")!;
+      const sections = container.querySelectorAll<HTMLElement>("[data-testid='thinking-trace-section']");
+      expect(sections).toHaveLength(2);
+      expect([...sections].every((section) => section.open)).toBe(true);
+      const first = sections[0];
+      act(() => streamHandlers.onThinking?.("\n\n**Editing README content**\n\nREADME edits remain visible in their own section."));
+      expect(container.querySelectorAll("[data-testid='thinking-trace-section']")).toHaveLength(3);
+      expect(container.querySelector("[data-testid='thinking-trace-section']")).toBe(first);
+    });
+
+    it("keeps titles-only milestone interview thinking visible with a raw trace escape hatch", async () => {
+      mockFetchAiSession.mockResolvedValue({ ...mockSessionGenerating, thinkingOutput: "**One**\n\n**Two**\n\n**Three**" });
+      render(
+        <MilestoneSliceInterviewModal
+          isOpen={true}
+          onClose={vi.fn()}
+          onApplied={vi.fn()}
+          targetType="milestone"
+          targetId="MS-001"
+          targetTitle="Test Milestone"
+          projectId="test-project"
+          resumeSessionId="session-resume-titles-only"
+        />,
+      );
+      await waitFor(() => expect(screen.getByTestId("thinking-trace-raw-toggle")).toBeInTheDocument());
+      const container = document.querySelector<HTMLElement>(".planning-thinking-output")!;
+      expect(container.querySelectorAll("[data-testid='thinking-trace-section']")).toHaveLength(0);
+      expect(container.querySelectorAll(".thinking-trace-section-empty")).toHaveLength(0);
+      fireEvent.click(screen.getByTestId("thinking-trace-raw-toggle"));
+      expect(screen.getByTestId("thinking-trace-raw")).toHaveTextContent("**One**");
     });
 
     it("shows error state for error session when resumeSessionId is provided", async () => {

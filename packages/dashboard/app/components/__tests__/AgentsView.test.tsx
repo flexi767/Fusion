@@ -5,6 +5,7 @@ import i18next from "i18next";
 import { loadAllAppCss } from "../../test/cssFixture";
 import { AgentsView } from "../AgentsView";
 import { ToastProvider } from "../../hooks/useToast";
+import { ViewLayoutProvider } from "../../context/ViewLayoutContext";
 import * as apiModule from "../../api";
 import type { Agent, AgentState, AgentCapability, OrgTreeNode } from "../../api";
 import { scopedKey } from "../../utils/projectStorage";
@@ -83,6 +84,7 @@ vi.mock("../../hooks/useViewportMode", () => ({
   isShortViewport: () => false,
   getViewportMode: () => mockViewportMode(),
   isMobileViewport: () => mockViewportMode() === "mobile",
+  isTabletTouchViewport: (mode?: string) => mode === "tablet",
   useViewportMode: () => mockViewportMode(),
 }));
 
@@ -102,6 +104,7 @@ const mockFetchOrgTree = vi.mocked((apiModule as any).fetchOrgTree);
 const mockFetchAgentStats = vi.mocked((apiModule as any).fetchAgentStats);
 const mockFetchSettings = vi.mocked((apiModule as any).fetchSettings);
 const mockUpdateSettings = vi.mocked((apiModule as any).updateSettings);
+const mockFetchDiscoveredSkills = vi.mocked(apiModule.fetchDiscoveredSkills);
 const mockClipboardWriteText = vi.fn();
 const mockResizeObserverObserve = vi.fn();
 const mockResizeObserverDisconnect = vi.fn();
@@ -110,13 +113,17 @@ const mockResizeObserverDisconnect = vi.fn();
 // unconditionally, so every AgentsView mount must be wrapped in a real ToastProvider
 // (see RuntimeFallbackBadge.test.tsx for the reference pattern this replicates).
 function renderView(ui: ReactElement) {
-  return render(<ToastProvider>{ui}</ToastProvider>);
+  return render(
+    <ViewLayoutProvider projectId="proj_123">
+      <ToastProvider>{ui}</ToastProvider>
+    </ViewLayoutProvider>,
+  );
 }
 
 describe("AgentsView", () => {
   const mockAddToast = vi.fn();
   const projectId = "proj_123";
-  const agentsSidebarWidthKey = "kb-dashboard-agents-sidebar-width";
+  const agentsSidebarWidthKey = "kb-dashboard-view-sidebar-width";
 
   const mockAgents: Agent[] = [
     {
@@ -254,6 +261,22 @@ describe("AgentsView", () => {
       });
     });
 
+    it("marks list-card stored skills as forced while preserving availability", async () => {
+      mockFetchAgents.mockResolvedValueOnce([
+        { ...mockAgents[0], id: "agent-skills", metadata: { skills: ["skill-auto"] } },
+      ]);
+      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: {}, byRole: {} });
+      mockFetchDiscoveredSkills.mockResolvedValueOnce([
+        { id: "skill-auto", name: "Auto", relativePath: "skills/auto/SKILL.md", enabled: true },
+      ] as any);
+
+      renderView(<AgentsView addToast={mockAddToast} />);
+
+      const badge = await screen.findByText("skill-auto");
+      expect(badge).toHaveAttribute("data-skill-state", "auto-available");
+      expect(badge).toHaveTextContent("Forced");
+    });
+
     it("formats skill badge labels from SKILL.md paths", async () => {
       mockFetchAgents.mockResolvedValueOnce([
         {
@@ -273,7 +296,7 @@ describe("AgentsView", () => {
         expect(screen.getByText("review")).toBeInTheDocument();
       });
       expect(screen.queryByText("auto::skills/../../.agents/skills/review/SKILL.md")).toBeNull();
-      expect(screen.getByText("review")).toHaveAttribute("title", "auto::skills/../../.agents/skills/review/SKILL.md");
+      expect(screen.getByText("review")).toHaveAttribute("title", expect.stringContaining("auto::skills/../../.agents/skills/review/SKILL.md"));
     });
 
     it("renders model and runtime labels on list-view agent cards", async () => {
@@ -326,17 +349,50 @@ describe("AgentsView", () => {
       expect(getCardModelRow("agent-auto").textContent).toMatch(/Model:\s*Auto/);
     });
 
-    it("renders cross-pane overview above split layout", async () => {
+    it("renders the inherited project model for a model-less built-in role agent", async () => {
+      mockFetchAgents.mockResolvedValueOnce([{
+        ...mockAgents[0],
+        id: "agent-built-in-merger",
+        name: "Workflow Merger",
+        role: "merger",
+        roles: ["merger"],
+        metadata: { builtInWorkflowRole: true, workflowRole: "merger" },
+        runtimeConfig: { enabled: false },
+      }]);
+      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: {}, byRole: {} });
+      mockFetchSettings.mockResolvedValueOnce({
+        defaultProviderOverride: "anthropic",
+        defaultModelIdOverride: "claude-project",
+      });
+
+      const { container } = renderView(<AgentsView addToast={mockAddToast} />);
+      await waitFor(() => {
+        expect(screen.getByText("Workflow Merger")).toBeInTheDocument();
+      });
+      await waitFor(() => {
+        expect(container.querySelector(".agent-model-runtime")?.textContent).toMatch(/anthropic\/claude-project/);
+      });
+    });
+
+    it("hosts the overview trigger in the header and drops its content above the split layout", async () => {
       const { container } = renderView(<AgentsView addToast={mockAddToast} />);
 
       await waitFor(() => {
-        expect(container.querySelector(".agents-overview-bar")).toBeTruthy();
         expect(container.querySelector(".agents-split-layout")).toBeTruthy();
       });
 
-      const overview = container.querySelector(".agents-overview-bar");
+      // The trigger is a header action, and the rail carries the agent collection alone.
+      const trigger = screen.getByTestId("agents-overview-toggle");
+      expect(container.querySelector(".view-header")?.contains(trigger)).toBe(true);
+      expect(container.querySelector("section.agents-overview-bar")).toBeNull();
+
+      fireEvent.click(trigger);
+
+      const overview = container.querySelector("section.agents-overview-bar");
       const splitLayout = container.querySelector(".agents-split-layout");
+      expect(overview).toBeTruthy();
       expect(overview?.nextElementSibling).toBe(splitLayout);
+      expect(overview?.querySelector("button.agents-overview-bar__toggle")).toBeNull();
       const sidebar = container.querySelector(".agents-split-sidebar");
       expect(sidebar).toBeTruthy();
       expect(sidebar?.querySelector(".agents-overview-bar")).toBeNull();
@@ -385,10 +441,10 @@ describe("AgentsView", () => {
       const handle = await screen.findByTestId("agents-sidebar-resize-handle");
       expect(handle).toHaveAttribute("role", "separator");
       expect(handle).toHaveAttribute("aria-orientation", "vertical");
-      expect(handle).toHaveAttribute("aria-valuemin", "260");
-      expect(handle).toHaveAttribute("aria-valuemax", "520");
-      expect(handle).toHaveAttribute("aria-valuenow", "320");
-      expect(container.querySelector<HTMLElement>(".agents-split-layout")?.style.gridTemplateColumns).toBe("320px var(--space-sm) minmax(0, 1fr)");
+      expect(handle).toHaveAttribute("aria-valuemin", "220");
+      expect(handle).toHaveAttribute("aria-valuemax", "560");
+      expect(handle).toHaveAttribute("aria-valuenow", "300");
+      expect(container.querySelector<HTMLElement>(".agents-split-sidebar")?.style.getPropertyValue("--view-sidebar-current-width")).toBe("300px");
     });
 
     it("does not render the resize handle or inline split width on mobile", async () => {
@@ -400,15 +456,15 @@ describe("AgentsView", () => {
       });
 
       expect(screen.queryByTestId("agents-sidebar-resize-handle")).toBeNull();
-      expect(container.querySelector<HTMLElement>(".agents-split-layout")?.style.gridTemplateColumns).toBe("");
+      expect(container.querySelector(".agents-split-sidebar")).toHaveClass("view-sidebar--mobile");
     });
 
     it.each([
-      { label: "no stored value", stored: null, expected: 320 },
+      { label: "no stored value", stored: null, expected: 300 },
       { label: "valid stored value", stored: "410", expected: 410 },
-      { label: "corrupt stored value", stored: "not-a-number", expected: 320 },
-      { label: "above max stored value", stored: "999", expected: 520 },
-      { label: "below min stored value", stored: "10", expected: 260 },
+      { label: "corrupt stored value", stored: "not-a-number", expected: 300 },
+      { label: "above max stored value", stored: "999", expected: 560 },
+      { label: "below min stored value", stored: "10", expected: 220 },
     ])("initializes sidebar width from $label", async ({ stored, expected }) => {
       if (stored !== null) {
         localStorage.setItem(scopedKey(agentsSidebarWidthKey, projectId), stored);
@@ -418,7 +474,7 @@ describe("AgentsView", () => {
 
       const handle = await screen.findByTestId("agents-sidebar-resize-handle");
       expect(handle).toHaveAttribute("aria-valuenow", String(expected));
-      expect(container.querySelector<HTMLElement>(".agents-split-layout")?.style.gridTemplateColumns).toBe(`${expected}px var(--space-sm) minmax(0, 1fr)`);
+      expect(container.querySelector<HTMLElement>(".agents-split-sidebar")?.style.getPropertyValue("--view-sidebar-current-width")).toBe(`${expected}px`);
     });
 
     it("supports keyboard resizing with project-scoped persistence and clamping", async () => {
@@ -427,30 +483,30 @@ describe("AgentsView", () => {
 
       const handle = await screen.findByTestId("agents-sidebar-resize-handle");
 
-      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+      fireEvent.keyDown(handle, { key: "End" });
       await waitFor(() => {
-        expect(handle).toHaveAttribute("aria-valuenow", "520");
-        expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("520");
+        expect(handle).toHaveAttribute("aria-valuenow", "560");
+        expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("560");
       });
 
-      fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
-      expect(handle).toHaveAttribute("aria-valuenow", "470");
-      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("470");
-
       fireEvent.keyDown(handle, { key: "ArrowLeft" });
-      expect(handle).toHaveAttribute("aria-valuenow", "460");
-      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("460");
+      expect(handle).toHaveAttribute("aria-valuenow", "544");
+      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("544");
+
+      fireEvent.keyDown(handle, { key: "Home" });
+      expect(handle).toHaveAttribute("aria-valuenow", "220");
+      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("220");
     });
 
     it("clamps keyboard resizing at the minimum width", async () => {
-      localStorage.setItem(scopedKey(agentsSidebarWidthKey, projectId), "260");
+      localStorage.setItem(scopedKey(agentsSidebarWidthKey, projectId), "220");
       renderView(<AgentsView addToast={mockAddToast} projectId={projectId} />);
 
       const handle = await screen.findByTestId("agents-sidebar-resize-handle");
-      fireEvent.keyDown(handle, { key: "ArrowLeft", shiftKey: true });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
 
-      expect(handle).toHaveAttribute("aria-valuenow", "260");
-      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("260");
+      expect(handle).toHaveAttribute("aria-valuenow", "220");
+      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("220");
     });
 
     it("supports pointer drag resizing with capture, cleanup, persistence, and max clamping", async () => {
@@ -468,14 +524,14 @@ describe("AgentsView", () => {
 
       fireEvent.pointerMove(document, { pointerId: 1, clientX: 400 });
       await waitFor(() => {
-        expect(handle).toHaveAttribute("aria-valuenow", "520");
+        expect(handle).toHaveAttribute("aria-valuenow", "560");
       });
-      expect(container.querySelector<HTMLElement>(".agents-split-layout")?.style.gridTemplateColumns).toBe("520px var(--space-sm) minmax(0, 1fr)");
+      expect(container.querySelector<HTMLElement>(".agents-split-sidebar")?.style.getPropertyValue("--view-sidebar-current-width")).toBe("560px");
 
       fireEvent.pointerUp(document, { pointerId: 1 });
       expect(releasePointerCapture).toHaveBeenCalledWith(1);
       expect(document.body.style.userSelect).toBe("");
-      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("520");
+      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("560");
     });
 
     it("supports pointer drag resizing with min clamping", async () => {
@@ -486,11 +542,11 @@ describe("AgentsView", () => {
       fireEvent.pointerDown(handle, { pointerId: 2, clientX: 300 });
       fireEvent.pointerMove(document, { pointerId: 2, clientX: 0 });
       await waitFor(() => {
-        expect(handle).toHaveAttribute("aria-valuenow", "260");
+        expect(handle).toHaveAttribute("aria-valuenow", "220");
       });
       fireEvent.pointerUp(document, { pointerId: 2 });
 
-      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("260");
+      expect(localStorage.getItem(scopedKey(agentsSidebarWidthKey, projectId))).toBe("220");
     });
 
     it("supports mobile drill-in detail with back navigation", async () => {
@@ -670,12 +726,12 @@ describe("AgentsView", () => {
       const { container } = renderView(<AgentsView addToast={mockAddToast} />);
 
       expect(screen.queryByRole("button", { name: "Import" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "New Agent" })).toBeNull();
+      expect(screen.getByRole("button", { name: "New Agent" })).toHaveClass("view-action-button--mobile-icon-only");
 
       await openControlsPanel();
       expect(container.querySelector(".agents-view-primary-actions--controls-open")).toBeTruthy();
       expect(screen.getByRole("button", { name: "Import" })).toBeTruthy();
-      expect(screen.getByRole("button", { name: "New Agent" })).toBeTruthy();
+      expect(screen.getAllByRole("button", { name: "New Agent" })).toHaveLength(1);
     });
 
     it("closes controls popup on Escape and outside click", async () => {
@@ -840,6 +896,13 @@ describe("AgentsView", () => {
       });
     });
 
+    it("keeps heartbeat controls available on board cards", async () => {
+      renderView(<AgentsView addToast={mockAddToast} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Board view" }));
+      expect(await screen.findByRole("button", { name: /Disable heartbeat for Test Agent 1/i })).toBeInTheDocument();
+    });
+
     it("displays agent task with column context when enriched", async () => {
       mockFetchAgents.mockResolvedValue([
         { ...mockAgents[0], id: "agent-triage", name: "Triage Agent", taskId: "FN-TRIAGE", taskColumn: "triage", state: "active" as AgentState },
@@ -908,6 +971,45 @@ describe("AgentsView", () => {
       expect(css).toContain("@container agent-card-actions (max-width: calc(var(--space-2xl) * 9))");
       expect(css).toContain(".agents-split-sidebar .agent-card-actions {\n    grid-template-columns: minmax(0, 1fr);\n  }");
       expect(css).toContain(".agents-split-sidebar .agent-card-actions .agent-card-action-label {\n    display: none;\n  }");
+    });
+
+    it("keeps long agent identities and populated health badges readable in split-sidebar cards", async () => {
+      const collisionAgent: Agent = {
+        ...mockAgents[1],
+        id: "agent-marketing-manager",
+        name: "Marketing Manager",
+        role: "custom",
+        state: "active",
+        runtimeConfig: { enabled: false },
+        metadata: {
+          skills: ["auto::skills/../../.agents/skills/brand-strategy/SKILL.md", "auto::skills/../../.agents/skills/campaign-analytics/SKILL.md"],
+        },
+      };
+      mockFetchAgents.mockResolvedValueOnce([collisionAgent]);
+      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: { active: 1 }, byRole: { custom: 1 } });
+
+      const { container } = renderView(<AgentsView addToast={mockAddToast} />);
+
+      const card = await waitFor(() => {
+        const renderedCard = container.querySelector<HTMLElement>(".agents-split-sidebar .agent-card");
+        expect(renderedCard).toBeTruthy();
+        return renderedCard!;
+      });
+
+      expect(within(card).getByText("Marketing Manager")).toBeInTheDocument();
+      expect(within(card).getByText("agent-marketing-manager")).toBeInTheDocument();
+      expect(within(card).getByText("active")).toBeInTheDocument();
+      expect(within(card).getByText("Heartbeat Disabled")).toBeInTheDocument();
+      expect(within(card).getByText("Custom")).toBeInTheDocument();
+      expect(within(card).getByText("brand-strategy")).toBeInTheDocument();
+      expect(within(card).getByText("campaign-analytics")).toBeInTheDocument();
+
+      const css = loadAllAppCss();
+      expect(css).toMatch(/\.agent-card-header\s*\{[^}]*flex-wrap:\s*wrap;[^}]*gap:\s*var\(--space-sm\);[^}]*\}/);
+      expect(css).toMatch(/\.agent-info\s*\{[^}]*flex:\s*1 1 auto;[^}]*min-width:\s*0;[^}]*\}/);
+      expect(css).toMatch(/\.agent-meta\s*\{[^}]*min-width:\s*0;[^}]*\}/);
+      expect(css).toMatch(/\.agent-name,\s*\.agent-id\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*\}/);
+      expect(css).toMatch(/\.agent-badges\s*\{[^}]*flex:\s*0 1 auto;[^}]*flex-wrap:\s*wrap;[^}]*min-width:\s*0;[^}]*\}/);
     });
 
     it("opens matching detail view when clicking View Details button", async () => {
@@ -1087,6 +1189,121 @@ describe("AgentsView", () => {
       const intervalSelect = screen.getByLabelText("Set heartbeat interval for Test Agent 2") as HTMLSelectElement;
       expect(intervalSelect.value).toBe("3600000");
       expect(intervalSelect.options[intervalSelect.selectedIndex]?.text).toBe("1h");
+    });
+
+    it("maps persisted heartbeat enablement to the dropdown across desktop and mobile", async () => {
+      const heartbeatAgents: Agent[] = [
+        { ...mockAgents[1], id: "agent-disabled", name: "Disabled Agent", runtimeConfig: { enabled: false, heartbeatIntervalMs: 900_000 } },
+        { ...mockAgents[1], id: "agent-enabled", name: "Enabled Agent", runtimeConfig: { enabled: true, heartbeatIntervalMs: 900_000 } },
+        { ...mockAgents[1], id: "agent-legacy", name: "Legacy Agent", runtimeConfig: { heartbeatIntervalMs: 900_000 } },
+        { ...mockAgents[1], id: "agent-default", name: "Default Agent", runtimeConfig: undefined },
+      ];
+      mockFetchAgents.mockResolvedValue(heartbeatAgents);
+      mockFetchAgentStats.mockResolvedValue({ total: heartbeatAgents.length, byState: {}, byRole: {} });
+      mockViewportMode.mockReturnValue("mobile");
+
+      renderView(<AgentsView addToast={mockAddToast} />);
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Set heartbeat interval for Disabled Agent") as HTMLSelectElement).value).toBe("__disabled__");
+      });
+      for (const name of ["Enabled Agent", "Legacy Agent"]) {
+        const select = screen.getByLabelText(`Set heartbeat interval for ${name}`) as HTMLSelectElement;
+        expect(select.value).toBe("900000");
+        expect(select.options[select.selectedIndex]?.text).toBe("15m");
+      }
+      expect((screen.getByLabelText("Set heartbeat interval for Default Agent") as HTMLSelectElement).value).toBe("3600000");
+    });
+
+    it("preserves runtime config while disabling and re-enabling heartbeat intervals", async () => {
+      const disabledAgent: Agent = {
+        ...mockAgents[1],
+        id: "agent-disabled",
+        name: "Disabled Agent",
+        runtimeConfig: {
+          enabled: false,
+          heartbeatIntervalMs: 900_000,
+          heartbeatTimeoutMs: 120_000,
+          maxConcurrentRuns: 3,
+          messageResponseMode: "on-heartbeat",
+        },
+      };
+      mockFetchAgents
+        .mockResolvedValueOnce([disabledAgent])
+        .mockResolvedValueOnce([disabledAgent])
+        .mockResolvedValueOnce([{ ...disabledAgent, runtimeConfig: { ...disabledAgent.runtimeConfig, enabled: true, heartbeatIntervalMs: 1_800_000 } }])
+        .mockResolvedValueOnce([{ ...disabledAgent, runtimeConfig: { ...disabledAgent.runtimeConfig, enabled: false, heartbeatIntervalMs: 1_800_000 } }]);
+      mockFetchAgentStats.mockResolvedValue({ total: 1, byState: {}, byRole: {} });
+
+      renderView(<AgentsView addToast={mockAddToast} />);
+
+      const select = await screen.findByLabelText("Set heartbeat interval for Disabled Agent") as HTMLSelectElement;
+      expect(select.value).toBe("__disabled__");
+      expect(Array.from(select.options).map((option) => option.text)).toContain("Disabled");
+
+      fireEvent.change(select, { target: { value: "__disabled__" } });
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenLastCalledWith(
+          "agent-disabled",
+          {
+            runtimeConfig: {
+              enabled: false,
+              heartbeatIntervalMs: 900_000,
+              heartbeatTimeoutMs: 120_000,
+              maxConcurrentRuns: 3,
+              messageResponseMode: "on-heartbeat",
+            },
+          },
+          undefined,
+        );
+      });
+
+      fireEvent.change(select, { target: { value: "1800000" } });
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenLastCalledWith(
+          "agent-disabled",
+          {
+            runtimeConfig: {
+              enabled: true,
+              heartbeatIntervalMs: 1_800_000,
+              heartbeatTimeoutMs: 120_000,
+              maxConcurrentRuns: 3,
+              messageResponseMode: "on-heartbeat",
+            },
+          },
+          undefined,
+        );
+      });
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Set heartbeat interval for Disabled Agent") as HTMLSelectElement).value).toBe("1800000");
+      });
+
+      const refreshedSelect = screen.getByLabelText("Set heartbeat interval for Disabled Agent");
+      fireEvent.change(refreshedSelect, { target: { value: "__disabled__" } });
+      await waitFor(() => {
+        expect((screen.getByLabelText("Set heartbeat interval for Disabled Agent") as HTMLSelectElement).value).toBe("__disabled__");
+      });
+
+      fireEvent.change(screen.getByLabelText("Set heartbeat interval for Disabled Agent"), { target: { value: "__custom__" } });
+      const customInput = await screen.findByLabelText("Custom heartbeat interval in minutes for Disabled Agent");
+      fireEvent.change(customInput, { target: { value: "7" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenLastCalledWith(
+          "agent-disabled",
+          {
+            runtimeConfig: {
+              enabled: true,
+              heartbeatIntervalMs: 420_000,
+              heartbeatTimeoutMs: 120_000,
+              maxConcurrentRuns: 3,
+              messageResponseMode: "on-heartbeat",
+            },
+          },
+          undefined,
+        );
+      });
     });
 
     it("updates agent heartbeat interval from preset dropdown", async () => {
@@ -1931,7 +2148,7 @@ describe("AgentsView", () => {
         expect(mockCreateAgent).toHaveBeenCalledWith(
           expect.objectContaining({
             name: "My Agent",
-            role: "custom",
+            roles: ["custom"],
           }),
           undefined,
         );
@@ -2779,6 +2996,69 @@ describe("AgentsView", () => {
           "Paused 1 agent; skipped 2; failed 1 (Running Agent: network boom)",
           "error",
         );
+      });
+    });
+  });
+
+  describe("durable heartbeat enablement controls", () => {
+    it("uses the shared default-enabled contract and preserved config from list and board controls", async () => {
+      const durable = {
+        ...mockAgents[1],
+        runtimeConfig: { heartbeatIntervalMs: 900_000, heartbeatTimeoutMs: 120_000, maxConcurrentRuns: 3, unknownRuntimeKey: "preserved" },
+      };
+      const worker = { ...mockAgents[2], id: "agent-worker", name: "Task Worker", metadata: { agentKind: "task-worker" } };
+      mockFetchAgents.mockResolvedValue([durable, worker]);
+      mockFetchAgentStats.mockResolvedValue({ total: 2, byState: {}, byRole: {} });
+
+      renderView(<AgentsView addToast={mockAddToast} projectId={projectId} />);
+
+      fireEvent.click(await screen.findByTitle("Board view"));
+      const boardToggle = await screen.findByRole("button", { name: "Disable heartbeat for Test Agent 2" });
+      fireEvent.click(boardToggle);
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenCalledWith("agent-002", {
+          runtimeConfig: {
+            enabled: false,
+            heartbeatIntervalMs: 900_000,
+            heartbeatTimeoutMs: 120_000,
+            maxConcurrentRuns: 3,
+            unknownRuntimeKey: "preserved",
+          },
+        }, projectId);
+      });
+      expect(screen.queryByRole("button", { name: /heartbeat for Task Worker/i })).toBeNull();
+      expect(screen.queryByTestId("agent-detail-view")).toBeNull();
+
+      expect(screen.queryByRole("button", { name: /heartbeat for Task Worker/i })).toBeNull();
+      expect(boardToggle).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("keeps heartbeat mutations out of org chart nodes", async () => {
+      mockFetchOrgTree.mockResolvedValue([{ agent: { ...mockAgents[1], runtimeConfig: { enabled: false, heartbeatIntervalMs: 900_000 } }, children: [] }]);
+      renderView(<AgentsView addToast={mockAddToast} projectId={projectId} />);
+      fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+      await screen.findByText("Test Agent 2");
+      expect(screen.queryByRole("button", { name: /heartbeat for Test Agent 2/i })).toBeNull();
+      expect(mockUpdateAgent).not.toHaveBeenCalled();
+    });
+
+    it("updates every eligible current-project durable agent through bulk controls despite filtered display", async () => {
+      const disabled = { ...mockAgents[1], id: "agent-disabled", name: "Disabled", runtimeConfig: { enabled: false, heartbeatIntervalMs: 900_000, unknownRuntimeKey: "keep" } };
+      const enabled = { ...mockAgents[2], id: "agent-enabled", name: "Enabled", runtimeConfig: { enabled: true, heartbeatIntervalMs: 1_800_000 } };
+      const worker = { ...mockAgents[3], id: "agent-worker", name: "Worker", metadata: { agentKind: "task-worker" }, runtimeConfig: { enabled: false } };
+      mockFetchAgents.mockResolvedValue([disabled, enabled, worker]);
+      mockFetchAgentStats.mockResolvedValue({ total: 3, byState: {}, byRole: {} });
+      renderView(<AgentsView addToast={mockAddToast} projectId={projectId} />);
+
+      await openControlsPanel();
+      fireEvent.click(screen.getByRole("menuitem", { name: /enable all heartbeats/i }));
+      await waitFor(() => expect(mockConfirm).toHaveBeenCalled());
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenCalledTimes(1);
+        expect(mockUpdateAgent).toHaveBeenCalledWith("agent-disabled", {
+          runtimeConfig: { enabled: true, heartbeatIntervalMs: 900_000, unknownRuntimeKey: "keep" },
+        }, projectId);
       });
     });
   });

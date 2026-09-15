@@ -7,19 +7,26 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   bucketDuration,
   attributeTestFile,
   extractFileDurations,
   buildTimingsSnapshot,
+  pruneMissingTimingFiles,
   writeTimings,
   TIMINGS_SNAPSHOT_RELATIVE,
+  TIMINGS_STALENESS_DAYS,
   discoverWorkspaceTimingFiles,
+  loadPlanningTimings,
 } from "../ci-test-shard.mjs";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 const PACKAGES = [
   { name: "@fusion/core", dir: "packages/core" },
@@ -42,6 +49,51 @@ function tmpRoot() {
   return mkdtempSync(path.join(tmpdir(), "fusion-timings-test-"));
 }
 
+/*
+ * FNXC:CITestSharding 2026-07-27-03:20:
+ * The committed timing snapshot must remain current and refer only to live test
+ * files. Stale or phantom-path entries silently degrade CI shard balancing and
+ * can hide merge-gate regressions, so this guard fails before that drift lands.
+ */
+
+test("committed timing snapshot is fresh, parseable, and references live test files", () => {
+  const snapshotPath = path.join(REPO_ROOT, TIMINGS_SNAPSHOT_RELATIVE);
+  const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+  assert.ok(snapshot.packages && typeof snapshot.packages === "object");
+  assert.ok(Object.keys(snapshot.packages).length > 0, "snapshot must contain package timings");
+
+  const capturedAtMs = new Date(snapshot.capturedAt).getTime();
+  assert.ok(Number.isFinite(capturedAtMs), `capturedAt must be a valid ISO timestamp: ${snapshot.capturedAt}`);
+  assert.ok(capturedAtMs <= Date.now(), `capturedAt must not be future-dated: ${snapshot.capturedAt}`);
+  assert.ok(
+    (Date.now() - capturedAtMs) / 86_400_000 <= TIMINGS_STALENESS_DAYS,
+    `capturedAt exceeds the ${TIMINGS_STALENESS_DAYS}-day staleness budget: ${snapshot.capturedAt}`,
+  );
+
+  const recordedFiles = Object.values(snapshot.packages).flatMap((pkg) => Object.keys(pkg.files ?? {}));
+  const missingFiles = recordedFiles.filter(
+    (file) => !existsSync(path.join(REPO_ROOT, file)),
+  );
+  assert.deepEqual(missingFiles, [], `timing snapshot references missing test files:\n${missingFiles.join("\n")}`);
+
+  const timings = loadPlanningTimings({ projectRoot: REPO_ROOT });
+  assert.equal(timings.present, true);
+  assert.equal(timings.stale, false);
+  assert.ok(timings.fileDurations.size > 0, "committed snapshot must expose duration-weighted files");
+
+  const dryRun = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "scripts/ci-test-shard.mjs"), "--dry-run", "--total", "4"],
+    { cwd: REPO_ROOT, encoding: "utf8" },
+  );
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  assert.doesNotMatch(
+    `${dryRun.stdout}\n${dryRun.stderr}`,
+    /timing snapshot is stale|no timing snapshot found/i,
+    "dry-run must use the committed duration snapshot without missing or stale warnings",
+  );
+});
+
 test("bucketDuration rounds to nearest 100ms, floors non-zero to one bucket", () => {
   assert.equal(bucketDuration(0), 0);
   assert.equal(bucketDuration(40), 100); // sub-bucket non-zero floors up
@@ -56,6 +108,15 @@ test("attributeTestFile maps absolute paths to owning package, repo-relative", (
   const got = attributeTestFile("/repo/packages/core/src/__tests__/a.test.ts", PACKAGES, root);
   assert.deepEqual(got, { pkg: "@fusion/core", file: "packages/core/src/__tests__/a.test.ts" });
   assert.equal(attributeTestFile("/repo/tools/x.test.ts", PACKAGES, root), null);
+});
+
+test("attributeTestFile accepts CI absolute paths when their checkout differs", () => {
+  const got = attributeTestFile(
+    "/home/runner/work/Fusion/Fusion/packages/core/src/__tests__/a.test.ts",
+    PACKAGES,
+    "/local/worktree/Fusion",
+  );
+  assert.deepEqual(got, { pkg: "@fusion/core", file: "packages/core/src/__tests__/a.test.ts" });
 });
 
 test("extractFileDurations sums per-file durations and tolerates bad rows", () => {
@@ -132,6 +193,76 @@ test("buildTimingsSnapshot omits a zero-test package entirely (no zero entry)", 
     const snap = buildTimingsSnapshot([f], { projectRoot: root, packages: PACKAGES, capturedAt: "2026-06-03T00:00:00.000Z" });
     assert.ok(snap.packages["@fusion/core"]);
     assert.ok(!("@fusion/engine" in snap.packages));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pruneMissingTimingFiles removes absent paths, empty packages, and preserves capturedAt", () => {
+  const root = tmpRoot();
+  try {
+    const existing = "packages/core/live.test.ts";
+    mkdirSync(path.join(root, "packages/core"), { recursive: true });
+    writeFileSync(path.join(root, existing), "");
+    const input = {
+      capturedAt: "2026-07-24T13:09:41.412Z",
+      packages: {
+        "@fusion/core": { files: { [existing]: 700, "packages/core/missing.test.ts": 400 } },
+        "@fusion/engine": { files: { "packages/engine/missing.test.ts": 900 } },
+      },
+    };
+
+    const { snapshot, removedPaths } = pruneMissingTimingFiles(input, { projectRoot: root });
+    assert.deepEqual(removedPaths, ["packages/core/missing.test.ts", "packages/engine/missing.test.ts"]);
+    assert.equal(snapshot.capturedAt, input.capturedAt);
+    assert.equal(snapshot.packages["@fusion/core"].files[existing], 700);
+    assert.ok(!("@fusion/engine" in snapshot.packages));
+    assert.deepEqual(input.packages["@fusion/core"].files, { [existing]: 700, "packages/core/missing.test.ts": 400 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pruneMissingTimingFiles leaves complete snapshots unchanged", () => {
+  const root = tmpRoot();
+  try {
+    const file = "packages/core/live.test.ts";
+    mkdirSync(path.join(root, "packages/core"), { recursive: true });
+    writeFileSync(path.join(root, file), "");
+    const input = { capturedAt: "2026-07-24T13:09:41.412Z", packages: { "@fusion/core": { files: { [file]: 700 } } } };
+
+    const { snapshot, removedPaths } = pruneMissingTimingFiles(input, { projectRoot: root });
+    assert.deepEqual(removedPaths, []);
+    assert.deepEqual(snapshot, input);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("--prune-timings prunes the on-disk snapshot without restamping capturedAt", () => {
+  const root = tmpRoot();
+  try {
+    const live = "packages/core/live.test.ts";
+    mkdirSync(path.join(root, "packages/core"), { recursive: true });
+    writeFileSync(path.join(root, live), "");
+    const snapshotPath = path.join(root, TIMINGS_SNAPSHOT_RELATIVE);
+    mkdirSync(path.dirname(snapshotPath), { recursive: true });
+    writeFileSync(snapshotPath, `${JSON.stringify({
+      capturedAt: "2026-07-24T13:09:41.412Z",
+      packages: {
+        "@fusion/core": { files: { [live]: 700, "packages/core/deleted.test.ts": 400 } },
+      },
+    }, null, 2)}\n`);
+
+    const result = spawnSync(process.execPath, [path.join(REPO_ROOT, "scripts/ci-test-shard.mjs"), "--prune-timings"], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /pruned 1 missing timing file/);
+    const pruned = JSON.parse(readFileSync(snapshotPath, "utf8"));
+    assert.equal(pruned.capturedAt, "2026-07-24T13:09:41.412Z");
+    assert.deepEqual(pruned.packages, { "@fusion/core": { files: { [live]: 700 } } });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

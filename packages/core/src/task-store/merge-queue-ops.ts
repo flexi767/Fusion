@@ -7,16 +7,28 @@
  * instance as its first parameter and performs byte-identical work.
  */
 import {TaskStore, storeLog} from "../store.js";
-import {InvalidMergeQueueLeaseDurationError} from "./errors.js";
 import {existsSync} from "node:fs";
 import type {Task, MergeResult, MergeQueueEntry, MergeQueueAcquireOptions} from "../types.js";
 import {assertNotWorkspaceTaskMerge} from "../types.js";
 import "../builtin-traits.js";
-import {getTaskMergeBlocker, resolveTaskMergeTarget} from "../task-merge.js";
+import {getTaskMergeBlocker, isPreMergeStepsNotRunBlocker, PreMergeStepsNotRunError, resolveTaskMergeTarget} from "../merge/task-merge.js";
+import {resolvePreMergeGateForTask} from "../merge/required-pre-merge-steps.js";
+import {resolveTaskLifecycleColumns} from "../workflows/workflow-lifecycle-traits.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {assertSafeGitBranchName, assertSafeAbsolutePath} from "../task-store/shell-safety.js";
-import {acquireMergeQueueLease as acquireMergeQueueLeaseAsync} from "../task-store/async-merge-coordination.js";
-import type {MergeQueueRow} from "../task-store/row-types.js";
+import {isFusionDeletableBranch} from "../branch/branch-assignment.js";
+import {acquireMergeQueueLease as acquireMergeQueueLeaseAsync} from "../task-store/async/async-merge-coordination.js";
+import {appendTaskStepReport} from "../workflows/task-step-reports.js";
+import {buildStepLedgerReopenLog, evaluateStepLedgerSeal, STEP_LEDGER_REFUSAL_MARKER_PREFIX} from "./step-ledger-seal.js";
+
+export type StepStartDisposition = "started" | "resumed" | "blocked" | "terminal";
+
+export interface StepStartResult {
+  task: Task;
+  accepted: boolean;
+  disposition: StepStartDisposition;
+  blockingStepIndex?: number;
+}
 
 /**
  * Step state is written from more places than an agent's explicit
@@ -32,16 +44,20 @@ function proactiveStepStatusMessage(
   status: import("../types.js").StepStatus,
 ): string | null {
   if (previousStatus === status) return null;
-  const label = stepName.trim() || `Step ${stepIndex}`;
+  // FNXC:ProactiveChatStatus 2026-07-23-10:30:
+  // Chat narration must display 1-based step numbers to match the task card's "N/M steps"
+  // counting; stepIndex stays 0-based in the store/tool contract (see proactive-status.ts).
+  const display = stepIndex + 1;
+  const label = stepName.trim() || `Step ${display}`;
   switch (status) {
     case "in-progress":
-      return `Starting Step ${stepIndex}: ${label}`;
+      return `Starting Step ${display}: ${label}`;
     case "done":
-      return `Step ${stepIndex} finished — ${label}.`;
+      return `Step ${display} finished — ${label}.`;
     case "skipped":
-      return `Step ${stepIndex} was skipped — ${label}.`;
+      return `Step ${display} was skipped — ${label}.`;
     case "pending":
-      return `Step ${stepIndex} was returned to pending — ${label}.`;
+      return `Step ${display} was returned to pending — ${label}.`;
   }
 }
 
@@ -53,15 +69,16 @@ async function appendProactiveStepStatus(store: TaskStore, taskId: string, messa
   await store.appendAgentLog(taskId, message, "status", undefined, "executor");
 }
 
-export async function updateStepImpl(store: TaskStore, id: string, stepIndex: number, status: import("../types.js").StepStatus, options?: { source?: "graph" },): Promise<Task> {
+async function mutateStepImpl(store: TaskStore, id: string, stepIndex: number, status: import("../types.js").StepStatus, options?: { source?: "graph"; summary?: string; operatorOverride?: boolean },): Promise<{ task: Task; startResult?: Omit<StepStartResult, "task"> }> {
     // FNXC:WorkflowStepOrdering 2026-07-20-20:05:
     // Step-inversion projection discipline (U6/KTD-7). A `source: "graph"` write
     // is the workflow-graph executor projecting a foreach instance's lifecycle
     // (in-progress / done / pending) onto Task.steps[] with EXPLICIT indices. Three
     // behaviors diverge from a legacy write with no explicit dependency metadata:
-    //   (a) the out-of-order-done guard uses DEPENDENCY order (a done write is
-    //       legal when every dependsOn step — default: the immediately-preceding
-    //       step — is done/skipped, KTD-11). Explicit dependsOn metadata is
+    //   (a) the out-of-order start/completion guard uses DEPENDENCY order (an
+    //       in-progress or done write is legal when every dependsOn step —
+    //       default: the immediately-preceding step — is done/skipped, KTD-11).
+    //       Explicit dependsOn metadata is
     //       authoritative for every writer, not only graph-tagged writes;
     //   (b) a guard that DOES suppress a graph write logs an audit warning loudly
     //       (legacy stays silent — a graph suppression is a projection bug);
@@ -114,6 +131,7 @@ export async function updateStepImpl(store: TaskStore, id: string, stepIndex: nu
       // step status would silently undo progress, and the currentStep
       // rewind below would discard the task's place in the plan.
       const currentStatus = task.steps[stepIndex].status;
+      const isTransition = status !== currentStatus;
       if (
         status === "in-progress" &&
         (currentStatus === "done" || currentStatus === "skipped")
@@ -127,16 +145,23 @@ export async function updateStepImpl(store: TaskStore, id: string, stepIndex: nu
         await store.atomicWriteTaskJson(dir, task);
         if (store.isWatching) store.taskCache.set(id, { ...task });
         store.emit("task:updated", task);
-        return task;
+        return {
+          task,
+          startResult: {
+            accepted: false,
+            disposition: "terminal",
+          },
+        };
       }
 
-      if (status === "done") {
+      if (status === "done" || status === "in-progress") {
         // The set of predecessor steps that must be done/skipped before this step
-        // may go done. Explicit dependency metadata is authoritative regardless
-        // of which execution surface performs the write: parallel step sessions
-        // and graph foreach instances share the same Task.steps[] contract. When
-        // metadata is absent, legacy callers retain strict index order while a
-        // graph-source write defaults to the immediately preceding step (KTD-11).
+        // may start or finish. Explicit dependency metadata is authoritative
+        // regardless of which execution surface performs the write: parallel
+        // step sessions and graph foreach instances share the same Task.steps[]
+        // contract. When metadata is absent, legacy callers retain strict index
+        // order while a graph-source write defaults to the immediately preceding
+        // step (KTD-11).
         const explicitDependencies = task.steps[stepIndex]?.dependsOn;
         const hasExplicitDependencies = Array.isArray(explicitDependencies);
         const validExplicitDependencies =
@@ -203,19 +228,124 @@ export async function updateStepImpl(store: TaskStore, id: string, stepIndex: nu
               timestamp: ts,
               action:
                 `[integrity-warning] graph-source updateStep suppressed: step ${stepIndex} ` +
-                `(${task.steps[stepIndex].name}) → done blocked by unmet dependency ` +
+                `(${task.steps[stepIndex].name}) → ${status} blocked by unmet dependency ` +
                 `step ${blockingIndex} (${blockingStatus})`,
             });
           }
           await store.atomicWriteTaskJson(dir, task);
           if (store.isWatching) store.taskCache.set(id, { ...task });
           store.emit("task:updated", task);
-          return task;
+          return {
+            task,
+            ...(status === "in-progress"
+              ? {
+                  startResult: {
+                    accepted: false,
+                    disposition: "blocked" as const,
+                    blockingStepIndex: blockingIndex,
+                  },
+                }
+              : {}),
+          };
         }
       }
 
+      const ledgerSeal = isTransition ? evaluateStepLedgerSeal(task.log) : { sealed: false };
+      const admittedPostCompletionStart = currentStatus === "pending" && status === "in-progress";
+      /*
+      FNXC:StepLedgerIntegrity 2026-09-01-02:31:
+      The completion seal prevents a FINISHED session from rewriting progress it already recorded;
+      starting work that the durable ledger still shows as pending is implementation re-entry, not
+      time travel. FN-272 measured the opposite at 2026-09-01T01:31:14: `steps#8:step-execute`
+      rejected the pending Fix step before `runTaskStep` invoked its body, failed the whole foreach
+      region, and routed the card away from the success edge that returns it to review. Admit only
+      pending-to-in-progress here; stale pending-to-done and in-progress-to-done projections remain
+      sealed, as does the earlier completed-step regression guard.
+      */
+      if (
+        isTransition
+        && status !== "pending"
+        && !admittedPostCompletionStart
+        && !options?.operatorOverride
+        && ledgerSeal.sealed
+      ) {
+        const ts = new Date().toISOString();
+        const stepName = task.steps[stepIndex].name;
+        task.updatedAt = ts;
+        task.log.push({
+          timestamp: ts,
+          action:
+            `${STEP_LEDGER_REFUSAL_MARKER_PREFIX} ${status} for step ${stepIndex} (${stepName}) — ` +
+            `implementation ended at "${ledgerSeal.markerAction}" and no new implementation session has started`,
+        });
+        if (graphSource) {
+          task.log.push({
+            timestamp: ts,
+            action:
+              `[integrity-warning] graph-source updateStep suppressed: step ${stepIndex} ` +
+              `(${stepName}) → ${status} arrived after completion`,
+          });
+        }
+        await store.atomicWriteTaskJson(dir, task);
+        if (store.isWatching) store.taskCache.set(id, { ...task });
+        store.emit("task:updated", task);
+        return {
+          task,
+          ...(status === "in-progress"
+            ? {
+                startResult: {
+                  accepted: false,
+                  disposition: "terminal" as const,
+                },
+              }
+            : {}),
+        };
+      }
+
+      const reopenAfterCompletion = isTransition && ledgerSeal.sealed
+        ? status === "pending"
+          ? "pending"
+          : options?.operatorOverride
+            ? "operator"
+            : admittedPostCompletionStart
+              ? "start"
+              : undefined
+        : undefined;
+      if (reopenAfterCompletion) {
+        const stepName = task.steps[stepIndex].name;
+        const reason = reopenAfterCompletion === "pending"
+          ? `step ${stepIndex} (${stepName}) returned to pending after completion`
+          : reopenAfterCompletion === "operator"
+            ? `step ${stepIndex} (${stepName}) edited by operator after completion`
+            : `step ${stepIndex} (${stepName}) started after completion`;
+        task.log = buildStepLedgerReopenLog(task.log, reason) ?? task.log;
+      }
+
+      /*
+      FNXC:StepLedgerIntegrity 2026-08-29-06:46:
+      The task timeline must describe state transitions, never repeated writes. On mono-025, the
+      graph step-runner start projection recorded the initial Preflight start, the implementation
+      StepSessionExecutor onStepStart re-wrote that same status, and its fire-and-forget
+      onStepComplete could write done after `Task marked done by agent`. A sealed completion window
+      refuses stale engine transitions; pending resets, explicit operator edits, and starting a step
+      still recorded pending append a reopen marker first, so genuine re-entry remains possible
+      without time-traveling the ledger.
+      */
       task.steps[stepIndex].status = status;
       task.updatedAt = new Date().toISOString();
+
+      /*
+      FNXC:TaskHistory 2026-08-28-02:23:
+      The locked updateStep seam is the sole ledger writer: updateTask cannot rewrite implementation history. Suppressed regression and dependency-order writes return above this point, so they cannot manufacture reports for transitions that never landed.
+      */
+      if (status === "done" && options?.summary?.trim()) {
+        task.stepReports = appendTaskStepReport(task.stepReports, {
+          stepIndex,
+          stepName: task.steps[stepIndex].name,
+          summary: options.summary,
+          recordedAt: task.updatedAt,
+        });
+      }
 
       // Recompute from the full list: an out-of-index parallel step may have
       // moved currentStep ahead of an earlier unfinished dependency branch.
@@ -243,17 +373,20 @@ export async function updateStepImpl(store: TaskStore, id: string, stepIndex: nu
       */
       if ((status === "done" || status === "skipped") && (task.stuckKillCount ?? 0) > 0) {
         task.stuckKillCount = undefined;
-        task.log.push({
-          timestamp: task.updatedAt,
-          action: `Reset stuck-kill streak (forward progress: step ${stepIndex} (${task.steps[stepIndex].name}) → ${status})`,
-        });
+        if (isTransition) {
+          task.log.push({
+            timestamp: task.updatedAt,
+            action: `Reset stuck-kill streak (forward progress: step ${stepIndex} (${task.steps[stepIndex].name}) → ${status})`,
+          });
+        }
       }
 
-      // Log it
-      task.log.push({
-        timestamp: task.updatedAt,
-        action: `Step ${stepIndex} (${task.steps[stepIndex].name}) → ${status}`,
-      });
+      if (isTransition) {
+        task.log.push({
+          timestamp: task.updatedAt,
+          action: `Step ${stepIndex} (${task.steps[stepIndex].name}) → ${status}`,
+        });
+      }
 
       await store.atomicWriteTaskJson(dir, task);
       if (store.isWatching) store.taskCache.set(id, { ...task });
@@ -264,124 +397,52 @@ export async function updateStepImpl(store: TaskStore, id: string, stepIndex: nu
         id,
         proactiveStepStatusMessage(stepIndex, task.steps[stepIndex].name, currentStatus, status),
       ).catch(() => undefined);
-      return task;
+      return {
+        task,
+        ...(status === "in-progress"
+          ? {
+              startResult: {
+                accepted: true,
+                disposition: currentStatus === "in-progress" ? "resumed" as const : "started" as const,
+              },
+            }
+          : {}),
+      };
     });
-  }
+}
+
+export async function updateStepImpl(store: TaskStore, id: string, stepIndex: number, status: import("../types.js").StepStatus, options?: { source?: "graph"; summary?: string; operatorOverride?: boolean },): Promise<Task> {
+  return (await mutateStepImpl(store, id, stepIndex, status, options)).task;
+}
+
+/*
+FNXC:StepLifecycle 2026-07-22-10:30:
+Execution must distinguish a dependency-blocked projection from a valid restart resume even when both return a task whose target step is already in-progress. Keep that verdict inside the same task lock as the dependency check; a caller-side pre-read would race and duplicate ordering policy.
+*/
+export async function startStepImpl(store: TaskStore, id: string, stepIndex: number, options?: { source?: "graph" },): Promise<StepStartResult> {
+  const result = await mutateStepImpl(store, id, stepIndex, "in-progress", options);
+  return {
+    task: result.task,
+    ...(result.startResult ?? {
+      accepted: false,
+      disposition: "terminal" as const,
+    }),
+  };
+}
 
 export async function acquireMergeQueueLeaseImpl(store: TaskStore, workerId: string, opts: MergeQueueAcquireOptions): Promise<MergeQueueEntry | null> {
-    if (store.backendMode) {
-      const layer = store.asyncLayer!;
-      return acquireMergeQueueLeaseAsync(layer, workerId, opts);
-    }
-    if (opts.leaseDurationMs <= 0) {
-      throw new InvalidMergeQueueLeaseDurationError(opts.leaseDurationMs);
-    }
-
-    return store.db.transactionImmediate(() => {
-      const now = opts.now ?? new Date().toISOString();
-      const leaseExpiresAt = new Date(Date.parse(now) + opts.leaseDurationMs).toISOString();
-      store.cleanupStaleMergeQueueRows(now);
-
-      let leased: MergeQueueRow | undefined;
-      if (opts.targetTaskId) {
-        leased = store.db.prepare(`
-          UPDATE mergeQueue
-             SET leasedBy = ?, leasedAt = ?, leaseExpiresAt = ?
-           WHERE taskId = ?
-             AND EXISTS (
-               SELECT 1
-                 FROM tasks t
-                WHERE t.id = mergeQueue.taskId
-                  AND t.column = 'in-review'
-             )
-             AND (leasedBy IS NULL OR leaseExpiresAt <= ?)
-           RETURNING *
-        `).get(workerId, now, leaseExpiresAt, opts.targetTaskId, now) as MergeQueueRow | undefined;
-
-        if (!leased) {
-          const queueHead = store.db.prepare(`
-            SELECT mq.taskId, mq.leasedBy, t.column
-              FROM mergeQueue mq
-              LEFT JOIN tasks t ON t.id = mq.taskId
-             ORDER BY CASE mq.priority
-                        WHEN 'urgent' THEN 0
-                        WHEN 'high'   THEN 1
-                        WHEN 'normal' THEN 2
-                        WHEN 'low'    THEN 3
-                        ELSE 4
-                      END ASC,
-                      mq.enqueuedAt ASC
-             LIMIT 1
-          `).get() as { taskId: string; leasedBy: string | null; column: string | null } | undefined;
-
-          store.insertRunAuditEventRow({
-            taskId: opts.targetTaskId,
-            domain: "database",
-            mutationType: "mergeQueue:lease-target-unavailable",
-            target: opts.targetTaskId,
-            metadata: {
-              targetTaskId: opts.targetTaskId,
-              workerId,
-              queueHeadTaskId: queueHead?.taskId ?? null,
-              queueHeadLeasedBy: queueHead?.leasedBy ?? null,
-              queueHeadColumn: queueHead?.column ?? null,
-            },
-          });
-          return null;
-        }
-      } else {
-        leased = store.db.prepare(`
-          UPDATE mergeQueue
-             SET leasedBy = ?, leasedAt = ?, leaseExpiresAt = ?
-           WHERE taskId = (
-             SELECT mq.taskId
-               FROM mergeQueue mq
-               JOIN tasks t ON t.id = mq.taskId
-              WHERE t.column = 'in-review'
-                AND (mq.leasedBy IS NULL OR mq.leaseExpiresAt <= ?)
-              ORDER BY CASE mq.priority
-                         WHEN 'urgent' THEN 0
-                         WHEN 'high'   THEN 1
-                         WHEN 'normal' THEN 2
-                         WHEN 'low'    THEN 3
-                         ELSE 4
-                       END ASC,
-                       mq.enqueuedAt ASC
-              LIMIT 1
-           )
-           RETURNING *
-        `).get(workerId, now, leaseExpiresAt, now) as MergeQueueRow | undefined;
-
-        if (!leased) {
-          return null;
-        }
-      }
-
-      const entry = store.rowToMergeQueueEntry(leased);
-      store.insertRunAuditEventRow({
-        taskId: entry.taskId,
-        domain: "database",
-        mutationType: "mergeQueue:lease-acquired",
-        target: entry.taskId,
-        metadata: {
-          taskId: entry.taskId,
-          workerId,
-          leaseExpiresAt: entry.leaseExpiresAt,
-          priority: entry.priority,
-        },
-      });
-      return entry;
-    });
-  }
+        const layer = store.asyncLayer!;
+    return acquireMergeQueueLeaseAsync(layer, workerId, opts);
+}
 
 export async function mergeTaskImpl(store: TaskStore, id: string): Promise<MergeResult> {
     return store.withTaskLock(id, async () => {
       const dir = store.taskDir(id);
       const task = await store.readTaskJson(dir);
-      // FNXC:Workspace 2026-06-21-19:05:
-      // R7 merge-boundary guard (master-plan U0). Reject workspace-mode tasks
-      // BEFORE any git checkout/squash — they need the per-repo merge loop that
-      // lands in master-plan U6, which removes this guard. See the predicate's
+      // FNXC:Workspace 2026-08-15-04:54:
+      // `landWorkspaceTask` owns workspace-mode per-repository land. Keep this
+      // single-repository merge door guard as defense-in-depth so a misrouted task
+      // fails before git runs against the non-git workspace root. See the predicate's
       // FNXC:Workspace note in @fusion/core types.
       assertNotWorkspaceTaskMerge(task);
       const branch = task.branch || `fusion/${id.toLowerCase()}`;
@@ -389,7 +450,20 @@ export async function mergeTaskImpl(store: TaskStore, id: string): Promise<Merge
       // but assert as defense-in-depth against future id-format changes.
       assertSafeGitBranchName(branch);
 
-      if (task.column === "done") {
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-31-15:30:
+      THE GUARD MUST AGREE WITH THE WRITER. `moveToDoneImpl` short-circuits on
+      `task.column === completeColumn`, resolved from the task's own workflow; this guard asked the
+      same question with the `done` literal. On a renamed board they DISAGREED — the guard said "not
+      finished" for a card already resting in the board's completion lane, so the merge path ran
+      again against a branch that was already landed and deleted.
+
+      Same resolution, same shape (a single first-match column, not membership), because the point is
+      that these two answers cannot differ. A workflow declaring no complete lane resolves to
+      `undefined`, which matches no column — the finaliser below refuses such a board explicitly.
+      */
+      const alreadyCompleteColumn = (await resolveTaskLifecycleColumns(store, id))?.complete ?? "done";
+      if (task.column === alreadyCompleteColumn) {
         const result: MergeResult = {
           task,
           branch,
@@ -409,13 +483,15 @@ export async function mergeTaskImpl(store: TaskStore, id: string): Promise<Merge
           }
         }
 
-        const deleteBranch = await store.runGitCommand(`git branch -d "${branch}"`);
-        if (deleteBranch.exitCode === 0) {
-          result.branchDeleted = true;
-        } else {
-          const forceDeleteBranch = await store.runGitCommand(`git branch -D "${branch}"`);
-          if (forceDeleteBranch.exitCode === 0) {
+        if (isFusionDeletableBranch(task, branch)) {
+          const deleteBranch = await store.runGitCommand(`git branch -d "${branch}"`);
+          if (deleteBranch.exitCode === 0) {
             result.branchDeleted = true;
+          } else {
+            const forceDeleteBranch = await store.runGitCommand(`git branch -D "${branch}"`);
+            if (forceDeleteBranch.exitCode === 0) {
+              result.branchDeleted = true;
+            }
           }
         }
 
@@ -430,8 +506,28 @@ export async function mergeTaskImpl(store: TaskStore, id: string): Promise<Merge
         return result;
       }
 
-      const mergeBlocker = getTaskMergeBlocker(task);
+      /*
+      FNXC:PreMergeGateResolution 2026-08-23-07:58:
+      Queue admission resolves the selected workflow with provenance. A selected workflow that
+      falls back to the builtin graph is not evidence about its review lanes, so it defers rather
+      than silently using the legacy result-only gate. An absent selection still uses builtin:coding.
+      */
+      let mergeGate;
+      try {
+        mergeGate = await resolvePreMergeGateForTask(store, id, task.enabledWorkflowSteps, task);
+      } catch {
+        throw new Error(`Cannot merge ${id}: merge gate could not resolve the task workflow`);
+      }
+      if (mergeGate.provenance === "default" && !mergeGate.selectionAbsent) {
+        throw new Error(`Cannot merge ${id}: merge gate could not resolve the task workflow`);
+      }
+      const mergeBlocker = getTaskMergeBlocker(task, {
+        reviewColumns: mergeGate.reviewColumns.size > 0 ? mergeGate.reviewColumns : new Set(["in-review"]),
+        requiredPreMergeStepIds: mergeGate.requiredPreMergeStepIds,
+      });
       if (mergeBlocker) {
+        /* FNXC:RequiredPreMergeSteps 2026-08-22-22:40: an unrun enabled gate is a deferral (typed), not a failure. */
+        if (isPreMergeStepsNotRunBlocker(mergeBlocker)) throw new PreMergeStepsNotRunError(id);
         throw new Error(`Cannot merge ${id}: ${mergeBlocker}`);
       }
 
@@ -481,7 +577,17 @@ export async function mergeTaskImpl(store: TaskStore, id: string): Promise<Merge
           mergeTargetSource: mergeTarget.source,
         };
         await store.moveToDone(task, dir);
-        result.task = { ...task, column: "done" };
+        /*
+        FNXC:WorkflowResolvedColumns 2026-07-31-15:30:
+        `moveToDone` already WROTE the resolved completion column onto this object
+        (`task.column = completeColumn` in `moveToDoneImpl`). The `column: "done"` override put the
+        literal back, so every `task:merged` listener — GitHub tracking, the auto-merge handoff —
+        was told the card landed in `done` while the persisted row said `shipped`.
+
+        Nothing to resolve here: read back what the writer set. A second resolution would be a second
+        chance to disagree with it.
+        */
+        result.task = { ...task };
         store.emit("task:merged", result);
         return result;
       }
@@ -527,20 +633,24 @@ export async function mergeTaskImpl(store: TaskStore, id: string): Promise<Merge
       }
 
       // 4. Delete the branch
-      const deleteBranch = await store.runGitCommand(`git branch -d "${branch}"`);
-      if (deleteBranch.exitCode === 0) {
-        result.branchDeleted = true;
-      } else {
-        // Branch might not be fully merged in some edge cases; try force
-        const forceDeleteBranch = await store.runGitCommand(`git branch -D "${branch}"`);
-        if (forceDeleteBranch.exitCode === 0) {
+      if (isFusionDeletableBranch(task, branch)) {
+        const deleteBranch = await store.runGitCommand(`git branch -d "${branch}"`);
+        if (deleteBranch.exitCode === 0) {
           result.branchDeleted = true;
+        } else {
+          // Branch might not be fully merged in some edge cases; try force.
+          const forceDeleteBranch = await store.runGitCommand(`git branch -D "${branch}"`);
+          if (forceDeleteBranch.exitCode === 0) {
+            result.branchDeleted = true;
+          }
         }
       }
 
       // 5. Move task to done
       await store.moveToDone(task, dir);
-      result.task = { ...task, column: "done" };
+      /* FNXC:WorkflowResolvedColumns 2026-07-31-15:30: read back what `moveToDone` wrote — see the
+         same override on the no-branch path above. */
+      result.task = { ...task };
 
       store.emit("task:merged", result);
       return result;

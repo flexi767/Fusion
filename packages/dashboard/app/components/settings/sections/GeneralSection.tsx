@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { DEPRECATED_BUILTIN_WORKFLOW_IDS, isLocale, SUPPORTED_LOCALES, type ReportActionType, type ReportTarget, type WorkflowDefinition } from "@fusion/core";
-import { DEFAULT_MOBILE_NAV_PRIMARY_ITEMS, MAX_MOBILE_NAV_PRIMARY_ITEMS, MOBILE_NAV_PRIMARY_SELECTABLE_ITEMS, MOBILE_NAV_SELECTABLE_ITEM_LABEL_KEYS } from "../../../../../core/src/mobile-nav-primary-items";
+import { DEFAULT_MOBILE_NAV_PRIMARY_ITEMS, MAX_MOBILE_NAV_PRIMARY_ITEMS, MOBILE_NAV_PRIMARY_SELECTABLE_ITEMS, MOBILE_NAV_SELECTABLE_ITEM_LABEL_KEYS } from "../../../../../core/src/board/mobile-nav-primary-items";
 import { SettingsFieldRow } from "../SettingsFieldRow";
 import { SettingsToggleRow } from "../SettingsToggleRow";
 import { SettingsSelectRow } from "../SettingsSelectRow";
 import { SettingsNumberRow } from "../SettingsNumberRow";
 import { SettingsTextRow } from "../SettingsTextRow";
 import { SettingsHelpTip } from "../SettingsHelpTip";
+import { WorkspaceReposCard } from "./WorkspaceReposCard";
 import { ReportActionMenu } from "../../ReportActionMenu";
 import { ReportModal } from "../../ReportModal";
 import { resolveReportContextRefs } from "../../../utils/reportContextRefs";
@@ -88,34 +89,58 @@ export function GeneralSection({ form, setForm, projectId, addToast, prefixError
     includes custom workflows too (builtinWorkflows is deliberately builtin-only, used for the
     enable/disable checkboxes).
     */
-    const [aiUndoWorkflowOptions, setAiUndoWorkflowOptions] = useState<WorkflowDefinition[]>([]);
+    const [selectableWorkflows, setSelectableWorkflows] = useState<WorkflowDefinition[]>([]);
     useEffect(() => {
         let cancelled = false;
         fetchWorkflows(projectId)
             .then((workflows) => {
             if (!cancelled) {
-                setAiUndoWorkflowOptions(workflows.filter((workflow) => workflow.kind !== "fragment"));
+                setSelectableWorkflows(workflows.filter((workflow) => workflow.kind !== "fragment"));
             }
         })
             .catch(() => {
             if (!cancelled)
-                setAiUndoWorkflowOptions([]);
+                setSelectableWorkflows([]);
         });
         return () => {
             cancelled = true;
         };
     }, [projectId]);
+    /*
+    FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+    `selectableWorkflows` is the full project workflow list (built-ins + custom, fragments
+    excluded — a fragment is a palette piece, never independently selectable). It backs the
+    AI-undo, CLI/agent-create, and refinement pickers alike; `builtinWorkflows` above stays
+    built-in-only because it drives the enable/disable checkboxes, a different question.
+    */
+    const isKnownSelectableWorkflow = (workflowId: string) => workflowId === "" ||
+        selectableWorkflows.some((workflow) => workflow.id === workflowId);
     const aiUndoTaskWorkflowValue = form.aiUndoTaskWorkflowId ?? "builtin:review-heavy";
-    const aiUndoWorkflowHasStoredValue = aiUndoTaskWorkflowValue === "" ||
-        aiUndoWorkflowOptions.some((workflow) => workflow.id === aiUndoTaskWorkflowValue);
+    const aiUndoWorkflowHasStoredValue = isKnownSelectableWorkflow(aiUndoTaskWorkflowValue);
+    /*
+    FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+    Unlike AI-undo (which has a concrete "builtin:review-heavy" schema default), these two
+    default to the EMPTY value, which is the meaningful "Selected workflow" choice rather
+    than a blank — so `?? ""` is the real default, not a placeholder for a missing one.
+    */
+    const taskCreateWorkflowValue = form.taskCreateWorkflowId ?? "";
+    const refinementTaskWorkflowValue = form.refinementTaskWorkflowId ?? "";
     const enabledBuiltinWorkflowIds = useMemo(() => {
         const configured = Array.isArray(form.enabledBuiltinWorkflowIds) ? form.enabledBuiltinWorkflowIds : undefined;
         return new Set(configured ?? builtinWorkflows.map((workflow) => workflow.id));
     }, [builtinWorkflows, form.enabledBuiltinWorkflowIds]);
+    const enabledBuiltinWorkflowCount = builtinWorkflows.filter((workflow) => enabledBuiltinWorkflowIds.has(workflow.id)).length;
     const setBuiltinWorkflowEnabled = (workflowId: string, enabled: boolean) => {
         setForm((f) => {
             const allIds = builtinWorkflows.map((workflow) => workflow.id);
             const current = new Set(Array.isArray(f.enabledBuiltinWorkflowIds) ? f.enabledBuiltinWorkflowIds : allIds);
+            const currentEnabledCount = allIds.filter((id) => current.has(id)).length;
+            /*
+            FNXC:DisabledBuiltinWorkflows 2026-08-19-00:18:
+            The form itself enforces the persistence invariant, including callers
+            that invoke the setter without clicking the disabled final checkbox.
+            */
+            if (!enabled && current.has(workflowId) && currentEnabledCount <= 1) return f;
             if (enabled) {
                 current.add(workflowId);
             }
@@ -162,6 +187,36 @@ export function GeneralSection({ form, setForm, projectId, addToast, prefixError
       >
         <ReportActionMenu onSelect={setReportAction} />
       </SettingsFieldRow>
+      {/* FNXC:TaskRecommendations 2026-08-08-05:10: Project policy caps only accepted completion suggestions; zero explicitly disables them while the API remains authoritative for malformed values. */}
+      <SettingsNumberRow
+        descriptor={{
+          key: "maxRecommendationsPerTask",
+          label: t("settings.general.maxRecommendationsPerTask", "Maximum recommendations per task"),
+          help: t("settings.general.maxRecommendationsPerTaskHelp", "Default: 3. Set 0 to disable recommendations; choose a whole number from 1 to 20 to cap each completed task."),
+          scope: "project",
+          min: 0,
+          max: 20,
+          placeholder: "3",
+        }}
+        value={form.maxRecommendationsPerTask ?? 3}
+        onChange={(value) => setForm((current) => ({ ...current, maxRecommendationsPerTask: value ?? 3 }))}
+      />
+      {/* FNXC:TaskRecommendations 2026-08-19-13:05: A single shared project toggle makes completion evaluation mandatory only for positive caps; relevance wins over filling the configured maximum, and cap 0 remains authoritative. */}
+      <SettingsToggleRow
+        descriptor={{
+          key: "requireTaskRecommendations",
+          label: t("settings.general.requireTaskRecommendations", "Require automatic task recommendations"),
+          help: t("settings.general.requireTaskRecommendationsHelp", "Default: disabled. When enabled, successful completion must explicitly evaluate grounded follow-ups. The executor aims toward the configured maximum, but fewer or [] are correct when relevance does not support more; cap 0 disables capture regardless of this setting."),
+          scope: "project",
+        }}
+        value={form.requireTaskRecommendations === true}
+        onChange={(value) => setForm((current) => ({ ...current, requireTaskRecommendations: value === true }))}
+      />
+      {/*
+        FNXC:TaskRecommendations 2026-08-13-03:56:
+        The operator asked to be notified in the mailbox when a completed task produces
+        recommendations, with an off switch. Turning it off suppresses only the notice, never capture.
+      */}
       {/*
         FNXC:SettingsGeneral 2026-07-15-17:35:
         A blank prefix stores `undefined`, not "": empty means "no prefix configured" and must delete the
@@ -205,11 +260,16 @@ export function GeneralSection({ form, setForm, projectId, addToast, prefixError
             <SettingsHelpTip settingKey="enabledBuiltinWorkflowIds">{t("settings.general.disabledFusionWorkflowsAreHiddenFromWorkflow", "Disabled Fusion workflows are hidden from workflow pickers. Existing tasks that already use one continue to resolve. Default: all built-in workflows enabled (unset).")}</SettingsHelpTip>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-sm)" }}>
-            {builtinWorkflows.map((workflow) => (<label key={workflow.id} htmlFor={`builtin-workflow-${workflow.id}`} className="checkbox-label">
-                <input id={`builtin-workflow-${workflow.id}`} type="checkbox" checked={enabledBuiltinWorkflowIds.has(workflow.id)} onChange={(e) => setBuiltinWorkflowEnabled(workflow.id, e.target.checked)}/>
+            <span id="builtin-workflow-enablement-hint" className="sr-only">{t("settings.general.builtinWorkflowAtLeastOneEnabled", "At least one built-in workflow must remain enabled.")}</span>
+            {builtinWorkflows.map((workflow) => {
+                const checked = enabledBuiltinWorkflowIds.has(workflow.id);
+                const isLastEnabled = checked && enabledBuiltinWorkflowCount <= 1;
+                return (<label key={workflow.id} htmlFor={`builtin-workflow-${workflow.id}`} className="checkbox-label" title={isLastEnabled ? t("settings.general.builtinWorkflowAtLeastOneEnabled", "At least one built-in workflow must remain enabled.") : undefined}>
+                <input id={`builtin-workflow-${workflow.id}`} type="checkbox" checked={checked} disabled={isLastEnabled} aria-describedby="builtin-workflow-enablement-hint" onChange={(e) => setBuiltinWorkflowEnabled(workflow.id, e.target.checked)}/>
                 <WorkflowIcon workflowId={workflow.id} decorative />
                 <span>{workflow.name}</span>
-              </label>))}
+              </label>);
+            })}
           </div>
         </div>)}
       <div className="form-group">
@@ -220,19 +280,53 @@ export function GeneralSection({ form, setForm, projectId, addToast, prefixError
         </div>
         <select id="aiUndoTaskWorkflowId" className="select" data-testid="ai-undo-workflow-select" value={aiUndoTaskWorkflowValue} onChange={(e) => setForm((f) => ({ ...f, aiUndoTaskWorkflowId: e.target.value }))}>
           <option value="">{t("settings.general.aiUndoTaskWorkflowInherit", "Inherit project default workflow")}</option>
-          {aiUndoWorkflowOptions.map((workflow) => (<option key={workflow.id} value={workflow.id}>
+          {selectableWorkflows.map((workflow) => (<option key={workflow.id} value={workflow.id}>
               {workflow.name}
             </option>))}
           {!aiUndoWorkflowHasStoredValue && (<option value={aiUndoTaskWorkflowValue}>{aiUndoTaskWorkflowValue}</option>)}
         </select>
       </div>
+      {/*
+        FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+        Two origins create tasks WITHOUT a workflow picker in front of the operator:
+        `fn task create` (CLI + the `fn_task_create` agent tool) and refinement tasks
+        (the follow-up card a comment on a done task spawns). Both previously always
+        inherited the project default workflow, with no way to route them elsewhere.
+        These pickers add that: the empty-string option means "Selected workflow" — the
+        operator's current Board lane, mirrored server-side so non-browser callers can
+        read it, falling back to the project default workflow — and any other value PINS
+        that origin to a concrete workflow regardless of the lane. Unset is the default,
+        which reproduces the previous behavior exactly.
+        Deliberately placed right after the default-workflow controls: all three answer
+        "which workflow does a new card get?", and reading them apart invites the wrong
+        mental model that this overrides the default for ALL new tasks (it does not — a
+        dashboard-created task still uses the picker in the create form).
+      */}
       <div className="form-group">
-        {/* FNXC:SettingsHelp 2026-07-16-12:45: Inline help moved behind the shared "?" affordance — operator requirement: no inline description paragraphs in Settings. The tip is a SIBLING of the checkbox label (a button inside a label breaks click-to-toggle). */}
         <div className="settings-field-label-row">
-          <label htmlFor="ephemeralAgentsEnabled" className="checkbox-label">
-            <input id="ephemeralAgentsEnabled" type="checkbox" checked={form.ephemeralAgentsEnabled !== false} onChange={(e) => setForm((f) => ({ ...f, ephemeralAgentsEnabled: e.target.checked }))}/>{t("settings.general.useEphemeralTaskWorkerAgents", " Use ephemeral task-worker agents ")}</label>
-          <SettingsHelpTip settingKey="ephemeralAgentsEnabled">{t("settings.general.whenEnabledDefaultFusionSpawnsShortLived", " When enabled (default), Fusion spawns short-lived ")}<code>executor-FN-XXXX</code>{t("settings.general.agentsToRunEachTaskWhenDisabledOnly", " agents to run each task. When disabled, only permanent agents execute tasks and the scheduler auto-assigns work using the agent reporting chain. Tasks with no eligible permanent agent stay queued. ")}</SettingsHelpTip>
+          <label htmlFor="taskCreateWorkflowId">{t("settings.general.taskCreateWorkflow", "CLI/agent-created task workflow")}</label>
+          <SettingsHelpTip settingKey="taskCreateWorkflowId">{t("settings.general.taskCreateWorkflowHelp", "Workflow applied to tasks opened by `fn task create` and the fn_task_create agent tool, which have no workflow picker. Choose \"Selected workflow\" to follow your current board workflow (falling back to the project default workflow). No default — unset means Selected workflow. An explicit workflow_id passed to fn_task_create still wins.")}</SettingsHelpTip>
         </div>
+        <select id="taskCreateWorkflowId" className="select" data-testid="task-create-workflow-select" value={taskCreateWorkflowValue} onChange={(e) => setForm((f) => ({ ...f, taskCreateWorkflowId: e.target.value }))}>
+          <option value="">{t("settings.general.originWorkflowSelected", "Selected workflow")}</option>
+          {selectableWorkflows.map((workflow) => (<option key={workflow.id} value={workflow.id}>
+              {workflow.name}
+            </option>))}
+          {!isKnownSelectableWorkflow(taskCreateWorkflowValue) && (<option value={taskCreateWorkflowValue}>{taskCreateWorkflowValue}</option>)}
+        </select>
+      </div>
+      <div className="form-group">
+        <div className="settings-field-label-row">
+          <label htmlFor="refinementTaskWorkflowId">{t("settings.general.refinementTaskWorkflow", "Refinement task workflow")}</label>
+          <SettingsHelpTip settingKey="refinementTaskWorkflowId">{t("settings.general.refinementTaskWorkflowHelp", "Workflow applied to refinement tasks — the follow-up card spawned from a done or in-review task plus your feedback. Choose \"Selected workflow\" to follow your current board workflow (falling back to the project default workflow). No default — unset means Selected workflow.")}</SettingsHelpTip>
+        </div>
+        <select id="refinementTaskWorkflowId" className="select" data-testid="refinement-task-workflow-select" value={refinementTaskWorkflowValue} onChange={(e) => setForm((f) => ({ ...f, refinementTaskWorkflowId: e.target.value }))}>
+          <option value="">{t("settings.general.originWorkflowSelected", "Selected workflow")}</option>
+          {selectableWorkflows.map((workflow) => (<option key={workflow.id} value={workflow.id}>
+              {workflow.name}
+            </option>))}
+          {!isKnownSelectableWorkflow(refinementTaskWorkflowValue) && (<option value={refinementTaskWorkflowValue}>{refinementTaskWorkflowValue}</option>)}
+        </select>
       </div>
       {/*
         FNXC:EphemeralAgentTaskCreation 2026-07-30-12:00:
@@ -256,21 +350,23 @@ export function GeneralSection({ form, setForm, projectId, addToast, prefixError
       />
       {/*
         FNXC:Workspace 2026-06-24-16:00:
-        Workspace mode toggle: when enabled, the project root is treated as a workspace parent
-        containing multiple git sub-repos instead of a single git repo. The executor runs tasks
-        per-sub-repo, and git init is skipped at the root. Toggling on triggers detectWorkspaceRepos
-        and persists .fusion/workspace.json; toggling off removes it.
+        Workspace mode is a live disk-backed switch: enabling detects sub-repositories and requires
+        at least one before it writes .fusion/workspace.json and mirrors config.json; disabling removes
+        workspace.json. The executor invalidates its memoized mode after a real transition. Non-UI writers
+        reconcile failures to disk state, while same-root transitions are serialized.
       */}
       <SettingsToggleRow
         descriptor={{
           key: "workspaceMode",
           label: t("settings.general.workspaceMode", " Workspace mode (multi-repo) "),
-          help: t("settings.general.workspaceModeHint", "When enabled, the project root is treated as a workspace containing multiple git sub-repos. Tasks run per-sub-repo and no git repo is created at the root. Disable for single-repo projects. No default \u2014 unset (disabled)."),
+          help: t("settings.general.workspaceModeHint", "Enabling detects git sub-repositories and requires at least one; it creates .fusion/workspace.json. Disabling removes .fusion/workspace.json and returns to single-repo mode. No default — unset (disabled)."),
           scope: "project",
         }}
         value={form.workspaceMode === true}
         onChange={(v) => setForm((f) => ({ ...f, workspaceMode: v === true }))}
       />
+      {/* FNXC:Workspace 2026-08-20-02:03: Membership remains editable after registration; the mode toggle alone never adds repository members. */}
+      <WorkspaceReposCard projectId={projectId} />
       {/*
         FNXC:FileBrowser 2026-06-29-00:00:
         This project-scoped General toggle is intentionally default-off because slash-prefixed file-browser paths can browse outside the workspace. It only affects workspace file-browser routes and keeps task-local file APIs and other path validators confined.

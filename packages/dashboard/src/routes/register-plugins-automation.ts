@@ -21,8 +21,17 @@ FNXC:PluginsAutomationRoutes 2026-07-19-12:00:
 Automation, routine, and plugin-management endpoints live in this registrar so routes.ts remains an orchestrator. Preserve registration order: Express parameter matching makes operation paths and the registry pass-through precedence-sensitive.
 */
 export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: PluginsAutomationRouteDependencies): void {
-  const { router, options, parseScopeParam, resolveAutomationStore, resolveRoutineStore, resolveRoutineRunner, getScopedStore, getProjectContext, rethrowAsApiError, runtimeLogger } = ctx;
+  const { router, options, parseScopeParam, resolveAutomationStore, resolveRoutineStore, resolveRoutineRunner, getScopedStore, getProjectContext, getProjectPluginLoader, rethrowAsApiError, runtimeLogger } = ctx;
   const makeRunStreamHandler = createAutomationRunStreamHandlerFactory({ parseScopeParam, rethrowAsApiError, ...deps });
+
+  /*
+  FNXC:PluginEnablementScope 2026-07-22-20:30:
+  getProjectPluginLoader moved to routes/context.ts so plugin-defined HTTP route dispatch
+  (plugin-routes.ts) shares the same project-scoped loader cache as the management and
+  introspection routes below. Do not re-introduce a registrar-local loader cache: split
+  caches are how dashboard-views could show a plugin whose API routes 404'd.
+  */
+
   // ── Automation / Scheduled Task Routes ────────────────────────────
   //
   // Scope-aware endpoints: Accept `scope=global|project` query param or body field.
@@ -37,13 +46,16 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
 
   // GET /automations — list all scheduled tasks (optionally filtered by scope)
   router.get("/automations", async (req: Request, res: Response) => {
-    // Return empty array when no store available (legacy backward-compatible behavior)
-    if (!options?.automationStore) {
-      return res.json([]);
-    }
-
     try {
       const scope = parseScopeParam(req);
+      /*
+      FNXC:PluginsAutomationRoutes 2026-08-27-14:40:
+      The legacy empty-list fallback applies only to omitted/global reads. Project reads must
+      resolve the engine-backed store used by creates, surfacing 503 when none is available.
+      */
+      if (!options?.automationStore && scope !== "project") {
+        return res.json([]);
+      }
       const automationStore = resolveAutomationStore(req, scope);
 
       // Get all schedules and filter by scope if specified
@@ -394,13 +406,16 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
 
   // GET /routines — list all routines (optionally filtered by scope)
   router.get("/routines", async (req: Request, res: Response) => {
-    // Return empty array when no store available (legacy backward-compatible behavior)
-    if (!options?.routineStore) {
-      return res.json([]);
-    }
-
     try {
       const scope = parseScopeParam(req);
+      /*
+      FNXC:PluginsAutomationRoutes 2026-08-27-14:40:
+      The legacy empty-list fallback applies only to omitted/global reads. Project reads must
+      resolve the engine-backed store used by creates, surfacing 503 when none is available.
+      */
+      if (!options?.routineStore && scope !== "project") {
+        return res.json([]);
+      }
       const routineStore = resolveRoutineStore(req, scope);
 
       // Get all routines and filter by scope if specified
@@ -857,8 +872,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Get all UI slot definitions from active plugins.
    * Returns aggregated array of { pluginId, slot } objects.
    */
-  router.get("/plugins/ui-slots", async (_req: Request, res: Response) => {
-    const slots = options?.pluginLoader?.getPluginUiSlots() ?? [];
+  router.get("/plugins/ui-slots", async (req: Request, res: Response) => {
+    const { store: scopedStore, engine } = await getProjectContext(req);
+    const slots = (await getProjectPluginLoader(scopedStore, engine))?.getPluginUiSlots() ?? [];
     const normalizedSlots = slots
       .map((entry) => ({
         pluginId: entry.pluginId,
@@ -882,8 +898,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * GET /api/plugins/ui-contributions
    * Get all structured UI contributions from active plugins.
    */
-  router.get("/plugins/ui-contributions", async (_req: Request, res: Response) => {
-    const contributions = options?.pluginLoader?.getPluginUiContributions() ?? [];
+  router.get("/plugins/ui-contributions", async (req: Request, res: Response) => {
+    const { store: scopedStore, engine } = await getProjectContext(req);
+    const contributions = (await getProjectPluginLoader(scopedStore, engine))?.getPluginUiContributions() ?? [];
     const normalizedContributions = contributions
       .map((entry) => ({
         pluginId: entry.pluginId,
@@ -915,9 +932,8 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
   Engineering navigation from project A into project B while B's loader is still absent or empty.
   */
   router.get("/plugins/dashboard-views", async (req: Request, res: Response) => {
-    const { engine, projectId } = await getProjectContext(req);
-    const pluginLoader = engine?.getPluginRunner?.()?.getLoader()
-      ?? (projectId === undefined ? options?.pluginLoader : undefined);
+    const { store: scopedStore, engine } = await getProjectContext(req);
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const views = await pluginLoader?.getPluginDashboardViews() ?? [];
     res.json(views);
   });
@@ -927,8 +943,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Get all plugin runtime metadata from active plugins.
    * Returns aggregated array of { pluginId, runtimeId, name, description, version }.
    */
-  router.get("/plugins/runtimes", async (_req: Request, res: Response) => {
-    const runtimes = options?.pluginLoader?.getPluginRuntimes() ?? [];
+  router.get("/plugins/runtimes", async (req: Request, res: Response) => {
+    const { store: scopedStore, engine } = await getProjectContext(req);
+    const runtimes = (await getProjectPluginLoader(scopedStore, engine))?.getPluginRuntimes() ?? [];
     const installed = runtimes.map(({ pluginId, runtime }) => ({
       pluginId,
       runtimeId: runtime.metadata.runtimeId,
@@ -1012,8 +1029,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Returns 201 on success, 400 for validation errors, 409 for conflicts.
    */
   router.post("/plugins", async (req: Request, res: Response) => {
-    const { store: scopedStore } = await getProjectContext(req);
+    const { store: scopedStore, engine } = await getProjectContext(req);
     const pluginStore = scopedStore.getPluginStore();
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
 
     if (!req.body || typeof req.body !== "object") {
       throw badRequest("Request body is required");
@@ -1069,9 +1087,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
           settings,
         });
 
-        if (plugin.enabled && options?.pluginLoader) {
+        if (plugin.enabled && pluginLoader) {
           try {
-            await options.pluginLoader.loadPlugin(plugin.id);
+            await pluginLoader.loadPlugin(plugin.id);
           } catch (loadErr) {
             // Log but don't fail - plugin is registered, just not loaded
             runtimeLogger.child("plugin-routes").error(`Failed to load plugin ${plugin.id}`, {
@@ -1095,7 +1113,7 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       }
 
       // Check if runtime install interface is available
-      if (!options?.pluginLoader) {
+      if (!pluginLoader) {
         throw badRequest("Plugin install mode is not supported: plugin loader not available");
       }
 
@@ -1163,7 +1181,7 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
         // remove the new registration so install does not leave a broken record.
         if (plugin.enabled) {
           try {
-            await options.pluginLoader.loadPlugin(plugin.id);
+            await pluginLoader.loadPlugin(plugin.id);
           } catch (loadErr) {
             if (plugin.aiScanOnLoad) {
               await pluginStore.unregisterPlugin(plugin.id);
@@ -1196,8 +1214,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Body: { projectId?: string }
    */
   router.post("/plugins/:id/enable", async (req: Request, res: Response) => {
-    const { store: scopedStore } = await getProjectContext(req);
+    const { store: scopedStore, engine } = await getProjectContext(req);
     const pluginStore = scopedStore.getPluginStore();
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
     let plugin = await pluginStore.enablePlugin(id);
@@ -1217,9 +1236,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
     }
 
     // Start the plugin if loader is available
-    if (options?.pluginLoader) {
+    if (pluginLoader) {
       try {
-        await options.pluginLoader.loadPlugin(id);
+        await pluginLoader.loadPlugin(id);
       } catch (loadErr) {
         // Update state to error
         await pluginStore.updatePluginState(
@@ -1240,14 +1259,15 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Body: { projectId?: string }
    */
   router.post("/plugins/:id/disable", async (req: Request, res: Response) => {
-    const { store: scopedStore } = await getProjectContext(req);
+    const { store: scopedStore, engine } = await getProjectContext(req);
     const pluginStore = scopedStore.getPluginStore();
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
     // Stop the plugin if loader is available
-    if (options?.pluginLoader) {
+    if (pluginLoader) {
       try {
-        await options.pluginLoader.stopPlugin(id);
+        await pluginLoader.stopPlugin(id);
       } catch {
         // Ignore errors from stopping - plugin might not be loaded
       }
@@ -1263,8 +1283,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Body: { projectId?: string }
    */
   router.post("/plugins/:id/reload", async (req: Request, res: Response) => {
-    const { store: scopedStore } = await getProjectContext(req);
+    const { store: scopedStore, engine } = await getProjectContext(req);
     const pluginStore = scopedStore.getPluginStore();
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
     let plugin: import("@fusion/core").PluginInstallation;
@@ -1281,12 +1302,12 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       throw badRequest("Plugin is not currently loaded. Use enable instead.");
     }
 
-    if (!options?.pluginRunner?.reloadPlugin) {
-      throw internalError("Plugin runner not available");
+    if (!pluginLoader) {
+      throw internalError("Plugin loader not available");
     }
 
     try {
-      await options.pluginRunner.reloadPlugin(id);
+      await pluginLoader.reloadPlugin(id);
     } catch (reloadErr: unknown) {
       throw internalError(`Reload failed: ${reloadErr instanceof Error ? reloadErr.message : String(reloadErr)}`);
     }
@@ -1327,8 +1348,9 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Trigger a fresh plugin scan/load gate via reload or load flow.
    */
   router.post("/plugins/:id/rescan", async (req: Request, res: Response) => {
-    const { store: scopedStore } = await getProjectContext(req);
+    const { store: scopedStore, engine } = await getProjectContext(req);
     const pluginStore = scopedStore.getPluginStore();
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
     let plugin: import("@fusion/core").PluginInstallation;
@@ -1338,15 +1360,15 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       throw notFound(`Plugin "${id}" not found`);
     }
 
-    if (!options?.pluginLoader) {
+    if (!pluginLoader) {
       throw internalError("Plugin loader not available");
     }
 
     try {
-      if (plugin.state === "started" && options.pluginRunner?.reloadPlugin) {
-        await options.pluginRunner.reloadPlugin(id);
+      if (plugin.state === "started") {
+        await pluginLoader.reloadPlugin(id);
       } else if (plugin.enabled) {
-        await options.pluginLoader.loadPlugin(id);
+        await pluginLoader.loadPlugin(id);
       }
     } catch (reloadErr) {
       runtimeLogger.child("plugin-routes").error(`Failed to rescan plugin ${id}`, {

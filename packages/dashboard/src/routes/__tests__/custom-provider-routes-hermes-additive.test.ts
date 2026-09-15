@@ -53,7 +53,7 @@ vi.mock("@fusion-plugin-examples/hermes-runtime/dist/cli-spawn.js", async () => 
 });
 vi.mock("@fusion-plugin-examples/hermes-runtime/dist/fusion-skill-install.js", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("@fusion-plugin-examples/hermes-runtime/dist/fusion-skill-install.js");
-  return { ...actual, installFusionSkillIntoHermesHome: mockInstallFusionSkill };
+  return { ...actual, installComputerUseSkillIntoHermesHome: mockInstallComputerUseSkill, installFusionSkillIntoHermesHome: mockInstallFusionSkill };
 });
 
 function createMockGlobalSettingsStore(settings: GlobalSettings) {
@@ -77,8 +77,6 @@ function createMockStore(settings: GlobalSettings, onUpdate: (patch: Partial<Glo
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({}),
     updateSettings: vi.fn(),

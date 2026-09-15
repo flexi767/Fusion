@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { API_JSON_HEADERS } from "../test/apiRequestHeaders";
 import {
   fetchTaskDetail,
   uploadAttachment,
@@ -11,12 +12,9 @@ import {
   updateTask,
   createTask,
   connectPlanningStream,
-  connectSubtaskStream,
   connectMissionInterviewStream,
   assignTask,
   fetchAgentTasks,
-  archiveTask,
-  unarchiveTask,
   deleteTask,
   ApiRequestError,
   moveTask,
@@ -552,27 +550,6 @@ describe("resilient SSE reconnect", () => {
     expect(stream.readyState).toBe(ControlledEventSource.CLOSED);
   });
 
-  it("stops subtask keep-alive after complete event", () => {
-    connectSubtaskStream("subtask-session", undefined, {});
-    const stream = ControlledEventSource.instances[0]!;
-
-    stream.emitOpen();
-    vi.advanceTimersByTime(25_000);
-
-    expect(globalThis.fetch).toHaveBeenCalledWith(
-      "/api/ai-sessions/subtask-session/ping",
-      expect.objectContaining({ method: "POST" }),
-    );
-
-    const pingCallsBeforeComplete = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
-    stream.emitEvent("complete", "");
-
-    vi.advanceTimersByTime(50_000);
-
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(pingCallsBeforeComplete);
-    expect(stream.readyState).toBe(ControlledEventSource.CLOSED);
-  });
-
   it("stops mission interview keep-alive after complete event", () => {
     connectMissionInterviewStream("mission-session", undefined, {});
     const stream = ControlledEventSource.instances[0]!;
@@ -645,7 +622,7 @@ describe("fetchAgentRunAudit", () => {
     expect(result).toEqual(mockResponse);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/agents/agent-001/runs/run-001/audit",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 
@@ -657,7 +634,7 @@ describe("fetchAgentRunAudit", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/agents/agent-001/runs/run-001/audit?projectId=my-project",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 
@@ -673,7 +650,7 @@ describe("fetchAgentRunAudit", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/agents/agent-001/runs/run-001/audit?taskId=FN-001&domain=git&limit=50",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 
@@ -724,7 +701,7 @@ describe("fetchAgentRunTimeline", () => {
     expect(result).toEqual(mockResponse);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/agents/agent-001/runs/run-001/timeline",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 
@@ -741,7 +718,7 @@ describe("fetchAgentRunTimeline", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/agents/agent-001/runs/run-001/timeline?projectId=my-project",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 
@@ -763,7 +740,7 @@ describe("fetchAgentRunTimeline", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/agents/agent-001/runs/run-001/timeline?taskId=FN-001&domain=filesystem&includeLogs=false&limit=100",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 

@@ -25,6 +25,33 @@
   height: min(85vh, calc(100dvh - 40px));
 }
 
+/*
+FNXC:Onboarding 2026-08-17-23:47:
+Hosted in FloatingWindow, this modal MUST fill its host exactly — the window paints its own bordered
+surface, so any part the child does not cover shows through as unexplained blank space around the
+content. FloatingWindow.css already sets `width/height: 100%` for this caller, but the two standalone
+sizing rules above carry equal specificity (0,2,0 — the `:not([style*=…])` attribute test counts) and
+won last on source order, so the panel rendered at 85vh inside a taller window and left ~60px of dead
+surface under the footer, plus the matching right-edge strip the operator reported. Re-assert the fill
+under the host class with the same `:not()` guards, so a user-resized window still wins via its inline
+style. `resize`/`min-*` are the standalone dialog's affordances; inside the window the FRAME resizes,
+and a 640px floor would push content under the east edge in a narrow window.
+*/
+.floating-window--model-onboarding .model-onboarding-modal:not([style*="width"]),
+.floating-window--model-onboarding .model-onboarding-modal:not([style*="height"]) {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  resize: none;
+}
+
+/*
+FNXC:ModalChrome 2026-09-13-14:21:
+Model Onboarding owns only the header layout and placement of its close action. ModalCloseButton remains the sole owner of close-button geometry, border, radius, paint, and interaction feedback so this modal cannot shrink or restyle the canonical control.
+*/
 .model-onboarding-header {
   display: flex;
   align-items: center;
@@ -33,34 +60,11 @@
   gap: var(--space-md);
 }
 
-.model-onboarding-header .modal-close {
-  background: none;
-  border: none;
-  font-size: 20px;
-  color: var(--text-muted);
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 4px;
-  line-height: 1;
-}
-
-.model-onboarding-header .modal-close:hover {
-  color: var(--text);
-  background: var(--surface-hover);
-}
-
-.model-onboarding-title {
-  font-size: 24px;
-  font-weight: 800;
-  margin: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--text);
-  line-height: 1.1;
-}
-
-.model-onboarding-title svg {
+/*
+FNXC:StandardizedViewLayout 2026-09-13-22:40:
+FN-379: the shared header owns onboarding's title typography; only the step icon accent stays local.
+*/
+.model-onboarding-header .view-header__title svg {
   color: var(--accent);
 }
 

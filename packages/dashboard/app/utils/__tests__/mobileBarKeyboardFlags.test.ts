@@ -1,132 +1,67 @@
-import { describe, expect, it } from "vitest";
-import { computeMobileBarKeyboardFlags } from "../mobileBarKeyboardFlags";
+import { afterEach, describe, expect, it } from "vitest";
+import { computeMobileBarKeyboardFlags, getMobileKeyboardLayoutViewportHeight } from "../mobileBarKeyboardFlags";
+
+const initialClientHeightDescriptor = Object.getOwnPropertyDescriptor(document.documentElement, "clientHeight");
+const initialInnerHeightDescriptor = Object.getOwnPropertyDescriptor(window, "innerHeight");
+
+afterEach(() => {
+  if (initialClientHeightDescriptor) Object.defineProperty(document.documentElement, "clientHeight", initialClientHeightDescriptor);
+  else delete (document.documentElement as { clientHeight?: number }).clientHeight;
+  if (initialInnerHeightDescriptor) Object.defineProperty(window, "innerHeight", initialInnerHeightDescriptor);
+  else delete (window as { innerHeight?: number }).innerHeight;
+});
+
+describe("mobile keyboard layout metrics", () => {
+  it("prefers the resized document viewport over stale Android innerHeight", () => {
+    Object.defineProperty(document.documentElement, "clientHeight", { configurable: true, value: 544 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 844 });
+    expect(getMobileKeyboardLayoutViewportHeight()).toBe(544);
+  });
+});
 
 describe("computeMobileBarKeyboardFlags", () => {
-  it("hides the footer on Android when keyboard is open, but does not apply the iOS bottom:0 collapse class", () => {
-    // FNXC:MobileChatKeyboardLayout 2026-06-26-09:04:
-    // Android now matches iOS: the keyboard-open footer is hidden (and its
-    // reserved padding dropped) so the composer sits flush above the keyboard
-    // with no dead band. `footerKeyboardOpen` stays iOS-only.
+  it("hides and collapses the mobile footer when the keyboard is open", () => {
     const flags = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: false,
-      isIOS: false,
+      isMobile: true, keyboardFocusPending: false, keyboardOpen: true, navigationViewportActive: true, anyModalOpen: false, overlayOpen: false,
     });
 
-    expect(flags.footerHidden).toBe(true);
-    expect(flags.navKeyboardOpen).toBe(true);
-    expect(flags.footerKeyboardOpen).toBe(false);
+    expect(flags).toEqual({ footerHidden: true, navKeyboardOpen: true, footerKeyboardOpen: true });
   });
 
-  it("hides and collapses footer on iOS when keyboard is open and no overlay is open", () => {
+  it("collapses the footer as soon as mobile keyboard focus is pending", () => {
     const flags = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: false,
-      isIOS: true,
+      isMobile: true, keyboardFocusPending: true, keyboardOpen: false, navigationViewportActive: false, anyModalOpen: false, overlayOpen: false,
     });
 
-    expect(flags.footerHidden).toBe(true);
-    expect(flags.navKeyboardOpen).toBe(true);
-    expect(flags.footerKeyboardOpen).toBe(true);
+    expect(flags).toEqual({ footerHidden: false, navKeyboardOpen: true, footerKeyboardOpen: true });
   });
 
-  it("keeps footer visible when iOS keyboard is open over a modal", () => {
+  it.each([
+    ["modal", true, false],
+    ["fullscreen overlay", false, true],
+  ])("keeps board padding settled while collapsing the footer over a %s", (_surface, anyModalOpen, overlayOpen) => {
     const flags = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: true,
-      overlayOpen: false,
-      isIOS: true,
+      isMobile: true, keyboardFocusPending: false, keyboardOpen: true, navigationViewportActive: true, anyModalOpen, overlayOpen,
     });
 
-    expect(flags.footerHidden).toBe(false);
-    expect(flags.footerKeyboardOpen).toBe(true);
-    expect(flags.navKeyboardOpen).toBe(true);
+    expect(flags).toEqual({ footerHidden: false, navKeyboardOpen: true, footerKeyboardOpen: true });
   });
 
-  it("returns all false when keyboard is closed", () => {
-    const flags = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: false,
-      anyModalOpen: false,
-      overlayOpen: false,
-      isIOS: true,
-    });
-
-    expect(flags).toEqual({
-      footerHidden: false,
-      navKeyboardOpen: false,
-      footerKeyboardOpen: false,
-    });
+  it("keeps only navigation placed while the visual viewport finishes closing", () => {
+    expect(computeMobileBarKeyboardFlags({
+      isMobile: true, keyboardFocusPending: false, keyboardOpen: false, navigationViewportActive: true, anyModalOpen: false, overlayOpen: false,
+    })).toEqual({ footerHidden: false, navKeyboardOpen: true, footerKeyboardOpen: false });
   });
 
-  it("returns all false when not mobile", () => {
-    const flags = computeMobileBarKeyboardFlags({
-      isMobile: false,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: false,
-      isIOS: true,
-    });
-
-    expect(flags).toEqual({
-      footerHidden: false,
-      navKeyboardOpen: false,
-      footerKeyboardOpen: false,
-    });
+  it("returns all false when the mobile keyboard and navigation viewport are closed", () => {
+    expect(computeMobileBarKeyboardFlags({
+      isMobile: true, keyboardFocusPending: false, keyboardOpen: false, navigationViewportActive: false, anyModalOpen: false, overlayOpen: false,
+    })).toEqual({ footerHidden: false, navKeyboardOpen: false, footerKeyboardOpen: false });
   });
 
-  it("keeps the board footer visible on iOS when a fullscreen overlay owns the keyboard", () => {
-    const flags = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: true,
-      isIOS: true,
-    });
-
-    expect(flags.footerHidden).toBe(false);
-    expect(flags.navKeyboardOpen).toBe(true);
-    expect(flags.footerKeyboardOpen).toBe(true);
-  });
-
-  it("keeps Android board-layout behavior unchanged when a fullscreen overlay owns the keyboard", () => {
-    const flags = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: true,
-      isIOS: false,
-    });
-
-    expect(flags.footerHidden).toBe(false);
-    expect(flags.navKeyboardOpen).toBe(true);
-    expect(flags.footerKeyboardOpen).toBe(false);
-  });
-
-  it("suppresses the original iOS board-shift trigger only when the Quick Chat overlay flag is set", () => {
-    const originalBoardShiftTrigger = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: false,
-      isIOS: true,
-    });
-    const quickChatOverlayKeyboard = computeMobileBarKeyboardFlags({
-      isMobile: true,
-      keyboardOpen: true,
-      anyModalOpen: false,
-      overlayOpen: true,
-      isIOS: true,
-    });
-
-    expect(originalBoardShiftTrigger.footerHidden).toBe(true);
-    expect(quickChatOverlayKeyboard.footerHidden).toBe(false);
-    expect(quickChatOverlayKeyboard.navKeyboardOpen).toBe(true);
-    expect(quickChatOverlayKeyboard.footerKeyboardOpen).toBe(true);
+  it("returns all false outside the mobile viewport", () => {
+    expect(computeMobileBarKeyboardFlags({
+      isMobile: false, keyboardFocusPending: true, keyboardOpen: true, navigationViewportActive: true, anyModalOpen: true, overlayOpen: true,
+    })).toEqual({ footerHidden: false, navKeyboardOpen: false, footerKeyboardOpen: false });
   });
 });

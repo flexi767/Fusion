@@ -13,10 +13,16 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, ModelInfo, MemoryFileInfo, AgentCapability, PluginRuntimeInfo, SkillContent, AgentOnboardingSummary, AgentMailboxResponse, AgentPromptSizePoint } from "../api";
-import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, fetchSettings, fetchSettingsByScope, upgradeAgentHeartbeatProcedure, fetchSkillContent, uploadAgentAvatar, deleteAgentAvatar, fetchAgentMailbox, markMessageRead, fetchAgentPromptSizes } from "../api";
-import type { Agent } from "../api";
-import type { AgentLogEntry, Task, Message, ParticipantType, AgentPermissionPolicy, AgentPermissionPolicyRules, AgentPermission, ThinkingLevel } from "@fusion/core";
-import { AGENT_PERMISSIONS, getErrorMessage, isEphemeralAgent } from "@fusion/core";
+import { fetchAgent, updateAgent, updateAgentState, deleteAgent, isAgentHeartbeatEnabled, withAgentHeartbeatEnabled, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, fetchAgentMemoryConsolidations, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, fetchSettings, fetchSettingsByScope, upgradeAgentHeartbeatProcedure, fetchSkillContent, uploadAgentAvatar, deleteAgentAvatar, fetchAgentMailbox, markMessageRead, fetchAgentPromptSizes } from "../api";
+import type { Agent, MemoryConsolidationEvent } from "../api";
+import type { AgentLogEntry, Task, Message, ParticipantType, AgentPermissionPolicy, AgentPermissionPolicyRules, AgentPermission, ThinkingLevel, Settings as CoreSettings } from "@fusion/core";
+import {
+  AGENT_PERMISSIONS,
+  getErrorMessage,
+  isEphemeralAgent,
+  resolvePermanentAgentEffectiveModel,
+  resolvePermanentAgentEffectiveThinkingLevel,
+} from "@fusion/core";
 import { AgentLogViewer } from "./AgentLogViewer";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { AgentReflectionsTab } from "./AgentReflectionsTab";
@@ -24,11 +30,17 @@ import { getAgentHealthStatus } from "../utils/agentHealth";
 import type { AgentHealthStatus } from "../utils/agentHealth";
 import { SkillMultiselect } from "./SkillMultiselect";
 import { subscribeSse } from "../sse-bus";
+import { MAX_LOG_ENTRIES } from "../hooks/useAgentLogs";
+import { countLeadingGapMarkers, reconcileReconnectedEntries } from "../hooks/logStreamReconcile";
 import { DEFAULT_HEARTBEAT_INTERVAL_MS, formatHeartbeatInterval, resolveHeartbeatIntervalMs } from "../utils/heartbeatIntervals";
-import { formatAgentSkillBadgeLabel } from "../utils/agentSkills";
+import { classifyAgentSkill, formatAgentSkillBadgeLabel } from "../utils/agentSkills";
+import { useDiscoveredSkillsCache } from "../hooks/useDiscoveredSkillsCache";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { useConfirm } from "../hooks/useConfirm";
-import { useModalResizePersist } from "../hooks/useModalResizePersist";
+import { FloatingWindow } from "./FloatingWindow";
+import { ModalCloseButton } from "./ModalCloseButton";
+import { ViewHeader } from "./ViewHeader";
+import { ViewLayout } from "./ViewLayout";
 import { AgentAvatar } from "./AgentAvatar";
 import { FileEditor } from "./FileEditor";
 import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
@@ -55,7 +67,7 @@ const AGENT_ROLE_DEFAULT_PERMISSION_MAP: Record<AgentCapability, AgentPermission
   executor: ["tasks:execute", "agents:view", "messages:read", "messages:send"],
   reviewer: ["tasks:review", "agents:view", "messages:read", "messages:send"],
   merger: ["tasks:merge", "agents:view", "messages:read"],
-  scheduler: ["tasks:assign", "tasks:create", "tasks:archive", "agents:view", "automations:manage", "missions:manage", "messages:read"],
+  scheduler: ["tasks:assign", "tasks:create", "agents:view", "automations:manage", "missions:manage", "messages:read"],
   engineer: ["tasks:execute", "tasks:review", "agents:view", "messages:read", "messages:send"],
   custom: [],
 };
@@ -105,6 +117,8 @@ interface AgentDetailViewProps {
   initialRunId?: string | null;
   preferActiveRun?: boolean;
   onMutationSuccess?: (context: { agentId: string; deleted?: boolean }) => void | Promise<void>;
+  /** Distinguishes the task-detail nested modal from the AgentsView window geometry. */
+  floatingWindowKey?: string;
 }
 
 type TabId = "dashboard" | "logs" | "mail" | "config" | "runs" | "tasks" | "employees" | "soul" | "instructions" | "memory" | "reflections";
@@ -141,6 +155,84 @@ const RUN_STATUS_ICONS: Record<string, { icon: typeof CheckCircle; color: string
 const DEFAULT_HEARTBEAT_INTERVAL_LABEL = formatHeartbeatInterval(DEFAULT_HEARTBEAT_INTERVAL_MS);
 const CONFIG_AUTOSAVE_DEBOUNCE_MS = 700;
 
+/*
+FNXC:AgentLogHistory 2026-07-26-13:05:
+CORRECTION to FNXC:MobileTabRetention 2026-07-26-10:34/10:35/10:38/10:40, which claimed that passing a
+fetched run log through `capLogEntries` was the way to keep a backgrounded mobile tab from being
+discarded. That reasoning was wrong and must not be reintroduced: `fetchAgentRunLogs` returns a run's
+ENTIRE log array unpaginated and accepts no offset, and this view has no loadMore/offset path, so
+capping the FETCHED array destroyed data the client already held — for a 1500-entry run the operator
+permanently lost entries 0..999, including the run's opening prompt and first tool calls, with no UI
+path back to them.
+
+The memory goal is served by not RENDERING 1500 rows, not by destroying them. So: the fetched array is
+kept whole in state, and the RENDER is windowed to the newest LOG_WINDOW_INITIAL entries with a
+"Load older" affordance that walks back to entry 0. This reuses the board's manual paging pattern
+(Column.tsx VISIBLE_TASKS_INCREMENT / ListView.tsx LIST_SECTION_VISIBLE_*) rather than adding a
+virtualization dependency — see AGENTS.md "Reuse Components ... (No Drift)".
+
+Log tails read bottom-up, so the window is anchored to the END of the array (newest visible by
+default) and grows backwards, the mirror image of the board's top-anchored window.
+*/
+
+/*
+FNXC:AgentLogResync 2026-07-26-18:02:
+Page size for the task-log fetch (matches `useAgentLogs`'s INITIAL_LOAD_LIMIT) and the hard ceiling on a
+reconnect refetch. The ceiling exists only to bound one request; it is not a retention cap, and it must
+never be applied to an array already held in state — see the correction on LOG_WINDOW_INITIAL.
+*/
+const AGENT_LOG_PAGE_LIMIT = 100;
+const AGENT_LOG_RESYNC_MAX_LIMIT = 1000;
+
+/**
+ * FNXC:AgentLogHistory 2026-07-26-13:08:
+ * Live SSE append with a SOFT ceiling, identical in intent to `useAgentLogs`'s tail: the buffer is
+ * held at `max(MAX_LOG_ENTRIES, prev.length)` so an hour-long stream cannot grow without bound, while
+ * a deliberately larger buffer (a 1500-entry fetched run) is NOT collapsed back to the cap on the
+ * first streamed line. Unlike the previous `capLogEntries([...prev, entry])` this never shrinks an
+ * array the user can still page through.
+ */
+function appendLiveLogEntry<T>(previous: T[], entry: T): T[] {
+  const limit = Math.max(MAX_LOG_ENTRIES, previous.length);
+  if (previous.length + 1 <= limit) return [...previous, entry];
+  return [...previous.slice(previous.length + 1 - limit), entry];
+}
+
+/*
+FNXC:AgentRunLogs 2026-08-29-05:06:
+FN-253 opts run-log hosts into the missing-detail explanation only for rows that can be persisted
+`tool` or `tool_result` evidence. The excerpt fallback emits only text and tool_error rows, so this
+keeps it from naming a settings path for synthesized output while historical real rows stay explained.
+*/
+function hasPersistedRunToolRows(entries: AgentLogEntry[]): boolean {
+  return entries.some((entry) => entry.type === "tool" || entry.type === "tool_result");
+}
+
+/**
+ * FNXC:AgentLogHistory 2026-07-26-13:10:
+ * Renders a bounded window over a complete log array plus the shared "Load older" button. Both agent
+ * log surfaces (Logs tab, expanded run in the Runs tab) use this one component so the two cannot
+ * drift — the reported defect only named the run stream, but the same discard existed on both.
+ * `resetKey` (task id / run id) collapses the window back to one screenful when the underlying
+ * stream is replaced; appends to the same stream must NOT reset it, or paging back would be undone
+ * by the next streamed line.
+ */
+function WindowedAgentLogViewer({
+  entries,
+  resetKey,
+  testId,
+  showMissingDetailHint = false,
+}: {
+  entries: AgentLogEntry[];
+  resetKey: string;
+  testId: string;
+  showMissingDetailHint?: boolean;
+}) {
+  void resetKey;
+  void testId;
+  return <AgentLogViewer entries={entries} loading={false} showMissingDetailHint={showMissingDetailHint} />;
+}
+
 function pickDefaultAgentMemoryPath(files: MemoryFileInfo[], currentPath: string): string {
   if (files.some((file) => file.path === currentPath)) {
     return currentPath;
@@ -151,10 +243,11 @@ function pickDefaultAgentMemoryPath(files: MemoryFileInfo[], currentPath: string
     ?? "";
 }
 
-export function AgentDetailView({ agentId, projectId, onClose, addToast, onChildClick, inline = false, showInlineBackButton = false, initialTab, initialRunId, preferActiveRun = false, onMutationSuccess }: AgentDetailViewProps) {
+export function AgentDetailView({ agentId, projectId, onClose, addToast, onChildClick, inline = false, showInlineBackButton = false, initialTab, initialRunId, preferActiveRun = false, onMutationSuccess, floatingWindowKey = "agent-detail" }: AgentDetailViewProps) {
   const { t } = useTranslation("app");
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [heartbeatMultiplier, setHeartbeatMultiplier] = useState(1);
+  const [agentModelSettings, setAgentModelSettings] = useState<Partial<CoreSettings>>({});
   const { confirm } = useConfirm();
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -172,15 +265,23 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
   const [agentMailbox, setAgentMailbox] = useState<AgentMailboxResponse | null>(null);
   const [isLoadingMailbox, setIsLoadingMailbox] = useState(false);
   const [mailboxError, setMailboxError] = useState<string | null>(null);
-  const agentDetailModalRef = useRef<HTMLDivElement>(null);
   const bulkMenuRef = useRef<HTMLDivElement | null>(null);
   const overlayMouseDownRef = useRef(false);
-  useModalResizePersist(agentDetailModalRef, !inline, "fusion:agent-detail-modal-size");
   const onCloseRef = useRef(onClose);
   const addToastRef = useRef(addToast);
   const agentRef = useRef<AgentDetail | null>(null);
   const hasConfigChangesRef = useRef(false);
   const loadedLatestRunLogsRef = useRef<string | null>(null);
+  /*
+  FNXC:AgentLogResync 2026-07-26-18:10:
+  `logs` mirrored into a ref plus an identifier for the stream that filled it. `loadLogs` needs the
+  current buffer length (to size the resync page) and its provenance (to decide merge-vs-replace), but
+  reading either from state would put them in `loadLogs`'s dependency list, and `loadLogs` is a
+  dependency of the Logs-tab effect — every streamed line would then refetch the log page.
+  */
+  const logsRef = useRef<AgentLogEntry[]>([]);
+  logsRef.current = logs;
+  const logsSourceRef = useRef<string | null>(null);
 
   // Track the context version to detect stale events after project/agent switches.
   // Incremented whenever agentId or projectId changes, invalidating any in-flight SSE handlers.
@@ -196,7 +297,10 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     let cancelled = false;
     void fetchSettings(projectId)
       .then((settings) => {
-        if (!cancelled) setHeartbeatMultiplier(settings.heartbeatMultiplier ?? 1);
+        if (!cancelled) {
+          setHeartbeatMultiplier(settings.heartbeatMultiplier ?? 1);
+          setAgentModelSettings(settings);
+        }
       })
       .catch(() => {
         if (!cancelled) setHeartbeatMultiplier(1);
@@ -223,7 +327,14 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     }
   }, [agentId, projectId]);
 
-  const loadLogs = useCallback(async () => {
+  /*
+  FNXC:AgentLogSuspendRecovery 2026-07-26-13:22:
+  `force` bypasses the `loadedLatestRunLogsRef` "already loaded this run" short-circuit. Tab switches
+  keep that memo (it exists to avoid refetching a run the view already holds), but an SSE reconnect
+  after a suspend gap MUST refetch even for the same run id — the memo would otherwise make the heal
+  a no-op and the missed lines would never arrive.
+  */
+  const loadLogs = useCallback(async (options?: { force?: boolean }) => {
     // Capture context version at callback creation - stale responses will be rejected
     const contextVersionAtCapture = contextVersionRef.current;
     const currentAgentId = agentId;
@@ -236,11 +347,44 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
 
     try {
       if (agent?.taskId) {
+        const currentTaskId = agent.taskId;
         setLatestRun(null);
         loadedLatestRunLogsRef.current = null;
-        const result = await fetchAgentLogsWithMeta(agent.taskId, currentProjectId, { limit: 100 });
+        /*
+        FNXC:AgentLogResync 2026-07-26-18:05:
+        Task-log refetch. This path is BOTH the initial load and the SSE-reconnect heal, and it used to
+        `setLogs(result.entries)` — a wholesale replace with a 100-entry page. After a hidden-tab suspend
+        an agent that had streamed 480 lines into the buffer was silently cut to the newest 100: this view
+        has no server-paging path (WindowedAgentLogViewer pages only over the array already in memory), so
+        `hiddenCount` became 0, the "Load older" affordance disappeared, and a truncated log was presented
+        as complete. Both halves of the fix are required:
+          1. request AT LEAST as many entries as the buffer already holds, so the fetched page provably
+             overlaps the buffer and the splice loses nothing;
+          2. merge through the SHARED `reconcileReconnectedEntries` rather than replacing, so an
+             unprovable splice renders a visible gap marker instead of implied continuity.
+        The request is clamped at AGENT_LOG_RESYNC_MAX_LIMIT so a very large buffer cannot turn one
+        reconnect into an unbounded query; past that ceiling the reconcile's gap marker is the honest
+        outcome.
+
+        The limit is `max(PAGE, heldRealCount)` and deliberately NOT `heldRealCount + PAGE`: the reconcile
+        splices when the fetched page STARTS INSIDE the buffer, so a page reaching further back than the
+        buffer's first entry has no overlap and would stamp a gap marker on a buffer that in fact lost
+        nothing — a false "entries are missing" claim.
+
+        `logsSourceRef` gates the merge on the buffer belonging to this same task stream. The Logs tab also
+        fills `logs` from the latest-RUN fallback, and reconciling a task page against a run buffer would
+        likewise fabricate a gap marker between two unrelated streams; a source change is a plain replace.
+        */
+        const sameSource = logsSourceRef.current === `task:${currentTaskId}`;
+        const heldEntries = sameSource ? logsRef.current : [];
+        const heldRealCount = heldEntries.length - countLeadingGapMarkers(heldEntries);
+        const limit = Math.min(AGENT_LOG_RESYNC_MAX_LIMIT, Math.max(AGENT_LOG_PAGE_LIMIT, heldRealCount));
+        const result = await fetchAgentLogsWithMeta(currentTaskId, currentProjectId, { limit });
         if (isStale()) return;
-        setLogs(result.entries);
+        setLogs((prev) =>
+          reconcileReconnectedEntries(sameSource ? prev : [], result.entries, [], currentTaskId).entries,
+        );
+        logsSourceRef.current = `task:${currentTaskId}`;
         return;
       }
 
@@ -252,21 +396,37 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
       setLatestRun(latest);
       if (!latest) {
         loadedLatestRunLogsRef.current = null;
+        logsSourceRef.current = null;
         setLogs([]);
         return;
       }
-      if (loadedLatestRunLogsRef.current === latest.id) {
+      if (!options?.force && loadedLatestRunLogsRef.current === latest.id) {
         return;
       }
       const entries = await fetchAgentRunLogs(currentAgentId, latest.id, currentProjectId);
       if (isStale()) return;
+      // FNXC:AgentLogHistory 2026-07-26-13:12: the fetched run is stored WHOLE — the render is windowed
+      // by WindowedAgentLogViewer instead. Capping here destroyed the run's opening entries outright
+      // (see the correction note on LOG_WINDOW_INITIAL).
       setLogs(entries);
+      logsSourceRef.current = `run:${latest.id}`;
       loadedLatestRunLogsRef.current = latest.id;
     } catch (err) {
       if (isStale()) return;
       console.error("Failed to load agent logs:", err);
     }
   }, [agent?.taskId, agentId, projectId]);
+
+  /*
+  FNXC:AgentLogSuspendRecovery 2026-07-26-13:20:
+  SSE channels are now suspended after ~60s hidden (mobile tab-retention work), so every reopen is a
+  potential gap: lines emitted while suspended were never delivered and a tail that only appends can
+  never learn about them. Each log subscription therefore refetches authoritative state in
+  `onReconnect`. Held in a ref so the refetch does not become an effect dependency — that would tear
+  down and re-open the very subscription it is meant to heal on every render.
+  */
+  const loadLogsRef = useRef(loadLogs);
+  loadLogsRef.current = loadLogs;
 
   const loadMailbox = useCallback(async () => {
     setIsLoadingMailbox(true);
@@ -401,7 +561,14 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
             if (contextVersionRef.current !== contextVersionAtStart) return;
             try {
               const entry: AgentLogEntry = JSON.parse(e.data);
-              setLogs(prev => [...prev, entry]);
+              /*
+              FNXC:AgentLogHistory 2026-07-26-13:24:
+              Latest-run log tail. Soft-bounded (see appendLiveLogEntry): still bounded so a long
+              stream cannot grow the resident set until a backgrounded mobile tab is discarded, but
+              no longer collapses a larger fetched run back to the cap and destroys its opening
+              entries — replacing the previous `capLogEntries([...prev, entry])`.
+              */
+              setLogs(prev => appendLiveLogEntry(prev, entry));
             } catch {
               // ignore malformed events
             }
@@ -411,6 +578,13 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
           if (contextVersionRef.current === contextVersionAtStart) {
             setIsStreaming(true);
           }
+        },
+        onReconnect: () => {
+          // FNXC:AgentLogSuspendRecovery 2026-07-26-13:26: heal the suspend gap by refetching the
+          // run's authoritative log array rather than resuming a tail that silently skipped lines.
+          if (contextVersionRef.current !== contextVersionAtStart) return;
+          setIsStreaming(true);
+          void loadLogsRef.current({ force: true });
         },
         onError: () => {
           if (contextVersionRef.current === contextVersionAtStart) {
@@ -442,6 +616,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
       setAgentMailbox(null);
       setMailboxError(null);
       loadedLatestRunLogsRef.current = null;
+      logsSourceRef.current = null;
       hasConfigChangesRef.current = false;
     }
   }, [agentId, projectId]);
@@ -483,6 +658,26 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
         "approval:updated": refreshAgentForApprovalEvent,
         "approval:decided": refreshAgentForApprovalEvent,
       },
+      /*
+      FNXC:AgentDetailResync 2026-07-26-18:18:
+      This subscription drives the WHOLE detail header (state badge, health, error indicator) and the
+      approval indicator purely from events — nothing else refetches on demand. `/api/events` replays
+      nothing on open and the bus tears the socket down after SSE_HIDDEN_SUSPEND_DELAY_MS hidden, so
+      every `agent:updated`/`approval:*` emitted during the suspend window is gone. Without this
+      handler an agent that went to `error` and raised an approval kept rendering as its pre-suspend
+      self on return. Not forever — the 30s `loadAgent` poll above eventually corrects it (do not
+      re-file this as a permanent stale view) — but that timer does not run through a frozen/suspended
+      tab, so the operator can stare at a confidently wrong header for up to a further 30s after
+      resume. Refetch authoritative agent state at the reopen instead.
+
+      The three log subscriptions in this file each got `onReconnect` when the suspend landed and this
+      one was missed; every subscribeSse here now declares one.
+      */
+      onReconnect: () => {
+        if (contextVersionRef.current !== contextVersionAtStart) return;
+        if (hasConfigChangesRef.current) return;
+        void loadAgent();
+      },
     });
   }, [agentId, projectId, loadAgent]);
 
@@ -506,7 +701,9 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
             if (contextVersionRef.current !== contextVersionAtStart) return;
             try {
               const entry: AgentLogEntry = JSON.parse(e.data);
-              setLogs(prev => [...prev, entry]);
+              // FNXC:AgentLogHistory 2026-07-26-13:28: Current-task log tail — same soft-bounded ring
+              // as the latest-run tail above (see appendLiveLogEntry).
+              setLogs(prev => appendLiveLogEntry(prev, entry));
             } catch {
               // Ignore parse errors
             }
@@ -516,6 +713,13 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
           if (contextVersionRef.current === contextVersionAtStart) {
             setIsStreaming(true);
           }
+        },
+        onReconnect: () => {
+          // FNXC:AgentLogSuspendRecovery 2026-07-26-13:29: a reopen after the hidden-tab suspend
+          // window means lines were missed; refetch the task's authoritative log page.
+          if (contextVersionRef.current !== contextVersionAtStart) return;
+          setIsStreaming(true);
+          void loadLogsRef.current({ force: true });
         },
         onError: () => {
           if (contextVersionRef.current === contextVersionAtStart) {
@@ -688,23 +892,45 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     }
 
     return (
-      <div
-        className="agent-detail-overlay"
-        onMouseDown={(e) => { if (e.target === e.currentTarget) overlayMouseDownRef.current = true; }}
-        onMouseUp={(e) => {
-          if (overlayMouseDownRef.current && e.target === e.currentTarget) onClose();
-          overlayMouseDownRef.current = false;
+      <FloatingWindow
+        windowKey={floatingWindowKey}
+        title={t("agents.loading", "Loading agent...")}
+        ariaLabel={t("agents.detailLoadingLabel", "Agent detail loading")}
+        onClose={onClose}
+        modal
+        hideHeader
+        dragHandleSelector=".agent-detail-header"
+        className="floating-window--agent-detail"
+        defaultSize={{ width: 608, height: 640 }}
+        minSize={{ width: 400, height: 320 }}
+        /*
+        FNXC:ModalTouchGeometry 2026-07-26-19:05:
+        Legacy Agent Detail stored only size, while FloatingWindow requires size plus position.
+        Use a new key for a deliberate one-time geometry reset rather than restoring an ambiguous partial payload.
+        */
+        persistGeometryKey={`floating-window:${floatingWindowKey}`}
+        suspendGeometryPersistenceOnMobile
+        suspendGeometryPersistenceOnShortViewport
+        /*
+        FNXC:ModalTouchGeometry 2026-07-26-19:05:
+        Agent Detail's historical dismiss guard is paired mouse-down/mouse-up on the backdrop.
+        Do not use closeOnOutsidePointerDown: it would dismiss earlier and include touch gestures.
+        */
+        backdropMouseHandlers={{
+          onMouseDown: (e) => { if (e.target === e.currentTarget) overlayMouseDownRef.current = true; },
+          onMouseUp: (e) => {
+            if (overlayMouseDownRef.current && e.target === e.currentTarget) onClose();
+            overlayMouseDownRef.current = false;
+          },
         }}
-        role="dialog"
-        aria-modal="true"
       >
-        <div className="agent-detail-modal" ref={agentDetailModalRef}>
+        <div className="agent-detail-modal">
           <div className="agent-detail-loading">
             <Loader2 className="animate-spin" size={24} />
             <span>{t("agents.loading", "Loading agent...")}</span>
           </div>
         </div>
-      </div>
+      </FloatingWindow>
     );
   }
 
@@ -714,39 +940,32 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
 
   const stateStyle = STATE_COLORS[agent.state];
   const health = getHealthStatus();
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-19:05:
+  Inline Agent Detail is the supported embedded presentation exception. It fills its owner and
+  deliberately bypasses FloatingWindow chrome, persistence, and drag/resize affordances.
+  */
+// FNXC:ModalTouchGeometry 2026-07-26-19:46: Nested Task Detail Agent Detail uses a distinct FloatingWindow identity, so its live dialog title id must also stay unique when both surfaces are open.
+  const agentDetailTitleId = `${floatingWindowKey}-modal-title`;
   const detailShellClassName = inline ? "agent-detail-inline" : "agent-detail-modal";
   const isPauseAllDisabled = isBulkEligibilityLoading || bulkPauseEligibleCount === 0;
   const isResumeAllDisabled = isBulkEligibilityLoading || bulkResumeEligibleCount === 0;
 
-  return (
-    <div
-      className={inline ? "agent-detail-inline-shell" : "agent-detail-overlay"}
-      onClick={(e) => !inline && e.target === e.currentTarget && onClose()}
-      role={inline ? "region" : "dialog"}
-      aria-label={inline ? "Agent detail" : undefined}
-      aria-modal={inline ? undefined : "true"}
-    >
-      <div className={detailShellClassName} ref={agentDetailModalRef}>
-        {/* Header */}
-        <div className="agent-detail-header">
-          {/* Identity area: icon + name + badges */}
-          <div className="agent-detail-identity">
-            {inline && showInlineBackButton ? (
-              <button
-                type="button"
-                className="btn agent-detail-inline-back"
-                onClick={onClose}
-                aria-label={t("agents.backToAgents", "Back to agents")}
-              >
-                <ChevronLeft size={16} />
-                {t("agents.agentsLabel", "Agents")}
-              </button>
-            ) : null}
+  const detailContent = (
+      <ViewLayout className={detailShellClassName} contentOwnsScroll header={<>
+        {/*
+        FNXC:StandardizedAgentDetail 2026-09-13-16:55:
+        Agent detail uses the shared title owner in inline and floating hosts. Embedded list-to-detail navigation is the canonical ChevronLeft before identity, never a second row inside detail content.
+        */}
+        <ViewHeader
+          className="agent-detail-header"
+          backAction={inline && showInlineBackButton ? { label: t("agents.backToAgents", "Back to agents"), onClick: onClose } : undefined}
+          title={<div className="agent-detail-identity">
             <div className="agent-detail-icon">
               <AgentAvatar agent={agent} size={36} />
             </div>
             <div className="agent-detail-info">
-              <h2>{agent.name}</h2>
+              <h2 id={agentDetailTitleId}>{agent.name}</h2>
               <div className="agent-detail-badges">
                 <span 
                   className="badge"
@@ -760,9 +979,8 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
                 </span>
               </div>
             </div>
-          </div>
-
-          <div className="agent-detail-header-actions">
+          </div>}
+          actions={<div className="agent-detail-header-actions">
             {/* Lifecycle controls: compact action buttons */}
             <div className="agent-detail-controls">
               {/* State-dependent action buttons */}
@@ -906,13 +1124,13 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
                 <RefreshCw size={16} />
               </button>
               {!inline && (
-                <button className="btn-icon" onClick={onClose} aria-label={t("common.close", "Close")} title={t("common.close", "Close")}>
-                  <X size={20} />
-                </button>
+                <ModalCloseButton onClick={onClose} aria-label={t("common.close", "Close")} title={t("common.close", "Close")} />
               )}
             </div>
-          </div>
-        </div>
+          </div>}
+        />
+      </>}
+      >
 
         {/* Tabs */}
         <div className="agent-detail-tabs">
@@ -951,15 +1169,24 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               health={health}
               onChildClick={onChildClick}
               projectId={projectId}
+              agentModelSettings={agentModelSettings}
             />
           )}
           
           {activeTab === "logs" && (
+            /*
+            FNXC:AgentLogHistory 2026-07-26-13:34: `windowResetKey` collapses the render window back
+            to one screenful only when the underlying log stream is REPLACED (different task, or a
+            different latest run), never on an append — otherwise a streamed line would undo the
+            operator's paging back through history.
+            */
             <LogsTab
               logs={logs}
               isStreaming={isStreaming}
               hasTask={!!agent.taskId || logs.length > 0 || latestRun !== null}
               fallbackLabel={!agent.taskId && latestRun ? t("agents.latestRunLabel", "Latest run · {{id}}", { id: latestRun.id.slice(0, 8) }) : null}
+              windowResetKey={agent.taskId ?? latestRun?.id ?? "none"}
+              showMissingDetailHint={!agent.taskId && hasPersistedRunToolRows(logs)}
             />
           )}
 
@@ -1045,6 +1272,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               key={agent.id}
               agent={agent}
               projectId={projectId}
+              agentModelSettings={agentModelSettings}
               addToast={addToast}
               onSaved={handleSavedMutation}
               onHasChangesChange={handleConfigChangesState}
@@ -1077,8 +1305,40 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
             )}
           </div>
         )}
-      </div>
-    </div>
+      </ViewLayout>
+  );
+
+  if (inline) {
+    return <div className="agent-detail-inline-shell" role="region" aria-label={t("agents.detailLabel", "Agent detail")}>{detailContent}</div>;
+  }
+
+  return (
+    <FloatingWindow
+      windowKey={floatingWindowKey}
+      title={agent.name}
+      ariaLabelledBy={agentDetailTitleId}
+      onClose={onClose}
+      modal
+      hideHeader
+      dragHandleSelector=".agent-detail-header"
+      className="floating-window--agent-detail"
+      defaultSize={{ width: 608, height: 640 }}
+      minSize={{ width: 400, height: 320 }}
+      /* FNXC:ModalTouchGeometry 2026-07-26-19:05: The legacy size-only key is deliberately replaced by FloatingWindow geometry, causing one intentional reset per user. */
+      persistGeometryKey={`floating-window:${floatingWindowKey}`}
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+      /* FNXC:ModalTouchGeometry 2026-07-26-19:05: Preserve Agent Detail's unconditional paired mouse-only dismissal instead of broader pointer-down/touch dismissal. */
+      backdropMouseHandlers={{
+        onMouseDown: (e) => { if (e.target === e.currentTarget) overlayMouseDownRef.current = true; },
+        onMouseUp: (e) => {
+          if (overlayMouseDownRef.current && e.target === e.currentTarget) onClose();
+          overlayMouseDownRef.current = false;
+        },
+      }}
+    >
+      {detailContent}
+    </FloatingWindow>
   );
 }
 
@@ -1089,13 +1349,16 @@ function DashboardTab({
   health,
   onChildClick,
   projectId,
+  agentModelSettings,
 }: {
   agent: AgentDetail;
   health: AgentHealthStatus;
   onChildClick?: (childId: string) => void;
   projectId?: string;
+  agentModelSettings: Partial<CoreSettings>;
 }) {
   const { t } = useTranslation("app");
+  const { skills: discoveredSkills, loading: discoveredSkillsLoading, error: discoveredSkillsError } = useDiscoveredSkillsCache(projectId);
   const stateStyle = STATE_COLORS[agent.state];
   const [chainOfCommand, setChainOfCommand] = useState<Agent[]>([]);
   const [isLoadingChainOfCommand, setIsLoadingChainOfCommand] = useState(true);
@@ -1123,7 +1386,8 @@ function DashboardTab({
       const slashIdx = rc.model.indexOf("/");
       return rc.model.slice(slashIdx + 1);
     }
-    return null;
+    const effective = resolvePermanentAgentEffectiveModel(agent, agentModelSettings);
+    return effective.provider && effective.modelId ? `${effective.provider}/${effective.modelId}` : null;
   })();
 
   // Fetch budget status on mount
@@ -1193,6 +1457,7 @@ function DashboardTab({
   const recentRuns = (agent.completedRuns || []).slice(0, 5);
   const agentSkills = Array.isArray(agent.metadata?.skills) ? (agent.metadata.skills as string[]) : [];
   const selectedSkillLabel = selectedSkillId ? formatAgentSkillBadgeLabel(selectedSkillId) : null;
+  const selectedSkillClassification = selectedSkillId ? classifyAgentSkill(selectedSkillId, discoveredSkillsLoading || discoveredSkillsError ? null : discoveredSkills, { forced: true }) : null;
   const loadSkillContent = useCallback(async (skillId: string) => {
     setIsLoadingSkillContent(true);
     setSkillContentError(null);
@@ -1218,8 +1483,15 @@ function DashboardTab({
     }
 
     setSelectedSkillId(skillId);
-    void loadSkillContent(skillId);
-  }, [loadSkillContent, selectedSkillId]);
+    const classification = classifyAgentSkill(
+      skillId,
+      discoveredSkillsLoading || discoveredSkillsError ? null : discoveredSkills,
+      { forced: true },
+    );
+    if (classification.state !== "unknown") {
+      void loadSkillContent(skillId);
+    }
+  }, [discoveredSkills, discoveredSkillsError, discoveredSkillsLoading, loadSkillContent, selectedSkillId]);
 
   const isTicking = agent.state === "active" || agent.state === "running";
   const heartbeatIntervalMs = resolveHeartbeatIntervalMs(agent.runtimeConfig?.heartbeatIntervalMs);
@@ -1251,7 +1523,7 @@ function DashboardTab({
               {t("agents.pendingApprovalsCount", "{{count}} pending approvals", { count: agent.pendingApprovalCount })}
             </span>
           ) : null}
-          <span>{t("agents.roleLabel", "Role: {{role}}", { role: agent.role })}</span>
+          <span>{t("agents.roleLabel", "Roles: {{role}}", { role: (agent.roles ?? [agent.role]).join(", ") })}</span>
           <span>
             <span className="dashboard-summary-label">{runtimeHint ? t("agents.runtime", "Runtime") : t("agents.model", "Model")}</span>
             <span> {modelDisplay ?? t("agents.auto", "Auto")}</span>
@@ -1262,30 +1534,39 @@ function DashboardTab({
               <span className="dashboard-summary-skill-badges" role="list" aria-label={t("agents.assignedSkills", "Assigned skills")}>
                 {agentSkills.map((skillId) => {
                   const isSelected = selectedSkillId === skillId;
+                  const classification = classifyAgentSkill(skillId, discoveredSkillsLoading || discoveredSkillsError ? null : discoveredSkills, { forced: true });
+                  /*
+                   * FNXC:AgentSkills 2026-08-16-06:34:
+                   * Preserve the exact persisted agent.metadata.skills ID in the tooltip so operators can diagnose stale or undiscovered entries. Only the visible badge label is humanized by formatAgentSkillBadgeLabel.
+                   */
                   return (
                     <button
                       key={skillId}
                       type="button"
                       className={cn("badge", "badge-skill", "dashboard-summary-skill-badge", "dashboard-summary-skill-badge-btn", isSelected && "dashboard-summary-skill-badge--selected")}
-                      title={skillId}
+                      title={`${skillId}: ${t(classification.titleKey, classification.defaultTitle)}`}
+                      data-skill-state={classification.state}
                       onClick={() => handleSkillBadgeClick(skillId)}
                       aria-expanded={isSelected}
                       aria-label={t("agents.viewSkillDetails", "View details for {{skill}}", { skill: formatAgentSkillBadgeLabel(skillId) })}
                     >
-                      {formatAgentSkillBadgeLabel(skillId)}
+                      {formatAgentSkillBadgeLabel(skillId)} <span className="skill-state-marker">{t(classification.labelKey, classification.defaultLabel)}</span> <span className="skill-state-marker skill-state-marker--forced">{t("skills.forced", "Forced")}</span>
                     </button>
                   );
                 })}
               </span>
             </span>
           ) : (
-            <span>{t("agents.skillsNone", "Skills: —")}</span>
+            <span className="dashboard-summary-skills" data-testid="agent-skills-empty">
+              <span className="dashboard-summary-label">{t("agents.skills", "Skills")}</span>
+              <span>{t("agents.skillsNone", "None")}</span>
+            </span>
           )}
         </div>
         {selectedSkillId ? (
           <div className="dashboard-summary-skill-detail" data-testid="agent-skill-detail">
             <div className="dashboard-summary-skill-detail-header">
-              <span className="dashboard-summary-skill-detail-title">{selectedSkillLabel}</span>
+              <span className="dashboard-summary-skill-detail-title" data-skill-state={selectedSkillClassification?.state}>{selectedSkillLabel} {selectedSkillClassification && <><span className="skill-state-marker">{t(selectedSkillClassification.labelKey, selectedSkillClassification.defaultLabel)}</span> <span className="skill-state-marker skill-state-marker--forced">{t("skills.forced", "Forced")}</span></>}</span>
               <button
                 type="button"
                 className="btn btn-sm"
@@ -1295,7 +1576,9 @@ function DashboardTab({
                 {t("common.close", "Close")}
               </button>
             </div>
-            {isLoadingSkillContent ? (
+            {selectedSkillClassification?.state === "unknown" ? (
+              <div className="dashboard-summary-skill-detail-empty" role="status">{t(selectedSkillClassification.titleKey, selectedSkillClassification.defaultTitle)}</div>
+            ) : isLoadingSkillContent ? (
               <div className="dashboard-summary-skill-detail-loading" role="status" aria-live="polite">
                 <Loader2 size={14} className="animate-spin" />
                 {t("agents.loadingSkillContent", "Loading skill content...")}
@@ -1416,11 +1699,15 @@ function LogsTab({
   isStreaming,
   hasTask,
   fallbackLabel,
+  windowResetKey,
+  showMissingDetailHint = false,
 }: {
   logs: AgentLogEntry[];
   isStreaming: boolean;
   hasTask: boolean;
   fallbackLabel?: string | null;
+  windowResetKey: string;
+  showMissingDetailHint?: boolean;
 }) {
   const { t } = useTranslation("app");
 
@@ -1442,6 +1729,15 @@ function LogsTab({
     <div className="logs-tab">
       <div className="logs-header">
         <span className="logs-count">{t("agents.logEntries", "{{count}} entries", { count: logs.length })}</span>
+        {/*
+        FNXC:AgentLogHistory 2026-07-26-13:32:
+        REMOVED the "Showing the most recent 500 entries" banner. It was false as written: it named a
+        cap that DESTROYED the older entries, so the operator was told about data that no longer
+        existed anywhere in the client and offered no way to get it back. Entries beyond the render
+        window are now still held, and the "Load older (N remaining)" button inside
+        WindowedAgentLogViewer is the single, actionable truncation signal — it states the remaining
+        count and reaches entry 0. Do not reintroduce a second, static banner beside it.
+        */}
         {fallbackLabel && (
           <span className="text-muted logs-fallback-label">{fallbackLabel}</span>
         )}
@@ -1461,7 +1757,12 @@ function LogsTab({
           </p>
         </div>
       ) : (
-        <AgentLogViewer entries={logs} loading={false} />
+        <WindowedAgentLogViewer
+          entries={logs}
+          resetKey={windowResetKey}
+          testId="agent-logs"
+          showMissingDetailHint={showMissingDetailHint}
+        />
       )}
     </div>
   );
@@ -1767,6 +2068,27 @@ function RunsTab({
   const hasAutoExpandedInitialRunRef = useRef(false);
   const didMountRunNowRefreshRef = useRef(false);
 
+  /*
+  FNXC:AgentLogSuspendRecovery 2026-07-26-13:38:
+  Authoritative refetch for the expanded run's logs, used by the run-log SSE `onReconnect` so a
+  suspend gap self-heals. Held in a ref (not a dependency) so re-creating it cannot tear down and
+  re-open the subscription it heals. Reads `selectedRunId` from a ref for the same reason.
+  */
+  const selectedRunIdRef = useRef<string | null>(null);
+  selectedRunIdRef.current = selectedRunId;
+  const refreshRunLogsRef = useRef<() => Promise<void>>(async () => {});
+  refreshRunLogsRef.current = async () => {
+    const runId = selectedRunIdRef.current;
+    if (!runId) return;
+    try {
+      const entries = await fetchAgentRunLogs(agentId, runId, projectId);
+      if (selectedRunIdRef.current !== runId) return;
+      setRunLogs(entries);
+    } catch {
+      // Leave the existing buffer in place; the next reconnect or run click retries.
+    }
+  };
+
   // Load runs on mount
   const loadRuns = useCallback(async () => {
     try {
@@ -1856,11 +2178,18 @@ function RunsTab({
           "agent:log": (e) => {
             try {
               const entry: AgentLogEntry = JSON.parse(e.data);
-              setRunLogs(prev => [...prev, entry]);
+              // FNXC:AgentLogHistory 2026-07-26-13:36: Expanded-run log tail — soft-bounded ring, same
+              // as the other two tails in this file (see appendLiveLogEntry).
+              setRunLogs(prev => appendLiveLogEntry(prev, entry));
             } catch {
               // ignore malformed events
             }
           },
+        },
+        onReconnect: () => {
+          // FNXC:AgentLogSuspendRecovery 2026-07-26-13:37: the expanded run's tail loses lines across
+          // the hidden-tab suspend window too; refetch the run's full log array on reopen.
+          void refreshRunLogsRef.current();
         },
       },
     );
@@ -1884,6 +2213,8 @@ function RunsTab({
         fetchAgentRunLogs(agentId, runId, projectId),
         fetchAgentRunDetail(agentId, runId, projectId),
       ]);
+      // FNXC:AgentLogHistory 2026-07-26-13:40: stored WHOLE — `fetchAgentRunLogs` is unpaginated, so
+      // capping here was an unrecoverable data loss. The render is windowed instead.
       setRunLogs(logs);
       setDetailRun(detail);
     } catch (err) {
@@ -2170,7 +2501,19 @@ function RunsTab({
               ) : runLogs.length === 0 ? (
                 <div className="text-muted run-output-empty">{t("agents.noLogsForRun", "No logs available for this run")}</div>
               ) : (
-                <AgentLogViewer entries={runLogs} loading={false} />
+                /*
+                FNXC:AgentLogHistory 2026-07-26-13:42:
+                REMOVED the "Showing the most recent 500 entries" note here for the same reason as the
+                Logs tab: it advertised a cap that had already discarded the run's opening entries with
+                no way back. The window's "Load older (N remaining)" button replaces it and reaches
+                entry 0 of the run.
+                */
+                <WindowedAgentLogViewer
+                  entries={runLogs}
+                  resetKey={selectedRunId ?? "none"}
+                  testId="agent-run-logs"
+                  showMissingDetailHint={hasPersistedRunToolRows(runLogs)}
+                />
               )}
             </div>
           </div>
@@ -2285,7 +2628,7 @@ function TasksTab({
       .catch((err) => {
         if (!cancelled) {
           setTasks([]);
-          addToast(t("agents.loadTasksFailed", "Failed to load assigned tasks: {{error}}", { error: getErrorMessage(err) }), "error");
+          addToast(t("agents.loadTasksFailed", "Failed to load agent tasks: {{error}}", { error: getErrorMessage(err) }), "error");
         }
       })
       .finally(() => {
@@ -2303,7 +2646,7 @@ function TasksTab({
     return (
       <div className="agent-tasks-empty">
         <Loader2 size={16} className="animate-spin" />
-        <p>{t("agents.loadingTasks", "Loading assigned tasks...")}</p>
+        <p>{t("agents.loadingTasks", "Loading agent tasks...")}</p>
       </div>
     );
   }
@@ -2312,7 +2655,7 @@ function TasksTab({
     return (
       <div className="agent-tasks-empty">
         <ListChecks size={18} />
-        <p>{t("agents.noTasksAssigned", "No tasks assigned to this agent")}</p>
+        <p>{t("agents.noVisibleTasks", "No assigned or active workflow tasks for this agent")}</p>
       </div>
     );
   }
@@ -2614,11 +2957,31 @@ function MemoryTab({
   const [savingSelectedFile, setSavingSelectedFile] = useState(false);
   const [selectedFileJustSaved, setSelectedFileJustSaved] = useState(false);
   const [fileSwitchHint, setFileSwitchHint] = useState("");
+  const [consolidations, setConsolidations] = useState<MemoryConsolidationEvent[]>([]);
+  const [consolidationsLoading, setConsolidationsLoading] = useState(false);
+  const [consolidationsError, setConsolidationsError] = useState("");
   const justSavedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const selectedFileJustSavedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isReadOnly = agent.state === "running";
+  const isMemoryKeeper = agent.metadata?.builtInMemoryAgent === true;
   const hasInlineChanges = memory !== (agent.memory ?? "");
+
+  const loadConsolidations = useCallback(async () => {
+    if (!isMemoryKeeper) return;
+    setConsolidationsLoading(true);
+    setConsolidationsError("");
+    try {
+      const result = await fetchAgentMemoryConsolidations(agent.id, 50, projectId);
+      setConsolidations(result.events);
+    } catch (err) {
+      setConsolidationsError(getErrorMessage(err));
+    } finally {
+      setConsolidationsLoading(false);
+    }
+  }, [agent.id, isMemoryKeeper, projectId]);
+
+  useEffect(() => { void loadConsolidations(); }, [loadConsolidations]);
 
   const selectedMemoryFile = useMemo(
     () => memoryFiles.find((file) => file.path === selectedFilePath),
@@ -2762,6 +3125,38 @@ function MemoryTab({
         <p className="config-description">
           {t("agents.memoryDescription", "Store context that belongs to this agent only. Workspace memory, daily notes, dreams, and qmd search live in project settings under Project Memory.")}
         </p>
+        {isMemoryKeeper && (
+          <section className="memory-consolidation-history" aria-label={t("agents.consolidationHistory", "Consolidation history")}>
+            {/*
+            FNXC:MemoryConsolidationHistory 2026-08-11-11:13:
+            FN-8934 keeps Memory Keeper history in its existing Memory tab and renders
+            only existing audit metadata, never memory content or synthesized audit prose.
+            */}
+            <div className="memory-consolidation-history__heading">
+              <h4>{t("agents.consolidationHistory", "Consolidation history")}</h4>
+              <button className="btn btn-sm" onClick={() => void loadConsolidations()} disabled={consolidationsLoading}>
+                <RefreshCw size={14} />{t("common.refresh", "Refresh")}
+              </button>
+            </div>
+            {consolidationsLoading ? <LoadingSpinner /> : consolidationsError ? (
+              <p className="config-hint">{t("agents.consolidationHistoryError", "Unable to load consolidation history: {{error}}", { error: consolidationsError })}</p>
+            ) : consolidations.length === 0 ? (
+              <p className="config-hint">{t("agents.consolidationHistoryEmpty", "No consolidation activity yet.")}</p>
+            ) : (
+              <ul className="memory-consolidation-history__list">
+                {consolidations.map((event) => {
+                  const outcome = event.mutationType.endsWith("completed") ? t("agents.consolidationCompleted", "Completed") : event.mutationType.endsWith("skipped") ? t("agents.consolidationSkipped", "Skipped") : t("agents.consolidationFailed", "Failed");
+                  const metadata = event.metadata ?? {};
+                  const details = ["graphChanged", "parsedFiles", "recallCreated", "reason", "stage"].flatMap((key) => metadata[key] === undefined ? [] : [`${key}: ${String(metadata[key])}`]);
+                  return <li key={event.id} className={`memory-consolidation-history__row memory-consolidation-history__row--${event.mutationType.split("-").at(-1)}`}>
+                    <span>{relativeTime(event.timestamp, t)}</span><strong>{outcome}</strong>{details.length > 0 && <span>{details.join(" · ")}</span>}
+                  </li>;
+                })}
+              </ul>
+            )}
+          </section>
+        )}
+
         {isReadOnly && (
           <p className="config-hint config-hint--block-spacing">
             {t("agents.memoryReadOnly", "Read-only while this agent is running.")}
@@ -3348,10 +3743,6 @@ function deriveHeartbeatValues(runtimeConfig: AgentDetail["runtimeConfig"] | und
   return nextValues;
 }
 
-function deriveHeartbeatEnabled(runtimeConfig: AgentDetail["runtimeConfig"] | undefined): boolean {
-  return runtimeConfig?.enabled !== false;
-}
-
 function deriveAutoClaimRelevantTasksEnabled(runtimeConfig: AgentDetail["runtimeConfig"] | undefined): boolean {
   return runtimeConfig?.autoClaimRelevantTasks !== false;
 }
@@ -3704,6 +4095,7 @@ function HeartbeatProcedureSection({
 function ConfigTab({
   agent,
   projectId,
+  agentModelSettings,
   addToast,
   onSaved,
   onHasChangesChange,
@@ -3712,6 +4104,7 @@ function ConfigTab({
 }: {
   agent: AgentDetail;
   projectId?: string;
+  agentModelSettings: Partial<CoreSettings>;
   addToast: (message: string, type?: "success" | "error") => void;
   onSaved: () => Promise<void>;
   onHasChangesChange?: (hasChanges: boolean) => void;
@@ -3722,6 +4115,7 @@ function ConfigTab({
   // Identity field state
   const [nameValue, setNameValue] = useState(agent.name);
   const [roleValue, setRoleValue] = useState(agent.role);
+  const [additionalRoleValues, setAdditionalRoleValues] = useState<AgentCapability[]>(() => (agent.roles ?? [agent.role]).filter((role) => role !== agent.role));
   const [titleValue, setTitleValue] = useState(agent.title ?? "");
   const [iconValue, setIconValue] = useState(agent.icon ?? "");
   const [reportsToValue, setReportsToValue] = useState(agent.reportsTo ?? "");
@@ -3740,7 +4134,7 @@ function ConfigTab({
         initial[field.key] = String(raw);
       }
     }
-    initial.thinkingLevel = typeof agent.runtimeConfig?.thinkingLevel === "string" ? agent.runtimeConfig.thinkingLevel : "off";
+    initial.thinkingLevel = typeof agent.runtimeConfig?.thinkingLevel === "string" ? agent.runtimeConfig.thinkingLevel : "";
     return initial;
   });
 
@@ -3749,7 +4143,7 @@ function ConfigTab({
     () => deriveHeartbeatValues(agent.runtimeConfig),
   );
   const [heartbeatEnabled, setHeartbeatEnabled] = useState<boolean>(
-    () => deriveHeartbeatEnabled(agent.runtimeConfig),
+    () => isAgentHeartbeatEnabled(agent),
   );
   const [autoClaimRelevantTasksEnabled, setAutoClaimRelevantTasksEnabled] = useState<boolean>(
     () => deriveAutoClaimRelevantTasksEnabled(agent.runtimeConfig),
@@ -3838,7 +4232,7 @@ function ConfigTab({
     skills: selectedSkills,
     model: modelValue || undefined,
     runtimeHint: runtimeMode === "runtime" ? selectedRuntimeId || undefined : undefined,
-    thinkingLevel: (formValues.thinkingLevel as "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined) ?? undefined,
+    thinkingLevel: (formValues.thinkingLevel as ThinkingLevel | undefined) ?? undefined,
     maxTurns: formValues.maxTurns ? Number(formValues.maxTurns) : undefined,
     heartbeatIntervalMs: heartbeatValues.heartbeatIntervalMs ? Number(heartbeatValues.heartbeatIntervalMs) * 1000 : undefined,
     heartbeatTimeoutMs: heartbeatValues.heartbeatTimeoutMs ? Number(heartbeatValues.heartbeatTimeoutMs) * 1000 : undefined,
@@ -4073,7 +4467,7 @@ function ConfigTab({
     }
     // Check heartbeat values
     const rc = agent.runtimeConfig ?? {};
-    if (heartbeatEnabled !== deriveHeartbeatEnabled(agent.runtimeConfig)) return true;
+    if (heartbeatEnabled !== isAgentHeartbeatEnabled(agent)) return true;
     if (autoClaimRelevantTasksEnabled !== deriveAutoClaimRelevantTasksEnabled(agent.runtimeConfig)) return true;
     if (engineerBacklogAutoClaimEnabled !== deriveEngineerBacklogAutoClaim(agent.runtimeConfig)) return true;
     if (assignmentPolicy !== deriveAssignmentPolicy(agent.runtimeConfig)) return true;
@@ -4116,7 +4510,7 @@ function ConfigTab({
     if (runtimeMode !== (initialRuntimeHint ? "runtime" : "model")) return true;
     if (modelValue !== initialModelValue) return true;
     if (selectedRuntimeId !== initialRuntimeHint) return true;
-    if ((formValues.thinkingLevel || "off") !== (typeof rc.thinkingLevel === "string" ? rc.thinkingLevel : "off")) return true;
+    if ((formValues.thinkingLevel ?? "") !== (typeof rc.thinkingLevel === "string" ? rc.thinkingLevel : "")) return true;
 
     return false;
   })();
@@ -4155,7 +4549,7 @@ function ConfigTab({
 
     previousAgentRuntimeSyncRef.current = nextSnapshot;
     setHeartbeatValues(deriveHeartbeatValues(agent.runtimeConfig));
-    setHeartbeatEnabled(deriveHeartbeatEnabled(agent.runtimeConfig));
+    setHeartbeatEnabled(isAgentHeartbeatEnabled(agent));
     setAutoClaimRelevantTasksEnabled(deriveAutoClaimRelevantTasksEnabled(agent.runtimeConfig));
     setEngineerBacklogAutoClaimEnabled(deriveEngineerBacklogAutoClaim(agent.runtimeConfig));
     setRunMissedHeartbeatOnStartup(deriveRunMissedHeartbeatOnStartup(agent.runtimeConfig));
@@ -4165,7 +4559,7 @@ function ConfigTab({
     setBudgetValues(deriveBudgetValues(agent.runtimeConfig));
     setFormValues((prev) => ({
       ...prev,
-      thinkingLevel: typeof agent.runtimeConfig?.thinkingLevel === "string" ? agent.runtimeConfig.thinkingLevel : "off",
+      thinkingLevel: typeof agent.runtimeConfig?.thinkingLevel === "string" ? agent.runtimeConfig.thinkingLevel : "",
     }));
     setModelValue(initialModelValue);
     setSelectedRuntimeId(initialRuntimeHint);
@@ -4318,7 +4712,7 @@ function ConfigTab({
 
     // Build the runtimeConfig payload — only include non-empty values
     const newRuntimeConfig: Record<string, unknown> = { ...agent.runtimeConfig };
-    newRuntimeConfig.enabled = heartbeatEnabled;
+    Object.assign(newRuntimeConfig, withAgentHeartbeatEnabled(agent, heartbeatEnabled));
     newRuntimeConfig.autoClaimRelevantTasks = autoClaimRelevantTasksEnabled;
     newRuntimeConfig.engineerBacklogAutoClaim = engineerBacklogAutoClaimEnabled;
     if (assignmentPolicy === "auto") {
@@ -4358,8 +4752,11 @@ function ConfigTab({
       newRuntimeConfig.heartbeatPromptTemplate = heartbeatPromptTemplate;
     }
 
-    const selectedThinkingLevel = (formValues.thinkingLevel || "off") as ThinkingLevel;
-    newRuntimeConfig.thinkingLevel = selectedThinkingLevel;
+    if (formValues.thinkingLevel) {
+      newRuntimeConfig.thinkingLevel = formValues.thinkingLevel as ThinkingLevel;
+    } else {
+      delete newRuntimeConfig.thinkingLevel;
+    }
 
     if (runtimeMode === "runtime") {
       if (selectedRuntimeId.trim()) {
@@ -4431,7 +4828,7 @@ function ConfigTab({
 
     return {
       name: nameValue.trim() || undefined,
-      role: roleValue,
+      roles: [roleValue, ...additionalRoleValues],
       title: titleValue.trim() || undefined,
       icon: iconValue.trim() || undefined,
       reportsTo: reportsToValue.trim() || undefined,
@@ -4439,7 +4836,7 @@ function ConfigTab({
       runtimeConfig: newRuntimeConfig,
       bundleConfig: newBundleConfig,
     };
-  }, [agent.metadata, agent.runtimeConfig, allowParallelExecution, assignmentPolicy, autoClaimRelevantTasksEnabled, budgetValues, bundleEntryFile, bundleExternalPath, bundleFiles, bundleMode, engineerBacklogAutoClaimEnabled, formValues, heartbeatEnabled, heartbeatPromptTemplate, heartbeatScopeDiscipline, heartbeatValues, iconValue, modelValue, nameValue, reportsToValue, roleValue, runMissedHeartbeatOnStartup, runtimeMode, selectedRuntimeId, selectedSkills, skipHeartbeatWhenIdle, titleValue, validationErrors]);
+  }, [additionalRoleValues, agent.metadata, agent.runtimeConfig, allowParallelExecution, assignmentPolicy, autoClaimRelevantTasksEnabled, budgetValues, bundleEntryFile, bundleExternalPath, bundleFiles, bundleMode, engineerBacklogAutoClaimEnabled, formValues, heartbeatEnabled, heartbeatPromptTemplate, heartbeatScopeDiscipline, heartbeatValues, iconValue, modelValue, nameValue, reportsToValue, roleValue, runMissedHeartbeatOnStartup, runtimeMode, selectedRuntimeId, selectedSkills, skipHeartbeatWhenIdle, titleValue, validationErrors]);
 
   const persistSettings = useCallback(async (showValidationToast: boolean, source: "auto" | "manual") => {
     const payload = buildSavePayload();
@@ -4592,13 +4989,15 @@ function ConfigTab({
           </div>
           
           <div className="config-field">
-            <label htmlFor="agent-role">{t("agents.roleLabel2", "Role")}</label>
+            <label htmlFor="agent-role">{t("agents.roleLabel2", "Primary role")}</label>
             <select
               id="agent-role"
               className="select"
               value={roleValue}
               onChange={(e) => {
-                setRoleValue(e.target.value as AgentCapability);
+                const next = e.target.value as AgentCapability;
+                setRoleValue(next);
+                setAdditionalRoleValues((current) => current.filter((role) => role !== next));
                 void scheduleAutoSave();
               }}
             >
@@ -4607,8 +5006,29 @@ function ConfigTab({
               <option value="reviewer">{t("agents.roleReviewer", "Reviewer")}</option>
               <option value="merger">{t("agents.roleMerger", "Merger")}</option>
               <option value="scheduler">{t("agents.roleScheduler", "Scheduler")}</option>
+              <option value="engineer">{t("agents.roleEngineer", "Engineer")}</option>
               <option value="custom">{t("agents.roleCustom", "Custom")}</option>
             </select>
+            <fieldset className="config-role-tags" aria-label={t("agents.additionalRoles", "Additional workflow roles")}>
+              <legend>{t("agents.additionalRoles", "Additional workflow roles")}</legend>
+              {(["triage", "executor", "reviewer", "merger", "scheduler", "engineer", "custom"] as AgentCapability[])
+                .filter((candidate) => candidate !== roleValue)
+                .map((candidate) => (
+                  <label key={candidate} className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={additionalRoleValues.includes(candidate)}
+                      onChange={() => {
+                        setAdditionalRoleValues((current) => current.includes(candidate)
+                          ? current.filter((role) => role !== candidate)
+                          : [...current, candidate]);
+                        void scheduleAutoSave();
+                      }}
+                    />
+                    {candidate}
+                  </label>
+                ))}
+            </fieldset>
           </div>
 
           <div className="config-field">
@@ -4628,6 +5048,10 @@ function ConfigTab({
             <label>{t("agents.avatarLabel", "Avatar")}</label>
             <div className="agent-avatar-editor">
               <AgentAvatar agent={agent} size={64} className="agent-avatar-editor-preview" />
+              {/*
+              FNXC:AgentSettingsTheming 2026-07-23-13:01:
+              Avatar actions retain their existing upload/remove behavior while explicit action classes let the Settings theme contract cover pending, hover, and keyboard-focus states without styling the hidden file input as a visible control.
+              */}
               <div className="agent-avatar-editor-actions">
                 <input
                   ref={avatarInputRef}
@@ -4645,14 +5069,14 @@ function ConfigTab({
                 />
                 <button
                   type="button"
-                  className="btn btn-sm"
+                  className="btn btn-sm agent-avatar-editor-action"
                   disabled={isAvatarPending}
                   onClick={() => avatarInputRef.current?.click()}
                 >
                   {t("agents.uploadAvatar", "Upload Avatar")}
                 </button>
                 {agent.imageUrl ? (
-                  <button type="button" className="btn btn-sm" onClick={() => void handleAvatarDelete()} disabled={isAvatarPending}>
+                  <button type="button" className="btn btn-sm agent-avatar-editor-action" onClick={() => void handleAvatarDelete()} disabled={isAvatarPending}>
                     {t("agents.removeAvatar", "Remove Avatar")}
                   </button>
                 ) : null}
@@ -4702,7 +5126,7 @@ function ConfigTab({
       <div className="config-section">
         <h3>{t("agents.skillsTitle", "Skills")}</h3>
         <p className="config-description">
-          {t("agents.skillsDescription", "Assign skills to this agent for specialized behavior.")}
+          {t("agents.skillsDescription", "All enabled skills can be consulted automatically by any agent. Select skills below to force this agent to read them before starting work.")}
         </p>
 
         <div className="config-fields">
@@ -4764,8 +5188,10 @@ function ConfigTab({
           {runtimeMode === "model" ? (
             <div className="config-field">
               {/*
-              FNXC:Settings-ThinkingLevel 2026-07-12-00:00:
-              Agent Detail now lets operators change a built-in agent's persisted runtimeConfig.thinkingLevel after creation through the shared inline model-dropdown control, matching NewAgentDialog's concrete-only agent semantics.
+              FNXC:AgentModelInheritance 2026-08-09-23:10:
+              An empty agent thinking selection remains an inherit marker rather than persisting "off".
+              Display the resolved role/project thinking as the dropdown default so operators can inspect
+              the active value without materializing it onto the permanent agent runtime configuration.
               */}
               <CustomModelDropdown
                 models={availableModels}
@@ -4774,7 +5200,7 @@ function ConfigTab({
                   setModelValue(value);
                   void scheduleAutoSave();
                 }}
-                placeholder={t("agents.useGlobalDefault", "Use global default")}
+                placeholder={t("agents.inheritProjectRoleDefault", "Inherit project/role default")}
                 label={t("agents.agentModelLabel", "Agent Model")}
                 disabled={modelsLoading}
                 favoriteProviders={favoriteProviders}
@@ -4782,6 +5208,9 @@ function ConfigTab({
                 favoriteModels={favoriteModels}
                 onToggleModelFavorite={toggleFavoriteModel}
                 thinkingLevel={formValues.thinkingLevel ?? ""}
+                defaultThinkingLevel={formValues.thinkingLevel
+                  ? undefined
+                  : resolvePermanentAgentEffectiveThinkingLevel(agent, agentModelSettings)}
                 onThinkingLevelChange={(level) => {
                   setFormValues((prev) => ({ ...prev, thinkingLevel: level as ThinkingLevel }));
                   void scheduleAutoSave();

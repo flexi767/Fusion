@@ -1,0 +1,82 @@
+/*
+FNXC:ToolCallDisplay 2026-08-01-15:39:
+FN-8701 requires one responsive presentation for complete available tool payloads. Preserve
+newlines, wrap normal paths and prose, and contain unavoidable long tokens without widening chat
+or log surfaces beyond the viewport.
+*/
+.tool-call-details {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.tool-call-details-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-xs);
+  align-items: start;
+}
+
+.tool-call-details-label {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tool-call-details-content {
+  min-width: 0;
+}
+
+.tool-call-details-value {
+  min-width: 0;
+  max-inline-size: 100%;
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/*
+FNXC:ToolCallDisplay 2026-08-29-04:37:
+FN-253 previews Task Activity payloads with CSS rather than truncating saved text. This keeps file
+paths and copyable values complete after the user chooses the adjacent reveal control.
+*/
+.tool-call-details-value--clamped {
+  max-block-size: calc(var(--font-size-xs) * var(--line-height-normal) * 6);
+  overflow: hidden;
+}
+
+.tool-call-details-reveal {
+  margin-top: var(--space-xs);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  text-decoration: underline;
+}
+
+.tool-call-details-reveal:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-strong);
+}
+
+.tool-call-details-row--error {
+  padding: var(--space-xs);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+}
+
+@media (max-width: 768px) {
+  .tool-call-details-row {
+    grid-template-columns: 1fr;
+  }
+}

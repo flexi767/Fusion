@@ -7,17 +7,24 @@
  * pre-extraction form. store.ts re-imports these helpers.
  */
 import type { Settings } from "../types.js";
-import { validateWorktrunkSettings } from "../worktrunk-settings.js";
+import { validateWorktrunkSettings } from "../config/worktrunk-settings.js";
 
 /**
  * Canonicalizes a settings object by stripping legacy fields that are no longer valid
  * and rewriting legacy path values left over from the kb → fn rename.
  */
 export function canonicalizeSettings(settings: Settings): Settings {
-  // Strip legacy globalMaxConcurrent from project settings - this field was
-  // deprecated in favor of the global-level maxConcurrent in concurrency settings.
-  const { globalMaxConcurrent, ...rest } = settings as Settings & { globalMaxConcurrent?: number };
-  const base = globalMaxConcurrent !== undefined ? (rest as Settings) : settings;
+  /*
+  FNXC:WorkflowAgentRouting 2026-08-09-01:04:
+  FN-8847 removes the retired ephemeralAgentsEnabled compatibility input. Strip it with the
+  earlier globalMaxConcurrent field at every read boundary so stale configuration payloads cannot
+  reappear or affect durable workflow-principal routing.
+  */
+  const { globalMaxConcurrent, ephemeralAgentsEnabled: _ephemeralAgentsEnabled, ...rest } = settings as Settings & {
+    globalMaxConcurrent?: number;
+    ephemeralAgentsEnabled?: boolean;
+  };
+  const base = globalMaxConcurrent !== undefined || _ephemeralAgentsEnabled !== undefined ? (rest as Settings) : settings;
 
   const canonicalWorktrunk = (() => {
     try {

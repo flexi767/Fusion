@@ -16,13 +16,12 @@ import {mkdir, writeFile, rename, unlink} from "node:fs/promises";
 import {join} from "node:path";
 import type {Task, RunAuditEvent, MergeQueueEntry, MergeRequestRecord, CompletionHandoffMarker, WorkflowWorkItem, PrEntity, PrConflictState, PrChecksRollup, PrReviewDecision} from "../types.js";
 import "../builtin-traits.js";
-import {normalizeTaskPriority} from "../task-priority.js";
-import {fromJson} from "../db.js";
-import {generateTaskLineageId} from "../task-lineage.js";
+import {normalizeTaskPriority} from "../tasks/task-priority.js";
+import {fromJson} from "../db/db.js";
+import {generateTaskLineageId} from "../tasks/task-lineage.js";
 import {type TaskRow, type TaskPersistSerializationContext, type TaskColumnDescriptor, TASK_COLUMN_DESCRIPTORS, TASK_COLUMN_DESCRIPTOR_BY_COLUMN} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {readTaskRow as readTaskRowAsync} from "../task-store/async-persistence.js";
-import {findArchivedTaskEntry} from "../task-store/async-archive-lineage.js";
+import {readTaskRow as readTaskRowAsync} from "../task-store/async/async-persistence.js";
 import type {PrEntityRow, RunAuditEventRow, MergeQueueRow, MergeRequestRow, CompletionHandoffMarkerRow, WorkflowWorkItemRow} from "../task-store/row-types.js";
 
 export function getTaskSelectClauseImpl2(store: TaskStore, slim: boolean, tableAlias?: string): string {
@@ -33,17 +32,17 @@ export function getTaskSelectClauseImpl2(store: TaskStore, slim: boolean, tableA
     const prefix = tableAlias ? `${tableAlias}.` : "";
     return [
       "id", "lineageId", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
-      "worktree", "blockedBy", "overlapBlockedBy", "paused", "pausedReason", "userPaused", "baseBranch", "branch", "autoMerge", "autoMergeProvenance", "executionStartBranch", "baseCommitSha",
-      "modelPresetId", "modelProvider", "modelId",
-      "validatorModelProvider", "validatorModelId",
-      "planningModelProvider", "planningModelId", "mergerModelProvider", "mergerModelId",
-      "mergeRetries", "workflowStepRetries", "stuckKillCount", "resumeLimboCount", "executeRequeueLoopCount", "graphResumeRetryCount", "consecutiveToolFailureRetryCount", "executorEscalationAttempted", "toolFailureDetectorLogCursor", "toolFailureRetryExhaustedAuditEmitted", "resumeLimboTipSha", "resumeLimboStepSignature", "executeRequeueLoopSignature", "postReviewFixCount", "planReviewReplanCount", "recoveryRetryCount", "taskDoneRetryCount", "bulkCompletionRefusalAt", "worktreeSessionRetryCount", "completionHandoffLimboRecoveryCount", "verificationFailureCount", "mergeConflictBounceCount", "mergeAuditBounceCount", "mergeTransientRetryCount", "branchConflictRecoveryCount", "reviewerContextRetryCount", "reviewerFallbackRetryCount", "nextRecoveryAt",
-      "error", "summary", "thinkingLevel", "validatorThinkingLevel", "planningThinkingLevel", "mergerThinkingLevel", "executionMode",
+      "worktree", "blockedBy", "overlapBlockedBy", "paused", "pausedReason", "wedgeNotification", "userPaused", "baseBranch", "branch", "autoMerge", "autoMergeProvenance", "executionStartBranch", "baseCommitSha",
+      "modelPresetId", "modelProvider", "credentialInstanceId", "modelId",
+      "validatorModelProvider", "validatorCredentialInstanceId", "validatorModelId",
+      "planningModelProvider", "planningCredentialInstanceId", "planningModelId", "mergerModelProvider", "mergerCredentialInstanceId", "mergerModelId",
+      "mergeRetries", "aiMergeReviewReconciliation", "workflowStepRetries", "stuckKillCount", "resumeLimboCount", "executeRequeueLoopCount", "graphResumeRetryCount", "consecutiveToolFailureRetryCount", "executorEscalationAttempted", "toolFailureDetectorLogCursor", "toolFailureRetryExhaustedAuditEmitted", "resumeLimboTipSha", "resumeLimboStepSignature", "executeRequeueLoopSignature", "postReviewFixCount", "planReviewReplanCount", "recoveryRetryCount", "sessionContentionHoldCount", "sessionContentionWaitReason", "taskDoneRetryCount", "bulkCompletionRefusalAt", "worktreeSessionRetryCount", "completionHandoffLimboRecoveryCount", "verificationFailureCount", "mergeConflictBounceCount", "mergeAuditBounceCount", "mergeTransientRetryCount", "branchConflictRecoveryCount", "reviewerContextRetryCount", "reviewerFallbackRetryCount", "reviewConvergenceStage", "reviewConvergenceEscalationCount", "nextRecoveryAt",
+      "error", "summary", "recommendations", "thinkingLevel", "validatorThinkingLevel", "planningThinkingLevel", "mergerThinkingLevel", "executionMode",
       "tokenUsageInputTokens", "tokenUsageOutputTokens", "tokenUsageCachedTokens", "tokenUsageCacheWriteTokens", "tokenUsageTotalTokens", "tokenUsageFirstUsedAt", "tokenUsageLastUsedAt", "tokenUsageModelProvider", "tokenUsageModelId", "tokenUsagePerModel", "tokenBudgetSoftAlertedAt", "tokenBudgetHardAlertedAt", "tokenBudgetOverride",
       "createdAt", "updatedAt", "columnMovedAt", "firstExecutionAt", "cumulativeActiveMs", "cumulativePlanningMs", "planningStartedAt", "executionStartedAt", "executionCompletedAt",
-      "dependencies", "steps", "customFields", "comments", "review", "reviewState", "workflowStepResults", "steeringComments",
-      "attachments", "prInfo", "prInfos", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "sourceIssueClosedAt", "mergeDetails", "workspaceWorktrees",
-      "breakIntoSubtasks", "noCommitsExpected", "enabledWorkflowSteps", "modifiedFiles", "declaredSymbols",
+      "dependencies", "steps", "stepReports", "customFields", "comments", "review", "reviewState", "workflowStepResults", "steeringComments",
+      "attachments", "prInfo", "prInfos", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "sourceIssueClosedAt", "mergeDetails", "workspaceWorktrees", "repositoryScope", "externalBlock", "planningFailure",
+      "noCommitsExpected", "enabledWorkflowSteps", "modifiedFiles", "declaredSymbols",
       "missionId", "sliceId", "scopeOverride", "scopeOverrideReason", "scopeAutoWiden", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata", "proposalClaimId",
       "checkedOutBy", "checkedOutAt", "checkoutNodeId", "checkoutRunId", "checkoutLeaseRenewedAt", "checkoutLeaseEpoch", "deletedAt", "allowResurrection",
@@ -154,35 +153,20 @@ export async function readTaskForMoveImpl(store: TaskStore, id: string): Promise
     // Backend mode: read the task row directly via the async helper (without
     // acquiring the task lock). This method is called INSIDE withTaskLock from
     // moveTask/handoffToReview, so using getTask() (which also acquires the
-    // lock) would deadlock. We read the raw row and convert it. Fall back to
-    // archive lookup if the task is not in the live table.
-    if (store.backendMode) {
-      const layer = store.asyncLayer!;
-      const pgRow = await readTaskRowAsync(layer, id, { includeDeleted: true });
-      if (pgRow) {
-        if (pgRow.deletedAt) {
-          throw new TaskDeletedError(id, pgRow.deletedAt as string);
-        }
-        return store.rowToTask(store.pgRowToTaskRow(pgRow));
+    // lock) would deadlock. We read the raw row and convert it.
+    // FNXC:TaskArchiveRemoval 2026-09-04-18:25:
+    // Move paths are live-only. A missing row must not fall back to a cold historical snapshot,
+    // because that would expose migration/forensic data to a lifecycle mutation.
+        const layer = store.asyncLayer!;
+    const pgRow = await readTaskRowAsync(layer, id, { includeDeleted: true });
+    if (pgRow) {
+      if (pgRow.deletedAt) {
+        throw new TaskDeletedError(id, pgRow.deletedAt as string);
       }
-      // Fall back to archive lookup (soft-deleted/archived tasks).
-      const entry = await findArchivedTaskEntry(layer.db, id, layer.projectId);
-      if (entry) {
-        return store.archiveEntryToTask(entry, false);
-      }
-      throw new Error(`Task ${id} not found`);
+      return store.rowToTask(store.pgRowToTaskRow(pgRow));
     }
-    const dir = store.taskDir(id);
-    try {
-      return await store.readTaskJson(dir);
-    } catch (error) {
-      const archived = store.archiveDb.get(id);
-      if (!archived) {
-        throw error;
-      }
-      return store.archiveEntryToTask(archived, false);
-    }
-  }
+    throw new Error(`Task ${id} not found`);
+}
 
 export function rowToMergeQueueEntryImpl(store: TaskStore, row: MergeQueueRow): MergeQueueEntry {
     return {
@@ -230,6 +214,16 @@ export function rowToWorkflowWorkItemImpl(store: TaskStore, row: WorkflowWorkIte
       leaseExpiresAt: row.leaseExpiresAt,
       lastError: row.lastError,
       blockedReason: row.blockedReason,
+      stableWorkflowRunId: row.stableWorkflowRunId,
+      continuationSequence: row.continuationSequence,
+      waitReason: row.waitReason === "planning" || row.waitReason === "capacity" ? row.waitReason : null,
+      sourceColumn: row.sourceColumn,
+      targetColumn: row.targetColumn,
+      irHash: row.irHash,
+      principalAgentId: row.principalAgentId,
+      workflowRole: row.workflowRole as WorkflowWorkItem["workflowRole"],
+      authorityKind: row.authorityKind as WorkflowWorkItem["authorityKind"],
+      nodeInstanceId: row.nodeInstanceId,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };

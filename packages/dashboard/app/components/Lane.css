@@ -45,6 +45,18 @@
 }
 
 
+/*
+FNXC:StandardBoardHeight 2026-09-12-19:19:
+The standard Board's horizontal scrollbar must not consume block-size between its symmetric padding edges. Keep the Board as the horizontal scroll owner and preserve wheel, trackpad, drag-pan, and touch scrolling, but render its scrollbar without a layout track so columns end one padding token above the shell-owned footer; Alpha keeps its existing scrollbar paint.
+*/
+[data-alpha-surface="false"] .board {
+  scrollbar-width: none;
+}
+
+[data-alpha-surface="false"] .board::-webkit-scrollbar {
+  height: 0;
+}
+
 .board.board-workflow-columns {
   flex: 1 1 auto;
   display: flex;
@@ -57,7 +69,12 @@
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
-  scroll-snap-type: x proximity;
+  /*
+  FNXC:BoardNavigation 2026-07-24-10:05:
+  Desktop/tablet workflow-column scrolling is free-panning — snapping (and its slow browser
+  settle animation) is reserved for the phone tier, where the JS column pager owns paging.
+  */
+  scroll-snap-type: none;
   touch-action: pan-x pan-y;
 }
 
@@ -118,47 +135,6 @@
   text-align: center;
 }
 
-.lane-columns {
-  display: flex;
-  gap: var(--column-gap, 12px);
-  padding: 12px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  overscroll-behavior-x: contain;
-  scroll-snap-type: x proximity;
-  scrollbar-color: var(--border) transparent;
-  scrollbar-width: thin;
-  min-height: 0;
-  touch-action: pan-x pan-y;
-}
-
-.lane-columns > .column {
-  flex: 0 0 clamp(280px, 28vw, 340px);
-  /* Repo convention (mobile-scroll-snap test): snap-align must be `center`. */
-  scroll-snap-align: center;
-  touch-action: pan-x pan-y;
-}
-
-.lane-columns::-webkit-scrollbar {
-  height: 6px;
-}
-.lane-columns::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: var(--radius-sm, 6px);
-}
-
-/* Inline column feedback (capacity-exhausted promote, deterministic drag
- * rejection) — rendered in-column, not a toast (R17 / promote spec). */
-.column-inline-feedback {
-  margin: 4px 12px 0;
-  padding: 6px 8px;
-  font-size: 0.8rem;
-  color: var(--color-error);
-  background: color-mix(in srgb, var(--color-error) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--color-error) 35%, transparent);
-  border-radius: var(--radius-sm, 6px);
-}
-
 
 @media (max-width: 1024px) {
   .board.board-lanes {
@@ -184,6 +160,18 @@
     min-height: 0;
     overflow-x: auto;
     overflow-y: hidden;
+    scroll-snap-type: none;
+  }
+}
+
+/*
+FNXC:BoardNavigation 2026-08-18-19:29:
+The selected-workflow and All-workflows Board paths share this live workflow-column scroller.
+Keep desktop free-panning and phone proximity snapping here; retired lane compatibility styling is
+not part of the current Board or plugin surface.
+*/
+@media (max-width: 768px), (max-height: 480px) {
+  .board.board-workflow-columns {
     scroll-snap-type: x proximity;
   }
 }

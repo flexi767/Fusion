@@ -3,7 +3,7 @@ import { GitLabApiError } from "./gitlab.js";
 import { resolveGitLabClient, resolveGitLabTargetFromItem, safeLogGitLabEntry, type GitLabLifecycleTarget } from "./gitlab-lifecycle.js";
 import { decideIssueAction, delay } from "./github-tracking-state.js";
 
-const TRANSIENT_RETRY_DELAY_MS = 25;
+export const TRANSIENT_RETRY_DELAY_MS = 25;
 
 interface TaskMovedEvent { task: Task; from: string; to: string; }
 
@@ -14,7 +14,7 @@ export function isTransientGitLabError(error: unknown): boolean {
   return message.includes("econn") || message.includes("timed out") || message.includes("socket hang up");
 }
 
-async function retryTransient<T>(fn: () => Promise<T>): Promise<T> {
+export async function retryTransient<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); } catch (error) {
     if (!isTransientGitLabError(error)) throw error;
     await delay(TRANSIENT_RETRY_DELAY_MS);

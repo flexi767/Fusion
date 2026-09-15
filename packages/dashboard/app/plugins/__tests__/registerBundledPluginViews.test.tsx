@@ -12,7 +12,9 @@ const MockCompoundEngineeringDashboardView = () => createElement("div", { "data-
 const MockCliPrintingPressWizardView = () => createElement("div", { "data-testid": "cli-printing-press-view" });
 const MockCliPrintingPressManageView = () => createElement("div", { "data-testid": "cli-printing-press-manage-view" });
 const MockLinearImportView = () => createElement("div", { "data-testid": "linear-import-view" });
+const MockTodoDashboardView = () => createElement("div", { "data-testid": "todos-view" });
 const MockRoadmapDashboardView = () => createElement("div", { "data-testid": "roadmaps-view" });
+const MockQualityDashboardView = () => createElement("div", { "data-testid": "quality-view" });
 
 vi.mock("@fusion-plugin-examples/dependency-graph/dashboard-view", () => ({
   DependencyGraphDashboardView: (...args: unknown[]) => MockDependencyGraphDashboardView(...args),
@@ -34,8 +36,16 @@ vi.mock("@fusion-plugin-examples/linear-import/dashboard-view", () => ({
   LinearImportDashboardView: (...args: unknown[]) => MockLinearImportView(...args),
 }));
 
+vi.mock("@fusion-plugin-examples/todos/dashboard-view", () => ({
+  TodoDashboardView: (...args: unknown[]) => MockTodoDashboardView(...args),
+}));
+
 vi.mock("@fusion-plugin-examples/roadmap/dashboard-view", () => ({
   RoadmapDashboardView: (...args: unknown[]) => MockRoadmapDashboardView(...args),
+}));
+
+vi.mock("@fusion-plugin-examples/quality/dashboard-view", () => ({
+  QualityDashboardView: (...args: unknown[]) => MockQualityDashboardView(...args),
 }));
 
 // The dashboard statically registers bundled views client-side, so these views can
@@ -57,9 +67,20 @@ describe("registerBundledPluginViews", () => {
     expect(isPluginViewRegistered("fusion-plugin-compound-engineering", "compound-engineering")).toBe(true);
     expect(getPluginViewComponent("fusion-plugin-compound-engineering", "compound-engineering")).toBeTruthy();
     expect(getPluginViewComponent("fusion-plugin-roadmap", "roadmaps")).toBeTruthy();
+    expect(getPluginViewComponent("fusion-plugin-todos", "todos")).toBeTruthy();
     expect(getPluginViewComponent("fusion-plugin-cli-printing-press", "wizard")).toBeTruthy();
     expect(getPluginViewComponent("fusion-plugin-cli-printing-press", "manage")).toBeTruthy();
     expect(getPluginViewComponent("fusion-plugin-linear-import", "linear-import")).toBeTruthy();
+    expect(getPluginViewComponent("fusion-plugin-quality", "quality")).toBeTruthy();
+    // Reports ships plugin UI but remains intentionally absent from the dashboard registry until enabled by its owning rollout.
+    expect(getPluginViewComponent("fusion-plugin-reports", "reports")).toBeNull();
+  });
+
+  it("hosts the bundled Todo view instead of the unavailable fallback", async () => {
+    registerBundledPluginViews();
+    render(<>{PluginDashboardViewHost({ viewId: "plugin:fusion-plugin-todos:todos" })}</>);
+    expect(await screen.findByTestId("todos-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("plugin-view-unavailable")).toBeNull();
   });
 
   it("hosts the bundled roadmaps view instead of the unavailable fallback", async () => {
@@ -87,9 +108,12 @@ describe("registerBundledPluginViews", () => {
     expect(isPluginViewRegistered("fusion-plugin-dependency-graph", "graph")).toBe(true);
     expect(isPluginViewRegistered("fusion-plugin-compound-engineering", "compound-engineering")).toBe(true);
     expect(isPluginViewRegistered("fusion-plugin-roadmap", "roadmaps")).toBe(true);
+    expect(isPluginViewRegistered("fusion-plugin-todos", "todos")).toBe(true);
     expect(isPluginViewRegistered("fusion-plugin-cli-printing-press", "wizard")).toBe(true);
     expect(isPluginViewRegistered("fusion-plugin-cli-printing-press", "manage")).toBe(true);
     expect(isPluginViewRegistered("fusion-plugin-linear-import", "linear-import")).toBe(true);
+    expect(isPluginViewRegistered("fusion-plugin-quality", "quality")).toBe(true);
+    expect(isPluginViewRegistered("fusion-plugin-reports", "reports")).toBe(false);
     // Unknown plugin/view should not be registered
     expect(isPluginViewRegistered("unknown-plugin", "unknown")).toBe(false);
   });

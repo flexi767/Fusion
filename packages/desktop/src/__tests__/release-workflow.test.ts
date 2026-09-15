@@ -106,16 +106,31 @@ describe("desktop release workflow wiring", () => {
     expect(verifier).not.toContain("found ${platform}; expected ${expectedPlatform}");
 
     const advisoryPackaging = await readRepoFile(".github/workflows/desktop-packaging.yml");
-    for (const workflow of [release, testRelease, advisoryPackaging]) {
+    /*
+    FNXC:DesktopEmbeddedPostgres 2026-07-15-11:55:
+    This verifier reads electron-builder's unpacked tree, so invoking it before
+    the Linux packaging command would only validate stale output.
+
+    FNXC:DesktopPackaging 2026-07-26-22:55:
+    Release/test-release package via the named "Package Linux desktop artifacts"
+    step; the advisory PR lane uses electron-builder --dir ("Validate packageable
+    closure"). Assert order against each workflow's real packaging step so a
+    missing release step cannot silently pass via indexOf === -1.
+    */
+    for (const workflow of [release, testRelease]) {
       expect(workflow).toContain("Verify Linux AppImage embedded Postgres packaging");
       expect(workflow).toContain("node scripts/verify-desktop-linux-pg-packaging.mjs");
-      // FNXC:DesktopEmbeddedPostgres 2026-07-15-11:55:
-      // This verifier reads electron-builder's unpacked tree, so invoking it
-      // before the Linux packaging command would only validate stale output.
+      expect(workflow).toContain("Package Linux desktop artifacts");
       expect(workflow.indexOf("node scripts/verify-desktop-linux-pg-packaging.mjs")).toBeGreaterThan(
         workflow.indexOf("Package Linux desktop artifacts"),
       );
     }
+    expect(advisoryPackaging).toContain("Verify Linux AppImage embedded Postgres packaging");
+    expect(advisoryPackaging).toContain("node scripts/verify-desktop-linux-pg-packaging.mjs");
+    expect(advisoryPackaging).toContain("Validate packageable closure (electron-builder --dir)");
+    expect(advisoryPackaging.indexOf("node scripts/verify-desktop-linux-pg-packaging.mjs")).toBeGreaterThan(
+      advisoryPackaging.indexOf("Validate packageable closure (electron-builder --dir)"),
+    );
   });
 
   it("wires release aggregation to include desktop assets across platforms", async () => {
@@ -159,7 +174,8 @@ describe("desktop release workflow wiring", () => {
     for (const workflow of [release, testRelease]) {
       expect(workflow).toContain("build-android:");
       expect(workflow).toContain("runs-on: ubuntu-latest");
-      expect(workflow).toContain("actions/setup-java@v4");
+      // FN-9295: Workflows moved to actions/setup-java v6.0.0; assert the major only.
+      expect(workflow).toMatch(/actions\/setup-java@v6(\.\d+(\.\d+)?)?\b/);
       // FNXC:AndroidRelease 2026-07-01-19:52: Capacitor 7 @capacitor/android compiles with JavaVersion.VERSION_21, so the Android release Gradle build must provision JDK 21 (JDK 17 fails with `invalid source release: 21`). Assert the intended JDK here.
       expect(workflow).toContain('java-version: "21"');
       expect(workflow).toContain("pnpm --filter @fusion/mobile cap add android");

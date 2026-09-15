@@ -1,3 +1,6 @@
+import { createLogger } from "../process/logger.js";
+
+const severityAuditLog = createLogger("core-bundled-plugin-install");
 /**
  * FNXC:PluginLoader 2026-07-07-00:00:
  * Bundled-plugin auto-install is host-agnostic in @fusion/core. Hosts (the CLI's
@@ -15,11 +18,11 @@
 import { existsSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { validatePluginManifest } from "../plugin-types.js";
-import type { PluginInstallation, PluginManifest } from "../plugin-types.js";
-import { resolvePluginEntryPath } from "../plugin-loader.js";
-import type { PluginLoader } from "../plugin-loader.js";
-import type { PluginStore } from "../plugin-store.js";
+import { validatePluginManifest } from "./plugin-types.js";
+import type { PluginInstallation, PluginManifest } from "./plugin-types.js";
+import { resolvePluginEntryPath } from "./plugin-loader.js";
+import type { PluginLoader } from "./plugin-loader.js";
+import type { PluginStore } from "../stores/plugin-store.js";
 
 const DEPENDENCY_GRAPH_PLUGIN_ID = "fusion-plugin-dependency-graph";
 const CURSOR_RUNTIME_PLUGIN_ID = "fusion-plugin-cursor-runtime";
@@ -31,6 +34,7 @@ export const BUNDLED_PLUGIN_IDS = [
   "fusion-plugin-reports",
   "fusion-plugin-whatsapp-chat",
   "fusion-plugin-roadmap",
+  "fusion-plugin-todos",
   "fusion-plugin-hermes-runtime",
   "fusion-plugin-openclaw-runtime",
   "fusion-plugin-paperclip-runtime",
@@ -120,7 +124,7 @@ export async function ensureBundledPluginInstalled(
   const entryPath = resolvePluginEntryPath(bundledDir);
 
   if (!entryPath) {
-    console.warn(`[plugins] Bundled plugin "${pluginId}" is missing a loadable entry file in ${bundledDir}`);
+    severityAuditLog.warn(`[plugins] Bundled plugin "${pluginId}" is missing a loadable entry file in ${bundledDir}`);
     return "missing-bundle";
   }
 
@@ -134,7 +138,7 @@ export async function ensureBundledPluginInstalled(
         try {
           await pluginLoader.loadPlugin(existingPlugin.id);
         } catch (err) {
-          console.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
+          severityAuditLog.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
         }
       }
       return "already-installed";
@@ -149,7 +153,7 @@ export async function ensureBundledPluginInstalled(
       try {
         await pluginLoader.loadPlugin(existingPlugin.id);
       } catch (err) {
-        console.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
+        severityAuditLog.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
       }
     }
 
@@ -165,7 +169,7 @@ export async function ensureBundledPluginInstalled(
     try {
       await pluginLoader.loadPlugin(plugin.id);
     } catch (err) {
-      console.warn("[plugins] failed to load bundled plugin", plugin.id, err);
+      severityAuditLog.warn("[plugins] failed to load bundled plugin", plugin.id, err);
     }
   }
 

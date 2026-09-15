@@ -1,35 +1,64 @@
 import "./QuickEntryBox.css";
-import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { AlphaButton, AlphaInput, AlphaListBox, AlphaListBoxItem, AlphaMenu, AlphaMenuItem, AlphaPopoverSurface, AlphaTextArea } from "./alpha-ui";
+import { useState, useCallback, useRef, useEffect, useMemo, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { createPortal } from "react-dom";
 import type { ToastType } from "../hooks/useToast";
 import { DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, getErrorMessage } from "@fusion/core";
-import type { Task, Settings, TaskPriority, ResolvedWorkflowOptionalStep, ThinkingLevel } from "@fusion/core";
+import type { Task, Settings, TaskPriority, ResolvedWorkflowOptionalStep, ThinkingLevel, ColumnId } from "@fusion/core";
 import type { ModelInfo, Agent, CreateTaskInput, DuplicateMatch, BoardWorkflowDefinition, NodeInfo } from "../api";
 import { checkDuplicateTasks, fetchModels, fetchSettings, updateGlobalSettings, fetchAgents, uploadAttachment, fetchWorkflowOptionalSteps } from "../api";
 import { DuplicateWarningModal } from "./DuplicateWarningModal";
-import { Link, Paperclip, Brain, Lightbulb, ListTree, Sparkles, Save, ChevronDown, ChevronUp, ChevronRight, Bot, Server, Zap, Eye, EyeOff } from "lucide-react";
+import { Link, Paperclip, Brain, Lightbulb, Sparkles, Save, ChevronDown, ChevronUp, ChevronRight, Bot, Server, Zap, Eye, EyeOff, Play } from "lucide-react";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { LoadingSpinner } from "./LoadingSpinner";
-import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
+import { getScopedItem, MAX_PERSISTED_DRAFT_BYTES, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { useNodes } from "../hooks/useNodes";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import { NodeHealthDot } from "./NodeHealthDot";
 import { ProviderIcon } from "./ProviderIcon";
 import { WorkflowOptionalStepsDropdown } from "./WorkflowOptionalStepsDropdown";
 import { WorkflowIcon } from "./WorkflowIcon";
-import { PendingImagePreviews } from "./PendingImagePreviews";
+import { PendingAttachmentPreviews } from "./PendingAttachmentPreviews";
 import { getPriorityColorVar, getPriorityIcon, getPriorityLabel } from "../utils/priorityIndicator";
+import { validateQuickAddStartWorkflow, workflowSupportsQuickAddStart, resolveQuickAddStartInitialColumn, resolveQuickAddStartWorkflowTarget, resolveQuickAddStartTargetColumn, type ValidatedQuickAddWorkflow } from "../utils/quickAddStart";
+import { computeFixedMenuPosition, getLayoutViewportSize } from "../utils/fixedMenuPosition";
+import { isInsidePortaledModelMenu } from "../utils/portalSurfaces";
+import { restoreOptionalStepsOnFastExit } from "../utils/fastModeOptionalSteps";
+import { useQuickAddSubmitOnEnter } from "../hooks/useQuickAddSubmitOnEnter";
+import { useAlphaSurface } from "../context/AlphaContext";
 
 const STORAGE_KEY = "kb-quick-entry-text";
-const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const ALPHA_START_HOLD_DURATION_MS = 500;
+type AlphaSaveGesture = { kind: "pointer"; pointerId: number } | { kind: "keyboard"; key: " " | "Enter" };
+const ALLOWED_TASK_ATTACHMENT_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "text/plain",
+  "text/markdown",
+  "application/json",
+  "text/yaml",
+  "text/x-toml",
+  "text/csv",
+  "application/xml",
+]);
+const TASK_ATTACHMENT_ACCEPT = "image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm,video/quicktime,.txt,.md,.json,.yaml,.yml,.toml,.csv,.xml";
 
-interface PendingImage {
+interface PendingAttachment {
   file: File;
-  previewUrl: string;
+  previewUrl?: string;
 }
 
 interface QuickEntryBoxProps {
   onCreate?: (input: CreateTaskInput) => Promise<Task | void>;
+  /** Host-owned state-updating move path; Quick Add never calls the raw API. */
+  onMoveTask?: (taskId: string, column: ColumnId) => Promise<unknown>;
   addToast: (message: string, type?: ToastType) => void;
   tasks?: Task[];
   availableModels?: ModelInfo[];
@@ -38,10 +67,6 @@ interface QuickEntryBoxProps {
    * QuickEntryBox intentionally does not render a quick-add Plan button.
    */
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  /**
-   * Called when the user clicks the "Subtask" button to trigger subtask breakdown.
-   */
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   /** Selected workflow lane for AI-assisted create actions. Omit in legacy board mode to preserve project-default inheritance. */
   workflowId?: string | null;
   /** Real workflows available to the quick-add workflow selector. Board-only aggregate sentinels must be filtered before rendering/submission. */
@@ -62,10 +87,14 @@ interface QuickEntryBoxProps {
   */
   defaultExpanded?: boolean;
   /*
-  FNXC:QuickEntry 2026-06-22-19:25:
-  List view renders quick-add as a COMPACT single-line input so the box isn't tall. When true, the textarea stays one line: isExpanded initializes false, focus does NOT auto-expand it, and auto-resize-to-scrollHeight is short-circuited (capped to the one-line min-height). Board/columns omit singleLine, preserving the tall 80px + auto-grow behavior. singleLine governs only textarea height, not the disclosure/controls panel (which List already collapses via defaultExpanded={false}).
+  FNXC:QuickEntry 2026-09-14-03:31:
+  The `singleLine` compact variant is REMOVED. It existed only for List, and made the same composer look and behave
+  differently depending on where it was mounted: one-line textarea, no auto-grow, no expand on focus, no expand on
+  Shift+Enter. List and Board now instantiate this component with the same contract, so there is one Quick Entry
+  presentation everywhere.
   */
-  singleLine?: boolean;
+  /** Explicit override of the global Enter-submit preference. */
+  submitOnEnter?: boolean;
   /**
    * Favorited provider IDs from shared app-level state.
    * When provided (alongside availableModels), the component uses these
@@ -135,8 +164,11 @@ function hasMeaningfulNodeChoice(nodes: NodeInfo[]): boolean {
   return nodes.length > 1 || nodes.some((node) => node.type !== "local");
 }
 
-export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels, onSubtaskBreakdown, workflowId, workflowOptions, defaultWorkflowId, projectId, autoExpand = true, defaultExpanded = true, singleLine = false, favoriteProviders: parentFavoriteProviders, favoriteModels: parentFavoriteModels, onToggleFavorite: parentToggleFavorite, onToggleModelFavorite: parentToggleModelFavorite, onOpenTask }: QuickEntryBoxProps) {
+export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], availableModels, workflowId, workflowOptions, defaultWorkflowId, projectId, autoExpand = true, defaultExpanded = true, submitOnEnter, favoriteProviders: parentFavoriteProviders, favoriteModels: parentFavoriteModels, onToggleFavorite: parentToggleFavorite, onToggleModelFavorite: parentToggleModelFavorite, onOpenTask }: QuickEntryBoxProps) {
   const { t } = useTranslation("app");
+  const alphaActive = useAlphaSurface();
+  const contextSubmitOnEnter = useQuickAddSubmitOnEnter();
+  const enterSubmits = submitOnEnter ?? contextSubmitOnEnter;
   const [description, setDescription] = useState(() => {
     if (typeof window !== "undefined") {
       return getScopedItem(STORAGE_KEY, projectId) || "";
@@ -145,18 +177,31 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   // isExpanded controls textarea height styling (auto-resize)
-  // FNXC:QuickEntry 2026-06-22-19:25: singleLine (List view) starts collapsed so the textarea is one line, not the tall 80px variant.
-  const [isExpanded, setIsExpanded] = useState(!singleLine);
-  // isDisclosureExpanded controls visibility of the controls panel (Deps, Models, etc.)
-  // Starts expanded by default — controls visible immediately
-  const [isDisclosureExpanded, setIsDisclosureExpanded] = useState(defaultExpanded);
+  const [isExpanded, setIsExpanded] = useState(true);
+  // isDisclosureExpanded controls visibility of advanced options (Deps, Models, etc.).
+  /*
+  FNXC:AlphaQuickEntry 2026-09-11-00:30:
+  Alpha Quick Entry starts with only its compact immediate-action row visible and progressively discloses advanced routing options. List and every non-Alpha host retain the historical defaultExpanded contract; state and callbacks stay in this single composer instance so disclosure never discards the draft.
+  */
+  const [isDisclosureExpanded, setIsDisclosureExpanded] = useState(alphaActive ? false : defaultExpanded);
+  const previousAlphaActiveRef = useRef(alphaActive);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef, value: description, onChange: setDescription, projectId });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const touchButtonRef = useRef<HTMLButtonElement | null>(null);
+  const startIntentRef = useRef<ValidatedQuickAddWorkflow | null>(null);
+  const alphaSaveButtonRef = useRef<HTMLButtonElement | null>(null);
+  const alphaSaveGestureRef = useRef<AlphaSaveGesture | null>(null);
+  const alphaSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const alphaSaveBarrierReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const alphaSaveSuppressClickRef = useRef(false);
+  const alphaStartWorkflowRef = useRef<ValidatedQuickAddWorkflow | null>(null);
+  const [alphaSaveState, setAlphaSaveState] = useState<"idle" | "holding">("idle");
   const justResetRef = useRef(false);
+  const draftPersistenceWarningShownRef = useRef(false);
   const previousProjectIdRef = useRef(projectId);
-  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
-  const pendingImagesRef = useRef<PendingImage[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const [isFileDragOver, setIsFileDragOver] = useState(false);
   const dragDepthRef = useRef(0);
 
@@ -175,12 +220,16 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const [activeModelSubmenu, setActiveModelSubmenu] = useState<"plan" | "executor" | "validator" | "merger" | null>(null);
   const [executorProvider, setExecutorProvider] = useState<string | undefined>(undefined);
   const [executorModelId, setExecutorModelId] = useState<string | undefined>(undefined);
+  const [credentialInstanceId, setCredentialInstanceId] = useState<string | undefined>(undefined);
   const [validatorProvider, setValidatorProvider] = useState<string | undefined>(undefined);
   const [validatorModelId, setValidatorModelId] = useState<string | undefined>(undefined);
+  const [validatorCredentialInstanceId, setValidatorCredentialInstanceId] = useState<string | undefined>(undefined);
   const [planningProvider, setPlanningProvider] = useState<string | undefined>(undefined);
   const [planningModelId, setPlanningModelId] = useState<string | undefined>(undefined);
+  const [planningCredentialInstanceId, setPlanningCredentialInstanceId] = useState<string | undefined>(undefined);
   const [mergerProvider, setMergerProvider] = useState<string | undefined>(undefined);
   const [mergerModelId, setMergerModelId] = useState<string | undefined>(undefined);
+  const [mergerCredentialInstanceId, setMergerCredentialInstanceId] = useState<string | undefined>(undefined);
   /* FNXC:Settings-ThinkingLevel 2026-07-09-00:00: inline quick-entry bar carries the same per-task thinking-level override as the full New Task modal; "" means "use default". */
   const [thinkingLevel, setThinkingLevel] = useState<string>("");
   const [validatorThinkingLevel, setValidatorThinkingLevel] = useState<string>("");
@@ -197,14 +246,20 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const nodePickerPortalRef = useRef<HTMLDivElement>(null);
   const priorityPickerRef = useRef<HTMLDivElement>(null);
   const priorityPickerPortalRef = useRef<HTMLDivElement>(null);
-  const [agentPickerPosition, setAgentPickerPosition] = useState<{ top: number; left: number; width: number; maxHeight?: number } | null>(null);
-  const [nodePickerPosition, setNodePickerPosition] = useState<{ top: number; left: number; width: number; maxHeight?: number } | null>(null);
-  const [priorityPickerPosition, setPriorityPickerPosition] = useState<{ top: number; left: number; width: number; maxHeight?: number } | null>(null);
-  const [modelMenuPosition, setModelMenuPosition] = useState<{ top: number; left: number; width: number; maxHeight?: number } | null>(null);
+  /*
+  FNXC:QuickAddMenuAnchor 2026-08-01-07:11:
+  Preserve both shared-helper vertical anchors in Quick Add state. Portal styles must use `bottom`
+  with `top: auto` upward, because a natural-height menu cannot remain attached when top is derived
+  from its independent max-height scroll cap.
+  */
+  const [agentPickerPosition, setAgentPickerPosition] = useState<{ top: number | null; bottom: number | null; left: number; width: number; maxHeight?: number } | null>(null);
+  const [nodePickerPosition, setNodePickerPosition] = useState<{ top: number | null; bottom: number | null; left: number; width: number; maxHeight?: number } | null>(null);
+  const [priorityPickerPosition, setPriorityPickerPosition] = useState<{ top: number | null; bottom: number | null; left: number; width: number; maxHeight?: number } | null>(null);
+  const [modelMenuPosition, setModelMenuPosition] = useState<{ top: number | null; bottom: number | null; left: number; width: number; maxHeight?: number } | null>(null);
   // Dependency dropdown portal refs and state
   const depTriggerRef = useRef<HTMLButtonElement>(null);
   const depDropdownPortalRef = useRef<HTMLDivElement>(null);
-  const [depDropdownPosition, setDepDropdownPosition] = useState<{ top: number; left: number; width: number; maxHeight?: number } | null>(null);
+  const [depDropdownPosition, setDepDropdownPosition] = useState<{ top: number | null; bottom: number | null; left: number; width: number; maxHeight?: number } | null>(null);
   const [portalRoot] = useState<HTMLElement | null>(() =>
     typeof document !== "undefined" ? document.body : null,
   );
@@ -212,12 +267,12 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const workflowPickerRef = useRef<HTMLDivElement>(null);
   const workflowTriggerRef = useRef<HTMLButtonElement>(null);
   const workflowPickerPortalRef = useRef<HTMLDivElement>(null);
-  const [workflowPickerPosition, setWorkflowPickerPosition] = useState<{ top: number; left: number; width: number; maxHeight?: number } | null>(null);
+  const [workflowPickerPosition, setWorkflowPickerPosition] = useState<{ top: number | null; bottom: number | null; left: number; width: number; maxHeight?: number } | null>(null);
   const previousWorkflowDefaultRef = useRef<{ workflowId: string | null | undefined; defaultWorkflowId: string | null | undefined }>({ workflowId, defaultWorkflowId });
   const [showWorkflowPicker, setShowWorkflowPicker] = useState(false);
   /*
   FNXC:QuickAddWorkflow 2026-06-30-00:00:
-  Quick-add needs an independent real workflow target because the main Board selector can be on the aggregate "All workflows" read view. Resolve only against real workflow ids and keep the aggregate sentinel out of task create, Plan, Subtask, and optional-step requests.
+  Quick-add needs an independent real workflow target because the main Board selector can be on the aggregate "All workflows" read view. Resolve only against real workflow ids and keep the aggregate sentinel out of task create, Plan, and optional-step requests.
   */
   const [quickEntryWorkflowId, setQuickEntryWorkflowId] = useState<string | null | undefined>(() => (
     resolveQuickAddWorkflowId(workflowId, defaultWorkflowId, getRealWorkflowOptions(workflowOptions))
@@ -233,6 +288,11 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const [enabledOptionalStepIds, setEnabledOptionalStepIds] = useState<string[]>([]);
   const [isFastMode, setIsFastMode] = useState(false);
   const isFastModeRef = useRef(isFastMode);
+  const preFastOptionalStepIdsRef = useRef<string[] | null>(null);
+  const defaultOnOptionalStepIds = useMemo(
+    () => optionalSteps.filter((step) => step.defaultOn).map((step) => step.templateId),
+    [optionalSteps],
+  );
   useEffect(() => {
     isFastModeRef.current = isFastMode;
   }, [isFastMode]);
@@ -263,6 +323,38 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
 
   // If onCreate is not provided, the component is disabled
   const isDisabled = !onCreate;
+
+  /*
+  FNXC:AlphaQuickEntryMode 2026-09-11-00:51:
+  Alpha can be toggled while Board remains mounted. Adopt progressive disclosure on entry and restore the non-Alpha `defaultExpanded` contract on exit without remounting the composer or clearing its draft.
+  */
+  useEffect(() => {
+    if (previousAlphaActiveRef.current === alphaActive) return;
+    previousAlphaActiveRef.current = alphaActive;
+    setIsDisclosureExpanded(alphaActive ? false : defaultExpanded);
+  }, [alphaActive, defaultExpanded]);
+
+  /*
+  FNXC:AlphaQuickEntryPortals 2026-09-11-00:51:
+  Collapsing advanced Alpha controls must close every parent-owned portal state before the triggers disappear. The options subtree is also unmounted below so child-owned workflow-step portals cannot remain visible without an anchor.
+  */
+  useEffect(() => {
+    if (!alphaActive || isDisclosureExpanded) return;
+    agentPickerOpenTokenRef.current += 1;
+    setShowDeps(false);
+    setDepDropdownPosition(null);
+    setShowAgentPicker(false);
+    setAgentPickerPosition(null);
+    setShowNodePicker(false);
+    setNodePickerPosition(null);
+    setShowPriorityPicker(false);
+    setPriorityPickerPosition(null);
+    setShowWorkflowPicker(false);
+    setWorkflowPickerPosition(null);
+    setIsModelMenuOpen(false);
+    setModelMenuPosition(null);
+    setActiveModelSubmenu(null);
+  }, [alphaActive, isDisclosureExpanded]);
 
   // Fetch models if not provided by parent
   useEffect(() => {
@@ -345,6 +437,20 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const quickEntryWorkflowLabel = selectedQuickEntryWorkflow?.name ?? t("tasks.workflow", "Workflow");
   const selectedQuickEntryWorkflowIcon = selectedQuickEntryWorkflow?.icon;
   const selectedWorkflowForCreate = workflowId === undefined ? undefined : quickEntryWorkflowId;
+  const validatedStartWorkflow = useMemo(() => validateQuickAddStartWorkflow(selectedQuickEntryWorkflow), [selectedQuickEntryWorkflow]);
+  const startInitialColumn = validatedStartWorkflow ? resolveQuickAddStartInitialColumn(validatedStartWorkflow) : null;
+  const startWorkflowTarget = validatedStartWorkflow ? resolveQuickAddStartWorkflowTarget(validatedStartWorkflow) : null;
+  /*
+  FNXC:QuickAddStart 2026-09-13-17:28:
+  Alpha exposes two outcomes through its single icon-only Save action: a brief click or tap saves the task, while a
+  continuous 500ms hold starts it. Legacy surfaces retain the explicit Start chip. Eligibility remains
+  `workflowSupportsQuickAddStart`: Coding (Ideas), or a workflow whose first visible lane is a server-derived
+  manual-intake/"waiting" column. A provable target is still required (`startInitialColumn` for the create-time
+  column override, or `onMoveTask` for the follow-up move), so malformed or ineligible workflows never turn Save
+  into an inferred transition.
+  */
+  const canQuickAddStart = Boolean(validatedStartWorkflow && workflowSupportsQuickAddStart(validatedStartWorkflow) && startWorkflowTarget && (startInitialColumn || onMoveTask));
+  const canQuickAddStartNow = canQuickAddStart && Boolean(description.trim()) && !isSubmitting;
 
   useEffect(() => {
     const parentChanged = previousWorkflowDefaultRef.current.workflowId !== workflowId
@@ -369,6 +475,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     let cancelled = false;
     setOptionalSteps([]);
     setEnabledOptionalStepIds([]);
+    preFastOptionalStepIdsRef.current = null;
 
     if (!effectiveOptionalWorkflowId) {
       return () => {
@@ -380,6 +487,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
       .then((steps) => {
         if (cancelled) return;
         setOptionalSteps(steps);
+        preFastOptionalStepIdsRef.current = null;
         /*
         FNXC:FastOptionalSteps 2026-06-30-10:24:
         Optional-step metadata can resolve after the operator has already selected Fast. Seed `[]` in that race so async defaultOn loading cannot undo Fast's speed-first opt-out; later dropdown clicks still add explicit selections normally.
@@ -390,6 +498,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
         if (cancelled) return;
         setOptionalSteps([]);
         setEnabledOptionalStepIds([]);
+        preFastOptionalStepIdsRef.current = null;
       });
 
     return () => {
@@ -411,14 +520,28 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
 
   FNXC:FastOptionalSteps 2026-06-30-10:41:
   A Fast create must submit explicit `[]` even if optional-step metadata has not loaded yet; otherwise the store/engine see `enabledWorkflowSteps` as omitted and re-seed default-on gates.
+
+  FNXC:FastOptionalSteps 2026-08-29-12:08:
+  FN-260 makes Fast reversible: leaving it restores the pre-Fast selection plus any steps explicitly enabled while Fast was active. Invalidate that baseline whenever non-user metadata seeding or reset replaces the enabled set, so stale workflow selections fall back to the current defaultOn seed.
   */
+
   const toggleFastMode = useCallback(() => {
-    setIsFastMode((prev) => {
-      const next = !prev;
-      if (next) setEnabledOptionalStepIds([]);
-      return next;
-    });
-  }, []);
+    const next = !isFastMode;
+    if (next) {
+      preFastOptionalStepIdsRef.current = enabledOptionalStepIds;
+      setEnabledOptionalStepIds([]);
+    } else {
+      setEnabledOptionalStepIds(
+        restoreOptionalStepsOnFastExit(
+          preFastOptionalStepIdsRef.current,
+          enabledOptionalStepIds,
+          defaultOnOptionalStepIds,
+        ),
+      );
+      preFastOptionalStepIdsRef.current = null;
+    }
+    setIsFastMode(next);
+  }, [defaultOnOptionalStepIds, enabledOptionalStepIds, isFastMode]);
 
   const executorSelectionValue = getModelSelectionValue(executorProvider, executorModelId);
   const validatorSelectionValue = getModelSelectionValue(validatorProvider, validatorModelId);
@@ -449,12 +572,26 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     setDescription(getScopedItem(STORAGE_KEY, projectId) || "");
   }, [projectId]);
 
-  // Persist description to localStorage whenever it changes
+  /*
+  FNXC:QuickAddDraftPersistence 2026-08-20-00:43:
+  Quick Add's in-memory draft remains authoritative for task creation. Browser restoration is best-effort and capped so a pasted description cannot exhaust localStorage or interrupt typing (Runfusion/Fusion#3477).
+  */
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      setScopedItem(STORAGE_KEY, description, projectId);
+    if (description.length === 0) {
+      removeScopedItem(STORAGE_KEY, projectId);
+      return;
     }
-  }, [description, projectId]);
+
+    const persisted = setScopedItem(STORAGE_KEY, description, projectId, {
+      maxBytes: MAX_PERSISTED_DRAFT_BYTES,
+    });
+    if (persisted) {
+      draftPersistenceWarningShownRef.current = false;
+    } else if (!draftPersistenceWarningShownRef.current) {
+      draftPersistenceWarningShownRef.current = true;
+      addToast(t("tasks.draftTooLargeToSave", "Draft is too large to save in this browser — it will not be restored after a reload."), "warning");
+    }
+  }, [addToast, description, projectId, t]);
 
   // Clear agents cache when projectId changes to prevent stale agents from leaking across projects
   useEffect(() => {
@@ -464,6 +601,17 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     previousProjectIdRef.current = projectId;
     setAgents([]);
     setAgentsProjectId(undefined);
+    /*
+    FNXC:QuickAddAttachments 2026-07-23-00:00:
+    Pending files belong to the project where they were selected. Clear them on a project switch so
+    an attachment cannot be uploaded into the next project's newly created task, and release image URLs.
+    */
+    setPendingAttachments((pending) => {
+      for (const attachment of pending) {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      }
+      return [];
+    });
     setSelectedAgentId(null);
     setShowAgentPicker(false);
     setAgentPickerPosition(null);
@@ -477,13 +625,13 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   }, []);
 
   useEffect(() => {
-    pendingImagesRef.current = pendingImages;
-  }, [pendingImages]);
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
 
-  // Cleanup image preview URLs on unmount
+  // Clean up image preview URLs on unmount
   useEffect(() => {
     return () => {
-      pendingImagesRef.current.forEach((img) => URL.revokeObjectURL(img.previewUrl));
+      pendingAttachmentsRef.current.forEach((attachment) => { if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl); });
     };
   }, []);
 
@@ -500,12 +648,11 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   }, []);
 
   // Resize when description changes (not in fullscreen mode since CSS handles it)
-  // FNXC:QuickEntry 2026-06-22-19:25: singleLine (List view) must stay one line — skip auto-resize-to-scrollHeight so the textarea never grows tall with content; CSS clamps it to the one-line height.
   useEffect(() => {
-    if (isExpanded && !singleLine) {
+    if (isExpanded) {
       autoResize();
     }
-  }, [description, isExpanded, autoResize, singleLine]);
+  }, [description, isExpanded, autoResize]);
 
   /*
   FNXC:QuickEntryFocus 2026-06-25-00:00:
@@ -526,7 +673,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
       const clickedInsideTrigger = modelTriggerRef.current?.contains(target);
       const clickedInsidePortal = modelMenuPortalRef.current?.contains(target);
       // Also check for clicks inside CustomModelDropdown's portaled dropdown
-      const clickedInsideCombobox = (target instanceof Element) && (target.closest?.(".model-combobox-dropdown--portal") != null);
+      const clickedInsideCombobox = isInsidePortaledModelMenu(target);
 
       if (!clickedInsideTrigger && !clickedInsidePortal && !clickedInsideCombobox) {
         setIsModelMenuOpen(false);
@@ -608,8 +755,8 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   }, [showWorkflowPicker]);
 
   const resetForm = useCallback(() => {
-    pendingImages.forEach((img) => URL.revokeObjectURL(img.previewUrl));
-    setPendingImages([]);
+    pendingAttachments.forEach((attachment) => { if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl); });
+    setPendingAttachments([]);
     dragDepthRef.current = 0;
     setIsFileDragOver(false);
     if (fileInputRef.current) {
@@ -627,18 +774,23 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     setPriorityPickerPosition(null);
     setExecutorProvider(undefined);
     setExecutorModelId(undefined);
+    setCredentialInstanceId(undefined);
     setValidatorProvider(undefined);
     setValidatorModelId(undefined);
+    setValidatorCredentialInstanceId(undefined);
     setPlanningProvider(undefined);
     setPlanningModelId(undefined);
+    setPlanningCredentialInstanceId(undefined);
     setMergerProvider(undefined);
     setMergerModelId(undefined);
+    setMergerCredentialInstanceId(undefined);
     setThinkingLevel("");
     setValidatorThinkingLevel("");
     setPlanningThinkingLevel("");
     setMergerThinkingLevel("");
     setSelectedPresetId(undefined);
-    setEnabledOptionalStepIds(optionalSteps.filter((step) => step.defaultOn).map((step) => step.templateId));
+    setEnabledOptionalStepIds(defaultOnOptionalStepIds);
+    preFastOptionalStepIdsRef.current = null;
     setIsFastMode(false);
     setGithubTrackingOverride(null);
     setSessionAdvisorOverride(null);
@@ -656,21 +808,22 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     if (typeof window !== "undefined") {
       removeScopedItem(STORAGE_KEY, projectId);
     }
-  }, [pendingImages, projectId, optionalSteps]);
+  }, [defaultOnOptionalStepIds, pendingAttachments, projectId]);
 
-  const handleImageFiles = useCallback((files: FileList | File[] | null | undefined) => {
+  const handleAttachmentFiles = useCallback((files: FileList | File[] | null | undefined) => {
     if (!files || files.length === 0) return;
 
-    const newImages: PendingImage[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (ALLOWED_IMAGE_TYPES.includes(file.type)) {
-        newImages.push({ file, previewUrl: URL.createObjectURL(file) });
-      }
+    const newAttachments: PendingAttachment[] = [];
+    for (const file of Array.from(files)) {
+      if (!ALLOWED_TASK_ATTACHMENT_TYPES.has(file.type)) continue;
+      newAttachments.push({
+        file,
+        previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined,
+      });
     }
 
-    if (newImages.length > 0) {
-      setPendingImages((prev) => [...prev, ...newImages]);
+    if (newAttachments.length > 0) {
+      setPendingAttachments((prev) => [...prev, ...newAttachments]);
     }
   }, []);
 
@@ -680,12 +833,13 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   }, []);
 
   /*
-  FNXC:QuickAddAttachments 2026-06-30-00:00:
-  Quick Add uses an icon-only paperclip to keep the action row compact, so the accessible name and title carry the Attach action plus pending-image count. The same image intake path handles file input, paste, and file drag/drop so previews and post-create uploads stay consistent.
+  FNXC:QuickAddAttachments 2026-07-23-00:00:
+  Quick Add must accept exactly the task-store attachment MIME set through picker, paste, and drop.
+  Only images receive object URLs and preview controls; all other accepted files remain uploadable file chips.
   */
-  const attachLabel = pendingImages.length > 0
-    ? t("tasks.attachImagesCount", "Attach images ({{count}} pending)", { count: pendingImages.length })
-    : t("tasks.attachImages", "Attach images");
+  const attachLabel = pendingAttachments.length > 0
+    ? t("tasks.attachFilesCount", "Attach photos or files ({{count}} pending)", { count: pendingAttachments.length })
+    : t("tasks.attachFiles", "Attach photos or files");
 
   const handleDragEnter = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     if (!isFileDrag(e.dataTransfer)) return;
@@ -720,19 +874,19 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     e.preventDefault();
     clearFileDragState();
     if (isSubmitting) return;
-    handleImageFiles(e.dataTransfer.files);
-  }, [clearFileDragState, handleImageFiles, isFileDrag, isSubmitting]);
+    handleAttachmentFiles(e.dataTransfer.files);
+  }, [clearFileDragState, handleAttachmentFiles, isFileDrag, isSubmitting]);
 
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (isSubmitting) return;
-    handleImageFiles(e.clipboardData?.files);
-  }, [handleImageFiles, isSubmitting]);
+    handleAttachmentFiles(e.clipboardData?.files);
+  }, [handleAttachmentFiles, isSubmitting]);
 
-  const removeImage = useCallback((index: number) => {
-    setPendingImages((prev) => {
+  const removeAttachment = useCallback((index: number) => {
+    setPendingAttachments((prev) => {
       const removed = prev[index];
       if (removed) {
-        URL.revokeObjectURL(removed.previewUrl);
+        if (removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
       }
       return prev.filter((_, i) => i !== index);
     });
@@ -744,6 +898,8 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     }
 
     const originalDescription = description;
+    const startWorkflow = startIntentRef.current;
+    const startInitialColumn = startWorkflow ? resolveQuickAddStartInitialColumn(startWorkflow) : null;
     setDescription("");
     try {
       /*
@@ -752,18 +908,23 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
       */
       const createdTask = await onCreate({
         description: trimmed,
-        ...(selectedWorkflowForCreate !== undefined ? { workflowId: selectedWorkflowForCreate } : {}),
+        ...(startWorkflow ? { workflowId: startWorkflow.id } : selectedWorkflowForCreate !== undefined ? { workflowId: selectedWorkflowForCreate } : {}),
+        ...(startInitialColumn ? { column: startInitialColumn as ColumnId } : {}),
         dependencies: dependencies.length ? dependencies : undefined,
         ...(selectedAgentId ? { assignedAgentId: selectedAgentId } : {}),
         modelPresetId: selectedPresetId,
         modelProvider: hasExecutorOverride ? executorProvider : undefined,
         modelId: hasExecutorOverride ? executorModelId : undefined,
+        ...(hasExecutorOverride && credentialInstanceId ? { credentialInstanceId } : {}),
         validatorModelProvider: hasValidatorOverride ? validatorProvider : undefined,
         validatorModelId: hasValidatorOverride ? validatorModelId : undefined,
+        ...(hasValidatorOverride && validatorCredentialInstanceId ? { validatorCredentialInstanceId } : {}),
         planningModelProvider: hasPlanningOverride ? planningProvider : undefined,
         planningModelId: hasPlanningOverride ? planningModelId : undefined,
+        ...(hasPlanningOverride && planningCredentialInstanceId ? { planningCredentialInstanceId } : {}),
         mergerModelProvider: hasMergerOverride ? mergerProvider : undefined,
         mergerModelId: hasMergerOverride ? mergerModelId : undefined,
+        ...(hasMergerOverride && mergerCredentialInstanceId ? { mergerCredentialInstanceId } : {}),
         validatorThinkingLevel: validatorThinkingLevel !== "" ? (validatorThinkingLevel as ThinkingLevel) : undefined,
         planningThinkingLevel: planningThinkingLevel !== "" ? (planningThinkingLevel as ThinkingLevel) : undefined,
         mergerThinkingLevel: mergerThinkingLevel !== "" ? (mergerThinkingLevel as ThinkingLevel) : undefined,
@@ -781,13 +942,40 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
         nodeId: effectiveNodeId,
         acknowledgedDuplicates: overrides?.acknowledgedDuplicates,
       });
-      if (createdTask && pendingImages.length > 0) {
-        const failures: string[] = [];
-        for (const pendingImage of pendingImages) {
+      /*
+      FNXC:QuickAddStart 2026-07-22-17:45:
+      Coding (Ideas) Start submits its validated Todo destination in the original create request.
+      Custom hold workflows retain their returned-task promotion path; unprovable targets stay
+      create-only, so Save/Enter and malformed metadata never guess a transition.
+      */
+      if (startWorkflow && !startInitialColumn && createdTask && typeof createdTask === "object"
+        && typeof createdTask.id === "string" && createdTask.id.trim()
+        && typeof createdTask.column === "string" && createdTask.column.trim()
+        && typeof (createdTask as Task & { workflowId?: unknown }).workflowId === "string"
+        && (createdTask as Task & { workflowId?: string }).workflowId === startWorkflow.id) {
+        const target = resolveQuickAddStartTargetColumn(startWorkflow, createdTask.column);
+        if (target && onMoveTask) {
           try {
-            await uploadAttachment(createdTask.id, pendingImage.file, projectId);
+            await onMoveTask(createdTask.id, target as ColumnId);
+            /*
+            FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+            Honest copy: this path performs a column move, not a plan dispatch. The old "Started
+            planning" claim was optimistic — planning begins when the engine admits the card, which
+            a busy maxConcurrent pool can defer indefinitely. Same wording as TaskCard's Start.
+            */
+            addToast(t("tasks.queuedForPlanning", "Queued {{taskId}} for planning", { taskId: createdTask.id }), "success");
+          } catch (moveError) {
+            addToast(getErrorMessage(moveError) || t("tasks.createFailed", "Failed to create task"), "error");
+          }
+        }
+      }
+      if (createdTask && typeof createdTask.id === "string" && createdTask.id.trim() && pendingAttachments.length > 0) {
+        const failures: string[] = [];
+        for (const pendingAttachment of pendingAttachments) {
+          try {
+            await uploadAttachment(createdTask.id, pendingAttachment.file, projectId);
           } catch {
-            failures.push(pendingImage.file.name);
+            failures.push(pendingAttachment.file.name);
           }
         }
 
@@ -800,11 +988,13 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
       setDescription(originalDescription);
       addToast(getErrorMessage(err) || t("tasks.createFailed", "Failed to create task"), "error");
     } finally {
+      startIntentRef.current = null;
       submitInFlightRef.current = false;
       setIsSubmitting(false);
     }
   }, [
     onCreate,
+    onMoveTask,
     description,
     dependencies,
     selectedWorkflowForCreate,
@@ -813,12 +1003,16 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     hasExecutorOverride,
     executorProvider,
     executorModelId,
+    credentialInstanceId,
     hasValidatorOverride,
     validatorProvider,
     validatorModelId,
+    validatorCredentialInstanceId,
     hasPlanningOverride,
     planningProvider,
     planningModelId,
+    planningCredentialInstanceId,
+    mergerCredentialInstanceId,
     thinkingLevel,
     enabledOptionalStepIds,
     isFastMode,
@@ -827,10 +1021,11 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     sessionAdvisorOverride,
     priority,
     effectiveNodeId,
-    pendingImages,
+    pendingAttachments,
     projectId,
     addToast,
     resetForm,
+    t,
   ]);
 
   const handleSubmit = useCallback(async () => {
@@ -896,6 +1091,13 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   }, [description, duplicateMatches, submitCreateTask]);
 
   const handleDuplicateCancel = useCallback(() => {
+    /*
+    FNXC:QuickAddStart 2026-09-12-21:38:
+    Cancelling duplicate confirmation discards the saved Start intent but retains the completed hold's click barrier.
+    The gesture's trailing pointer/key release and synthetic click must be consumed before a later independent Save,
+    even when the dialog closes while the original physical gesture is still held.
+    */
+    startIntentRef.current = null;
     setDuplicateMatches(null);
     submitInFlightRef.current = false;
     setIsSubmitting(false);
@@ -907,17 +1109,26 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
         if (e.shiftKey) {
           // Allow Shift+Enter to insert a newline in any quick-entry state
           // Don't prevent default - let the newline be inserted
-          // FNXC:QuickEntry 2026-06-22-19:25: singleLine (List view) stays one line even on Shift+Enter — do not expand the textarea.
-          if (!singleLine) {
-            setIsExpanded(true);
-          }
+          setIsExpanded(true);
           return;
         }
-        // Enter without Shift submits
-        e.preventDefault();
         if (duplicateMatches || submitInFlightRef.current) {
+          e.preventDefault();
           return;
         }
+        /*
+        FNXC:QuickEntry 2026-08-16-03:15:
+        The global Quick Add option defaults on to preserve historical Enter submission. When disabled, plain Enter remains a browser newline while Cmd/Ctrl+Enter stays the explicit save accelerator.
+        */
+        if (e.metaKey || e.ctrlKey) {
+          e.preventDefault();
+          handleSubmit();
+          return;
+        }
+        if (!enterSubmits) {
+          return;
+        }
+        e.preventDefault();
         handleSubmit();
       } else if (e.key === "Escape") {
         e.preventDefault();
@@ -988,7 +1199,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
       projectId,
       setIsDisclosureExpanded,
       duplicateMatches,
-      singleLine,
+      enterSubmits,
     ],
   );
 
@@ -1002,11 +1213,10 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
 
   const handleFocus = useCallback(() => {
     // Auto-expand on focus when autoExpand prop is true (default)
-    // FNXC:QuickEntry 2026-06-22-19:25: never auto-expand the textarea on focus when singleLine (List view) — it must stay one line.
-    if (autoExpand && !singleLine) {
+    if (autoExpand) {
       setIsExpanded(true);
     }
-  }, [autoExpand, singleLine]);
+  }, [autoExpand]);
 
   const toggleDep = useCallback((id: string) => {
     setDependencies((prev) =>
@@ -1014,361 +1224,206 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
     );
   }, []);
 
-  const getEffectiveViewport = useCallback(() => {
-    const vv = window.visualViewport;
-    if (vv && vv.width > 0 && vv.height > 0) {
-      return {
-        width: vv.width,
-        height: vv.height,
-        offsetTop: vv.offsetTop,
-        offsetLeft: vv.offsetLeft,
-      };
-    }
-
-    return {
-      width: window.innerWidth,
-      height: window.innerHeight,
-      offsetTop: 0,
-      offsetLeft: 0,
-    };
-  }, []);
-
+  /*
+  FNXC:QuickAddDepsMenu 2026-07-25-12:00:
+  All Quick Add portaled menus (Deps, Models, workflow, agent, node, priority) share anchor-first
+  layout-viewport positioning. Mixing visualViewport offsets with getBoundingClientRect, or deriving
+  upward `top` from a height cap, made short menus float too high; upward portals consume `bottom`
+  and `top: auto` so their rendered bottom remains attached regardless of content height.
+  */
   const updateModelMenuPosition = useCallback(() => {
     const trigger = modelTriggerRef.current;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 360)
       : Math.min(viewportHeight * 0.5, 360);
-
-    const preferredDesktopWidth = Math.max(rect.width * 1.35, 320);
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 360)
-      : preferredDesktopWidth;
+      : Math.max(rect.width * 1.35, 320);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 240),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setModelMenuPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 240,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setModelMenuPosition({
+      top: position.top,
+      bottom: position.bottom,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateWorkflowPickerPosition = useCallback(() => {
     const trigger = workflowTriggerRef.current;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
     const preferredHeight = Math.min(viewportHeight * (isMobile ? 0.6 : 0.5), 360);
     /*
     FNXC:QuickAddWorkflow 2026-06-30-16:16:
-    The workflow menu is wider than its compact trigger, so portal and clamp it against the visual viewport instead of anchoring it to the trigger's inline start. This keeps right-side Board columns and wrapped mobile action rows readable without horizontal overflow.
+    The workflow menu is wider than its compact trigger, so portal and clamp it against the layout viewport instead of anchoring it to the trigger's inline start. This keeps right-side Board columns and wrapped mobile action rows readable without horizontal overflow.
+
+    FNXC:QuickAddDepsMenu 2026-07-25-12:00:
+    Width still expands past the compact trigger; vertical placement uses the shared anchor-first helper so the menu stays attached like Deps/Models.
     */
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 448)
       : Math.min(Math.max(rect.width * 3, 448), 512);
-    const width = Math.min(
+
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 240),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 180);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 180);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      180,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setWorkflowPickerPosition({ top, left, width, maxHeight });
-  }, [getEffectiveViewport]);
+      preferredHeight,
+      minWidth: 240,
+      horizontalPadding,
+    });
+    setWorkflowPickerPosition({
+      top: position.top,
+      bottom: position.bottom,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateDepDropdownPosition = useCallback(() => {
     const trigger = depTriggerRef.current;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 320)
       : Math.min(viewportHeight * 0.5, 320);
-
     // Wider dropdown for dependency selection - easier to read task names
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 360)
       : Math.max(rect.width, 280);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 240),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 200);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 200);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      200,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setDepDropdownPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 240,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setDepDropdownPosition({
+      top: position.top,
+      bottom: position.bottom,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateAgentPickerPosition = useCallback(() => {
     const trigger = agentPickerRef.current?.querySelector("button") as HTMLButtonElement | null;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 320)
       : Math.min(viewportHeight * 0.5, 320);
-
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 280)
       : Math.max(rect.width, 240);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 200),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setAgentPickerPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 200,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setAgentPickerPosition({
+      top: position.top,
+      bottom: position.bottom,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateNodePickerPosition = useCallback(() => {
     const trigger = nodePickerRef.current?.querySelector("button") as HTMLButtonElement | null;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 320)
       : Math.min(viewportHeight * 0.5, 320);
-
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 280)
       : Math.max(rect.width, 240);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 200),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setNodePickerPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 200,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setNodePickerPosition({
+      top: position.top,
+      bottom: position.bottom,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updatePriorityPickerPosition = useCallback(() => {
     const trigger = priorityPickerRef.current?.querySelector("button") as HTMLButtonElement | null;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
-    const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
-    const preferredHeight = 220;
-    const width = Math.min(
-      Math.max(rect.width, 200),
-      Math.max(viewportWidth - horizontalPadding * 2, 200),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setPriorityPickerPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
+      preferredWidth: Math.max(rect.width, 200),
+      preferredHeight: 220,
+      minWidth: 200,
     });
-  }, [getEffectiveViewport]);
+    setPriorityPickerPosition({
+      top: position.top,
+      bottom: position.bottom,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   // Keep model menu portal anchored during scroll/resize
   useEffect(() => {
@@ -1522,18 +1577,21 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
 
   const handlePlanningModelChange = useCallback((value: string) => {
     const next = parseModelSelection(value);
+    setPlanningCredentialInstanceId(undefined);
     setPlanningProvider(next.provider);
     setPlanningModelId(next.modelId);
   }, []);
 
   const handleExecutorChange = useCallback((value: string) => {
     const next = parseModelSelection(value);
+    setCredentialInstanceId(undefined);
     setExecutorProvider(next.provider);
     setExecutorModelId(next.modelId);
   }, []);
 
   const handleValidatorChange = useCallback((value: string) => {
     const next = parseModelSelection(value);
+    setValidatorCredentialInstanceId(undefined);
     setValidatorProvider(next.provider);
     setValidatorModelId(next.modelId);
   }, []);
@@ -1541,6 +1599,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const handleThinkingLevelChange = useCallback((value: string) => setThinkingLevel(value), []);
   const handleMergerModelChange = useCallback((value: string) => {
     const next = parseModelSelection(value);
+    setMergerCredentialInstanceId(undefined);
     setMergerProvider(next.provider);
     setMergerModelId(next.modelId);
   }, []);
@@ -1595,25 +1654,89 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   FNXC:QuickEntry 2026-06-30-00:00:
   Quick-add intentionally exposes no Plan button, disabled Plan state, tooltip, test id, or click target. Keep non-quick-add planning entry points such as the New Task dialog and model-menu planning lane intact.
   */
-  const handleSubtaskClick = useCallback(() => {
-    const trimmed = description.trim();
-    if (!trimmed) {
-      addToast(t("tasks.enterDescriptionFirst", "Enter a description first"), "error");
-      return;
-    }
-    if (selectedWorkflowForCreate !== undefined) {
-      onSubtaskBreakdown?.(trimmed, selectedWorkflowForCreate);
-    } else {
-      onSubtaskBreakdown?.(trimmed);
-    }
-    // Clear the form after triggering subtask breakdown
-    resetForm();
-  }, [description, onSubtaskBreakdown, selectedWorkflowForCreate, addToast, resetForm]);
+  /*
+  FNXC:QuickAddStart 2026-07-24-11:20:
+  Start stashes the workflow snapshot validated at click time in `startIntentRef` and then runs the SAME submit
+  path as Save. The snapshot (not live state) is what `submitCreateTask` reads, so a workflow list refreshed
+  mid-duplicate-confirmation cannot retarget an in-flight Start.
+  */
+  const handleStartClick = useCallback((workflowSnapshot: ValidatedQuickAddWorkflow | null = validatedStartWorkflow) => {
+    if (!canQuickAddStartNow || !workflowSnapshot) return;
+    startIntentRef.current = workflowSnapshot;
+    void handleSubmit();
+  }, [canQuickAddStartNow, handleSubmit, validatedStartWorkflow]);
 
-  const handleSaveClick = useCallback(() => {
-    // Save button now creates the task (same as Enter key)
-    handleSubmit();
-  }, [handleSubmit]);
+  const cancelAlphaSaveGesture = useCallback((suppressClick = false) => {
+    const hadActiveGesture = alphaSaveGestureRef.current !== null;
+    if (alphaSaveTimerRef.current) clearTimeout(alphaSaveTimerRef.current);
+    alphaSaveTimerRef.current = null;
+    alphaSaveGestureRef.current = null;
+    alphaStartWorkflowRef.current = null;
+    if (hadActiveGesture) alphaSaveSuppressClickRef.current = suppressClick;
+    setAlphaSaveState("idle");
+  }, []);
+
+  const releaseAlphaSaveClickBarrierAfterTerminalEvent = useCallback(() => {
+    if (!alphaSaveSuppressClickRef.current || alphaSaveBarrierReleaseTimerRef.current) return;
+    alphaSaveBarrierReleaseTimerRef.current = setTimeout(() => {
+      alphaSaveBarrierReleaseTimerRef.current = null;
+      alphaSaveSuppressClickRef.current = false;
+    }, 0);
+  }, []);
+
+  const beginAlphaSaveGesture = useCallback((gesture: AlphaSaveGesture) => {
+    if (!alphaActive || !canQuickAddStartNow || !validatedStartWorkflow || alphaSaveGestureRef.current || alphaSaveSuppressClickRef.current) return false;
+    alphaSaveGestureRef.current = gesture;
+    alphaStartWorkflowRef.current = validatedStartWorkflow;
+    setAlphaSaveState("holding");
+    alphaSaveTimerRef.current = setTimeout(() => {
+      const workflowSnapshot = alphaStartWorkflowRef.current;
+      alphaSaveTimerRef.current = null;
+      alphaSaveGestureRef.current = null;
+      alphaStartWorkflowRef.current = null;
+      alphaSaveSuppressClickRef.current = true;
+      setAlphaSaveState("idle");
+      handleStartClick(workflowSnapshot);
+    }, ALPHA_START_HOLD_DURATION_MS);
+    return true;
+  }, [alphaActive, canQuickAddStartNow, handleStartClick, validatedStartWorkflow]);
+
+  const completeAlphaSaveGesture = useCallback((gesture: AlphaSaveGesture) => {
+    const active = alphaSaveGestureRef.current;
+    const matches = active?.kind === gesture.kind && (active.kind === "pointer"
+      ? active.pointerId === (gesture as Extract<AlphaSaveGesture, { kind: "pointer" }>).pointerId
+      : active.key === (gesture as Extract<AlphaSaveGesture, { kind: "keyboard" }>).key);
+    if (!matches) return;
+    cancelAlphaSaveGesture(true);
+    void handleSubmit();
+  }, [cancelAlphaSaveGesture, handleSubmit]);
+
+  /*
+  FNXC:AlphaQuickEntry 2026-09-13-17:28:
+  Pointer and keyboard holds share one 500ms timer and one captured workflow snapshot. Only a primary pointer using
+  its primary button may begin a hold. Explicit cancellation never saves; an ordinary release before the threshold
+  saves exactly once and consumes its synthetic click. Reaching the threshold consumes Start exactly once, arms
+  suppression for late release/click events, and resets the visual state to Save immediately rather than tying
+  protection to rendered confirmation state. Workflow changes, submission, disablement, blur, Escape, capture loss,
+  and unmount invalidate a pending gesture.
+
+  FNXC:AlphaQuickEntry 2026-09-12-21:38:
+  A completed Start hold owns its synthetic-click barrier until the trailing click is consumed, independently of
+  submission success, failure, or duplicate-dialog cancellation. Success can reset and re-enable the form before the
+  pointer is released, while cancellation preserves the draft; neither outcome may let that same physical gesture
+  save a new or retained draft. After pointerup/keyup, a zero-delay terminal-event fence releases the barrier only
+  after the browser's associated click turn; this also prevents a click suppressed by a temporarily disabled native
+  button from consuming the next independent Save. A new hold cannot replace an unconsumed gesture barrier.
+  */
+  useEffect(() => () => {
+    cancelAlphaSaveGesture();
+    if (alphaSaveBarrierReleaseTimerRef.current) clearTimeout(alphaSaveBarrierReleaseTimerRef.current);
+  }, [cancelAlphaSaveGesture]);
+  useEffect(() => {
+    if (alphaSaveGestureRef.current && (!alphaActive || isSubmitting || isDisabled || !canQuickAddStartNow || alphaStartWorkflowRef.current !== validatedStartWorkflow)) {
+      cancelAlphaSaveGesture(true);
+    }
+  }, [alphaActive, canQuickAddStartNow, cancelAlphaSaveGesture, isDisabled, isSubmitting, validatedStartWorkflow]);
 
   const truncate = (s: string, len: number) =>
     s.length > len ? s.slice(0, len) + "…" : s;
@@ -1703,9 +1826,13 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   const priorityLabel = getPriorityLabel(priority);
   const priorityButtonLabel = t("tasks.quickEntryPriorityLabel", "Priority: {{priority}}", { priority: priorityLabel });
   const fastToggleLabel = t("tasks.toggleFastMode", "Toggle fast execution mode");
+  const disclosureLabel = isDisclosureExpanded
+    ? t("tasks.hideAdvancedOptions", "Hide advanced options")
+    : t("tasks.showAdvancedOptions", "Show advanced options");
 
-  // Show expanded controls based on disclosure state (user preference), not textarea focus
+  // Alpha keeps immediate actions available while disclosure controls advanced routing options only.
   const showExpandedControls = isDisclosureExpanded;
+  const showActionRow = alphaActive || showExpandedControls;
 
   const toggleExpanded = useCallback(() => {
     setIsDisclosureExpanded((prev) => {
@@ -1718,7 +1845,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
   return (
     <>
       <div
-        className={`quick-entry-box ${isDisclosureExpanded ? "quick-entry-box--expanded" : "quick-entry-box--collapsed"}${singleLine ? " quick-entry--single-line" : ""}${isFileDragOver ? " quick-entry-box--drag-over" : ""}`}
+        className={`quick-entry-box ${isDisclosureExpanded ? "quick-entry-box--expanded" : "quick-entry-box--collapsed"}${isFileDragOver ? " quick-entry-box--drag-over" : ""}`}
         data-testid="quick-entry-box"
         onDragEnter={handleDragEnter}
         onDragOver={handleDragOver}
@@ -1729,15 +1856,15 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
       {isFileDragOver && (
         <div className="quick-entry-drop-target" data-testid="quick-entry-drop-target" aria-hidden="true">
           <Paperclip size={16} aria-hidden="true" />
-          <span>{t("tasks.dropImagesToAttach", "Drop images to attach")}</span>
+          <span>{t("tasks.dropFilesToAttach", "Drop photos or files to attach")}</span>
         </div>
       )}
       <div className="description-with-refine">
         <div className="quick-entry-main-row">
           <div className="quick-entry-textarea-wrap">
-            <textarea
+            <AlphaTextArea
               ref={textareaRef}
-              className={`quick-entry-input ${isExpanded && !singleLine ? "quick-entry-input--expanded" : ""}`}
+              className={`quick-entry-input ${isExpanded ? "quick-entry-input--expanded" : ""}`}
               placeholder={isSubmitting ? t("tasks.creating", "Creating...") : t("tasks.addTaskPlaceholder", "Add a task...")}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -1747,32 +1874,34 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               onBlur={handleBlur}
               disabled={isSubmitting || isDisabled}
               data-testid="quick-entry-input"
-              rows={singleLine ? 1 : 2}
+              rows={2}
               aria-controls="quick-entry-controls"
               aria-expanded={isDisclosureExpanded}
             />
           </div>
-          <button
+          <MicButton {...dictation.micProps} disabled={isSubmitting || isDisabled} />
+          <AlphaButton
             type="button"
             className="btn btn-sm quick-entry-toggle"
             onClick={toggleExpanded}
             aria-expanded={isDisclosureExpanded}
             aria-controls="quick-entry-controls"
             data-testid="quick-entry-toggle"
-            title={isDisclosureExpanded ? t("tasks.collapse", "Collapse") : t("tasks.expand", "Expand")}
+            title={alphaActive ? disclosureLabel : (isDisclosureExpanded ? t("tasks.collapse", "Collapse") : t("tasks.expand", "Expand"))}
+            aria-label={alphaActive ? disclosureLabel : (isDisclosureExpanded ? t("tasks.collapse", "Collapse") : t("tasks.expand", "Expand"))}
           >
             {isDisclosureExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-          </button>
+          </AlphaButton>
         </div>
       </div>
       <div
         id="quick-entry-controls"
         className="quick-entry-controls"
-        hidden={!showExpandedControls}
-        aria-hidden={!showExpandedControls}
+        hidden={!showActionRow}
+        aria-hidden={!showActionRow}
       >
-        {/* All quick-create actions behind single disclosure toggle */}
-        {showExpandedControls && !isSubmitting && (
+        {/* Alpha keeps immediate actions visible and progressively discloses advanced options. */}
+        {showActionRow && !isSubmitting && (
           <div
             className="quick-entry-actions"
             data-testid="quick-entry-actions"
@@ -1798,7 +1927,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
             FNXC:BoardComposer 2026-07-10-12:00:
             First-run review flagged the quick-add composer as disorganized: chips wrapped into four
             arbitrary-looking rows with Save buried mid-row. Reorganize into two logical clusters inside
-            the single wrapping action row: an options group (workflow, optional steps, subtask, deps,
+            the single wrapping action row: an options group (workflow, optional steps, deps,
             models, node, agent) and a right-aligned primary group (attach, GitHub tracking, Priority,
             Fast, Save) so status controls sit beside attach and Save still reads last/right.
 
@@ -1807,10 +1936,14 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
             up/high, down/low, flag/normal, alert/urgent glyph helper, and Fast uses Zap while retaining
             title/aria-label/test-id semantics.
             */}
-            <div className="quick-entry-options-group" data-testid="quick-entry-options-group">
+            {(!alphaActive || showExpandedControls) && (
+            <div
+              className="quick-entry-options-group"
+              data-testid="quick-entry-options-group"
+            >
             {showWorkflowSelector && (
               <div className="quick-entry-workflow-wrap" ref={workflowPickerRef}>
-                <button
+                <AlphaButton
                   ref={workflowTriggerRef}
                   type="button"
                   className="btn btn-sm dep-trigger quick-entry-workflow-trigger"
@@ -1856,16 +1989,18 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                   />
                   <span className="quick-entry-workflow-label">{quickEntryWorkflowLabel}</span>
                   <ChevronDown size={12} aria-hidden="true" />
-                </button>
+                </AlphaButton>
                 {showWorkflowPicker && portalRoot && workflowPickerPosition && createPortal(
-                  <div
+                  <AlphaPopoverSurface
                     ref={workflowPickerPortalRef}
+                    triggerRef={workflowPickerRef}
+                    onClose={() => setShowWorkflowPicker(false)}
                     className="dep-dropdown quick-entry-workflow-menu"
-                    role="listbox"
                     data-testid="quick-entry-workflow-menu"
                     style={{
                       position: "fixed",
-                      top: `${workflowPickerPosition.top}px`,
+                      top: workflowPickerPosition.bottom === null ? `${workflowPickerPosition.top}px` : "auto",
+                      bottom: workflowPickerPosition.bottom === null ? undefined : `${workflowPickerPosition.bottom}px`,
                       left: `${workflowPickerPosition.left}px`,
                       width: `${workflowPickerPosition.width}px`,
                       maxHeight: workflowPickerPosition.maxHeight ? `${workflowPickerPosition.maxHeight}px` : undefined,
@@ -1873,16 +2008,18 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                     }}
                   >
                     <div className="dep-dropdown-search-header">{t("tasks.quickEntryWorkflowHeader", "Create in workflow")}</div>
+                    <AlphaListBox aria-label={t("tasks.quickEntryWorkflowHeader", "Create in workflow")}>
                     {realWorkflowOptions.map((option) => {
                       const duplicateName = (quickEntryWorkflowNameCounts.get(option.name) ?? 0) > 1;
                       const optionLabel = duplicateName
                         ? t("tasks.quickEntryWorkflowDuplicateLabel", "{{name}} ({{id}})", { name: option.name, id: option.id })
                         : option.name;
                       return (
-                        <button
+                        <AlphaListBoxItem
                           key={option.id}
-                          type="button"
-                          role="option"
+                          id={option.id}
+                          textValue={optionLabel}
+                          legacyAs="button"
                           aria-selected={quickEntryWorkflowId === option.id}
                           aria-label={optionLabel}
                           className={`dep-dropdown-item quick-entry-workflow-option${quickEntryWorkflowId === option.id ? " selected" : ""}`}
@@ -1899,10 +2036,11 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                             <span className="dep-dropdown-title quick-entry-workflow-option-name">{option.name}</span>
                             {duplicateName ? <span className="dep-dropdown-subtitle quick-entry-workflow-option-id">{option.id}</span> : null}
                           </span>
-                        </button>
+                        </AlphaListBoxItem>
                       );
                     })}
-                  </div>,
+                    </AlphaListBox>
+                  </AlphaPopoverSurface>,
                   portalRoot,
                 )}
               </div>
@@ -1916,28 +2054,12 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               disabled={isSubmitting || isDisabled}
               triggerTestId="quick-entry-optional-steps-trigger"
             />
-
-            {/* FNXC:QuickAddSubtaskFlag 2026-06-21-00:00: Render no Subtask button or click target unless App wires the default-off `subtaskBreakdown` experiment callback. */}
-            {onSubtaskBreakdown && (
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={handleSubtaskClick}
-                onMouseDown={(e) => e.preventDefault()}
-                disabled={!description.trim()}
-                data-testid="subtask-button"
-                title={t("tasks.subtaskButtonTitle", "Break down into AI-generated subtasks")}
-              >
-                <ListTree size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
-                {t("tasks.subtask", "Subtask")}
-              </button>
-            )}
             {/*
               FNXC:QuickAddRefine 2026-06-30-00:00:
               Quick Add intentionally omits AI Refine so the compact create row has no refine button, menu, loading state, or /ai/refine-text path. New Task and TaskForm keep their dedicated refine affordance for richer task drafting.
             */}
             <div className="dep-trigger-wrap">
-              <button
+              <AlphaButton
                 ref={depTriggerRef}
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
@@ -1967,7 +2089,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               >
                 <Link size={12} style={{ verticalAlign: "middle" }} />
                 {dependencies.length > 0 ? t("tasks.depsCount", "{{count}} deps", { count: dependencies.length }) : t("tasks.deps", "Deps")}
-              </button>
+              </AlphaButton>
             </div>
             {/* Dependency dropdown rendered via portal for proper viewport positioning */}
             {showDeps && portalRoot && depDropdownPosition && (() => {
@@ -1993,14 +2115,15 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                   onMouseDown={(e) => e.preventDefault()}
                   style={{
                     position: "fixed",
-                    top: `${depDropdownPosition.top}px`,
+                    top: depDropdownPosition.bottom === null ? `${depDropdownPosition.top}px` : "auto",
+                    bottom: depDropdownPosition.bottom === null ? undefined : `${depDropdownPosition.bottom}px`,
                     left: `${depDropdownPosition.left}px`,
                     width: `${depDropdownPosition.width}px`,
                     maxHeight: depDropdownPosition.maxHeight ? `${depDropdownPosition.maxHeight}px` : undefined,
                     overflowY: depDropdownPosition.maxHeight ? "auto" : undefined,
                   }}
                 >
-                  <input
+                  <AlphaInput
                     className="dep-dropdown-search"
                     placeholder={t("tasks.searchTasksPlaceholder", "Search tasks…")}
                     autoFocus={typeof document === "undefined" || document.activeElement !== textareaRef.current}
@@ -2028,7 +2151,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               );
             })()}
 
-            <button
+            <AlphaButton
               ref={modelTriggerRef}
               type="button"
               onMouseDown={(e) => e.preventDefault()}
@@ -2049,11 +2172,11 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
             >
               <Brain size={12} style={{ verticalAlign: "middle" }} />
               {modelMenuLabel}
-            </button>
+            </AlphaButton>
 
             {shouldShowNodePicker && (
               <div className="node-trigger-wrap" ref={nodePickerRef}>
-                <button
+                <AlphaButton
                   type="button"
                   onMouseDown={(e) => e.preventDefault()}
                   className="btn btn-sm dep-trigger"
@@ -2085,7 +2208,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                       <NodeHealthDot status={selectedNode.status} showLabel />
                     </span>
                   )}
-                </button>
+                </AlphaButton>
               </div>
             )}
 
@@ -2096,7 +2219,8 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 onMouseDown={(e) => e.preventDefault()}
                 style={{
                   position: "fixed",
-                  top: `${nodePickerPosition.top}px`,
+                  top: nodePickerPosition.bottom === null ? `${nodePickerPosition.top}px` : "auto",
+                  bottom: nodePickerPosition.bottom === null ? undefined : `${nodePickerPosition.bottom}px`,
                   left: `${nodePickerPosition.left}px`,
                   width: `${nodePickerPosition.width}px`,
                   maxHeight: nodePickerPosition.maxHeight ? `${nodePickerPosition.maxHeight}px` : undefined,
@@ -2143,7 +2267,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
             )}
 
             <div className="agent-trigger-wrap" ref={agentPickerRef}>
-              <button
+              <AlphaButton
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
                 className="btn btn-sm dep-trigger"
@@ -2163,7 +2287,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               >
                 <Bot size={12} style={{ verticalAlign: "middle" }} />
                 {selectedAgentLabel ? ` ${selectedAgentLabel}` : ` ${t("tasks.agent", "Agent")}`}
-              </button>
+              </AlphaButton>
             </div>
             {showAgentPicker && portalRoot && agentPickerPosition && createPortal(
               <div
@@ -2172,7 +2296,8 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 onMouseDown={(e) => e.preventDefault()}
                 style={{
                   position: "fixed",
-                  top: `${agentPickerPosition.top}px`,
+                  top: agentPickerPosition.bottom === null ? `${agentPickerPosition.top}px` : "auto",
+                  bottom: agentPickerPosition.bottom === null ? undefined : `${agentPickerPosition.bottom}px`,
                   left: `${agentPickerPosition.left}px`,
                   width: `${agentPickerPosition.width}px`,
                   maxHeight: agentPickerPosition.maxHeight ? `${agentPickerPosition.maxHeight}px` : undefined,
@@ -2216,7 +2341,32 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               </div>,
               portalRoot,
             )}
+
+            {/*
+            FNXC:QuickAddStart 2026-07-31-23:51:
+            Start renders as the last chip in the options group so it wraps onto the same line as Models/Agent and
+            reads as an alternate create action beside Save (which stays right-aligned in the primary group). It is
+            present ONLY for manual-intake/"waiting"-first workflows — `hold` alone is not eligibility because the
+            merged auto-triaging Planning lane also holds cards. With an empty description it stays visible but
+            DISABLED (matching Save) so the affordance does not appear and vanish as the operator types; the whole
+            action row still unmounts while a create is in flight.
+            */}
+            {!alphaActive && canQuickAddStart && (
+              <AlphaButton
+                type="button"
+                className="btn btn-sm quick-entry-start-button"
+                onClick={() => handleStartClick()}
+                onMouseDown={(e) => e.preventDefault()}
+                disabled={!canQuickAddStartNow}
+                data-testid="quick-entry-save-start"
+                title={t("tasks.startTaskTitle", "Create and start the task")}
+              >
+                <Play size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
+                {t("tasks.start", "Start")}
+              </AlphaButton>
+            )}
             </div>
+            )}
 
             {/*
             FNXC:BoardComposer 2026-07-10-12:00:
@@ -2234,7 +2384,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
             ProviderIcon's shared size map to size this one GitHub use case.
             */}
             <div className="quick-entry-primary-group" data-testid="quick-entry-primary-group">
-              <button
+              <AlphaButton
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
                 className="btn btn-icon btn-sm quick-entry-attach-button"
@@ -2244,12 +2394,12 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 title={attachLabel}
               >
                 <Paperclip size={12} aria-hidden="true" />
-                {pendingImages.length > 0 && (
-                  <span className="quick-entry-attach-count" aria-hidden="true">{pendingImages.length}</span>
+                {pendingAttachments.length > 0 && (
+                  <span className="quick-entry-attach-count" aria-hidden="true">{pendingAttachments.length}</span>
                 )}
-              </button>
+              </AlphaButton>
 
-              <button
+              <AlphaButton
                 type="button"
                 className={`btn btn-icon btn-sm ${effectiveGithubTracking ? "btn-primary" : ""}`}
                 onClick={() => {
@@ -2262,7 +2412,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 aria-label={githubToggleLabel}
               >
                 <ProviderIcon provider="github" size="sm" />
-              </button>
+              </AlphaButton>
 
               {/*
               FNXC:PlannerOversight 2026-07-14-18:11:
@@ -2274,7 +2424,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               clear override to null (inherit) — same as TaskDetailModal — instead of
               permanently hardcoding true/false after a double-click.
               */}
-              <button
+              <AlphaButton
                 type="button"
                 className={`btn btn-icon btn-sm ${effectiveSessionAdvisor ? "btn-primary" : ""}`}
                 onClick={() => {
@@ -2291,10 +2441,10 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 aria-label={sessionAdvisorToggleLabel}
               >
                 {effectiveSessionAdvisor ? <Eye size={14} aria-hidden="true" /> : <EyeOff size={14} aria-hidden="true" />}
-              </button>
+              </AlphaButton>
 
               <div className="priority-trigger-wrap" ref={priorityPickerRef}>
-                <button
+                <AlphaButton
                   type="button"
                   onMouseDown={(e) => e.preventDefault()}
                   className="btn btn-icon btn-sm dep-trigger"
@@ -2323,7 +2473,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 >
                   {/* FNXC:PriorityColorCoding 2026-07-11-00:00: The quick-add icon-only priority trigger must preview urgency color from priorityIndicator without changing its label, test id, or picker behavior. */}
                   <PriorityIcon size={14} aria-hidden="true" style={{ color: getPriorityColorVar(priority) }} />
-                </button>
+                </AlphaButton>
               </div>
 
               {showPriorityPicker && portalRoot && priorityPickerPosition && createPortal(
@@ -2333,7 +2483,8 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                   onMouseDown={(e) => e.preventDefault()}
                   style={{
                     position: "fixed",
-                    top: `${priorityPickerPosition.top}px`,
+                    top: priorityPickerPosition.bottom === null ? `${priorityPickerPosition.top}px` : "auto",
+                    bottom: priorityPickerPosition.bottom === null ? undefined : `${priorityPickerPosition.bottom}px`,
                     left: `${priorityPickerPosition.left}px`,
                     width: `${priorityPickerPosition.width}px`,
                     maxHeight: priorityPickerPosition.maxHeight ? `${priorityPickerPosition.maxHeight}px` : undefined,
@@ -2365,7 +2516,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 portalRoot,
               )}
 
-              <button
+              <AlphaButton
                 type="button"
                 className={`btn btn-icon btn-sm ${isFastMode ? "btn-primary" : ""}`}
                 onClick={toggleFastMode}
@@ -2376,40 +2527,115 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                 aria-label={fastToggleLabel}
               >
                 <Zap size={14} aria-hidden="true" />
-              </button>
+              </AlphaButton>
 
-              <button
+              <AlphaButton
+                ref={alphaSaveButtonRef}
                 type="button"
-                className="btn btn-task-create btn-sm"
-                onClick={handleSaveClick}
+                className={`btn btn-task-create btn-sm${alphaActive ? " btn-icon quick-entry-alpha-save" : ""}`}
+                onClick={() => {
+                  if (alphaSaveSuppressClickRef.current) {
+                    alphaSaveSuppressClickRef.current = false;
+                    if (alphaSaveBarrierReleaseTimerRef.current) clearTimeout(alphaSaveBarrierReleaseTimerRef.current);
+                    alphaSaveBarrierReleaseTimerRef.current = null;
+                    return;
+                  }
+                  if (!alphaSaveGestureRef.current) void handleSubmit();
+                }}
                 onMouseDown={(e) => e.preventDefault()}
+                onPointerDown={(event) => {
+                  if (event.button !== 0 || event.isPrimary === false) return;
+                  if (!beginAlphaSaveGesture({ kind: "pointer", pointerId: event.pointerId })) return;
+                  event.currentTarget.setPointerCapture?.(event.pointerId);
+                }}
+                onPointerUp={(event) => {
+                  completeAlphaSaveGesture({ kind: "pointer", pointerId: event.pointerId });
+                  releaseAlphaSaveClickBarrierAfterTerminalEvent();
+                  if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                onPointerCancel={() => cancelAlphaSaveGesture(true)}
+                onPointerLeave={() => cancelAlphaSaveGesture(true)}
+                onLostPointerCapture={() => cancelAlphaSaveGesture(true)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    cancelAlphaSaveGesture(true);
+                    return;
+                  }
+                  if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+                    event.preventDefault();
+                    beginAlphaSaveGesture({ kind: "keyboard", key: event.key });
+                  }
+                }}
+                onKeyUp={(event) => {
+                  if (event.key === " " || event.key === "Enter") {
+                    event.preventDefault();
+                    completeAlphaSaveGesture({ kind: "keyboard", key: event.key });
+                    releaseAlphaSaveClickBarrierAfterTerminalEvent();
+                  }
+                }}
+                onBlur={() => cancelAlphaSaveGesture(true)}
                 disabled={!description.trim() || isSubmitting}
+                style={alphaActive ? ({ "--quick-entry-alpha-hold-duration": `${ALPHA_START_HOLD_DURATION_MS}ms` } as CSSProperties) : undefined}
                 data-testid="quick-entry-save"
-                title={t("tasks.createTaskTitle", "Create task")}
+                data-hold-state={alphaActive ? alphaSaveState : undefined}
+                aria-label={alphaActive
+                  ? (alphaSaveState === "holding" ? t("tasks.releaseToSaveHoldToStart", "Release to save; keep holding to start") : t("tasks.saveHoldToStart", "Save task; hold to start"))
+                  : undefined}
+                title={alphaActive ? t("tasks.saveHoldToStart", "Save task; hold to start") : t("tasks.createTaskTitle", "Create task")}
               >
-                <Save size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
-                {t("tasks.save", "Save")}
-              </button>
+                {alphaActive && (
+                  <span className="quick-entry-alpha-save-icons">
+                    <span className="quick-entry-alpha-save-icon quick-entry-alpha-save-icon--save" aria-hidden="true">
+                      <Save size={12} />
+                    </span>
+                    <span className="quick-entry-alpha-save-progress" aria-hidden="true">
+                      <span className="quick-entry-alpha-save-icon quick-entry-alpha-save-icon--start">
+                        <Play size={12} />
+                      </span>
+                    </span>
+                  </span>
+                )}
+                {!alphaActive && <>{t("tasks.save", "Save")}</>}
+              </AlphaButton>
+              {alphaActive && (
+                <span className="visually-hidden" role="status" aria-live="polite">
+                  {alphaSaveState === "holding" ? t("tasks.holdToStartProgress", "Keep holding to start") : ""}
+                </span>
+              )}
             </div>
           </div>
         )}
 
-        <PendingImagePreviews
-          images={pendingImages}
-          onRemove={removeImage}
+        <PendingAttachmentPreviews
+          attachments={pendingAttachments}
+          onRemove={removeAttachment}
           disabled={isSubmitting}
-          removeLabel={t("tasks.removeImage", "Remove image")}
+          removeLabel={t("tasks.removeAttachment", "Remove image")}
           testIdPrefix="quick-entry-preview"
         />
-        {isModelMenuOpen && portalRoot && modelMenuPosition && createPortal(
-            <div
+        {(!alphaActive || showExpandedControls) && isModelMenuOpen && portalRoot && modelMenuPosition && createPortal(
+            <AlphaPopoverSurface
               ref={modelMenuPortalRef}
+              onClose={() => setIsModelMenuOpen(false)}
               className="model-nested-menu model-nested-menu--portal"
-              onMouseDown={(e) => e.preventDefault()}
+              onMouseDown={(e) => {
+                /*
+                FNXC:QuickAddModels 2026-08-12-21:51:
+                React synthetic mouse events cross createPortal boundaries, so this composer-focus guard
+                must exempt form controls and the portaled model dropdown or preventDefault suppresses
+                focus for its filter input. Plain menu chrome still preserves the quick-entry focus.
+                */
+                const target = e.target as Element;
+                if (target.closest("input, textarea, select, [contenteditable]") || isInsidePortaledModelMenu(target)) {
+                  return;
+                }
+                e.preventDefault();
+              }}
               data-testid="model-nested-menu"
               style={{
                 position: "fixed",
-                top: `${modelMenuPosition.top}px`,
+                top: modelMenuPosition.bottom === null ? `${modelMenuPosition.top}px` : "auto",
+                bottom: modelMenuPosition.bottom === null ? undefined : `${modelMenuPosition.bottom}px`,
                 left: `${modelMenuPosition.left}px`,
                 width: `${modelMenuPosition.width}px`,
                 maxHeight: modelMenuPosition.maxHeight ? `${modelMenuPosition.maxHeight}px` : undefined,
@@ -2417,9 +2643,14 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
               }}
             >
               {activeModelSubmenu === null ? (
-                // Top-level menu with Plan/Executor/Reviewer choices
-                <div className="model-menu-items">
-                  <button
+                /*
+                 * FNXC:QuickAddModelMenu 2026-08-12-22:04:
+                 * Top-level model rows use bare role names and matching icon alignment because
+                 * .model-menu-item-label has no gap. Submenu headers retain the "<Role> Model" form.
+                 */
+                <AlphaMenu className="model-menu-items" aria-label={t("tasks.modelOverrides", "Model overrides")}>
+                  <AlphaMenuItem
+                    id="plan"
                     type="button"
                     className={`model-menu-item ${hasPlanningOverride ? "model-menu-item--active" : ""}`}
                     onClick={() => setActiveModelSubmenu("plan")}
@@ -2435,8 +2666,9 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                         : t("tasks.usingDefault", "Using default")}
                     </span>
                     <ChevronRight size={12} style={{ marginLeft: "auto", color: "var(--text-dim)" }} />
-                  </button>
-                  <button
+                  </AlphaMenuItem>
+                  <AlphaMenuItem
+                    id="executor"
                     type="button"
                     className={`model-menu-item ${hasExecutorOverride ? "model-menu-item--active" : ""}`}
                     onClick={() => setActiveModelSubmenu("executor")}
@@ -2452,8 +2684,9 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                         : t("tasks.usingDefault", "Using default")}
                     </span>
                     <ChevronRight size={12} style={{ marginLeft: "auto", color: "var(--text-dim)" }} />
-                  </button>
-                  <button
+                  </AlphaMenuItem>
+                  <AlphaMenuItem
+                    id="validator"
                     type="button"
                     className={`model-menu-item ${hasValidatorOverride ? "model-menu-item--active" : ""}`}
                     onClick={() => setActiveModelSubmenu("validator")}
@@ -2469,16 +2702,30 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                         : t("tasks.usingDefault", "Using default")}
                     </span>
                     <ChevronRight size={12} style={{ marginLeft: "auto", color: "var(--text-dim)" }} />
-                  </button>
-                  <button type="button" className={`model-menu-item ${hasMergerOverride ? "model-menu-item--active" : ""}`} onClick={() => setActiveModelSubmenu("merger")} data-testid="model-menu-merger">
-                    <span className="model-menu-item-label"><Brain size={12} /> {t("tasks.mergerModel", "Merger Model")}</span>
-                    <span className="model-menu-item-value">{hasMergerOverride ? getModelBadgeLabel(mergerProvider, mergerModelId) : t("tasks.usingDefault", "Using default")}</span><ChevronRight size={12} style={{ marginLeft: "auto", color: "var(--text-dim)" }} />
-                  </button>
-                </div>
+                  </AlphaMenuItem>
+                  <AlphaMenuItem
+                    id="merger"
+                    type="button"
+                    className={`model-menu-item ${hasMergerOverride ? "model-menu-item--active" : ""}`}
+                    onClick={() => setActiveModelSubmenu("merger")}
+                    data-testid="model-menu-merger"
+                  >
+                    <span className="model-menu-item-label">
+                      <Brain size={12} style={{ verticalAlign: "middle", marginRight: 6 }} />
+                      {t("tasks.modelMerger", "Merger")}
+                    </span>
+                    <span className="model-menu-item-value">
+                      {hasMergerOverride
+                        ? getModelBadgeLabel(mergerProvider, mergerModelId)
+                        : t("tasks.usingDefault", "Using default")}
+                    </span>
+                    <ChevronRight size={12} style={{ marginLeft: "auto", color: "var(--text-dim)" }} />
+                  </AlphaMenuItem>
+                </AlphaMenu>
               ) : (
                 // Submenu with CustomModelDropdown for the selected target
                 <div className="model-submenu">
-                  <button
+                  <AlphaButton
                     type="button"
                     className="model-submenu-back"
                     onClick={() => setActiveModelSubmenu(null)}
@@ -2486,7 +2733,7 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                   >
                     <ChevronDown size={12} style={{ transform: "rotate(90deg)", marginRight: 4 }} />
                     {t("common.back", "Back")}
-                  </button>
+                  </AlphaButton>
                   <div className="model-submenu-header">
                     {activeModelSubmenu === "plan" && t("tasks.planModel", "Plan Model")}
                     {activeModelSubmenu === "executor" && t("tasks.executorModel", "Executor Model")}
@@ -2520,29 +2767,37 @@ export function QuickEntryBox({ onCreate, addToast, tasks = [], availableModels,
                     thinkingLevel={activeModelSubmenu === "executor" ? thinkingLevel : activeModelSubmenu === "plan" ? planningThinkingLevel : activeModelSubmenu === "validator" ? validatorThinkingLevel : mergerThinkingLevel}
                     onThinkingLevelChange={activeModelSubmenu === "executor" ? handleThinkingLevelChange : activeModelSubmenu === "plan" ? setPlanningThinkingLevel : activeModelSubmenu === "validator" ? setValidatorThinkingLevel : setMergerThinkingLevel}
                     defaultThinkingLevel={settings?.defaultThinkingLevel ?? "off"}
+                    credentialInstanceId={activeModelSubmenu === "plan" ? planningCredentialInstanceId : activeModelSubmenu === "executor" ? credentialInstanceId : activeModelSubmenu === "validator" ? validatorCredentialInstanceId : mergerCredentialInstanceId}
+                    onCredentialInstanceChange={(instanceId) => {
+                      const next = instanceId || undefined;
+                      if (activeModelSubmenu === "plan") setPlanningCredentialInstanceId(next);
+                      else if (activeModelSubmenu === "executor") setCredentialInstanceId(next);
+                      else if (activeModelSubmenu === "validator") setValidatorCredentialInstanceId(next);
+                      else setMergerCredentialInstanceId(next);
+                    }}
                   />
                   {modelsError && (
                     <div className="model-submenu-error">
                       <span>{modelsError}</span>
-                      <button type="button" className="btn btn-sm" onClick={loadModels}>
+                      <AlphaButton type="button" className="btn btn-sm" onClick={loadModels}>
                         {t("common.retry", "Retry")}
-                      </button>
+                      </AlphaButton>
                     </div>
                   )}
                 </div>
               )}
-            </div>,
+            </AlphaPopoverSurface>,
             portalRoot,
           )}
         </div>
-        <input
+        <AlphaInput
           ref={fileInputRef}
           type="file"
-          accept="image/*"
+          accept={TASK_ATTACHMENT_ACCEPT}
           multiple
           style={{ display: "none" }}
           onChange={(e) => {
-            handleImageFiles(e.target.files);
+            handleAttachmentFiles(e.target.files);
             e.currentTarget.value = "";
           }}
           data-testid="quick-entry-file-input"

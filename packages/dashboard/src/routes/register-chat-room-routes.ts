@@ -8,7 +8,7 @@ import { RoomReplyGenerationError } from "../chat.js";
 import { createProjectScopedChatManager, resolveProjectChatContext } from "../chat-project-services.js";
 import { ApiError, badRequest, internalError, notFound } from "../api-error.js";
 import { rateLimit, RATE_LIMITS } from "../rate-limit.js";
-import { CHAT_ALLOWED_MIME_TYPES, CHAT_MAX_ATTACHMENT_SIZE } from "./chat-attachment-config.js";
+import { CHAT_ALLOWED_MIME_TYPES, CHAT_MAX_VIDEO_ATTACHMENT_SIZE, getChatAttachmentMaxSize } from "./chat-attachment-config.js";
 import type { ApiRoutesContext } from "./types.js";
 
 function isSlugCollisionError(err: unknown): boolean {
@@ -21,7 +21,7 @@ function parseRoomThinkingLevel(value: unknown): string | null {
   if (typeof value === "string" && THINKING_LEVELS.includes(value as (typeof THINKING_LEVELS)[number])) {
     return value;
   }
-  throw badRequest("thinkingLevel must be one of off, minimal, low, medium, high, xhigh, or null");
+  throw badRequest(`thinkingLevel must be one of ${THINKING_LEVELS.join(", ")}, or null`);
 }
 
 interface ChatRoomRouteDeps {
@@ -53,7 +53,7 @@ export function registerChatRoomRoutes(ctx: ApiRoutesContext, deps: ChatRoomRout
       }
       const multerError = err as { code?: string };
       if (multerError?.code === "LIMIT_FILE_SIZE") {
-        next(badRequest(`File too large. Maximum: ${CHAT_MAX_ATTACHMENT_SIZE} bytes (5MB)`));
+        next(badRequest(`File too large. Maximum: ${CHAT_MAX_VIDEO_ATTACHMENT_SIZE} bytes (100MB)`));
         return;
       }
       next(err as Error);
@@ -95,11 +95,18 @@ export function registerChatRoomRoutes(ctx: ApiRoutesContext, deps: ChatRoomRout
       return { chatStore, chatManager };
     }
 
+    const requestContext = await getProjectContext(req);
     const { store: scopedStore, chatStore } = await resolveProjectChatContext({
       projectId: roomProjectId,
       defaultStore: ctx.store,
       defaultChatStore: options?.chatStore,
       engineManager: options?.engineManager,
+      /*
+      FNXC:TaskChatProjectContext 2026-08-19-17:27:
+      A room request already has the canonical selected-project store; preserve that
+      store/chat pair when its explicit room scope agrees with the request.
+      */
+      requestStore: requestContext.projectId === roomProjectId ? requestContext.store : undefined,
     });
     const engine = options.engineManager.getEngine(roomProjectId);
     const chatManager = await createProjectScopedChatManager({
@@ -415,8 +422,9 @@ export function registerChatRoomRoutes(ctx: ApiRoutesContext, deps: ChatRoomRout
       const file = req.file;
       if (!file) throw badRequest("file is required");
       if (!CHAT_ALLOWED_MIME_TYPES.has(file.mimetype)) throw badRequest(`Invalid mime type '${file.mimetype}'`);
-      if (file.size > CHAT_MAX_ATTACHMENT_SIZE) {
-        throw badRequest(`File too large (${file.size} bytes). Maximum: ${CHAT_MAX_ATTACHMENT_SIZE} bytes (5MB)`);
+      const maxSize = getChatAttachmentMaxSize(file.mimetype);
+      if (file.size > maxSize) {
+        throw badRequest(`File too large (${file.size} bytes). Maximum: ${maxSize} bytes (${file.mimetype.startsWith("video/") ? "100MB" : "5MB"})`);
       }
       const { store: scopedStore } = await getProjectContext(req);
       const roomDir = resolve(scopedStore.getRootDir(), ".fusion", "chat-room-attachments", roomId);

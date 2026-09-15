@@ -42,12 +42,12 @@ const EXPECTED_KEY_OWNING_SECTIONS: Record<string, "global" | "project"> = {
   "agent-permissions": "project",
   backups: "project",
   "research-project": "project",
+  "voice-input": "project",
   "project-models": "project",
 };
 
 const EXPECTED_EXCLUDED_SECTIONS = [
   // Owns one control, and it is not a settings-blob key (global-concurrency endpoint).
-  "scheduling-global",
   "secrets",
   "global-mcp",
   "mcp",
@@ -143,6 +143,8 @@ describe("settings section-keys registry", () => {
         "mergeConflictStrategy",
         "mergeIntegrationWorktree",
         "mergeStrategy",
+        "githubNativeAutoMerge",
+        "requiredChecks",
         "mergeStrategyOverlapBehavior",
         "merger",
         "planApprovalMode",
@@ -190,6 +192,7 @@ describe("settings section-keys registry", () => {
         "gitlabAuthTokenType",
         "gitlabEnabled",
         "gitlabInstanceUrl",
+        "jiraEnabled", "jiraBaseUrl", "jiraApiBaseUrl", "jiraAuthEmail", "jiraAuthTokenSecretKey", "jiraAuthTokenSecretScope", "jiraBranchNameTemplate",
       ]),
     );
 
@@ -213,6 +216,7 @@ describe("settings section-keys registry", () => {
         "reportRoadmapDedupeEnabled",
         "reportRoadmapLabel",
         "reportRoadmapRepo",
+        "jiraEnabled", "jiraBaseUrl", "jiraApiBaseUrl", "jiraAuthEmail", "jiraAuthTokenSecretKey", "jiraAuthTokenSecretScope", "jiraBranchNameTemplate",
       ]),
     );
 

@@ -1,22 +1,36 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { describe, expect, it, afterEach, beforeEach } from "vitest";
-import { type TaskStore } from "@fusion/core";
-import { createTaskStoreForTest, pgDescribe, type PgTestHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
+import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
+
+const createResolvedAgentSessionMock = vi.hoisted(() => vi.fn());
+vi.mock("../agents/agent-session-helpers.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../agents/agent-session-helpers.js")>()),
+  createResolvedAgentSession: createResolvedAgentSessionMock,
+}));
+vi.mock("../pi.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../pi.js")>()),
+  promptWithFallback: vi.fn(async (session: { prompt: (prompt: string) => Promise<void> }, prompt: string) => session.prompt(prompt)),
+}));
 import {
   evaluateBranchGroupCompletion,
   evaluateBranchGroupPromotion,
   promoteBranchGroup,
   reconcileBranchGroupPr,
   resolveBranchGroupMergeRouting,
-} from "../group-merge-coordinator.js";
+} from "../merge/group-merge-coordinator.js";
 import { ProjectEngine } from "../project-engine.js";
+import { runAiMerge } from "../merge/merger-ai.js";
+import { seedMergeLaneState } from "./_project-engine-merge-lane-fixture.js";
 
 const dirs: string[] = [];
+
+function git(repo: string, command: string): string {
+  return execSync(command, { cwd: repo, encoding: "utf8" }).trim();
+}
 
 function makeRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "fusion-group-route-"));
@@ -128,16 +142,14 @@ describe("evaluateBranchGroupCompletion", () => {
 
   /*
    * FNXC:BranchGroupCompletion 2026-07-04-00:00:
-   * FN-7534: an archived member that never landed onto the group branch must still count
-   * as pending — it must NOT silently drop out of the membership set (see
-   * TaskStore.listTasksByBranchGroup, which now scans with includeArchived: true so this
-   * shape of member reaches the coordinator at all).
+   * A completed member that never landed onto the group branch must still count as pending;
+   * completion alone does not fabricate branch-integration evidence.
    */
-  it("does NOT count an archived member that never landed onto the group branch (FN-7534)", () => {
+  it("does NOT count a completed member that never landed onto the group branch (FN-7534)", () => {
     const result = evaluateBranchGroupCompletion({
       members: [
         landed("FN-A"),
-        { id: "FN-B", column: "archived" as const } as any,
+        { id: "FN-B", column: "done" as const } as any,
       ] as any,
       group,
     });
@@ -147,13 +159,13 @@ describe("evaluateBranchGroupCompletion", () => {
     expect(result.pendingMemberIds).toEqual(["FN-B"]);
   });
 
-  it("still counts an archived member as landed once its mergeDetails snapshot is preserved (FN-7534)", () => {
+  it("counts a completed member as landed once its mergeDetails snapshot is preserved (FN-7534)", () => {
     const result = evaluateBranchGroupCompletion({
       members: [
         landed("FN-A"),
         {
           id: "FN-B",
-          column: "archived" as const,
+          column: "done" as const,
           mergeDetails: {
             mergeConfirmed: true,
             mergeTargetSource: "branch-group-integration",
@@ -386,114 +398,6 @@ describe("promoteBranchGroup", () => {
   });
 });
 
-/*
- * FNXC:BranchGroupCompletion 2026-07-04-00:00:
- * FN-7534: the completion gate is a first-class regression target, not just the display
- * serializers (FN-5893). These tests wire a REAL TaskStore (not a hand-rolled fixture) so
- * `promoteBranchGroup` exercises the actual `listTasksByBranchGroup` membership scan that
- * previously silently dropped an archived-but-unlanded member from `total`.
- */
-/*
-FNXC:PgMigrationQuarantine 2026-07-18-01:50:
-FN-8258 exercises archived shared-branch members through the PostgreSQL TaskStore, including
-awaited branch-group writes, instead of the removed SQLite constructor path.
-*/
-pgDescribe("promoteBranchGroup with a real TaskStore (FN-7534 archived-member regression)", () => {
-  let rootDir: string;
-  let harness: PgTestHarness;
-  let store: TaskStore;
-
-  beforeEach(async () => {
-    rootDir = makeRepo();
-    harness = await createTaskStoreForTest({ prefix: "fusion_branch_group_archive" });
-    store = harness.store;
-  });
-
-  afterEach(async () => {
-    await harness?.teardown();
-  });
-
-  it("returns reason: incomplete when an archived member never landed onto the group branch", async () => {
-    const group = await store.createBranchGroup({
-      sourceType: "planning",
-      sourceId: "PS-archived-gate",
-      branchName: "fusion/groups/archived-gate",
-      autoMerge: true,
-    });
-
-    const landedTask = await store.createTask({ description: "landed member" });
-    await store.setTaskBranchGroup(landedTask.id, group.id);
-    await store.updateTask(landedTask.id, {
-      mergeDetails: {
-        mergeConfirmed: true,
-        mergeTargetSource: "branch-group-integration",
-        mergeTargetBranch: group.branchName,
-      } as any,
-    });
-
-    const abandonedTask = await store.createTask({ description: "unlanded member, later archived" });
-    await store.setTaskBranchGroup(abandonedTask.id, group.id);
-    await store.archiveTask(abandonedTask.id);
-
-    const result = await promoteBranchGroup({
-      rootDir,
-      groupId: group.id,
-      settings: { autoMerge: true, globalPause: false, enginePaused: false, mergeStrategy: "direct", baseBranch: "main" },
-      store,
-    });
-
-    expect(result.reason).toBe("incomplete");
-    expect(result.promoted).toBe(false);
-  });
-
-  it("still promotes when the only archived member had already landed before archival", async () => {
-    const group = await store.createBranchGroup({
-      sourceType: "planning",
-      sourceId: "PS-archived-landed-gate",
-      branchName: "fusion/groups/archived-landed-gate",
-      autoMerge: true,
-    });
-    execSync(`git checkout -b ${group.branchName}`, { cwd: rootDir });
-    execSync("echo promoted > group.txt", { cwd: rootDir, shell: "/bin/bash" });
-    execSync("git add group.txt && git commit -m group", { cwd: rootDir, shell: "/bin/bash" });
-    execSync("git checkout main", { cwd: rootDir });
-
-    const task = await store.createTask({ description: "landed then archived" });
-    await store.setTaskBranchGroup(task.id, group.id);
-    await store.updateTask(task.id, {
-      mergeDetails: {
-        mergeConfirmed: true,
-        mergeTargetSource: "branch-group-integration",
-        mergeTargetBranch: group.branchName,
-      } as any,
-    });
-    await store.moveTask(task.id, "todo");
-    await store.moveTask(task.id, "in-progress");
-    await store.moveTask(task.id, "done");
-    await store.archiveTask(task.id);
-
-    // The completion invariant includes archived members and their persisted landing proof.
-    expect(await store.listTasksByBranchGroup(group.id)).toEqual([
-      expect.objectContaining({
-        id: task.id,
-        mergeDetails: expect.objectContaining({
-          mergeConfirmed: true,
-          mergeTargetBranch: group.branchName,
-        }),
-      }),
-    ]);
-
-    const result = await promoteBranchGroup({
-      rootDir,
-      groupId: group.id,
-      settings: { autoMerge: true, globalPause: false, enginePaused: false, mergeStrategy: "direct", baseBranch: "main" },
-      store,
-    });
-
-    expect(result.reason).toBe("promoted");
-    expect(result.promoted).toBe(true);
-  });
-});
 
 describe("promoteBranchGroup PR creation (U5)", () => {
   function makeGroup(overrides?: Partial<any>): any {
@@ -550,6 +454,45 @@ describe("promoteBranchGroup PR creation (U5)", () => {
     mergeStrategy: "pull-request" as const,
     baseBranch: "main",
   };
+
+  it("fails closed before PR-mode promotion mutates the project checkout when cancelled", async () => {
+    const rootDir = makePrRepo();
+    const controller = new AbortController();
+    controller.abort(new Error("promotion cancelled"));
+    let group = makeGroup();
+    const createGroupPr = vi.fn();
+
+    await expect(promoteBranchGroup({
+      rootDir,
+      groupId: group.id,
+      settings: prSettings,
+      signal: controller.signal,
+      store: makeStore(() => group, (g) => { group = g; }, [landedMember("FN-A", group.branchName)]),
+      createGroupPr,
+    })).rejects.toThrow("promotion cancelled");
+
+    expect(createGroupPr).not.toHaveBeenCalled();
+    expect(execSync("git branch --show-current", { cwd: rootDir, encoding: "utf8" }).trim()).toBe("main");
+    expect(execSync("git log --format=%s -1", { cwd: rootDir, encoding: "utf8" }).trim()).not.toBe("Merge branch 'fusion/groups/planning-x'");
+  });
+
+  it("forwards the configured integration remote to automated group PR creation", async () => {
+    const rootDir = makePrRepo();
+    let group = makeGroup();
+    let receivedRemote: string | undefined;
+    await promoteBranchGroup({
+      rootDir,
+      groupId: group.id,
+      settings: { ...prSettings, worktreeRebaseRemote: "upstream" },
+      store: makeStore(() => group, (g) => { group = g; }, [landedMember("FN-A", group.branchName)]),
+      createGroupPr: async ({ integrationRemote }) => {
+        receivedRemote = integrationRemote;
+        return { prNumber: 42, prUrl: "https://github.com/x/y/pull/42", prState: "open" };
+      },
+    });
+
+    expect(receivedRemote).toBe("upstream");
+  });
 
   it("creates exactly one PR for a complete PR-mode group and persists prNumber/prUrl/prState=open", async () => {
     const rootDir = makePrRepo();
@@ -1218,6 +1161,101 @@ describe("reconcileBranchGroupPr (Fix #3 engine primitive)", () => {
   });
 });
 
+/*
+FNXC:BranchGroupAutoMergeGate 2026-08-03-23:30:
+Runfusion/Fusion#3324 requires the post-Code-Review merge seam to leave a member targeting the
+project default branch under human release control. This fixture reaches ProjectEngine's interpreter
+merge request, then uses the production AI merger against real Git only for the distinct-branch
+control, proving the safety gate prevents a command from advancing main rather than merely relabeling it.
+*/
+function createPostReviewTask(groupId: string): Record<string, any> {
+  return {
+    id: "FN-3324",
+    title: "post-Code-Review member",
+    description: "Regression fixture for Runfusion/Fusion#3324",
+    column: "in-review",
+    status: null,
+    branch: "fusion/fn-3324",
+    baseBranch: "main",
+    dependencies: [],
+    steps: [{ name: "Code Review", status: "done" }],
+    /*
+    FNXC:RequiredPreMergeSteps 2026-08-23-00:20:
+    This fixture IS a post-Code-Review member, so its enabled pre-merge groups must carry passing
+    RESULTS — the merge door reads `workflowStepResults`, not the step row whose name happens to say
+    "Code Review". Without them the door refused this card before the branch-group routing under
+    test ran. Recording the passes states the fixture's intent; disabling the gates would not.
+    */
+    workflowStepResults: [
+      { workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "passed", phase: "pre-merge", verdict: "APPROVE" },
+      { workflowStepId: "code-review", workflowStepName: "Code Review", status: "passed", phase: "pre-merge", verdict: "APPROVE" },
+    ],
+    log: [],
+    paused: false,
+    autoMerge: undefined,
+    mergeRetries: 0,
+    branchContext: { assignmentMode: "shared", groupId, source: "mission" },
+  };
+}
+
+function createPostReviewStore(task: Record<string, any>, branchGroup: Record<string, any> | null) {
+  const settings = {
+    autoMerge: false,
+    merger: { maxReviewPasses: 0 },
+    includeTaskIdInCommit: false,
+    mergeIntegrationWorktree: "cwd-main",
+    mergeStrategy: "direct",
+    directMergeCommitStrategy: "auto",
+  };
+
+  return {
+    getTask: vi.fn(async () => task),
+    listTasks: vi.fn(async () => [task]),
+    getSettings: vi.fn(async () => settings),
+    /*
+    FNXC:BranchGroupAutoMergeGate 2026-08-09-08:55:
+    The production drain calls these methods for token-budget enforcement and branch-group promotion
+    evaluation inside catch-and-warn wrappers. Supply the real, budget-free seams so a missing method
+    cannot silently remove coverage while leaving this prototype fixture green.
+
+    FNXC:BranchGroupAutoMergeGate 2026-08-09-22:51:
+    The production merger drain emits session-start telemetry in both its review and merge passes.
+    Telemetry failures are swallowed by design, so this fake must implement emitUsageEvent or a missing
+    seam degrades coverage into warnings that the user-hold regression guard catches.
+    */
+    getSettingsByScope: vi.fn(async () => ({ global: {}, project: settings })),
+    emitUsageEvent: vi.fn(async () => true),
+    listTasksByBranchGroup: vi.fn(async () => (branchGroup ? [task] : [])),
+    getBranchGroup: vi.fn(() => branchGroup),
+    updateTask: vi.fn(async (_id: string, patch: Record<string, unknown>) => Object.assign(task, patch)),
+    /* FNXC:MergeMockDrift 2026-08-23-00:20: production write seam used by the merge path; a fake
+       store omitting it throws before the routing behaviour under test runs. */
+    updateTaskAtomic: vi.fn(async (_id: string, updater: (current: typeof task) => Record<string, unknown> | undefined) => {
+      const patch = await updater(task);
+      if (patch) Object.assign(task, patch);
+      return task;
+    }),
+    moveTask: vi.fn(async (_id: string, column: string) => { task.column = column; return task; }),
+    logEntry: vi.fn(async () => undefined),
+    appendAgentLog: vi.fn(async () => undefined),
+    recordRunAuditEvent: vi.fn(async () => undefined),
+    getActiveMergingTask: vi.fn(async () => null),
+    emit: vi.fn(),
+  } as any;
+}
+
+function createInterpreterMergeEngine(repo: string, store: any): any {
+  const engine = Object.create(ProjectEngine.prototype) as any;
+  engine.config = { workingDirectory: repo };
+  engine.options = {};
+  // FNXC:PullRequestFreshness 2026-08-09-04:26:
+  // The production merge admission clears its deduplicated capacity reason on a
+  // successful release, so this prototype-backed engine must provide that state.
+  engine.capacityDeferredMergeReasons = new Map();
+  engine.runtime = { getTaskStore: () => store, getPluginRunner: () => undefined };
+  return engine;
+}
+
 describe("resolveBranchGroupMergeRouting", () => {
   it("returns null for non-shared tasks", async () => {
     const routing = await resolveBranchGroupMergeRouting({
@@ -1253,6 +1291,192 @@ describe("resolveBranchGroupMergeRouting", () => {
     expect(routing?.mergeTarget.branch).toBe(branchGroup.branchName);
     expect(routing?.mergeTarget.source).toBe("branch-group-integration");
   });
+
+  it("does not route a default-branch group as ungated member integration", async () => {
+    const routing = await resolveBranchGroupMergeRouting({
+      task: { branchContext: { groupId: "BG-main", source: "mission", assignmentMode: "shared" } },
+      store: { getBranchGroup: () => ({ id: "BG-main", branchName: " main ", status: "open" }) } as any,
+      projectDefaultBranch: "main",
+    });
+
+    expect(routing).toBeNull();
+  });
+
+  it("keeps the post-Code-Review main collision manual while merging the dedicated-branch control", async () => {
+    const repo = makeRepo();
+    const mainBefore = git(repo, "git rev-parse main");
+    git(repo, "git checkout -q -b fusion/fn-3324");
+    writeFileSync(join(repo, "feature.txt"), "feature work\n");
+    git(repo, "git add feature.txt && git commit -q -m feature");
+    git(repo, "git checkout -q main");
+
+    const unsafeTask = createPostReviewTask("BG-main");
+    const unsafeStore = createPostReviewStore(unsafeTask, { id: "BG-main", status: "open", branchName: "main" });
+    const unsafeEngine = createInterpreterMergeEngine(repo, unsafeStore);
+    unsafeEngine.onMerge = vi.fn(async () => { throw new Error("main collision must not invoke the merger"); });
+
+    const held = await unsafeEngine.requestInterpreterMerge("FN-3324");
+
+    expect(held).toMatchObject({ merged: false, noOp: true, task: unsafeTask });
+    expect(unsafeEngine.onMerge).not.toHaveBeenCalled();
+    expect(git(repo, "git rev-parse main")).toBe(mainBefore);
+    expect(unsafeTask.mergeDetails).toBeUndefined();
+
+    git(repo, "git branch mission/M-3324 main");
+    /*
+    FNXC:SharedBranchMemberHold 2026-08-08-02:16:
+    FN-8823 makes project Off hold every non-opted-in member, including this
+    fixture's unset value. Explicit task On is the deliberate integration control.
+    */
+    const safeTask = { ...createPostReviewTask("BG-dedicated"), autoMerge: true };
+    const safeStore = createPostReviewStore(safeTask, { id: "BG-dedicated", status: "open", branchName: "mission/M-3324" });
+    const safeEngine = createInterpreterMergeEngine(repo, safeStore);
+    safeEngine.onMerge = vi.fn(() => runAiMerge(safeStore, repo, "FN-3324", { manual: true }, {
+      mergeAgent: async (cwd: string) => {
+        git(cwd, "git merge --squash fusion/fn-3324");
+        git(cwd, "git add -A && git commit -q -m 'squash dedicated member'");
+      },
+      reviewAgent: async () => "REVIEW_VERDICT: approve",
+    }));
+
+    const integrated = await safeEngine.requestInterpreterMerge("FN-3324");
+
+    expect(integrated.merged).toBe(true);
+    expect(safeEngine.onMerge).toHaveBeenCalledWith("FN-3324", expect.any(Object));
+    expect(git(repo, "git rev-parse main")).toBe(mainBefore);
+    expect(git(repo, "git show mission/M-3324:feature.txt")).toBe("feature work");
+    expect(safeTask.mergeDetails).toMatchObject({
+      mergeConfirmed: true,
+      mergeTargetBranch: "mission/M-3324",
+      mergeTargetSource: "branch-group-integration",
+    });
+  }, 30_000);
+
+  /*
+  FNXC:SharedBranchMemberHold 2026-08-05-23:45:
+  FN-8811 requires an operator-authored task-level Off choice to stop before
+  member→group integration, while the explicit Merge & Close release must still
+  land exactly once on the mission branch. Exercise the production requester and
+  real merger together so a gate-only test cannot hide a release-target regression.
+  */
+  it("holds a user-off member before release, then lands exactly once on its mission branch", async () => {
+    const repo = makeRepo();
+    const mainBefore = git(repo, "git rev-parse main");
+    git(repo, "git checkout -q -b fusion/fn-3324");
+    writeFileSync(join(repo, "user-hold-feature.txt"), "release only after operator confirmation\n");
+    git(repo, "git add user-hold-feature.txt && git commit -q -m feature");
+    git(repo, "git checkout -q main");
+    git(repo, "git branch mission/M-8811 main");
+
+    const task = {
+      ...createPostReviewTask("BG-user-hold"),
+      autoMerge: false,
+      autoMergeProvenance: "user",
+    };
+    const store = createPostReviewStore(task, {
+      id: "BG-user-hold",
+      status: "open",
+      branchName: "mission/M-8811",
+    });
+    const engine = createInterpreterMergeEngine(repo, store);
+    const blockedMerge = vi.fn(async () => {
+      throw new Error("user hold must prevent automatic member integration");
+    });
+    engine.onMerge = blockedMerge;
+
+    const held = await engine.requestInterpreterMerge("FN-3324");
+
+    expect(held).toMatchObject({ merged: false, noOp: true });
+    expect(blockedMerge).not.toHaveBeenCalled();
+    expect(git(repo, "git rev-parse main")).toBe(mainBefore);
+    /*
+    FNXC:BranchGroupAutoMergeGate 2026-08-09-22:51:
+    The expected fatal-path stderr is the proof that the automatic hold did not land this member;
+    it is not a missing fixture path.
+    */
+    expect(() => git(repo, "git show mission/M-8811:user-hold-feature.txt")).toThrow();
+
+    let mergeAttempts = 0;
+    /*
+     * FNXC:SharedBranchMemberHold 2026-08-06-00:24:
+     * FN-8811 requires release to travel through the production queue, not a
+     * test-owned drain. The session fake supplies deterministic AI responses,
+     * while ProjectEngine's real drain invokes runAiMerge against Git.
+     */
+    createResolvedAgentSessionMock.mockImplementation(async (options: any) => ({
+      session: {
+        async prompt() {
+          if (String(options.systemPrompt).includes("read-only")) {
+            options.onText?.("REVIEW_VERDICT: approve");
+            return;
+          }
+          mergeAttempts += 1;
+          git(options.cwd, "git merge --squash fusion/fn-3324");
+          git(options.cwd, "git add -A && git commit -q -m 'squash user-held member'");
+        },
+        dispose: vi.fn(),
+        getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 1 } })),
+      },
+    }));
+    /*
+    FNXC:SharedBranchMemberHold 2026-08-09-05:22:
+    FN-8811's release half runs the production drain, so this prototype fake must carry complete
+    merge-lane state rather than only the fields the test happened to seed when it was written.
+    */
+    seedMergeLaneState(engine);
+
+    let resolvePromotionEvaluation!: () => void;
+    const promotionEvaluationReached = new Promise<void>((resolve) => {
+      resolvePromotionEvaluation = resolve;
+    });
+    store.recordRunAuditEvent.mockImplementation(async (event: { target?: string; mutationType?: string }) => {
+      if (event.target === "BG-user-hold" && event.mutationType?.startsWith("merge:branch-group-promotion")) {
+        resolvePromotionEvaluation();
+      }
+    });
+
+    /*
+    FNXC:BranchGroupAutoMergeGate 2026-08-09-09:00:
+    The drain's catch-and-warn wrappers can turn a missing fake-store seam into silent coverage loss.
+    This fixture therefore treats an `is not a function` warning as a failure after its asynchronous
+    promotion continuation completes, rather than allowing stderr noise to hide the skipped path.
+    */
+    const warnSpy = vi.spyOn(console, "warn");
+    let released: any;
+    let offendingWarnings: string[] = [];
+    try {
+      released = await ProjectEngine.prototype.onMerge.call(engine, "FN-3324");
+      await promotionEvaluationReached;
+      offendingWarnings = warnSpy.mock.calls
+        .map((args) => args.map((arg) => String(arg)).join(" "))
+        .filter((message) => message.includes("is not a function"));
+    } finally {
+      warnSpy.mockRestore();
+      createResolvedAgentSessionMock.mockReset();
+    }
+
+    expect(offendingWarnings, "merge drain emitted missing-store-seam warnings").toEqual([]);
+    /*
+    FNXC:BranchGroupAutoMergeGate 2026-08-09-22:51:
+    An empty warning list is insufficient when a future path skips telemetry entirely. Assert the
+    production merger lane exercised the fake-store seam during the explicit release.
+    */
+    expect(store.emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "session_start",
+      category: "agent-session",
+      meta: expect.objectContaining({ lane: "merger" }),
+    }));
+    expect(released.merged).toBe(true);
+    expect(store.listTasksByBranchGroup).toHaveBeenCalledWith("BG-user-hold");
+    expect(mergeAttempts).toBe(1);
+    expect(git(repo, "git rev-parse main")).toBe(mainBefore);
+    expect(git(repo, "git show mission/M-8811:user-hold-feature.txt")).toBe("release only after operator confirmation");
+    expect(task.mergeDetails).toMatchObject({
+      mergeConfirmed: true,
+      mergeTargetBranch: "mission/M-8811",
+      mergeTargetSource: "branch-group-integration",
+    });
+  }, 30_000);
 
   it("creates the group branch when missing", async () => {
     const rootDir = makeRepo();

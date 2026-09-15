@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   BUILTIN_CODING_WORKFLOW_IR,
+  BUILTIN_CODING_IDEAS_WORKFLOW_IR,
+  BUILTIN_LEAD_GENERATION_WORKFLOW_IR,
+  BUILTIN_MARKETING_WORKFLOW_IR,
   BUILTIN_PR_WORKFLOW_IR,
   BUILTIN_STEPWISE_CODING_WORKFLOW_IR,
   DEFAULT_WORKFLOW_COLUMN_IDS,
   parseWorkflowIr,
   serializeWorkflowIr,
 } from "../index.js";
-import { BROWSER_VERIFICATION_GROUP_ID, BROWSER_VERIFICATION_STEP_NODE_ID } from "../builtin-browser-verification-group.js";
-import { CODE_REVIEW_GROUP_ID, CODE_REVIEW_STEP_NODE_ID } from "../builtin-code-review-group.js";
-import type { WorkflowIrV2 } from "../workflow-ir-types.js";
+import { BROWSER_VERIFICATION_GROUP_ID, BROWSER_VERIFICATION_STEP_NODE_ID } from "../workflows/builtin-browser-verification-group.js";
+import { CODE_REVIEW_GROUP_ID, CODE_REVIEW_STEP_NODE_ID } from "../workflows/builtin-code-review-group.js";
+import type { WorkflowIrV2 } from "../workflows/workflow-ir-types.js";
 
 const EXECUTE_NODE_MAX_RETRIES = 2;
 
@@ -83,14 +86,14 @@ describe("builtin coding workflow ir", () => {
       toolMode: "readonly",
       gateMode: "gate",
     });
-    // execute → browser-verification → code-review → completion-summary → review on the success path; the
-    // pre-merge code-review optional-group sits next to browser-verification. failures route to remediation nodes.
+    // FNXC:WorkspaceReviewSeal 2026-08-21-19:36: the summary precedes Code Review so no
+    // built-in worktree agent can mutate the approved branch before landing.
     expect(BUILTIN_CODING_WORKFLOW_IR.edges).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ from: "execute", to: "browser-verification", condition: "success" }),
-        expect.objectContaining({ from: "browser-verification", to: "code-review", condition: "success" }),
-        expect.objectContaining({ from: "code-review", to: "completion-summary", condition: "success" }),
-        expect.objectContaining({ from: "completion-summary", to: "review", condition: "success" }),
+        expect.objectContaining({ from: "browser-verification", to: "completion-summary", condition: "success" }),
+        expect.objectContaining({ from: "completion-summary", to: "code-review", condition: "success" }),
+        expect.objectContaining({ from: "code-review", to: "review", condition: "success" }),
         expect.objectContaining({ from: "browser-verification", to: "browser-verification-remediation", condition: "failure" }),
         expect.objectContaining({ from: "code-review", to: "code-review-remediation", condition: "failure" }),
       ]),
@@ -99,12 +102,27 @@ describe("builtin coding workflow ir", () => {
     expect("optionalSteps" in BUILTIN_CODING_WORKFLOW_IR).toBe(false);
   });
 
-  it("defines the six legacy columns in legacy order (KTD-1)", () => {
+  it("defines the five active legacy columns in legacy order (KTD-1)", () => {
     expect(BUILTIN_CODING_WORKFLOW_IR.version).toBe("v2");
     if (BUILTIN_CODING_WORKFLOW_IR.version !== "v2") throw new Error("expected v2");
     const ids = BUILTIN_CODING_WORKFLOW_IR.columns.map((c) => c.id);
     expect(ids).toEqual([...DEFAULT_WORKFLOW_COLUMN_IDS]);
-    expect(ids).toEqual(["triage", "todo", "in-progress", "in-review", "done", "archived"]);
+    expect(ids).toEqual(["triage", "todo", "in-progress", "in-review", "done"]);
+  });
+
+  it.each([
+    ["coding", BUILTIN_CODING_WORKFLOW_IR],
+    ["coding-ideas", BUILTIN_CODING_IDEAS_WORKFLOW_IR],
+    ["stepwise-coding", BUILTIN_STEPWISE_CODING_WORKFLOW_IR],
+    ["pull-request", BUILTIN_PR_WORKFLOW_IR],
+    ["marketing", BUILTIN_MARKETING_WORKFLOW_IR],
+    ["lead-generation", BUILTIN_LEAD_GENERATION_WORKFLOW_IR],
+  ])("does not expose an archived column or trait in %s", (_name, ir) => {
+    expect(ir.version).toBe("v2");
+    if (ir.version !== "v2") throw new Error("expected v2");
+    expect(ir.columns.some((column) => column.id === "archived")).toBe(false);
+    expect(ir.columns.flatMap((column) => column.traits).some((trait) => trait.trait === "archived")).toBe(false);
+    expect(ir.edges.some((edge) => edge.to === "archived")).toBe(false);
   });
 
   // FNXC:Workflows 2026-07-05-00:00: FN-7599 — the intake column displays as "Planning" while its id stays "triage" for lifecycle/DB/type stability.
@@ -123,7 +141,6 @@ describe("builtin coding workflow ir", () => {
     expect(traitsFor("in-progress")).toEqual(["wip", "abort-on-exit", "timing"]);
     expect(traitsFor("in-review")).toEqual(["merge-blocker", "human-review", "stall-detection", "merge"]);
     expect(traitsFor("done")).toEqual(["complete"]);
-    expect(traitsFor("archived")).toEqual(["archived"]);
     // in-progress owns the legacy execution concurrency policy in workflow data:
     // the limit is supplied by the project maxConcurrent setting.
     const wip = byId.get("in-progress")!.traits.find((t) => t.trait === "wip");
@@ -184,6 +201,7 @@ describe("builtin coding workflow ir", () => {
         expect.objectContaining({ from: "merge-gate", to: "branch-group-member-integration", condition: "outcome:auto-on" }),
         expect.objectContaining({ from: "merge-gate", to: "merge-manual-hold", condition: "outcome:auto-off" }),
         expect.objectContaining({ from: "merge-attempt", to: "merge-retry", condition: "outcome:transient-failure" }),
+        expect.objectContaining({ from: "merge-attempt", to: "code-review", condition: "outcome:workspace-review-required", kind: "rework" }),
       ]),
     );
   });

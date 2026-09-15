@@ -5,8 +5,8 @@ const mocks = vi.hoisted(() => ({
   buildNtfyClickUrl: vi.fn(() => "http://dash/?project=p1&task=FN-1"),
 }));
 
-vi.mock("../notifier.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../notifier.js")>();
+vi.mock("../util/notifier.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../util/notifier.js")>();
   return {
     ...actual,
     sendNtfyNotificationWithResult: mocks.sendNtfyNotificationWithResult,
@@ -97,6 +97,20 @@ describe("NtfyNotificationProvider", () => {
         message: expect.stringContaining(messagePart),
       }),
     );
+  });
+
+  it("describes a pull-request policy hold without calling it plan approval", async () => {
+    await provider.sendNotification("awaiting-approval", {
+      taskId: "FN-1",
+      taskTitle: "T",
+      event: "awaiting-approval",
+      metadata: { awaitingApprovalReason: "merge-blocked-by-policy" },
+    });
+
+    expect(mocks.sendNtfyNotificationWithResult).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Pull-request policy block for FN-1",
+      message: expect.stringContaining("Resolve the policy requirement, then retry the merge."),
+    }));
   });
 
   it("resolveParticipantLabel prefers names and falls back to ids", () => {

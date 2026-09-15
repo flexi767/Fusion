@@ -1,4 +1,6 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type SetStateAction } from "react";
+import { ViewHeader } from "./ViewHeader";
+import { ViewSidebar } from "./ViewSidebar";
+import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type MouseEvent, type ReactNode, type SetStateAction } from "react";
 import { Globe, Folder, GitBranch, Power, RefreshCw, Star, Settings as SettingsIcon, Search, X as SearchToggleCloseIcon } from "lucide-react";
 import {
   getErrorMessage,
@@ -8,9 +10,11 @@ import {
 } from "@fusion/core";
 import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset } from "@fusion/core";
 import { DEFAULT_GLOBAL_SETTINGS } from "@fusion/core";
-import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotes, fetchGitRemotesDetailed, fetchGitBranches, fetchProjects, fetchDashboardHealth, checkForUpdates, installUpdate, fetchSystemInfo, requestSystemRestart, fetchRemoteSettings, fetchRemoteStatus, installCloudflared, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode } from "../api";
+import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotes, fetchGitRemotesDetailed, fetchGitBranches, fetchProjects, fetchDashboardHealth, checkForUpdates, installUpdate, fetchSystemInfo, requestSystemRestart, fetchRemoteSettings, fetchRemoteStatus, installCloudflared, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode, fetchPlugins, formatProviderInstanceKey } from "../api";
 import type { AuthProvider, ManualOAuthCodeInfo, ModelInfo, BackupListResponse, SettingsExportData, MemoryFileInfo, MemoryRetrievalTestResult, GitRemote, GitRemoteDetailed, ProjectInfo, RemoteStatus, UpdateCheckResponse, UpdateInstallResponse, OAuthDeviceCodeInfo } from "../api";
 import { resolveScopedMcpSettings, splitSettingsSave, type McpSettingsScope } from "./settings/save-split";
+import { systemRestartRecovery, useSystemRestartRecovery } from "../hooks/useSystemRestartRecovery";
+import { pendingUpdateInstallState, usePendingUpdateInstall } from "../hooks/usePendingUpdateInstall";
 import {
   ALL_PROJECT_RESET_KEYS,
   getResetIneligibleReason,
@@ -23,6 +27,7 @@ import {
   type DashboardShortcutAction,
 } from "../utils/keyboardShortcuts";
 import type { DashboardKeyboardShortcutMap } from "../utils/keyboardShortcuts";
+import { normalizeChatMessageLayout, type ChatMessageLayout } from "../hooks/useAppSettings";
 import { SettingsHelpTip } from "./settings/SettingsHelpTip";
 import type { SectionSaveHandler } from "./settings/sections/context";
 import { AppearanceSection } from "./settings/sections/AppearanceSection";
@@ -46,7 +51,6 @@ import { PromptsSection } from "./settings/sections/PromptsSection";
 import { GeneralSection } from "./settings/sections/GeneralSection";
 import { ProjectModelsSection, WorkflowLaneFlushRejection } from "./settings/sections/ProjectModelsSection";
 import { SchedulingSection } from "./settings/sections/SchedulingSection";
-import { SchedulingGlobalSection } from "./settings/sections/SchedulingGlobalSection";
 import { CliBinarySection } from "./settings/sections/CliBinarySection";
 import { ScheduledEvalsSection } from "./settings/sections/ScheduledEvalsSection";
 import { NodeRoutingSection } from "./settings/sections/NodeRoutingSection";
@@ -58,6 +62,7 @@ import { SourceControlGlobalSection } from "./settings/sections/SourceControlGlo
 import { AgentPermissionsSection } from "./settings/sections/AgentPermissionsSection";
 import { MemorySection } from "./settings/sections/MemorySection";
 import { ResearchProjectSection } from "./settings/sections/ResearchProjectSection";
+import { VoiceInputSection } from "./settings/sections/VoiceInputSection";
 import { ProjectMcpSection } from "./settings/sections/ProjectMcpSection";
 import { BackupsSection } from "./settings/sections/BackupsSection";
 import { ConfigurationVersionsSection } from "./settings/sections/ConfigurationVersionsSection";
@@ -65,14 +70,15 @@ import { DatabaseBackupsSection } from "./settings/sections/DatabaseBackupsSecti
 import { LoadingSpinner } from "./LoadingSpinner";
 import { PluginsSection } from "./settings/sections/PluginsSection";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
-import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 import type { ToastType } from "../hooks/useToast";
 import { useTranslation } from "react-i18next";
 import { useSessionBannersHidden, setSessionBannersHidden } from "../hooks/useSessionBannerPref";
 import "./SettingsModal.css";
 import { FileBrowser } from "./FileBrowser";
 import { useWorkspaceFileBrowser } from "../hooks/useWorkspaceFileBrowser";
-import { useModalResizePersist } from "../hooks/useModalResizePersist";
+import { FloatingWindow } from "./FloatingWindow";
+import { ProviderLoginDialog, type ProviderLoginPhase } from "./ProviderLoginDialog";
+import { describeLoginFailure } from "../utils/loginFailure";
 import { ProviderIcon } from "./ProviderIcon";
 import { generateUniquePresetId } from "../utils/modelPresets";
 import { copyTextToClipboard } from "../utils/copyToClipboard";
@@ -90,12 +96,19 @@ import { filterVisibleOnboardingAndSettingsProviders } from "./providerVisibilit
 import { SETTINGS_SEARCH_ENTRIES } from "./settings/search/entries";
 import { rankSettingsSearchResults, matchedSectionIds } from "./settings/search/match";
 import { SettingsSearchHighlightProvider } from "./settings/SettingsSearchHighlightContext";
+import { subscribeSse } from "../sse-bus";
+import { SETTINGS_SECTION_METADATA } from "../../src/shared/settings-sections";
 
 // ---------------------------------------------------------------------------
 // GitHub star count — cached locally and refreshed only while Settings is visible.
 // ---------------------------------------------------------------------------
 export const GITHUB_STAR_CACHE_KEY = "fusion_github_star_count";
 export const GITHUB_STAR_CACHE_TTL_MS = 15 * 60 * 1000;
+/*
+FNXC:SettingsAutoSave 2026-08-17-00:20:
+Form-backed Settings persist after this debounce. Named so quality-lane tests flush the same interval instead of inventing a second timeout.
+*/
+export const SETTINGS_AUTOSAVE_DEBOUNCE_MS = 500;
 const GITHUB_STAR_CLICKED_KEY = "fusion:github-star-clicked";
 
 function isSlashPrefixedAbsolutePath(path: string): boolean {
@@ -292,11 +305,6 @@ function settingsSearchScrollBehavior(): ScrollBehavior {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
 }
 
-const SETTINGS_NAV_WIDTH_STORAGE_KEY = "fusion:settings-nav-width";
-const SETTINGS_NAV_DEFAULT_WIDTH = 248;
-const SETTINGS_NAV_MIN_WIDTH = 200;
-const SETTINGS_NAV_MAX_WIDTH = 420;
-
 /*
 FNXC:SettingsSimplification 2026-07-10-23:24:
 Settings opens in a focused mode that omits specialist integration, runtime, diagnostics, and infrastructure sections. The Advanced settings switch restores every section, applies consistently to desktop navigation, mobile navigation, and search, and persists only as a browser-local display preference so it never changes or exports project settings.
@@ -304,47 +312,23 @@ Settings opens in a focused mode that omits specialist integration, runtime, dia
 FNXC:SettingsNavigation 2026-07-16-12:00:
 FN-8128 returns CLI Binary to the default Settings view. It is deliberately absent from this Advanced-only set so desktop navigation, the mobile picker, and search expose binary install and diagnostic controls without requiring the browser-local Advanced preference.
 */
-const ADVANCED_SETTINGS_SECTION_IDS = new Set([
-  "node-sync",
-  "global-mcp",
-  "cli-agents",
-  "research-global",
-  "remote",
-  "experimental",
-  "hermes-runtime",
-  "openclaw-runtime",
-  "paperclip-runtime",
-  "scheduled-evals",
-  "node-routing",
-  "agent-permissions",
-  "memory",
-  "backups",
-  "research-project",
-  "secrets",
-  "mcp",
-  "prompts",
-  "plugins",
-]);
+const RUNTIME_PLUGIN_SECTION_IDS: ReadonlyMap<string, string> = new Map([
+  ["fusion-plugin-hermes-runtime", "hermes-runtime"],
+  ["fusion-plugin-openclaw-runtime", "openclaw-runtime"],
+  ["fusion-plugin-paperclip-runtime", "paperclip-runtime"],
+] as const);
+
+const RUNTIME_SETTINGS_SECTION_IDS = new Set(RUNTIME_PLUGIN_SECTION_IDS.values());
+
+export const ADVANCED_SETTINGS_SECTION_IDS = new Set(
+  SETTINGS_SECTION_METADATA.filter((section) => section.advanced).map((section) => section.id),
+);
 
 function readAdvancedSettingsPreference(): boolean {
   try {
     return localStorage.getItem(ADVANCED_SETTINGS_STORAGE_KEY) === "true";
   } catch {
     return false;
-  }
-}
-
-function clampSettingsNavWidth(width: number): number {
-  if (!Number.isFinite(width)) return SETTINGS_NAV_DEFAULT_WIDTH;
-  return Math.min(SETTINGS_NAV_MAX_WIDTH, Math.max(SETTINGS_NAV_MIN_WIDTH, Math.round(width)));
-}
-
-function readSettingsNavWidthPreference(): number {
-  try {
-    const stored = Number.parseFloat(localStorage.getItem(SETTINGS_NAV_WIDTH_STORAGE_KEY) ?? "");
-    return clampSettingsNavWidth(stored);
-  } catch {
-    return SETTINGS_NAV_DEFAULT_WIDTH;
   }
 }
 
@@ -473,196 +457,22 @@ function resolveNonNegativeExecutorToolFailureSetting(value: unknown, fallback: 
   return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : fallback;
 }
 
-export const SETTINGS_SECTIONS: SettingsSection[] = [
-  { id: "__preferences_header", label: "Preferences", labelKey: "settings.nav.preferencesHeader", scope: undefined, isGroupHeader: true },
-  { id: "appearance", label: "Appearance", labelKey: "settings.nav.appearance", scope: "global", searchableText: ["theme", "color", "sidebar", "dock", "task popup", "task popups", "board list popups", "popup view attachment", "open tasks as popups", "quick chat"] },
-  { id: "keyboard-shortcuts", label: "Keyboard Shortcuts", labelKey: "settings.nav.keyboardShortcuts", scope: "global", searchableText: ["keyboard shortcuts", "hotkeys", "quick chat shortcut", "terminal shortcut", "open files", "open settings", "command center", "new task shortcut", "record shortcut"] },
-  { id: "notifications", label: "Notifications", labelKey: "settings.nav.notifications", scope: "global", searchableText: ["ntfy", "webhook", "events", "failure notifications", "sticky", "toast"] },
-  { id: "global-general", label: "General · Global", labelKey: "settings.nav.globalGeneral", scope: "global", searchableText: ["global defaults", "modal outside dismiss", "agent logs", "persist tool output", "thinking logs"] },
-  /*
-  FNXC:SettingsNavigation 2026-07-16-12:00:
-  FN-8128 keeps the `fn` binary panel as a dedicated section rather than re-inlining machine plumbing at the top of General · Global, while restoring it to the default-visible Global group. Operators need installation, version, path, and diagnostic controls in Basic mode when setup or repair is needed.
-  */
-  { id: "cli-binary", label: "CLI Binary", labelKey: "settings.nav.cliBinary", scope: "global", searchableText: ["fn binary", "cli", "install", "version", "path", "upgrade", "homebrew", "binary check"] },
+const SETTINGS_SECTION_ICONS: Readonly<Record<string, typeof Globe>> = {
+  authentication: Globe,
+  "source-control-global": GitBranch,
+  "source-control": GitBranch,
+};
 
-  { id: "__project_header", label: "Project", labelKey: "settings.nav.projectHeader", scope: undefined, isGroupHeader: true },
-  /*
-  FNXC:GitHubImportTranslate 2026-07-15-16:20:
-  Import auto-translation lives in Project General beside the other import-scoped GitHub settings, but operators look for it by what it DOES ("translate", "language", "auto translate issues"), not by the section it happens to live in.
-  FNXC:SettingsSearch 2026-07-15-19:10: the per-setting index now matches these controls on their own label and help text, so the terms that merely restate the copy are no longer load-bearing. The list is kept for the genuine vocabulary gaps — "localize", "localization", "foreign language issues" — which appear nowhere in the copy, and because unmigrated siblings in this section still rely on section-level keywords.
-  */
-  { id: "general", label: "General · Project", labelKey: "settings.nav.projectGeneral", scope: "project", searchableText: ["project general", "Completion Documentation Automation", "Quick Chat launcher", "ephemeral task-worker agents", "chat rooms", "auto-cleanup old chats", "translate", "translation", "auto translate", "auto-translate", "autotranslate", "auto translate issues", "translate issues", "translate imported issues", "githubImportAutoTranslate", "importTranslateTargetLocale", "target language", "translation target language", "translation language", "language", "foreign language issues", "import language", "localize", "localization", "report", "report bug", "send feedback", "share idea", "get help"], searchableKeys: ["settings.general.autoTranslateImportedIssues", "settings.general.autoTranslateImportedIssuesHelp", "settings.general.translationTargetLanguage", "settings.general.translationTargetLanguageHelp", "settings.general.followDashboardLanguage"] },
-  { id: "commands", label: "Commands & Scripts", labelKey: "settings.nav.commands", scope: "project", searchableText: ["test command", "build command", "verification command", "workflow scripts", "commands"] },
-  { id: "worktrees", label: "Worktrees", labelKey: "settings.nav.worktrees", scope: "project", searchableText: ["worktree directory", "copy files", "recycle worktrees", "branch naming", "sibling branch rename"] },
-  { id: "merge", label: "Merge", labelKey: "settings.nav.merge", scope: "project", searchableText: ["auto merge", "AI merge", "merge strategy", "plan approval", "direct merge", "integration branch", "push after merge"] },
-  /*
-  FNXC:SettingsNavigation 2026-07-18-12:30:
-  FN-8350 makes configuration history a project Settings destination instead of a
-  Command Center card. Register it in the shared section registry so desktop
-  navigation, the mobile picker, and Settings search expose one canonical view.
-  */
-  { id: "config-versions", label: "Configuration Versions", labelKey: "settings.nav.configVersions", scope: "project", searchableText: ["configuration versions", "revision history", "roll back settings", "restore configuration", "config rollback"] },
-
-  { id: "__ai_header", label: "AI & Models", labelKey: "settings.nav.aiHeader", scope: undefined, isGroupHeader: true },
-  /*
-  FNXC:SettingsNavigation 2026-07-16-01:30:
-  Authentication leads the AI & Models group. It is a provider-credentials screen, so it belongs with the model settings it gates rather than under Integrations (where it sat among MCP/Plugins/runtimes) or floating above the groups as a special case — connecting a provider and choosing its models are one task, done in that order.
-  First within the group because nothing else in AI & Models can be configured until it is done: with no provider connected there are no models to pick.
-
-  FNXC:SettingsNavigation 2026-07-16-13:40:
-  FN-8130 changes the Settings landing surface from Authentication to Appearance. Authentication remains first within its own AI & Models group, but the always-visible global Preferences section is the default instead.
-  */
-  { id: "authentication", label: "Authentication", labelKey: "settings.nav.authentication", scope: undefined, icon: Globe, searchableText: ["login", "OAuth", "API key", "custom providers", "Anthropic", "OpenAI", "provider credentials"] },
-  { id: "global-models", label: "Models · Global", labelKey: "settings.nav.globalModels", scope: "global", searchableText: ["global models", "model presets", "favorite providers", "model pricing overrides", "LiteLLM pricing", "token pricing", "translate", "translation model", "import translation model", "import auto-translation model"] },
-  /**
-   * FNXC:SettingsNavigation 2026-07-13-00:00:
-   * Project Models owns the FN-7907 Direct-chat default settings. Its shared Settings search index must advertise chat-default terms and i18n labels so desktop nav, the mobile section picker, and filtered search all surface this section when operators search for Chat defaults.
-
-   * FNXC:SettingsNavigation 2026-07-14-20:15:
-   * Title auto-summarization lives under Project Models but operators search for "summarize", "auto summarize", "title summarization", and related phrases that did not match the prior chat-only/summarization-model index. Advertise those terms and the control's i18n keys so Settings search finds this section.
-   */
-  {
-    id: "project-models",
-    label: "Models · Project",
-    labelKey: "settings.nav.projectModels",
-    scope: "project",
-    searchableText: [
-      "default provider",
-      "default model",
-      "workflow model lanes",
-      "Plan/Triage",
-      "Executor",
-      "Reviewer",
-      "summarization model",
-      "summarize",
-      "summarize titles",
-      "auto summarize",
-      "auto-summarize",
-      "auto summarize titles",
-      "auto-summarize titles",
-      "autoSummarizeTitles",
-      "task definition language",
-      "task definitions input language",
-      "taskDefinitionInInputLanguage",
-      "localized task prose",
-      "title summarization",
-      "title summarizer",
-      "AI title",
-      "AI merge commit summaries",
-      "merge commit summary",
-      "chat",
-      "new chat",
-      "new chat behavior",
-      "chat default",
-      "chat default model",
-      "chat default agent",
-      "chat model",
-      "chat agent",
-      "prompt for model",
-      "always use default",
-      // FNXC:GitHubImportTranslate 2026-07-15-16:20: the import-translate lane is picked here.
-      "translate",
-      "translation",
-      "translation model",
-      "import translation model",
-      "import auto-translation model",
-      "auto-translate model",
-    ],
-    searchableKeys: [
-      "settings.projectModels.chatHeading",
-      "settings.projectModels.chatDescription",
-      "settings.projectModels.chatNewSessionMode",
-      "settings.projectModels.chatNewSessionModePrompt",
-      "settings.projectModels.chatNewSessionModeAlwaysDefault",
-      "settings.projectModels.chatDefaultKind",
-      "settings.projectModels.chatDefaultModel",
-      "settings.projectModels.chatDefaultAgent",
-      "settings.projectModels.aITitleAndGitCommitMessageSummarization",
-      "settings.projectModels.autoSummarizeLongDescriptionsAsTitles",
-      "settings.projectModels.whenEnabledTasksCreatedWithoutATitleBut",
-      "settings.projectModels.aIMergeCommitSummaries",
-      "settings.projectModels.whenEnabledMergeCommitMessagesIncludeAnAI",
-    ],
-  },
-  {
-    id: "cli-agents",
-    label: "CLI Agents",
-    labelKey: "settings.nav.cliAgents",
-    scope: "global",
-    searchableText: [
-      "Droid CLI",
-      "Cursor CLI",
-      "agent runtime",
-      "command line agents",
-      "Adapter",
-      "Command override",
-      "Path or name of the binary to launch",
-      "Extra arguments",
-      "Appended after the adapter's computed arguments",
-      "Environment variable additions",
-      "Comma-separated variable names forwarded",
-      "Autonomy mode",
-      "Elevated autonomy requires a per-project approval",
-    ],
-    searchableKeys: [
-      "settings.cliAgents.adapterLabel",
-      "settings.cliAgents.commandLabel",
-      "settings.cliAgents.commandHelp",
-      "settings.cliAgents.extraArgsLabel",
-      "settings.cliAgents.extraArgsHelp",
-      "settings.cliAgents.envLabel",
-      "settings.cliAgents.envHelp",
-      "settings.cliAgents.autonomyLabel",
-      "settings.cliAgents.autonomyHelp",
-      "settings.cliAgents.approvedNote",
-    ],
-  },
-  { id: "agent-permissions", label: "Agents & Permissions", labelKey: "settings.nav.agentPermissions", scope: "project", searchableText: ["agent provisioning", "approval", "permissions", "policy", "agent creation"] },
-  { id: "prompts", label: "Prompts", labelKey: "settings.nav.prompts", scope: "project", searchableText: ["prompt instructions", "PR title prompt", "PR description prompt", "custom prompts"] },
-  { id: "memory", label: "Memory", labelKey: "settings.nav.memory", scope: "project", searchableText: ["memory backend", "Dreams", "long-term memory", "qmd", "memory file", "retrieval"] },
-  { id: "research-global", label: "Research · Global", labelKey: "settings.nav.researchGlobal", scope: "global", searchableText: ["research providers", "external search providers", "fetch limits", "global research defaults", "citations"] },
-  { id: "research-project", label: "Research · Project", labelKey: "settings.nav.researchProject", scope: "project", searchableText: ["project research", "research runs", "citations", "search limits", "fetch synthesis"] },
-
-  { id: "__automation_header", label: "Automation", labelKey: "settings.nav.automationHeader", scope: undefined, isGroupHeader: true },
-  /*
-  FNXC:SettingsNavigation 2026-07-15-18:52:
-  Scheduling is split into a Global/Project pair rather than one section holding both authority levels behind in-section subheadings. The machine-wide concurrency cap and a project's scheduling posture are different questions, and a search result landing mid-section showed no subheading to disambiguate them.
-  */
-  { id: "scheduling-global", label: "Scheduling · Global", labelKey: "settings.nav.schedulingGlobal", scope: "global", searchableText: ["global max concurrent", "concurrency cap", "all projects", "machine wide", "parallel agents", "scheduler"] },
-  { id: "scheduling", label: "Scheduling · Project", labelKey: "settings.nav.scheduling", scope: "project", searchableText: ["max concurrent", "capacity", "stuck tasks", "poll interval", "parallel steps", "scheduler"] },
-  { id: "scheduled-evals", label: "Scheduled Evals", labelKey: "settings.nav.scheduledEvals", scope: "project", searchableText: ["scheduled evals", "evaluation schedule", "eval runs", "quality jobs"] },
-
-  { id: "__integrations_header", label: "Integrations", labelKey: "settings.nav.integrationsHeader", scope: undefined, isGroupHeader: true },
-  /*
-  FNXC:SourceControl 2026-07-15-20:30:
-  The Global/Project source-control pair sits under Integrations, not Project: these settings configure how Fusion talks to GitHub/GitLab, which is the same kind of thing as the MCP and provider entries beside them.
-  The two are adjacent and ordered global-then-project to match the inheritance they model — the global entry holds the fallbacks the project entry overrides — mirroring the MCP Servers pair directly below.
-  The GitLab/GitHub keywords below were curated on the `general` and `merge` nav entries before their controls moved here; a keyword left behind would send an operator searching "gitlab token" to a section that no longer renders one. The translate keywords deliberately did NOT move: `githubImportAutoTranslate`/`importTranslateTargetLocale` are Import Tasks panel settings and stay in General.
-  */
-  { id: "source-control-global", label: "Source Control · Global", labelKey: "settings.nav.sourceControlGlobal", scope: "global", icon: GitBranch, searchableText: ["GitLab instance URL", "global tracking repo", "GitLab", "GitHub", "global GitLab token", "GitLab fallback", "source control", "forge"] },
-  { id: "source-control", label: "Source Control · Project", labelKey: "settings.nav.sourceControl", scope: "project", icon: GitBranch, searchableText: ["GitHub tracking", "GitLab integration", "GitHub auth mode", "GitLab access token", "GitHub personal access token", "tracking repo", "source control", "forge", "gh cli", "issue tracking"] },
-  { id: "global-mcp", label: "MCP Servers · Global", labelKey: "settings.nav.globalMcp", scope: "global", searchableText: ["global MCP servers", "shared MCP", "user MCP", "tool servers"] },
-  { id: "mcp", label: "MCP Servers · Project", labelKey: "settings.nav.mcp", scope: "project", searchableText: ["project MCP servers", "workspace MCP", "project tool servers", "mcp config"] },
-  { id: "plugins", label: "Plugins", labelKey: "settings.nav.plugins", scope: "project", searchableText: ["Fusion plugins", "Pi extensions", "plugin manager", "extension marketplace"] },
-  { id: "hermes-runtime", label: "Hermes", labelKey: "settings.nav.hermesRuntime", scope: "global", searchableText: ["Hermes runtime", "plugin runtime", "printer runtime"] },
-  { id: "openclaw-runtime", label: "OpenClaw", labelKey: "settings.nav.openclawRuntime", scope: "global", searchableText: ["OpenClaw runtime", "plugin runtime", "open claw"] },
-  { id: "paperclip-runtime", label: "Paperclip", labelKey: "settings.nav.paperclipRuntime", scope: "global", searchableText: ["Paperclip runtime", "plugin runtime"] },
-  { id: "secrets", label: "Secrets", labelKey: "settings.nav.secrets", scope: "project", searchableText: ["secrets", "secret storage", "environment", "credentials"] },
-
-  { id: "__infrastructure_header", label: "Infrastructure", labelKey: "settings.nav.infrastructureHeader", scope: undefined, isGroupHeader: true },
-  { id: "node-sync", label: "Node Sync", labelKey: "settings.nav.nodeSync", scope: "global", searchableText: ["sync", "node", "distributed", "heartbeat", "coordination"] },
-  { id: "node-routing", label: "Node Routing", labelKey: "settings.nav.nodeRouting", scope: "project", searchableText: ["node routing", "routing rules", "node selection", "execution nodes"] },
-  /*
-  FNXC:SettingsNavigation 2026-06-26-09:20:
-  FN-7062 requires the remote settings nav entry to read "Remote Access" only. The stale "& Node Sync" suffix belongs to the separate Node Sync settings section, while this section body already uses the Remote Access heading.
-  */
-  { id: "remote", label: "Remote Access", labelKey: "settings.nav.remote", scope: "global", searchableText: ["cloudflared", "tunnel", "QR", "persistent token", "remote URL"] },
-  { id: "backups-global", label: "Database Backups", labelKey: "settings.backups.databaseBackups", scope: "global", searchableText: ["database backup", "restore", "shared cluster"] },
-  { id: "backups", label: "Memory Backups", labelKey: "settings.backups.memoryBackups", scope: "project", searchableText: ["memory backup", "memory snapshot"] },
-
-  { id: "__advanced_header", label: "Advanced", labelKey: "settings.nav.advancedHeader", scope: undefined, isGroupHeader: true },
-  { id: "experimental", label: "Experimental Features", labelKey: "settings.nav.experimental", scope: "global", searchableText: ["feature flags", "experiments", "research view", "evals view", "sandbox", "subtask breakdown"] },
-];
+export const SETTINGS_SECTIONS: SettingsSection[] = SETTINGS_SECTION_METADATA.map((section) => ({
+  id: section.id,
+  label: section.label,
+  labelKey: section.labelKey,
+  scope: section.scope,
+  ...(SETTINGS_SECTION_ICONS[section.id] ? { icon: SETTINGS_SECTION_ICONS[section.id] } : {}),
+  ...(section.isGroupHeader ? { isGroupHeader: true } : {}),
+  ...(section.searchableText ? { searchableText: [...section.searchableText] } : {}),
+  ...(section.searchableKeys ? { searchableKeys: [...section.searchableKeys] } : {}),
+}));
 
 // FNXC:SettingsNavigation 2026-07-04-00:00: sectionId -> owning group label ("Global"/"Runtimes"/"Project"),
 // derived once from SETTINGS_SECTIONS order. Used by resolveSettingsSectionOptionLabel to prefix
@@ -674,27 +484,27 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
  *  IMPORTANT: Dev Server is canonically keyed by `devServerView`; `devServer`
  *  is treated as a legacy alias and must never render as a second row. */
 const KNOWN_EXPERIMENTAL_FEATURES: Record<string, string> = {
+  /* FNXC:WhiteboardAlpha 2026-09-10-05:42: The workspace has its own explicit global default-off toggle so enabling unrelated Alpha chrome never exposes Whiteboard. */
+  whiteboardView: "Whiteboard Alpha",
   insights: "Insights",
   memoryView: "Memory Editor",
   skillsView: "Skills View",
   nodesView: "Nodes View",
   devServerView: "Dev Server",
-  todoView: "Todo List",
   researchView: "Research View",
   evalsView: "Evals View",
   /*
-  FNXC:SettingsExperimental 2026-08-01-00:00:
+  FNXC:SettingsExperimental 2026-07-19-00:00:
   FN-8352 promotes Ideation to a default-off top-level view. Keep its toggle
   visible so operators explicitly opt into the sidebar and mobile More surface.
   */
   ideationView: "Ideation View",
   qualityPlugin: "Quality Plugin",
   goalsView: "Goals View",
-  /* FNXC:QuickAddSubtaskFlag 2026-06-21-00:00: The AI subtask-breakdown quick-add affordance is exposed only through this default-off experimental flag so missing settings keep every quick-add Subtask button hidden. */
-  subtaskBreakdown: "Subtask Breakdown",
   leftSidebarNav: "Left Sidebar Navigation",
   sandbox: "Sandbox (command isolation)",
   chatRooms: "Chat Rooms",
+  chatFocus: "Chat Focus (per-conversation memory recall)",
   agentOnboarding: "Planning-style Agent Onboarding",
   workflowInterpreterDualObserve: "Workflow Graph Engine — dual-observe parity (diagnostic)",
 };
@@ -718,7 +528,9 @@ Chat Rooms, Goals, Memory, Insights, Skills, and Todo graduated from Experimenta
 FNXC:SettingsExperimental 2026-06-26-00:00:
 Remote Access graduated from Experimental — section is always available; stale persisted `remoteAccess` flags are hidden so upgrades cannot disable it.
 */
+/* FNXC:OfficialDashboardDesign 2026-09-13-00:38: Alpha chrome is Fusion's official dashboard design. Keep stale alphaUpdates values persisted but hidden and inert while Whiteboard remains an independent experiment. */
 const HIDDEN_EXPERIMENTAL_FEATURE_KEYS = new Set<string>([
+  "alphaUpdates",
   "chatRooms",
   "goalsView",
   "insights",
@@ -727,7 +539,6 @@ const HIDDEN_EXPERIMENTAL_FEATURE_KEYS = new Set<string>([
   "roadmap",
   "rightDock",
   "skillsView",
-  "todoView",
   "workflowColumns",
   "workflowGraphExecutor",
   "workflowInterpreterDualObserve",
@@ -811,7 +622,7 @@ type PluginsSubsectionId = "fusion-plugins" | "pi-extensions";
 
 /** Local form state extends Settings with a worktreeInitCommand override and lets tokenCap carry null (delete semantic). */
 type SettingsFormState = Settings & { worktreeInitCommand?: string; tokenCap?: number | null };
-type GlobalSourceControlSettings = Pick<GlobalSettings, "gitlabEnabled" | "gitlabInstanceUrl" | "gitlabApiBaseUrl" | "gitlabAuthToken" | "gitlabAuthTokenType" | "reportRoadmapDedupeEnabled" | "reportRoadmapLabel" | "reportRoadmapRepo">;
+type GlobalSourceControlSettings = Pick<GlobalSettings, "gitlabEnabled" | "gitlabInstanceUrl" | "gitlabApiBaseUrl" | "gitlabAuthToken" | "gitlabAuthTokenType" | "reportRoadmapDedupeEnabled" | "reportRoadmapLabel" | "reportRoadmapRepo" | "jiraEnabled" | "jiraBaseUrl" | "jiraApiBaseUrl" | "jiraAuthEmail" | "jiraAuthTokenSecretKey" | "jiraAuthTokenSecretScope" | "jiraBranchNameTemplate">;
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -839,6 +650,20 @@ interface SettingsModalProps {
   onShadcnCustomColorsChange?: (colors: Record<string, string>) => void;
   /** Mirrors pending Quick Chat launcher changes into the app shell immediately. */
   onQuickChatButtonModeChange?: (mode: "floating" | "footer" | "off") => void;
+  /** Mirrors the pending project conversation layout into mounted chat surfaces immediately. */
+  chatMessageLayout?: ChatMessageLayout;
+  onChatMessageLayoutChange?: (layout: ChatMessageLayout) => void;
+  /** Current App-shell values and optimistic callbacks for mounted Appearance consumers. */
+  openTasksInRightSidebar?: boolean;
+  onOpenTasksInRightSidebarChange?: (enabled: boolean) => void;
+  openMobileTasksInPopup?: boolean;
+  onOpenMobileTasksInPopupChange?: (enabled: boolean) => void;
+  taskPopupsBoardListOnly?: boolean;
+  onTaskPopupsBoardListOnlyChange?: (enabled: boolean) => void;
+  showCostBadgeOnCards?: boolean;
+  onShowCostBadgeOnCardsChange?: (enabled: boolean) => void;
+  taskDetailChatFirst?: boolean;
+  onTaskDetailChatFirstChange?: (enabled: boolean) => void;
   /** Mirrors pending mobile quick-action changes into the app shell immediately. */
   onMobileNavPrimaryItemsChange?: (items: string[]) => void;
   /** Optional callback when user wants to reopen the onboarding guide */
@@ -1104,13 +929,25 @@ export function SettingsModal({
   onDashboardFontScaleChange,
   onShadcnCustomColorsChange,
   onQuickChatButtonModeChange,
+  chatMessageLayout = "bubbles",
+  onChatMessageLayoutChange,
+  openTasksInRightSidebar,
+  onOpenTasksInRightSidebarChange,
+  openMobileTasksInPopup,
+  onOpenMobileTasksInPopupChange,
+  taskPopupsBoardListOnly,
+  onTaskPopupsBoardListOnlyChange,
+  showCostBadgeOnCards,
+  onShowCostBadgeOnCardsChange,
+  taskDetailChatFirst,
+  onTaskDetailChatFirstChange,
   onMobileNavPrimaryItemsChange,
   onReopenOnboarding,
   onOpenApprovals,
   onOpenWorkflowSettings,
   presentation = "modal",
 }: SettingsModalProps) {
-  const { isEmbedded, scrollLockEnabled, resizePersistEnabled, escapeEnabled, overlayDismissEnabled } = useEmbeddedPresentation(presentation);
+  const { isEmbedded, scrollLockEnabled, escapeEnabled, overlayDismissEnabled } = useEmbeddedPresentation(presentation);
   const { t } = useTranslation("app");
   const { confirm } = useConfirm();
   const viewportMode = useViewportMode();
@@ -1126,11 +963,10 @@ export function SettingsModal({
         ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
       } as CSSProperties)
     : {};
-  const modalRef = useRef<HTMLDivElement>(null);
   const settingsContentRef = useRef<HTMLDivElement>(null);
   const workflowLaneSaverRef = useRef<SectionSaveHandler | null>(null);
   /*
-  FNXC:SettingsAutoSave 2026-08-03-01:00:
+  FNXC:SettingsAutoSave 2026-07-20-01:00:
   Workflow lane edits live outside the shared Settings form. Track their revision
   alongside form dirtiness so Option 1 auto-save and every close path flush them
   too; a completion only clears the revision it actually persisted.
@@ -1150,14 +986,15 @@ export function SettingsModal({
       workflowLaneSaverRef.current = saver;
     }
   }, []);
-  // Modal-only: persist user-resized dialog dimensions. Embedded view fills its host and is not resizable.
-  useModalResizePersist(modalRef, resizePersistEnabled, "fusion:settings-modal-size");
+  // FNXC:ModalTouchGeometry 2026-07-26-14:10: FloatingWindow owns movable, clamped geometry for the modal branch; the embedded Settings view remains an inline, chrome-free destination.
   const sessionBannersHidden = useSessionBannersHidden();
   const [form, setForm] = useState<SettingsFormState>({
     maxConcurrent: 2,
     maxConcurrentVerifications: 1,
-    maxTriageConcurrent: 2,
     maxWorktrees: 4,
+    // FNXC:CapacityModel 2026-07-28-13:20: worktrees are a capacity dimension by
+    // default; off means capacity is total agents only.
+    worktreeLimitEnabled: true,
     pollIntervalMs: 15000,
     heartbeatMultiplier: 1,
     groupOverlappingFiles: true,
@@ -1171,7 +1008,8 @@ export function SettingsModal({
     maxAutoMergeRetries: 3,
     executorToolFailureRetryCount: 2,
     executorToolFailureRetryBackoffMs: 2000,
-    executorToolFailureThreshold: 3,
+    // FNXC:ExecutorToolFailureRetry 2026-08-06-14:56: mirror the core first-terminal-error default so an unset project setting never displays or persists the retired threshold of three.
+    executorToolFailureThreshold: 1,
     executorModelEscalationEnabled: false,
     executorEscalationProvider: "",
     executorEscalationModelId: "",
@@ -1179,15 +1017,14 @@ export function SettingsModal({
     mergeIntegrationWorktree: "reuse-task-worktree",
     mergeAdvanceAutoSync: "stash-and-ff",
     merger: { mode: "ai", maxReviewPasses: 3, allowDirtyLocalCheckoutSync: true },
-    recycleWorktrees: false,
     showWorktreeGrouping: false,
     openTasksInRightSidebar: false,
     openMobileTasksInPopup: false,
     taskPopupsBoardListOnly: true,
     showCostBadgeOnCards: false,
     taskDetailChatFirst: false,
+    chatMessageLayout: "bubbles",
     executorAllowSiblingBranchRename: false,
-    worktreeNaming: "random",
     worktreeCopyFiles: [],
     worktreesDir: "",
     worktrunk: {
@@ -1259,6 +1096,55 @@ export function SettingsModal({
   }, [form]);
   // Find the first non-group-header section for visibility fallback handling
   const firstNonHeaderSection = SETTINGS_SECTIONS.find((s) => !s.isGroupHeader);
+  const [installedRuntimeSectionIds, setInstalledRuntimeSectionIds] = useState<Set<string>>(() => new Set());
+  const [runtimeVisibilitySettled, setRuntimeVisibilitySettled] = useState(false);
+  const runtimeVisibilityRequestRef = useRef(0);
+  const refreshInstalledRuntimeSections = useCallback(async () => {
+    /*
+    FNXC:SettingsRuntimeNavigation 2026-07-22-12:00:
+    Runtime settings pages are backed only by installed plugin records, not the built-in catalog or runtime binary detection. Disabled installed records remain navigable so operators can inspect and re-enable them.
+    Every refresh clears visibility first: loading, undefined lists, and errors fail closed until a successful project-scoped GET /plugins response restores precisely its deduplicated runtime records.
+    */
+    const requestId = ++runtimeVisibilityRequestRef.current;
+    setRuntimeVisibilitySettled(false);
+    setInstalledRuntimeSectionIds(new Set());
+    try {
+      const plugins = await fetchPlugins(projectId);
+      const next = new Set<string>();
+      for (const plugin of plugins ?? []) {
+        const sectionId = RUNTIME_PLUGIN_SECTION_IDS.get(plugin.id);
+        if (sectionId) next.add(sectionId);
+      }
+      if (requestId !== runtimeVisibilityRequestRef.current) return;
+      setInstalledRuntimeSectionIds(next);
+      setRuntimeVisibilitySettled(true);
+    } catch {
+      // Fail closed; a later successful lifecycle/reconnect refresh restores entries.
+      if (requestId !== runtimeVisibilityRequestRef.current) return;
+      setInstalledRuntimeSectionIds(new Set());
+      setRuntimeVisibilitySettled(true);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void refreshInstalledRuntimeSections();
+    const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+    return subscribeSse(`/api/events${query}`, {
+      events: {
+        "plugin:lifecycle": (event) => {
+          try {
+            const payload = JSON.parse(event.data) as { scope?: string; projectId?: string };
+            if (payload.scope === "project" && (payload.projectId ?? projectId) !== projectId) return;
+            void refreshInstalledRuntimeSections();
+          } catch {
+            // Ignore malformed lifecycle data; reconnect still re-syncs authoritative state.
+          }
+        },
+      },
+      onReconnect: () => void refreshInstalledRuntimeSections(),
+    });
+  }, [projectId, refreshInstalledRuntimeSections]);
+
   const [activeSection, setActiveSection] = useState<SectionId>(() => {
     if (initialSection === "pi-extensions") {
       return "plugins";
@@ -1300,12 +1186,6 @@ export function SettingsModal({
       ? window.matchMedia(MOBILE_SETTINGS_MEDIA_QUERY)?.matches === true
       : false),
   );
-  /**
-   * FNXC:Settings 2026-07-11-18:52:
-   * FN-7825 makes the desktop/tablet Settings rail resizable and persists the chosen width locally. Mobile remains stacked and ignores this inline CSS variable so a desktop-saved width cannot leak into the top-bar layout.
-   */
-  const [settingsNavWidth, setSettingsNavWidth] = useState(() => readSettingsNavWidthPreference());
-  const settingsNavDragRef = useRef<{ startX: number; startWidth: number; previousUserSelect: string } | null>(null);
   const [settingsSearchQuery, setSettingsSearchQuery] = useState("");
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(() => {
     const requestedSection = initialSection === "pi-extensions" ? "plugins" : initialSection;
@@ -1322,16 +1202,6 @@ export function SettingsModal({
     } catch {
       // Storage can be unavailable in private/locked-down browser contexts; the in-session preference still works.
     }
-  }, []);
-  const persistSettingsNavWidth = useCallback((width: number) => {
-    const nextWidth = clampSettingsNavWidth(width);
-    setSettingsNavWidth(nextWidth);
-    try {
-      localStorage.setItem(SETTINGS_NAV_WIDTH_STORAGE_KEY, String(nextWidth));
-    } catch {
-      // Storage can be unavailable in private/locked-down browser contexts; the in-session width still works.
-    }
-    return nextWidth;
   }, []);
   /*
    * FNXC:Settings 2026-07-09-00:00:
@@ -1351,9 +1221,12 @@ export function SettingsModal({
   const [updateInstallLoading, setUpdateInstallLoading] = useState(false);
   const [updateInstallResult, setUpdateInstallResult] = useState<UpdateInstallResponse | null>(null);
   const [restartSupported, setRestartSupported] = useState<boolean | undefined>();
+  const [restartPriorPid, setRestartPriorPid] = useState<number | undefined>();
   const [restartLoading, setRestartLoading] = useState(false);
   const [restartScheduled, setRestartScheduled] = useState(false);
   const [restartError, setRestartError] = useState<string | null>(null);
+  const restartRecovery = useSystemRestartRecovery();
+  const pendingInstall = usePendingUpdateInstall();
   const gitHubStarCount = useGitHubStarCount();
   const [starClicked, markStarClicked] = useStarClickedFlag();
   const [prefixError, setPrefixError] = useState<string | null>(null);
@@ -1387,7 +1260,7 @@ export function SettingsModal({
     loading: worktreesDirPickerLoading,
     error: worktreesDirPickerError,
     refresh: refreshWorktreesDirPicker,
-  } = useWorkspaceFileBrowser("project", worktreesDirPickerOpen, projectId, { allowAbsolutePaths: false });
+  } = useWorkspaceFileBrowser("project", worktreesDirPickerOpen, projectId, { allowAbsolutePaths: true });
 
   const {
     entries: worktreeCopyFilePickerEntries,
@@ -1407,6 +1280,10 @@ export function SettingsModal({
       return false;
     }
 
+    if (RUNTIME_SETTINGS_SECTION_IDS.has(section.id) && !installedRuntimeSectionIds.has(section.id)) {
+      return false;
+    }
+
     if (section.id === "research-global" || section.id === "research-project") {
       return researchViewEnabled;
     }
@@ -1416,7 +1293,7 @@ export function SettingsModal({
     }
 
     return true;
-  })), [researchViewEnabled, evalsViewEnabled, showAdvancedSettings]);
+  })), [researchViewEnabled, evalsViewEnabled, installedRuntimeSectionIds, showAdvancedSettings]);
   const firstVisibleSectionId = visibleSections.some((section) => section.id === DEFAULT_SETTINGS_SECTION)
     ? DEFAULT_SETTINGS_SECTION
     : resolveFirstSelectableSettingsSection(visibleSections, firstNonHeaderSection?.id ?? "general");
@@ -1471,7 +1348,7 @@ export function SettingsModal({
     // jump; otherwise the row we just scrolled to would be scrolled away from.
     settingsJumpPendingRef.current = true;
     /*
-    FNXC:SettingsAutoSave 2026-08-03-00:00:
+    FNXC:SettingsAutoSave 2026-07-20-00:00:
     Search navigation is an operator-initiated section change too. Route it
     through the same flush path as sidebar/mobile navigation so a pending edit
     to raw global GitLab fields cannot be re-scoped as a project save after the
@@ -1546,6 +1423,7 @@ export function SettingsModal({
     }
 
     if (!visibleSections.some((section) => section.id === activeSection)) {
+      if (RUNTIME_SETTINGS_SECTION_IDS.has(activeSection) && !runtimeVisibilitySettled) return;
       setActiveSection(firstVisibleSectionId);
       return;
     }
@@ -1553,24 +1431,36 @@ export function SettingsModal({
     if (hasSettingsSearchQuery && hasSettingsSearchResults && !searchMatchedSections.some((section) => section.id === activeSection)) {
       setActiveSection(firstSearchMatchedSectionId);
     }
-  }, [activeSection, researchViewEnabled, evalsViewEnabled, firstVisibleSectionId, firstSearchMatchedSectionId, hasSettingsSearchQuery, hasSettingsSearchResults, searchMatchedSections, visibleSections]);
+  }, [activeSection, researchViewEnabled, evalsViewEnabled, firstVisibleSectionId, firstSearchMatchedSectionId, hasSettingsSearchQuery, hasSettingsSearchResults, runtimeVisibilitySettled, searchMatchedSections, visibleSections]);
 
   // Auth state (independent of the settings save flow)
   const [authProviders, setAuthProviders] = useState<AuthProvider[]>([]);
   const [authLoading, setAuthLoading] = useState(false);
-  const [authActionInProgress, setAuthActionInProgress] = useState<string | null>(null);
+  const [authActionInProgress, setAuthActionInProgress] = useState<Record<string, boolean>>({});
   const [loginInstructions, setLoginInstructions] = useState<Record<string, string>>({});
   const [manualCodeConfigs, setManualCodeConfigs] = useState<Record<string, ManualOAuthCodeInfo>>({});
   const [deviceCodes, setDeviceCodes] = useState<Record<string, OAuthDeviceCodeInfo>>({});
   const [manualCodeInputs, setManualCodeInputs] = useState<Record<string, string>>({});
   const [manualCodeSubmitInProgress, setManualCodeSubmitInProgress] = useState<string | null>(null);
+  /*
+  FNXC:ProviderAuth 2026-08-18-06:10:
+  Settings shares onboarding's persistent paste-back login dialog (ProviderLoginDialog). Everything
+  here is keyed by `stateKey` (provider + credential instance), not a bare provider id, because
+  Settings can hold several named accounts for one provider and each runs its own flow.
+  `loginDialog` carries the identity the dialog's handlers need; `loginAuthUrls` re-opens a lost
+  sign-in tab; `loginErrors` keeps the terminal reason on screen after the flow dies, since a toast
+  is gone before the operator is back from the browser tab they were signing in on.
+  */
+  const [loginDialog, setLoginDialog] = useState<{ stateKey: string; providerId: string; instanceId?: string; providerName: string } | null>(null);
+  const [loginAuthUrls, setLoginAuthUrls] = useState<Record<string, string>>({});
+  const [loginErrors, setLoginErrors] = useState<Record<string, string>>({});
   const [apiKeyInputs, setApiKeyInputs] = useState<Record<string, string>>({});
   const [apiKeyErrors, setApiKeyErrors] = useState<Record<string, string>>({});
   const [opencodeApiKeyRefreshStatus, setOpencodeApiKeyRefreshStatus] = useState<Record<string, {
     tone: "success" | "error";
     message: string;
   }>>({});
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollIntervalRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const lastAutoCopiedDeviceCodesRef = useRef<Record<string, string>>({});
 
   // Model state
@@ -1633,11 +1523,12 @@ export function SettingsModal({
   const skipNextMemoryReloadRef = useRef(false);
 
   // Global concurrency state
-  const [globalMaxConcurrent, setGlobalMaxConcurrent] = useState<number | undefined>(4);
-  const initialGlobalMaxConcurrentRef = useRef<number | undefined>(4);
-  const hasFetchedGlobalConcurrencyRef = useRef(false);
-  const globalConcurrencyDirtyRef = useRef(false);
-  const [globalConcurrencyLoaded, setGlobalConcurrencyLoaded] = useState(false);
+  /*
+  FNXC:CapacityModel 2026-07-29-00:10 (drop the cross-project cap — settings half):
+  The machine-wide cap's state, its dedicated fetch, its save branch and its dirty
+  tracking are DELETED along with the Scheduling · Global section that hosted it.
+  Capacity is two numbers PER PROJECT, both of which live in the settings form.
+  */
 
   // Import/Export state
   const [importDialogOpen, setImportDialogOpen] = useState(false);
@@ -1659,74 +1550,6 @@ export function SettingsModal({
     projectId,
     enabled: activeSection === "memory",
   });
-
-  const settingsNavResizeEnabled = !showMobileSectionPicker;
-  const settingsNavigationStyle = settingsNavResizeEnabled
-    ? ({ "--settings-nav-width": `${settingsNavWidth}px` } as CSSProperties)
-    : undefined;
-
-  const endSettingsNavResize = useCallback((pointerId?: number, target?: EventTarget | null) => {
-    const dragState = settingsNavDragRef.current;
-    if (!dragState) return;
-    document.body.style.userSelect = dragState.previousUserSelect;
-    settingsNavDragRef.current = null;
-    if (typeof pointerId === "number" && target instanceof HTMLElement && typeof target.releasePointerCapture === "function") {
-      try {
-        target.releasePointerCapture(pointerId);
-      } catch {
-        // Pointer capture may already be released by the browser; cleanup is still complete.
-      }
-    }
-  }, []);
-
-  const handleSettingsNavResizePointerMove = useCallback((event: PointerEvent) => {
-    const dragState = settingsNavDragRef.current;
-    if (!dragState) return;
-    event.preventDefault();
-    persistSettingsNavWidth(dragState.startWidth + event.clientX - dragState.startX);
-  }, [persistSettingsNavWidth]);
-
-  const handleSettingsNavResizePointerUp = useCallback((event: PointerEvent) => {
-    endSettingsNavResize(event.pointerId, event.target);
-  }, [endSettingsNavResize]);
-
-  const handleSettingsNavResizePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!settingsNavResizeEnabled) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (typeof event.currentTarget.setPointerCapture === "function") {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
-    settingsNavDragRef.current = {
-      startX: event.clientX,
-      startWidth: settingsNavWidth,
-      previousUserSelect: document.body.style.userSelect,
-    };
-    document.body.style.userSelect = "none";
-  }, [settingsNavResizeEnabled, settingsNavWidth]);
-
-  const handleSettingsNavResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (!settingsNavResizeEnabled) return;
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    persistSettingsNavWidth(settingsNavWidth + (event.key === "ArrowRight" ? 16 : -16));
-  }, [persistSettingsNavWidth, settingsNavResizeEnabled, settingsNavWidth]);
-
-  useEffect(() => {
-    if (!settingsNavResizeEnabled) {
-      endSettingsNavResize();
-      return;
-    }
-    document.addEventListener("pointermove", handleSettingsNavResizePointerMove);
-    document.addEventListener("pointerup", handleSettingsNavResizePointerUp);
-    document.addEventListener("pointercancel", handleSettingsNavResizePointerUp);
-    return () => {
-      document.removeEventListener("pointermove", handleSettingsNavResizePointerMove);
-      document.removeEventListener("pointerup", handleSettingsNavResizePointerUp);
-      document.removeEventListener("pointercancel", handleSettingsNavResizePointerUp);
-      endSettingsNavResize();
-    };
-  }, [endSettingsNavResize, handleSettingsNavResizePointerMove, handleSettingsNavResizePointerUp, settingsNavResizeEnabled]);
 
   useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
@@ -1773,6 +1596,11 @@ export function SettingsModal({
           */
           taskDetailChatFirst: s.taskDetailChatFirst === true,
           /*
+          FNXC:ChatMessageLayout 2026-08-18-20:27:
+          Normalize legacy or malformed project values before they enter the form so the selector always has exactly its two valid choices and defaults to Bubbles.
+          */
+          chatMessageLayout: normalizeChatMessageLayout(s.chatMessageLayout),
+          /*
           FNXC:GithubImportTracking 2026-07-01-00:00:
           Missing githubLinkImportedIssuesToTracking must render as unchecked and save as project-scoped false only after operator interaction; this keeps upgraded projects on legacy import behavior by default.
           */
@@ -1782,7 +1610,7 @@ export function SettingsModal({
           maxAutoMergeRetries: resolveMaxAutoMergeRetriesForSettingsForm(s),
           executorToolFailureRetryCount: resolveNonNegativeExecutorToolFailureSetting(s.executorToolFailureRetryCount, 2),
           executorToolFailureRetryBackoffMs: resolveNonNegativeExecutorToolFailureSetting(s.executorToolFailureRetryBackoffMs, 2000),
-          executorToolFailureThreshold: Math.max(1, Math.floor(Number(s.executorToolFailureThreshold ?? 3) || 3)),
+          executorToolFailureThreshold: Math.max(1, Math.floor(Number(s.executorToolFailureThreshold ?? 1) || 1)),
           executorModelEscalationEnabled: s.executorModelEscalationEnabled === true,
           executorEscalationProvider: s.executorEscalationProvider ?? "",
           executorEscalationModelId: s.executorEscalationModelId ?? "",
@@ -1801,6 +1629,13 @@ export function SettingsModal({
           reportRoadmapDedupeEnabled: scoped.global.reportRoadmapDedupeEnabled,
           reportRoadmapLabel: scoped.global.reportRoadmapLabel,
           reportRoadmapRepo: scoped.global.reportRoadmapRepo,
+          jiraEnabled: scoped.global.jiraEnabled,
+          jiraBaseUrl: scoped.global.jiraBaseUrl,
+          jiraApiBaseUrl: scoped.global.jiraApiBaseUrl,
+          jiraAuthEmail: scoped.global.jiraAuthEmail,
+          jiraAuthTokenSecretKey: scoped.global.jiraAuthTokenSecretKey,
+          jiraAuthTokenSecretScope: scoped.global.jiraAuthTokenSecretScope,
+          jiraBranchNameTemplate: scoped.global.jiraBranchNameTemplate,
         });
         setInitialScopedValues({
           ...scoped,
@@ -1830,38 +1665,6 @@ export function SettingsModal({
     void refreshSettingsForm(true);
   }, [addToast, projectId]);
 
-  /*
-  FNXC:SettingsConcurrency 2026-07-15-18:52:
-  Fetches for EITHER scheduling section. `scheduling-global` renders the cap itself, and `scheduling` (project) gates its own concurrency inputs on this load — the FN-era invariant that a concurrency input stays disabled until its live value arrives, so an operator cannot overwrite a resolved limit with a blank fallback.
-  Gating on `"scheduling"` alone (the id before the Global/Project split) would leave the global cap's own section waiting on a fetch that never fires, disabling the only control it renders.
-  */
-  useEffect(() => {
-    if ((activeSection !== "scheduling" && activeSection !== "scheduling-global") || hasFetchedGlobalConcurrencyRef.current) {
-      return;
-    }
-
-    let cancelled = false;
-    fetchGlobalConcurrency()
-      .then((state) => {
-        if (cancelled) {
-          return;
-        }
-        if (!globalConcurrencyDirtyRef.current) {
-          setGlobalMaxConcurrent(state.globalMaxConcurrent);
-        }
-        initialGlobalMaxConcurrentRef.current = state.globalMaxConcurrent;
-        hasFetchedGlobalConcurrencyRef.current = true;
-        setGlobalConcurrencyLoaded(true);
-      })
-      .catch(() => {
-        // Silently fail — global concurrency may not be available
-        setGlobalConcurrencyLoaded(true);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeSection]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1888,13 +1691,23 @@ export function SettingsModal({
   const handleCheckForUpdates = useCallback(async () => {
     setUpdateCheckLoading(true);
     setUpdateInstallResult(null);
-    setRestartSupported(undefined);
+    /*
+    FNXC:SettingsUpdate 2026-07-25-10:05:
+    Do NOT clear restartSupported here. It is a property of the HOST (is there a
+    supervising parent?), not of this update check, and clearing it stranded the
+    post-update "Restart Fusion" button: the capability effect was keyed on
+    updateAvailable, so a second "Check now" that returned the same
+    updateAvailable=true left restartSupported permanently `undefined` and the
+    button disabled with "Needs a supervising parent" on a perfectly supervised
+    host. The probe below owns this state for the modal's lifetime.
+    */
     setRestartLoading(false);
     setRestartScheduled(false);
     setRestartError(null);
 
     try {
       const result = await checkForUpdates();
+      pendingUpdateInstallState.record(result.pendingInstall);
       setUpdateCheckResult(result);
 
       if (result.error) {
@@ -1923,15 +1736,32 @@ export function SettingsModal({
 
     try {
       const result = await installUpdate(projectId);
+      pendingUpdateInstallState.record(result);
       setUpdateInstallResult(result);
-
-      if (result.error) {
-        addToast(result.error, "error");
-        return;
+      if (result.restartScheduled && result.latestVersion) {
+        setRestartScheduled(true);
+        systemRestartRecovery.arm(result.latestVersion, result.priorPid ?? restartPriorPid);
       }
 
       if (result.updated) {
         addToast(t("settings.general.updateSuccessToast", "Update installed. Restart Fusion to apply it."), "success");
+        /*
+        FNXC:SettingsUpdate 2026-07-25-10:05:
+        Re-probe capability right before the restart button appears so a transient
+        /system/info failure at mount (which fails closed to `false`) cannot leave a
+        supervised host permanently unable to restart from Settings.
+        */
+        void fetchSystemInfo()
+          .then((info) => {
+            setRestartSupported(info.restartSupported);
+            setRestartPriorPid(info.pid);
+          })
+          .catch(() => {
+            // Keep whatever the mount probe resolved; the guidance text covers it.
+          });
+      } else {
+        const message = result.message ?? result.error ?? t("settings.general.updateUnknown", "Update did not complete — see the Fusion logs");
+        addToast(message, result.outcome === "check-failed" || result.outcome === "failed" || Boolean(result.error) ? "error" : "info");
       }
     } catch (error) {
       const message = getErrorMessage(error) || t("settings.general.updateFailed", "Update failed");
@@ -1940,24 +1770,33 @@ export function SettingsModal({
         latestVersion: updateCheckResult?.latestVersion ?? null,
         updated: false,
         error: message,
+        outcome: "failed",
+        message,
       });
       addToast(message, "error");
     } finally {
       setUpdateInstallLoading(false);
     }
-  }, [addToast, appVersion, projectId, t, updateCheckResult]);
+  }, [addToast, appVersion, projectId, restartPriorPid, t, updateCheckResult]);
 
+  /*
+  FNXC:SettingsUpdate 2026-07-25-10:05:
+  Probe host restart capability once when Settings mounts — same unconditional
+  shape UpdateAvailableBanner and the Command Center System panel use. It used to
+  run only after an update became available, which made the state order-dependent
+  and left the restart button dead in the re-check case described above. Fetching
+  on mount means the capability is already resolved by the time an install
+  finishes, so the button is enabled the moment it appears.
+  */
   useEffect(() => {
-    if (!updateCheckResult?.updateAvailable && updateInstallResult?.updated !== true) {
-      return;
-    }
-
     let cancelled = false;
-    setRestartSupported(undefined);
 
     void fetchSystemInfo()
       .then((info) => {
-        if (!cancelled) setRestartSupported(info.restartSupported);
+        if (!cancelled) {
+          setRestartSupported(info.restartSupported);
+          setRestartPriorPid(info.pid);
+        }
       })
       .catch(() => {
         // Fail closed: system capability fetch errors must not expose an unavailable restart action.
@@ -1967,16 +1806,23 @@ export function SettingsModal({
     return () => {
       cancelled = true;
     };
-  }, [updateCheckResult?.updateAvailable, updateInstallResult?.updated]);
+  }, []);
 
   /*
   FNXC:SettingsUpdate 2026-07-16-00:00:
   After a successful in-app update, the Settings footer must offer the same supervised
-  one-click restart as SystemControlsArea. The FN-8134-deferred Settings surface keeps
-  the control disabled with manual-restart guidance unless restartSupported is true.
+  one-click restart as SystemControlsArea.
+
+  FNXC:SettingsUpdate 2026-07-25-10:05:
+  The control must never silently do nothing. It used to be hard-disabled on
+  `restartSupported !== true`, so any host whose capability probe answered false —
+  including a probe that merely failed, or a stale answer — left the operator with a
+  dead button and no way to learn why ("the restart button does nothing"). Now the
+  click always reaches the server and the server's own refusal is shown inline; the
+  supervising-parent line stays as advisory guidance rather than a hard block.
   */
   const handleRestart = useCallback(async () => {
-    if (restartLoading || restartSupported !== true) return;
+    if (restartLoading) return;
 
     setRestartLoading(true);
     setRestartError(null);
@@ -1984,6 +1830,8 @@ export function SettingsModal({
       const result = await requestSystemRestart("settings-update");
       if (result.scheduled) {
         setRestartScheduled(true);
+        const targetVersion = pendingInstall?.latestVersion ?? updateInstallResult?.latestVersion ?? updateCheckResult?.latestVersion;
+        if (targetVersion) systemRestartRecovery.arm(targetVersion, restartPriorPid);
       } else {
         setRestartError(t("settings.general.restartFailed", "Restart could not be scheduled. Try restarting Fusion manually."));
       }
@@ -1992,25 +1840,36 @@ export function SettingsModal({
     } finally {
       setRestartLoading(false);
     }
-  }, [restartLoading, restartSupported, t]);
+  }, [pendingInstall, restartLoading, restartPriorPid, t, updateCheckResult, updateInstallResult]);
 
   const renderUpdateCheckResultContent = useCallback(() => {
-    if (!updateCheckResult) {
+    /* FNXC:PendingUpdateInstall 2026-08-21-05:58: A host-retained install takes precedence over this modal's transient check and loading state, including after the modal remounts. */
+    const effectiveCheckResult = pendingInstall
+      ? { currentVersion: pendingInstall.currentVersion, latestVersion: pendingInstall.latestVersion, updateAvailable: true }
+      : updateCheckResult;
+    const effectiveInstallResult = pendingInstall ?? updateInstallResult;
+    if (!effectiveCheckResult) {
       return null;
     }
 
-    if (updateCheckResult.error) {
-      return updateCheckResult.error;
+    if (effectiveCheckResult.externallyManaged) {
+      return <span className="settings-update-install-status">{effectiveCheckResult.message}</span>;
     }
 
-    if (updateCheckResult.updateAvailable && updateCheckResult.latestVersion) {
-      const installSucceeded = updateInstallResult?.updated === true;
-      const installError = updateInstallResult?.error;
+    if (effectiveCheckResult.error) {
+      return effectiveCheckResult.error;
+    }
+
+    if (effectiveCheckResult.updateAvailable && effectiveCheckResult.latestVersion) {
+      const installSucceeded = effectiveInstallResult?.updated === true;
+      const installError = effectiveInstallResult?.error;
+      const installMessage = effectiveInstallResult?.message ?? installError ?? (effectiveInstallResult && !effectiveInstallResult.updated ? t("settings.general.updateUnknown", "Update did not complete — see the Fusion logs") : undefined);
+      const installIsError = effectiveInstallResult?.outcome === "check-failed" || effectiveInstallResult?.outcome === "failed" || Boolean(installError && effectiveInstallResult?.outcome !== "unsupported-install-method");
 
       return (
         <>
           <span>
-            {t("settings.general.updateAvailablePrefix", "v{{version}} available", { version: updateCheckResult.latestVersion })} ·{" "}
+            {t("settings.general.updateAvailablePrefix", "v{{version}} available", { version: effectiveCheckResult.latestVersion })} ·{" "}
             <a
               href="https://runfusion.ai"
               target="_blank"
@@ -2024,13 +1883,20 @@ export function SettingsModal({
             <span className="settings-update-install-succeeded">
               <span className="settings-update-install-status settings-update-install-status--success" aria-live="polite">
                 {t("settings.general.updateSuccess", "Updated to v{{version}} — restart Fusion to apply", {
-                  version: updateInstallResult.latestVersion ?? updateCheckResult.latestVersion,
+                  version: effectiveInstallResult.latestVersion ?? effectiveCheckResult.latestVersion,
                 })}
               </span>
-              {restartScheduled ? (
-                <span className="settings-update-install-status" aria-live="polite">
-                  {t("settings.general.restarting", "Restarting… Your connection will close shortly.")}
-                </span>
+              {restartScheduled || pendingInstall?.restartScheduled ? (
+                <>
+                  <span className="settings-update-install-status" aria-live="polite">
+                    {restartRecovery.phase === "back"
+                      ? t("settings.general.backOnline", "Fusion v{{version}} is back online — reloading…", { version: restartRecovery.version })
+                      : restartRecovery.phase === "timeout"
+                        ? t("settings.general.restartTimedOut", "Fusion did not return in time. Refresh when it is back online.")
+                        : t("settings.general.restarting", "Restarting… Your connection will close shortly.")}
+                  </span>
+                  {restartRecovery.phase === "timeout" && <button type="button" className="btn btn-sm settings-update-now-btn" onClick={() => systemRestartRecovery.retry()}>{t("settings.general.retryRestart", "Retry readiness check")}</button>}
+                </>
               ) : (
                 <button
                   type="button"
@@ -2038,7 +1904,7 @@ export function SettingsModal({
                   onClick={() => {
                     void handleRestart();
                   }}
-                  disabled={restartSupported !== true || restartLoading}
+                  disabled={restartLoading}
                 >
                   {restartLoading ? (
                     <>
@@ -2053,7 +1919,14 @@ export function SettingsModal({
                   )}
                 </button>
               )}
-              {restartSupported !== true && (
+              {/*
+                FNXC:SettingsUpdate 2026-07-25-10:05:
+                Advisory, not a block. The probe says this host reported no supervising
+                parent, so restarting will likely be refused — but the operator can still
+                press the button and read the server's actual reason instead of facing a
+                dead control.
+              */}
+              {restartSupported === false && (
                 <span className="settings-update-install-status" aria-live="polite">
                   {t("settings.general.restartUnavailable", "Needs a supervising parent — restart Fusion manually without --no-supervise.")}
                 </span>
@@ -2083,9 +1956,9 @@ export function SettingsModal({
               )}
             </button>
           )}
-          {installError && (
-            <span className="settings-update-install-status settings-update-install-status--error" aria-live="polite">
-              {t("settings.general.updateFailedWithMessage", "Update failed: {{message}}", { message: installError })}
+          {installMessage && !installSucceeded && (
+            <span className={`settings-update-install-status${installIsError ? " settings-update-install-status--error" : ""}`} aria-live="polite">
+              {installIsError ? t("settings.general.updateFailedWithMessage", "Update failed: {{message}}", { message: installMessage }) : installMessage}
             </span>
           )}
         </>
@@ -2093,7 +1966,34 @@ export function SettingsModal({
     }
 
     return t("settings.general.upToDate", "You're up to date ✓");
-  }, [handleInstallUpdate, handleRestart, restartError, restartLoading, restartScheduled, restartSupported, t, updateCheckResult, updateInstallLoading, updateInstallResult]);
+  }, [handleInstallUpdate, handleRestart, pendingInstall, restartError, restartLoading, restartRecovery, restartScheduled, restartSupported, t, updateCheckResult, updateInstallLoading, updateInstallResult]);
+
+  /*
+  FNXC:SettingsUpdate 2026-07-25-19:40:
+  The update-check result ("vX available · Learn more" plus the Update now / Restart controls) is one node rendered
+  in two places: inline next to the version button on desktop/tablet, and on its OWN full-width row above the footer
+  rail on mobile. The mobile footer is a single nowrap horizontally-scrolling rail (FN-7752); once an update banner
+  joined that rail its intrinsic width exceeded the viewport, so the banner itself was clipped mid-sentence and
+  Import/Export/Reset/Close were pushed off-screen behind a scroll affordance operators do not see. Giving the banner
+  its own row keeps the rail to the controls it was sized for, and the banner wraps normally instead of clipping.
+  */
+  const displayedUpdateCheckResult = pendingInstall
+    ? { currentVersion: pendingInstall.currentVersion, latestVersion: pendingInstall.latestVersion, updateAvailable: true }
+    : updateCheckResult;
+  const updateCheckResultNode = displayedUpdateCheckResult ? (
+    <span
+      aria-live="polite"
+      className={`settings-update-result ${
+        displayedUpdateCheckResult.error
+          ? "settings-update-result--error"
+          : displayedUpdateCheckResult.updateAvailable
+            ? "settings-update-result--available"
+            : "settings-update-result--up-to-date"
+      }`}
+    >
+      {renderUpdateCheckResultContent()}
+    </span>
+  ) : null;
 
   // Load auth status when the authentication section is active
   const loadAuthStatus = useCallback(async () => {
@@ -2131,7 +2031,7 @@ export function SettingsModal({
   }, [activeSection]);
 
   useEffect(() => {
-    if (activeSection === "backups") {
+    if (activeSection === "backups-global") {
       setBackupLoading(true);
       fetchBackups(projectId)
         .then((info) => setBackupInfo(info))
@@ -2448,12 +2348,10 @@ export function SettingsModal({
       setAuthLoading(true);
       loadAuthStatus().finally(() => setAuthLoading(false));
     }
-    // Clean up polling when leaving auth section
+    // Each instance owns its own login poll; leaving Settings stops every active account poll.
     return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
-      }
+      for (const interval of Object.values(pollIntervalRef.current)) clearInterval(interval);
+      pollIntervalRef.current = {};
     };
   }, [activeSection, loadAuthStatus]);
 
@@ -2501,6 +2399,14 @@ export function SettingsModal({
   }, []);
 
   const clearAuthLoginUiState = useCallback((providerId: string) => {
+    setLoginAuthUrls((prev) => {
+      if (!(providerId in prev)) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[providerId];
+      return next;
+    });
     if (providerId in lastAutoCopiedDeviceCodesRef.current) {
       const next = { ...lastAutoCopiedDeviceCodesRef.current };
       delete next[providerId];
@@ -2541,20 +2447,19 @@ export function SettingsModal({
   }, []);
 
   useEffect(() => {
-    const copilotDeviceCode = deviceCodes["github-copilot"];
-    if (!copilotDeviceCode?.userCode) {
-      return;
+    for (const [stateKey, deviceCode] of Object.entries(deviceCodes)) {
+      if (!deviceCode.userCode || lastAutoCopiedDeviceCodesRef.current[stateKey] === deviceCode.userCode) continue;
+      lastAutoCopiedDeviceCodesRef.current[stateKey] = deviceCode.userCode;
+      void copyTextToClipboard(deviceCode.userCode);
     }
-
-    if (lastAutoCopiedDeviceCodesRef.current["github-copilot"] === copilotDeviceCode.userCode) {
-      return;
-    }
-
-    lastAutoCopiedDeviceCodesRef.current["github-copilot"] = copilotDeviceCode.userCode;
-    void copyTextToClipboard(copilotDeviceCode.userCode);
   }, [deviceCodes]);
 
-  const handleLogin = useCallback(async (providerId: string) => {
+  /*
+  FNXC:SettingsCredentialInstance 2026-08-01-17:06:
+  Settings must omit the optional instance argument for a provider's default credential, while every explicit account id follows its OAuth or API-key action unchanged. This preserves the API's default-provider compatibility and prevents UI-local state from conflating default and named account flows.
+  */
+  const handleLogin = useCallback(async (providerId: string, instanceId?: string, label?: string) => {
+    const stateKey = formatProviderInstanceKey({ providerId, instanceId: instanceId ?? "default" });
     const provider = authProviders.find((entry) => entry.id === providerId);
     if (provider?.requiresManualCode === true) {
       const shouldContinue = await confirm({
@@ -2566,40 +2471,69 @@ export function SettingsModal({
       if (!shouldContinue) {
         return;
       }
+      /*
+      FNXC:ProviderAuth 2026-08-18-06:10:
+      Hand straight from the warning into the persistent dialog, so the paste field and the flow's
+      current step are on screen from the moment the browser tab opens instead of appearing inline in
+      a scrolling provider list.
+      */
+      setLoginErrors((prev) => {
+        if (!(stateKey in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[stateKey];
+        return next;
+      });
+      setLoginDialog({ stateKey, providerId, instanceId, providerName: provider.name });
     }
 
-    setAuthActionInProgress(providerId);
-    clearAuthLoginUiState(providerId);
+    setAuthActionInProgress((prev) => ({ ...prev, [stateKey]: true }));
+    clearAuthLoginUiState(stateKey);
 
     try {
-      const { url, instructions, manualCode, deviceCode } = await loginProvider(providerId);
-      if (instructions?.trim() && !(providerId === "github-copilot" && deviceCode)) {
-        setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
+      const { url, instructions, manualCode, deviceCode } = instanceId === undefined
+        ? await loginProvider(providerId)
+        : label === undefined
+          ? await loginProvider(providerId, instanceId)
+          : await loginProvider(providerId, instanceId, label);
+      if (instructions?.trim() && !deviceCode) {
+        setLoginInstructions((prev) => ({ ...prev, [stateKey]: instructions }));
       }
       if (manualCode) {
-        setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
+        setManualCodeConfigs((prev) => ({ ...prev, [stateKey]: manualCode }));
       }
-      if (deviceCode && providerId === "github-copilot") {
-        setDeviceCodes((prev) => ({ ...prev, [providerId]: deviceCode }));
+      if (deviceCode) {
+        setDeviceCodes((prev) => ({ ...prev, [stateKey]: deviceCode }));
       }
-      if (providerId !== "github-copilot" || !deviceCode) {
-        openExternalUrl(appendTokenQuery(deviceCode?.verificationUri ?? url));
+      const authUrl = appendTokenQuery(deviceCode ? deviceCode.verificationUri : url);
+      setLoginAuthUrls((prev) => ({ ...prev, [stateKey]: authUrl }));
+      if (!deviceCode) {
+        openExternalUrl(authUrl);
       }
 
       // Poll for auth completion every 2 seconds
-      pollIntervalRef.current = setInterval(async () => {
+      pollIntervalRef.current[stateKey] = setInterval(async () => {
         try {
-          const { providers } = await fetchAuthStatus();
-          const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
-          setAuthProviders(visibleProviders);
-          const provider = visibleProviders.find((p) => p.id === providerId);
+          const { providers } = await fetchAuthStatus({ provider: providerId, instance: instanceId });
+          const provider = providers.find((candidate) => candidate.id === providerId
+            && (candidate.instanceId ?? "default") === (instanceId ?? "default"));
           if (provider?.authenticated) {
-            if (pollIntervalRef.current) {
-              clearInterval(pollIntervalRef.current);
-              pollIntervalRef.current = null;
+            if (pollIntervalRef.current[stateKey]) {
+              clearInterval(pollIntervalRef.current[stateKey]);
+              delete pollIntervalRef.current[stateKey];
             }
-            setAuthActionInProgress(null);
-            clearAuthLoginUiState(providerId);
+            setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
+            setLoginDialog((current) => (current?.stateKey === stateKey ? null : current));
+            clearAuthLoginUiState(stateKey);
+            /*
+            FNXC:SettingsCredentialInstance 2026-08-01-17:49:
+            A targeted OAuth poll reports only the requested account's instance rows. Do not
+            replace Authentication's full provider envelope with that scoped response: sibling
+            providers and named accounts must remain visible while the login finishes. Refresh
+            the unscoped status only after this requested instance is terminal.
+            */
+            await loadAuthStatus().catch(() => {});
             addToast(t("settings.auth.loginSuccessful", "Login successful"), "success");
             window.dispatchEvent(new CustomEvent(OAUTH_RELOGIN_SUCCESS_EVENT, { detail: { providerId } }));
             scrollSettingsToTop();
@@ -2607,12 +2541,18 @@ export function SettingsModal({
           }
 
           if (!provider?.loginInProgress) {
-            if (pollIntervalRef.current) {
-              clearInterval(pollIntervalRef.current);
-              pollIntervalRef.current = null;
+            if (pollIntervalRef.current[stateKey]) {
+              clearInterval(pollIntervalRef.current[stateKey]);
+              delete pollIntervalRef.current[stateKey];
             }
-            setAuthActionInProgress(null);
-            clearAuthLoginUiState(providerId);
+            setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
+            /*
+            FNXC:ProviderAuth 2026-08-18-07:10:
+            Prefer the server's own reason over the generic sentence — an `OAuth state mismatch`
+            (pasted URL from an older attempt) is actionable, and "try again" alone reproduces it.
+            */
+            setLoginErrors((prev) => ({ ...prev, [stateKey]: describeLoginFailure(provider?.loginError) }));
+            clearAuthLoginUiState(stateKey);
             addToast(t("settings.auth.loginDidNotComplete", "Login did not complete. Please try again."), "error");
           }
         } catch {
@@ -2627,29 +2567,33 @@ export function SettingsModal({
         await loadAuthStatus();
       } else {
         addToast(message, "error");
+        setLoginErrors((prev) => ({ ...prev, [stateKey]: message }));
       }
-      setAuthActionInProgress(null);
-      clearAuthLoginUiState(providerId);
+      setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
+      clearAuthLoginUiState(stateKey);
     }
   }, [addToast, authProviders, clearAuthLoginUiState, confirm, loadAuthStatus, scrollSettingsToTop]);
 
-  const handleSubmitManualCode = useCallback(async (providerId: string) => {
-    const code = manualCodeInputs[providerId]?.trim();
+  const handleSubmitManualCode = useCallback(async (providerId: string, instanceId?: string) => {
+    const stateKey = formatProviderInstanceKey({ providerId, instanceId: instanceId ?? "default" });
+    const code = manualCodeInputs[stateKey]?.trim();
     if (!code) {
       addToast(t("settings.auth.pasteRedirectUrlFirst", "Paste the full redirect URL or authorization code first."), "warning");
       return;
     }
 
-    setManualCodeSubmitInProgress(providerId);
+    setManualCodeSubmitInProgress(stateKey);
     try {
-      const result = await submitProviderManualCode(providerId, code);
+      const result = instanceId === undefined
+        ? await submitProviderManualCode(providerId, code)
+        : await submitProviderManualCode(providerId, code, instanceId);
       if (result.submitted) {
         setManualCodeInputs((prev) => {
-          if (!(providerId in prev)) {
+          if (!(stateKey in prev)) {
             return prev;
           }
           const next = { ...prev };
-          delete next[providerId];
+          delete next[stateKey];
           return next;
         });
         addToast(t("settings.auth.authCodeReceived", "Authorization code received. Finishing login…"), "success");
@@ -2663,58 +2607,69 @@ export function SettingsModal({
     }
   }, [addToast, manualCodeInputs]);
 
-  const handleCancelLogin = useCallback(async (providerId: string) => {
-    setAuthActionInProgress(providerId);
-    setAuthProviders((prev) => prev.map((provider) =>
-      provider.id === providerId ? { ...provider, loginInProgress: false } : provider,
-    ));
+  const handleCancelLogin = useCallback(async (providerId: string, instanceId?: string) => {
+    const stateKey = formatProviderInstanceKey({ providerId, instanceId: instanceId ?? "default" });
+    setAuthActionInProgress((prev) => ({ ...prev, [stateKey]: true }));
+    // Provider status is shared; do not optimistically clear a concurrent instance's login flag.
     try {
-      await cancelProviderLogin(providerId);
-      clearAuthLoginUiState(providerId);
+      if (instanceId === undefined) {
+        await cancelProviderLogin(providerId);
+      } else {
+        await cancelProviderLogin(providerId, instanceId);
+      }
+      clearAuthLoginUiState(stateKey);
       await loadAuthStatus().catch(() => {});
       addToast(t("settings.auth.loginCancelled", "Login cancelled"), "success");
     } catch (err) {
       addToast(getErrorMessage(err) || "Failed to cancel login", "error");
     } finally {
-      setAuthActionInProgress(null);
-      setManualCodeSubmitInProgress((prev) => prev === providerId ? null : prev);
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
+      setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
+      setManualCodeSubmitInProgress((prev) => prev === stateKey ? null : prev);
+      if (pollIntervalRef.current[stateKey]) {
+        clearInterval(pollIntervalRef.current[stateKey]);
+        delete pollIntervalRef.current[stateKey];
       }
     }
   }, [addToast, clearAuthLoginUiState, loadAuthStatus]);
 
-  const handleLogout = useCallback(async (providerId: string) => {
-    setAuthActionInProgress(providerId);
+  const handleLogout = useCallback(async (providerId: string, instanceId?: string) => {
+    const stateKey = formatProviderInstanceKey({ providerId, instanceId: instanceId ?? "default" });
+    setAuthActionInProgress((prev) => ({ ...prev, [stateKey]: true }));
     try {
-      await logoutProvider(providerId);
+      if (instanceId === undefined) {
+        await logoutProvider(providerId);
+      } else {
+        await logoutProvider(providerId, instanceId);
+      }
       await loadAuthStatus();
       addToast(t("settings.auth.loggedOut", "Logged out"), "success");
     } catch (err) {
       addToast(getErrorMessage(err) || "Logout failed", "error");
     } finally {
-      setAuthActionInProgress(null);
+      setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
     }
   }, [addToast, loadAuthStatus]);
 
-  const handleSaveApiKey = useCallback(async (providerId: string) => {
-    const key = apiKeyInputs[providerId]?.trim();
+  const handleSaveApiKey = useCallback(async (providerId: string, instanceId?: string, label?: string) => {
+    const stateKey = formatProviderInstanceKey({ providerId, instanceId: instanceId ?? "default" });
+    const key = apiKeyInputs[stateKey]?.trim();
     if (!key) {
-      setApiKeyErrors((prev) => ({ ...prev, [providerId]: "API key is required" }));
+      setApiKeyErrors((prev) => ({ ...prev, [stateKey]: "API key is required" }));
       return;
     }
-    setAuthActionInProgress(providerId);
+    setAuthActionInProgress((prev) => ({ ...prev, [stateKey]: true }));
     setApiKeyErrors((prev) => {
       const next = { ...prev };
-      delete next[providerId];
+      delete next[stateKey];
       return next;
     });
     try {
-      const saveResult = await saveApiKey(providerId, key);
+      const saveResult = instanceId === undefined
+        ? await saveApiKey(providerId, key)
+        : await saveApiKey(providerId, key, instanceId, label);
       setApiKeyInputs((prev) => {
         const next = { ...prev };
-        delete next[providerId];
+        delete next[stateKey];
         return next;
       });
       await loadAuthStatus();
@@ -2749,7 +2704,7 @@ export function SettingsModal({
         } else {
           setOpencodeApiKeyRefreshStatus((prev) => {
             const next = { ...prev };
-            delete next[providerId];
+            delete next[stateKey];
             return next;
           });
         }
@@ -2757,31 +2712,36 @@ export function SettingsModal({
       addToast(t("settings.auth.apiKeySaved", "API key saved"), "success");
       scrollSettingsToTop();
     } catch (err) {
-      setApiKeyErrors((prev) => ({ ...prev, [providerId]: getErrorMessage(err) || "Failed to save API key" }));
+      setApiKeyErrors((prev) => ({ ...prev, [stateKey]: getErrorMessage(err) || "Failed to save API key" }));
       if (providerId === "opencode" || providerId === "opencode-go") {
         setOpencodeApiKeyRefreshStatus((prev) => {
           const next = { ...prev };
-          delete next[providerId];
+          delete next[stateKey];
           return next;
         });
       }
     } finally {
-      setAuthActionInProgress(null);
+      setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
     }
   }, [apiKeyInputs, addToast, loadAuthStatus, scrollSettingsToTop]);
 
-  const handleClearApiKey = useCallback(async (providerId: string) => {
-    setAuthActionInProgress(providerId);
+  const handleClearApiKey = useCallback(async (providerId: string, instanceId?: string) => {
+    const stateKey = formatProviderInstanceKey({ providerId, instanceId: instanceId ?? "default" });
+    setAuthActionInProgress((prev) => ({ ...prev, [stateKey]: true }));
     try {
-      await clearApiKey(providerId);
+      if (instanceId === undefined) {
+        await clearApiKey(providerId);
+      } else {
+        await clearApiKey(providerId, instanceId);
+      }
       setApiKeyInputs((prev) => {
         const next = { ...prev };
-        delete next[providerId];
+        delete next[stateKey];
         return next;
       });
       setApiKeyErrors((prev) => {
         const next = { ...prev };
-        delete next[providerId];
+        delete next[stateKey];
         return next;
       });
       await loadAuthStatus();
@@ -2789,7 +2749,7 @@ export function SettingsModal({
     } catch (err) {
       addToast(getErrorMessage(err) || "Failed to clear API key", "error");
     } finally {
-      setAuthActionInProgress(null);
+      setAuthActionInProgress((prev) => { const next = { ...prev }; delete next[stateKey]; return next; });
     }
   }, [addToast, loadAuthStatus]);
 
@@ -2907,10 +2867,10 @@ export function SettingsModal({
   const handleExport = useCallback(async () => {
     try {
       // Default scope based on active section
-      const scope = activeSectionScope === "global" ? "global" : 
+      const scope = activeSectionScope === "global" ? "global" :
                     activeSectionScope === "project" ? "project" : "both";
       const data = await exportSettings(scope, projectId);
-      
+
       // Create and download the JSON file
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
@@ -2922,7 +2882,7 @@ export function SettingsModal({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      
+
       const scopeLabel = scope === "global"
         ? t("settings.importExport.scopeLabel.global", "global")
         : scope === "project"
@@ -2937,10 +2897,10 @@ export function SettingsModal({
   const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    
+
     setImportFile(file);
     setImportLoading(true);
-    
+
     try {
       const text = await file.text();
       const data = JSON.parse(text) as SettingsExportData;
@@ -2956,7 +2916,7 @@ export function SettingsModal({
 
   const handleImport = useCallback(async () => {
     if (!importPreview) return;
-    
+
     setImportLoading(true);
     try {
       const result = await importSettings(importPreview, { scope: importScope, merge: importMerge }, projectId);
@@ -3070,6 +3030,22 @@ export function SettingsModal({
       projectModelKey: "executionModelId",
       helperText: "AI model used for task implementation (executor agent).",
       fallbackOrder: "Project override → Global execution lane → Global default lane → Automatic resolution",
+    },
+    /*
+    FNXC:FastModeModel 2026-08-29-02:43:
+    Fast & Cheap work has a dedicated no-plan/no-review execution route. Keep its pair and credential companion separate from the normal executor lane in both settings scopes so inexpensive routing is explicitly opt-in.
+    */
+    {
+      laneId: "fast-cheap",
+      label: t("settings.globalModels.fastAndCheapModel", "Fast & Cheap Model"),
+      globalProviderKey: "fastCheapGlobalProvider",
+      globalModelKey: "fastCheapGlobalModelId",
+      globalThinkingKey: "fastCheapGlobalThinkingLevel",
+      projectProviderKey: "fastCheapProvider",
+      projectModelKey: "fastCheapModelId",
+      projectThinkingKey: "fastCheapThinkingLevel",
+      helperText: t("settings.globalModels.fastAndCheapModelHelp", "Select a cheap model here for quick edits. It is used for Fast Mode when creating a task."),
+      fallbackOrder: "Project override → Global Fast & Cheap lane → Execution lane → Project default lane → Global default lane → Automatic resolution",
     },
     {
       laneId: "planning",
@@ -3290,8 +3266,6 @@ export function SettingsModal({
   }, [closeWorktreesDirPicker]);
 
   const selectCurrentWorktreesDir = useCallback(() => {
-    if (isSlashPrefixedAbsolutePath(worktreesDirPickerCurrentPath)) return;
-
     const normalizedPath = worktreesDirPickerCurrentPath === "."
       ? "./"
       : (worktreesDirPickerCurrentPath.endsWith("/") ? worktreesDirPickerCurrentPath : `${worktreesDirPickerCurrentPath}/`);
@@ -3417,7 +3391,7 @@ export function SettingsModal({
   }, []);
 
   /*
-  FNXC:SettingsAutoSave 2026-08-02-12:00:
+  FNXC:SettingsAutoSave 2026-07-20-12:00:
   FN-8395 implements issue #2343 Option 1: form-backed Settings persist through
   this debounced single-flight path, never a Save button or dirty-leave prompt.
   Each request works from a captured render snapshot and advances only matching
@@ -3437,7 +3411,6 @@ export function SettingsModal({
     const scopedSettingsSnapshot = scopedSettings;
     const initialValuesSnapshot = initialValues;
     const initialScopedValuesSnapshot = initialScopedValues;
-    const globalMaxConcurrentSnapshot = globalMaxConcurrent;
     const activeSectionSnapshot = activeSection;
     const globalGitlabSettingsSnapshot = globalGitlabSettings;
     const workflowLaneRevisionSnapshot = workflowLaneRevisionRef.current;
@@ -3510,7 +3483,7 @@ export function SettingsModal({
         maxAutoMergeRetries: resolveMaxAutoMergeRetriesForSettingsForm(formSnapshot),
         executorToolFailureRetryCount: resolveNonNegativeExecutorToolFailureSetting(formSnapshot.executorToolFailureRetryCount, 2),
         executorToolFailureRetryBackoffMs: resolveNonNegativeExecutorToolFailureSetting(formSnapshot.executorToolFailureRetryBackoffMs, 2000),
-        executorToolFailureThreshold: Math.max(1, Math.floor(Number(formSnapshot.executorToolFailureThreshold ?? 3) || 3)),
+        executorToolFailureThreshold: Math.max(1, Math.floor(Number(formSnapshot.executorToolFailureThreshold ?? 1) || 1)),
         executorModelEscalationEnabled: formSnapshot.executorModelEscalationEnabled === true,
         executorEscalationProvider: formSnapshot.executorEscalationProvider?.trim() || undefined,
         executorEscalationModelId: formSnapshot.executorEscalationModelId?.trim() || undefined,
@@ -3533,6 +3506,19 @@ export function SettingsModal({
         reportRoadmapDedupeEnabled: gitlabFormForSave.reportRoadmapDedupeEnabled,
         reportRoadmapLabel: gitlabFormForSave.reportRoadmapLabel?.trim() || undefined,
         reportRoadmapRepo: gitlabFormForSave.reportRoadmapRepo?.trim() || undefined,
+        /*
+        FNXC:JiraBranchNaming 2026-08-20-05:18:
+        Project forms begin with effective JIRA values inherited from global settings. Preserve
+        unset values here rather than coercing defaults so splitSettingsSave can distinguish an
+        untouched inherited setting from an operator's project override or explicit clear.
+        */
+        jiraEnabled: gitlabFormForSave.jiraEnabled,
+        jiraBaseUrl: gitlabFormForSave.jiraBaseUrl?.trim() || undefined,
+        jiraApiBaseUrl: gitlabFormForSave.jiraApiBaseUrl?.trim() || undefined,
+        jiraAuthEmail: gitlabFormForSave.jiraAuthEmail?.trim() || undefined,
+        jiraAuthTokenSecretKey: gitlabFormForSave.jiraAuthTokenSecretKey?.trim() || undefined,
+        jiraAuthTokenSecretScope: gitlabFormForSave.jiraAuthTokenSecretScope,
+        jiraBranchNameTemplate: gitlabFormForSave.jiraBranchNameTemplate?.trim() || undefined,
         githubAuthToken: formSnapshot.githubAuthToken?.trim() || undefined,
         prTitlePromptInstructions: formSnapshot.prTitlePromptInstructions?.trim() || undefined,
         prDescriptionPromptInstructions: formSnapshot.prDescriptionPromptInstructions?.trim() || undefined,
@@ -3589,12 +3575,19 @@ export function SettingsModal({
       await Promise.all([
         Object.keys(globalPatch).length > 0 ? updateGlobalSettings(globalPatch) : Promise.resolve(),
         Object.keys(projectPatch).length > 0 ? updateSettings(projectPatch, projectId) : Promise.resolve(),
-        globalMaxConcurrentSnapshot !== initialGlobalMaxConcurrentRef.current
-          ? updateGlobalConcurrency({ globalMaxConcurrent: globalMaxConcurrentSnapshot ?? 4 })
-          : Promise.resolve(),
       ]);
 
       await workflowLaneSaverRef.current?.();
+
+      /*
+      FNXC:SettingsBackups 2026-08-13-23:51:
+      Saving database-backup settings can register or reschedule the central
+      routine. Refresh its evidence immediately so the open settings view does
+      not require a close-and-reopen cycle to report the new schedule.
+      */
+      if (Object.keys(globalPatch).some((key) => key.startsWith("autoBackup"))) {
+        void fetchBackups(projectId).then(setBackupInfo).catch(() => setBackupInfo(null));
+      }
 
       // Only clear workflow-lane dirtiness when no newer lane edit arrived.
       if (workflowLaneRevisionRef.current === workflowLaneRevisionSnapshot) {
@@ -3604,7 +3597,7 @@ export function SettingsModal({
       // Quiet state feedback avoids a toast for each debounced edit.
       setAutoSaveStatus("saved");
       /*
-      FNXC:SettingsAutoSave 2026-08-02-20:50:
+      FNXC:SettingsAutoSave 2026-07-20-20:50:
       A completed request may describe an older form snapshot. Advance only the
       keys that request actually wrote so a response can never bless unrelated,
       newer edits as already persisted.
@@ -3620,11 +3613,8 @@ export function SettingsModal({
           project: mergePatch(current.project, projectPatch as Record<string, unknown>) as Partial<Settings>,
         };
       });
-      if (globalMaxConcurrentSnapshot !== initialGlobalMaxConcurrentRef.current) {
-        initialGlobalMaxConcurrentRef.current = globalMaxConcurrentSnapshot;
-      }
       /*
-      FNXC:SettingsAutoSave 2026-08-02-21:45:
+      FNXC:SettingsAutoSave 2026-07-20-21:45:
       A successful snapshot becomes the next autosave comparison point. If the
       user edited while this request was in flight, the live snapshot differs
       and the effect queues exactly one trailing write.
@@ -3633,7 +3623,6 @@ export function SettingsModal({
         form: formSnapshot,
         scopedSettings: scopedSettingsSnapshot,
         globalGitlabSettings: globalGitlabSettingsSnapshot,
-        globalMaxConcurrent: globalMaxConcurrentSnapshot,
       });
       lastPersistSucceededRef.current = true;
       return true;
@@ -3651,7 +3640,7 @@ export function SettingsModal({
         void persistSettingsRef.current?.();
       }
     }
-  }, [form, globalGitlabSettings, globalMaxConcurrent, prefixError, presetDraft, initialValues, initialScopedValues, scopedSettings, addToast, projectId, activeSection, t]);
+  }, [form, globalGitlabSettings, prefixError, presetDraft, initialValues, initialScopedValues, scopedSettings, addToast, projectId, activeSection, t]);
 
   persistSettingsRef.current = persistSettings;
   const settingsDirty = useMemo(() => {
@@ -3669,18 +3658,17 @@ export function SettingsModal({
       } : undefined,
     });
     return Object.keys(globalPatch).length > 0 || Object.keys(projectPatch).length > 0
-      || globalMaxConcurrent !== initialGlobalMaxConcurrentRef.current
       || workflowLanesDirty;
-  }, [form, globalGitlabSettings, globalMaxConcurrent, initialScopedValues, initialValues, scopedSettings, activeSection, workflowLanesDirty]);
+  }, [form, globalGitlabSettings, initialScopedValues, initialValues, scopedSettings, activeSection, workflowLanesDirty]);
 
-  const autoSaveSnapshot = useMemo(() => JSON.stringify({ form, scopedSettings, globalGitlabSettings, globalMaxConcurrent, workflowLaneRevision: workflowLaneRevisionRef.current }), [form, globalGitlabSettings, globalMaxConcurrent, scopedSettings, workflowLanesDirty]);
+  const autoSaveSnapshot = useMemo(() => JSON.stringify({ form, scopedSettings, globalGitlabSettings, workflowLaneRevision: workflowLaneRevisionRef.current }), [form, globalGitlabSettings, scopedSettings, workflowLanesDirty]);
   const hasAutoSaveChange = autoSaveActivationSnapshotRef.current !== null
     && autoSaveActivationSnapshotRef.current !== autoSaveSnapshot;
   latestAutoSaveStateRef.current = { dirty: settingsDirty, changed: hasAutoSaveChange };
 
   useEffect(() => {
     /*
-    FNXC:SettingsAutoSave 2026-08-02-21:35:
+    FNXC:SettingsAutoSave 2026-07-20-21:35:
     Some legacy form values are normalized differently from their raw scoped
     settings. Snapshot the hydrated form before enabling autosave so opening
     Settings cannot write those untouched defaults; later user edits change the
@@ -3702,11 +3690,11 @@ export function SettingsModal({
     autoSaveTimerRef.current = setTimeout(() => {
       autoSaveTimerRef.current = null;
       void persistSettingsRef.current?.();
-    }, 500);
+    }, SETTINGS_AUTOSAVE_DEBOUNCE_MS);
     return () => {
       if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
     };
-  }, [loading, autoSaveReady, hasAutoSaveChange, settingsDirty, prefixError, presetDraft, form, scopedSettings, globalGitlabSettings, globalMaxConcurrent, workflowLanesDirty, activeSection]);
+  }, [loading, autoSaveReady, hasAutoSaveChange, settingsDirty, prefixError, presetDraft, form, scopedSettings, globalGitlabSettings, workflowLanesDirty, activeSection]);
 
   const requestClose = useCallback(async () => {
     if (autoSaveTimerRef.current) {
@@ -3714,7 +3702,7 @@ export function SettingsModal({
       autoSaveTimerRef.current = null;
     }
     /*
-    FNXC:SettingsAutoSave 2026-08-02-20:50:
+    FNXC:SettingsAutoSave 2026-07-20-20:50:
     Close is never a discard path. If a request is already running, queue its
     latest trailing snapshot and wait for that queue to drain before the modal
     unmounts; otherwise flush the current dirty snapshot synchronously.
@@ -3762,7 +3750,7 @@ export function SettingsModal({
       autoSaveTimerRef.current = null;
     }
     /*
-    FNXC:SettingsAutoSave 2026-08-03-22:15:
+    FNXC:SettingsAutoSave 2026-07-20-22:15:
     Parent-driven unmount is also a dismissal path. Retain a dirty snapshot's
     flush even when a debounce timer is not present at cleanup, rather than
     treating the timer itself as the source of durability.
@@ -3781,14 +3769,6 @@ export function SettingsModal({
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
   }, [escapeEnabled, requestClose, resetDialogOpen]);
-
-  const modalOverlayDismissProps = useOverlayDismiss(() => { void requestClose(); });
-  /*
-  FNXC:SettingsAutoSave 2026-08-02-21:45:
-  Backdrop dismissal remains preference-gated, but every enabled modal path
-  shares requestClose so its latest dirty snapshot is flushed before unmount.
-  */
-  const overlayDismissProps = !isEmbedded && overlayDismissEnabled ? modalOverlayDismissProps : {};
 
 
   /*
@@ -3817,7 +3797,14 @@ export function SettingsModal({
       if (activeSectionResetEntry.scope === "global") {
         const patch: Record<string, unknown> = {};
         for (const key of activeSectionResetEntry.keys) {
-          patch[key] = (DEFAULT_GLOBAL_SETTINGS as Record<string, unknown>)[key];
+          /*
+          FNXC:SettingsReset 2026-07-22-23:55:
+          Issue #2411: global keys whose canonical default is undefined (e.g.
+          embeddedPostgresMaxConnections, resolved platform-aware server-side)
+          must reset via null-as-delete. A literal undefined is dropped by JSON
+          serialization, so the stored value would silently survive the reset.
+          */
+          patch[key] = (DEFAULT_GLOBAL_SETTINGS as Record<string, unknown>)[key] ?? null;
         }
         await updateGlobalSettings(patch);
       } else {
@@ -3983,8 +3970,10 @@ export function SettingsModal({
       name: nextName,
       executorProvider: presetDraft.executorProvider,
       executorModelId: presetDraft.executorModelId,
+      ...(presetDraft.executorCredentialInstanceId ? { executorCredentialInstanceId: presetDraft.executorCredentialInstanceId } : {}),
       validatorProvider: presetDraft.validatorProvider,
       validatorModelId: presetDraft.validatorModelId,
+      ...(presetDraft.validatorCredentialInstanceId ? { validatorCredentialInstanceId: presetDraft.validatorCredentialInstanceId } : {}),
     };
 
     setForm((current) => {
@@ -4102,6 +4091,13 @@ export function SettingsModal({
               reportRoadmapDedupeEnabled: current?.reportRoadmapDedupeEnabled,
               reportRoadmapLabel: current?.reportRoadmapLabel,
               reportRoadmapRepo: current?.reportRoadmapRepo,
+              jiraEnabled: current?.jiraEnabled,
+              jiraBaseUrl: current?.jiraBaseUrl,
+              jiraApiBaseUrl: current?.jiraApiBaseUrl,
+              jiraAuthEmail: current?.jiraAuthEmail,
+              jiraAuthTokenSecretKey: current?.jiraAuthTokenSecretKey,
+              jiraAuthTokenSecretScope: current?.jiraAuthTokenSecretScope,
+              jiraBranchNameTemplate: current?.jiraBranchNameTemplate,
               ...patch,
             }))}
             globalTrackingRepoOptions={globalTrackingRepoOptions}
@@ -4144,7 +4140,7 @@ export function SettingsModal({
         );
 
       case "secrets":
-        return <SecretsSection addToast={addToast} />;
+        return <SecretsSection addToast={addToast} projectId={projectId} />;
       case "global-mcp":
         return (
           <GlobalMcpSection
@@ -4213,27 +4209,37 @@ export function SettingsModal({
             onColorThemeChange={onColorThemeChange}
             onDashboardFontScaleChange={onDashboardFontScaleChange}
             onShadcnCustomColorsChange={onShadcnCustomColorsChange}
+            chatMessageLayout={chatMessageLayout}
+            onChatMessageLayoutChange={onChatMessageLayoutChange}
+            openTasksInRightSidebar={openTasksInRightSidebar}
+            onOpenTasksInRightSidebarChange={onOpenTasksInRightSidebarChange}
+            openMobileTasksInPopup={openMobileTasksInPopup}
+            onOpenMobileTasksInPopupChange={onOpenMobileTasksInPopupChange}
+            taskPopupsBoardListOnly={taskPopupsBoardListOnly}
+            onTaskPopupsBoardListOnlyChange={onTaskPopupsBoardListOnlyChange}
+            showCostBadgeOnCards={showCostBadgeOnCards}
+            onShowCostBadgeOnCardsChange={onShowCostBadgeOnCardsChange}
+            taskDetailChatFirst={taskDetailChatFirst}
+            onTaskDetailChatFirstChange={onTaskDetailChatFirstChange}
             sessionBannersHidden={sessionBannersHidden}
             setSessionBannersHidden={setSessionBannersHidden}
           />
         );
-      case "scheduling-global":
-        return (
-          <SchedulingGlobalSection
-            globalMaxConcurrent={globalMaxConcurrent}
-            concurrencyLoading={activeSection === "scheduling-global" && !globalConcurrencyLoaded && !globalConcurrencyDirtyRef.current}
-            onGlobalMaxConcurrentChange={(value) => {
-              globalConcurrencyDirtyRef.current = true;
-              setGlobalMaxConcurrent(value);
-            }}
-          />
-        );
       case "scheduling":
         return (
+          /*
+          FNXC:CapacityModel 2026-07-29-00:10 (drop the cross-project cap — settings half):
+          `concurrencyLoading` gated the PROJECT concurrency inputs on the GLOBAL
+          concurrency fetch, which was never the right source — maxConcurrent and
+          maxWorktrees come from the settings form. With the global cap deleted the gate
+          is repointed at the form's own load, preserving the invariant it existed for:
+          a concurrency input stays disabled until its live value has arrived, so an
+          operator cannot overwrite a resolved limit with a blank fallback.
+          */
           <SchedulingSection
             form={form}
             setForm={setForm}
-            concurrencyLoading={activeSection === "scheduling" && !globalConcurrencyLoaded && !globalConcurrencyDirtyRef.current}
+            concurrencyLoading={loading}
             onOverlapIgnorePathChange={handleOverlapIgnorePathChange}
             onOpenOverlapPathPicker={openOverlapPathPicker}
             onRemoveOverlapIgnorePath={handleRemoveOverlapIgnorePath}
@@ -4352,6 +4358,8 @@ export function SettingsModal({
             researchLimitError={researchLimitError}
           />
         );
+      case "voice-input":
+        return <VoiceInputSection form={form} setForm={setForm} />;
       case "cli-binary":
         return <CliBinarySection />;
       case "experimental":
@@ -4439,6 +4447,7 @@ export function SettingsModal({
             addToast={addToast}
             activePluginsSubsection={activePluginsSubsection}
             setActivePluginsSubsection={setActivePluginsSubsection}
+            onPluginsChanged={refreshInstalledRuntimeSections}
           />
         );
       case "authentication":
@@ -4460,6 +4469,7 @@ export function SettingsModal({
               manualCodeInputs,
               setManualCodeInputs,
               manualCodeSubmitInProgress,
+              activeLoginDialogKey: loginDialog?.stateKey ?? null,
               loadAuthStatus,
               handleLogin,
               handleLogout,
@@ -4469,6 +4479,15 @@ export function SettingsModal({
               handleSubmitManualCode,
               onReopenOnboarding,
             }}
+            /*
+            FNXC:ProviderAuth 2026-07-24-17:05:
+            Authentication is presentational like every other section — the shell keeps
+            ownership of persistence. It needs the form only for the Anthropic
+            credential-precedence row, which belongs beside the two Anthropic cards
+            rather than buried in a general settings list.
+            */
+            form={form}
+            setForm={setForm}
           />
         );
       case "hermes-runtime":
@@ -4484,95 +4503,168 @@ export function SettingsModal({
   FNXC:Settings 2026-06-22-00:00:
   Embedded settings is a main-content destination, not a dialog. It drops the fixed `.modal-overlay` backdrop and the inner card chrome (modal-overlay/modal/settings-modal classes), and instead uses `settings-embedded right-dock-embedded-view` (host) + `settings-modal--embedded` (panel) to fill the pane flush like other embedded views (Planning, Command Center). The modal path stays byte-identical.
   */
-  return (
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-19:40:
+  The shell MUST stay a plain render function, never a component declared inside this render. A nested component is a
+  new element type on every render, so React remounts the whole Settings subtree on each keystroke and text inputs lose
+  focus after one character. Keep the returned element types (div / FloatingWindow) stable by calling this directly.
+  */
+  const renderModalShell = (children: ReactNode) => isEmbedded ? (
     <div
-      className={isEmbedded ? "settings-embedded right-dock-embedded-view" : "modal-overlay open settings-modal-overlay"}
-      {...overlayDismissProps}
-      data-testid={isEmbedded ? "settings-view" : undefined}
-      role={isEmbedded ? "region" : "dialog"}
-      aria-label={isEmbedded ? t("settings.title", "Settings") : undefined}
-      aria-modal={isEmbedded ? undefined : "true"}
+      className="settings-embedded right-dock-embedded-view"
+      data-testid="settings-view"
+      role="region"
+      aria-label={t("settings.title", "Settings")}
     >
+      {children}
+    </div>
+  ) : (
+    <FloatingWindow
+      windowKey="settings"
+      title={t("settings.title", "Settings")}
+      ariaLabel={t("settings.title", "Settings")}
+      onClose={() => void requestClose()}
+      hideHeader
+      dragHandleSelector=".settings-modal > .modal-header"
+      className="floating-window--settings"
+      defaultSize={{ width: 1100, height: 720 }}
+      minSize={{ width: 520, height: 480 }}
+      persistGeometryKey="floating-window:settings"
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+      closeOnOutsidePointerDown={overlayDismissEnabled}
+    >
+      {children}
+    </FloatingWindow>
+  );
+
+  /*
+  FNXC:ProviderAuth 2026-08-18-06:10:
+  The login dialog is rendered OUTSIDE renderModalShell, deliberately. In its modal presentation the
+  shell is a FloatingWindow, and a portaled dialog inside a window's React subtree lifts that window
+  above itself on first click (a portal moves the DOM node, not the React tree, and the window raises
+  itself on every pointerdown it sees). As a sibling it is unaffected in both presentations.
+  */
+  const loginDialogElement = loginDialog ? (() => {
+    const { stateKey, providerId, instanceId, providerName } = loginDialog;
+    const manualCode = manualCodeConfigs[stateKey];
+    const failure = loginErrors[stateKey];
+    const authenticated = authProviders.some((entry) => entry.id === providerId
+      && (entry.instanceId ?? "default") === (instanceId ?? "default")
+      && entry.authenticated);
+    const phase: ProviderLoginPhase = authenticated
+      ? "succeeded"
+      : failure
+        ? "failed"
+        : manualCodeSubmitInProgress === stateKey
+          ? "submitting"
+          : "waiting";
+    return (
+      <ProviderLoginDialog
+        data-testid={`provider-login-dialog-${stateKey}`}
+        providerName={providerName}
+        authUrl={loginAuthUrls[stateKey]}
+        instructions={loginInstructions[stateKey]}
+        phase={phase}
+        errorMessage={failure}
+        manualCode={{
+          prompt: manualCode?.prompt ?? t("settings.auth.pasteRedirectUrl", "Paste the final redirect URL or authorization code"),
+          placeholder: manualCode?.placeholder,
+          helpText: manualCode?.helpText,
+        }}
+        codeValue={manualCodeInputs[stateKey] ?? ""}
+        onCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, [stateKey]: value }))}
+        onSubmitCode={() => void handleSubmitManualCode(providerId, instanceId)}
+        onOpenAuthUrl={() => {
+          const url = loginAuthUrls[stateKey];
+          if (url) {
+            openExternalUrl(url);
+          }
+        }}
+        onCancel={() => {
+          setLoginDialog(null);
+          // A still-running flow must be cancelled server-side, or its slot blocks the retry with a 409.
+          if (authActionInProgress[stateKey]) {
+            void handleCancelLogin(providerId, instanceId);
+          }
+        }}
+      />
+    );
+  })() : null;
+
+  return (
+    <>
+      {loginDialogElement}
+      {renderModalShell(
+    <>
       <div
         className={isEmbedded ? "modal modal-lg settings-modal settings-modal--embedded" : "modal modal-lg settings-modal"}
-        ref={modalRef}
         style={isEmbedded ? undefined : keyboardStyle}
       >
-        <div className={isEmbedded ? "modal-header modal-header--embedded" : "modal-header"}>
-          {/* FNXC:Settings 2026-06-22-01:00: Embedded title gains a Settings icon (size 20, matching the sidebar nav and shared ViewHeader) so the embedded settings panel reads consistently with other main-content destinations; title is already 1.125rem. */}
-          <div className="settings-modal-heading">
-            <h3>
-              {isEmbedded && <SettingsIcon size={20} aria-hidden="true" />}
-              <span>{t("settings.title", "Settings")}</span>
-            </h3>
-          </div>
-          <div className="settings-header-actions">
-            <a
-              href="https://github.com/Runfusion/Fusion"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="settings-github-star-btn"
-              aria-label={t("settings.header.starFusion", "Star Fusion on GitHub")}
-              title={t("settings.header.starFusion", "Star Fusion on GitHub")}
-              onClick={markStarClicked}
-              data-clicked={starClicked ? "true" : "false"}
-            >
-              <span className="settings-github-star-btn__action">
-                <ProviderIcon provider="github" size="sm" />
-                <Star size={11} aria-hidden="true" />
-                {t("settings.header.star", "Star")}
-              </span>
-              {gitHubStarCount !== null && (
-                <span className="settings-github-star-btn__count" aria-label={`${gitHubStarCount.toLocaleString()} stars`}>
-                  {gitHubStarCount >= 1000
-                    ? `${(gitHubStarCount / 1000).toFixed(1)}k`
-                    : gitHubStarCount.toLocaleString()}
+        <ViewHeader
+          className={isEmbedded ? "modal-header modal-header--embedded" : "modal-header"}
+          icon={SettingsIcon}
+          title={t("settings.title", "Settings")}
+          actions={(
+            <div className="settings-header-actions">
+              <a
+                href="https://github.com/Runfusion/Fusion"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="settings-github-star-btn"
+                aria-label={t("settings.header.starFusion", "Star Fusion on GitHub")}
+                title={t("settings.header.starFusion", "Star Fusion on GitHub")}
+                onClick={markStarClicked}
+                data-clicked={starClicked ? "true" : "false"}
+              >
+                <span className="settings-github-star-btn__action">
+                  <ProviderIcon provider="github" size="sm" />
+                  <Star size={11} aria-hidden="true" />
+                  {t("settings.header.star", "Star")}
                 </span>
-              )}
-            </a>
-            <a
-              href="https://discord.gg/ksrfuy7WYR"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="btn btn-sm settings-header-discord-btn"
-              aria-label={t("settings.header.joinDiscord", "Join our Discord")}
-              title={t("settings.header.joinDiscord", "Join our Discord")}
-            >
-              <DiscordIcon size={13} />
-              {t("settings.header.discord", "Discord")}
-            </a>
-          </div>
-          {!isEmbedded && (
-            <button className="modal-close" onClick={() => void requestClose()} aria-label={t("actions.close", "Close")}>
-              &times;
-            </button>
+                {gitHubStarCount !== null ? (
+                  <span className="settings-github-star-btn__count" aria-label={`${gitHubStarCount.toLocaleString()} stars`}>
+                    {gitHubStarCount >= 1000
+                      ? `${(gitHubStarCount / 1000).toFixed(1)}k`
+                      : gitHubStarCount.toLocaleString()}
+                  </span>
+                ) : null}
+              </a>
+              <a
+                href="https://discord.gg/ksrfuy7WYR"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn btn-sm settings-header-discord-btn"
+                aria-label={t("settings.header.joinDiscord", "Join our Discord")}
+                title={t("settings.header.joinDiscord", "Join our Discord")}
+              >
+                <DiscordIcon size={13} />
+                {t("settings.header.discord", "Discord")}
+              </a>
+            </div>
           )}
-          {/*
-            FNXC:Settings 2026-07-07-00:00:
-            Mobile embedded Settings (taskView === "settings", presentation="embedded") has no left sidebar to exit
-            through — only the bottom MobileNavBar — so the header needs an explicit close affordance calling the
-            existing onClose prop (wired to closeSettingsView: modalManager.closeSettings() + back to board + refresh
-            app settings). Desktop/tablet embedded still exit via the sidebar (no button here), and the standalone
-            modal presentation keeps its own `!isEmbedded` `modal-close` button above, untouched and byte-identical.
-          */}
-          {isEmbedded && viewportMode === "mobile" && (
-            <button
-              className="modal-close settings-embedded-mobile-close"
-              onClick={() => void requestClose()}
-              aria-label={t("actions.close", "Close")}
-            >
-              &times;
-            </button>
-          )}
-        </div>
+          onClose={!isEmbedded || viewportMode === "mobile" ? () => void requestClose() : undefined}
+          closeButtonProps={{
+            ...(isEmbedded ? { className: "settings-embedded-mobile-close" } : {}),
+            "aria-label": t("actions.close", "Close"),
+          }}
+        />
         {loading ? (
           <div className="settings-empty-state settings-loading"><LoadingSpinner label={t("settings.loading", "Loading…")} /></div>
         ) : (
           <div className="settings-layout">
-            <aside
+            {/*
+            FNXC:StandardizedViewLayout 2026-09-13-21:43:
+            Settings keeps its existing section/search controller while its desktop and tablet rail uses the same project-scoped width and resize lifecycle as every other full dashboard view. Mobile remains a stacked section picker and cannot persist a competing width.
+            */}
+            <ViewSidebar
+              ariaLabel={t("settings.search.navigationLabel", "Settings navigation")}
+              resizeLabel={t("settings.nav.resize", "Resize settings navigation")}
+              hostIdentity="settings"
+              mobile={showMobileSectionPicker}
               className="settings-navigation"
-              aria-label={t("settings.search.navigationLabel", "Settings navigation")}
-              style={settingsNavigationStyle}
+              panelClassName="settings-navigation__panel"
+              separatorTestId="settings-nav-resize-handle"
             >
               {showMobileSectionPicker && (
                 <div className="settings-mobile-section-picker">
@@ -4795,21 +4887,7 @@ export function SettingsModal({
                   </div>
                 )}
               </nav>
-            </aside>
-            {settingsNavResizeEnabled && (
-              <div
-                className="settings-nav-resize-handle"
-                role="separator"
-                aria-orientation="vertical"
-                aria-label={t("settings.nav.resize", "Resize settings navigation")}
-                aria-valuemin={SETTINGS_NAV_MIN_WIDTH}
-                aria-valuemax={SETTINGS_NAV_MAX_WIDTH}
-                aria-valuenow={settingsNavWidth}
-                tabIndex={0}
-                onPointerDown={handleSettingsNavResizePointerDown}
-                onKeyDown={handleSettingsNavResizeKeyDown}
-              />
-            )}
+            </ViewSidebar>
             <div
               className="settings-content"
               ref={settingsContentRef}
@@ -4831,6 +4909,9 @@ export function SettingsModal({
               )}
             </div>
           </div>
+        )}
+        {viewportMode === "mobile" && updateCheckResultNode && (
+          <div className="settings-modal-footer-update-row">{updateCheckResultNode}</div>
         )}
         <div className="modal-actions">
           <div className="settings-modal-footer-version">
@@ -4868,20 +4949,7 @@ export function SettingsModal({
                   <RefreshCw size={12} className={updateCheckLoading ? "spinning" : undefined} />
                 </button>
               )}
-              {updateCheckResult && (
-                <span
-                  aria-live="polite"
-                  className={`settings-update-result ${
-                    updateCheckResult.error
-                      ? "settings-update-result--error"
-                      : updateCheckResult.updateAvailable
-                        ? "settings-update-result--available"
-                        : "settings-update-result--up-to-date"
-                  }`}
-                >
-                  {renderUpdateCheckResultContent()}
-                </span>
-              )}
+              {viewportMode !== "mobile" && updateCheckResultNode}
             </div>
           </div>
           <div className="modal-actions-left">
@@ -4916,7 +4984,7 @@ export function SettingsModal({
             (only Cancel is), so this button renders in both automatically (FN-7506
             Surface Enumeration: modal + embedded).
 
-            FNXC:SettingsReset 2026-08-02-21:45:
+            FNXC:SettingsReset 2026-07-20-21:45:
             The mobile Settings footer needs the compact Reset label to preserve horizontal space alongside Help, version, Import, Export, and Close. Desktop and tablet keep the full Reset Settings wording while the existing destructive confirmation dialog remains unchanged.
             */}
             <button
@@ -4956,12 +5024,14 @@ export function SettingsModal({
           aria-label={t("settings.scheduling.browseWorkspacePath", "Browse workspace path")}
         >
           <div className="modal modal-lg settings-overlap-path-picker-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{t("settings.scheduling.selectIgnoredOverlapPath", "Select ignored overlap path")}</h3>
-              <button className="modal-close" onClick={closeOverlapPathPicker} aria-label={t("actions.close", "Close")}>
-                &times;
-              </button>
-            </div>
+            {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: Settings' nested pickers and confirmations share the canonical header. */}
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={t("settings.scheduling.selectIgnoredOverlapPath", "Select ignored overlap path")}
+              onClose={closeOverlapPathPicker}
+              closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+            />
             <div className="modal-body settings-overlap-path-picker-body">
               <p className="settings-overlap-path-picker-note">
                 {t("settings.scheduling.overlapPickerNote", "Choose a file to ignore directly, or navigate into a folder and select the current directory.")}
@@ -5010,12 +5080,13 @@ export function SettingsModal({
           aria-label={t("settings.worktrees.browseWorktreesDirectory", "Browse worktrees directory")}
         >
           <div className="modal modal-lg settings-overlap-path-picker-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{t("settings.worktrees.selectWorktreesDir", "Select worktrees directory")}</h3>
-              <button className="modal-close" onClick={closeWorktreesDirPicker} aria-label={t("actions.close", "Close")}>
-                &times;
-              </button>
-            </div>
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={t("settings.worktrees.selectWorktreesDir", "Select worktrees directory")}
+              onClose={closeWorktreesDirPicker}
+              closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+            />
             <div className="modal-body settings-overlap-path-picker-body">
               <p className="settings-overlap-path-picker-note">
                 {t("settings.worktrees.worktreesPickerNote", "Navigate to the folder where Fusion should create task worktrees, then select the current directory.")}
@@ -5060,12 +5131,13 @@ export function SettingsModal({
           aria-label={t("settings.worktrees.browseCopyFile", "Browse file to copy into new worktrees")}
         >
           <div className="modal modal-lg settings-overlap-path-picker-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{t("settings.worktrees.selectCopyFile", "Select file to copy")}</h3>
-              <button className="modal-close" onClick={closeWorktreeCopyFilePicker} aria-label={t("actions.close", "Close")}>
-                &times;
-              </button>
-            </div>
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={t("settings.worktrees.selectCopyFile", "Select file to copy")}
+              onClose={closeWorktreeCopyFilePicker}
+              closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+            />
             <div className="modal-body settings-overlap-path-picker-body">
               <p className="settings-overlap-path-picker-note">
                 {t("settings.worktrees.copyFilePickerNote", "Choose a repository file to copy into each newly assigned task worktree. Directories are not selected from this picker.")}
@@ -5097,20 +5169,21 @@ export function SettingsModal({
           </div>
         </div>
       )}
-      
+
       {/* Import Confirmation Dialog */}
       {importDialogOpen && importPreview && (
         <div className="modal-overlay open" onClick={(e) => e.target === e.currentTarget && setImportDialogOpen(false)} role="dialog" aria-modal="true">
           <div className="modal modal-md">
-            <div className="modal-header">
-              <h3>{t("settings.importExport.importTitle", "Import Settings")}</h3>
-              <button className="modal-close" onClick={() => setImportDialogOpen(false)} aria-label={t("actions.close", "Close")}>
-                &times;
-              </button>
-            </div>
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={t("settings.importExport.importTitle", "Import Settings")}
+              onClose={() => setImportDialogOpen(false)}
+              closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+            />
             <div className="modal-body">
               <p>{t("settings.importExport.reviewPrompt", "Review the settings to be imported:")}</p>
-              
+
               {importPreview.global && Object.keys(importPreview.global).length > 0 && (
                 <div className="form-group">
                   <strong>{t("settings.importExport.globalSettings", "Global Settings:")}</strong>
@@ -5123,7 +5196,7 @@ export function SettingsModal({
                   </ul>
                 </div>
               )}
-              
+
               {importPreview.project && Object.keys(importPreview.project).length > 0 && (
                 <div className="form-group">
                   <strong>{t("settings.importExport.projectSettings", "Project Settings:")}</strong>
@@ -5136,7 +5209,7 @@ export function SettingsModal({
                   </ul>
                 </div>
               )}
-              
+
               <div className="form-group">
                 <label htmlFor="import-scope">{t("settings.importExport.importScope", "Import Scope:")}</label>
                 <select
@@ -5149,7 +5222,7 @@ export function SettingsModal({
                   <option value="project">{t("settings.importExport.scopeProject", "Project settings only")}</option>
                 </select>
               </div>
-              
+
               <div className="form-group">
                 {/* FNXC:SettingsHelp 2026-07-16-12:45: Inline help moved behind the shared "?" affordance — operator requirement: no inline description paragraphs in Settings. */}
                 <div className="settings-field-label-row">
@@ -5200,12 +5273,13 @@ export function SettingsModal({
           data-testid="settings-reset-dialog"
         >
           <div className="modal modal-md settings-reset-dialog" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{t("settings.reset.dialogTitle", "Reset Settings")}</h3>
-              <button className="modal-close" onClick={closeResetDialog} aria-label={t("actions.close", "Close")}>
-                &times;
-              </button>
-            </div>
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={t("settings.reset.dialogTitle", "Reset Settings")}
+              onClose={closeResetDialog}
+              closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+            />
             <div className="modal-body">
               <p>{t("settings.reset.dialogBody", "Choose what to reset to its defaults. This cannot be undone.")}</p>
               <div className="settings-reset-dialog__choice">
@@ -5245,7 +5319,9 @@ export function SettingsModal({
           </div>
         </div>
       )}
-    </div>
+    </>
+      )}
+    </>
   );
 }
 

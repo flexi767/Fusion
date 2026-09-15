@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Task } from "@fusion/core";
+import { isReviewColumnRole } from "../utils/columnRoles";
+import { DEFAULT_PROJECT_SETTINGS, type Task, type TraitFlags } from "@fusion/core";
+import { enrichRunningAgentTaskShapeFromFlags, isRunningAgentTask, isWaitingAgentTask } from "../../../core/src/agents/live-agent-count";
 import { fetchExecutorStats } from "../api";
 import type { ExecutorStats, ExecutorState } from "../api";
-import { isTaskStuck } from "../utils/taskStuck";
-import { isLikelyTabSuspensionError, isVisibilityResumeError, useTabVisibilitySuspension } from "./visibilitySuspension";
+import { isLikelyTabSuspensionError, isVisibilityResumeError, useTabVisibilitySuspension, useVisibilityAwarePoll } from "./visibilitySuspension";
 
 const POLL_INTERVAL_MS = 5000; // 5 seconds - different from useProjectHealth's 10s
 /*
@@ -12,6 +13,10 @@ const POLL_INTERVAL_MS = 5000; // 5 seconds - different from useProjectHealth's 
  */
 const TRANSIENT_FAILURE_THRESHOLD = 2;
 
+/*
+FNXC:StuckTagRemoval 2026-08-17-22:30: Operator removed stuck-task tagging from the dashboard; engine recovery sweeps still consume taskStuckTimeoutMs server-side.
+This hook no longer derives a stuck-task count.
+*/
 export interface UseExecutorStatsResult {
   /** Aggregated executor statistics */
   stats: ExecutorStats;
@@ -25,16 +30,19 @@ export interface UseExecutorStatsResult {
 
 /**
  * Derive the executor state from globalPause, enginePaused, and runningTaskCount.
- * 
+ *
  * - "stopped": globalPause is true
- * - "idle": (enginePaused is true AND runningTaskCount is 0) OR not paused with nothing running
- * - "paused": enginePaused is true AND runningTaskCount > 0
+ * - "paused": enginePaused is true (regardless of runningTaskCount)
  * - "running": globalPause is false AND enginePaused is false AND runningTaskCount > 0
+ * - "idle": nothing paused and nothing running
  *
  * FNXC:EngineControls 2026-06-22-00:00:
  * `globalPause` dominates the footer state matrix so an operator-stopped engine is distinct from idle even if in-progress tasks still exist.
+ *
+ * FNXC:EngineControls 2026-07-24-18:35:
+ * A paused engine must read "Paused" even when nothing is running. The prior matrix mapped (enginePaused && runningTaskCount === 0) to "idle", so the footer was indistinguishable from a healthy engine waiting for work — and that is precisely the state a pause produces once in-flight tasks drain. Operators saw triage tasks sitting untouched with an "Idle" badge and no visible cause; the pause is only otherwise surfaced by the Engine Control menu item label, which requires opening the menu. Pause state now dominates run state: the badge reports the operator-set condition, and the separate running/queued counters already report throughput.
  */
-function deriveExecutorState(
+export function deriveExecutorState(
   globalPause: boolean,
   enginePaused: boolean,
   runningTaskCount: number
@@ -42,10 +50,7 @@ function deriveExecutorState(
   if (globalPause) {
     return "stopped";
   }
-  if (enginePaused && runningTaskCount === 0) {
-    return "idle";
-  }
-  if (enginePaused && runningTaskCount > 0) {
+  if (enginePaused) {
     return "paused";
   }
   // globalPause is false and enginePaused is false
@@ -58,41 +63,50 @@ function deriveExecutorState(
 /**
  * Derive statistics from the task list.
  *
- * FNXC:ExecutorStatusBar 2026-07-03-00:18:
- * Footer task counters must mirror the board's operator-facing active work states: Queued includes todo plus planning/triage work, Running and Stuck stay scoped to in-progress execution, Done remains absent from the footer contract unless a labeled Done segment is introduced, and archived/completed/non-planning custom lanes never inflate active pressure counts.
+ * FNXC:ExecutorStatusBar 2026-07-21-14:30:
+ * FN-8453 / #2359 requires footer capacity indicators to share the live top-level
+ * agent predicate with admission: Waiting is trait-derived intake/hold membership,
+ * Running is unpaused WIP plus live planners/reviewers, and custom columns require
+ * task-scoped workflow flags rather than legacy column-id assumptions.
+ *
+ * FNXC:ExecutorStatusBar 2026-07-21-19:00:
+ * Do not require task.sessionFile for Running — it is not on board/listTasks rows.
  */
-function deriveStatsFromTasks(tasks: Task[], taskStuckTimeoutMs?: number, lastFetchTimeMs?: number): Pick<
+export type ExecutorColumnFlags = Pick<TraitFlags, "complete" | "intake" | "hold" | "countsTowardWip" | "mergeOrchestration" | "mergeBlocker">;
+
+/*
+FNXC:StuckTagRemoval 2026-08-17-22:30: Operator removed stuck-task tagging from the dashboard; engine recovery sweeps still consume taskStuckTimeoutMs server-side.
+The stuck-task count and the taskStuckTimeoutMs/lastFetchTimeMs parameters are gone from this derivation.
+*/
+export function deriveStatsFromTasks(tasks: Task[], columnFlagsById?: ReadonlyMap<string, ExecutorColumnFlags>, columnFlagsByTaskId?: ReadonlyMap<string, ExecutorColumnFlags>): Pick<
   ExecutorStats,
-  "runningTaskCount" | "blockedTaskCount" | "stuckTaskCount" | "queuedTaskCount" | "inReviewCount"
+  "runningTaskCount" | "blockedTaskCount" | "queuedTaskCount" | "inReviewCount"
 > {
   let runningTaskCount = 0;
   let blockedTaskCount = 0;
-  let stuckTaskCount = 0;
   let queuedTaskCount = 0;
   let inReviewCount = 0;
 
   for (const task of tasks) {
-    switch (task.column) {
-      case "in-progress":
-        runningTaskCount++;
-        if (isTaskStuck(task, taskStuckTimeoutMs, lastFetchTimeMs)) {
-          stuckTaskCount++;
-        }
-        break;
-      case "todo":
-      case "triage":
-        queuedTaskCount++;
-        break;
-      case "in-review":
-        inReviewCount++;
-        break;
-      default:
-        if (task.status === "planning" && !isTerminalOrActiveTaskColumn(task.column)) {
-          queuedTaskCount++;
-        }
-        break;
+    // Task-scoped flags preserve custom workflow meaning when aggregate boards reuse column ids.
+    const enriched = enrichRunningAgentTaskShapeFromFlags(task, columnFlagsByTaskId?.get(task.id) ?? columnFlagsById?.get(task.column));
+    if (isRunningAgentTask(enriched)) {
+      runningTaskCount++;
     }
-
+    if (isWaitingAgentTask(enriched)) queuedTaskCount++;
+    // Kept in the API shape for compatibility; the footer no longer renders it.
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-13:10 (batch-dashboard-app):
+    Review-lane count, resolved. Kept in the API shape for compatibility (the footer no longer
+    renders it), but a counter that silently reads 0 on a renamed board is worse than one that is
+    absent — a future consumer would take it at face value.
+    */
+    /* Per-TASK flags first, exactly as line ~86 does: `columnFlagsById` is keyed by column id and
+       is a cross-workflow union, so two workflows reusing an id would answer for each other. */
+    if (isReviewColumnRole(
+      columnFlagsByTaskId?.get(task.id) ?? columnFlagsById?.get(task.column),
+      task.column,
+    )) inReviewCount++;
     if (hasActionableBlockedBy(task.blockedBy)) {
       blockedTaskCount++;
     }
@@ -101,14 +115,9 @@ function deriveStatsFromTasks(tasks: Task[], taskStuckTimeoutMs?: number, lastFe
   return {
     runningTaskCount,
     blockedTaskCount,
-    stuckTaskCount,
     queuedTaskCount,
     inReviewCount,
   };
-}
-
-function isTerminalOrActiveTaskColumn(column: Task["column"]): boolean {
-  return column === "in-progress" || column === "in-review" || column === "done" || column === "archived";
 }
 
 function hasActionableBlockedBy(blockedBy: Task["blockedBy"] | string[] | null): boolean {
@@ -126,21 +135,21 @@ function hasActionableBlockedBy(blockedBy: Task["blockedBy"] | string[] | null):
  *   so footer counts always match the board state
  * - Polls `/api/executor/stats` every 5 seconds for executor state
  * - Derives blockedTaskCount from tasks with blockedBy field set
- * - Derives stuckTaskCount using the project's `taskStuckTimeoutMs` setting;
- *   returns 0 when the setting is undefined/disabled
- * - Derives executorState from globalPause and enginePaused flags, with globalPause mapping to "stopped"
+ * - Derives executorState from globalPause and enginePaused flags, with globalPause mapping to "stopped" and enginePaused to "paused" at any running count
  * - Returns ExecutorStats object with reactive updates
  */
-const DEFAULT_API_DATA: Pick<ExecutorStats, "maxConcurrent" | "lastActivityAt"> & {
+const DEFAULT_API_DATA: Pick<ExecutorStats, "maxConcurrent" | "maxWorktrees" | "worktreeLimitEnabled" | "lastActivityAt"> & {
   globalPause: boolean;
   enginePaused: boolean;
 } = {
   globalPause: false,
   enginePaused: false,
-  maxConcurrent: 2,
+  maxConcurrent: DEFAULT_PROJECT_SETTINGS.maxConcurrent,
+  maxWorktrees: DEFAULT_PROJECT_SETTINGS.maxWorktrees,
+  worktreeLimitEnabled: true,
 };
 
-export function useExecutorStats(tasks: Task[], projectId?: string, taskStuckTimeoutMs?: number, lastFetchTimeMs?: number): UseExecutorStatsResult {
+export function useExecutorStats(tasks: Task[], projectId?: string, columnFlagsByTaskId?: ReadonlyMap<string, ExecutorColumnFlags>): UseExecutorStatsResult {
 
   const [apiDataState, setApiDataState] = useState<{
     projectId?: string;
@@ -148,7 +157,6 @@ export function useExecutorStats(tasks: Task[], projectId?: string, taskStuckTim
   } | null>(null);
   const [loading, setLoading] = useState(true);
   const [errorState, setErrorState] = useState<{ projectId?: string; message: string } | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const hasFetchedStatsRef = useRef(false);
   const consecutiveFailuresRef = useRef(0);
@@ -229,25 +237,13 @@ export function useExecutorStats(tasks: Task[], projectId?: string, taskStuckTim
     };
   }, [refresh]);
 
-  // Polling - refresh every 5 seconds
-  useEffect(() => {
-    // Clear any existing interval
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-    }
-
-    // Start new polling interval
-    intervalRef.current = setInterval(() => {
-      refresh();
-    }, POLL_INTERVAL_MS);
-
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-    };
-  }, [refresh]);
+  /*
+  FNXC:MobileTabRetention 2026-07-26-10:12:
+  This 5s poll was one of the loudest background loops. Mobile browsers discard a backgrounded page that
+  keeps issuing network requests, so the interval is suspended while the document is hidden and resumed
+  with a single immediate refresh on return. See `useVisibilityAwarePoll`.
+  */
+  useVisibilityAwarePoll(refresh, POLL_INTERVAL_MS);
 
   const currentProjectApiDataState = apiDataState && apiDataState.projectId === projectId ? apiDataState : null;
   const apiData = currentProjectApiDataState?.data ?? DEFAULT_API_DATA;
@@ -255,7 +251,7 @@ export function useExecutorStats(tasks: Task[], projectId?: string, taskStuckTim
   const effectiveLoading = loading || (!error && !currentProjectApiDataState);
 
   // Derive stats from tasks and API data
-  const taskStats = deriveStatsFromTasks(tasks, taskStuckTimeoutMs, lastFetchTimeMs);
+  const taskStats = deriveStatsFromTasks(tasks, undefined, columnFlagsByTaskId);
   const executorState = deriveExecutorState(
     apiData.globalPause,
     apiData.enginePaused,
@@ -266,6 +262,8 @@ export function useExecutorStats(tasks: Task[], projectId?: string, taskStuckTim
     ...taskStats,
     executorState,
     maxConcurrent: apiData.maxConcurrent,
+    maxWorktrees: apiData.maxWorktrees,
+    worktreeLimitEnabled: apiData.worktreeLimitEnabled,
     lastActivityAt: apiData.lastActivityAt,
   };
 

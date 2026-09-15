@@ -1,3 +1,4 @@
+import type { VoiceInputSettings, ProjectSettings } from "../types.js";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_GLOBAL_SETTINGS,
@@ -9,8 +10,9 @@ import {
   isGlobalSettingsKey,
   isProjectSettingsKey,
 } from "../types.js";
-import { NON_DEFAULT_PROJECT_SETTINGS_KEYS } from "../settings-schema.js";
-import { BUILTIN_WORKFLOW_SETTINGS } from "../builtin-workflow-settings.js";
+import { NON_DEFAULT_PROJECT_SETTINGS_KEYS } from "../config/settings-schema.js";
+import { canonicalizeSettings } from "../task-store/settings-helpers.js";
+import { BUILTIN_WORKFLOW_SETTINGS } from "../workflows/builtin-workflow-settings.js";
 
 function assertExactKeyCoverage(scopeName: string, actual: readonly string[], expected: readonly string[]): void {
   const uniqueActual = [...new Set(actual)];
@@ -59,6 +61,17 @@ describe("settings key parity", () => {
     expect(isGlobalSettingsKey("themeMode")).toBe(true);
     expect(isGlobalSettingsKey("maxConcurrent")).toBe(false);
     expect(isProjectSettingsKey("maxConcurrent")).toBe(true);
+    expect(isProjectSettingsKey("maxRecommendationsPerTask")).toBe(true);
+    expect(isGlobalSettingsKey("maxRecommendationsPerTask")).toBe(false);
+    expect(isProjectSettingsKey("requireTaskRecommendations")).toBe(true);
+    expect(isGlobalSettingsKey("requireTaskRecommendations")).toBe(false);
+    expect(DEFAULT_PROJECT_SETTINGS.requireTaskRecommendations).toBe(false);
+    expect(isProjectSettingsKey("chatMessageLayout")).toBe(true);
+    expect(isGlobalSettingsKey("chatMessageLayout")).toBe(false);
+    expect(PROJECT_SETTINGS_KEYS).toContain("chatMessageLayout");
+    expect(GLOBAL_SETTINGS_KEYS).not.toContain("chatMessageLayout");
+    expect(isProjectSettingsKey("recommendationMailboxNoticeEnabled")).toBe(false);
+    expect(isGlobalSettingsKey("recommendationMailboxNoticeEnabled")).toBe(false);
     expect(isProjectSettingsKey("heartbeatMultiplier")).toBe(true);
     expect(isProjectSettingsKey("completionDocumentationMode")).toBe(true);
     expect(isProjectSettingsKey("reviewArtifacts")).toBe(true);
@@ -284,10 +297,22 @@ describe("settings key parity", () => {
     expect(isGlobalSettingsKey("executorAllowSiblingBranchRename")).toBe(false);
   });
 
-  it("defaults ephemeralAgentsEnabled to true and keeps it project-scoped", () => {
-    expect(DEFAULT_PROJECT_SETTINGS.ephemeralAgentsEnabled).toBe(true);
-    expect(isProjectSettingsKey("ephemeralAgentsEnabled")).toBe(true);
+  it("removes the retired ephemeral compatibility input from settings and canonicalizes stale values", () => {
+    expect(DEFAULT_PROJECT_SETTINGS).not.toHaveProperty("ephemeralAgentsEnabled");
+    expect(isProjectSettingsKey("ephemeralAgentsEnabled")).toBe(false);
     expect(isGlobalSettingsKey("ephemeralAgentsEnabled")).toBe(false);
+
+    for (const retiredValue of [true, false]) {
+      const persisted = { ephemeralAgentsEnabled: retiredValue, taskPrefix: "SURVIVES" } as import("../types.js").Settings;
+      const canonical = canonicalizeSettings(persisted);
+      expect(canonical).not.toHaveProperty("ephemeralAgentsEnabled");
+      expect(canonical.taskPrefix).toBe("SURVIVES");
+      expect(persisted).toHaveProperty("ephemeralAgentsEnabled", retiredValue);
+    }
+
+    const absent = { taskPrefix: "UNCHANGED" } as import("../types.js").Settings;
+    expect(canonicalizeSettings(absent)).not.toHaveProperty("ephemeralAgentsEnabled");
+    expect(canonicalizeSettings(absent).taskPrefix).toBe("UNCHANGED");
   });
 
   it("defaults ephemeralAgentsCanCreateTasks to true and keeps it project-scoped", () => {
@@ -412,6 +437,12 @@ describe("settings key parity", () => {
     expect(isProjectSettingsKey("openrouterProviderPreferences")).toBe(false);
   });
 
+  it("keeps OrcaRouter model sync global with an enabled default", () => {
+    expect(DEFAULT_GLOBAL_SETTINGS.orcarouterModelSync).toBe(true);
+    expect(isGlobalSettingsKey("orcarouterModelSync")).toBe(true);
+    expect(isProjectSettingsKey("orcarouterModelSync")).toBe(false);
+  });
+
   it("defaults stale high fan-out blocker escalation age threshold", () => {
     expect(DEFAULT_PROJECT_SETTINGS.staleHighFanoutBlockerAgeThresholdMs).toBe(2 * 60 * 60 * 1000);
     expect(isProjectSettingsKey("staleHighFanoutBlockerAgeThresholdMs")).toBe(true);
@@ -444,32 +475,6 @@ describe("settings key parity", () => {
     expect(isGlobalSettingsKey("backlogPressureRatioThreshold")).toBe(false);
     expect(isGlobalSettingsKey("backlogPressureMinTodoCount")).toBe(false);
     expect(isGlobalSettingsKey("backlogPressureAlertCooldownMs")).toBe(false);
-  });
-
-  it("keeps dependency-blocked todo report settings project-scoped with documented defaults", () => {
-    expect(DEFAULT_PROJECT_SETTINGS.dependencyBlockedTodoReportEnabled).toBe(true);
-    expect(DEFAULT_PROJECT_SETTINGS.dependencyBlockedTodoFreshAgeMs).toBe(30 * 60_000);
-    expect(DEFAULT_PROJECT_SETTINGS.dependencyBlockedTodoStaleAgeMs).toBe(4 * 60 * 60_000);
-    expect(DEFAULT_PROJECT_SETTINGS.dependencyBlockedTodoMinCount).toBe(1);
-    expect(DEFAULT_PROJECT_SETTINGS.dependencyBlockedTodoReportCooldownMs).toBe(6 * 60 * 60_000);
-
-    expect(PROJECT_SETTINGS_KEYS).toContain("dependencyBlockedTodoReportEnabled");
-    expect(PROJECT_SETTINGS_KEYS).toContain("dependencyBlockedTodoFreshAgeMs");
-    expect(PROJECT_SETTINGS_KEYS).toContain("dependencyBlockedTodoStaleAgeMs");
-    expect(PROJECT_SETTINGS_KEYS).toContain("dependencyBlockedTodoMinCount");
-    expect(PROJECT_SETTINGS_KEYS).toContain("dependencyBlockedTodoReportCooldownMs");
-
-    expect(isProjectSettingsKey("dependencyBlockedTodoReportEnabled")).toBe(true);
-    expect(isProjectSettingsKey("dependencyBlockedTodoFreshAgeMs")).toBe(true);
-    expect(isProjectSettingsKey("dependencyBlockedTodoStaleAgeMs")).toBe(true);
-    expect(isProjectSettingsKey("dependencyBlockedTodoMinCount")).toBe(true);
-    expect(isProjectSettingsKey("dependencyBlockedTodoReportCooldownMs")).toBe(true);
-
-    expect(isGlobalSettingsKey("dependencyBlockedTodoReportEnabled")).toBe(false);
-    expect(isGlobalSettingsKey("dependencyBlockedTodoFreshAgeMs")).toBe(false);
-    expect(isGlobalSettingsKey("dependencyBlockedTodoStaleAgeMs")).toBe(false);
-    expect(isGlobalSettingsKey("dependencyBlockedTodoMinCount")).toBe(false);
-    expect(isGlobalSettingsKey("dependencyBlockedTodoReportCooldownMs")).toBe(false);
   });
 
   it("keeps github tracking keys in expected scopes with documented defaults", () => {
@@ -542,6 +547,7 @@ describe("settings key parity", () => {
     // GLOBAL_SETTINGS_KEYS order.
     expect(overlap).toEqual([
       "testMode",
+      "voiceInput",
       "mergeRequestContractShadowEnabled",
       "taskTokenBudget",
       "githubTrackingDefaultRepo",
@@ -553,6 +559,27 @@ describe("settings key parity", () => {
       "gitlabApiBaseUrl",
       "gitlabAuthToken",
       "gitlabAuthTokenType",
+      /*
+      FNXC:JiraBranchNaming 2026-08-20-05:18:
+      JIRA configuration is intentionally dual-scoped: global values are organization defaults
+      and project values override them without storing a plaintext token.
+      */
+      "jiraEnabled",
+      "jiraBaseUrl",
+      "jiraApiBaseUrl",
+      "jiraAuthEmail",
+      "jiraAuthTokenSecretKey",
+      "jiraAuthTokenSecretScope",
+      "jiraBranchNameTemplate",
+      /*
+      FNXC:ToolOutputBudget 2026-07-30-03:40:
+      Shared ON PURPOSE. settings-schema.ts:462 states it outright: "Project settings participate in
+      the existing effective-settings merge, allowing a project-specific tool-output cap or explicit
+      no-limit sentinel to override global policy." So a global default with a per-project override is
+      the intended shape, and this list is the record of intentional overlap.
+      Placed in GLOBAL_SETTINGS_KEYS order, as the comment above requires.
+      */
+      "agentToolOutputMaxChars",
       "mcpServers",
       "worktrunk",
       "owningNodeHandoffPolicy",
@@ -634,6 +661,8 @@ describe("model lane key parity regression (FN-1729)", () => {
     { provider: "mergerProvider", modelId: "mergerModelId", expectedScope: "project" },
     { provider: "mergerFallbackProvider", modelId: "mergerFallbackModelId", expectedScope: "project" },
     { provider: "mergerGlobalProvider", modelId: "mergerGlobalModelId", expectedScope: "global" },
+    { provider: "fastCheapProvider", modelId: "fastCheapModelId", expectedScope: "project" },
+    { provider: "fastCheapGlobalProvider", modelId: "fastCheapGlobalModelId", expectedScope: "global" },
   ] as const;
 
   it.each(allModelLanePairs)(
@@ -715,6 +744,14 @@ describe("model lane key parity regression (FN-1729)", () => {
   it("testMode key is recognized in both project and global scopes", () => {
     expect(isProjectSettingsKey("testMode")).toBe(true);
     expect(isGlobalSettingsKey("testMode")).toBe(true);
+  });
+
+  it("exports voiceInput from the public type barrel in both scopes", () => {
+    const sample: VoiceInputSettings = { enabled: true, model: "parakeet-v3", language: "en" };
+    const projectValue: ProjectSettings["voiceInput"] = sample;
+    expect(projectValue).toEqual(sample);
+    expect(isProjectSettingsKey("voiceInput")).toBe(true);
+    expect(isGlobalSettingsKey("voiceInput")).toBe(true);
   });
 
   it("no model lane provider exists without its corresponding modelId key", () => {

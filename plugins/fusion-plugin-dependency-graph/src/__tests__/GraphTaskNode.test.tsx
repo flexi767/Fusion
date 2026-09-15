@@ -41,14 +41,11 @@ function createProps(task: Task) {
     onOpenDetail: vi.fn(),
     addToast: vi.fn(),
     onUpdateTask: vi.fn(),
-    onArchiveTask: vi.fn(),
-    onUnarchiveTask: vi.fn(),
     onDeleteTask: vi.fn(),
     onRetryTask: vi.fn(),
     onOpenDetailWithTab: vi.fn(),
     onMoveTask: vi.fn(),
     onOpenMission: vi.fn(),
-    taskStuckTimeoutMs: 60_000,
     lastFetchTimeMs: Date.now(),
     workflowStepNameLookup: new Map<string, string>(),
   };
@@ -68,7 +65,13 @@ describe("GraphTaskNode", () => {
     expect(node).toBeTruthy();
     expect(container.querySelector(".card-title")?.textContent).toContain("Task description");
     expect(node.getAttribute("draggable")).toBe("false");
-    expect(container.querySelector(".card")?.getAttribute("draggable")).toBe("false");
+    /*
+    FNXC:PluginInteropDrift 2026-08-20-21:01:
+    FN-051 removed the native draggable attribute from TaskCard entirely (it is never rendered
+    now), so the card assertion mirrors the dashboard's own TaskCard tests: the attribute must
+    be ABSENT, not "false". The old .toBe("false") could only pass against the pre-FN-051 card.
+    */
+    expect(container.querySelector(".card")?.hasAttribute("draggable")).toBe(false);
   });
 
   it("shows active indicator with capitalized status for in-progress executing tasks", () => {
@@ -351,7 +354,7 @@ describe("GraphTaskNode", () => {
 
     const { container } = render(
       <div>
-        <TaskCard {...props} disableDrag={true} />
+        <TaskCard {...props} />
         <GraphTaskNode {...props} />
       </div>,
     );
@@ -381,5 +384,15 @@ describe("GraphTaskNode", () => {
     expect(Boolean(boardCard.querySelector(".card-error"))).toBe(Boolean(graphCard.querySelector(".card-error")));
     expect(boardCard.querySelector(".card-id")?.textContent).toBe(graphCard.querySelector(".card-id")?.textContent);
     expect(boardCard.querySelector(".card-title")?.textContent).toBe(graphCard.querySelector(".card-title")?.textContent);
+  });
+});
+
+// FNXC:StuckTagRemoval 2026-08-17-22:30: stuck-task tagging removed from the dashboard; the stalled-card-as-stuck coverage went with it.
+describe("active styling", () => {
+  it("still reads a legacy in-progress card as active when it is fresh", () => {
+    const props = createProps(createTask({ column: "in-progress", status: "executing", updatedAt: new Date().toISOString() } as Partial<Task>));
+    render(<GraphTaskNode {...props} />);
+
+    expect(screen.getByTestId("graph-task-node-FN-TEST").className).toContain("graph-task-node--active");
   });
 });

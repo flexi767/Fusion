@@ -48,6 +48,8 @@ vi.mock("../../../../api", () => ({
   fetchWorkflows,
   // Pulled in by WorkflowSelector, which GeneralSection renders.
   fetchProjectDefaultWorkflow,
+  // FNXC:DashboardTests 2026-07-20-23:40: GeneralSection now loads Discussion categories for report target settings.
+  listDiscussionCategories: vi.fn().mockResolvedValue({ categories: [] }),
 }));
 
 beforeEach(() => {
@@ -145,6 +147,7 @@ describe("GeneralSection - import auto-translate controls", () => {
     expect(select.className).toContain("select");
     expect(select.value).toBe("");
     expect([...select.options].map((o) => o.textContent)).toContain("Follow dashboard language");
+    expect([...select.options].map((o) => o.textContent)).toContain("Português (Brasil)");
   });
 
   it("reflects and stores an explicit target locale", () => {

@@ -1,12 +1,26 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Task } from "@fusion/core";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import * as fusionCore from "@fusion/core";
+import { listRecall, type RecallCaptureWriterWithTestDrain, type Task } from "@fusion/core";
+import {
+  createSharedPgTaskStoreTestHarness,
+  pgDescribe,
+  type SharedPgTaskStoreHarness,
+} from "../../../core/src/__test-utils__/pg-test-harness.js";
 import { ProjectEngine, __resetDeterministicMergerModeDeprecationWarned } from "../project-engine.js";
+import { AgentSemaphore, projectAdmissionCoordinator} from "../concurrency/concurrency.js";
 // Resolves to the vi.mock factory above (the mocked merger-ai exports the real-shaped
 // workspace land error classes so the dispatch's `instanceof` matching is exercised).
-import { WorkspacePartialLandError, WorkspaceRepoLandBusyError } from "../merger-ai.js";
+import {
+  WorkspaceFinalizeBlockedError,
+  WorkspacePartialLandError,
+  WorkspaceRepoLandBusyError,
+  WorkspaceReviewRequiredError,
+} from "../merge/merger-ai.js";
 import { runtimeLog } from "../logger.js";
 import { TunnelProcessManager } from "../remote-access/tunnel-process-manager.js";
-import { NtfyNotifier } from "../notifier.js";
+import { __resetRemoteTunnelServicesForTests } from "../remote-access/remote-tunnel-service.js";
+import { setLocalDashboardPort, resetLocalDashboardPortForTests } from "../local-dashboard-port.js";
+import { NtfyNotifier } from "../util/notifier.js";
 import { NotificationService, OAuthAlertStateStore, OAuthExpiryMonitor, OAuthValidityLogger } from "../notification/index.js";
 
 const mocks = vi.hoisted(() => ({
@@ -43,8 +57,8 @@ const mocks = vi.hoisted(() => ({
   prHandlerCreateFollowUpTask: vi.fn(async () => undefined),
 }));
 
-vi.mock("../postgres-migration-notice.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../postgres-migration-notice.js")>();
+vi.mock("../project/postgres-migration-notice.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../project/postgres-migration-notice.js")>();
   return {
     ...actual,
     deliverPostgresMigrationCompleteNoticeIfNeeded: mocks.deliverPostgresMigrationCompleteNotice,
@@ -66,7 +80,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
   });
 });
 
-vi.mock("../cron-runner.js", () => {
+vi.mock("../scheduling/cron-runner.js", () => {
   return {
     CronRunner: vi.fn().mockImplementation(function () {
       return {
@@ -92,7 +106,7 @@ vi.mock("../merger.js", () => ({
 // and a mockable `landWorkspaceTask`; otherwise `err instanceof WorkspacePartialLandError`
 // throws "not callable" and the workspace dispatch can't be exercised. The classes are
 // declared INSIDE the (hoisted) factory so they exist when the mock is evaluated.
-vi.mock("../merger-ai.js", () => {
+vi.mock("../merge/merger-ai.js", () => {
   class WorkspaceRepoLandBusyError extends Error {
     public readonly retryable = true;
     constructor(
@@ -115,11 +129,54 @@ vi.mock("../merger-ai.js", () => {
       this.name = "WorkspacePartialLandError";
     }
   }
+  class WorkspaceFinalizeBlockedError extends Error {
+    constructor(
+      public readonly taskId: string,
+      public readonly reason: string,
+    ) {
+      super(`Workspace finalize blocked for ${taskId}: ${reason}`);
+      this.name = "WorkspaceFinalizeBlockedError";
+    }
+  }
+  class WorkspaceReviewRequiredError extends Error {
+    constructor(
+      public readonly taskId: string,
+      public readonly assessment: { kind: "approval-missing" | "content-changed"; repositories: string[]; files: string[] },
+    ) {
+      super(assessment.kind === "approval-missing"
+        ? `Workspace Code Review approval is missing for ${taskId}`
+        : `Workspace Code Review content changed after approval for ${taskId}`);
+      this.name = "WorkspaceReviewRequiredError";
+    }
+  }
+  /*
+  FNXC:WorkspaceMerge 2026-08-19-04:00:
+  Production imports this error from merger-ai, so a factory that omits it makes the merge-queue
+  drain throw "No <export> is defined on the mock" BEFORE reaching the behaviour under test — the
+  four Phase C hardening cases then saw a resolved promise and no updateTask call, failing for a
+  reason unrelated to what they assert. Keep this list in step with merger-ai's exported errors.
+  */
+  class WorkspaceMergeDispatchSupersededError extends Error {
+    constructor(public readonly taskId: string) {
+      super(`Workspace merge dispatch lease was superseded before finalization for ${taskId}`);
+      this.name = "WorkspaceMergeDispatchSupersededError";
+    }
+  }
+  class WorkspaceMergeTechnicalError extends Error {
+    constructor(public readonly kind: string, message: string) {
+      super(message);
+      this.name = "WorkspaceMergeTechnicalError";
+    }
+  }
   return {
     runAiMerge: mocks.runAiMerge,
     landWorkspaceTask: mocks.landWorkspaceTask,
     WorkspaceRepoLandBusyError,
     WorkspacePartialLandError,
+    WorkspaceFinalizeBlockedError,
+    WorkspaceReviewRequiredError,
+    WorkspaceMergeDispatchSupersededError,
+    WorkspaceMergeTechnicalError,
   };
 });
 
@@ -131,7 +188,20 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-vi.mock("../pr-monitor.js", () => ({
+/*
+FNXC:EngineTests 2026-08-10-09:35:
+FN-8937 seals the exec-based integration-branch probe so this ProjectEngine suite
+never spawns host git while fake timers exercise workspace dispatch. Resolver data
+states remain owned by integration-branch.test.ts; this seam supplies only a stable branch.
+*/
+vi.mock("../merge/integration-branch.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../merge/integration-branch.js")>()),
+  resolveIntegrationBranch: vi.fn().mockResolvedValue("main"),
+  resolveIntegrationBranchSync: vi.fn().mockReturnValue("main"),
+  __resetIntegrationBranchCacheForTests: vi.fn(),
+}));
+
+vi.mock("../merge/pr-monitor.js", () => ({
   PrMonitor: vi.fn().mockImplementation(function () {
     return {
       onNewComments: vi.fn(),
@@ -139,7 +209,7 @@ vi.mock("../pr-monitor.js", () => ({
   }),
 }));
 
-vi.mock("../pr-comment-handler.js", () => ({
+vi.mock("../merge/pr-comment-handler.js", () => ({
   PrCommentHandler: vi.fn().mockImplementation(function () {
     return {
       handleNewComments: vi.fn(),
@@ -148,7 +218,7 @@ vi.mock("../pr-comment-handler.js", () => ({
   }),
 }));
 
-vi.mock("../notifier.js", () => ({
+vi.mock("../util/notifier.js", () => ({
   NtfyNotifier: vi.fn().mockImplementation(function () {
     return {
       start: mocks.notifierStart,
@@ -189,7 +259,7 @@ vi.mock("../notification/index.js", () => ({
   }),
 }));
 
-vi.mock("../auth-storage.js", () => ({
+vi.mock("../auth/auth-storage.js", () => ({
   createFusionAuthStorage: vi.fn(() => ({
     reload: vi.fn(),
     getOAuthProviders: vi.fn(() => []),
@@ -230,12 +300,23 @@ function createMockStore(initialSettings: Record<string, unknown>) {
   const store = {
     getSettings: vi.fn(async () => structuredClone(settings)),
     listTasks: vi.fn(async (): Promise<Array<Record<string, unknown>>> => []),
+    /*
+    FNXC:EngineTests 2026-09-01-05:50:
+    A real task row always carries `steps` and `enabledWorkflowSteps`; this default omitted both, so
+    every merge-confirmed fast-path test silently exercised a shape the product never sees. The
+    finalize path reads them AFTER the first read, so a per-test `mockResolvedValueOnce` could not
+    supply them — the fast path threw "Cannot read properties of undefined (reading 'map')" into the
+    merge loop's catch and the task:merged emit never happened. Fixing the shared factory, not each
+    test, is what keeps the next author out of the same trap.
+    */
     getTask: vi.fn(async (taskId: string): Promise<Record<string, unknown>> => ({
       id: taskId,
       column: "in-review",
       paused: false,
       mergeRetries: 0,
       status: null,
+      steps: [],
+      enabledWorkflowSteps: [],
     })),
     updateTask: vi.fn(async () => undefined),
     moveTask: vi.fn(async () => undefined),
@@ -376,26 +457,39 @@ beforeEach(() => {
   mocks.oauthRefreshSchedulerStart.mockClear();
   mocks.oauthRefreshSchedulerStop.mockClear();
 
+  /*
+  FNXC:EngineTests 2026-08-23-02:03:
+  The default exec seam answers TWO different probes now. `which <bin>` still resolves to a stub path,
+  but the tailscale preflight additionally runs `tailscale status --json` and PARSES the result, so a
+  path string on that call reads as an unreadable daemon rather than a ready one. Branching on the
+  argv keeps "tools are present and healthy" as the suite-wide default; the prerequisite-failure cases
+  override this mock per test.
+  */
   mocks.execFile.mockImplementation((
     _file: string,
     _args: string[],
     _options: unknown,
     callback?: (error: Error | null, result: { stdout: string; stderr: string }) => void,
   ) => {
+    const stdout = _args?.includes("status") && _args?.includes("--json")
+      ? JSON.stringify({ BackendState: "Running" })
+      : "/usr/bin/mock\n";
+
     if (typeof _options === "function") {
       (_options as (error: Error | null, result: { stdout: string; stderr: string }) => void)(null, {
-        stdout: "/usr/bin/mock\n",
+        stdout,
         stderr: "",
       });
       return {} as never;
     }
 
-    callback?.(null, { stdout: "/usr/bin/mock\n", stderr: "" });
+    callback?.(null, { stdout, stderr: "" });
     return {} as never;
   });
 });
 
 describe("ProjectEngine notification ownership wiring", () => {
+
   beforeEach(() => {
     vi.clearAllMocks();
     const mockStore = createMockStore(baseSettings);
@@ -828,47 +922,75 @@ describe("ProjectEngine memory dreams wiring", () => {
 describe("ProjectEngine remote tunnel manager wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // The tunnel service registry is process-lifetime by design; isolate tests from each other.
+    __resetRemoteTunnelServicesForTests();
     const mockStore = createMockStore(baseSettings);
     mocks.currentStore = mockStore.store;
   });
 
-  it("is unavailable before start and available after start", async () => {
+  /*
+  FNXC:RemoteAccess 2026-08-31-07:08:
+  Original symptom (reproduced twice in production): clicking "Stop engine" / "Restart engine" in
+  Command Center killed the Tailscale tunnel, so the operator lost the public URL — the very channel
+  they use to reach the box and undo it. Cause: TunnelProcessManager was a ProjectEngine field created
+  in start() and destroyed in stop().
+
+  These tests replace three that asserted exactly that coupling ("unavailable before start", "stop
+  once during shutdown", "clears manager reference"). The invariant is now the opposite, and is
+  asserted across every engine-lifecycle surface: stop, restart (stop -> new engine start), and
+  repeated cycles.
+  */
+  it("keeps one tunnel manager across engine stop and restart", async () => {
     const engine = createEngine();
 
-    expect(engine.getRemoteTunnelManager()).toBeUndefined();
+    const beforeStart = engine.getRemoteTunnelManager();
+    expect(beforeStart).toBeInstanceOf(TunnelProcessManager);
 
     await engine.start();
-
-    expect(engine.getRemoteTunnelManager()).toBeInstanceOf(TunnelProcessManager);
+    const afterStart = engine.getRemoteTunnelManager();
+    expect(afterStart).toBe(beforeStart);
 
     await engine.stop();
-    expect(engine.getRemoteTunnelManager()).toBeUndefined();
+    // The defect: this used to be undefined, and the tunnel process was dead.
+    expect(engine.getRemoteTunnelManager()).toBe(beforeStart);
+
+    // Restart = a fresh ProjectEngine for the same project. It must find the same live manager.
+    const restarted = createEngine();
+    await restarted.start();
+    expect(restarted.getRemoteTunnelManager()).toBe(beforeStart);
+    await restarted.stop();
+    expect(restarted.getRemoteTunnelManager()).toBe(beforeStart);
   });
 
-  it("calls tunnel manager stop once during shutdown", async () => {
-    const stopSpy = vi.spyOn(TunnelProcessManager.prototype, "stop").mockResolvedValueOnce(undefined);
+  it("never stops the tunnel process on engine stop or restart", async () => {
+    const stopSpy = vi.spyOn(TunnelProcessManager.prototype, "stop").mockResolvedValue(undefined);
     const engine = createEngine();
 
     await engine.start();
     await engine.stop();
 
-    expect(stopSpy).toHaveBeenCalledTimes(1);
+    const restarted = createEngine();
+    await restarted.start();
+    await restarted.stop();
+
+    expect(stopSpy).not.toHaveBeenCalled();
     stopSpy.mockRestore();
   });
 
-  it("warns when tunnel manager shutdown fails and clears manager reference", async () => {
+  it("stops the tunnel only on process shutdown, and warns without throwing when that fails", async () => {
     const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
     const stopSpy = vi.spyOn(TunnelProcessManager.prototype, "stop").mockRejectedValueOnce(new Error("tunnel stop failed"));
     const engine = createEngine();
 
     await engine.start();
-    await engine.stop();
+    await engine.shutdownRemoteTunnelForProcessExit();
 
+    expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("Tunnel process manager stop failed"),
     );
-    expect(engine.getRemoteTunnelManager()).toBeUndefined();
 
+    await engine.stop();
     stopSpy.mockRestore();
     warnSpy.mockRestore();
   });
@@ -877,6 +999,7 @@ describe("ProjectEngine remote tunnel manager wiring", () => {
 describe("ProjectEngine remote lifecycle restore policy", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetRemoteTunnelServicesForTests();
     const mockStore = createMockStore(baseSettings);
     mocks.currentStore = mockStore.store;
   });
@@ -1021,28 +1144,44 @@ describe("ProjectEngine remote lifecycle restore policy", () => {
 
     const startSpy = vi.spyOn(TunnelProcessManager.prototype, "start").mockResolvedValue(undefined);
     const stopSpy = vi.spyOn(TunnelProcessManager.prototype, "stop").mockResolvedValue(undefined);
+    /*
+    FNXC:RemoteAccess 2026-08-31-07:08:
+    Status is driven by an explicit variable rather than call-ordered `mockReturnValueOnce`, because
+    restore-on-start now reads status first (to leave an already-running tunnel alone) and a
+    call-counted spy silently attributed the "running" answer to the wrong reader.
+    */
+    const stoppedStatus = {
+      provider: null,
+      state: "stopped" as const,
+      pid: null,
+      startedAt: null,
+      stoppedAt: "2026-04-26T12:05:00.000Z",
+      url: null,
+      lastError: null,
+    };
+    let managedStatus: ReturnType<TunnelProcessManager["getStatus"]> = stoppedStatus;
     const getStatusSpy = vi.spyOn(TunnelProcessManager.prototype, "getStatus")
-      .mockReturnValueOnce({
-        provider: "cloudflare",
-        state: "running",
-        pid: 4321,
-        startedAt: "2026-04-26T12:00:00.000Z",
-        stoppedAt: null,
-        url: "https://remote.example.com",
-        lastError: null,
-      })
-      .mockReturnValue({
-        provider: null,
-        state: "stopped",
-        pid: null,
-        startedAt: null,
-        stoppedAt: "2026-04-26T12:05:00.000Z",
-        url: null,
-        lastError: null,
-      });
+      .mockImplementation(() => managedStatus);
 
     const firstEngine = createEngine();
     await firstEngine.start();
+    managedStatus = {
+      provider: "cloudflare",
+      state: "running",
+      pid: 4321,
+      startedAt: "2026-04-26T12:00:00.000Z",
+      stoppedAt: null,
+      url: "https://remote.example.com",
+      lastError: null,
+    };
+    /*
+    FNXC:RemoteAccess 2026-08-31-07:08:
+    Shutdown markers are persisted on PROCESS exit, not on engine stop — engine stop must leave the
+    tunnel running. This is the ProjectEngineManager.stopAll() ordering: tunnel shutdown first (store
+    still open), then engine.stop().
+    */
+    await firstEngine.shutdownRemoteTunnelForProcessExit();
+    managedStatus = stoppedStatus;
     await firstEngine.stop();
 
     const persistedSettings = mockStore.getCurrentSettings() as {
@@ -1063,6 +1202,7 @@ describe("ProjectEngine remote lifecycle restore policy", () => {
       provider: "cloudflare",
     });
 
+    await secondEngine.shutdownRemoteTunnelForProcessExit();
     await secondEngine.stop();
     expect(stopSpy).toHaveBeenCalled();
 
@@ -1198,12 +1338,62 @@ describe("ProjectEngine remote lifecycle quick tunnel mode", () => {
         provider: "cloudflare",
         quickTunnel: true,
         executablePath: "cloudflared",
+        // Nothing reported a port, so the historical default stands.
         args: ["tunnel", "--url", "http://localhost:4040"],
       }),
     );
 
     await engine.stop();
     startSpy.mockRestore();
+  });
+
+  /*
+  FNXC:RemoteAccess 2026-08-19-04:00:
+  The target was hardcoded to 4040, so a dashboard on any other port — an explicit --port, a PORT
+  override, or runDashboard's EADDRINUSE rebind to an ephemeral port — published a public tunnel to
+  whatever ELSE owned 4040 (another Fusion, another app, or nothing). The dashboard reports its
+  bound port and the tunnel must follow it.
+  */
+  it("targets the port the dashboard actually bound", async () => {
+    const quickTunnelSettings = {
+      ...baseSettings,
+      remoteAccess: {
+        ...baseRemoteAccess,
+        providers: {
+          ...baseRemoteAccess.providers,
+          cloudflare: {
+            ...baseRemoteAccess.providers.cloudflare,
+            quickTunnel: true,
+            tunnelName: "",
+            tunnelToken: null,
+            ingressUrl: "",
+          },
+        },
+      },
+    };
+    const mockStore = createMockStore(quickTunnelSettings);
+    mocks.currentStore = mockStore.store;
+
+    const startSpy = vi.spyOn(TunnelProcessManager.prototype, "start").mockResolvedValue(undefined);
+    setLocalDashboardPort(51234);
+
+    try {
+      const engine = createEngine();
+      await engine.start();
+      await engine.startRemoteTunnel();
+
+      expect(startSpy).toHaveBeenCalledWith(
+        "cloudflare",
+        expect.objectContaining({
+          args: ["tunnel", "--url", "http://localhost:51234"],
+        }),
+      );
+
+      await engine.stop();
+    } finally {
+      resetLocalDashboardPortForTests();
+      startSpy.mockRestore();
+    }
   });
 
   it("surfaces runtime prerequisite missing when cloudflared is unavailable in quick tunnel mode", async () => {
@@ -1249,6 +1439,94 @@ describe("ProjectEngine remote lifecycle quick tunnel mode", () => {
     await engine.start();
     await expect(engine.startRemoteTunnel()).rejects.toThrow(
       "runtime_prerequisite_missing:cloudflared is not available on PATH",
+    );
+    await engine.stop();
+  });
+
+  /*
+  FNXC:RemoteAccess 2026-08-23-02:03:
+  Surface enumeration for the tailscaled-readiness preflight. The reported symptom was ONE of these
+  (daemon absent in a container), but all three reach the tunnel spawn through the same path and all
+  three previously produced an unexplained "process exited 1", so the invariant under test is
+  "an unusable tailscale backend fails preflight with an actionable message", not the single repro.
+  Cases: daemon unreachable (exec fails, no stdout), logged out (non-zero exit but JSON on stdout —
+  the reason stdout is trusted over exit code), and stopped.
+  */
+  const tailscaleSettings = () => ({
+    ...baseSettings,
+    remoteAccess: {
+      ...baseRemoteAccess,
+      activeProvider: "tailscale" as const,
+    },
+  });
+
+  const mockTailscaleStatus = (
+    outcome: { error?: Error; stdout?: string; stderr?: string },
+  ): void => {
+    mocks.execFile.mockImplementation((
+      _file: string,
+      _args: string[],
+      _options: unknown,
+      callback?: (error: Error | null, result: { stdout: string; stderr: string }) => void,
+    ) => {
+      const isStatusProbe = _args?.includes("status") && _args?.includes("--json");
+      const error = isStatusProbe ? outcome.error ?? null : null;
+      const result = isStatusProbe
+        ? { stdout: outcome.stdout ?? "", stderr: outcome.stderr ?? "" }
+        : { stdout: "/usr/bin/mock\n", stderr: "" };
+
+      const done = typeof _options === "function"
+        ? _options as (error: Error | null, result: { stdout: string; stderr: string }) => void
+        : callback;
+
+      // execFile's promisified form attaches stdout/stderr to the rejection, which is exactly how the
+      // logged-out case delivers its JSON; mirror that shape instead of a bare Error.
+      if (error) {
+        Object.assign(error, result);
+      }
+      done?.(error, result);
+      return {} as never;
+    });
+  };
+
+  it("fails tailscale preflight with an actionable message when tailscaled is unreachable", async () => {
+    mockTailscaleStatus({
+      error: new Error("exit 1"),
+      stderr: "failed to connect to local tailscaled; it doesn't appear to be running",
+    });
+    mocks.currentStore = createMockStore(tailscaleSettings()).store;
+
+    const engine = createEngine();
+    await engine.start();
+    await expect(engine.startRemoteTunnel()).rejects.toThrow(
+      /runtime_prerequisite_missing:tailscaled is not reachable: failed to connect to local tailscaled/,
+    );
+    await engine.stop();
+  });
+
+  it("fails tailscale preflight when the daemon runs but the node is logged out", async () => {
+    mockTailscaleStatus({
+      error: new Error("exit 1"),
+      stdout: JSON.stringify({ BackendState: "NeedsLogin" }),
+    });
+    mocks.currentStore = createMockStore(tailscaleSettings()).store;
+
+    const engine = createEngine();
+    await engine.start();
+    await expect(engine.startRemoteTunnel()).rejects.toThrow(
+      /runtime_prerequisite_missing:Tailscale is not logged in/,
+    );
+    await engine.stop();
+  });
+
+  it("fails tailscale preflight when the backend is stopped", async () => {
+    mockTailscaleStatus({ stdout: JSON.stringify({ BackendState: "Stopped" }) });
+    mocks.currentStore = createMockStore(tailscaleSettings()).store;
+
+    const engine = createEngine();
+    await engine.start();
+    await expect(engine.startRemoteTunnel()).rejects.toThrow(
+      /runtime_prerequisite_missing:Tailscale is stopped/,
     );
     await engine.stop();
   });
@@ -1475,6 +1753,7 @@ describe("ProjectEngine U0 merge unification dispatch", () => {
     mocks.currentStore = mockStore.store;
     mocks.landWorkspaceTask.mockResolvedValue({
       allLanded: true,
+      finalized: true,
       repos: [
         { repo: "repo-a", status: "landed", landedSha: "aaaa1111", integrationBranch: "main" },
         { repo: "repo-b", status: "landed", landedSha: "bbbb2222", integrationBranch: "main" },
@@ -1517,6 +1796,7 @@ describe("ProjectEngine U0 merge unification dispatch", () => {
       mocks.currentStore = mockStore.store;
       mocks.landWorkspaceTask.mockResolvedValue({
         allLanded: true,
+        finalized: true,
         repos: [
           { repo: "repo-a", status: "landed", landedSha: "aaaa1111", integrationBranch: "main" },
           { repo: "repo-b", status: "landed", landedSha: "bbbb2222", integrationBranch: "main" },
@@ -1549,6 +1829,7 @@ describe("ProjectEngine U0 merge unification dispatch", () => {
       mocks.currentStore = mockStore.store;
       mocks.landWorkspaceTask.mockResolvedValue({
         allLanded: true,
+        finalized: true,
         repos: [{ repo: "repo-c", status: "landed", landedSha: "cccc3333", integrationBranch: "main" }],
       } as any);
 
@@ -1581,6 +1862,7 @@ describe("ProjectEngine U0 merge unification dispatch", () => {
       // reports allLanded:true and finalizes gracefully.
       mocks.landWorkspaceTask.mockResolvedValue({
         allLanded: true,
+        finalized: true,
         repos: [{ repo: "repo-d", status: "empty", integrationBranch: "main" }],
       } as any);
 
@@ -1658,6 +1940,240 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
     ...overrides,
   });
 
+  /*
+  FNXC:WorkspaceMergeDispatch 2026-08-15-08:56:
+  The queue's process-local Set cannot serialize two ProjectEngine instances. These
+  dispatch tests use the real queue path and only mock the durable lease boundary.
+  */
+  it("releases its durable workspace dispatch claim after a successful manual land", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const task = workspaceTask();
+    mockStore.store.getTask.mockResolvedValue(task);
+    const handle = {
+      leaseKey: "merge-dispatch:FN-WSH",
+      owner: { taskId: "FN-WSH", nodeId: "node-a", incarnationId: "run-a" },
+      fenceToken: 1n,
+      expiresAt: "2026-08-15T09:01:00.000Z",
+    };
+    const acquireWorkspaceLease = vi.fn(async () => ({ outcome: "acquired" as const, handle }));
+    const releaseWorkspaceLease = vi.fn(async () => true);
+    Object.assign(mockStore.store, { acquireWorkspaceLease, releaseWorkspaceLease });
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue({
+      allLanded: true,
+      finalized: true,
+      repos: [{ repo: "repo-a", status: "landed", landedSha: "aaaa1111", integrationBranch: "main" }],
+    });
+
+    const engine = createEngine();
+    await engine.start();
+    await engine.onMerge("FN-WSH");
+
+    expect(acquireWorkspaceLease).toHaveBeenCalledWith(expect.objectContaining({
+      leaseKey: "merge-dispatch:FN-WSH",
+      kind: "merge-dispatch",
+      owner: expect.objectContaining({ taskId: "FN-WSH" }),
+    }));
+    expect(releaseWorkspaceLease).toHaveBeenCalledWith(handle);
+    await engine.stop();
+  });
+
+  it("retries missing workspace approval through Code Review without merge retries", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+    Object.assign(mockStore.store, {
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: "builtin:coding", stepIds: [] })),
+      listWorkflowWorkItemsForTask: vi.fn(async () => []),
+      seedWorkspaceCodeReviewContinuationIfIdle: vi.fn(async () => ({ seeded: true, workItemId: "review-reroute" })),
+    });
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockRejectedValue(new WorkspaceReviewRequiredError("FN-WSH", {
+      kind: "approval-missing",
+      repositories: ["repo-a"],
+      files: ["repo-a/src/example.ts"],
+    }));
+    const engine = createEngine();
+    await engine.start();
+
+    await expect(engine.onMerge("FN-WSH")).rejects.toMatchObject({
+      name: "WorkspaceReviewRequiredError",
+      assessment: expect.objectContaining({ kind: "approval-missing" }),
+    });
+    expect(mockStore.store.updateTask.mock.calls.some(([, patch]) =>
+      typeof (patch as { mergeRetries?: unknown }).mergeRetries === "number"
+        || (patch as { status?: unknown }).status === "failed",
+    )).toBe(false);
+    expect(mockStore.store.logEntry).toHaveBeenCalledWith(
+      "FN-WSH",
+      expect.stringContaining("Code Review re-entry is owned by the workflow graph"),
+      "WorkspaceReviewRequired",
+    );
+    expect((mockStore.store as any).seedWorkspaceCodeReviewContinuationIfIdle).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: "FN-WSH",
+      nodeId: "code-review",
+      kind: "task",
+    }));
+    expect(mockStore.store.updateTask).toHaveBeenCalledWith("FN-WSH", {
+      status: "workspace-review-required",
+      error: null,
+    });
+    expect(mockStore.store.logEntry).not.toHaveBeenCalledWith(
+      "FN-WSH",
+      expect.stringContaining("configure or enable Code Review"),
+      "WorkspaceReviewRequired",
+    );
+    await engine.stop();
+  });
+
+  it("returns a typed Code Review rework result to an active graph owner", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+    Object.assign(mockStore.store, {
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: "builtin:coding", stepIds: [] })),
+      listWorkflowWorkItemsForTask: vi.fn(async () => [{ id: "active-merge", state: "running" }]),
+      seedWorkspaceCodeReviewContinuationIfIdle: vi.fn(async () => ({ seeded: false, reason: "active-continuation" })),
+    });
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockRejectedValue(new WorkspaceReviewRequiredError("FN-WSH", {
+      kind: "content-changed",
+      repositories: ["repo-a"],
+      files: ["repo-a/src/example.ts"],
+    }));
+    const engine = createEngine();
+    await engine.start();
+
+    await expect(engine.onMerge("FN-WSH")).resolves.toMatchObject({
+      merged: false,
+      reason: "workspace-review-required",
+    });
+    expect(mockStore.store.updateTask.mock.calls.some(([, patch]) =>
+      (patch as { status?: unknown }).status === "failed"
+        || typeof (patch as { mergeRetries?: unknown }).mergeRetries === "number",
+    )).toBe(false);
+    expect(mockStore.store.updateTask).toHaveBeenCalledWith("FN-WSH", {
+      status: "workspace-review-required",
+      error: null,
+    });
+    expect(mockStore.store.logEntry).toHaveBeenCalledWith(
+      "FN-WSH",
+      expect.stringContaining("Code Review re-entry is owned by the workflow graph"),
+      "WorkspaceReviewRequired",
+    );
+    await engine.stop();
+  });
+
+  it("fails a conflicting manual dispatch without calling the workspace land body", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask());
+    const acquireWorkspaceLease = vi.fn(async () => ({
+      outcome: "conflict" as const,
+      conflict: {
+        leaseKey: "merge-dispatch:FN-WSH",
+        taskId: "FN-other",
+        nodeId: "node-b",
+        incarnationId: "run-b",
+        fenceToken: 2n,
+        expiresAt: "2026-08-15T09:01:00.000Z",
+      },
+    }));
+    Object.assign(mockStore.store, { acquireWorkspaceLease });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+    await expect(engine.onMerge("FN-WSH")).rejects.toThrow("workspace merge dispatch is in progress for task FN-other");
+
+    expect(acquireWorkspaceLease).toHaveBeenCalledTimes(1);
+    expect(mocks.landWorkspaceTask).not.toHaveBeenCalled();
+    expect(mockStore.store.updateTask).not.toHaveBeenCalled();
+    await engine.stop();
+  });
+
+  it("rejects a manual workspace merge when finalization is blocked without laundering success", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const task = workspaceTask({
+      branchContext: { assignmentMode: "shared", groupId: "BG-9051", source: "planning" },
+    });
+    mockStore.store.getTask.mockResolvedValue(task as any);
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue({
+      allLanded: true,
+      finalized: false,
+      finalizeBlockedReason: "operator review required",
+      repos: [{ repo: "repo-a", status: "empty", integrationBranch: "main" }],
+    } as any);
+    const mergedLogSpy = vi.spyOn(runtimeLog, "log").mockImplementation(() => undefined);
+    const engine = createEngine({ createGroupPr: vi.fn() });
+    await engine.start();
+
+    await expect(engine.onMerge("FN-WSH")).rejects.toMatchObject({
+      name: "WorkspaceFinalizeBlockedError",
+      reason: "operator review required",
+    });
+
+    expect(mockStore.store.updateTask.mock.calls.some(([, patch]) =>
+      typeof (patch as { mergeRetries?: unknown }).mergeRetries === "number",
+    )).toBe(false);
+    expect(mockStore.store.updateTask).not.toHaveBeenCalledWith(
+      "FN-WSH",
+      expect.objectContaining({ status: "failed" }),
+    );
+    expect(mockStore.store.getBranchGroup).not.toHaveBeenCalled();
+    expect(mergedLogSpy.mock.calls.flat().join(" ")).not.toContain("merge merged: FN-WSH");
+
+    mergedLogSpy.mockRestore();
+    await engine.stop();
+  });
+
+  it("keeps a blocked workspace finalize out of the auto retry and failure paths", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue({
+      allLanded: true,
+      finalized: false,
+      finalizeBlockedReason: "operator review required",
+      repos: [{ repo: "repo-a", status: "empty", integrationBranch: "main" }],
+    } as any);
+    const engine = createEngine();
+    await engine.start();
+    engine.enqueueMerge("FN-WSH");
+
+    await vi.waitFor(() => {
+      expect(mockStore.store.logEntry).toHaveBeenCalledWith(
+        "FN-WSH",
+        expect.stringContaining("operator review required"),
+        "WorkspaceFinalizeBlocked",
+      );
+    });
+
+    expect(mockStore.store.updateTask.mock.calls.some(([, patch]) =>
+      typeof (patch as { mergeRetries?: unknown }).mergeRetries === "number"
+      || (patch as { status?: unknown }).status === "failed",
+    )).toBe(false);
+    await engine.stop();
+  });
+
+  it("uses the generic blocked reason when the workspace finalize fence is orphaned", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue({
+      allLanded: true,
+      finalized: false,
+      repos: [{ repo: "repo-a", status: "empty", integrationBranch: "main" }],
+    } as any);
+    const engine = createEngine();
+    await engine.start();
+
+    await expect(engine.onMerge("FN-WSH")).rejects.toMatchObject({
+      name: "WorkspaceFinalizeBlockedError",
+      reason: expect.stringContaining("workspace finalize was blocked"),
+    });
+
+    await engine.stop();
+  });
+
   // B1: getTask returning null in the partial-land catch must FAIL CLOSED — no retry timer.
   it("B1: partial land with getTask null fails closed (parks failed, no retry timer)", async () => {
     vi.useFakeTimers();
@@ -1714,8 +2230,15 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
         "FN-WSH",
         expect.objectContaining({ mergeRetries: expect.anything(), status: null }),
       );
+      // The isolated child-process seam proves this fail-closed ordering never falls through
+      // to the root-cwd reachability probe (`git remote` was the original guard timeout).
+      const gitRemoteCalls = (mocks.execFile.mock.calls as Array<[string, string[]]>).filter(
+        (call) => Array.isArray(call[1]) && call[1][0] === "remote",
+      );
+      expect(gitRemoteCalls).toHaveLength(0);
 
-      await engine.stop();
+      await expect(engine.stop()).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1728,6 +2251,10 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
     mockStore.store.getTask.mockResolvedValue(
       workspaceTask({
         status: null,
+        // A real row carries these. Without them the merge-confirmed fast path threw on `steps.map`
+        // and never reached the workspace gate-skip this test exists to prove.
+        steps: [],
+        enabledWorkflowSteps: [],
         mergeDetails: {
           mergeConfirmed: true,
           // A sub-repo squash sha — unreachable from the workspace ROOT cwd; the gate would
@@ -1788,7 +2315,12 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
     vi.useFakeTimers();
     try {
       const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
-      mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+      let liveTask = workspaceTask() as Record<string, unknown>;
+      mockStore.store.getTask.mockImplementation(async () => liveTask as any);
+      mockStore.store.updateTask.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+        liveTask = { ...liveTask, ...patch };
+        return liveTask as any;
+      });
       mocks.currentStore = mockStore.store;
       mocks.landWorkspaceTask.mockRejectedValue(
         new WorkspaceRepoLandBusyError("repo-a", "FN-OTHER", "FN-WSH"),
@@ -1799,6 +2331,10 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
       const enqueueSpy = vi.spyOn(
         engine as unknown as { internalEnqueueMerge: (id: string) => void },
         "internalEnqueueMerge",
+      );
+      const scheduleBusyRetrySpy = vi.spyOn(
+        engine as unknown as { scheduleWorkspaceBusyReenqueue: (id: string, delayMs: number) => void },
+        "scheduleWorkspaceBusyReenqueue",
       );
       engine.enqueueMerge("FN-WSH");
 
@@ -1820,44 +2356,31 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
       expect(burnedRetries).toBe(false);
 
       /*
-      FNXC:Workspace 2026-06-22-09:30 (Phase C review B5b — assert the 60s CAP, not just the first retry):
-      Advancing 60s once only proves the first 5s timer fired; an UNcapped exponential
-      (5s,10s,20s,40s,80s,160s,…) would still pass that. Capture EVERY scheduled busy backoff delay
-      across enough cycles to pass the cap point (busyCount=4 → 5000*2^4 = 80_000ms, clamped to 60_000)
-      and assert no delay exceeds 60_000 AND the cap is actually reached. Each advance fires the pending
-      timer → re-enqueue → landWorkspaceTask rejects busy again → next backoff is scheduled.
+      FNXC:WorkspaceMergeDispatch 2026-08-05-23:56:
+      Attribute delays at the workspace-owned scheduler, never global setTimeout: merge dispatch also
+      schedules body-settle and maintenance timers, which made an unrelated 120s timer look like a
+      workspace backoff. Drive the first six busy attempts through the cap and require its exact ladder.
       */
-      const scheduledBusyDelays: number[] = [];
-      // `globalThis.setTimeout` is already the fake-timer impl here (vi.useFakeTimers above).
-      // Wrap it to record the requested delay, then delegate to the SAME fake timer so the
-      // fake clock still drives the callback — no real-timer leakage.
-      const fakeSetTimeout = globalThis.setTimeout;
-      const setTimeoutSpy = vi
-        .spyOn(globalThis, "setTimeout")
-        .mockImplementation(((cb: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
-          if (typeof ms === "number") scheduledBusyDelays.push(ms);
-          return (fakeSetTimeout as (...a: unknown[]) => unknown)(cb, ms, ...rest);
-        }) as typeof setTimeout);
-
-      try {
-        // Drive enough busy cycles to climb past the cap point (busyCount 0..5 = 6 cycles).
-        for (let i = 0; i < 6; i++) {
-          await vi.advanceTimersByTimeAsync(60_000);
-        }
-      } finally {
-        setTimeoutSpy.mockRestore();
+      const expectedBusyDelays = [5_000, 10_000, 20_000, 40_000, 60_000, 60_000] as const;
+      await vi.waitFor(() => {
+        expect(scheduleBusyRetrySpy).toHaveBeenCalledWith("FN-WSH", expectedBusyDelays[0]);
+      });
+      for (const [index, delayMs] of expectedBusyDelays.slice(0, -1).entries()) {
+        await vi.advanceTimersByTimeAsync(delayMs);
+        await vi.waitFor(() => {
+          expect(scheduleBusyRetrySpy).toHaveBeenCalledTimes(index + 2);
+        });
       }
 
-      // The exponential climbed (more than one distinct delay) AND every delay is capped at 60s.
-      expect(scheduledBusyDelays.length).toBeGreaterThanOrEqual(5);
-      expect(Math.max(...scheduledBusyDelays)).toBe(60_000);
-      expect(scheduledBusyDelays.every((d) => d <= 60_000)).toBe(true);
-      // The cap was actually exercised: at least one delay sits at the 60s ceiling.
-      expect(scheduledBusyDelays).toContain(60_000);
-      // Each fired backoff re-enqueued the merge (the contention retry loop is live).
+      const scheduledBusyDelays = scheduleBusyRetrySpy.mock.calls.map(([, delayMs]) => delayMs);
+      expect(scheduledBusyDelays).toEqual(expectedBusyDelays);
+      expect(scheduledBusyDelays).not.toContain(120_000);
+      // Each fired backoff reaches one fresh merge body; the queue remains single-flight.
+      expect(mocks.landWorkspaceTask).toHaveBeenCalledTimes(expectedBusyDelays.length);
       expect(enqueueSpy).toHaveBeenCalledWith("FN-WSH");
 
-      await engine.stop();
+      await expect(engine.stop()).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1940,34 +2463,22 @@ describe("ProjectEngine merge queue priority ordering", () => {
     // Tasks returned in createdAt ASC order (matches store.listTasks contract).
     // Priority order is interleaved so a naive iteration would merge FN-low
     // first; priority-aware sorting must reorder to urgent → normal → low.
+    /* FNXC:MergeAuthority 2026-08-23-18:05: the sweep now also proves graph authority per card, so a
+       fixture expected to reach the queue must look mergeable — no outstanding optional gates, and
+       quiet long enough for stall recovery. Priority ordering is what this test is about. */
+    const mergeable = {
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      steps: [],
+      enabledWorkflowSteps: [],
+      updatedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    };
     const sweptTasks = [
-      {
-        id: "FN-low",
-        column: "in-review",
-        paused: false,
-        mergeRetries: 0,
-        status: null,
-        priority: "low",
-        createdAt: "2026-04-01T00:00:00.000Z",
-      },
-      {
-        id: "FN-urgent",
-        column: "in-review",
-        paused: false,
-        mergeRetries: 0,
-        status: null,
-        priority: "urgent",
-        createdAt: "2026-04-02T00:00:00.000Z",
-      },
-      {
-        id: "FN-normal",
-        column: "in-review",
-        paused: false,
-        mergeRetries: 0,
-        status: null,
-        priority: "normal",
-        createdAt: "2026-04-03T00:00:00.000Z",
-      },
+      { ...mergeable, id: "FN-low", priority: "low", createdAt: "2026-04-01T00:00:00.000Z" },
+      { ...mergeable, id: "FN-urgent", priority: "urgent", createdAt: "2026-04-02T00:00:00.000Z" },
+      { ...mergeable, id: "FN-normal", priority: "normal", createdAt: "2026-04-03T00:00:00.000Z" },
     ];
     const tasksById: Record<string, Record<string, unknown>> = Object.fromEntries(
       sweptTasks.map((t) => [t.id, t]),
@@ -2001,9 +2512,9 @@ describe("ProjectEngine merge queue priority ordering", () => {
   it("picker falls back to next-priority task when the chosen one is removed from the queue during getTask awaits", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
     const tasksById: Record<string, Record<string, unknown>> = {
-      "FN-urgent": { id: "FN-urgent", column: "in-review", paused: false, mergeRetries: 0, status: null, priority: "urgent", createdAt: "2026-04-01T00:00:00.000Z" },
-      "FN-normal-a": { id: "FN-normal-a", column: "in-review", paused: false, mergeRetries: 0, status: null, priority: "normal", createdAt: "2026-04-02T00:00:00.000Z" },
-      "FN-normal-b": { id: "FN-normal-b", column: "in-review", paused: false, mergeRetries: 0, status: null, priority: "normal", createdAt: "2026-04-03T00:00:00.000Z" },
+      "FN-urgent": { id: "FN-urgent", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, priority: "urgent", createdAt: "2026-04-01T00:00:00.000Z", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      "FN-normal-a": { id: "FN-normal-a", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, priority: "normal", createdAt: "2026-04-02T00:00:00.000Z", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      "FN-normal-b": { id: "FN-normal-b", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, priority: "normal", createdAt: "2026-04-03T00:00:00.000Z", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     };
 
     let releaseUrgent: (() => void) = () => {};
@@ -2055,8 +2566,8 @@ describe("ProjectEngine merge queue priority ordering", () => {
   it("picker returns undefined when shutdown lands during getTask awaits", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
     const tasksById: Record<string, Record<string, unknown>> = {
-      "FN-a": { id: "FN-a", column: "in-review", paused: false, mergeRetries: 0, status: null, priority: "high", createdAt: "2026-04-01T00:00:00.000Z" },
-      "FN-b": { id: "FN-b", column: "in-review", paused: false, mergeRetries: 0, status: null, priority: "normal", createdAt: "2026-04-02T00:00:00.000Z" },
+      "FN-a": { id: "FN-a", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, priority: "high", createdAt: "2026-04-01T00:00:00.000Z", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      "FN-b": { id: "FN-b", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, priority: "normal", createdAt: "2026-04-02T00:00:00.000Z", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     };
 
     let release: (() => void) = () => {};
@@ -2120,7 +2631,12 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
     await engine.start();
 
-    const taskMovedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+    /*
+    FNXC:EngineTests 2026-08-10-10:34:
+    FN-8937 must invoke the auto-merge listener, not spec-drift's earlier observer;
+    the latest registration owns the merge handoff assertions below.
+    */
+    const taskMovedHandler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:moved")?.[1] as
       | ((payload: { task: { id: string; column: string; paused?: boolean }; to: string }) => Promise<void>)
       | undefined;
 
@@ -2146,13 +2662,13 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     await engine.start();
     enqueueSpy.mockClear();
 
-    const taskUpdatedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:updated")?.[1] as
+    const taskUpdatedHandler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:updated")?.[1] as
       | ((task: { id: string; column: string; paused?: boolean; status?: string | null }) => Promise<void>)
       | undefined;
     if (!taskUpdatedHandler) throw new Error("task:updated handler was not registered");
 
     await taskUpdatedHandler({ id: "FN-unpause", column: "in-review", paused: true, status: "paused" });
-    await taskUpdatedHandler({ id: "FN-unpause", column: "in-review", paused: false, status: null });
+    await taskUpdatedHandler({ id: "FN-unpause", column: "in-review", paused: false, status: null, enabledWorkflowSteps: [], steps: [], updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() });
 
     expect(enqueueSpy).toHaveBeenCalledWith("FN-unpause");
 
@@ -2445,6 +2961,8 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     const processPullRequestMerge = vi.fn(async () => "merged" as const);
     const engine = createEngine({ processPullRequestMerge, getMergeStrategy: () => "pull-request" });
     await engine.start();
+    const semaphore = new AgentSemaphore(1);
+    (engine as unknown as { runtime: { projectSemaphore?: AgentSemaphore } }).runtime.projectSemaphore = semaphore;
     engine.enqueueMerge("FN-pr");
 
     await vi.waitFor(() => {
@@ -2457,6 +2975,148 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
       );
     });
 
+    expect(semaphore.activeCount).toBe(0);
+    await engine.stop();
+  });
+
+  it("runs a sole dequeued merge when coordinator capacity is available", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1 });
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-sole-merge",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-sole-merge",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+    // Exercise the production reservation path: this task has already been
+    // dequeued, so it must add itself as the one-shot admission candidate.
+    (engine as unknown as { runtime: { projectSemaphore?: AgentSemaphore } }).runtime.projectSemaphore = new AgentSemaphore(1);
+    engine.enqueueMerge("FN-sole-merge");
+
+    await vi.waitFor(() => expect(mocks.runAiMerge).toHaveBeenCalledWith(
+      mockStore.store,
+      "/tmp/proj_test",
+      "FN-sole-merge",
+      expect.any(Object),
+    ));
+    expect((engine as unknown as { mergeQueue: string[] }).mergeQueue).toEqual([]);
+    await engine.stop();
+  });
+
+  it("does not admit a merge over the maxConcurrent agent ceiling", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1, maxWorktrees: 1 });
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-MERGE-WAITING",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-merge-waiting",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+    mockStore.store.listTasks.mockImplementation(async (options?: { slim?: boolean }) => options?.slim === false
+      ? [{
+          id: "FN-LIVE-REVIEW",
+          column: "todo",
+          paused: false,
+          status: null,
+          workflowStepResults: [{
+            workflowStepId: "code-review",
+            workflowStepName: "Code Review",
+            phase: "pre-merge",
+            source: "optional-group",
+            status: "pending",
+            startedAt: "2026-08-01T00:00:00.000Z",
+          }],
+        }]
+      : []);
+
+    engine.enqueueMerge("FN-MERGE-WAITING");
+
+    await vi.waitFor(() => {
+      expect(mockStore.store.listTasks).toHaveBeenCalledWith({ slim: false, includeArchived: false });
+    });
+    expect(mocks.runAiMerge).not.toHaveBeenCalled();
+    expect(mockStore.store.listTasks.mock.calls.filter(([options]) => options?.slim === false)).toHaveLength(1);
+    const privateEngine = engine as unknown as {
+      mergeQueue: string[];
+      capacityDeferredMergeTaskIds: Set<string>;
+    };
+    expect(privateEngine.mergeQueue).not.toContain("FN-MERGE-WAITING");
+    expect(privateEngine.capacityDeferredMergeTaskIds.has("FN-MERGE-WAITING")).toBe(true);
+    expect(await engine.isMergePending("FN-MERGE-WAITING")).toBe(true);
+    expect(mockStore.store.logEntry).toHaveBeenCalledWith(
+      "FN-MERGE-WAITING",
+      expect.stringContaining("maxConcurrent capacity exhausted: used=1/1"),
+    );
+
+    // An unrelated queue wake must not make the deferred task runnable before its timer.
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-OTHER-MERGE",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-other-merge",
+      createdAt: "2026-01-02T00:00:00.000Z",
+    });
+    engine.enqueueMerge("FN-OTHER-MERGE");
+    await vi.waitFor(() => {
+      expect(privateEngine.capacityDeferredMergeTaskIds.has("FN-OTHER-MERGE")).toBe(true);
+    });
+    expect(privateEngine.mergeQueue).not.toContain("FN-MERGE-WAITING");
+    expect(mocks.runAiMerge).not.toHaveBeenCalled();
+    await engine.stop();
+    expect(privateEngine.capacityDeferredMergeTaskIds.size).toBe(0);
+    expect(await engine.isMergePending("FN-MERGE-WAITING")).toBe(false);
+  });
+
+  it("admits a merge claim when maxWorktrees is full but maxConcurrent has slack", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 2, maxWorktrees: 1 });
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-MERGE-WORKTREE-FULL",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-merge-worktree-full",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    mockStore.store.listTasks.mockImplementation(async (options?: { slim?: boolean }) => options?.slim === false
+      ? [{
+          id: "FN-WORKTREE-HOLDER",
+          column: "in-progress",
+          paused: false,
+          status: null,
+          worktree: "/tmp/fn-worktree-holder",
+        }]
+      : []);
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+    engine.enqueueMerge("FN-MERGE-WORKTREE-FULL");
+
+    await vi.waitFor(() => expect(mocks.runAiMerge).toHaveBeenCalledWith(
+      mockStore.store,
+      "/tmp/proj_test",
+      "FN-MERGE-WORKTREE-FULL",
+      expect.any(Object),
+    ));
+    expect(mockStore.store.logEntry).not.toHaveBeenCalledWith(
+      "FN-MERGE-WORKTREE-FULL",
+      expect.stringContaining("maxWorktrees capacity exhausted"),
+    );
     await engine.stop();
   });
 
@@ -2599,7 +3259,7 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
       expect(mocks.runAiMerge).toHaveBeenCalledTimes(1);
     });
 
-    const taskUpdatedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:updated")?.[1] as
+    const taskUpdatedHandler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:updated")?.[1] as
       | ((task: { id: string; column: string; paused?: boolean }) => void)
       | undefined;
     if (!taskUpdatedHandler) throw new Error("task:updated handler was not registered");
@@ -2625,10 +3285,17 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
     const inReviewTasks = [
       { id: "FN-paused", column: "in-review", paused: true, mergeRetries: 0, status: null },
-      { id: "FN-ready", column: "in-review", paused: false, mergeRetries: 0, status: null },
+      { id: "FN-ready", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     ];
-    // Critical stale-status cleanup reads first; deferred startup then evaluates eligibility.
-    mockStore.store.listTasks.mockResolvedValueOnce([]).mockResolvedValueOnce(inReviewTasks);
+    /*
+    FNXC:EngineTests 2026-08-10-10:34:
+    FN-8937 keeps this rescue suite aligned with the startup ownership contract:
+    spec-drift seeds first, stale-status cleanup reads second, then deferred merge admission reads the candidates.
+    */
+    mockStore.store.listTasks
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(inReviewTasks);
     mocks.currentStore = mockStore.store;
     const engine = createEngine();
     const privateEngine = engine as unknown as { internalEnqueueMerge: (taskId: string) => void };
@@ -2643,7 +3310,13 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     await engine.stop();
   });
 
-  it("startup merge sweep enqueues shared-group members when autoMerge is false", async () => {
+  /*
+  FNXC:SharedBranchMemberHold 2026-08-09-09:09:
+  FN-8823 applies the project-Off consent rule to startup merge recovery as well
+  as direct admission. An explicit per-task On remains eligible, but group
+  liveness cannot re-admit a non-opted-in shared member.
+  */
+  it("startup merge sweep holds non-opted-in shared-group members when autoMerge is false", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: false });
     mockStore.store.getBranchGroup.mockReturnValue({ id: "BG-5819", status: "open", branchName: "fusion/groups/bg-5819" });
     const inReviewTasks = [
@@ -2655,19 +3328,27 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
         status: null,
         branchContext: { assignmentMode: "shared", groupId: "BG-5819", source: "planning" },
       },
-      { id: "FN-plain", column: "in-review", paused: false, mergeRetries: 0, status: null },
+      { id: "FN-opted-in", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, autoMerge: true, branchContext: { assignmentMode: "shared", groupId: "BG-5819", source: "planning" }, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      { id: "FN-plain", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     ];
-    // Critical stale-status cleanup reads first; deferred startup then evaluates eligibility.
-    mockStore.store.listTasks.mockResolvedValueOnce([]).mockResolvedValueOnce(inReviewTasks);
+    /*
+    FNXC:EngineTests 2026-08-10-10:34:
+    FN-8937 preserves the three startup readers: spec-drift seed, stale-status cleanup, then deferred merge admission.
+    */
+    mockStore.store.listTasks
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(inReviewTasks);
     mocks.currentStore = mockStore.store;
     const engine = createEngine();
     const privateEngine = engine as unknown as { internalEnqueueMerge: (taskId: string) => void };
     const enqueueSpy = vi.spyOn(privateEngine, "internalEnqueueMerge");
 
     await engine.start();
-    await vi.waitFor(() => expect(enqueueSpy).toHaveBeenCalledWith("FN-shared"));
+    await vi.waitFor(() => expect(enqueueSpy).toHaveBeenCalledWith("FN-opted-in"));
 
-    expect(enqueueSpy).toHaveBeenCalledWith("FN-shared");
+    expect(enqueueSpy).toHaveBeenCalledWith("FN-opted-in");
+    expect(enqueueSpy).not.toHaveBeenCalledWith("FN-shared");
     expect(enqueueSpy).not.toHaveBeenCalledWith("FN-plain");
 
     await engine.stop();
@@ -2687,7 +3368,7 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
       await engine.start();
       enqueueSpy.mockClear();
-      const movedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+      const movedHandler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:moved")?.[1] as
         | ((event: { task: Task; to: string }) => void)
         | undefined;
       if (!movedHandler) throw new Error("task:moved handler was not registered");
@@ -2721,7 +3402,7 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     enqueueSpy.mockClear();
     mockStore.store.listTasks.mockResolvedValueOnce([
       { id: "FN-paused", column: "in-review", paused: true, mergeRetries: 0, status: null },
-      { id: "FN-ready", column: "in-review", paused: false, mergeRetries: 0, status: null },
+      { id: "FN-ready", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     ]);
 
     await mockStore.emitSettingsUpdated(
@@ -2748,10 +3429,10 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
     mockStore.store.listTasks.mockResolvedValueOnce([
       // Retry exhausted + failed (FN-2997 observed state after merge error)
-      { id: "FN-failed", column: "in-review", paused: false, mergeRetries: 3, status: "failed", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      { id: "FN-failed", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 3, status: "failed", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
       // Failed status must block even when retries are below the cap.
-      { id: "FN-failed-low-retries", column: "in-review", paused: false, mergeRetries: 0, status: "failed", updatedAt: new Date().toISOString() },
-      { id: "FN-ready", column: "in-review", paused: false, mergeRetries: 0, status: null, updatedAt: new Date().toISOString() },
+      { id: "FN-failed-low-retries", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: "failed", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      { id: "FN-ready", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     ]);
 
     await vi.advanceTimersByTimeAsync(15_000);
@@ -2777,9 +3458,9 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     enqueueSpy.mockClear();
     mockStore.store.listTasks.mockResolvedValueOnce([
       { id: "FN-paused", column: "in-review", paused: true, mergeRetries: 0, status: null },
-      { id: "FN-failed", column: "in-review", paused: false, mergeRetries: 0, status: "failed" },
-      { id: "FN-blocked", column: "in-review", paused: false, mergeRetries: 0, status: null },
-      { id: "FN-ready", column: "in-review", paused: false, mergeRetries: 0, status: null },
+      { id: "FN-failed", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: "failed", updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      { id: "FN-blocked", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
+      { id: "FN-ready", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], mergeRetries: 0, status: null, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
     ]);
 
     await mockStore.emitSettingsUpdated(
@@ -3135,11 +3816,12 @@ describe("ProjectEngine swallowed error hardening", () => {
 
     const engine = createEngine();
     await engine.start();
-    await vi.waitFor(() => expect(mockStore.store.listTasks).toHaveBeenCalledTimes(2));
+    // Spec-drift's initial scan precedes stale-status cleanup and deferred merge admission.
+    await vi.waitFor(() => expect(mockStore.store.listTasks).toHaveBeenCalledTimes(3));
 
     mockStore.store.getSettings.mockRejectedValueOnce(new Error("db locked"));
 
-    const handler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+    const handler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:moved")?.[1] as
       | ((payload: { task: { id: string; column: string }; to: string }) => Promise<void>)
       | undefined;
     expect(handler).toBeTypeOf("function");
@@ -3167,8 +3849,9 @@ describe("ProjectEngine swallowed error hardening", () => {
   it("warns when startup merge sweep fails", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
     mocks.currentStore = mockStore.store;
-    // The critical stale-status read precedes the deferred enqueue sweep.
+    // Spec-drift scans first, stale-status cleanup is second, and deferred admission must fail third.
     mockStore.store.listTasks
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockRejectedValueOnce(new Error("connection lost"));
 
@@ -3189,7 +3872,7 @@ describe("ProjectEngine swallowed error hardening", () => {
     mocks.currentStore = mockStore.store;
     const engine = createEngine();
     await engine.start();
-    await vi.waitFor(() => expect(mockStore.store.listTasks).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(mockStore.store.listTasks).toHaveBeenCalledTimes(3));
     warnSpy.mockClear();
 
     mockStore.store.listTasks.mockRejectedValueOnce(new Error("sweep db error"));
@@ -3207,7 +3890,7 @@ describe("ProjectEngine swallowed error hardening", () => {
     mocks.currentStore = mockStore.store;
     const engine = createEngine();
     await engine.start();
-    await vi.waitFor(() => expect(mockStore.store.listTasks).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(mockStore.store.listTasks).toHaveBeenCalledTimes(3));
     warnSpy.mockClear();
 
     mockStore.store.getSettings
@@ -3405,12 +4088,18 @@ describe("ProjectEngine stale mergeActive rescue (FN-3900)", () => {
     vi.useFakeTimers();
 
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    /* FNXC:MergeAuthority 2026-08-23-20:05: the column-entry handoff now proves graph authority
+       before enqueueing, so a fixture expected to reach the queue must look mergeable — no
+       outstanding optional gates, and quiet long enough for stall recovery. */
     mockStore.store.getTask.mockResolvedValue({
       id: "FN-leaked",
       column: "in-review",
       paused: false,
       status: null,
       mergeRetries: 0,
+      steps: [],
+      enabledWorkflowSteps: [],
+      updatedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
     mocks.currentStore = mockStore.store;
 
@@ -3434,13 +4123,13 @@ describe("ProjectEngine stale mergeActive rescue (FN-3900)", () => {
     });
     const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
 
-    const taskMovedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+    const taskMovedHandler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:moved")?.[1] as
       | ((payload: { task: { id: string; column: string; paused?: boolean }; to: string }) => Promise<void>)
       | undefined;
     if (!taskMovedHandler) throw new Error("task:moved handler was not registered");
 
     await taskMovedHandler({
-      task: { id: "FN-leaked", column: "in-review", paused: false },
+      task: { id: "FN-leaked", column: "in-review", paused: false, enabledWorkflowSteps: [], steps: [], updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
       to: "in-review",
     });
 
@@ -3527,6 +4216,9 @@ describe("ProjectEngine stale mergeActive rescue (FN-3900)", () => {
       paused: false,
       status: null,
       mergeRetries: 0,
+      steps: [],
+      enabledWorkflowSteps: [],
+      updatedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
     });
     mocks.currentStore = mockStore.store;
 
@@ -3546,13 +4238,13 @@ describe("ProjectEngine stale mergeActive rescue (FN-3900)", () => {
     const enqueueSpy = vi.spyOn(privateEngine, "internalEnqueueMerge");
     const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
 
-    const taskMovedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+    const taskMovedHandler = mockStore.store.on.mock.calls.findLast((c: unknown[]) => c[0] === "task:moved")?.[1] as
       | ((payload: { task: { id: string; column: string; paused?: boolean }; to: string }) => Promise<void>)
       | undefined;
     if (!taskMovedHandler) throw new Error("task:moved handler was not registered");
 
     await taskMovedHandler({
-      task: { id: "FN-busy", column: "in-review", paused: false },
+      task: { id: "FN-busy", column: "in-review", paused: false, updatedAt: new Date(Date.now() - 60 * 60_000).toISOString() },
       to: "in-review",
     });
 
@@ -3568,7 +4260,7 @@ describe("ProjectEngine stale mergeActive rescue (FN-3900)", () => {
 });
 
 describe("allowInReviewMergeProcessing per-task autoMerge override", () => {
-  const gate = (task: Partial<Task>, settings: { autoMerge: boolean }, branchGroup: { status: "open" | "finalized" | "abandoned" } | null = null): Promise<boolean> =>
+  const gate = (task: Partial<Task>, settings: { autoMerge: boolean; integrationBranch?: string }, branchGroup: { status: "open" | "finalized" | "abandoned"; branchName?: string } | null = null): Promise<boolean> =>
     (createEngine() as any).allowInReviewMergeProcessing(task, settings, { getBranchGroup: vi.fn(() => branchGroup) });
 
   it("lets an explicit per-task autoMerge:true through when the global setting is off", async () => {
@@ -3580,29 +4272,93 @@ describe("allowInReviewMergeProcessing per-task autoMerge override", () => {
     await expect(gate({ autoMerge: false }, { autoMerge: false })).resolves.toBe(false);
   });
 
-  it("keeps everything flowing when the global setting is on — explicit autoMerge:false is parked manual-required downstream", async () => {
+  it("keeps standalone values flowing when the global setting is on", async () => {
     await expect(gate({}, { autoMerge: true })).resolves.toBe(true);
     await expect(gate({ autoMerge: false }, { autoMerge: true })).resolves.toBe(true);
   });
 
-  it("still exempts live shared-branch-group member integration when the global setting is off", async () => {
+  /*
+  FNXC:SharedBranchMemberHold 2026-08-09-09:09:
+  FN-8823 supersedes the FN-5819 live-member exemption when project auto-merge
+  is Off. Every non-opted-in member is held before liveness is considered; an
+  explicit task-level On is the sole consent path through this requester.
+  */
+  it("holds live shared-branch-group member integration on an intermediate branch when the global setting is off", async () => {
+    const shared = { branchContext: { assignmentMode: "shared", groupId: "grp-1" } as Task["branchContext"] };
+    const settings = { autoMerge: false, integrationBranch: "main" };
+    const group = { status: "open" as const, branchName: "mission/M-3324" };
+
+    await expect(gate(shared, settings, group)).resolves.toBe(false);
+    await expect(gate({ ...shared, autoMerge: true }, settings, group)).resolves.toBe(true);
+  });
+
+  it("holds every non-opted-in provenance before live member integration when global auto-merge is off", async () => {
+    const shared = { branchContext: { assignmentMode: "shared", groupId: "grp-1" } as Task["branchContext"] };
+    const settings = { autoMerge: false, integrationBranch: "main" };
+    const group = { status: "open" as const, branchName: "mission/M-3324" };
+
+    await expect(gate({ ...shared, autoMerge: false, autoMergeProvenance: "user" }, settings, group)).resolves.toBe(false);
+    await expect(gate({ ...shared, autoMerge: false, autoMergeProvenance: "mission" }, settings, group)).resolves.toBe(false);
+    await expect(gate({ ...shared, autoMerge: false, autoMergeProvenance: "legacy-stamp" }, settings, group)).resolves.toBe(false);
+    await expect(gate({ ...shared, autoMerge: false }, settings, group)).resolves.toBe(false);
+  });
+
+  it("keeps live shared-branch-group member integration on the default branch behind the manual gate", async () => {
     await expect(gate(
       { branchContext: { assignmentMode: "shared", groupId: "grp-1" } as Task["branchContext"] },
-      { autoMerge: false },
-      { status: "open" },
-    )).resolves.toBe(true);
+      { autoMerge: false, integrationBranch: "main" },
+      { status: "open", branchName: "main" },
+    )).resolves.toBe(false);
   });
 
   it.each([
     ["missing", null],
     ["finalized", { status: "finalized" as const }],
     ["abandoned", { status: "abandoned" as const }],
-  ])("blocks shared-branch-group member integration for %s groups when global autoMerge is off", async (_label, branchGroup) => {
+    ["default-branch", { status: "open" as const, branchName: "main" }],
+  ])("blocks false shared members for %s groups even when global autoMerge is on", async (_label, branchGroup) => {
     await expect(gate(
-      { branchContext: { assignmentMode: "shared", groupId: "grp-1" } as Task["branchContext"] },
-      { autoMerge: false },
+      { branchContext: { assignmentMode: "shared", groupId: "grp-1" } as Task["branchContext"], autoMerge: false, autoMergeProvenance: "mission" },
+      { autoMerge: true, integrationBranch: "main" },
       branchGroup,
     )).resolves.toBe(false);
+  });
+
+  it("keeps stale false members in the interpreter manual hold until the explicit release path merges once into the group", async () => {
+    const task = {
+      id: "FN-8811",
+      column: "in-review",
+      branch: "fusion/fn-8811",
+      autoMerge: false,
+      autoMergeProvenance: "mission",
+      branchContext: { assignmentMode: "shared", groupId: "BG-8811", source: "mission" },
+    } as Task;
+    const settings = { autoMerge: true, globalPause: false, enginePaused: false, integrationBranch: "main" } as Settings;
+    const store = {
+      getTask: vi.fn(async () => task),
+      getSettings: vi.fn(async () => settings),
+      getBranchGroup: vi.fn(async () => ({ status: "open", branchName: "main" })),
+      getTaskWorkflowSelection: () => undefined,
+      getTaskWorkflowSelectionAsync: async () => undefined,
+    } as unknown as TaskStore;
+    const onMerge = vi.fn(async () => ({ task, branch: task.branch ?? "", merged: true, mergeTargetBranch: "mission/M-8811" }));
+    const self: any = {
+      config: { workingDirectory: "/tmp/proj_test" },
+      runtime: { getTaskStore: () => store },
+      onMerge,
+    };
+    self.allowInReviewMergeProcessing = (candidate: Task, candidateSettings: Settings, candidateStore: TaskStore) =>
+      (ProjectEngine.prototype as any).allowInReviewMergeProcessing.call(self, candidate, candidateSettings, candidateStore);
+
+    const held = await (ProjectEngine.prototype as any).requestInterpreterMerge.call(self, task.id);
+
+    expect(held).toMatchObject({ merged: false, noOp: true });
+    expect(onMerge).not.toHaveBeenCalled();
+
+    // The operator's explicit release uses onMerge, not the auto-merge requester.
+    await self.onMerge(task.id, { manual: true });
+    expect(onMerge).toHaveBeenCalledTimes(1);
+    expect(onMerge).toHaveBeenCalledWith(task.id, { manual: true });
   });
 
   it.each([
@@ -3644,6 +4400,15 @@ describe("allowInReviewMergeProcessing per-task autoMerge override", () => {
 // tests above.
 
 describe("enqueueEligibleInReviewTasks honors per-task autoMerge override (shared sweep funnel)", () => {
+  /*
+  FNXC:MergeAuthority 2026-08-23-18:05:
+  These fixtures test the autoMerge-override contract, so they must clear the sweep's graph-authority
+  gate for an unrelated reason. `enabledWorkflowSteps: []` (no optional gates to wait on) plus an old
+  `updatedAt` puts them on the quiescent-stall recovery path — the one admission that does not
+  require a merge-region continuation. Without this they are refused as `gates-unsatisfied`, which is
+  correct behaviour for a card whose default-on Plan/Code Review have not run, but says nothing about
+  the override being tested here.
+  */
   const inReview = (id: string, overrides: Partial<Task> = {}): Task =>
     ({
       id,
@@ -3651,6 +4416,8 @@ describe("enqueueEligibleInReviewTasks honors per-task autoMerge override (share
       paused: false,
       mergeRetries: 0,
       status: null,
+      enabledWorkflowSteps: [],
+      updatedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
       ...overrides,
     }) as unknown as Task;
 
@@ -3687,5 +4454,152 @@ describe("enqueueEligibleInReviewTasks honors per-task autoMerge override (share
     const count = await run([inReview("FN-explicit-false", { autoMerge: false })], { autoMerge: true });
     expect(count).toBe(1);
     expect(enqueueSpy).toHaveBeenCalledWith("FN-explicit-false");
+  });
+});
+
+/*
+FNXC:MergeSafeguards 2026-07-28-19:40 (U9):
+The user-pause filter on merge admission had ZERO test coverage: deleting it
+produced no new failure across project-engine, merge-*, concurrency, or
+merge-single-flight-invariant. The guard works correctly today — what was missing
+is anything that would notice if it stopped. U9 moves merge behind graph nodes, so
+it must be pinned BEFORE the conversion, not after.
+
+(An earlier draft also added a single-flight test here. That was redundant —
+merge-single-flight-invariant.test.ts already covers capacity, verified by
+mutation. It is admitted to the gate instead.)
+
+The test asserts BOTH directions (guard blocks / guard permits) so it fails if the
+guard is removed AND if the filter stops discriminating — a one-sided assertion
+would still pass against a guard that rejects everything.
+*/
+describe("U9 merge safeguards without prior coverage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /*
+  Safeguard 1 — user pause. The pause invariant re-ratified in #2486: never MUTATE
+  lifecycle state of a user-paused card. The merge admission provider is the seam
+  that decides which queued in-review cards are offered to the merge pump; without
+  its `paused || userPaused` filter a user-paused card is admitted and merged.
+  */
+  it("merge admission excludes a user-paused card and admits the same card once unpaused", async () => {
+    const registered = new Map<string, { refresh: () => Promise<unknown[]> }>();
+    const registerSpy = vi
+      .spyOn(projectAdmissionCoordinator, "registerProvider")
+      .mockImplementation((providerId: string, provider: never) => {
+        registered.set(providerId, provider as unknown as { refresh: () => Promise<unknown[]> });
+        return () => {};
+      });
+
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+
+    const mergeProvider = [...registered.entries()].find(([id]) => id.startsWith("merge:"))?.[1];
+    if (!mergeProvider) throw new Error("merge admission provider was not registered");
+
+    const privateEngine = engine as unknown as { mergeQueue: string[]; coordinatorAdmittedMergeTaskIds: Set<string> };
+    privateEngine.mergeQueue = ["FN-paused"];
+    privateEngine.coordinatorAdmittedMergeTaskIds.clear();
+
+    // User-paused: must NOT be offered for merge admission.
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-paused",
+      column: "in-review",
+      paused: false,
+      userPaused: true,
+      status: null,
+      mergeRetries: 0,
+      createdAt: new Date(0).toISOString(),
+    });
+    await expect(mergeProvider.refresh()).resolves.toEqual([]);
+
+    // Same card, same queue, pause cleared: must now be offered. This half proves
+    // the exclusion above came from the pause flag and not from an unrelated gate.
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-paused",
+      column: "in-review",
+      paused: false,
+      userPaused: false,
+      status: null,
+      mergeRetries: 0,
+      createdAt: new Date(0).toISOString(),
+    });
+    const admitted = (await mergeProvider.refresh()) as Array<{ taskId: string; lane: string }>;
+    expect(admitted).toMatchObject([{ taskId: "FN-paused", lane: "review" }]);
+
+    // Engine-level `paused` is the sibling half of the same filter.
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-paused",
+      column: "in-review",
+      paused: true,
+      userPaused: false,
+      status: null,
+      mergeRetries: 0,
+      createdAt: new Date(0).toISOString(),
+    });
+    await expect(mergeProvider.refresh()).resolves.toEqual([]);
+
+    registerSpy.mockRestore();
+    await engine.stop();
+  });
+
+});
+
+/*
+FNXC:MemoryRecallCapture 2026-08-11-12:31:
+ProjectEngine owns the long-lived research-orchestrator composition root. This fixture preserves
+its real writer and AsyncDataLayer, then drains the real detached writer before checking recall
+storage; a fake capture callback would not prove finalized production research is persisted.
+*/
+pgDescribe("ProjectEngine research recall composition", () => {
+  const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_project_engine_research_recall",
+    projectId: "project-engine-research-recall",
+  });
+
+  beforeAll(h.beforeAll);
+  beforeEach(async () => {
+    await h.beforeEach();
+    mocks.currentStore = h.store() as unknown as Record<string, unknown>;
+  });
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
+
+  it("persists finalized research through ProjectEngine's live recall composition", async () => {
+    const store = h.store();
+    const run = await store.getResearchStore().createRun({ query: "ProjectEngine recall composition", tags: ["project-engine"] });
+    const realFactory = fusionCore.createRecallCaptureWriter;
+    const writerFactory = vi.spyOn(fusionCore, "createRecallCaptureWriter");
+    let writer: RecallCaptureWriterWithTestDrain | undefined;
+    writerFactory.mockImplementation((deps) => {
+      writer = realFactory(deps);
+      return writer;
+    });
+    const engine = createEngine();
+
+    try {
+      await engine.start();
+      const orchestrator = engine.getResearchOrchestrator() as unknown as {
+        runFinalizing(runId: string, output: string, citations: string[], confidence: number | undefined, signal: AbortSignal): Promise<void>;
+      };
+      expect(orchestrator).toBeDefined();
+      await orchestrator.runFinalizing(run.id, "ProjectEngine final synthesis", ["https://example.test/project-engine"], 0.9, new AbortController().signal);
+      await writer!.flushPendingCaptures();
+      expect(await listRecall(h.layer(), { limit: 10 })).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: "solution",
+          source: expect.objectContaining({ origin: "deep-research", sessionId: run.id }),
+          tags: expect.arrayContaining([`research-run:${run.id}`]),
+        }),
+      ]));
+    } finally {
+      writerFactory.mockRestore();
+      await engine.stop();
+    }
   });
 });

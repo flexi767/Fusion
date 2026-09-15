@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
-import { getProjectRootFromWorktree, resolvePiExtensionProjectRoot } from "../pi-extensions.js";
+import {
+  workspaceRepoSegment,
+  workspaceWorktreeGroupSegment,
+} from "../tasks/worktree-layout.js";
+import { getProjectRootFromWorktree, resolvePiExtensionProjectRoot } from "../plugins/pi-extensions.js";
 
 function git(cwd: string, args: string): string {
   return execSync(`git ${args}`, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -38,6 +42,46 @@ describe("getProjectRootFromWorktree", () => {
     ).toBe("/tmp");
   });
 
+  /*
+  FNXC:WorkspaceWorktree 2026-08-20-02:04:
+  A grouped checkout has two one-way segments between its configured root and
+  worktree. Pi must receive the known workspace root as a forward-derived
+  candidate, never infer it by trimming those path components.
+  */
+  it("resolves a real grouped workspace checkout to the supplied workspace root", () => {
+    const root = mkdtempSync(join(tmpdir(), "PRD-9162 unsafe root "));
+    const sharedRoot = join(dirname(root), "fn-9162-shared-worktrees");
+    const candidateDir = join(
+      sharedRoot,
+      workspaceWorktreeGroupSegment(root),
+      workspaceRepoSegment("group/api"),
+    );
+    const worktreeDir = join(candidateDir, "fn-9162");
+    try {
+      git(root, "init -q -b main");
+      git(root, "config user.email test@example.com");
+      git(root, "config user.name Test");
+      mkdirSync(join(root, ".fusion"), { recursive: true });
+      writeFileSync(join(root, "base.txt"), "base\n");
+      git(root, "add -A");
+      git(root, "commit -q -m base");
+      mkdirSync(candidateDir, { recursive: true });
+      git(root, `worktree add --detach ${JSON.stringify(worktreeDir)} HEAD`);
+
+      expect(getProjectRootFromWorktree(join(worktreeDir, "src"), {
+        worktreesDirCandidates: [{ dir: candidateDir, projectRoot: root }],
+      })).toBe(resolve(root));
+    } finally {
+      try {
+        git(root, `worktree remove --force ${JSON.stringify(worktreeDir)}`);
+      } catch {
+        // Best-effort cleanup after an incomplete real-git fixture.
+      }
+      rmSync(sharedRoot, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("returns null without throwing when child_process partial mocks omit spawnSync", async () => {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
@@ -46,7 +90,7 @@ describe("getProjectRootFromWorktree", () => {
 
     try {
       const { getProjectRootFromWorktree: getProjectRootFromWorktreeWithPartialMock } = await import(
-        "../pi-extensions.js"
+        "../plugins/pi-extensions.js"
       );
       const unmatchedPath = join(tmpdir(), "fn-6102-not-a-worktree");
 
@@ -120,7 +164,7 @@ describe("getProjectRootFromWorktree", () => {
       writeFileSync(join(worktreeGitDir, "commondir"), "../..\n");
       writeFileSync(join(worktreeDir, ".git"), `gitdir: ${worktreeGitDir}\n`);
 
-      const { getProjectRootFromWorktree: fresh } = await import("../pi-extensions.js");
+      const { getProjectRootFromWorktree: fresh } = await import("../plugins/pi-extensions.js");
       expect(fresh(worktreeDir)).toBe(expectedRoot);
       expect(fresh(join(worktreeDir, "subdir", "file.ts"))).toBe(expectedRoot);
     } finally {
@@ -161,7 +205,7 @@ describe("getProjectRootFromWorktree", () => {
       // own local `.fusion` directory as a hydration/decoy target.
       mkdirSync(join(worktreeDir, ".fusion"), { recursive: true });
 
-      const { resolvePiExtensionProjectRoot: fresh } = await import("../pi-extensions.js");
+      const { resolvePiExtensionProjectRoot: fresh } = await import("../plugins/pi-extensions.js");
       expect(fresh(worktreeDir)).toBe(expectedRoot);
       expect(fresh(worktreeDir)).not.toBe(resolve(worktreeDir));
     } finally {

@@ -1,3 +1,5 @@
+import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
+/* FNXC:RunAudit 2026-08-20-05:49: FN-9177 bounds optional audit telemetry so a hostile sink cannot alter this lifecycle path. */
 /**
  * lifecycle-ops operations.
  *
@@ -7,32 +9,38 @@
  * instance as its first parameter and performs byte-identical work.
  */
 import {TaskStore, storeLog, RECONCILE_ORPHAN_TASK_DIR_MAX_AGE_MS, WORKFLOW_COMPILED_STEP_TEMPLATE_PREFIX} from "../store.js";
-import {planLegacyAdoption} from "../legacy-adoption.js";
-import {sql} from "drizzle-orm";
-import {MIGRATION_BOOKKEEPING_TABLE, LEGACY_ADOPTION_DRAINED_MARKER} from "../postgres/schema-applier.js";
-import {mkdir, readdir, readFile, stat, writeFile} from "node:fs/promises";
+import {planLegacyAdoption} from "../db/legacy-adoption.js";
+import {and, eq, sql} from "drizzle-orm";
+import {
+  MIGRATION_BOOKKEEPING_TABLE,
+  LEGACY_ADOPTION_DRAINED_MARKER,
+  LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION,
+} from "../postgres/schema-applier.js";
+import {mkdir, readdir, readFile, stat} from "node:fs/promises";
 import {join} from "node:path";
-import {existsSync, watch, type Dirent} from "node:fs";
-import type {Task, AgentLogEntry, Column, Settings, GlobalSettings} from "../types.js";
-import {DEFAULT_SETTINGS} from "../types.js";
-import {MOVED_SETTINGS_KEYS, SETTINGS_MIGRATION_VERSION, SETTINGS_MIGRATION_MARKER_KEY} from "../moved-settings.js";
-import {stepsToWorkflowIr, stepToFragmentIr, layoutForIr} from "../workflow-steps-to-ir.js";
-import {getTraitRegistry} from "../trait-registry.js";
-import {registerDefaultWorkflowHooks} from "../default-workflow-hooks.js";
-import {clearTransitionPending, readTransitionPending, reconcileHooksRemaining} from "../transition-pending.js";
-import {clearTransitionPendingAsync, listTransitionPendingTaskIdsAsync, readTransitionPendingAsync} from "./async-transition-pending.js";
-import type {WorkflowSettingDefinition} from "../workflow-ir-types.js";
-import {validateSettingValuePatch} from "../workflow-settings.js";
+import {existsSync, type Dirent} from "node:fs";
+import type {Task, AgentLogEntry, GlobalSettings} from "../types.js";
+import {MOVED_SETTINGS_KEYS, SETTINGS_MIGRATION_VERSION, SETTINGS_MIGRATION_MARKER_KEY} from "../config/moved-settings.js";
+import {stepsToWorkflowIr, stepToFragmentIr, layoutForIr} from "../workflows/workflow-steps-to-ir.js";
+import {getTraitRegistry} from "../workflows/trait-registry.js";
+import {registerDefaultWorkflowHooks} from "../workflows/default-workflow-hooks.js";
+import {clearTransitionPending, readTransitionPending, reconcileHooksRemaining} from "../tasks/transition-pending.js";
+import {clearTransitionPendingAsync, listTransitionPendingTaskIdsAsync, readTransitionPendingAsync} from "./async/async-transition-pending.js";
+import type {WorkflowSettingDefinition} from "../workflows/workflow-ir-types.js";
+import {validateSettingValuePatch} from "../workflows/workflow-settings.js";
 import "../builtin-traits.js";
-import {Database, SCHEMA_VERSION} from "../db.js";
-import {ensureMemoryFileWithBackend} from "../project-memory.js";
-import {appendAgentLogEntriesSync} from "../agent-log-file-store.js";
-import {getErrorMessage} from "../error-message.js";
-import {type TaskRow} from "../task-store/persistence.js";
+import {appendAgentLogEntriesSync} from "../agents/agent-log-file-store.js";
+import {getErrorMessage} from "../process/error-message.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {reconcileTaskIdStateAsync} from "../task-store/async-allocator.js";
+import {reconcileTaskIdStateAsync} from "../task-store/async/async-allocator.js";
+import {ACTIVE_TASK_FILTER, insertTaskRowInTransaction, isTaskIdConflictError as isPgTaskIdConflictError, readTaskRow} from "./async/async-persistence.js";
+import {resolveWorkflowIrForTask} from "../workflows/workflow-ir-resolver.js";
+import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
+import * as schema from "../postgres/schema/index.js";
+import {diffSettingsForActivity, formatSettingsActivity} from "./settings-activity.js";
+import {LIFECYCLE_ROLE_RANK} from "../workflows/workflow-lifecycle-direction.js";
 
-export async function initImpl(store: TaskStore): Promise<void> {
+export async function initImpl(store: TaskStore, options?: { skipArchiveReintegration?: boolean }): Promise<void> {
     store.closing = false;
     await mkdir(store.tasksDir, { recursive: true });
 
@@ -43,240 +51,61 @@ export async function initImpl(store: TaskStore): Promise<void> {
     // transitively via default-workflow-hooks / trait-registry).
     registerDefaultWorkflowHooks();
 
-    // FNXC:RuntimeBackendInjection 2026-06-24-14:15:
-    // In backend mode (an AsyncDataLayer was injected), TaskStore skips ALL
-    // SQLite construction and the SQLite-specific startup reconciliations
-    // (corruption guard, legacy file migration, agent-log file migration,
-    // schema-version re-init, orphaned task-dir reconcile, etc.). The PostgreSQL
-    // schema baseline is applied by the startup factory before constructing the
-    // store. Backend-safe startup work is performed explicitly in the branch below.
-    //
-    // When the async layer is ABSENT, the entire block below runs exactly as
-    // before — byte-identical to the pre-migration SQLite path.
-    if (store.backendMode) {
-      // FNXC:RuntimePersistenceAsync 2026-06-24-10:32:
-      // In backend mode, run the async allocator reconciliation so sequences
-      // are bumped to the high-water mark on store open (VAL-DATA-007/008).
-      // Soft-deleted/archived IDs stay reserved because the reconciliation
-      // scans them. The SQLite-specific integrity-report refreshers are not
-      // applicable in backend mode (the async task-id-integrity detector is
-      // wired by a separate feature).
-      try {
-        await reconcileTaskIdStateAsync(store.asyncLayer!);
-        store.taskIdStateReconciled = true;
-      } catch (error) {
-        storeLog.warn("Async allocator reconciliation failed during backend init", {
-          phase: "init:async-allocator-reconcile",
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      /*
-      FNXC:LegacyAdoption 2026-07-19-05:10 (U9b / R10 / KTD-8):
-      Store-open legacy adoption must run HERE, not only in the SQLite tail below — backend
-      mode returns early, and backend mode is production. Placing the call only after this
-      return would make it dead code exactly where pre-cutover rows actually live. Uses the
-      async store API (listTasks/updateTask), so it is PG-safe.
-      */
-      await adoptLegacyTaskRowsOnOpen(store);
-      // Lifecycle listeners are backend-agnostic: recordActivity() routes their
-      // best-effort writes through the injected PostgreSQL data layer.
-      store.setupActivityLogListeners();
-      return;
-    }
-
-    // Initialize SQLite database
-    if (!store._db) {
-      // Startup corruption guard: before opening, detect a malformed fusion.db
-      // (a node:sqlite SIGSEGV mid-write can leave the B-tree corrupt in a way
-      // that still opens) and rebuild it via sqlite3 .recover, preserving the
-      // corrupt original. Disk-backed only; opt out with FUSION_DISABLE_DB_AUTORECOVER.
-      // FNXC:SqliteRemoval 2026-06-25-18:30: inMemoryDb always false now (removed).
-      if (process.env.FUSION_DISABLE_DB_AUTORECOVER !== "1") {
-        try {
-          const recovery = Database.recoverIfCorrupt(store.fusionDir);
-          if (recovery.status === "recovered") {
-            // A `.recover` rebuild can drop task rows whose task.json survived on disk. Let the
-            // orphan reconcile below bypass its recency window so those rows are recovered even
-            // when their (possibly old) task.json mtime would otherwise fail the gate.
-            store.dbWasCorruptionRecovered = true;
-            storeLog.warn("Recovered corrupt fusion.db on startup", {
-              phase: "init:db-autorecover",
-              corruptBackupPath: recovery.corruptBackupPath,
-              errors: recovery.errors?.slice(0, 5),
-            });
-          } else if (recovery.status === "failed") {
-            storeLog.error("fusion.db is corrupt and automatic recovery failed", {
-              phase: "init:db-autorecover",
-              errors: recovery.errors?.slice(0, 5),
-            });
-          }
-        } catch (error) {
-          storeLog.warn("Startup db corruption guard threw — continuing to open", {
-            phase: "init:db-autorecover",
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      const db = new Database(store.fusionDir, { inMemory: false });
-      try {
-        db.init();
-      } catch (error) {
-        db.close();
-        throw error;
-      }
-      store._db = db;
-    }
-
-    store.reconcileDistributedTaskIdStateOnOpen();
-    
-    await store.migrateActiveArchivedTasksToArchiveDb();
-    await store.migrateAgentLogEntriesToFilesOnce();
-    await store.cleanupNoOpTaskMovedActivityRowsOnce();
-    try {
-      await store.markLegacyAutoMergeStampsOnce();
-    } catch (err) {
-      storeLog.warn("Legacy auto-merge stamp marker failed during init (non-fatal)", {
-        phase: "init:legacy-auto-merge-stamp-marker",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // U4: one-time per-project hard-move of MOVED_SETTINGS_KEYS into workflow
-    // setting values (marker-gated, idempotent, never blocks startup).
-    try {
-      await store.migrateMovedSettingsToWorkflowValuesOnce();
-    } catch (err) {
-      storeLog.warn("Settings hard-move migration failed during init (non-fatal)", {
-        phase: "init:settings-hard-move",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // Re-run init when migrations are pending, or when the deferred
-    // agentLogEntries drop still needs to fire: migration 102 skips the
-    // destructive drop until migrateAgentLogEntriesToFilesOnce() above writes
-    // the __meta guard, but migrations 103+ bump the schema version past 102
-    // on the first pass, so the version check alone no longer triggers the
-    // second pass that performs the drop.
-    const legacyAgentLogTableRemains =
-      store.db
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agentLogEntries' LIMIT 1")
-        .get() !== undefined;
-    if (store.db.getSchemaVersion() < SCHEMA_VERSION || legacyAgentLogTableRemains) {
-      store.db.init();
-    }
-    await store.importLegacyAgentLogsOnce();
-    store.taskIdStateReconciled = false;
-    store.reconcileDistributedTaskIdStateOnOpen();
-    try {
-      await store.reconcileOrphanedTaskDirs({ ignoreRecencyWindow: store.dbWasCorruptionRecovered });
-    } catch (err) {
-      storeLog.warn("Orphaned task-dir reconcile failed during init (non-fatal)", {
-        phase: "init:orphaned-task-dir-reconcile",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    // Write config.json for backward compatibility if it doesn't exist
-    if (!existsSync(store.configPath)) {
-      const config = await store.readConfig();
-      try {
-        await writeFile(store.configPath, store.serializeConfigForDisk(config));
-      } catch (err) {
-        storeLog.warn("Backward-compat config.json sync failed during init", {
-          phase: "init:config-sync",
-          configPath: store.configPath,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-    
-    store.setupActivityLogListeners();
-
-    // Bootstrap project memory file if memory is enabled
-    try {
-      const config = await store.readConfig();
-      const mergedSettings: Settings = { ...DEFAULT_SETTINGS, ...config.settings };
-      if (mergedSettings.memoryEnabled !== false) {
-        // Use backend-aware bootstrap to honor memoryBackendType setting
-        await ensureMemoryFileWithBackend(store.rootDir, mergedSettings);
-      }
-    } catch (err) {
-      // Non-fatal — memory bootstrap failure should not block startup
-      storeLog.warn("Project-memory bootstrap failed during init", {
-        phase: "init:memory-bootstrap",
-        rootDir: store.rootDir,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
     /*
-    FNXC:RunAudit 2026-07-13-13:10 (merge port from main):
-    Store-open provenance stamp. A store open by a stale binary is how the
-    FN-7910 incident happened (a pre-fix process's init evacuated Ideas cards;
-    the run-audit row said only agentId:"system"). Stamp pid / parent pid /
-    executable / entry script / cwd / node version — ids/paths only, no prose.
-    Best-effort: a failed stamp never blocks startup.
+    FNXC:SqliteDualPathCleanup 2026-07-26-13:50:
+    TaskStore.init is PostgreSQL-only. The former non-backend SQLite corruption-guard / legacy-migration / schema-version init tail is deleted. Production always injects AsyncDataLayer; schema baseline is applied by the startup factory before constructing the store.
+
+    FNXC:RuntimePersistenceAsync 2026-06-24-10:32:
+    Run async allocator reconciliation so sequences are bumped to the high-water mark on store open (VAL-DATA-007/008). Soft-deleted/archived IDs stay reserved because the reconciliation scans them.
     */
     try {
-      store.insertRunAuditEventRow({
-        agentId: "store",
-        domain: "database",
-        mutationType: "store:open",
-        target: store.rootDir,
-        metadata: {
-          pid: process.pid,
-          ppid: process.ppid,
-          execPath: process.execPath,
-          entry: process.argv[1] ?? null,
-          cwd: process.cwd(),
-          nodeVersion: process.version,
-        },
-      });
-    } catch (err) {
-      storeLog.warn("store-open provenance stamp failed during init", {
-        phase: "init:store-open-stamp",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    // U12: workflow-columns integrity pass. Audit + re-home any task whose
-    // stored column is no longer valid in its resolved workflow (KTD-1
-    // guarantees zero rewrites for healthy legacy rows, so this is a no-op for
-    // the common case). Idempotent; non-fatal — never blocks startup.
-    /*
-    FNXC:WorkflowColumns 2026-07-12-22:40 (merge port from main):
-    Workflow columns graduated to always-on at runtime, so init must ALWAYS run
-    the workflow-aware integrity pass and must NEVER run the #1409 flag-OFF
-    evacuation: the retired experimental flag reads false for virtually every
-    install, so the old flag-keyed branch ran
-    evacuateCustomColumnsToLegacy("flag-off-init") on EVERY store open — it
-    declared healthy custom intake columns (e.g. Coding (Ideas)) invalid and
-    dumped their cards into "triage", where triage auto-planned and executed
-    work the operator had deliberately parked (FN-7910). The evacuation now
-    runs only on an explicit ON→OFF settings toggle.
-    */
-    try {
-      await store.runWorkflowColumnsIntegrityPass();
-      // #1401: recover any transitionPending markers stranded by a crash
-      // between the in-txn write and the post-commit clear (they otherwise
-      // permanently inflate capacity counts for their target column).
-      await store.recoverStaleTransitionPending();
-    } catch (err) {
-      storeLog.warn("workflowColumns integrity pass failed during init", {
-        phase: "init:workflow-columns-integrity",
-        error: err instanceof Error ? err.message : String(err),
+      await reconcileTaskIdStateAsync(store.asyncLayer!);
+      store.taskIdStateReconciled = true;
+    } catch (error) {
+      storeLog.warn("Async allocator reconciliation failed during backend init", {
+        phase: "init:async-allocator-reconcile",
+        error: error instanceof Error ? error.message : String(error),
       });
     }
     /*
-    FNXC:LegacyAdoption 2026-07-19-14:30 (PR #2341 review):
-    Adoption runs OUTSIDE the integrity-pass try block: a throw from
-    runWorkflowColumnsIntegrityPass/recoverStaleTransitionPending must not skip the
-    sweep for the boot cycle ("every pre-cutover row wakes OWNED" cannot depend on an
-    unrelated pass succeeding). Safe as a bare await — the sweep is internally fail-soft
-    and never throws.
+    FNXC:LegacyAdoption 2026-07-19-05:10 (U9b / R10 / KTD-8):
+    Store-open legacy adoption must run HERE, not only in the SQLite tail below — backend
+    mode returns early, and backend mode is production. Placing the call only after this
+    return would make it dead code exactly where pre-cutover rows actually live. Uses the
+    async store API (listTasks/updateTask), so it is PG-safe.
     */
     await adoptLegacyTaskRowsOnOpen(store);
-  }
+    /*
+    FNXC:TaskArchiveReintegration 2026-09-06-08:00:
+    Legacy status adoption must finish before the cooperative archive drain. Run the same idempotent
+    primitive here as engine maintenance so dashboard-only and CLI hosts expose every eligible
+    completed task before later completion-column consumers run.
+    */
+    try {
+      if (!options?.skipArchiveReintegration) await store.reconcileArchivedTasksIntoDone();
+    } catch (error) {
+      storeLog.warn("Archived task reintegration failed during backend init", {
+        phase: "init:archive-reintegration",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    /*
+    FNXC:PatchnodeLedger 2026-08-28-12:16:
+    Store-open reconciliation is a warn-degraded backlog convenience, not the live durability guarantee. Init runs once per process; completion writers capture in their own transactions, while the TTL-rearmed read path revisits surviving legacy evidence.
+    */
+    try {
+      await store.reconcilePatchnodeLedger({ force: true });
+    } catch (error) {
+      storeLog.warn("Patchnode reconciliation failed during backend init", {
+        phase: "init:patchnode-reconcile",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    // Lifecycle listeners are backend-agnostic: recordActivity() routes their
+    // best-effort writes through the injected PostgreSQL data layer.
+    store.setupActivityLogListeners();
+    return;
+}
 
 /*
 FNXC:LegacyAdoption 2026-07-19-05:00 (U9b / R10 / KTD-8):
@@ -320,6 +149,69 @@ Safety rules:
   marker WRITE is warned and swallowed (the next clean drain retries).
 - SQLite (non-backend) mode has no bookkeeping table → no marker, sweep always runs.
 */
+/*
+FNXC:LegacyAdoption 2026-07-22-10:30:
+#2387's Drizzle wrapper says only "Failed query" while PostgreSQL puts the
+actionable SQLSTATE on a nested cause. Preserve that chain in the diagnostic and
+only report permanent marker infrastructure classes once per process: a CLI
+process may open many stores, but repeated permission-denied spam hides real
+startup failures. Read failures still fail open to preserve adoption correctness.
+*/
+const reportedLegacyAdoptionMarkerFailureClasses = new Set<string>();
+const PERMANENT_LEGACY_ADOPTION_MARKER_SQLSTATES = new Set(["42501", "42P01", "42883", "3F000"]);
+
+type StoreOpenDbError = {cause?: unknown; code?: unknown; message?: unknown};
+
+function getStoreOpenDbErrorSqlstate(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 4; depth += 1) {
+    if (typeof current !== "object") break;
+    const candidate = current as StoreOpenDbError;
+    if (typeof candidate.code === "string" && /^[0-9A-Z]{5}$/.test(candidate.code)) return candidate.code;
+    current = candidate.cause;
+  }
+  return undefined;
+}
+
+function describeStoreOpenDbError(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 4; depth += 1) {
+    const candidate = typeof current === "object" ? current as StoreOpenDbError : undefined;
+    const message = current instanceof Error
+      ? current.message
+      : typeof candidate?.message === "string" ? candidate.message : String(current);
+    const sqlstate = typeof candidate?.code === "string" && /^[0-9A-Z]{5}$/.test(candidate.code)
+      ? ` [SQLSTATE ${candidate.code}]`
+      : "";
+    parts.push(`${message.length > 400 ? `${message.slice(0, 200)} … ${message.slice(-120)}` : message}${sqlstate}`);
+    current = candidate?.cause;
+  }
+  return parts.join(" ⇐ ");
+}
+
+function reportLegacyAdoptionMarkerFailure(operation: "read" | "write", error: unknown): void {
+  const sqlstate = getStoreOpenDbErrorSqlstate(error);
+  if (sqlstate && PERMANENT_LEGACY_ADOPTION_MARKER_SQLSTATES.has(sqlstate)) {
+    const sqlstateClass = sqlstate.slice(0, 2);
+    if (reportedLegacyAdoptionMarkerFailureClasses.has(sqlstateClass)) return;
+    reportedLegacyAdoptionMarkerFailureClasses.add(sqlstateClass);
+    storeLog.error("Legacy-adoption drained-marker infrastructure is unavailable; sweeping will continue", {
+      phase: "init:legacy-adoption",
+      operation,
+      sqlstate,
+      sqlstateClass,
+      error: describeStoreOpenDbError(error),
+      hint: "Apply schema baseline 0032+ and verify fusion_runtime has public schema USAGE, bookkeeping SELECT, and marker-helper EXECUTE.",
+    });
+    return;
+  }
+  storeLog.warn(`Legacy-adoption drained-marker ${operation} failed${operation === "read" ? " — sweeping anyway" : ""}`, {
+    phase: "init:legacy-adoption",
+    error: describeStoreOpenDbError(error),
+  });
+}
+
 async function hasLegacyAdoptionDrainedMarker(store: TaskStore): Promise<boolean> {
   const db = store.asyncLayer?.db;
   if (!db) return false;
@@ -330,10 +222,7 @@ async function hasLegacyAdoptionDrainedMarker(store: TaskStore): Promise<boolean
     return rows.length > 0;
   } catch (error) {
     // Fail-open toward correctness: an unreadable marker means sweep.
-    storeLog.warn("Legacy-adoption drained-marker read failed — sweeping anyway", {
-      phase: "init:legacy-adoption",
-      error: error instanceof Error ? error.message : String(error),
-    });
+    reportLegacyAdoptionMarkerFailure("read", error);
     return false;
   }
 }
@@ -342,15 +231,16 @@ async function writeLegacyAdoptionDrainedMarker(store: TaskStore): Promise<void>
   const db = store.asyncLayer?.db;
   if (!db) return;
   try {
-    await db.execute(
-      sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${LEGACY_ADOPTION_DRAINED_MARKER}) ON CONFLICT (version) DO NOTHING`,
-    );
+    /*
+    FNXC:LegacyAdoption 2026-07-21-17:30:
+    Call the SECURITY DEFINER helper (migration 0032) instead of a raw INSERT.
+    fusion_runtime has EXECUTE on the function but not unrestricted INSERT on
+    fusion_schema_migrations, so it cannot stamp arbitrary migration versions.
+    */
+    await db.execute(sql`SELECT public.${sql.identifier(LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION)}()`);
   } catch (error) {
     // Non-fatal: the next fully-clean drain writes it again.
-    storeLog.warn("Legacy-adoption drained-marker write failed", {
-      phase: "init:legacy-adoption",
-      error: error instanceof Error ? error.message : String(error),
-    });
+    reportLegacyAdoptionMarkerFailure("write", error);
   }
 }
 
@@ -368,6 +258,7 @@ export async function adoptLegacyTaskRowsOnOpen(store: TaskStore): Promise<numbe
         const plan = planLegacyAdoption(
           {
             status: task.status,
+            column: task.column,
             reviewLevel: task.reviewLevel,
             enabledWorkflowSteps: task.enabledWorkflowSteps,
             legacyAdoptedAt: task.legacyAdoptedAt,
@@ -416,7 +307,6 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
 
     // Task created
     store.on("task:created", (task) => {
-      if (store.suppressActivityLogForPollingEmit) return;
       store.recordActivityFromListener(
         {
           type: "task:created",
@@ -430,15 +320,30 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
 
     // Task moved
     store.on("task:moved", (data) => {
-      if (store.suppressActivityLogForPollingEmit) return;
       if (data.from === data.to) return;
+      const roles = Object.keys(LIFECYCLE_ROLE_RANK) as Array<keyof typeof LIFECYCLE_ROLE_RANK>;
+      const fromRole = roles.find((role) => data.lanes?.[role] === data.from);
+      const toRole = roles.find((role) => data.lanes?.[role] === data.to);
+      const direction = !fromRole || !toRole
+        ? "unclassified"
+        : LIFECYCLE_ROLE_RANK[toRole] > LIFECYCLE_ROLE_RANK[fromRole]
+          ? "forward"
+          : LIFECYCLE_ROLE_RANK[toRole] < LIFECYCLE_ROLE_RANK[fromRole]
+            ? "backward"
+            : "lateral";
       store.recordActivityFromListener(
         {
           type: "task:moved",
           taskId: data.task.id,
           taskTitle: data.task.title,
-          details: `Task ${data.task.id} moved: ${data.from} → ${data.to}`,
-          metadata: { from: data.from, to: data.to },
+          details: `Task ${data.task.id} moved: ${data.from} → ${data.to} (${direction})`,
+          metadata: {
+            from: data.from,
+            to: data.to,
+            direction,
+            source: data.source,
+            ...(data.lifecycleReason ? { lifecycleReason: data.lifecycleReason } : {}),
+          },
         },
         "task:moved",
       );
@@ -459,10 +364,14 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
       );
     });
 
-    // Task updated (check for failures)
-    store.on("task:updated", (task) => {
-      if (store.suppressActivityLogForPollingEmit) return;
-      if (task.status === "failed") {
+    /*
+    FNXC:ActivityLogFailureDedup 2026-08-19-19:33:
+    A failed-state bookkeeping update is not a new durable failure episode. Only the serialized
+    non-failed → failed transition from updateTask may append task:failed activity, so listeners
+    cannot turn subsequent task mutations into an unbounded project.activity_log write path.
+    */
+    store.on("task:updated", (task, meta) => {
+      if (meta?.failedTransition) {
         store.recordActivityFromListener(
           {
             type: "task:failed",
@@ -476,37 +385,34 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
       }
     });
 
-    // Settings updated (log important changes)
+    /*
+    FNXC:SettingsAuditTrail 2026-08-09-02:05:
+    Keep settings activity policy in settings-activity.ts so every settings:updated emitter
+    gets one safe, generic diff without reintroducing a partial listener allowlist.
+    */
     store.on("settings:updated", (data) => {
-      const importantChanges: string[] = [];
-      if (data.settings.ntfyEnabled !== data.previous.ntfyEnabled) {
-        importantChanges.push(`ntfy ${data.settings.ntfyEnabled ? "enabled" : "disabled"}`);
-      }
-      if (data.settings.ntfyTopic !== data.previous.ntfyTopic) {
-        importantChanges.push(`ntfy topic changed to ${data.settings.ntfyTopic}`);
-      }
-      if (data.settings.globalPause !== data.previous.globalPause) {
-        importantChanges.push(`global pause ${data.settings.globalPause ? "enabled" : "disabled"}`);
-      }
-      if (data.settings.enginePaused !== data.previous.enginePaused) {
-        importantChanges.push(`engine pause ${data.settings.enginePaused ? "enabled" : "disabled"}`);
-      }
-
-      if (importantChanges.length > 0) {
-        store.recordActivityFromListener(
-          {
-            type: "settings:updated",
-            details: `Settings updated: ${importantChanges.join(", ")}`,
-            metadata: { changes: importantChanges },
-          },
-          "settings:updated",
-        );
+      try {
+        const activity = formatSettingsActivity(diffSettingsForActivity(data.previous, data.settings));
+        if (activity) {
+          store.recordActivityFromListener(
+            { type: "settings:updated", details: activity.details, metadata: activity.metadata },
+            "settings:updated",
+          );
+        }
+      } catch (error) {
+        storeLog.warn("Failed to format settings activity", { error: getErrorMessage(error) });
       }
     });
 
     // Task deleted
-    store.on("task:deleted", (task) => {
-      if (store.suppressActivityLogForPollingEmit) return;
+    store.on("task:deleted", (task, meta) => {
+      /*
+      FNXC:CrossProcessDeleteObservation 2026-08-01-11:39:
+      Observed outbox replay is intentionally at-least-once. Activity is writer-owned and
+      accumulating, so observed events must not create a duplicate activity/audit side effect.
+      Cache eviction and bridge fan-out remain safe for duplicate observed notifications.
+      */
+      if (meta?.observed) return;
       store.recordActivityFromListener(
         {
           type: "task:deleted",
@@ -521,18 +427,11 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
 
 export async function reconcileOrphanedTaskDirsImpl(store: TaskStore, opts: { ignoreRecencyWindow?: boolean } = {},): Promise<{ recovered: string[]; skipped: Array<{ id: string; reason: string }> }> {
     /*
-    FNXC:PostgresCutover 2026-07-04-00:00:
-    Assessed safe-default: in PG backend mode, the sync filesystem scan + store.db re-insert
-    path cannot run (Drizzle is async, store.db is removed). The self-healing caller (line 2302)
-    receives an empty result — orphaned task dirs are NOT reconciled in PG mode. This is low-risk
-    because PG soft-delete is the norm (task.json dirs persist for active tasks; deleted tasks
-    keep their dirs but are tombstoned in PG, not lost). A full async reconcile (scan dirs,
-    check PG for matching rows, re-import missing) is feasible but not P0 given the rarity of
-    PG-mode orphans. Not claiming a non-existent async fallback.
+    FNXC:IncompletePgPorts 2026-07-26-20:45:
+    PostgreSQL path: scan task.json dirs and re-insert missing IDs via insertTaskRow
+    after taskIdExistsAnywhere (live + archive). Same recency/empty-board gates as
+    the SQLite path; previously backendMode returned empty and never recovered.
     */
-    if (store.backendMode) {
-      return { recovered: [], skipped: [] };
-    }
     const result: { recovered: string[]; skipped: Array<{ id: string; reason: string }> } = {
       recovered: [],
       skipped: [],
@@ -551,10 +450,20 @@ export async function reconcileOrphanedTaskDirsImpl(store: TaskStore, opts: { ig
     // the same guard added to stop resurrection. Callers may also force the bypass explicitly.
     let dbHasLiveTasks = true;
     try {
-      const row = store.db
-        .prepare('SELECT EXISTS(SELECT 1 FROM tasks WHERE deletedAt IS NULL LIMIT 1) AS present')
-        .get() as { present?: number } | undefined;
-      dbHasLiveTasks = (row?.present ?? 0) === 1;
+            const layer = store.asyncLayer!;
+      /*
+      FNXC:SqliteDualPathCleanup 2026-07-26-15:00:
+      Empty-board probe must be project-scoped; another project's live rows must not keep this project's recency window closed.
+      */
+      const probeConds = [ACTIVE_TASK_FILTER];
+      if (layer.projectId) probeConds.push(eq(schema.project.tasks.projectId, layer.projectId));
+      const rows = await layer.db
+        .select({ id: schema.project.tasks.id })
+        .from(schema.project.tasks)
+        .where(and(...probeConds))
+        .limit(1);
+      dbHasLiveTasks = rows.length > 0;
+
     } catch {
       // If the count probe fails, keep the gate on (conservative — don't mass-resurrect).
       dbHasLiveTasks = true;
@@ -600,7 +509,16 @@ export async function reconcileOrphanedTaskDirsImpl(store: TaskStore, opts: { ig
           const ageMs = Date.now() - mtimeMs;
           if (ageMs > RECONCILE_ORPHAN_TASK_DIR_MAX_AGE_MS) {
             result.skipped.push({ id, reason: "stale-orphan-dir-beyond-recency-window" });
-            storeLog.warn("Skipping stale orphaned task-dir reconcile (beyond recency window)", {
+            /*
+            FNXC:Diagnostics 2026-07-31-00:50 (operator report — warn spam):
+            This skip is STEADY-STATE: a months-old orphan dir (e.g. a pre-tombstone hard-delete
+            leftover) trips it on EVERY maintenance sweep, forever, until someone deletes the dir.
+            Per the self-healing logging policy (self-healing.ts header), per-sweep
+            no-action/skip lines are debug (FUSION_DEBUG=task-store), not warn — warn is for real
+            recoveries and failures. The skip stays visible in the sweep's returned `skipped`
+            summary either way.
+            */
+            storeLog.debug("Skipping stale orphaned task-dir reconcile (beyond recency window)", {
               phase: "reconcileOrphanedTaskDirs:recency",
               taskId: id,
               taskJsonPath,
@@ -646,36 +564,46 @@ export async function reconcileOrphanedTaskDirsImpl(store: TaskStore, opts: { ig
       let recovered = false;
       let skipReason: string | undefined;
       try {
-        store.db.transactionImmediate(() => {
-          // FNXC:SqliteFinalRemoval 2026-06-26: taskIdExistsAnywhere is now async;
-          // inline the sync SQLite check here since this runs inside transactionImmediate.
-          if (store.readTaskFromDb(id, { includeDeleted: true }) || store.isTaskIdPresentInArchivedTasksTable(id) || store.archiveDb.get(id) !== undefined) {
-            skipReason = "id-exists-anywhere";
-            return;
-          }
+                if (await store.taskIdExistsAnywhere(id)) {
+          skipReason = "id-exists-anywhere";
+        } else {
           try {
-            store.insertTaskWithFtsRecovery(task, "reconcileOrphanedTaskDirs");
-            store.insertRunAuditEventRow({
-              taskId: id,
-              domain: "database",
-              mutationType: "task:reconcile-orphaned-task-dir",
-              target: id,
-              metadata: {
-                id,
-                column: task.column,
-                status: task.status ?? null,
-                taskJsonPath,
-              },
+            /*
+            FNXC:SqliteDualPathCleanup 2026-07-26-15:00:
+            Orphan recovery insert + audit share one transaction (parity with the removed SQLite transactionImmediate wrap) so a failed audit cannot leave an unaudited recovered row.
+            */
+            const layer = store.asyncLayer!;
+            const context = store.createTaskPersistSerializationContext(task);
+            await layer.transactionImmediate(async (tx) => {
+              await insertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+              /*
+              FNXC:SqliteDualPathCleanup 2026-07-26-15:10:
+              Run-audit metadata stays ids/outcomes-only — do not persist taskJsonPath (filesystem path). Path remains on the transient storeLog lines around this recovery.
+              */
+              await recordRunAuditEventWithinTransaction(tx, {
+                taskId: id,
+                agentId: "system",
+                runId: "unknown",
+                domain: "database",
+                mutationType: "task:reconcile-orphaned-task-dir",
+                target: id,
+                metadata: {
+                  id,
+                  column: task.column,
+                  status: task.status ?? null,
+                },
+              });
             });
             recovered = true;
           } catch (error) {
-            if (store.isTaskIdConflictError(error) || /Task ID already exists/i.test(error instanceof Error ? error.message : String(error))) {
+            if (isPgTaskIdConflictError(error) || /Task ID already exists/i.test(error instanceof Error ? error.message : String(error))) {
               skipReason = "id-conflict-during-insert";
-              return;
+            } else {
+              throw error;
             }
-            throw error;
           }
-        });
+        }
+
       } catch (error) {
         const reason = `insert-failed: ${error instanceof Error ? error.message : String(error)}`;
         result.skipped.push({ id, reason });
@@ -691,12 +619,13 @@ export async function reconcileOrphanedTaskDirsImpl(store: TaskStore, opts: { ig
       if (recovered) {
         result.recovered.push(id);
         if (store.isWatching) store.taskCache.set(id, { ...task });
-        storeLog.warn("Recovered orphaned task.json into SQLite task index", {
+        storeLog.warn("Recovered orphaned task.json into task index", {
           phase: "reconcileOrphanedTaskDirs:recovered",
           taskId: id,
           column: task.column,
           status: task.status,
           taskJsonPath,
+          backend: store.backendMode ? "postgres" : "sqlite",
         });
         store.emitTaskLifecycleEventSafely("task:created", [task]);
       } else {
@@ -708,250 +637,26 @@ export async function reconcileOrphanedTaskDirsImpl(store: TaskStore, opts: { ig
   }
 
 export async function watchImpl(store: TaskStore): Promise<void> {
-    if (store.watcher || store.pollInterval) return; // already watching
+    if (store.watcher) return; // already watching
     store.clearStartupSlimListMemo();
 
     /*
-     * FNXC:BackendFlip 2026-06-26-16:00:
-     * In backend mode (PostgreSQL), the entire watch() body below is
-     * SQLite-specific: it reads store.db.getLastModified(), sets up an fs.watch
-     * sentinel + a 1s polling interval whose checkForChanges() cycle queries
-     * store.db.prepare('SELECT ... FROM tasks'), and runs SQLite-only stamp
-     * markers. All of those throw "SQLite Database is not available in backend
-     * mode" because store.db is not constructed when an AsyncDataLayer is
-     * injected.
-     *
-     * The async backend does not rely on this SQLite polling loop for change
-     * detection — runtime mutations go through the async layer and emit their
-     * own events. Populate the in-memory task cache (so the HTTP layer has a
-     * snapshot) via the backend-aware listTasks(), then return without
-     * installing the SQLite watcher/poller. This keeps `fn serve` / boot smoke
-     * booting against embedded PG.
+     * FNXC:TaskDeletedObservation 2026-08-01-09:59:
+     * PostgreSQL has no cross-process `task:deleted` observer today. FN-8683 removed the
+     * unreachable SQLite poller because `store.db` always throws for AsyncDataLayer stores;
+     * cache warming below is the only supported watch behavior. The transactional-outbox design is
+     * documented in docs/solutions/architecture/postgres-cross-process-task-deleted-observation.md.
+     * FN-8684 owns the transactional writer and FN-8685 owns durable consumer delivery; do not
+     * reintroduce a local polling replica as a substitute for their cursor/replay contract.
      */
-    if (store.backendMode) {
-      const tasks = await store.listTasks({ slim: true, startupMemo: false });
-      store.taskCache.clear();
-      for (const task of tasks) {
-        store.taskCache.set(task.id, { ...task });
-      }
-      return;
-    }
-
-    // Populate cache with current state. The watcher only needs metadata to
-    // detect created/updated/moved/deleted events; full task logs stay on the
-    // detail path.
     const tasks = await store.listTasks({ slim: true, startupMemo: false });
     store.taskCache.clear();
     for (const task of tasks) {
       store.taskCache.set(task.id, { ...task });
     }
-
-    try {
-      await store.markLegacyAutoMergeStampsOnce();
-    } catch (err) {
-      storeLog.warn("Legacy auto-merge stamp marker failed during watch startup (non-fatal)", {
-        phase: "watch:legacy-auto-merge-stamp-marker",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    if (!store.donePauseBackfillDone) {
-      const repairedTaskIds: string[] = [];
-      for (const [taskId, cachedTask] of store.taskCache.entries()) {
-        if (cachedTask.column !== "done") continue;
-
-        const taskDir = store.taskDir(taskId);
-        let raw: string;
-        try {
-          raw = await readFile(join(taskDir, "task.json"), "utf-8");
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-            /*
-             * FNXC:StartupRecovery 2026-06-23-05:02:
-             * A recovered or corrupt SQLite index can retain done-task rows whose legacy task.json mirror was already removed. Startup watch must not crash while running the one-time done-pause backfill; skip the missing mirror and keep the dashboard available so operators can inspect or repair the project.
-             */
-            storeLog.warn("Skipping done-task pause metadata backfill for missing task.json", {
-              phase: "watch:done-pause-backfill",
-              taskId,
-              taskJsonPath: join(taskDir, "task.json"),
-            });
-            continue;
-          }
-          throw error;
-        }
-        const diskTask = JSON.parse(raw) as Task;
-        if (!store.clearDoneTransientFields(diskTask)) continue;
-
-        await store.atomicWriteTaskJson(taskDir, diskTask);
-        store.taskCache.set(taskId, { ...diskTask });
-        repairedTaskIds.push(taskId);
-      }
-      store.donePauseBackfillDone = true;
-
-      storeLog.log("done-task pause metadata backfill completed", {
-        phase: "watch:done-pause-backfill",
-        repairedCount: repairedTaskIds.length,
-        repairedTaskIds: repairedTaskIds.slice(0, 20),
-      });
-    }
-
-    // Store current lastModified
-    store.lastKnownModified = store.db.getLastModified();
-    // Initialize lastPollTime so the first checkForChanges() cycle filters by
-    // "modified since now" instead of doing a full SELECT * + emitting an
-    // update event for every cached task. Without this, dashboard startup
-    // re-loaded the entire tasks table 1s after watch() began.
-    store.lastPollTime = new Date().toISOString();
-
-    // Use a sentinel watcher object so existing code that checks `store.watcher` still works
-    try {
-      store.watcher = watch(store.tasksDir, { recursive: true }, (_event, _filename) => {
-        // No-op - we use polling now, but keep watcher for API compat
-      });
-      store.watcher.on("error", (err) => {
-        storeLog.warn("fs.watch emitted an error; polling will continue", {
-          phase: "watch:fs-watch-error",
-          error: err instanceof Error ? err.message : String(err),
-          tasksDir: store.tasksDir,
-        });
-      });
-    } catch (err) {
-      // fs.watch may not be available - that's fine
-      storeLog.warn("fs.watch unavailable; falling back to polling-only updates", {
-        phase: "watch:fs-watch-setup",
-        error: err instanceof Error ? err.message : String(err),
-        tasksDir: store.tasksDir,
-      });
-    }
-
-    // Poll for changes every second
-    store.pollInterval = setInterval(() => {
-      void store.checkForChanges();
-    }, 1000);
-    store.clearStartupSlimListMemo();
-  }
-
-export async function checkForChangesImpl(store: TaskStore): Promise<void> {
-    const startTime = Date.now();
-
-    // Guard against overlapping poll cycles
-    if (store.pollingInProgress) return;
-    store.pollingInProgress = true;
-
-    try {
-      const currentModified = store.db.getLastModified();
-      if (currentModified <= store.lastKnownModified) return;
-      store.lastKnownModified = currentModified;
-
-      // Detect deletions cheaply: compare ID sets without loading full rows.
-      // A row missing from `tasks` can mean two things: the task was actually
-      // deleted, OR it was archived (archiveTask removes it from `tasks` after
-      // copying into `archived_tasks`). Other TaskStore instances polling the
-      // same DB can't tell the difference from this view alone — without the
-      // archive check below they emit spurious task:deleted events for every
-      // archived task, which the activity log records as a deletion.
-      // FN-5105: intentionally include soft-deleted rows here so a deletedAt
-      // transition can be observed and emit task:deleted exactly once.
-      const idRows = store.db.prepare('SELECT id FROM tasks').all() as Array<{ id: string }>;
-      const currentIds = new Set(idRows.map((r) => r.id));
-      const missingIds: string[] = [];
-      for (const id of store.taskCache.keys()) {
-        if (!currentIds.has(id)) missingIds.push(id);
-      }
-      if (missingIds.length > 0) {
-        const archivedSet = store.archiveDb.filterArchived(missingIds);
-        for (const id of missingIds) {
-          const cached = store.taskCache.get(id);
-          if (!cached) continue;
-          store.taskCache.delete(id);
-          store.suppressActivityLogForPollingEmit = true;
-          try {
-            if (archivedSet.has(id)) {
-              // Task moved to archive — emit task:moved (matching what
-              // archiveTask emits in-process) so other subscribers can react.
-              // Skip already-archived cache entries to avoid no-op emits.
-              // Activity-log listeners skip polling emits; the originating
-              // TaskStore instance wrote the row in-process.
-              if (cached.column !== "archived") {
-                store.emit("task:moved", { task: cached, from: cached.column, to: "archived" as Column, source: "engine" });
-              }
-            } else {
-              // Polling replicas only mirror the originating delete signal.
-              // Do not record run-audit here; the writer already owns that row.
-              store.emit("task:deleted", cached);
-            }
-          } finally {
-            store.suppressActivityLogForPollingEmit = false;
-          }
-        }
-      }
-
-      // Yield to event loop before the expensive SELECT query
-      await new Promise<void>((resolve) => setImmediate(resolve));
-
-      // Only load tasks modified since our last known timestamp.
-      // Use lastKnownPollTime (ISO string) to filter — much cheaper than full scan.
-      const selectClause = store.getTaskSelectClause(true);
-      const changedRows = store.lastPollTime
-        ? store.db.prepare(`SELECT ${selectClause} FROM tasks WHERE updatedAt > ? OR columnMovedAt > ?`).all(store.lastPollTime, store.lastPollTime) as unknown as TaskRow[]
-        : store.db.prepare(`SELECT ${selectClause} FROM tasks`).all() as unknown as TaskRow[];
-      store.lastPollTime = new Date().toISOString();
-
-      for (let i = 0; i < changedRows.length; i++) {
-        const row = changedRows[i];
-        const task = store.rowToTask(row);
-        const cached = store.taskCache.get(task.id);
-
-        store.suppressActivityLogForPollingEmit = true;
-        try {
-          if (task.deletedAt) {
-            if (cached) {
-              store.taskCache.delete(task.id);
-              // Polling replicas only re-emit task:deleted for subscribers.
-              // They must not insert duplicate run-audit rows cross-instance.
-              store.emit("task:deleted", cached);
-            }
-            continue;
-          }
-
-          if (!cached) {
-            store.taskCache.set(task.id, { ...task });
-            store.emit("task:created", task);
-          } else if (cached.column !== task.column) {
-            const from = cached.column;
-            store.taskCache.set(task.id, { ...task });
-            store.emit("task:moved", { task, from, to: task.column, source: "engine" });
-          } else {
-            store.taskCache.set(task.id, { ...task });
-            store.emit("task:updated", task);
-          }
-        } finally {
-          store.suppressActivityLogForPollingEmit = false;
-        }
-
-        // Yield every ~50 rows to prevent blocking the event loop during large updates
-        if (i > 0 && i % 50 === 0) {
-          await new Promise<void>((resolve) => setImmediate(resolve));
-        }
-      }
-
-      const elapsed = Date.now() - startTime;
-      if (elapsed > 750) {
-        storeLog.warn("checkForChanges took longer than expected", {
-          elapsedMs: elapsed,
-          thresholdMs: 750,
-        });
-      }
-    } catch (err) {
-      storeLog.warn("checkForChanges poll cycle failed", {
-        lastKnownModified: store.lastKnownModified,
-        lastPollTime: store.lastPollTime,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      store.pollingInProgress = false;
-    }
-  }
+    // Cache must be populated before observed deletes can safely evict local task state.
+    await store.startTaskDeletedOutboxConsumer();
+}
 
 export async function migrateAgentLogEntriesImpl(store: TaskStore): Promise<void> {
     const migrationKey = "agentLogEntriesToFileMigrationVersion";
@@ -1266,11 +971,46 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
         // `default-workflow:postCommit` needs no re-run — just a clear).
         const hasSurvivingPluginHook = hooksRemaining.some((h) => h !== "default-workflow:postCommit");
         if (hasSurvivingPluginHook) {
+          /*
+          FNXC:PostgresCutover 2026-07-31-15:40 (DEADLOCK, introduced by the backend-mode port above):
+          LOCK-FREE READ, and it must stay lock-free. This whole block runs inside
+          `store.withTaskLock(id, ...)`, and the per-task lock is NON-REENTRANT — the same invariant
+          `branch-and-pr-entities.ts` and `workflow-ops.ts` both state in prose. `store.getTask()`
+          acquires that lock (`getTaskImpl` opens with `store.withTaskLock(id, ...)`), so reading
+          through it here waits forever on a lock this very frame holds.
+
+          The SQLite path on the line below never had the bug: `readTaskFromDb` is a lock-free row
+          read. The port swapped it for `getTask` on the backend arm only, so the deadlock is
+          PostgreSQL-only — which is every production install.
+
+          Reachability is narrow but real, and it is exactly the state a crash leaves behind: the
+          branch runs only when a stale marker names a plugin hook the registry still knows
+          (`hasSurvivingPluginHook`). A marker with no plugin hook, or one naming an uninstalled
+          plugin, takes the degraded path and never reaches here — which is why every existing test
+          passes. This sweep runs at STARTUP, and it deadlocks while holding the task's lock, so the
+          affected task is also left permanently unlockable.
+          */
           const task = backend
-            ? await store.getTask(id).catch(() => null)
+            ? await readTaskRow(store.asyncLayer!, id).catch(() => null) as { column?: string } | null
             : store.readTaskFromDb(id, { includeDeleted: false });
           if (task) {
-            const ir = store.resolveTaskWorkflowIrSync(id);
+            /*
+            FNXC:WorkflowLifecycleColumns 2026-07-31-18:40 (PR #2809 review — greptile P1):
+            ASYNC RESOLVER, because the sync one cannot answer here. `resolveTaskWorkflowIrSync`
+            returns the DEFAULT workflow IR for every task under PostgreSQL (its selection reader is
+            a cutover stub that answers `undefined` unconditionally). The hook runner below derives
+            its pending set from the columns of the IR it is handed, so with the default IR a task on
+            a CUSTOM workflow matched no plugin trait and its interrupted hook was silently skipped —
+            the recovery reported success having re-run nothing.
+
+            Nothing forced the sync call: this frame is already `async`, and awaiting here does not
+            reorder anything (the marker read above is awaited on the same path). The sync reader was
+            simply the one the SQLite-era code had.
+
+            This site is removed from the `resolveTaskWorkflowIrSync` call-site allow-list in the same
+            change, so the two cannot drift.
+            */
+            const ir = await resolveWorkflowIrForTask(store, id);
             // fromColumn is unknown post-crash; the marker only records toColumn.
             // The hook runner keys onEnter off toColumn (and onExit off fromColumn);
             // re-running onEnter for the destination is the recoverable, idempotent
@@ -1278,7 +1018,7 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
             // toColumn at marker-write time, so current == toColumn and onExit is a
             // no-op, which is correct — we never re-fire an exit we may have run).
             try {
-              await store.runPluginColumnTransitionHooks(id, ir, task.column, live.toColumn);
+              await store.runPluginColumnTransitionHooks(id, ir, task.column as string, live.toColumn);
             } catch (err) {
               storeLog.warn("transitionPending recovery: hook re-run faulted (degraded)", {
                 phase: "recover-stale-transition-pending",
@@ -1303,7 +1043,7 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
           // best-effort; a later sweep retries.
         }
 
-        void store.recordRunAuditEvent({
+        void emitBoundedRunAudit(store, {
           taskId: id,
           agentId: "system",
           runId: `transition-pending-recovery-${id}-${Date.now()}`,
@@ -1333,11 +1073,15 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
   }
 
 export async function migrateLegacyWorkflowStepsImpl(store: TaskStore): Promise<{ migrated: number; skipped: number; combinedWorkflowId?: string; }> {
-    // Resolve async prerequisites BEFORE the synchronous transaction: the
-    // workflow-columns flag (for flag-aware persistence). The project default is
-    // re-read AFTER the transaction (compare-and-set) so a concurrently-set
-    // default is never clobbered.
-    const flagOn = await store.workflowColumnsFlagOn();
+    /*
+    FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R9, BEHAVIOUR-PRESERVING):
+    The workflow-columns flag read is DELETED. It was resolved here only to thread
+    "flag-aware persistence" into `insertWorkflowDefinitionSync`, where it chose
+    between the v2 shape and the pure-v1 downgrade. The flag is retired and always
+    false, so the downgrade arm was always taken; it is now unconditional inside the
+    insert and the parameter is gone. The project default is still re-read AFTER the
+    transaction (compare-and-set) so a concurrently-set default is never clobbered.
+    */
 
     const result = store.db.transactionImmediate(() => {
       // Write lock is now held. Read the raw step rows directly (the cached,
@@ -1373,7 +1117,6 @@ export async function migrateLegacyWorkflowStepsImpl(store: TaskStore): Promise<
             ir: fragmentIr,
             layout: layoutForIr(fragmentIr),
           },
-          flagOn,
         );
         store.db
           .prepare("UPDATE workflow_steps SET migrated_fragment_id = ?, updatedAt = ? WHERE id = ?")
@@ -1395,7 +1138,6 @@ export async function migrateLegacyWorkflowStepsImpl(store: TaskStore): Promise<
             ir,
             layout: layoutForIr(ir),
           },
-          flagOn,
         );
         combinedWorkflowId = combined.id;
       }
@@ -1430,7 +1172,6 @@ export async function migrateLegacyWorkflowStepsImpl(store: TaskStore): Promise<
     return result;
   }
 
-
 /**
  * FNXC:StoreModularization 2026-06-25-00:00:
  * Emit task lifecycle events safely, catching listener errors so one bad
@@ -1438,7 +1179,7 @@ export async function migrateLegacyWorkflowStepsImpl(store: TaskStore): Promise<
  */
 export function emitTaskLifecycleEventSafelyImpl(
   store: TaskStore,
-  event: "task:created" | "task:updated",
+  event: "task:created" | "task:updated" | "task:deleted",
   args: Parameters<TaskStore["emitTaskLifecycleEventSafely"]>[1],
 ): boolean {
   const listeners = store.listeners(event) as Array<(...listenerArgs: typeof args) => unknown>;

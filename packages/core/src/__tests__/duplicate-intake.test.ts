@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { computeCrossParentDiagnosticClaimId, computeParentIntentClaimId, findSameAgentDuplicates, flagSameAgentDuplicate } from "../duplicate-intake.js";
+import { computeCrossParentDiagnosticClaimId, computeParentIntentClaimId, findSameAgentDuplicates, flagSameAgentDuplicate } from "../duplicates/duplicate-intake.js";
 import type { TaskStore } from "../store.js";
 
 describe("findSameAgentDuplicates", () => {
@@ -40,10 +40,10 @@ describe("findSameAgentDuplicates", () => {
     expect(matches).toEqual([]);
   });
 
-  it("filters archived candidates via duplicate matcher defaults", () => {
+  it("filters completed candidates via duplicate matcher defaults", () => {
     const matches = findSameAgentDuplicates(
       { title: "Fix typecheck", description: "typecheck error" },
-      [{ id: "FN-1", title: "Fix typecheck", description: "typecheck error", column: "archived", createdAt: nowMs - 60 * 1000, sourceAgentId: "agent-x" }],
+      [{ id: "FN-1", title: "Fix typecheck", description: "typecheck error", column: "done", createdAt: nowMs - 60 * 1000, sourceAgentId: "agent-x" }],
       { nowMs, sourceAgentId: "agent-x" },
     );
     expect(matches).toEqual([]);
@@ -138,6 +138,75 @@ describe("findSameAgentDuplicates", () => {
     expect(claims[0]).toMatch(/^agent-diagnostic-intent:/);
   });
 
+  /*
+  FNXC:TaskCreationDeduplication 2026-07-22-14:30:
+  FN-8510/8511/8513/8514 regression: four executors on unrelated parents filed the same
+  "fix the oversized changeset summary" follow-up with different phrasings (exceeds limit /
+  so check:changesets passes / oversized / blocking) and different fingerprints; all four
+  must converge on one cross-parent claim anchored to the named changeset file.
+  */
+  it("derives one cross-parent claim for a gate failure named by file path or slug (FN-8514)", () => {
+    const incidents = [
+      {
+        title: "Shorten mobile board changeset summary",
+        description: "Fix the pre-existing `.changeset/mobile-board-pointercancel-settle.md` summary exceeding the 120-character changeset-format limit, so `pnpm check:changesets` passes.",
+      },
+      {
+        description: "Shorten `.changeset/mobile-board-pointercancel-settle.md` summary to <=120 chars so `pnpm check:changesets` passes. Existing summary is 131 chars; unrelated to FN-8503.",
+      },
+      {
+        description: "Fix oversized summary in existing mobile-board-pointercancel-settle changeset so pnpm check:changesets passes.",
+      },
+      {
+        description: "Fix existing changeset format failure: .changeset/mobile-board-pointercancel-settle.md summary exceeds 120-character limit, blocking pnpm check:changesets.",
+      },
+    ];
+
+    const claims = incidents.map((input) => computeCrossParentDiagnosticClaimId(input));
+
+    expect(new Set(claims).size).toBe(1);
+    expect(claims[0]).toMatch(/^agent-diagnostic-intent:/);
+  });
+
+  it("converges failure paraphrases naming the same file path without a distinctive slug", () => {
+    const first = computeCrossParentDiagnosticClaimId({
+      description: "Fix broken import in packages/core/src/store.ts causing a typecheck error.",
+    });
+    const second = computeCrossParentDiagnosticClaimId({
+      description: "Investigate packages/core/src/store.ts typecheck failure observed during pnpm verify:fast.",
+    });
+
+    expect(first).not.toBeNull();
+    expect(first).toBe(second);
+  });
+
+  it("never anchors on dates or UUIDs, and a date never outranks a file-path anchor", () => {
+    expect(computeCrossParentDiagnosticClaimId({
+      description: "Fix nightly build failure observed on 2026-07-22 in the settings modal",
+    })).toBeNull();
+    expect(computeCrossParentDiagnosticClaimId({
+      description: "Fix failed run d3be2cd6-9221-4e1d-a27a-c5fbe04f9200 stuck in merge",
+    })).toBeNull();
+
+    const withDate = computeCrossParentDiagnosticClaimId({
+      description: "Fix typecheck error in packages/core/src/store.ts since 2026-07-22",
+    });
+    const withoutDate = computeCrossParentDiagnosticClaimId({
+      description: "Fix typecheck error in packages/core/src/store.ts",
+    });
+    expect(withDate).not.toBeNull();
+    expect(withDate).toBe(withoutDate);
+  });
+
+  it("does not claim ordinary work that merely names a file path", () => {
+    expect(computeCrossParentDiagnosticClaimId({
+      description: "Add caching to packages/core/src/store.ts for faster board loads",
+    })).toBeNull();
+    expect(computeCrossParentDiagnosticClaimId({
+      description: "Shorten the onboarding copy in WelcomeModal",
+    })).toBeNull();
+  });
+
   it("does not globally claim ordinary work or unrelated work on the same module", () => {
     expect(computeCrossParentDiagnosticClaimId({
       description: "Add screenshot upload support using html2canvas",
@@ -223,7 +292,7 @@ describe("flagSameAgentDuplicate (FN-7658)", () => {
     expect(recordActivity).toHaveBeenCalledTimes(1);
     const activity = recordActivity.mock.calls[0]?.[0];
     expect(activity).toMatchObject({
-      type: "task:auto-archived-duplicate",
+      type: "task:near-duplicate-flagged",
       taskId: "FN-2",
       metadata: { siblingTaskIds: ["FN-1"], scores: { "FN-1": 0.9 }, source: "same-agent-flagged" },
     });
@@ -250,7 +319,7 @@ describe("flagSameAgentDuplicate (FN-7658)", () => {
 
 describe("flagTriageDuplicate", () => {
   it("flags a triage marker without moving or deleting the task", async () => {
-    const { flagTriageDuplicate } = await import("../duplicate-intake.js");
+    const { flagTriageDuplicate } = await import("../duplicates/duplicate-intake.js");
     const store = { logEntry: vi.fn(), recordActivity: vi.fn(), updateTask: vi.fn() } as any;
     await flagTriageDuplicate(store, "FN-2", "FN-1");
     expect(store.updateTask).toHaveBeenCalledWith("FN-2", { sourceMetadataPatch: { nearDuplicateOf: "FN-1", nearDuplicateScore: 1, duplicateSource: "triage-marker", nearDuplicateDismissed: false } });
@@ -259,7 +328,7 @@ describe("flagTriageDuplicate", () => {
   });
 
   it("preserves a same-canonical Keep acknowledgement when re-flagged", async () => {
-    const { flagTriageDuplicate } = await import("../duplicate-intake.js");
+    const { flagTriageDuplicate } = await import("../duplicates/duplicate-intake.js");
     const store = {
       getTask: vi.fn().mockResolvedValue({ sourceMetadata: { nearDuplicateOf: "fn-1", nearDuplicateDismissed: true } }),
       logEntry: vi.fn(),

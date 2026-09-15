@@ -272,7 +272,15 @@ describe("AgentListModal", () => {
         expect(screen.getAllByText((_, el) => el?.textContent === "FN-PROGRESS · In Progress").length).toBeGreaterThanOrEqual(1);
         expect(screen.getAllByText((_, el) => el?.textContent === "FN-BARE · Unresolved task").length).toBeGreaterThanOrEqual(1);
       });
-      expect(container.querySelectorAll(".agent-task").length).toBe(3);
+  /*
+      FNXC:PortalQueryRoot 2026-07-31-20:10:
+      document, not container — this modal renders through a PORTAL.
+
+      `container` from `render()` is empty for a portalled subtree, so this lookup could only ever
+      return nothing. Same defect as #2885 / #2890 / #2893 / #2895 / #2907; probed here before
+      converting (`PROBE container=0 document=3`).
+      */
+      expect(document.querySelectorAll(".agent-task").length).toBe(3);
     });
 
     it("shows empty state when no agents exist", async () => {
@@ -1319,7 +1327,12 @@ describe("AgentListModal", () => {
       expect(modal).toBeTruthy();
     });
 
-    it("renders modal-title element for header consistency", async () => {
+    /*
+    FNXC:StandardizedViewLayout 2026-09-13-21:49:
+    FN-379 replaced the local `.modal-title` row with the shared header, so header consistency is now asserted on
+    the canonical header element that owns the destination title.
+    */
+    it("renders the shared header title for header consistency", async () => {
       render(
         <AgentListModal
           isOpen={true}
@@ -1329,7 +1342,7 @@ describe("AgentListModal", () => {
       );
 
       await waitFor(() => {
-        const title = document.querySelector(".modal-title");
+        const title = document.querySelector(".view-header .view-header__title");
         expect(title).toBeTruthy();
         expect(title?.textContent).toContain("Agents");
       });

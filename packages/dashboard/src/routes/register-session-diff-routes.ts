@@ -1,9 +1,15 @@
+import { createLogger } from "@fusion/core";
+import { landedColumnsForTask } from "../task-lifecycle-lanes.js";
+
+const severityAuditLog = createLogger("dashboard-register-session-diff-routes");
 import { access } from "node:fs/promises";
 import { join } from "node:path";
 import type { Request, Router } from "express";
 import type { RunAuditEvent, RunAuditEventFilter } from "@fusion/core";
 import { isWorkspaceTask } from "@fusion/core";
 import { ApiError, notFound, rethrowAsApiError } from "../api-error.js";
+// FNXC:TaskLookup404 2026-07-26-11:40: shared task-miss -> 404 mapping seam.
+import { isTaskLookupMiss, rethrowTaskApiError } from "./task-lookup-error.js";
 import { resolveDiffBase, runGitCommand } from "./resolve-diff-base.js";
 import { countPatchLines } from "./diff-counts.js";
 import { filterFilesToOwnTaskCommits } from "./attribute-done-range-files.js";
@@ -21,6 +27,8 @@ export interface SessionDiffRouteDeps {
  * task's "files changed" list. Returns true when no validation is possible
  * (e.g. task.branch was never set) so we don't break tests/legacy tasks.
  */
+
+
 async function worktreeStillBelongsToTask(
   worktree: string,
   expectedBranch: string | undefined | null,
@@ -241,6 +249,8 @@ async function isReachableFromHead(sha: string, rootDir: string): Promise<boolea
 type DoneTaskAggregationTask = {
   id: string;
   lineageId?: string | null;
+  /** Executor-captured paths used only when landed-file capture cannot prove ownership. */
+  modifiedFiles?: string[];
   mergeDetails?: {
     commitSha?: string;
     rebaseBaseSha?: string;
@@ -250,6 +260,7 @@ type DoneTaskAggregationTask = {
     landedFiles?: string[];
     landedFilesAttributionRestricted?: boolean;
     noOpVerifiedShortCircuit?: boolean;
+    landedFilesCaptureFallback?: "attribution-failed";
   } | null;
 };
 
@@ -523,7 +534,7 @@ async function computeWorkspaceTaskFiles(
   task: {
     id: string;
     baseBranch?: string;
-    workspaceWorktrees?: Record<string, { worktreePath: string; branch: string; baseCommitSha?: string; landedSha?: string }>;
+    workspaceWorktrees?: Record<string, { worktreePath: string; branch: string; baseCommitSha?: string; landedSha?: string; revertBoundarySha?: string }>;
   },
   rootDir: string,
   timeoutMs: number,
@@ -810,30 +821,39 @@ async function restrictRebaseRangeFiles(
     return rebaseRangeFiles.filter((file) => landedSet.has(file.path));
   }
 
-  if (Array.isArray(landed) && landed.length > 0) {
-    return rebaseRangeFiles.filter((file) => landedSet.has(file.path));
-  }
-
+  let attribution: Awaited<ReturnType<typeof filterFilesToOwnTaskCommits>> | undefined;
   try {
-    const attribution = await filterFilesToOwnTaskCommits({
+    attribution = await filterFilesToOwnTaskCommits({
       worktreePath: deps.rootDir,
       baseRef: deps.rebaseBaseShaForAggregation,
       taskId: task.id,
       runGit: deps.runGit,
     });
-    if (attribution.files.length === 0) {
-      // Read-only done-task diff display should still surface the rebase range
-      // when commit attribution cannot prove ownership from subjects/trailers.
-      return rebaseRangeFiles;
-    }
+  } catch (err) {
+    severityAuditLog.warn(
+      `[diff] FN-5154 attribution failed for ${task.id}: ${(err as Error).message}`,
+    );
+  }
+
+  if (attribution?.files.length) {
     const ownSet = new Set(attribution.files);
     return rebaseRangeFiles.filter((file) => ownSet.has(file.path));
-  } catch (err) {
-    console.warn(
-      `[diff] FN-5154 attribution failed for ${task.id}: ${(err as Error).message}; falling back to unrestricted range`,
-    );
-    return rebaseRangeFiles;
   }
+
+  /*
+  FNXC:TaskDiffAttribution 2026-08-18-18:44:
+  A rebase range describes repository history, not task ownership. Prefer commit attribution,
+  then the executor's persisted snapshot only when landed-file capture is absent or explicitly
+  failed; never widen to foreign range files when neither source proves ownership.
+  */
+  const captureFailed = task.mergeDetails?.landedFilesCaptureFallback === "attribution-failed";
+  const mergeCaptureAbsent = !Array.isArray(landed);
+  if (captureFailed || mergeCaptureAbsent) {
+    const executionFiles = new Set(task.modifiedFiles ?? []);
+    return rebaseRangeFiles.filter((file) => executionFiles.has(file.path));
+  }
+
+  return [];
 }
 
 /**
@@ -945,7 +965,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Internal server error");
@@ -986,7 +1006,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
         return;
       }
 
-      if (task.column === "done") {
+      if ((await landedColumnsForTask(scopedStore, task.id)).has(task.column)) {
         const mergeShaForBaseBoundary = await resolveDoneTaskMergeSha(task, scopedStore, { includeBaseCommitSha: true });
         const resolvedMergeSha = await resolveDoneTaskMergeSha(task, scopedStore);
         if (mergeShaForBaseBoundary && task.baseCommitSha) {
@@ -1088,7 +1108,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
           if (rebaseDiffSpec) {
             diffSpec = rebaseDiffSpec;
           } else {
-            console.warn(`[diff] done task ${task.id}: mergeDetails.rebaseBaseSha ${rebaseBaseSha} is not ancestor of ${sha}; falling back to single-commit diff`);
+            severityAuditLog.warn(`[diff] done task ${task.id}: mergeDetails.rebaseBaseSha ${rebaseBaseSha} is not ancestor of ${sha}; falling back to single-commit diff`);
             try {
               diffSpec = await resolveCommitDiffSpec(sha, rootDir);
             } catch {
@@ -1106,8 +1126,15 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
         }
 
         const doneFiles = await collectDoneRangeFiles(diffSpec.range, rootDir).catch(() => []);
-        if (doneFiles.length > 0) {
-          const files = doneFiles.map((file) => ({
+        const scopedDoneFiles = diffSpec.mode === "rebase-range"
+          ? await restrictRebaseRangeFiles(task, doneFiles, {
+              rootDir,
+              rebaseBaseShaForAggregation: diffSpec.base,
+              runGit: (args: string[]) => runGitCommand(args, rootDir, 10000),
+            })
+          : doneFiles;
+        if (scopedDoneFiles.length > 0) {
+          const files = scopedDoneFiles.map((file) => ({
             ...file,
             status: file.status === "renamed" ? "modified" : file.status,
           }));
@@ -1119,6 +1146,12 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
               deletions: files.reduce((sum, file) => sum + file.deletions, 0),
             },
           });
+          return;
+        }
+
+        // A failed or foreign-only rebase range has no task-owned shortstat to report.
+        if (diffSpec.mode === "rebase-range") {
+          res.json({ files: [], stats: { filesChanged: 0, additions: 0, deletions: 0 } });
           return;
         }
 
@@ -1186,7 +1219,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
       if (err instanceof ApiError) {
         throw err;
       }
-      rethrowAsApiError(err);
+      rethrowTaskApiError(err, req.params.id);
     }
   });
 
@@ -1213,7 +1246,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
         return;
       }
 
-      if (task.column === "done") {
+      if ((await landedColumnsForTask(scopedStore, task.id)).has(task.column)) {
         const mergeShaForBaseBoundary = await resolveDoneTaskMergeSha(task, scopedStore, { includeBaseCommitSha: true });
         const resolvedMergeSha = await resolveDoneTaskMergeSha(task, scopedStore);
         if (mergeShaForBaseBoundary && task.baseCommitSha) {
@@ -1283,7 +1316,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
           if (rebaseDiffSpec) {
             diffSpec = rebaseDiffSpec;
           } else {
-            console.warn(`[file-diffs] done task ${task.id}: mergeDetails.rebaseBaseSha ${rebaseBaseSha} is not ancestor of ${sha}; falling back to single-commit diff`);
+            severityAuditLog.warn(`[file-diffs] done task ${task.id}: mergeDetails.rebaseBaseSha ${rebaseBaseSha} is not ancestor of ${sha}; falling back to single-commit diff`);
             try {
               diffSpec = await resolveCommitDiffSpec(sha, rootDir);
             } catch {
@@ -1302,7 +1335,14 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
 
         try {
           const doneFiles = await collectDoneRangeFiles(diffSpec.range, rootDir);
-          res.json(doneFiles.map((file) => ({ path: file.path, status: file.status, diff: file.patch })));
+          const scopedDoneFiles = diffSpec.mode === "rebase-range"
+            ? await restrictRebaseRangeFiles(task, doneFiles, {
+                rootDir,
+                rebaseBaseShaForAggregation: diffSpec.base,
+                runGit: (args: string[]) => runGitCommand(args, rootDir, 10000),
+              })
+            : doneFiles;
+          res.json(scopedDoneFiles.map((file) => ({ path: file.path, status: file.status, diff: file.patch })));
         } catch {
           res.json([]);
         }
@@ -1378,7 +1418,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Internal server error");
@@ -1421,7 +1461,7 @@ export function registerSessionDiffRoutes(router: Router, deps: SessionDiffRoute
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Internal server error");

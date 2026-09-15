@@ -9,17 +9,18 @@ import type {
   PluginSetupHooks,
   PluginSetupManifest,
   PluginSkillContribution,
+  PluginMcpServerContribution,
   PluginWorkflowStepContribution,
-} from "../plugin-types.js";
+} from "../plugins/plugin-types.js";
 import type {
   WorkflowExtensionContribution,
   WorkflowExtensionFallback,
   WorkflowExtensionKind,
-} from "../workflow-extension-types.js";
+} from "../workflows/workflow-extension-types.js";
 import {
   validatePluginManifest,
   validateWorkflowExtensionContribution,
-} from "../plugin-types.js";
+} from "../plugins/plugin-types.js";
 
 describe("plugin contribution type constraints", () => {
   it("accepts setup check result status variants", () => {
@@ -125,6 +126,21 @@ describe("plugin contribution type constraints", () => {
     expect(plugin.setup?.manifest.channel).toBe("stable");
     expect(check.status).toBe("installed");
     expect((await minimalHooks.checkSetup({} as never)).status).toBe("not-installed");
+  });
+
+  it("accepts declarative MCP contributions without a per-server enabled flag", () => {
+    const server: PluginMcpServerContribution = {
+      name: "roslyn-navigator",
+      transport: "stdio",
+      command: "cwm-roslyn-navigator",
+      env: { TOKEN: { secretRef: "roslyn-token", scope: "project" } },
+      enabledByDefault: true,
+    };
+    const plugin: FusionPlugin = {
+      manifest: { id: "roslyn", name: "Roslyn", version: "1.0.0" }, state: "installed", hooks: {}, mcpServers: [server],
+    };
+    expect(plugin.mcpServers?.[0]?.name).toBe("roslyn-navigator");
+    expectTypeOf(server.enabledByDefault).toEqualTypeOf<boolean | undefined>();
   });
 
   it("accepts prompt surface union and prompt contribution records", () => {

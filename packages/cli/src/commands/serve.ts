@@ -18,9 +18,6 @@ import {
   getTaskMergeBlocker,
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
   processAndAuditInsightExtraction,
-  DaemonTokenManager,
-  GlobalSettingsStore,
-  resolveGlobalDir,
   getEnabledPiExtensionPaths,
   mergeBuiltInGrokProviderModels,
   mergeBuiltInZaiProviderModels,
@@ -37,8 +34,13 @@ import {
   setHostExtensionPaths,
   createFusionAuthStorage,
   createFusionModelRegistry,
+  refreshFusionModelRegistry,
+  setLocalDashboardPort,
+  startCloudLinkPresence,
+  stopCloudLinkPresence,
 } from "@fusion/engine";
 import { setHostTaskStore, clearHostTaskStores } from "../extension.js";
+import { resolveServeDaemonToken } from "./serve-daemon-token.js";
 import {
   DefaultPackageManager,
   SettingsManager,
@@ -57,6 +59,7 @@ import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getPackageManagerAgentDir } from "./auth-paths.js";
+import { createProjectScopedPackageManagerFactory } from "./skills-package-manager.js";
 import { resolveProject } from "../project-context.js";
 import { startMigrationHoldingServer } from "./migration-holding-server.js";
 import {
@@ -81,7 +84,7 @@ import {
 import { resolveSelfExtension } from "./self-extension.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
-import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 import { phaseTime } from "../startup-phase.js";
 
@@ -242,7 +245,9 @@ function ensureProcessDiagnostics(): void {
 
 export async function runServe(
   port: number,
-  opts: { interactive?: boolean; paused?: boolean; host?: string; daemon?: boolean; noAutoRegister?: boolean; project?: string } = {},
+  // FNXC:ServeSecureByDefault 2026-07-26-16:55: `noAuth` is the explicit opt-out from
+  // the always-on bearer-token default (mirrors `fn dashboard --no-auth`).
+  opts: { interactive?: boolean; paused?: boolean; host?: string; daemon?: boolean; noAuth?: boolean; noAutoRegister?: boolean; project?: string } = {},
 ) {
   serveStartTime = Date.now();
   ensureProcessDiagnostics();
@@ -302,7 +307,7 @@ export async function runServe(
    * the TaskStore) as the externalTaskStore for the cwd project's engine so
    * the connection pool is shared — no second embedded PG instance is started.
    */
-  const { createTaskStoreForBackend } = await import("@fusion/core");
+  const { createTaskStoreForBackend, buildConsumerId } = await import("@fusion/core");
   /*
    * FNXC:PostgresFinalCutover 2026-07-14-17:20:
    * Serve must share one successfully booted PostgreSQL layer between CentralCore and the cwd engine. A backend boot error is fatal; constructing a layerless CentralCore would make project discovery appear empty and split control-plane state.
@@ -316,6 +321,13 @@ export async function runServe(
     "backend.factory",
     () => createTaskStoreForBackend({
       rootDir: cwd,
+      /*
+      FNXC:CrossProcessDeleteObservation 2026-08-01-13:03:
+      serve shares this store with the engine, whose runtime starts the durable consumer. Give the
+      shared store the engine identity so its cursor survives restart and cross-process deletes reach
+      runtime observers even though this headless path never calls dashboard watch().
+      */
+      consumerId: buildConsumerId("engine"),
       onMigrationProgress: (event) => migrationHoldingServer?.setMigrationProgress(event),
     }),
     logPhase,
@@ -414,14 +426,21 @@ export async function runServe(
   const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
   const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
-  const engineManager = startupEngineManager = new ProjectEngineManager(sharedCentralCore, {
+  const engineManager: ProjectEngineManager = startupEngineManager = new ProjectEngineManager(sharedCentralCore, {
     cliPackageVersion,
     getMergeStrategy,
-    processPullRequestMerge: (s, wd, taskId, pool) =>
-      processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool),
+    processPullRequestMerge: (s, wd, taskId, signal) =>
+      processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, signal),
     createGroupPr: createGroupPrCallback(githubClient),
     syncGroupPr: syncGroupPrCallback(githubClient),
-    prNodeGithubOps: createPrNodeGithubOps(githubClient),
+    /*
+    FNXC:PrMergeAutoMerge 2026-08-09-10:59:
+    Serve may own several engines. Bind native auto-merge policy to the runtime
+    TaskStore instead of guessing task ownership from a project-scoped task ID.
+    */
+    createPrNodeGithubOps: (taskStore) => createPrNodeGithubOps(githubClient, {
+      isNativeAutoMergeEnabled: async () => (await taskStore.getSettings()).githubNativeAutoMerge === true,
+    }),
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
@@ -642,6 +661,24 @@ export async function runServe(
     console.warn(`[plugins] Failed to auto-install bundled Grok CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
   }
 
+  /*
+   * FNXC:CursorCli 2026-08-16-04:05:
+   * FN-9093: `cursor-cli` is runtime-routed with a fail-fast missing-runtime error, but the provider card's
+   * Enable action only flips `useCursorCli` in settings — nothing registered fusion-plugin-cursor-runtime,
+   * so every Cursor selection failed with "install and enable the Cursor runtime plugin" even after enabling.
+   * Mirror the FN-7761 Grok eager bootstrap so the Cursor runtime is discoverable before any session lane starts.
+   */
+  try {
+    const installStatus = await ensureBundledCursorRuntimePluginInstalled(pluginStore, pluginLoader);
+    if (installStatus === "installed") {
+      console.log("[plugins] Installed bundled Cursor CLI runtime plugin");
+    } else if (installStatus === "missing-bundle") {
+      console.warn("[plugins] Bundled Cursor CLI runtime plugin was not found in this build");
+    }
+  } catch (err) {
+    console.warn(`[plugins] Failed to auto-install bundled Cursor CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
+  }
+
   // Lazy-install hook for bundled runtime plugins (Hermes/OpenClaw/Paperclip/Grok).
   const ensureBundledPluginInstalledCallback = async (pluginId: string): Promise<boolean> => {
     if (!isBundledPluginId(pluginId)) {
@@ -813,7 +850,13 @@ export async function runServe(
     extensionsResult.runtime.pendingProviderRegistrations = [];
     mergeBuiltInZaiProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
     mergeBuiltInGrokProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
-    await modelRegistry.refresh();
+    /*
+    FNXC:ModelRegistry 2026-07-21-17:15:
+    Bound post-extension refresh so a hung remote catalog cannot leave serve stuck before listen.
+    */
+    await refreshFusionModelRegistry(modelRegistry, {
+      log: (message) => console.log(`[extensions] ${message}`),
+    });
 
     try {
       const globalSettings = await store.getGlobalSettingsStore().getSettings();
@@ -831,7 +874,9 @@ export async function runServe(
     const message = error instanceof Error ? error.message : String(error);
     console.log(`[extensions] Failed to discover extensions: ${message}`);
     createExtensionRuntime();
-    await modelRegistry.refresh();
+    await refreshFusionModelRegistry(modelRegistry, {
+      log: (message) => console.log(`[extensions] ${message}`),
+    });
   }
 
   void syncStartupModels({
@@ -860,31 +905,18 @@ export async function runServe(
   });
 
   // ── Daemon token resolution ─────────────────────────────────────────────
-  //
-  // When --daemon flag is set, resolve the daemon token using the same
-  // priority as fn daemon: env var > stored token > generate new token.
-  //
-  let daemonToken: string | undefined;
-  if (opts.daemon) {
-    // 1. Check environment variable first
-    daemonToken = process.env.FUSION_DAEMON_TOKEN;
-
-    // 2. Check stored token in global settings
-    if (!daemonToken) {
-      const globalDir = resolveGlobalDir();
-      const settingsStore = new GlobalSettingsStore(globalDir);
-      const tokenManager = new DaemonTokenManager(settingsStore);
-      daemonToken = await tokenManager.getToken();
-    }
-
-    // 3. Generate and store a new token if none exists
-    if (!daemonToken) {
-      const globalDir = resolveGlobalDir();
-      const settingsStore = new GlobalSettingsStore(globalDir);
-      const tokenManager = new DaemonTokenManager(settingsStore);
-      daemonToken = await tokenManager.generateToken();
-    }
-  }
+  /*
+  FNXC:ServeSecureByDefault 2026-07-26-16:55:
+  Token resolution is now UNCONDITIONAL, not gated on `--daemon`. Plain `fn serve`
+  previously started with no token, so `createServer` installed no auth middleware and
+  the whole API (including POST /api/approvals/:id/decision) was reachable
+  unauthenticated — the hole an AI agent used to self-approve destructive actions.
+  `fn serve` now always resolves/mints a persisted token (env > stored > generated,
+  matching `fn daemon` and `fn dashboard`) unless the operator explicitly passes
+  `--no-auth`. The resolved token/URL is printed after listen so operators can still
+  connect (see the startup banner below).
+  */
+  const daemonToken = await resolveServeDaemonToken({ noAuth: opts.noAuth });
 
   // ── Skills adapter for skills discovery and execution toggling ─────────────
   //
@@ -952,6 +984,7 @@ export async function runServe(
     ? createSkillsAdapter({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dashboard's resolve() uses a looser onMissing signature than pi's DefaultPackageManager
         packageManager: packageManager as any,
+        getPackageManager: createProjectScopedPackageManagerFactory(getPackageManagerAgentDir()),
         getSettingsPath: (rootDir: string) => getProjectSettingsPath(rootDir),
         /*
          * FNXC:PluginSkills 2026-07-10-00:00:
@@ -1061,6 +1094,9 @@ export async function runServe(
     headless: true,
     skillsAdapter,
     daemon: daemonToken ? { token: daemonToken } : undefined,
+    // FNXC:ServeSecureByDefault 2026-07-26-16:55: forward the explicit opt-out so a
+    // stale FUSION_DAEMON_TOKEN env var cannot silently re-enable auth under --no-auth.
+    noAuth: opts.noAuth === true ? true : undefined,
     https: loadTlsCredentialsFromEnv(),
   });
 
@@ -1074,7 +1110,26 @@ export async function runServe(
   });
 
   const actualPort = (server.address() as AddressInfo).port;
+  // FNXC:RemoteAccess 2026-08-19-04:00: headless serve must publish its bound port too, or a remote
+  // tunnel started from it targets a hardcoded 4040. See local-dashboard-port.
+  setLocalDashboardPort(actualPort);
   logPhase(`startup phase time-to-listen: ${Date.now() - serveStartedAt}ms`);
+  /*
+   * FNXC:CloudLink 2026-08-22-00:40:
+   * After listen, a linked instance provisions a Cloudflare Quick Tunnel to this
+   * bound port and heartbeats the live URL (including rotations) to Cloud Link.
+   */
+  /*
+   * FNXC:CloudLink 2026-08-24-00:05:
+   * Do not publish an unauthenticated dashboard through a public Quick Tunnel.
+   */
+  if (daemonToken) {
+    void startCloudLinkPresence(actualPort, (message) => console.log(`[cloud-link] ${message}`)).catch((error) => {
+      console.warn(`[cloud-link] Presence failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  } else {
+    console.log("[cloud-link] Skipping public tunnel because dashboard auth is off.");
+  }
 
   /*
   FNXC:CustomProviders 2026-06-30-00:00:
@@ -1142,10 +1197,18 @@ export async function runServe(
   const { maskApiKey } = await import("./node.js");
 
   console.log();
+  /*
+  FNXC:ServeSecureByDefault 2026-07-26-16:55:
+  Auth is now the default for every `fn serve` (not just --daemon), so the banner must
+  always surface the token and a click-through `?token=` launch URL — the same operator
+  affordance `fn dashboard` provides — or a secure-by-default serve would lock the
+  operator out of their own dashboard. The explicit `--no-auth` opt-out is called out
+  loudly instead of silently printing an open endpoint.
+  */
   if (daemonToken) {
-    console.log(`  Fusion Node (daemon mode)`);
+    console.log(opts.daemon ? `  Fusion Node (daemon mode)` : `  Fusion Node`);
     console.log(`  ────────────────────────`);
-    console.log(`  → http://${selectedHost}:${actualPort}`);
+    console.log(`  → http://${selectedHost}:${actualPort}/?token=${daemonToken}`);
     console.log();
     console.log(`  Token: fn_${maskApiKey(daemonToken)}`);
     console.log();
@@ -1162,7 +1225,7 @@ export async function runServe(
     console.log(`  → http://${selectedHost}:${actualPort}`);
     console.log();
     console.log(`  Health:     GET /api/health`);
-    console.log(`  API:        /api/*`);
+    console.log(`  API:        /api/* (auth DISABLED via --no-auth — anyone who can reach this socket has full API access)`);
     console.log(`  AI engine:  ✓ active`);
     console.log(`  Press Ctrl+C to stop`);
   }
@@ -1243,6 +1306,12 @@ export async function runServe(
     }
 
     try {
+      await stopCloudLinkPresence();
+    } catch {
+      // best-effort
+    }
+
+    try {
       server.close();
     } catch {
       // best-effort
@@ -1290,6 +1359,7 @@ export async function runServe(
   });
   } catch (error) {
     /* FNXC:PostgresServeLifecycle 2026-07-14-19:10: Any startup failure after the shared PostgreSQL boot must unwind partially-started engines and CentralCore before releasing the sole backend owner exactly once. */
+    await stopCloudLinkPresence().catch(() => undefined);
     await startupEngineManager?.stopAll().catch(() => undefined);
     await sharedCentralCore?.close().catch(() => undefined);
     await shutdownCentralBackendOnce().catch(() => undefined);

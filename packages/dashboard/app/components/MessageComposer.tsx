@@ -1,7 +1,7 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useAutosizeTextarea } from "../hooks/useAutosizeTextarea";
-import { X, Send, Loader2, Bot, AlertCircle } from "lucide-react";
+import { Send, Loader2, Bot, AlertCircle } from "lucide-react";
 import type { DragEvent } from "react";
 import type { NativeStructureEmbed, NativeStructureRef, ParticipantType, MessageType } from "@fusion/core";
 import { getErrorMessage } from "@fusion/core";
@@ -20,7 +20,7 @@ export interface NativeStructureCandidate {
   label: string;
 }
 
-interface MessageComposerProps {
+export interface MessageComposerProps {
   /** Pre-fill recipient (e.g. when replying) */
   recipient?: { id: string; type: ParticipantType } | null;
   /** Reply context for linked replies */
@@ -39,9 +39,26 @@ interface MessageComposerProps {
   isLoadingAgents?: boolean;
   /** Project-scoped structures the mail parent makes available for attachment. */
   nativeStructureCandidates?: NativeStructureCandidate[];
+  /** Optional chat-to-mail report prefill. */
+  initialMode?: "quick" | "report";
+  initialContent?: string;
+  initialReportTitle?: string;
+  prefillNonce?: number;
 }
 
 const MAX_CONTENT_LENGTH = 2000;
+
+/**
+ * FNXC:NativeStructureProjectIsolation 2026-08-09-05:13:
+ * DataTransfer is controlled by foreign windows and attackers. The parser validates only shape, so
+ * this consumer rejects foreign project refs and stamps unscoped refs before they enter mail metadata.
+ */
+export function resolveDroppedNativeStructureRef(ref: NativeStructureRef | null, projectId?: string): NativeStructureRef | null {
+  if (!ref) return null;
+  if (!projectId) return ref;
+  if (ref.projectId && ref.projectId !== projectId) return null;
+  return { ...ref, projectId };
+}
 
 // ── Component ─────────────────────────────────────────────────────────────
 
@@ -55,11 +72,19 @@ export function MessageComposer({
   addToast,
   isLoadingAgents = false,
   nativeStructureCandidates = [],
+  initialMode = "quick",
+  initialContent = "",
+  initialReportTitle = "",
+  prefillNonce,
 }: MessageComposerProps) {
   const { t } = useTranslation("app");
   const [toId, setToId] = useState(recipient?.id ?? "");
   const [toType, setToType] = useState<ParticipantType>(recipient?.type ?? "agent");
-  const [content, setContent] = useState("");
+  const [content, setContent] = useState(initialContent);
+  const [mode, setMode] = useState<"quick" | "report">(initialMode);
+  const [reportTitle, setReportTitle] = useState(initialReportTitle);
+  const sectionIdRef = useRef(0);
+  const [sections, setSections] = useState<Array<{ id: number; heading: string; body: string }>>([]);
   const [wakeRecipient, setWakeRecipient] = useState(false);
   const [nativeStructures, setNativeStructures] = useState<NativeStructureEmbed[]>([]);
   const [isSending, setIsSending] = useState(false);
@@ -92,14 +117,22 @@ export function MessageComposer({
   const handleSend = useCallback(async () => {
     if (!isValid || isSending) return;
 
-    setIsSending(true);
     setError(null);
+    const reportSections = sections.filter((section) => section.heading.trim() || section.body.trim());
+    if (mode === "report") {
+      if (!reportTitle.trim()) { setError("A report needs a title"); return; }
+      // FNXC:StructuralMail 2026-08-09-12:41: FN-8870 rejects empty report section arrays, so report-mode composition must stop locally rather than issuing a request the shared metadata validator cannot accept.
+      if (reportSections.length === 0) { setError("A report needs at least one section"); return; }
+      if (reportSections.some((section) => !section.heading.trim() || !section.body.trim())) { setError("Every report section needs a heading and a body"); return; }
+    }
+    setIsSending(true);
 
     try {
       const messageType: MessageType = toType === "agent" ? "user-to-agent" : "system";
       const metadata = {
         ...(replyContext ? { replyTo: { messageId: replyContext.messageId } } : {}),
         ...(nativeStructures.length > 0 ? { nativeStructures } : {}),
+        ...(mode === "report" ? { mailKind: "report" as const, report: { title: reportTitle.trim(), sections: reportSections.map(({ heading, body }) => ({ heading: heading.trim(), body: body.trim() })) } } : {}),
       };
       const hasMetadata = Object.keys(metadata).length > 0;
       const sendWakeImmediately = wakeImmediately;
@@ -122,7 +155,7 @@ export function MessageComposer({
     } finally {
       setIsSending(false);
     }
-  }, [isValid, isSending, toId, toType, content, wakeImmediately, replyContext, nativeStructures, projectId, onSend, addToast]);
+  }, [isValid, isSending, toId, toType, content, wakeImmediately, replyContext, nativeStructures, projectId, onSend, addToast, mode, reportTitle, sections]);
 
   const handleAgentSelect = useCallback((agentId: string) => {
     setToId(agentId);
@@ -143,7 +176,16 @@ export function MessageComposer({
   }, [addNativeStructure, nativeStructureCandidates]);
 
   const [isNativeStructureDragOver, setIsNativeStructureDragOver] = useState(false);
-  const [isComposeChatOpen, setIsComposeChatOpen] = useState(false);
+  const [isComposeChatOpen, setIsComposeChatOpen] = useState(initialMode === "report");
+
+  useEffect(() => {
+    if (prefillNonce === undefined) return;
+    setMode(initialMode);
+    setContent(initialContent);
+    setReportTitle(initialReportTitle);
+    setSections([]);
+    setIsComposeChatOpen(initialMode === "report");
+  }, [prefillNonce, initialContent, initialMode, initialReportTitle]);
 
   /*
   FNXC:NativeStructureEmbed 2026-07-22-10:30:
@@ -166,9 +208,9 @@ export function MessageComposer({
     if (!hasNativeStructureDrag(event.dataTransfer)) return;
     event.preventDefault();
     setIsNativeStructureDragOver(false);
-    const ref = readNativeStructureRef(event.dataTransfer);
+    const ref = resolveDroppedNativeStructureRef(readNativeStructureRef(event.dataTransfer), projectId);
     if (ref) addNativeStructure(ref);
-  }, [addNativeStructure]);
+  }, [addNativeStructure, projectId]);
 
   const scrollTextareaIntoView = useCallback(() => {
     if (typeof textareaRef.current?.scrollIntoView !== "function") {
@@ -200,24 +242,24 @@ export function MessageComposer({
     <div
       className={`message-composer${isNativeStructureDragOver ? " message-composer--native-structure-drag-over" : ""}`}
       data-testid="message-composer"
-      aria-label="Message composer; drop a structure to attach it"
+      aria-label={t("composer.ariaLabel", "Message composer; drop a structure to attach it")}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <div className="message-composer-header">
-        <span>{replyContext ? t("composer.replyTitle", "Reply") : t("composer.newMessageTitle", "New Message")}</span>
-        <button
-          className="btn-icon"
-          onClick={onCancel}
-          aria-label={t("actions.cancel", "Cancel")}
-          data-testid="message-composer-cancel"
-        >
-          <X size={16} />
-        </button>
-      </div>
-
+      {/*
+      FNXC:StandardizedMailboxLayout 2026-09-14-10:24:
+      FN-379 remediation: the composer is hosted content, never a second chrome owner. Its dynamic identity
+      ("New Message"/"Reply") and its abandon action belong to the owning ViewHeader of Mailbox (destination and
+      floating window alike), so the composer no longer renders a local header row or a local close control. The
+      contextual footer Cancel remains a form command of the open form.
+      */}
       <div className="message-composer-body">
+        {/* FNXC:StructuralMail 2026-08-09-12:41: Quick mail remains the default and never adds metadata; report validation stays at send time so recipient gating remains independent. FN-8870 requires at least one complete section for structural reports. */}
+        <div className="message-composer-mode" role="group" aria-label={t("composer.mode", "Message mode")}>
+          <button type="button" className="btn btn-sm btn-secondary" aria-pressed={mode === "quick"} data-testid="message-composer-mode-quick" onClick={() => { setMode("quick"); setIsComposeChatOpen(false); }}>{t("composer.quickMessage", "Quick message")}</button>
+          <button type="button" className="btn btn-sm btn-secondary" aria-pressed={mode === "report"} data-testid="message-composer-mode-report" onClick={() => { setMode("report"); setIsComposeChatOpen(true); }}>{t("composer.report", "Report")}</button>
+        </div>
         {/* Recipient selection */}
         {!recipient && (
           <div className="message-composer-field">
@@ -264,6 +306,16 @@ export function MessageComposer({
           </div>
         )}
 
+        {mode === "report" && <div className="message-composer-report" data-testid="message-composer-report">
+          <div className="message-composer-field"><label className="message-composer-label" htmlFor="report-title">{t("composer.reportTitle", "Report title")}</label><input id="report-title" className="input" value={reportTitle} onChange={(event) => setReportTitle(event.target.value)} data-testid="report-title" /></div>
+          {sections.map((section) => <div className="message-composer-report-section" key={section.id}>
+            <input className="input" value={section.heading} placeholder={t("composer.sectionHeading", "Section heading")} onChange={(event) => setSections((current) => current.map((item) => item.id === section.id ? { ...item, heading: event.target.value } : item))} data-testid={`report-section-heading-${section.id}`} />
+            <textarea className="message-composer-textarea" value={section.body} placeholder={t("composer.sectionBody", "Section body")}  onChange={(event) => setSections((current) => current.map((item) => item.id === section.id ? { ...item, body: event.target.value } : item))} data-testid={`report-section-body-${section.id}`} />
+            <button type="button" className="btn btn-sm btn-secondary" onClick={() => setSections((current) => current.filter((item) => item.id !== section.id))} data-testid={`report-section-remove-${section.id}`}>{t("composer.removeSection", "Remove section")}</button>
+          </div>)}
+          <button type="button" className="btn btn-sm btn-secondary" onClick={() => setSections((current) => [...current, { id: sectionIdRef.current++, heading: "", body: "" }])} data-testid="report-section-add">{t("composer.addSection", "Add section")}</button>
+        </div>}
+
         {/* Content */}
         <div className="message-composer-field message-composer-field--content">
           <label className="message-composer-label" htmlFor="message-content">
@@ -294,7 +346,7 @@ export function MessageComposer({
         persisted message metadata so reports carry first-class, independently reviewable embeds.
         */}
         <div className="message-composer-field message-composer-field--structures">
-          <label className="message-composer-label" htmlFor="message-native-structure">Attach structure</label>
+          <label className="message-composer-label" htmlFor="message-native-structure">{t("composer.attachStructure", "Attach structure")}</label>
           <div className="message-composer-structure-controls">
             <select
               id="message-native-structure"
@@ -304,7 +356,7 @@ export function MessageComposer({
               onChange={(event) => attachNativeStructure(event.target.value)}
               data-testid="message-composer-attach-structure"
             >
-              <option value="">{nativeStructureCandidates.length === 0 ? "No structures available" : "Select structure…"}</option>
+              <option value="">{nativeStructureCandidates.length === 0 ? t("composer.noStructures", "No structures available") : t("composer.selectStructure", "Select structure…")}</option>
               {nativeStructureCandidates.map((candidate, index) => (
                 <option key={`${candidate.ref.kind}:${candidate.ref.id}`} value={index}>{candidate.ref.kind}: {candidate.label}</option>
               ))}
@@ -318,7 +370,7 @@ export function MessageComposer({
                       capturedLabel={embed.label}
                       onOpen={openNativeStructure}
                     />
-                    <button className="btn btn-sm btn-secondary" type="button" onClick={() => setNativeStructures((current) => current.filter((currentEmbed) => currentEmbed.kind !== embed.kind || currentEmbed.id !== embed.id))} aria-label={`Remove ${embed.label ?? embed.id}`}>Remove</button>
+                    <button className="btn btn-sm btn-secondary" type="button" onClick={() => setNativeStructures((current) => current.filter((currentEmbed) => currentEmbed.kind !== embed.kind || currentEmbed.id !== embed.id))} aria-label={t("composer.removeStructure", "Remove {{label}}", { label: embed.label ?? embed.id })}>{t("actions.remove", "Remove")}</button>
                   </li>
                 ))}
               </ul>
@@ -334,7 +386,7 @@ export function MessageComposer({
             <ComposeChatPanel
               projectId={projectId}
               embeds={nativeStructures}
-              draftBody={content}
+              draftBody={mode === "report" ? `Report: ${reportTitle}\n${sections.map((section) => section.heading).filter(Boolean).join("\n")}\n${content}` : content}
               onUseDraft={(draft) => {
                 if (content.trim() && !window.confirm("Replace the message you have already typed with this draft?")) return;
                 setContent(draft);

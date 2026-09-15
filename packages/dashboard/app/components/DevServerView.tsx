@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getDevServerState, saveDevServerState } from "../hooks/modalPersistence";
+import { isWipColumnRole } from "../utils/columnRoles";
 import type { RefObject } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, ExternalLink, Eye, Loader2, Monitor, Play, RefreshCw, RotateCw, ShieldAlert, Square, X } from "lucide-react";
+import { AlertTriangle, ExternalLink, Eye, Loader2, Monitor, Play, RefreshCw, RotateCw, ShieldAlert, Square } from "lucide-react";
 import type { Task, TaskDetail } from "@fusion/core";
 import "./DevServerView.css";
 import type { DetectedDevServerCommand } from "../api";
@@ -15,8 +17,11 @@ import { DevServerLogViewer } from "./DevServerLogViewer";
 import { PreviewIframe } from "./PreviewIframe";
 import { recordResumeEvent } from "../utils/resumeInstrumentation";
 import { ViewHeader } from "./ViewHeader";
+import { ViewActionButton } from "./ViewActionButton";
 
 interface DevServerViewProps {
+  /** Per-task resolved column flags, from MainContent. */
+  columnFlagsByTaskId?: ReadonlyMap<string, Parameters<typeof isWipColumnRole>[0]>;
   addToast: (msg: string, type?: ToastType) => void;
   projectId?: string;
   tasks?: Array<Task | TaskDetail>;
@@ -169,7 +174,7 @@ function truncateCommand(command: string): string {
   return `${command.slice(0, maxLength)}…`;
 }
 
-export function DevServerView({ addToast, projectId, tasks }: DevServerViewProps) {
+export function DevServerView({ addToast, projectId, tasks, columnFlagsByTaskId }: DevServerViewProps) {
   const { t } = useTranslation("app");
 
   useEffect(() => {
@@ -232,10 +237,27 @@ export function DevServerView({ addToast, projectId, tasks }: DevServerViewProps
   The 480px threshold catches the dock's compact range before preview chrome becomes unusable while preserving full-page, true mobile viewport, and expanded pop-out inline previews.
   */
   const [showCandidates, setShowCandidates] = useState(true);
-  const [commandInput, setCommandInput] = useState("");
+  /*
+  FNXC:DevServer 2026-07-22-13:40:
+  FN remount-churn fix R12: this view unmounts on navigation by design (no keep-alive), so the selected script/task target and a typed-but-unsent command restore from per-project persisted state on remount (modalPersistence precedent). Log pagination/scroll intentionally re-derives live.
+  */
+  const [commandInput, setCommandInput] = useState(() => getDevServerState(projectId)?.commandInput ?? "");
   const [previewInput, setPreviewInput] = useState("");
-  const [selectedScript, setSelectedScript] = useState<string | null>(null);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedScript, setSelectedScript] = useState<string | null>(() => getDevServerState(projectId)?.selectedScript ?? null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(() => getDevServerState(projectId)?.selectedTaskId ?? null);
+  const devServerPersistProjectRef = useRef(projectId);
+  useEffect(() => {
+    if (devServerPersistProjectRef.current === projectId) return;
+    devServerPersistProjectRef.current = projectId;
+    const stored = getDevServerState(projectId);
+    setCommandInput(stored?.commandInput ?? "");
+    setSelectedScript(stored?.selectedScript ?? null);
+    setSelectedTaskId(stored?.selectedTaskId ?? null);
+  }, [projectId]);
+  useEffect(() => {
+    if (devServerPersistProjectRef.current !== projectId) return;
+    saveDevServerState({ selectedScript, selectedTaskId, commandInput }, projectId);
+  }, [commandInput, projectId, selectedScript, selectedTaskId]);
   const [actionInFlight, setActionInFlight] = useState<"start" | "stop" | "restart" | "preview" | null>(null);
 
   /*
@@ -243,9 +265,27 @@ export function DevServerView({ addToast, projectId, tasks }: DevServerViewProps
   The board and right dock pass live task data into DevServerView so the dev server can target the checked-out worktree of an executing task instead of only the integration worktree.
   Only in-progress tasks with concrete worktree paths are targetable because a missing cwd cannot be safely passed to the start endpoint.
   */
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-18:30 (batch-dashboard-app):
+  WIP role, resolved PER TASK. This list is the dev-server's set of live worktrees to attach to;
+  keyed on the literal it was EMPTY on a renamed board, so the view offered nothing to attach to
+  while agents were running with worktrees on disk.
+
+  Per-task rather than per-column id: `columnFlagsByTaskId` is what MainContent already threads to
+  its other children, and an id-keyed map would answer with a neighbouring workflow's traits when
+  two workflows reuse a column id.
+
+  BOTH RENDER SURFACES ARE NOW COVERED. This view also mounts through `overflowViewRegistry` into the
+  right dock, and that path used to answer on the legacy id because the registry's render props
+  carried no flags — recorded here as unfixed while it was. `OverflowViewRenderProps` now carries
+  `columnFlagsByTaskId`, threaded from App through `useRightDockController`, so the dock surface
+  resolves the same way this one does.
+  */
   const executingTasks = useMemo(
-    () => (tasks ?? []).filter((task) => task.column === "in-progress" && typeof task.worktree === "string" && task.worktree.length > 0),
-    [tasks],
+    () => (tasks ?? []).filter((task) =>
+      isWipColumnRole(columnFlagsByTaskId?.get(task.id), task.column)
+      && typeof task.worktree === "string" && task.worktree.length > 0),
+    [tasks, columnFlagsByTaskId],
   );
   const selectedTask = useMemo(
     () => executingTasks.find((task) => task.id === selectedTaskId) ?? null,
@@ -350,7 +390,11 @@ export function DevServerView({ addToast, projectId, tasks }: DevServerViewProps
     }
 
     if (selectedCandidate) {
-      setCommandInput(selectedCandidate.command);
+      /*
+      FNXC:DevServer 2026-07-22-13:50:
+      Never clobber a non-empty command with the candidate default: the user may have customized the command after selecting the script (explicit candidate clicks still sync it via handleSelectCandidate), and R12's restored typed-but-unsent command must survive the remount this effect runs on.
+      */
+      setCommandInput((current) => (current.trim().length > 0 ? current : selectedCandidate.command));
       return;
     }
 
@@ -693,36 +737,29 @@ export function DevServerView({ addToast, projectId, tasks }: DevServerViewProps
               </span>
             </span>
             <div className="dev-server-header-actions">
-              <button
-                type="button"
-                className="btn btn-primary btn-sm"
+              <ViewActionButton
+                kind="create"
+                icon={Play}
+                label={actionInFlight === "start" ? t("devserver.starting", "Starting...") : t("devserver.start", "Start")}
                 onClick={handleStart}
                 disabled={startDisabled}
                 data-testid="dev-server-start-button"
-              >
-                <Play size={14} />
-                <span>{actionInFlight === "start" ? t("devserver.starting", "Starting...") : t("devserver.start", "Start")}</span>
-              </button>
-              <button
-                type="button"
-                className="btn btn-danger btn-sm"
+              />
+              <ViewActionButton
+                icon={Square}
+                className="btn-danger"
+                label={actionInFlight === "stop" ? t("devserver.stopping", "Stopping...") : t("devserver.stop", "Stop")}
                 onClick={handleStop}
                 disabled={stopDisabled}
                 data-testid="dev-server-stop-button"
-              >
-                <Square size={14} />
-                <span>{actionInFlight === "stop" ? t("devserver.stopping", "Stopping...") : t("devserver.stop", "Stop")}</span>
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm"
+              />
+              <ViewActionButton
+                icon={RotateCw}
+                label={actionInFlight === "restart" ? t("devserver.restarting", "Restarting...") : t("devserver.restart", "Restart")}
                 onClick={handleRestart}
                 disabled={restartDisabled}
                 data-testid="dev-server-restart-button"
-              >
-                <RotateCw size={14} />
-                <span>{actionInFlight === "restart" ? t("devserver.restarting", "Restarting...") : t("devserver.restart", "Restart")}</span>
-              </button>
+              />
             </div>
           </>
         )}
@@ -966,18 +1003,21 @@ export function DevServerView({ addToast, projectId, tasks }: DevServerViewProps
             ref={previewModalRef}
             data-testid="devserver-preview-modal"
           >
-            <div className="devserver-preview-modal__titlebar">
-              <h2 id="devserver-preview-modal-title">{t("devserver.preview", "Preview")}</h2>
-              <button
-                type="button"
-                className="btn btn-sm btn-icon"
-                onClick={closePreviewModal}
-                aria-label={t("devserver.closePreviewModal", "Close preview modal")}
-                data-testid="devserver-preview-modal-close"
-              >
-                <X />
-              </button>
-            </div>
+            {/*
+            FNXC:StandardizedViewLayout 2026-09-13-22:40:
+            FN-379 remediation: the narrow-dock preview window shares the canonical header instead of a local
+            titlebar row, keeping its labelling id and close test hook.
+            */}
+            <ViewHeader
+              className="devserver-preview-modal__titlebar"
+              titleId="devserver-preview-modal-title"
+              title={t("devserver.preview", "Preview")}
+              onClose={closePreviewModal}
+              closeButtonProps={{
+                "aria-label": t("devserver.closePreviewModal", "Close preview modal"),
+                "data-testid": "devserver-preview-modal-close",
+              }}
+            />
             <div className="devserver-preview-modal__body">
               {renderPreviewContent()}
             </div>

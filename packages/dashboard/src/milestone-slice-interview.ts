@@ -104,14 +104,28 @@ function parseTargetInterviewResponseImpl(text: string): TargetInterviewResponse
 // Export the parse function for tests
 export { parseTargetInterviewResponseImpl as parseTargetInterviewResponse };
 
-import { buildSessionSkillContextSync, createFnAgent as engineCreateFnAgent, resolveMcpServersForStore } from "@fusion/engine";
+import { buildSessionSkillContextSync, createResolvedAgentSession, promptWithFallback as enginePromptWithFallback, resolveMcpServersForStore } from "@fusion/engine";
 import { createPlanningBoardTools } from "./planning-board-tools.js";
+import { laneModelOptions, resolveLaneSessionModel } from "./lane-session-model.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AgentResult = any;
 type SkillSelectionPluginRunner = Parameters<typeof buildSessionSkillContextSync>[3];
+/*
+FNXC:MissionInterviewRuntimeResolution 2026-08-16-14:37:
+Milestone/slice interviews must use the shared `createResolvedAgentSession` seam (like chat, Planning Mode, and the mission interview) instead of bare `createFnAgent`, which pins the session to the default pi runtime. Without the seam, a CLI-runtime model selection (cursor-cli, claude-cli, hermes, omp-cli, no-key grok-cli) failed with "not found in the pi model registry" while chat on the same model worked.
+*/
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const createFnAgent: any = engineCreateFnAgent;
+const createFnAgent: any = async (options: any): Promise<AgentResult> => {
+  const { pluginRunner, runtimeHint, settings, ...runtimeOptions } = options ?? {};
+  return createResolvedAgentSession({
+    sessionPurpose: "executor",
+    ...(runtimeHint ? { runtimeHint } : {}),
+    ...(pluginRunner ? { pluginRunner } : {}),
+    ...(settings ? { settings } : {}),
+    ...runtimeOptions,
+  });
+};
 
 function ensureEngineReady(): Promise<void> {
   return Promise.resolve();
@@ -316,6 +330,14 @@ interface TargetInterviewSession {
   /** Last terminal error for retry UX */
   error?: string;
   agent?: AgentResult;
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  The provider/model pair this interview runs on, pinned on first resolution so every rebuild
+  (retry, resumed session) stays on the same model instead of falling through to the runtime's
+  built-in Anthropic default. See lane-session-model.ts.
+  */
+  modelProvider?: string;
+  modelId?: string;
   thinkingOutput: string;
   /** Thinking output generated while producing currentQuestion */
   lastGeneratedThinking: string;
@@ -656,6 +678,25 @@ export function getRateLimitResetTime(ip: string): Date | null {
 
 // ── Response Formatting ──────────────────────────────────────────────────────
 
+/*
+FNXC:PlanningQuestionRegeneration 2026-07-23-22:20:
+Reprompt used when a submission arrives while the interview has no active question — the
+agent continues the interview and asks a fresh question instead of the operator seeing
+"No active question in session". Submitted input is preserved as context, never dropped.
+*/
+function formatNoActiveQuestionReprompt(responses: Record<string, unknown>): string {
+  const operatorInput = Object.entries(responses)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+  return [
+    "The interview currently has no active question; continue instead of treating this as an error.",
+    "Use the accumulated interview context and ask exactly one focused next question, following the established response contract.",
+    ...(operatorInput.length
+      ? ["The operator submitted this input while no question was active; honor it as context:", operatorInput.join("\n")]
+      : []),
+  ].join("\n\n");
+}
+
 /**
  * Format user response as a message for the AI agent.
  */
@@ -797,12 +838,31 @@ export async function createTargetInterviewAgent(
   */
   const mcpServers = (await resolveMcpServersForStore(store)).servers;
 
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  This lane previously passed NO provider/model pair at all, so every milestone/slice
+  interview turn ran on the runtime's built-in default model regardless of the operator's
+  configured provider — a permanent `401 invalid x-api-key` for anyone without a raw
+  Anthropic key, and a hole in test-mode forcing. Resolve the planning pair here (covering
+  both the first turn and the rebuild call sites) and pin it to the session.
+  */
+  const model = await resolveLaneSessionModel(
+    store,
+    { provider: session.modelProvider, modelId: session.modelId },
+    (reason) => diagnostics.warn("Milestone/slice interview has no resolved provider/model pair; the runtime will use its built-in default model", { sessionId: session.id, operation: "resolve-interview-model", reason }),
+  );
+  session.modelProvider = model.provider;
+  session.modelId = model.modelId;
+
   return createFnAgent({
     cwd: rootDir,
     systemPrompt: getSystemPrompt(session.targetType),
     tools: "readonly",
     mcpServers,
+    ...laneModelOptions(model),
     allowMcpToolsInReadonly: true,
+    // FNXC:MissionInterviewRuntimeResolution 2026-08-16-14:37: forward the plugin runner so the shared seam can route CLI-runtime model selections to their runtime plugins.
+    ...(pluginRunner ? { pluginRunner } : {}),
     customTools: [...createPlanningBoardTools(store)],
     /*
     FNXC:InterviewSkills 2026-06-17-21:42:
@@ -945,7 +1005,9 @@ async function ensureInterviewAgent(
       if (abortSignal.aborted) {
         throw createAbortError();
       }
-      await session.agent!.session.prompt(
+      // FNXC:MissionInterviewRuntimeResolution 2026-08-16-14:37: prompt through the engine dispatcher — plugin CLI runtime sessions (cursor/grok/droid) have no session.prompt(); the shared seam bound the runtime's promptWithFallback onto the session and this delegates to it.
+      await enginePromptWithFallback(
+        session.agent!.session,
         [
           "Previous conversation summary:",
           historySummary,
@@ -1029,7 +1091,7 @@ async function continueAgentConversation(session: TargetInterviewSession, messag
         if (abortSignal.aborted) {
           throw createAbortError();
         }
-        await agent.session.prompt(message, { signal: abortSignal });
+        await enginePromptWithFallback(agent.session, message, { signal: abortSignal });
         if (abortSignal.aborted) {
           throw createAbortError();
         }
@@ -1076,7 +1138,8 @@ async function continueAgentConversation(session: TargetInterviewSession, messag
                 if (abortSignal.aborted) {
                   throw createAbortError();
                 }
-                await agent.session.prompt(
+                await enginePromptWithFallback(
+                  agent.session,
                   "Your previous response could not be parsed as JSON. " +
                   'Please respond with ONLY a valid JSON object: either {"type":"question","data":{...}} ' +
                   'or {"type":"complete","data":{"title":"...","description":"...","planningNotes":"...","verification":"..."}}' +
@@ -1240,25 +1303,41 @@ export async function submitTargetInterviewResponse(
   }
 
   if (!session.currentQuestion) {
-    throw new TargetInvalidSessionStateError("No active question in session");
+    /*
+    FNXC:PlanningQuestionRegeneration 2026-07-23-22:20:
+    A completed interview (summary present) still rejects late submissions, but a live session
+    with no active question (e.g. cleared by a failed generation) must not dead-end with
+    "No active question in session". Mirror Planning Mode: reprompt the agent to continue the
+    interview and generate a fresh question, carrying the submitted input along as context.
+    No history entry is recorded because there is no question to pair the response with.
+    */
+    if (session.summary) {
+      throw new TargetInvalidSessionStateError("No active question in session");
+    }
+    session.error = undefined;
+    persistSession(session, "generating");
+    if (!session.agent) {
+      await ensureInterviewAgent(session, rootDir, store, session.history, pluginRunner);
+    }
+    await continueAgentConversation(session, formatNoActiveQuestionReprompt(responses));
+  } else {
+    // Record the response
+    session.history.push({
+      question: session.currentQuestion,
+      response: responses,
+      thinkingOutput: session.lastGeneratedThinking || "",
+    });
+    session.error = undefined;
+    persistSession(session, "generating");
+
+    if (!session.agent) {
+      const replayHistory = session.history.slice(0, -1);
+      await ensureInterviewAgent(session, rootDir, store, replayHistory, pluginRunner);
+    }
+
+    const message = formatResponseForAgent(session.currentQuestion, responses);
+    await continueAgentConversation(session, message);
   }
-
-  // Record the response
-  session.history.push({
-    question: session.currentQuestion,
-    response: responses,
-    thinkingOutput: session.lastGeneratedThinking || "",
-  });
-  session.error = undefined;
-  persistSession(session, "generating");
-
-  if (!session.agent) {
-    const replayHistory = session.history.slice(0, -1);
-    await ensureInterviewAgent(session, rootDir, store, replayHistory, pluginRunner);
-  }
-
-  const message = formatResponseForAgent(session.currentQuestion, responses);
-  await continueAgentConversation(session, message);
 
   if (session.summary) {
     return { type: "complete", data: session.summary };

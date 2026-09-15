@@ -13,6 +13,7 @@ import { userEvent } from "@testing-library/user-event";
 import { ChatView } from "../ChatView";
 import {
   renderWithAct,
+  renderChatDetailWithAct,
   setupMockChat,
   activeSessionFixture,
   createMockSkill,
@@ -41,9 +42,14 @@ vi.mock("../../api", () => ({
   }),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchDiscoveredSkills: vi.fn().mockResolvedValue([]),
+  fetchGlobalSettings: vi.fn().mockResolvedValue({ chatSnippets: [] }),
+  updateGlobalSettings: vi.fn().mockResolvedValue({ chatSnippets: [] }),
   fetchTasks: vi.fn().mockResolvedValue([]),
   searchFiles: vi.fn().mockResolvedValue({ files: [] }),
   addSteeringComment: vi.fn(),
+  // FNXC:ChatMemoryFocus (RUFU-068): ChatView now fetches per-session detail to seed
+  // the focus chip; the harness never asserts on it, so resolve to a whole-project session.
+  fetchChatSession: vi.fn().mockResolvedValue({ session: { memoryFocus: null } }),
 }));
 
 import { addSteeringComment } from "../../api";
@@ -57,7 +63,7 @@ const commandContext = { taskId: "TASK-1", projectId: "proj-123", agentRunning: 
 describe("ChatView slash-command dispatch (/steer)", () => {
   it("does not show the command menu entry when no chatCommandContext is provided", async () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [] });
-    await renderWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+    await renderChatDetailWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
 
     const textarea = screen.getByTestId("chat-input");
     await userEvent.type(textarea, "/");
@@ -72,7 +78,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     ]);
     setupMockChat({ activeSession: activeSessionFixture, messages: [] });
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={vi.fn()} chatCommandContext={commandContext} />,
     );
 
@@ -89,7 +95,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     ]);
     setupMockChat({ activeSession: activeSessionFixture, messages: [] });
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={vi.fn()} chatCommandContext={commandContext} />,
     );
 
@@ -102,7 +108,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
 
   it("selecting /steer from the menu inserts the trigger as text, not a /skill: token", async () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [] });
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={vi.fn()} chatCommandContext={commandContext} />,
     );
 
@@ -121,7 +127,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     ]);
     setupMockChat({ activeSession: activeSessionFixture, messages: [] });
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={vi.fn()} chatCommandContext={commandContext} />,
     );
 
@@ -138,7 +144,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     mockAddSteeringComment.mockResolvedValueOnce({ id: "TASK-1" } as any);
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={addToast} chatCommandContext={commandContext} />,
     );
 
@@ -156,7 +162,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [], sendMessage });
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={addToast} chatCommandContext={commandContext} />,
     );
 
@@ -164,7 +170,17 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     fireEvent.change(textarea, { target: { value: "hello there" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("hello there", []));
+    /*
+    FNXC:ChatAttachments 2026-07-23-22:35:
+    FN-8502 made ChatView pass attachment delivery callbacks as a third
+    sendMessage argument ({ onDelivered, onFailed }); assert them structurally
+    so the /steer dispatch contract (text + empty attachments, no steering
+    comment) stays the protected invariant.
+    */
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("hello there", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    })));
     expect(mockAddSteeringComment).not.toHaveBeenCalled();
   });
 
@@ -173,7 +189,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [], sendMessage });
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={addToast} chatCommandContext={commandContext} />,
     );
 
@@ -181,7 +197,11 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     fireEvent.change(textarea, { target: { value: "please /steer this" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("please /steer this", []));
+    // FNXC:ChatAttachments 2026-07-23-22:35: FN-8502 delivery-callback third arg (see above).
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("please /steer this", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    })));
     expect(mockAddSteeringComment).not.toHaveBeenCalled();
   });
 
@@ -190,7 +210,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [], sendMessage });
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView
         projectId="proj-123"
         addToast={addToast}
@@ -210,7 +230,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
 
   it("shows a disabled hint in the menu when no running agent is bound", async () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [] });
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView
         projectId="proj-123"
         addToast={vi.fn()}
@@ -237,7 +257,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     mockAddSteeringComment.mockRejectedValueOnce(new Error("network down"));
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={addToast} chatCommandContext={commandContext} />,
     );
 
@@ -259,7 +279,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     mockAddSteeringComment.mockReturnValueOnce(runPromise as unknown as ReturnType<typeof addSteeringComment>);
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={addToast} chatCommandContext={commandContext} />,
     );
 
@@ -283,7 +303,7 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     setupMockChat({ activeSession: activeSessionFixture, messages: [], sendMessage });
     const addToast = vi.fn();
 
-    await renderWithAct(
+    await renderChatDetailWithAct(
       <ChatView projectId="proj-123" addToast={addToast} chatCommandContext={commandContext} />,
     );
 

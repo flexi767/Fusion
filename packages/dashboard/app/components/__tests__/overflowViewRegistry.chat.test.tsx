@@ -4,19 +4,23 @@ import {
   findOverflowViewEntry,
   getVisibleOverflowViewEntries,
   isOverflowViewKeyVisible,
+  isOverflowViewEntryExpandable,
   type OverflowViewRenderProps,
 } from "../overflowViewRegistry";
 import { readStoredRightDockView, RIGHT_DOCK_VIEW_STORAGE_KEY } from "../RightDock";
 import type { ChatViewProps } from "../ChatView";
 
 vi.mock("../ChatView", () => ({
-  ChatView: ({ projectId, addToast, floating, compactLayout, onPopOut, onMaximize, onMinimize, onClose }: ChatViewProps) => (
+  ChatView: ({ projectId, addToast, floating, compactLayout, listOnly, openChatWindows, onPopOut, onMaximize, onClose, onOpenSessionInNewWindow }: ChatViewProps) => (
     <div
       data-testid="mock-chat-view"
       data-project-id={projectId}
       data-has-toast={String(typeof addToast === "function")}
       data-compact-layout={String(compactLayout === true)}
-      data-has-dock-chrome-props={String(Boolean(floating || onPopOut || onMaximize || onMinimize || onClose))}
+      data-list-only={String(listOnly === true)}
+      data-open-window-count={String(openChatWindows?.size ?? 0)}
+      data-has-dock-chrome-props={String(Boolean(floating || onPopOut || onMaximize || onClose))}
+      data-has-open-window={String(typeof onOpenSessionInNewWindow === "function")}
     >
       Chat dock view
     </div>
@@ -26,6 +30,9 @@ vi.mock("../ChatView", () => ({
 const renderProps: OverflowViewRenderProps = {
   projectId: "project-chat",
   addToast: vi.fn(),
+  onOpenSessionInNewWindow: vi.fn(),
+  experimentalFeatures: {},
+  openChatWindows: new Map([["session-1", "open" as const]]),
 };
 
 describe("overflowViewRegistry chat entry", () => {
@@ -46,6 +53,8 @@ describe("overflowViewRegistry chat entry", () => {
     expect(chatEntry?.testId).toBe("right-dock-tab-chat");
     expect(chatEntry?.render).toBeTypeOf("function");
     expect(chatEntry?.onActivate).toBeUndefined();
+    expect(isOverflowViewEntryExpandable(chatEntry, {})).toBe(true);
+    expect(isOverflowViewEntryExpandable(chatEntry, { hostMode: "alpha-desktop" })).toBe(false);
     expect(getVisibleOverflowViewEntries({}).map((entry) => entry.key)).toContain("chat");
   });
 
@@ -68,7 +77,14 @@ describe("overflowViewRegistry chat entry", () => {
     expect(compactChat).toHaveAttribute("data-has-toast", "true");
     expect(compactChat).toHaveAttribute("data-compact-layout", "true");
     expect(compactChat).toHaveAttribute("data-has-dock-chrome-props", "false");
+    expect(compactChat).toHaveAttribute("data-has-open-window", "true");
+    expect(compactChat).toHaveAttribute("data-list-only", "false");
     compact.unmount();
+
+    const alphaDesktop = render(<>{chatEntry.render({ ...renderProps, hostMode: "alpha-desktop", surface: "dock", dockWidth: 900 })}</>);
+    expect(await screen.findByTestId("mock-chat-view")).toHaveAttribute("data-list-only", "true");
+    expect(screen.getByTestId("mock-chat-view")).toHaveAttribute("data-open-window-count", "1");
+    alphaDesktop.unmount();
 
     const wideDock = render(<>{chatEntry.render({ ...renderProps, surface: "dock", dockWidth: 900 })}</>);
     const wideDockChat = await screen.findByTestId("mock-chat-view");
@@ -81,6 +97,7 @@ describe("overflowViewRegistry chat entry", () => {
     expect(expandedChat).toHaveAttribute("data-has-toast", "true");
     expect(expandedChat).toHaveAttribute("data-compact-layout", "false");
     expect(expandedChat).toHaveAttribute("data-has-dock-chrome-props", "false");
+    expect(expandedChat).toHaveAttribute("data-has-open-window", "true");
   });
 
   it("keeps Files as the default right-dock view when no selection is persisted", () => {

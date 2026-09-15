@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { TaskDetail, TaskStep, WorkflowIr, WorkflowIrNode } from "@fusion/core";
 
-import { WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflow-graph-executor.js";
+import { WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflows/workflow-graph-executor.js";
 import {
   FOREACH_ACTIVE_CONTEXT_KEY,
   type ForeachActiveContext,
   type WorkflowLegacySeams,
-} from "../workflow-node-handlers.js";
-import type { WorkflowStepInstanceState } from "../workflow-graph-foreach.js";
+} from "../workflows/workflow-node-handlers.js";
+import type { WorkflowStepInstanceState } from "../workflows/workflow-graph-foreach.js";
 
 const settingsOn = () => ({ experimentalFeatures: { workflowGraphExecutor: true } });
 
@@ -93,6 +93,21 @@ describe("WorkflowGraphExecutor foreach (U3)", () => {
     // The foreach itself is visited and routes its success edge to end (end is
     // intentionally not pushed to visited — same posture as other tail edges).
     expect(result.visitedNodeIds).toContain("fe");
+  });
+
+  it("uses a distinct materialized identity for each template-session admission", async () => {
+    const admitted: string[] = [];
+    const executor = new WorkflowGraphExecutor({
+      seams: baseSeams({ stepExecute: async () => ({ outcome: "success" as const }) }),
+      beforeNodeExecution: (node, _task, context) => {
+        if (node.id === "exec") admitted.push(String(context["workflow:node-instance-id"]));
+      },
+    });
+
+    const result = await executor.run(taskWithSteps(2), settingsOn(), foreachIr(singleExecuteTemplate()));
+
+    expect(result.outcome).toBe("success");
+    expect(admitted).toEqual(["fe#0:exec", "fe#1:exec"]);
   });
 
   it("zero steps → foreach traverses its success edge without running any instance", async () => {
@@ -489,6 +504,62 @@ describe("WorkflowGraphExecutor foreach (U3)", () => {
     const executor = new WorkflowGraphExecutor({ seams });
     const result = await executor.run(taskWithSteps(1), settingsOn(), foreachIr(singleExecuteTemplate()));
     expect(result.outcome).toBe("failure");
+  });
+
+  it.each([
+    ["explicit worktree isolation", { isolation: "worktree" }],
+    ["parallel's implicit worktree isolation", { mode: "parallel", concurrency: 2 }],
+  ])("%s fails fast for workspace isolation before any allocation", async (_label, config) => {
+    const allocateInstanceWorktree = vi.fn();
+    const resolveIntegrationBase = vi.fn();
+    const resumeReconcile = vi.fn();
+    const logTaskEntry = vi.fn();
+    const executor = new WorkflowGraphExecutor({
+      seams: baseSeams({ stepExecute: async () => ({ outcome: "success", value: "step-done" }) }),
+      allocateInstanceWorktree,
+      resolveIntegrationBase,
+      resumeReconcile,
+      integrationGitOps: { integrate: vi.fn(), discardBranch: vi.fn() },
+      integrationProjection: { markStepDone: vi.fn(), markInstanceIntegrated: vi.fn() },
+      resolveWorktreeIsolationBlock: async () => "per-instance worktree isolation is not supported for workspace projects (task FN-FOREACH)",
+      logTaskEntry,
+    });
+
+    const result = await executor.run(taskWithSteps(1), settingsOn(), foreachIr(singleExecuteTemplate(), { config }));
+
+    expect(result.outcome).toBe("failure");
+    expect(result.context["node:fe:value"]).toBe("worktree-isolation-unsupported-workspace");
+    expect(allocateInstanceWorktree).not.toHaveBeenCalled();
+    expect(resolveIntegrationBase).not.toHaveBeenCalled();
+    expect(resumeReconcile).not.toHaveBeenCalled();
+    expect(logTaskEntry).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringContaining("per-instance worktree isolation is not supported for workspace projects"),
+    );
+  });
+
+  it.each(["returns undefined", "is absent"])("keeps worktree isolation operational when the workspace gate %s", async (gate) => {
+    const allocateInstanceWorktree = vi.fn(async () => ({ worktreePath: "/instance", branchName: "fusion/FN-FOREACH-step-0" }));
+    const executor = new WorkflowGraphExecutor({
+      seams: baseSeams({ stepExecute: async () => ({ outcome: "success", value: "step-done" }) }),
+      allocateInstanceWorktree,
+      resolveIntegrationBase: async () => "base",
+      integrationGitOps: {
+        integrate: async () => ({ kind: "integrated" as const, integratedAt: "now" }),
+        discardBranch: async () => {},
+      },
+      integrationProjection: { markStepDone: async () => {}, markInstanceIntegrated: async () => {} },
+      ...(gate === "returns undefined" ? { resolveWorktreeIsolationBlock: async () => undefined } : {}),
+    });
+
+    const result = await executor.run(
+      taskWithSteps(1),
+      settingsOn(),
+      foreachIr(singleExecuteTemplate(), { config: { isolation: "worktree" } }),
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(allocateInstanceWorktree).toHaveBeenCalledTimes(1);
   });
 
   it("parallel mode (now worktree isolation, U10) fails cleanly without isolation wiring", async () => {

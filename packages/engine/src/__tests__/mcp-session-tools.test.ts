@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ResolvedMcpServerDefinition } from "@fusion/core";
-import { connectMcpSessionTools, uniqueMcpToolName, type McpSessionClient } from "../mcp-session-tools.js";
+import { connectMcpSessionTools, uniqueMcpToolName, type McpSessionClient } from "../mcp/mcp-session-tools.js";
 
 function stdioServer(name: string, enabled = true): ResolvedMcpServerDefinition {
   return { name, transport: "stdio", command: "fake", enabled };
@@ -38,15 +38,24 @@ describe("connectMcpSessionTools", () => {
   it("registers namespaced tools and routes calls to the owning MCP client", async () => {
     const calls: string[] = [];
     const client = fakeClient(["lookup"], calls);
+    const logger = { log: vi.fn(), debug: vi.fn(), warn: vi.fn() };
     const toolset = await connectMcpSessionTools([stdioServer("context7")], {
       clientFactory: () => client,
       transportFactory,
+      logger,
     });
 
     expect(toolset.connected).toEqual(["context7"]);
     expect(toolset.tools.map((tool) => tool.name)).toEqual(["mcp__context7__lookup"]);
     expect(client.connect).toHaveBeenCalledWith(expect.anything(), { timeout: 15_000 });
     expect(client.listTools).toHaveBeenCalledWith(undefined, { timeout: 15_000 });
+    // FNXC:EngineDiagnostics 2026-07-26-09:50: success connect is debug, not info.
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining("MCP server connected for pi session: name=context7"),
+    );
+    expect(logger.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("MCP server connected for pi session"),
+    );
     expect(toolset.tools[0]!.parameters).toMatchObject({
       type: "object",
       properties: { topic: { type: "string", description: "Topic to look up" } },
@@ -167,6 +176,26 @@ describe("connectMcpSessionTools", () => {
 
     expect(toolset.connected).toEqual(["empty"]);
     expect(toolset.tools).toEqual([]);
+  });
+
+  it("records raw server origins for sanitized tool-name collisions", async () => {
+    const clients = new Map([
+      ["Code Nav", fakeClient(["lookup"])],
+      ["code_nav", fakeClient(["lookup"])],
+    ]);
+    const toolset = await connectMcpSessionTools([stdioServer("Code Nav"), stdioServer("code_nav")], {
+      clientFactory: (server) => clients.get(server.name)!,
+      transportFactory,
+    });
+
+    expect(toolset.tools.map((tool) => tool.name)).toEqual([
+      "mcp__code_nav__lookup",
+      "mcp__code_nav__lookup__2",
+    ]);
+    expect(toolset.serverByToolName).toEqual(new Map([
+      ["mcp__code_nav__lookup", "Code Nav"],
+      ["mcp__code_nav__lookup__2", "code_nav"],
+    ]));
   });
 
   it("deduplicates sanitized server and tool name collisions deterministically", () => {

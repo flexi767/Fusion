@@ -1,10 +1,10 @@
+import { createLogger } from "@fusion/core";
 /**
  * Shared AI-Session Diagnostics Helper
  *
  * Provides a reusable diagnostics contract for planning-like AI session flows.
  * Modules such as `planning.ts`, `mission-interview.ts`, `milestone-slice-interview.ts`,
- * and `subtask-breakdown.ts` can use this helper to converge on one consistent
- * diagnostics pattern.
+ * can use this helper to converge on one consistent diagnostics pattern.
  *
  * ## Design Goals
  *
@@ -186,18 +186,17 @@ let _sink: DiagnosticsSink = defaultSink;
  * All methods are non-throwing (safe to call even if console is mocked).
  */
 function defaultSink(level: DiagnosticsLevel, scope: string, message: string, context: DiagnosticsContext): void {
-  const prefix = `[${scope}]`;
-  const logArgs = [prefix, message, context];
+  const log = createLogger(scope);
   try {
     switch (level) {
       case "info":
-        console.log(...logArgs);
+        log.log(message, context);
         break;
       case "warn":
-        console.warn(...logArgs);
+        log.warn(message, context);
         break;
       case "error":
-        console.error(...logArgs);
+        log.error(message, context);
         break;
     }
   } catch {

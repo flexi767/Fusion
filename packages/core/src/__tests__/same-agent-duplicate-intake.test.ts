@@ -5,17 +5,17 @@ const { recordRunAuditEventAsync, softDeleteTaskRowAsync } = vi.hoisted(() => ({
   softDeleteTaskRowAsync: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("../task-store/async-audit.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../task-store/async-audit.js")>()),
+vi.mock("../task-store/async/async-audit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../task-store/async/async-audit.js")>()),
   recordRunAuditEvent: recordRunAuditEventAsync,
 }));
-vi.mock("../task-store/async-persistence.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../task-store/async-persistence.js")>()),
+vi.mock("../task-store/async/async-persistence.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../task-store/async/async-persistence.js")>()),
   softDeleteTaskRow: softDeleteTaskRowAsync,
 }));
 
 import { TombstonedTaskResurrectionError } from "../task-store/errors.js";
-import { _maybeAutoArchiveSameAgentDuplicateBackendImpl } from "../task-store/remaining-ops-2.js";
+import { _resolveSameAgentDuplicateIntakeBackendImpl } from "../task-store/task-mutation-ops.js";
 import { resolveSameAgentDuplicateIntake } from "../task-store/task-creation.js";
 
 const NOW = new Date().toISOString();
@@ -37,8 +37,10 @@ function createStore(overrides: Record<string, unknown> = {}) {
     isWatching: false,
     asyncLayer: { db: {} },
     taskCache: new Map(),
-    getSettings: vi.fn().mockResolvedValue({ autoArchiveDuplicateTasksEnabled: false, tombstoneStickyWindowDays: 7 }),
+    getSettings: vi.fn().mockResolvedValue({ tombstoneStickyWindowDays: 7 }),
     listTasks: vi.fn().mockResolvedValue([]),
+    listTasksBySourceLineage: vi.fn().mockResolvedValue([]),
+    listWorkflowDefinitions: vi.fn().mockResolvedValue([]),
     logEntry: vi.fn().mockResolvedValue(undefined),
     recordActivity: vi.fn().mockResolvedValue(undefined),
     updateTask: vi.fn().mockResolvedValue(undefined),
@@ -61,6 +63,7 @@ describe("same-agent duplicate intake policy (FN-8401)", () => {
     await resolveSameAgentDuplicateIntake(store as any, noProvenance as any, noProvenance as any);
 
     expect(store.listTasks).not.toHaveBeenCalled();
+    expect(store.listTasksBySourceLineage).not.toHaveBeenCalled();
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalled();
   });
@@ -68,15 +71,18 @@ describe("same-agent duplicate intake policy (FN-8401)", () => {
   it("flags the new live duplicate in place and never deletes its sibling by default", async () => {
     const sibling = task("FN-SIBLING", { createdAt: new Date(Date.now() - 60_000).toISOString() });
     const created = task("FN-NEW");
-    const store = createStore({ listTasks: vi.fn().mockResolvedValue([created, sibling]) });
+    const store = createStore({ listTasksBySourceLineage: vi.fn().mockResolvedValue([created, sibling]) });
 
     /*
     FNXC:SameAgentDuplicateIntake 2026-07-19-16:33:
     The production backend wrapper must remain thin so it cannot reintroduce the
     former delete-on-match behavior independently of the shared resolver.
     */
-    await _maybeAutoArchiveSameAgentDuplicateBackendImpl(store as any, created as any, created as any);
+    await _resolveSameAgentDuplicateIntakeBackendImpl(store as any, created as any, created as any);
 
+    // Pre-fix performed a board scan; provenance creates must use the narrow lineage read.
+    expect(store.listTasks).not.toHaveBeenCalled();
+    expect(store.listTasksBySourceLineage).toHaveBeenCalledWith({ sourceAgentId: "agent-intake", sourceParentTaskId: null });
     expect(store.updateTask).toHaveBeenCalledWith("FN-NEW", {
       sourceMetadataPatch: expect.objectContaining({ nearDuplicateOf: "FN-SIBLING" }),
     });
@@ -89,27 +95,11 @@ describe("same-agent duplicate intake policy (FN-8401)", () => {
     expect(created.column).toBe("triage");
   });
 
-  it("archives only the new task when the legacy setting is explicitly enabled", async () => {
-    const sibling = task("FN-SIBLING", { createdAt: new Date(Date.now() - 60_000).toISOString() });
-    const created = task("FN-NEW");
-    const store = createStore({
-      getSettings: vi.fn().mockResolvedValue({ autoArchiveDuplicateTasksEnabled: true, tombstoneStickyWindowDays: 7 }),
-      listTasks: vi.fn().mockResolvedValue([created, sibling]),
-    });
-
-    await resolveSameAgentDuplicateIntake(store as any, created as any, created as any);
-
-    expect(store.moveTask).toHaveBeenCalledWith("FN-NEW", "archived");
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-SIBLING", "archived");
-    expect(store.deleteTaskById).not.toHaveBeenCalled();
-    expect(created.column).toBe("archived");
-  });
-
   it("uses backend-safe tombstone reads and rejects a sticky same-agent resurrection", async () => {
     const deletedAt = new Date(Date.now() - 60_000).toISOString();
     const tombstone = task("FN-TOMBSTONE", { deletedAt, allowResurrection: false });
     const created = task("FN-NEW");
-    const store = createStore({ backendMode: true, listTasks: vi.fn().mockResolvedValue([created, tombstone]) });
+    const store = createStore({ backendMode: true, listTasksBySourceLineage: vi.fn().mockResolvedValue([created, tombstone]) });
 
     await expect(resolveSameAgentDuplicateIntake(store as any, created as any, created as any))
       .rejects.toBeInstanceOf(TombstonedTaskResurrectionError);
@@ -119,7 +109,7 @@ describe("same-agent duplicate intake policy (FN-8401)", () => {
     Soft deletes move to `archived`; sticky tombstones require both flags so
     same-agent recreation is rejected on every persistence backend.
     */
-    expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: true, includeDeleted: true });
+    expect(store.listTasksBySourceLineage).toHaveBeenCalledWith({ sourceAgentId: "agent-intake", sourceParentTaskId: null });
     expect(recordRunAuditEventAsync).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       taskId: "FN-NEW", mutationType: "intake:resurrection-blocked",
     }));

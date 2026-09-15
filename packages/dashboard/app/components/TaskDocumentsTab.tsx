@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FileText, ChevronDown, ChevronUp, Plus, Trash2, History, X } from "lucide-react";
+import { FileText, ChevronDown, ChevronUp, Plus, Trash2, History } from "lucide-react";
 import "./DocumentsView.css";
 import "./TaskDocumentsTab.css";
 import ReactMarkdown from "react-markdown";
@@ -18,6 +18,7 @@ import {
 import { useArtifacts } from "../hooks/useArtifacts";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { ArtifactMedia, getArtifactTypeLabel } from "./ArtifactMedia";
+import { ArtifactImageViewer } from "./ArtifactImageViewer";
 
 // Document key validation: alphanumeric, hyphens, underscores, 1-64 chars
 const DOCUMENT_KEY_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -96,12 +97,12 @@ function TaskArtifactCard({ artifact, projectId, onExpandImage }: TaskArtifactCa
           onClick={() => onExpandImage(artifact)}
           aria-label={t("documents.expandImageArtifact", "Expand image artifact {{title}}", { title })}
         >
-          <ArtifactMedia artifact={artifact} mediaUrl={mediaUrl} title={title} preview={preview} t={t} />
+          <ArtifactMedia artifact={artifact} mediaUrl={mediaUrl} projectId={projectId} title={title} preview={preview} t={t} />
           <span className="documents-artifact-expand-hint">{t("documents.expandArtifactHint", "Click to expand")}</span>
         </button>
       ) : (
         <div className="documents-artifact-preview">
-          <ArtifactMedia artifact={artifact} mediaUrl={mediaUrl} title={title} preview={preview} t={t} />
+          <ArtifactMedia artifact={artifact} mediaUrl={mediaUrl} projectId={projectId} title={title} preview={preview} t={t} />
         </div>
       )}
       <div className="documents-artifact-body">
@@ -132,8 +133,17 @@ export function TaskDocumentsTab({
   const [loading, setLoading] = useState(true);
   const [expandedDocKeys, setExpandedDocKeys] = useState<Set<string>>(() => new Set());
   const [revisionContentByKey, setRevisionContentByKey] = useState<Record<string, string>>({});
+  /*
+  FNXC:TaskDocumentCAS 2026-07-20-11:06:
+  Task Detail captures the loaded revision/hash when editing begins and never replaces that baseline behind the draft. A 409 refreshes visible server state while retaining the editor and exact user draft on desktop and mobile; Save never silently retries a stale overwrite. New-document saves use revision zero so duplicate-key races are visible conflicts.
+
+  FNXC:TaskDocumentCAS 2026-07-20-15:42:
+  After a conflict, keep the refreshed revision/hash pending until the operator explicitly rebases the preserved draft. Disable Save during that decision so repeated clicks cannot resubmit the stale baseline or silently adopt a newer baseline.
+  */
   const [editingDocKey, setEditingDocKey] = useState<string | null>(null);
   const [editContent, setEditContent] = useState("");
+  const [editPrecondition, setEditPrecondition] = useState<{ revision: number; contentHash: string } | null>(null);
+  const [pendingEditRebase, setPendingEditRebase] = useState<{ revision: number; contentHash: string } | null>(null);
   const [showHistory, setShowHistory] = useState<string | null>(null);
   const [revisions, setRevisions] = useState<TaskDocumentRevision[]>([]);
   const [loadingRevisions, setLoadingRevisions] = useState(false);
@@ -153,9 +163,6 @@ export function TaskDocumentsTab({
    * Task detail image artifacts must be viewable in-place from the task modal. Keep the expand target image-only so document, audio, video, and generic cards retain their current non-lightbox behavior without empty controls.
    */
   const [lightboxArtifact, setLightboxArtifact] = useState<ArtifactWithTask | null>(null);
-  const lightboxDialogRef = useRef<HTMLDivElement>(null);
-  const lightboxCloseRef = useRef<HTMLButtonElement>(null);
-  const lightboxReturnFocusRef = useRef<HTMLElement | null>(null);
   const loadedTaskIdRef = useRef(taskId);
   const documentKeysRef = useRef<Set<string>>(new Set());
   const { artifacts, loading: artifactsLoading, error: artifactsError } = useArtifacts({ projectId, taskId });
@@ -178,8 +185,10 @@ export function TaskDocumentsTab({
         return next;
       });
       setRevisionContentByKey((current) => Object.fromEntries(Object.entries(current).filter(([key]) => nextKeys.has(key))));
+      return docs;
     } catch (error) {
       addToast(getErrorMessage(error) || t("taskDocuments.failedToLoad", "Failed to load documents"), "error");
+      return undefined;
     } finally {
       setLoading(false);
     }
@@ -214,6 +223,8 @@ export function TaskDocumentsTab({
       if (editingDocKey === doc.key) {
         setEditingDocKey(null);
         setEditContent("");
+        setEditPrecondition(null);
+        setPendingEditRebase(null);
       }
       if (showHistory === doc.key) {
         setShowHistory(null);
@@ -243,20 +254,35 @@ export function TaskDocumentsTab({
   function handleStartEdit(doc: TaskDocument) {
     setEditingDocKey(doc.key);
     setEditContent(revisionContentByKey[doc.key] ?? doc.content);
+    setEditPrecondition({ revision: doc.revision, contentHash: doc.contentHash });
+    setPendingEditRebase(null);
   }
 
   function handleCancelEdit() {
     setEditingDocKey(null);
     setEditContent("");
+    setEditPrecondition(null);
+    setPendingEditRebase(null);
+  }
+
+  function handleRebaseEdit() {
+    if (!pendingEditRebase) return;
+    setEditPrecondition(pendingEditRebase);
+    setPendingEditRebase(null);
   }
 
   async function handleSaveEdit() {
-    if (!editingDocKey || !editContent.trim()) return;
+    if (!editingDocKey || !editContent.trim() || !editPrecondition || pendingEditRebase) return;
     setSaving(true);
     try {
-      await putTaskDocument(taskId, editingDocKey, editContent, {}, projectId);
+      await putTaskDocument(taskId, editingDocKey, editContent, {
+        expectedRevision: editPrecondition.revision,
+        expectedContentHash: editPrecondition.contentHash,
+      }, projectId);
       setEditingDocKey(null);
       setEditContent("");
+      setEditPrecondition(null);
+      setPendingEditRebase(null);
       setRevisionContentByKey((current) => {
         const next = { ...current };
         delete next[editingDocKey];
@@ -265,7 +291,16 @@ export function TaskDocumentsTab({
       await loadDocuments();
       addToast(t("taskDocuments.saved", "Document saved"), "success");
     } catch (error) {
-      addToast(getErrorMessage(error) || t("taskDocuments.failedToSave", "Failed to save document"), "error");
+      if (typeof error === "object" && error !== null && "status" in error && error.status === 409) {
+        const latestDocuments = await loadDocuments();
+        const latest = latestDocuments?.find((doc) => doc.key === editingDocKey);
+        if (latest) {
+          setPendingEditRebase({ revision: latest.revision, contentHash: latest.contentHash });
+          addToast(t("taskDocuments.staleCopy", "This document changed since you opened it. Your draft is preserved; review the latest revision, then choose Rebase draft before saving."), "error");
+        }
+      } else {
+        addToast(getErrorMessage(error) || t("taskDocuments.failedToSave", "Failed to save document"), "error");
+      }
     } finally {
       setSaving(false);
     }
@@ -291,14 +326,19 @@ export function TaskDocumentsTab({
 
     setSaving(true);
     try {
-      await putTaskDocument(taskId, key, content, {}, projectId);
+      await putTaskDocument(taskId, key, content, { expectedRevision: 0 }, projectId);
       setShowCreateForm(false);
       setNewDocKey("");
       setNewDocContent("");
       await loadDocuments();
       addToast(t("taskDocuments.created", "Document created"), "success");
     } catch (error) {
-      addToast(getErrorMessage(error) || t("taskDocuments.failedToCreate", "Failed to create document"), "error");
+      if (typeof error === "object" && error !== null && "status" in error && error.status === 409) {
+        await loadDocuments();
+        addToast(t("taskDocuments.keyAlreadyCreated", "A document with this key was created elsewhere. Your draft is preserved; choose a new key or rebase onto the current document."), "error");
+      } else {
+        addToast(getErrorMessage(error) || t("taskDocuments.failedToCreate", "Failed to create document"), "error");
+      }
     } finally {
       setSaving(false);
     }
@@ -339,79 +379,8 @@ export function TaskDocumentsTab({
     setEditContent("");
   }
 
-  const handleExpandArtifactImage = useCallback((artifact: ArtifactWithTask) => {
-    lightboxReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    setLightboxArtifact(artifact);
-  }, []);
-
-  const handleCloseLightbox = useCallback(() => {
-    setLightboxArtifact(null);
-    lightboxReturnFocusRef.current?.focus();
-    lightboxReturnFocusRef.current = null;
-  }, []);
-
-  useEffect(() => {
-    if (!lightboxArtifact) {
-      return;
-    }
-
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    lightboxCloseRef.current?.focus();
-
-    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        handleCloseLightbox();
-        return;
-      }
-
-      if (event.key !== "Tab") {
-        return;
-      }
-
-      /*
-       * FNXC:ArtifactRegistry 2026-06-29-17:08:
-       * The artifact preview declares an aria-modal dialog, so keyboard focus must stay inside the lightbox until Escape, overlay click, or the close button dismisses it. Cycle Tab/Shift+Tab over current focusable controls instead of letting focus escape into the task-detail modal behind the overlay.
-       */
-      const dialog = lightboxDialogRef.current;
-      const focusableElements = Array.from(dialog?.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ) ?? []).filter((element) => element.getAttribute("aria-hidden") !== "true");
-
-      if (!dialog || focusableElements.length === 0) {
-        event.preventDefault();
-        return;
-      }
-
-      const firstElement = focusableElements[0];
-      const lastElement = focusableElements[focusableElements.length - 1];
-      const activeElement = document.activeElement;
-
-      if (event.shiftKey && activeElement === firstElement) {
-        event.preventDefault();
-        lastElement.focus();
-      } else if (!event.shiftKey && activeElement === lastElement) {
-        event.preventDefault();
-        firstElement.focus();
-      } else if (!dialog.contains(activeElement)) {
-        event.preventDefault();
-        firstElement.focus();
-      }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [handleCloseLightbox, lightboxArtifact]);
-
-  const handleLightboxOverlayClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
-    if (event.target === event.currentTarget) {
-      handleCloseLightbox();
-    }
-  }, [handleCloseLightbox]);
+  const handleExpandArtifactImage = useCallback((artifact: ArtifactWithTask) => setLightboxArtifact(artifact), []);
+  const handleCloseLightbox = useCallback(() => setLightboxArtifact(null), []);
 
   if (loading || artifactsLoading) {
     return (
@@ -611,10 +580,15 @@ export function TaskDocumentsTab({
                     <button className="btn btn-sm" onClick={handleCancelEdit} disabled={saving}>
                       {t("taskDocuments.cancel", "Cancel")}
                     </button>
+                    {pendingEditRebase && (
+                      <button className="btn btn-sm" onClick={handleRebaseEdit} disabled={saving}>
+                        {t("taskDocuments.rebaseDraft", "Rebase draft")}
+                      </button>
+                    )}
                     <button
                       className="btn btn-primary btn-sm"
                       onClick={() => void handleSaveEdit()}
-                      disabled={saving || !editContent.trim()}
+                      disabled={saving || !editContent.trim() || pendingEditRebase !== null}
                     >
                       {saving ? t("taskDocuments.saving", "Saving…") : t("taskDocuments.save", "Save")}
                     </button>
@@ -702,32 +676,7 @@ export function TaskDocumentsTab({
       )}
       </section>
 
-      {lightboxArtifact && (
-        <div
-          ref={lightboxDialogRef}
-          className="modal-overlay open documents-artifact-lightbox-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={t("documents.lightboxLabel", "Artifact media preview")}
-          onClick={handleLightboxOverlayClick}
-        >
-          <div className="documents-artifact-lightbox" onClick={(event) => event.stopPropagation()}>
-            <div className="documents-artifact-lightbox-header">
-              <h3 className="documents-artifact-lightbox-title">{lightboxArtifact.title || t("documents.untitledArtifact", "Untitled artifact")}</h3>
-              <button ref={lightboxCloseRef} className="modal-close" onClick={handleCloseLightbox} aria-label={t("documents.closeLightbox", "Close artifact preview")}>
-                <X size={20} />
-              </button>
-            </div>
-            <div className="documents-artifact-lightbox-media-frame">
-              <img
-                className="documents-artifact-lightbox-media"
-                src={artifactMediaUrlWithToken(lightboxArtifact.id, projectId)}
-                alt={lightboxArtifact.title || t("documents.untitledArtifact", "Untitled artifact")}
-              />
-            </div>
-          </div>
-        </div>
-      )}
+      {lightboxArtifact && <ArtifactImageViewer artifactId={lightboxArtifact.id} title={lightboxArtifact.title || t("documents.untitledArtifact", "Untitled artifact")} projectId={projectId} onClose={handleCloseLightbox} />}
     </div>
   );
 }

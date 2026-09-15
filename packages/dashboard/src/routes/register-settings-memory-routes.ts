@@ -1,4 +1,13 @@
 import {
+  createLogger,
+  effectiveEnabledBuiltinWorkflowIds,
+  getRequiredPluginIdForBuiltinWorkflow,
+  validateEnabledBuiltinWorkflowIds,
+} from "@fusion/core";
+import { resolveRequestActor } from "../request-actor.js";
+
+const severityAuditLog = createLogger("dashboard-register-settings-memory-routes");
+import {
   DEFAULT_GLOBAL_SETTINGS,
   GLOBAL_SETTINGS_KEYS,
   PROJECT_SETTINGS_KEYS,
@@ -28,8 +37,6 @@ import {
   resolveTitleSummarizerSettingsModel,
   resolveWorktrunkSettings,
   requiresWorktrunkInstallVerification,
-  isRecycleWorktreeNamingConflict,
-  RECYCLE_WORKTREE_NAMING_CONFLICT_MESSAGE,
   scheduleQmdProjectMemoryRefresh,
   searchProjectMemory,
   syncBackupRoutine,
@@ -45,12 +52,17 @@ import {
   writeMemory,
   writeProjectMemoryFile,
   updatePiExtensionDisabledIds,
+  detectWorkspaceRepos,
+  loadWorkspaceConfig,
 } from "@fusion/core";
 import {
   buildSessionSkillContextSync,
   createFnAgent as engineCreateFnAgent,
+  getRemoteTunnelService,
   probeWorktrunk,
+  remoteTunnelScopeKey,
   resolveWorktrunkBinary,
+  type RemoteTunnelService,
 } from "@fusion/engine";
 import QRCode from "qrcode";
 import crypto from "node:crypto";
@@ -61,6 +73,7 @@ import { mkdir } from "node:fs/promises";
 import { promisify } from "node:util";
 import { ApiError, badRequest } from "../api-error.js";
 import { resolveGithubTrackingAuth } from "../github-auth.js";
+import { emitWorkflowSseEvent } from "../sse.js";
 import { generateRemoteToken, issueRemoteAuthToken, maskRemoteToken } from "../remote-auth.js";
 import { invalidateAllGlobalSettingsCaches } from "../project-store-resolver.js";
 import type { ApiRoutesContext } from "./types.js";
@@ -246,7 +259,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       if (process.arch === "x64") {
         return "cloudflared-linux-amd64";
       }
-      console.warn(`[remote-access] Unsupported Linux architecture '${process.arch}' for cloudflared; falling back to amd64`);
+      severityAuditLog.warn(`[remote-access] Unsupported Linux architecture '${process.arch}' for cloudflared; falling back to amd64`);
       return "cloudflared-linux-amd64";
     }
 
@@ -257,7 +270,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       if (process.arch === "x64") {
         return "cloudflared-darwin-amd64";
       }
-      console.warn(`[remote-access] Unsupported macOS architecture '${process.arch}' for cloudflared; falling back to amd64`);
+      severityAuditLog.warn(`[remote-access] Unsupported macOS architecture '${process.arch}' for cloudflared; falling back to amd64`);
       return "cloudflared-darwin-amd64";
     }
 
@@ -494,8 +507,40 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         },
       },
     });
+    /*
+    FNXC:RemoteAccessAuth 2026-08-18-06:49:
+    A token minted from any remote surface must authenticate at /remote-login
+    immediately, including when its server-level store was cached before mint.
+    */
+    invalidateAllGlobalSettingsCaches();
 
     return token;
+  }
+
+  /*
+  FNXC:RemoteAccess 2026-08-31-07:08:
+  Remote access must not depend on an attached engine. Incident: "Stop engine" killed the Tailscale
+  funnel AND left the project durably paused, so the very control that would restart the engine was
+  unreachable — the operator lost the box. The tunnel now lives in a process-lifetime per-project
+  service (@fusion/engine remote-tunnel-service), so every remote route resolves it directly.
+
+  When an engine IS attached the routes still go through the engine's own tunnel methods (which now
+  delegate to the very same service), so there is exactly one code path in production; this resolver is
+  the engine-less fallback. It takes the engine's service when one is available rather than re-deriving
+  the key, so the two paths can never land on two different services — that would mean two tunnels for
+  one project.
+  */
+  function resolveTunnelService(ctx: {
+    store: typeof store;
+    engine: { remoteTunnelService?: () => RemoteTunnelService } | undefined;
+    projectId?: string;
+  }): RemoteTunnelService {
+    const fromEngine = ctx.engine?.remoteTunnelService?.();
+    if (fromEngine) return fromEngine;
+    return getRemoteTunnelService(remoteTunnelScopeKey({
+      projectId: ctx.projectId ?? null,
+      rootDir: ctx.store.getRootDir?.() ?? null,
+    }));
   }
 
   function getCurrentTunnelUrl(engine: unknown): string | null {
@@ -583,7 +628,11 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
 
   router.put("/settings", async (req, res) => {
     try {
-      const { store: scopedStore } = await getProjectContext(req);
+      const workflowEnablementPatch = Object.prototype.hasOwnProperty.call(req.body ?? {}, "enabledBuiltinWorkflowIds");
+      const { store: scopedStore, projectId } = await getProjectContext(req);
+      const previousWorkflowSettings = workflowEnablementPatch
+        ? await scopedStore.getSettings()
+        : undefined;
       // Strip server-owned fields that should never be persisted to config.json.
       // These are computed server-side and injected only on GET /settings.
        
@@ -603,28 +652,36 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         throw badRequest(`Cannot update global settings via this endpoint. Use PUT /settings/global instead. Global fields found: ${globalFieldsFound.join(", ")}`);
       }
 
+      if (Object.prototype.hasOwnProperty.call(clientSettings, "enabledBuiltinWorkflowIds")) {
+        try {
+          validateEnabledBuiltinWorkflowIds(clientSettings.enabledBuiltinWorkflowIds);
+          if (Array.isArray(clientSettings.enabledBuiltinWorkflowIds)) {
+            for (const workflowId of clientSettings.enabledBuiltinWorkflowIds) {
+              const requiredPluginId = getRequiredPluginIdForBuiltinWorkflow(workflowId);
+              if (requiredPluginId && !(await scopedStore.isPluginInstalled(requiredPluginId))) {
+                throw new Error(`enabledBuiltinWorkflowIds contains unavailable plugin-gated workflow id: ${workflowId}`);
+              }
+            }
+          }
+        } catch (error) {
+          throw badRequest(error instanceof Error ? error.message : String(error));
+        }
+      }
+
       if (Object.prototype.hasOwnProperty.call(clientSettings, "modelPresets")) {
         clientSettings.modelPresets = validateModelPresets(clientSettings.modelPresets);
       }
       if (Object.prototype.hasOwnProperty.call(clientSettings, "ignoreHiddenOverlapPaths")) {
         clientSettings.ignoreHiddenOverlapPaths = sanitizeBooleanSetting("ignoreHiddenOverlapPaths", clientSettings.ignoreHiddenOverlapPaths);
       }
+      // FNXC:TaskRecommendations 2026-08-19-13:05: Keep the required-completion policy boolean-safe at the HTTP boundary while canonical project-key routing handles scope and persistence.
+      if (Object.prototype.hasOwnProperty.call(clientSettings, "requireTaskRecommendations")) {
+        clientSettings.requireTaskRecommendations = sanitizeBooleanSetting("requireTaskRecommendations", clientSettings.requireTaskRecommendations);
+      }
       if (Object.prototype.hasOwnProperty.call(clientSettings, "overlapIgnorePaths")) {
         clientSettings.overlapIgnorePaths = sanitizeOverlapIgnorePaths(clientSettings.overlapIgnorePaths);
       }
 
-      if (clientSettings.autoArchiveDoneAfterMs !== undefined) {
-        const ageMs = clientSettings.autoArchiveDoneAfterMs;
-        if (!Number.isInteger(ageMs) || ageMs < 60_000 || ageMs > 10 * 365 * 24 * 60 * 60 * 1000) {
-          throw badRequest("autoArchiveDoneAfterMs must be between 60000 and 315360000000");
-        }
-      }
-      if (clientSettings.doneAutoArchiveDays !== undefined) {
-        const doneAutoArchiveDays = clientSettings.doneAutoArchiveDays;
-        if (!Number.isInteger(doneAutoArchiveDays) || doneAutoArchiveDays < 0 || doneAutoArchiveDays > 3650) {
-          throw badRequest("doneAutoArchiveDays must be an integer between 0 and 3650");
-        }
-      }
       const operationalLogRetentionDays = clientSettings.operationalLogRetentionDays;
       if (operationalLogRetentionDays !== undefined && operationalLogRetentionDays !== null) {
         if (
@@ -634,12 +691,6 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         ) {
           throw badRequest("operationalLogRetentionDays must be one of: 0, 7, 14, 30, 60, 90");
         }
-      }
-      if (
-        clientSettings.archiveAgentLogMode !== undefined &&
-        !["none", "compact", "full"].includes(clientSettings.archiveAgentLogMode)
-      ) {
-        throw badRequest("archiveAgentLogMode must be one of: none, compact, full");
       }
       if (clientSettings.unavailableNodePolicy !== undefined) {
         const validatedUnavailableNodePolicy = validateUnavailableNodePolicy(clientSettings.unavailableNodePolicy);
@@ -691,22 +742,19 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         }
       }
 
-      // FNXC:TaskPinnedWorktrees 2026-07-16-00:00: recycleWorktrees and worktreeNaming:"task-id" are mutually
-      // exclusive. Validate the RESOLVED next state (current merged with this partial patch) so a clean 400 is
-      // returned before the store backstop throws. Only fetch current settings when one of the two fields moves.
-      if (
-        Object.prototype.hasOwnProperty.call(clientSettings, "recycleWorktrees")
-        || Object.prototype.hasOwnProperty.call(clientSettings, "worktreeNaming")
-      ) {
-        const currentForWorktreeCheck = await scopedStore.getSettings();
-        const nextRecycle = Object.prototype.hasOwnProperty.call(clientSettings, "recycleWorktrees")
-          ? clientSettings.recycleWorktrees
-          : currentForWorktreeCheck.recycleWorktrees;
-        const nextNaming = Object.prototype.hasOwnProperty.call(clientSettings, "worktreeNaming")
-          ? clientSettings.worktreeNaming
-          : currentForWorktreeCheck.worktreeNaming;
-        if (isRecycleWorktreeNamingConflict({ recycleWorktrees: nextRecycle, worktreeNaming: nextNaming })) {
-          throw badRequest(RECYCLE_WORKTREE_NAMING_CONFLICT_MESSAGE);
+      /*
+      FNXC:Workspace 2026-08-15-05:28:
+      This dashboard-only preflight explains an unachievable enable. The universal publish seam
+      remains authoritative for CLI/MCP/import/rollback writers and unpredictable disk failures.
+      */
+      if (clientSettings.workspaceMode === true) {
+        const currentSettings = await scopedStore.getSettings();
+        const existing = await loadWorkspaceConfig(scopedStore.rootDir);
+        if (currentSettings.workspaceMode !== true && !existing?.repos.length) {
+          const repos = await detectWorkspaceRepos(scopedStore.rootDir);
+          if (repos.length === 0) {
+            throw badRequest(`Workspace mode requires at least one git sub-repository under project root ${scopedStore.rootDir}`);
+          }
         }
       }
 
@@ -735,22 +783,32 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         }
       }
 
-      const settings = await scopedStore.updateSettings(clientSettings);
-      
+      const settings = await scopedStore.updateSettings(clientSettings, resolveRequestActor(req));
+      if (
+        workflowEnablementPatch
+        && previousWorkflowSettings
+        && JSON.stringify(effectiveEnabledBuiltinWorkflowIds(previousWorkflowSettings.enabledBuiltinWorkflowIds))
+          !== JSON.stringify(effectiveEnabledBuiltinWorkflowIds(settings.enabledBuiltinWorkflowIds))
+      ) {
+        /*
+        FNXC:DisabledBuiltinWorkflows 2026-08-19-00:18:
+        Settings changes invalidate the shared board-workflow cache only after the
+        PostgreSQL settings/revision transaction commits. One event refreshes every
+        Header, Board, List, Planning, and Graph consumer without polling.
+        */
+        emitWorkflowSseEvent("workflow:updated", { reason: "enabledBuiltinWorkflowIds" }, projectId);
+      }
       res.json(settings);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
       }
       const errorMessage = err instanceof Error ? err.message : String(err);
-      // FNXC:TaskPinnedWorktrees 2026-07-16-12:30: the recycleWorktrees/worktreeNaming mutual-exclusion
-      // backstop lives in store.updateSettings, so it can fire for edge cases the route pre-check misses
-      // (e.g. a null-clear that resolves to a conflicting fallback). Classify it as a 400 client error here
-      // alongside the other validation messages so it never surfaces as a 500.
       const status = (
         errorMessage.includes("modelPresets")
         || errorMessage.includes("must include both provider and modelId")
-        || errorMessage.includes("mutually exclusive")
+        || errorMessage.includes("enabledBuiltinWorkflowIds")
+        || errorMessage.includes("requireTaskRecommendations must be a boolean")
       ) ? 400 : 500;
       throw new ApiError(status, errorMessage);
     }
@@ -855,6 +913,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       };
 
       await scopedStore.updateGlobalSettings({ remoteAccess: nextRemoteAccess });
+      invalidateAllGlobalSettingsCaches();
       res.json({ settings: toRemoteSettingsPayload(nextRemoteAccess) });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
@@ -864,11 +923,11 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
 
   router.get("/remote/status", async (req, res) => {
     try {
-      const { store: scopedStore, engine } = await getProjectContext(req);
+      const { store: scopedStore, engine, projectId } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
-      const manager = engine?.getRemoteTunnelManager();
-      const tunnelStatus = manager?.getStatus();
-      const restore = engine?.getRemoteTunnelRestoreDiagnostics();
+      const tunnelService = engine ? undefined : resolveTunnelService({ store: scopedStore, engine, projectId });
+      const tunnelStatus = engine ? engine.getRemoteTunnelManager()?.getStatus() : tunnelService?.getStatus();
+      const restore = engine ? engine.getRemoteTunnelRestoreDiagnostics() : tunnelService?.getRestoreDiagnostics();
 
       const activeProvider = tunnelStatus?.provider ?? settings.remoteAccess?.activeProvider ?? null;
       const tunnelState = tunnelStatus?.state ?? "stopped";
@@ -878,7 +937,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       }
 
       const externalTunnel = tunnelState === "stopped"
-        ? await engine?.detectExternalTunnel()
+        ? (engine ? await engine.detectExternalTunnel() : await tunnelService?.detectExternal(scopedStore) ?? null)
         : null;
 
       res.json({
@@ -933,6 +992,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
           activeProvider: provider,
         },
       });
+      invalidateAllGlobalSettingsCaches();
       res.json({ activeProvider: provider });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
@@ -942,7 +1002,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
 
   router.post("/remote/tunnel/start", async (req, res) => {
     try {
-      const { store: scopedStore, engine } = await getProjectContext(req);
+      const { store: scopedStore, engine, projectId } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
       const provider = settings.remoteAccess?.activeProvider ?? null;
       if (!provider) {
@@ -972,12 +1032,21 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         }
       }
 
-      if (!engine) {
-        res.json({ state: "starting", provider });
-        return;
-      }
+      /*
+      FNXC:RemoteAuth 2026-08-19-01:10:
+      NO SILENT FAKE "STARTING". This route once answered `{state:"starting"}` when it could not act,
+      so the UI showed a tunnel coming up that never would. Whatever this route reports is the truth.
 
-      const status = await engine.startRemoteTunnel();
+      FNXC:RemoteAccess 2026-08-31-07:08:
+      The engine-unavailable bail is GONE. A tunnel no longer needs an engine: the process-lifetime
+      service starts one from the scoped store alone. That bail was reachable in exactly the state the
+      operator got stuck in — engine stopped, project paused, no engine attachable — and it made
+      remote access unrecoverable from the UI, which is also how they reached the box. Prerequisite
+      and config failures still surface through the catch below, so nothing is silently faked.
+      */
+      const status = engine
+        ? await engine.startRemoteTunnel()
+        : await resolveTunnelService({ store: scopedStore, engine, projectId }).start(scopedStore);
       res.json({
         state: status.state,
         provider: status.provider,
@@ -999,16 +1068,13 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
 
   router.post("/remote/tunnel/stop", async (req, res) => {
     try {
-      const { store: scopedStore, engine } = await getProjectContext(req);
-      const settings = await scopedStore.getSettings();
-      const provider = settings.remoteAccess?.activeProvider ?? null;
+      const { store: scopedStore, engine, projectId } = await getProjectContext(req);
 
-      if (!engine) {
-        res.json({ state: "stopped", provider });
-        return;
-      }
-
-      const status = await engine.stopRemoteTunnel();
+      // FNXC:RemoteAccess 2026-08-31-07:08: symmetric with start — stopping a tunnel must not require
+      // an engine either, or a tunnel started engine-lessly could never be stopped from the UI.
+      const status = engine
+        ? await engine.stopRemoteTunnel()
+        : await resolveTunnelService({ store: scopedStore, engine, projectId }).stop(scopedStore);
       res.json({
         state: status.state,
         provider: status.provider,
@@ -1024,9 +1090,12 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
 
   router.post("/remote/tunnel/kill-external", async (req, res) => {
     try {
-      const { engine } = await getProjectContext(req);
+      const { store: scopedStore, engine, projectId } = await getProjectContext(req);
+      // FNXC:RemoteAccess 2026-08-31-07:08: engine-independent, like start/stop.
       if (engine) {
         await engine.killExternalTunnel();
+      } else {
+        await resolveTunnelService({ store: scopedStore, engine, projectId }).killExternal(scopedStore);
       }
       res.json({ ok: true });
     } catch (err: unknown) {
@@ -1057,6 +1126,7 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
           },
         },
       });
+      invalidateAllGlobalSettingsCaches();
       res.json({ token, maskedToken: maskRemoteToken(token) });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;

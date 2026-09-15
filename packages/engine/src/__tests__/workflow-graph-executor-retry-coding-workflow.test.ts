@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { BUILTIN_CODING_WORKFLOW_IR } from "@fusion/core";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
 
-import { WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflow-graph-executor.js";
+import { WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflows/workflow-graph-executor.js";
 
 const task = { id: "FN-6051" } as TaskDetail;
 
@@ -38,9 +38,11 @@ describe("WorkflowGraphExecutor built-in coding workflow retries", () => {
       "plan-review::plan-review-step",
       "execute",
       "browser-verification",
+      /* FNXC:WorkflowIR 2026-08-23-22:20: the built-in coding IR wires completion-summary BEFORE
+         code-review; this topology list still encoded the pre-reorder order. */
+      "completion-summary",
       "code-review",
       "code-review::code-review-step",
-      "completion-summary",
       "review",
       "merge",
       "post-merge-verification",
@@ -133,9 +135,11 @@ describe("WorkflowGraphExecutor built-in coding workflow retries", () => {
       "plan-review::plan-review-step",
       "execute",
       "browser-verification",
+      /* FNXC:WorkflowIR 2026-08-23-22:20: the built-in coding IR wires completion-summary BEFORE
+         code-review; this topology list still encoded the pre-reorder order. */
+      "completion-summary",
       "code-review",
       "code-review::code-review-step",
-      "completion-summary",
       "review",
     ]);
   });

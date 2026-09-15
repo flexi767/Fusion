@@ -7,14 +7,14 @@ import {
   resolveAgentPrompt,
   resolvePlanningPromptFromIr,
 } from "@fusion/core";
-import { TriageProcessor } from "../triage.js";
+import { buildSpecificationPrompt, TriageProcessor } from "../triage.js";
 
 const { mockReviewStep, mockCreateFnAgent } = vi.hoisted(() => ({
   mockReviewStep: vi.fn(),
   mockCreateFnAgent: vi.fn(),
 }));
 
-vi.mock("../reviewer.js", () => ({
+vi.mock("../execution/reviewer.js", () => ({
   reviewStep: mockReviewStep,
 }));
 
@@ -117,6 +117,25 @@ async function captureBasePrompt(task: Task, store: TaskStore): Promise<string> 
   return captured;
 }
 
+async function capturePromptLayers(task: Task, store: TaskStore): Promise<string> {
+  let captured = "";
+  mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
+    captured = JSON.stringify(opts.systemPromptLayers ?? opts.systemPrompt);
+    return {
+      session: {
+        state: {},
+        sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        navigateTree: vi.fn(),
+      },
+    };
+  });
+
+  await new TriageProcessor(store, "/tmp/root").specifyTask(task);
+  return captured;
+}
+
 const canonicalPlanningPrompt = resolvePlanningPromptFromIr(BUILTIN_CODING_WORKFLOW_IR)!;
 const renderedCanonicalPlanningPrompt = renderTriagePolicyPlaceholders(canonicalPlanningPrompt, {});
 const renderedDefaultTriagePrompt = renderTriagePolicyPlaceholders(resolveAgentPrompt("triage"), {});
@@ -134,6 +153,43 @@ describe("triage planning prompt single source", () => {
     });
 
     await expect(captureBasePrompt(task, store)).resolves.toBe(renderedCanonicalPlanningPrompt);
+  });
+
+  it("exposes the TaskStore-backed PROMPT.md writer to triage sessions", async () => {
+    const task = createTask({ id: "FN-6232-PROMPT-WRITER" });
+    const store = createStore(task);
+    let customTools: Array<{ name?: string }> = [];
+    let sessionTools: string | undefined;
+    mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
+      customTools = opts.customTools ?? [];
+      sessionTools = opts.tools;
+      return {
+        session: {
+          state: {},
+          sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          navigateTree: vi.fn(),
+        },
+      };
+    });
+
+    await new TriageProcessor(store, "/tmp/root").specifyTask(task);
+
+    expect(customTools.map((tool) => tool.name)).toContain("fn_task_prompt_write");
+    expect(sessionTools).toBe("coding");
+  });
+
+  it("requires triage plans to use the durable prompt writer instead of generic filesystem writes", () => {
+    const task = createDetail(createTask({ id: "FN-6232-DURABLE-PROMPT" }));
+    const prompt = buildSpecificationPrompt(task, `.fusion/tasks/${task.id}/PROMPT.md`, {} as Settings);
+
+    expect(prompt).toContain("fn_task_prompt_write");
+    expect(prompt).toContain("Do not use the generic filesystem write tool");
+    expect(prompt).toContain("If it returns an error, correct the problem and retry");
+    expect(prompt).toContain("do not finish planning until the tool confirms");
+    expect(prompt).not.toContain("Use the write tool to write the specification file");
+    expect(prompt).not.toContain("exactly once");
   });
 
   it("uses the built-in workflow IR planning prompt when no workflow is selected", async () => {
@@ -156,11 +212,25 @@ describe("triage planning prompt single source", () => {
     await expect(captureBasePrompt(task, store)).resolves.toBe(overridePrompt);
   });
 
-  it("keeps fast mode on the planning-fast workflow prompt", async () => {
-    const task = createTask({ id: "FN-6232-FAST", executionMode: "fast" });
-    const store = createStore(task);
+  it("uses the planning-fast workflow prompt when leanPlanning is enabled", async () => {
+    const task = createTask({ id: "FN-6232-LEAN", executionMode: "standard" });
+    const store = createStore(task, {}, { leanPlanning: true });
 
     await expect(captureBasePrompt(task, store)).resolves.toBe(renderedFastPlanningPrompt);
+  });
+
+  it.each(["standard", "lean"] as const)("injects direct-user duplicate policy into the %s planning session", async (mode) => {
+    const task = createTask({ id: `FN-6232-USER-${mode}`, executionMode: "standard", sourceType: "dashboard_ui" });
+    const store = createStore(task, {}, mode === "lean" ? { leanPlanning: true } : {});
+
+    await expect(capturePromptLayers(task, store)).resolves.toContain("Only active tasks can be duplicate blockers");
+  });
+
+  it("injects active-only duplicate policy into programmatic planning sessions", async () => {
+    const task = createTask({ id: "FN-6232-API", executionMode: "standard", sourceType: "api" });
+    const store = createStore(task);
+
+    await expect(capturePromptLayers(task, store)).resolves.toContain("Only active tasks can be duplicate blockers");
   });
 
   it("uses a selected custom workflow planning prompt", async () => {

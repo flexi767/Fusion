@@ -18,14 +18,14 @@ import {
   serializeWorkflowIr,
 } from "@fusion/core";
 
-import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
+import { WorkflowTaskRuntime } from "../workflows/workflow-task-runtime.js";
 import {
   createWorkflowColumnBoundary,
   type WorkflowColumnBoundary,
-} from "../workflow-column-boundary.js";
-import { isUnplannedForExecution } from "../hold-release.js";
-import type { WorkflowNodeHandler } from "../workflow-graph-executor.js";
-import type { WorkflowRuntimePrimitives } from "../runtime-primitives.js";
+} from "../workflows/workflow-column-boundary.js";
+import { isUnplannedForExecution } from "../execution/hold-release.js";
+import type { WorkflowNodeHandler } from "../workflows/workflow-graph-executor.js";
+import type { WorkflowRuntimePrimitives } from "../execution/runtime-primitives.js";
 
 /*
 FNXC:WorkflowBuiltins 2026-07-19-11:30:
@@ -294,21 +294,34 @@ interface BuiltinExpectation {
 const EXPECTATIONS: BuiltinExpectation[] = [
   {
     id: "builtin:coding",
-    entryColumn: "triage",
+        /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-01:35:
+    U11 merged the two pre-implementation columns for this lineage: its declared columns are now
+    `todo,in-progress,in-review,done` with NO `triage`. So the card ENTERS at `todo` and the
+    former `triage -> todo` graph hop does not exist — there is no longer a boundary to cross.
+    Verified by resolving the built-in IR and reading its column ids, not inferred from the failure.
+    */
+    entryColumn: "todo",
     trail: [
-      ["triage", "in-progress", "graph"],
+      // FNXC:PlanReviewStep 2026-07-26-17:10: plan-in-place — specification (plan + plan review) runs
+      // in the planning lane, so the card crosses into implementation once, via the scheduler.
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
     finalColumn: "done",
     leasedGates: ["plan-review", "code-review"],
   },
+  /*
+  FNXC:CodingIdeasV2Workflow 2026-09-06-02:15:
+  The surviving Ideas built-in preserves the five-column board while its read-only review policy remains entirely INSIDE the two
+  working columns. A read-only review lane must not
+  change where the card goes, only what happens while it is there.
+  This entry was missing when the workflow was registered, which left the catalog-coverage assertion
+  red on main while every other test in this file passed.
+  */
   {
-    /* Plan-in-place: the only built-in whose planning nodes live in the HOLD
-       column. It must plan AND review in `todo` and then be released by the
-       scheduler — the bootstrap-stub deadlock shows up here as a card that
-       never leaves `todo`. */
-    id: "builtin:coding-ideas",
+    id: "builtin:coding-ideas-v2",
     entryColumn: "ideas",
     trail: [
       ["ideas", "todo", "graph"],
@@ -323,7 +336,10 @@ const EXPECTATIONS: BuiltinExpectation[] = [
     id: "builtin:legacy-coding",
     entryColumn: "triage",
     trail: [
-      ["triage", "in-progress", "graph"],
+      // FNXC:PlanReviewStep 2026-07-26-17:10: plan-in-place — specification (plan + plan review) runs
+      // in the planning lane, so the card crosses into implementation once, via the scheduler.
+      ["triage", "todo", "graph"],
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
@@ -332,9 +348,18 @@ const EXPECTATIONS: BuiltinExpectation[] = [
   },
   {
     id: "builtin:stepwise-coding",
-    entryColumn: "triage",
+        /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-01:35:
+    U11 merged the two pre-implementation columns for this lineage: its declared columns are now
+    `todo,in-progress,in-review,done` with NO `triage`. So the card ENTERS at `todo` and the
+    former `triage -> todo` graph hop does not exist — there is no longer a boundary to cross.
+    Verified by resolving the built-in IR and reading its column ids, not inferred from the failure.
+    */
+    entryColumn: "todo",
     trail: [
-      ["triage", "in-progress", "graph"],
+      // FNXC:PlanReviewStep 2026-07-26-17:10: plan-in-place — specification (plan + plan review) runs
+      // in the planning lane, so the card crosses into implementation once, via the scheduler.
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
@@ -342,10 +367,16 @@ const EXPECTATIONS: BuiltinExpectation[] = [
     leasedGates: ["plan-review", "code-review"],
   },
   {
+    /* FNXC:PlanReviewStep 2026-07-26-14:05: the linear helper's Plan Review group is
+       column-inherited, so like `plan` it lands in the hold column and the card takes the
+       normal capacity release into implementation instead of entering wip straight from
+       intake. Holds even when the gate is default-off (quick-fix) — a disabled optional
+       group is still traversed and still reaches the same capacity boundary. */
     id: "builtin:quick-fix",
     entryColumn: "triage",
     trail: [
-      ["triage", "in-progress", "graph"],
+      ["triage", "todo", "graph"],
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
@@ -358,7 +389,9 @@ const EXPECTATIONS: BuiltinExpectation[] = [
     id: "builtin:review-heavy",
     entryColumn: "triage",
     trail: [
-      ["triage", "in-progress", "graph"],
+      // Plan Review is column-inherited into the hold column — see builtin:quick-fix.
+      ["triage", "todo", "graph"],
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
@@ -370,7 +403,9 @@ const EXPECTATIONS: BuiltinExpectation[] = [
     id: "builtin:design",
     entryColumn: "triage",
     trail: [
-      ["triage", "in-progress", "graph"],
+      // Plan Review is column-inherited into the hold column — see builtin:quick-fix.
+      ["triage", "todo", "graph"],
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
@@ -435,9 +470,18 @@ const EXPECTATIONS: BuiltinExpectation[] = [
     /* The brainstorm loop only exits once the user's answer carries the approval
        phrase; after that it is the stepwise-final-review pipeline. */
     id: "builtin:brainstorming",
-    entryColumn: "triage",
+        /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-01:35:
+    U11 merged the two pre-implementation columns for this lineage: its declared columns are now
+    `todo,in-progress,in-review,done` with NO `triage`. So the card ENTERS at `todo` and the
+    former `triage -> todo` graph hop does not exist — there is no longer a boundary to cross.
+    Verified by resolving the built-in IR and reading its column ids, not inferred from the failure.
+    */
+    entryColumn: "todo",
     trail: [
-      ["triage", "in-progress", "graph"],
+      // FNXC:PlanReviewStep 2026-07-26-17:10: plan-in-place — specification (plan + plan review) runs
+      // in the planning lane, so the card crosses into implementation once, via the scheduler.
+      ["todo", "in-progress", "scheduler"],
       ["in-progress", "in-review", "graph"],
       ["in-review", "done", "graph"],
     ],
@@ -589,8 +633,10 @@ describe("failure parks the card in place (KTD-1)", () => {
   column it never reached, and never back in a hold column.
   */
   const cases: Array<{ id: string; failNodeId: string; expectedColumn: string }> = [
-    { id: "builtin:coding", failNodeId: "plan", expectedColumn: "in-progress" },
-    { id: "builtin:coding-ideas", failNodeId: "plan", expectedColumn: "todo" },
+    // FNXC:PlanReviewStep 2026-07-26-17:10: `plan` runs in the planning lane, so a failed plan parks
+    // there — the card never reached implementation.
+    { id: "builtin:coding", failNodeId: "plan", expectedColumn: "todo" },
+    { id: "builtin:coding-ideas-v2", failNodeId: "plan", expectedColumn: "todo" },
     { id: "builtin:marketing", failNodeId: "draft", expectedColumn: "drafting" },
     { id: "builtin:lead-generation", failNodeId: "enrich-lead", expectedColumn: "enrichment" },
     { id: "builtin:pr-workflow", failNodeId: "pr-create", expectedColumn: "in-progress" },
@@ -661,13 +707,13 @@ describe("no-merge-region built-ins complete without merge-blocker interference 
 
 describe("plan-in-place built-ins plan and review inside the hold column", () => {
   /*
-  `builtin:coding-ideas` is the plan-in-place shape: `plan` and `plan-review` sit
+  `builtin:coding-ideas-v2` is the plan-in-place Ideas shape: `plan` and `plan-review` sit
   in `todo` (the capacity-hold column), not in the wip column. The deadlock this
   guards is a card that plans in `todo` but is never released because the
   pre-release plan-review gate cannot see a passed result.
   */
   it("coding-ideas plans and reviews in `todo`, then the scheduler releases it", async () => {
-    const ir = builtinIr("builtin:coding-ideas");
+    const ir = builtinIr("builtin:coding-ideas-v2");
     const byId = new Map(ir.nodes.map((n) => [n.id, n]));
     expect(byId.get("plan")?.column).toBe("todo");
     expect(byId.get("plan-review")?.column).toBe("todo");
@@ -677,7 +723,7 @@ describe("plan-in-place built-ins plan and review inside the hold column", () =>
     const unplanned = { id: "FN-HOLD", column: "todo", workflowStepResults: [], enabledWorkflowSteps: optionalGroupIds(ir) } as unknown as Task;
     await expect(isUnplannedForExecution({} as never, unplanned, ir)).resolves.toBe(true);
 
-    const run = await drive("builtin:coding-ideas", ir);
+    const run = await drive("builtin:coding-ideas-v2", ir);
     expect(run.disposition).toBe("completed");
     // Exactly one scheduler release, out of `todo`, and it happened AFTER the
     // plan-review passed (otherwise the harness's gate check would have held it).

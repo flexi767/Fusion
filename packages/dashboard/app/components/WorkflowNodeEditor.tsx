@@ -1,3 +1,8 @@
+import { ModalCloseButton } from "./ModalCloseButton";
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewHeader } from "./ViewHeader";
+import { ViewLayout } from "./ViewLayout";
+import { ViewSidebar } from "./ViewSidebar";
 import "@xyflow/react/dist/style.css";
 import "./WorkflowNodeEditor.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -18,7 +23,7 @@ import {
 } from "@xyflow/react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { X, Plus, Trash2, Save, MessageSquare, Terminal, Shield, GitMerge, Loader2, HelpCircle, PauseCircle, Split, Merge, Repeat, ToggleRight, ClipboardCheck, ListChecks, Code2, Bell, LayoutGrid, Workflow, Download, Upload, ChevronDown, ChevronRight, ChevronLeft, Library, Sparkles, Maximize2, Minimize2, DoorOpen } from "lucide-react";
+import { Plus, Trash2, Save, MessageSquare, Terminal, Shield, GitMerge, Loader2, HelpCircle, PauseCircle, Split, Merge, Repeat, ToggleRight, ClipboardCheck, ListChecks, Code2, Bell, LayoutGrid, Workflow, Download, Upload, ChevronDown, ChevronRight, Library, Sparkles, Maximize2, Minimize2, DoorOpen } from "lucide-react";
 import type { WorkflowDefinition, WorkflowIrColumn, TraitViolation, WorkflowStepTemplate, WorkflowIrNodeKind } from "@fusion/core";
 import { getErrorMessage, analyzeWorkflowLifecycle } from "@fusion/core";
 import type { WorkflowLifecycleWarning, WorkflowLifecycleWarningCode } from "@fusion/core";
@@ -613,17 +618,14 @@ function CreateWorkflowDialog({
           }
         }}
       >
-        <div className="modal-header">
-          <h3>{t("workflows.createTitle", "New workflow")}</h3>
-          <button
-            type="button"
-            className="modal-close"
-            onClick={onClose}
-            aria-label={t("actions.close", "Close")}
-          >
-            <X size={16} />
-          </button>
-        </div>
+        {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: The nested create-workflow dialog shares the canonical header. */}
+        <ViewHeader
+          className="modal-header"
+          headingLevel={3}
+          title={t("workflows.createTitle", "New workflow")}
+          onClose={onClose}
+          closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+        />
         <form onSubmit={handleSubmit}>
           <div className="modal-body">
             {/* U10/R11: AI-design disclosure. Toggling reveals a prompt textarea
@@ -945,27 +947,13 @@ function InnerEditor({
   const [templateConflict, setTemplateConflict] = useState<string | null>(null);
   const canvasNodesMaterializedRef = useRef(false);
 
+  // FNXC:StandardizedViewSidebar 2026-09-13-21:43: The workflow rail remains present on desktop/tablet; only its internal authoring disclosures may collapse, so navigation and the shared resize authority never disappear.
   // U12: the columns/fields authoring panels live in the left sidebar (below the
   // workflow list) as collapsible disclosure sections. Each section's collapsed
   // state persists in localStorage; default expanded.
-  /*
-  FNXC:WorkflowSidebar 2026-06-22-12:00:
-  The workflow view needs the entire left sidebar collapsible, not only its
-  internal column/field/settings groups, so graph editing can use the full
-  canvas width. Persist the shell state and keep a visible restore control in
-  the canvas area when the sidebar is hidden.
-  */
-  const sidebarCollapsedStorageKey = "fusion:wf-left-sidebar-collapsed";
   const columnsCollapsedStorageKey = "fusion:wf-sidebar-columns-collapsed";
   const fieldsCollapsedStorageKey = "fusion:wf-sidebar-fields-collapsed";
   const settingsCollapsedStorageKey = "fusion:wf-sidebar-settings-collapsed";
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(sidebarCollapsedStorageKey) === "1";
-    } catch {
-      return false;
-    }
-  });
   const [columnsCollapsed, setColumnsCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem(columnsCollapsedStorageKey) === "1";
@@ -987,13 +975,6 @@ function InnerEditor({
       return false;
     }
   });
-  useEffect(() => {
-    try {
-      localStorage.setItem(sidebarCollapsedStorageKey, sidebarCollapsed ? "1" : "0");
-    } catch {
-      // localStorage unavailable (private mode / SSR): non-fatal.
-    }
-  }, [sidebarCollapsed]);
   useEffect(() => {
     try {
       localStorage.setItem(columnsCollapsedStorageKey, columnsCollapsed ? "1" : "0");
@@ -1244,7 +1225,16 @@ function InnerEditor({
     const refreshFromWorkflowMutation = () => {
       void loadWorkflows({ forceFresh: true });
     };
+    /*
+    FNXC:ChatWorkflowAuthoring 2026-07-26-16:24:
+    Resync contract (see SseSubscription in sse-bus.ts). The editor's workflow list is refreshed ONLY by
+    these events after the initial load, and the stream is lossy: an error/heartbeat reconnect or the
+    >=60s hidden-tab suspend drops the socket with no replay buffer. A workflow created or deleted while
+    the editor sat backgrounded would otherwise stay missing (or stay listed after deletion, so opening
+    it 404s) until a hard reload. The reconnect reuses the same force-fresh reload the events use.
+    */
     return subscribeSse(`/api/events${query}`, {
+      onReconnect: refreshFromWorkflowMutation,
       events: {
         "workflow:created": refreshFromWorkflowMutation,
         "workflow:updated": refreshFromWorkflowMutation,
@@ -2826,53 +2816,48 @@ function InnerEditor({
           requestClose();
         }}
       >
-        <header className="wf-editor-header">
-          {/* FNXC:WorkflowEditorEmbedding 2026-06-22-01:00: Title row aligned to the shared ViewHeader/Command Center metric — a Workflow icon (size 20) + 1.125rem title — so the embedded workflows view reads consistently with other main-content destinations. */}
-          <h2>
-            <Workflow size={20} aria-hidden="true" />
-            <span>{t("workflows.title", "Workflows")}</span>
-          </h2>
-          {/* FNXC:WorkflowEditorEmbedding 2026-06-22-00:00: embedded views keep a
-              Command Center-style header title but drop the modal X close button. */}
-          {!isEmbedded ? (
-            <button className="wf-editor-close" onClick={requestClose} aria-label={t("workflows.closeEditor", "Close workflow editor")}>
-              <X size={18} />
-            </button>
-          ) : null}
-        </header>
-
-
-        <div
+        <ViewLayout
           className={`wf-editor-body${workflowListStageOpen ? " wf-editor-body--list-stage" : " wf-editor-body--editor-stage"}${
             simpleLayoutEnabled ? " wf-editor-body--simple-layout" : ""
           }${simpleViewEnabled ? " wf-editor-body--simple-view" : ""}${mobileNodeDetailStage ? " wf-editor-body--mobile-node-detail" : ""}${
             mobileEdgeDetailStage ? " wf-editor-body--mobile-edge-detail" : ""
-          }${sidebarCollapsed ? " wf-editor-body--sidebar-collapsed" : ""}`}
-        >
-          <aside className="wf-editor-sidebar">
-            <div className="wf-editor-sidebar-head">
-              <button
-                className="wf-editor-new"
-                ref={newWorkflowBtnRef}
-                data-testid="wf-new-workflow"
-                onClick={() => setCreateOpen(true)}
-              >
-                <Plus size={14} /> {t("workflows.newWorkflow", "New workflow")}
-              </button>
-              {!isMobileMode && (
-                <button
-                  type="button"
-                  className="wf-sidebar-shell-toggle"
-                  data-testid="wf-sidebar-collapse"
-                  aria-expanded={!sidebarCollapsed}
-                  aria-label={t("workflows.collapseSidebar", "Collapse workflow sidebar")}
-                  title={t("workflows.collapseSidebar", "Collapse workflow sidebar")}
-                  onClick={() => setSidebarCollapsed(true)}
-                >
-                  <ChevronLeft size={14} aria-hidden />
-                </button>
+          }`}
+          contentOwnsScroll
+          mobilePane={workflowListStageOpen ? "list" : "detail"}
+          header={(
+            <ViewHeader
+              className="wf-editor-header"
+              icon={Workflow}
+              title={t("workflows.title", "Workflows")}
+              backAction={isMobileMode && !workflowListStageOpen ? {
+                label: t("workflows.backToWorkflowList", "Back to workflows"),
+                onClick: () => setWorkflowListStageOpen(true),
+              } : undefined}
+              actions={(
+                <>
+                  <ViewActionButton
+                    className="wf-editor-new"
+                    ref={newWorkflowBtnRef}
+                    data-testid="wf-new-workflow"
+                    kind="create"
+                    label={t("workflows.newWorkflow", "New workflow")}
+                    onClick={() => setCreateOpen(true)}
+                  />
+                  {!isEmbedded ? (
+                    <ModalCloseButton className="wf-editor-close" onClick={requestClose} aria-label={t("workflows.closeEditor", "Close workflow editor")} />
+                  ) : null}
+                </>
               )}
-            </div>
+            />
+          )}
+          sidebar={(
+            <ViewSidebar
+              ariaLabel={t("workflows.workflowList", "Workflows")}
+              resizeLabel={t("workflows.resizeSidebar", "Resize workflow sidebar")}
+              hostIdentity="workflow-editor"
+              mobile={isMobileMode}
+              panelClassName="wf-editor-sidebar"
+            >
             {/* U5/R10: keyboard-accessible import affordance triggering a hidden
                 file input; validation failures render in the persistent inline
                 region below (role="alert"), not a toast. */}
@@ -3022,37 +3007,16 @@ function InnerEditor({
                     are authored as graph-native `optional-group` nodes on the canvas. */}
               </div>
             )}
-          </aside>
-
+            </ViewSidebar>
+          )}
+        >
           <section className="wf-editor-canvas-wrap">
-            <button
-              type="button"
-              className="wf-editor-mobile-back"
-              onClick={() => setWorkflowListStageOpen(true)}
-              aria-label={t("workflows.backToWorkflowList", "Back to workflows")}
-            >
-              <ChevronLeft size={16} />
-              <span>{t("common.back", "Back")}</span>
-            </button>
             {activeWorkflow ? (
               <>
                 {/* Inline name + description strip (KTD-10). Built-ins render as
                     plain text (no click affordance); user-owned workflows are
                     click-to-edit (Enter commits, Escape cancels, blur commits). */}
                 <div className="wf-name-strip">
-                  {sidebarCollapsed && !isMobileMode && (
-                    <button
-                      type="button"
-                      className="wf-sidebar-shell-restore"
-                      data-testid="wf-sidebar-restore"
-                      aria-expanded="false"
-                      aria-label={t("workflows.showSidebar", "Show workflow sidebar")}
-                      title={t("workflows.showSidebar", "Show workflow sidebar")}
-                      onClick={() => setSidebarCollapsed(false)}
-                    >
-                      <ChevronRight size={14} aria-hidden />
-                    </button>
-                  )}
                   <WorkflowIcon workflowId={activeWorkflow.id} icon={icon} decorative />
                   {isBuiltin ? (
                     <span className="wf-workflow-name wf-workflow-name--readonly" data-testid="wf-workflow-name">
@@ -4314,6 +4278,23 @@ function InnerEditor({
               ) : null}
 
               <fieldset className="wf-inspector-fields" disabled={isBuiltin}>
+              {/* FNXC:WorkflowReviewKind 2026-08-05-02:31: Only top-level result-producing
+                  nodes have an instance-safe current-result contract. Clearing this selector
+                  passes undefined through config cleanup instead of serializing a sentinel. */}
+              {!selectedNode.parentId && (selectedNode.data.kind === "prompt" || selectedNode.data.kind === "gate" || selectedNode.data.kind === "script" || selectedNode.data.kind === "optional-group") ? (
+                <label className="wf-field">
+                  <span>{t("workflowNodes.reviewKind", "Review kind")}</span>
+                  <select
+                    data-testid="wf-review-kind"
+                    value={String(selectedNode.data.config?.reviewKind ?? "")}
+                    onChange={(e) => updateSelectedData({ config: { reviewKind: e.target.value || undefined } })}
+                  >
+                    <option value="">{t("workflowNodes.notAReview", "Not a review")}</option>
+                    <option value="plan">{t("workflowNodes.planReview", "Plan review")}</option>
+                    <option value="code">{t("workflowNodes.codeReview", "Code review")}</option>
+                  </select>
+                </label>
+              ) : null}
               {selectedNode.data.kind === "prompt" ? (
                 <>
                   <label className="wf-field">
@@ -4355,8 +4336,15 @@ function InnerEditor({
                         )}
                         onChange={(value) => {
                           const { provider, modelId } = parseModelDropdownValue(value);
-                          updateSelectedData({ config: { modelProvider: provider || undefined, modelId: modelId || undefined } });
+                          updateSelectedData({ config: {
+                            modelProvider: provider || undefined,
+                            modelId: modelId || undefined,
+                            // FNXC:ModelDropdown 2026-08-01-10:45: Explicit node-model changes cannot retain an instance selected for the previous provider.
+                            credentialInstanceId: undefined,
+                          } });
                         }}
+                        credentialInstanceId={String(selectedNode.data.config?.credentialInstanceId ?? "")}
+                        onCredentialInstanceChange={(credentialInstanceId) => updateSelectedData({ config: { credentialInstanceId: credentialInstanceId || undefined } })}
                         /*
                          * FNXC:Settings-ThinkingLevel 2026-07-10-00:00:
                          * Prompt model nodes expose the shared inline thinking selector only for the model executor, persisting `config.thinkingLevel` with Default clearing the key.
@@ -4397,6 +4385,25 @@ function InnerEditor({
                             {t("workflowColumns.agentNotFound", "Agent not found — {{id}}", { id: nodeAgentId })}
                           </p>
                         )}
+                      </label>
+                    );
+                  })()}
+
+                  {selectedNode.data.config?.seam === "review" && (() => {
+                    const reviewerAgentId = typeof selectedNode.data.reviewerAgentId === "string" ? selectedNode.data.reviewerAgentId : "";
+                    const missingReviewer = reviewerAgentId && !agents.some((agent) => agent.id === reviewerAgentId);
+                    return (
+                      <label className="wf-field">
+                        <span>{t("workflowEditor.reviewerOverride", "Reviewer override")}</span>
+                        <select
+                          value={reviewerAgentId}
+                          onChange={(event) => updateSelectedData({ reviewerAgentId: event.target.value || undefined })}
+                        >
+                          <option value="">{t("workflowEditor.reviewerPool", "Role pool / task owner")}</option>
+                          {missingReviewer ? <option value={reviewerAgentId}>{reviewerAgentId} ({t("workflowColumns.agentNotFound", "unavailable")})</option> : null}
+                          {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+                        </select>
+                        {missingReviewer ? <p className="wf-inspector-note wf-inspector-note--warn">{reviewerAgentId}</p> : null}
                       </label>
                     );
                   })()}
@@ -5093,9 +5100,13 @@ function InnerEditor({
                             modelProvider: provider || undefined,
                             modelId: modelId || undefined,
                             model: value || undefined,
+                            // FNXC:ModelDropdown 2026-08-01-10:45: Review-node model changes clear the prior credential-instance override.
+                            credentialInstanceId: undefined,
                           },
                         });
                       }}
+                      credentialInstanceId={String(selectedNode.data.config?.credentialInstanceId ?? "")}
+                      onCredentialInstanceChange={(credentialInstanceId) => updateSelectedData({ config: { credentialInstanceId: credentialInstanceId || undefined } })}
                       /*
                        * FNXC:Settings-ThinkingLevel 2026-07-10-00:00:
                        * Step-review nodes share the model dropdown thinking selector so review sessions can pin reasoning effort with the same node > task > settings precedence as executor steps.
@@ -5595,7 +5606,7 @@ function InnerEditor({
               )}
             </aside>
           )}
-        </div>
+        </ViewLayout>
         {createOpen && (
           <CreateWorkflowDialog
             workflows={workflows}

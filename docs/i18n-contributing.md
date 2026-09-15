@@ -54,6 +54,17 @@ Any remaining user-facing copy must be localized with `t()` / `<Trans>` and an
 specific files or a small cluster in `lint.ignore`, includes an `FNXC` rationale,
 and has a filed follow-up task that removes the ignore. The settings sections
 cluster is no longer deferred as of FN-6771; keep those files covered by lint.
+The production catalog currently has a clean lint baseline: `pnpm i18n:lint`
+must finish with `No issues found.`. Keep the executable regression alongside the
+catalog tests so future shipping copy cannot reintroduce debt:
+
+```bash
+pnpm --filter @fusion/i18n exec vitest run src/__tests__/i18n-lint-baseline.test.ts src/__tests__/i18n-gate-coverage.test.ts --silent=passed-only --reporter=dot
+```
+
+`i18n-lint-baseline.test.ts` imports the root `i18next.config.ts` and calls the
+installed `runLinter` API directly. It therefore checks the same production
+inputs as the CLI rather than relying on a mocked catalog or a source-text count.
 The `@fusion/i18n` regression tests also assert the lint-ignore scope and live
 catalog key parity so those guardrails cannot silently drift.
 
@@ -86,7 +97,12 @@ No feature code changes are required: the dashboard discovers the locale through
 the generated `app/locales/` tree, and the CLI through the regenerated import
 map. Add the language's endonym to `ENDONYMS` in
 `packages/dashboard/app/components/LanguageSelector.tsx` so it appears in the
-Settings switcher.
+Settings switcher, add a prompt label to `LOCALE_LABELS` in
+`packages/dashboard/src/ai-translate.ts` (compile-enforced), and add a display
+name to `localeDisplayName` in
+`packages/core/src/i18n/detect-content-language.ts`. For Latin-script languages,
+also consider a stopword list in `LATIN_STOPWORDS` there so content-language
+detection can recognize the language (entries must be accent-stripped).
 
 ## Using a non-English locale
 

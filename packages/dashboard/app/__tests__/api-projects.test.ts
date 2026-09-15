@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { API_JSON_HEADERS, API_JSON_HEADERS_NO_ATTRIBUTION } from "../test/apiRequestHeaders";
 import {
   fetchTaskDetail,
   uploadAttachment,
@@ -13,8 +14,6 @@ import {
   connectMissionInterviewStream,
   assignTask,
   fetchAgentTasks,
-  archiveTask,
-  unarchiveTask,
   deleteTask,
   ApiRequestError,
   moveTask,
@@ -62,7 +61,6 @@ import {
   resumeProject,
   fetchFirstRunStatus,
   fetchGlobalConcurrency,
-  updateGlobalConcurrency,
   fetchPiSettings,
   updatePiSettings,
   installPiPackage,
@@ -284,6 +282,28 @@ describe("API Error Handling", () => {
 
       await expect(fetchTasks()).rejects.toThrow("API returned HTML instead of JSON");
     });
+
+    it("maps Traefik 503 text/plain to an operator-facing unavailable message", async () => {
+      globalThis.fetch = vi.fn().mockReturnValue(
+        Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: "",
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "content-type" ? "text/plain; charset=utf-8" : null,
+          },
+          json: () => Promise.reject(new Error("JSON parse error")),
+          text: () => Promise.resolve("no available server"),
+        } as unknown as Response),
+      );
+
+      await expect(fetchTasks()).rejects.toMatchObject({
+        name: "ApiRequestError",
+        message: "The server is temporarily unavailable. Please try again.",
+        status: 503,
+      });
+    });
   });
 
   describe("Non-JSON success responses", () => {
@@ -366,7 +386,7 @@ describe("refineText", () => {
 
     expect(result).toBe("Refined task description");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/ai/refine-text", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ text: "Original text", type: "clarify" }),
     });
@@ -381,7 +401,7 @@ describe("refineText", () => {
 
     expect(result).toBe("Refined with scoped settings");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/ai/refine-text?projectId=proj-123", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ text: "Original text", type: "clarify" }),
     });
@@ -500,15 +520,17 @@ describe("summarizeTitle", () => {
     });
     global.fetch = mockFetch;
 
-    const result = await summarizeTitle("a".repeat(201));
+    const result = await summarizeTitle("a");
 
     expect(result).toBe("Generated Title");
     expect(mockFetch).toHaveBeenCalledWith(
       "/api/ai/summarize-title",
       expect.objectContaining({
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ description: "a".repeat(201), provider: undefined, modelId: undefined }),
+        // `summarizeTitle` calls `fetch()` directly, bypassing `api()`, so no attribution header.
+        // See the note in test/apiRequestHeaders.ts — this is a MUTATION without attribution.
+        headers: API_JSON_HEADERS_NO_ATTRIBUTION,
+        body: JSON.stringify({ description: "a", provider: undefined, modelId: undefined }),
       })
     );
   });
@@ -640,7 +662,7 @@ describe("fetchProjects", () => {
     expect(result[0].name).toBe("Test Project");
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "/api/projects",
-      expect.objectContaining({ headers: { "Content-Type": "application/json" } })
+      expect.objectContaining({ headers: API_JSON_HEADERS })
     );
   });
 
@@ -871,13 +893,15 @@ describe("fetchActivityFeed", () => {
       since: "2026-01-01T00:00:00.000Z",
       projectId: "proj_abc123",
       type: "task:created",
+      taskId: "FN-066",
     });
 
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("limit=50");
     expect(call[0]).toContain("since=2026-01-01T00%3A00%3A00.000Z");
     expect(call[0]).toContain("projectId=proj_abc123");
-    expect(call[0]).toContain("type=task%3Acreated");
+    expect(call[0]).toContain("types=task%3Acreated");
+    expect(call[0]).toContain("taskId=FN-066");
   });
 });
 
@@ -972,24 +996,17 @@ describe("fetchGlobalConcurrency", () => {
     expect(result.projectsActive["proj_abc123"]).toBe(2);
   });
 
-  it("updates global concurrency state", async () => {
-    const mockState: GlobalConcurrencyState = {
-      globalMaxConcurrent: 10,
-      currentlyActive: 4,
-      queuedCount: 0,
-      projectsActive: {},
-    };
-    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, mockState));
+  /*
+  FNXC:CapacityModel 2026-07-30-22:40:
+  The "updates global concurrency state" case is DELETED with the client function it exercised.
+  `updateGlobalConcurrency` PUT to `/api/global-concurrency`, a route removed when the machine-wide cap
+  went (capacity is two numbers PER PROJECT), so the client could only call an endpoint that no longer
+  exists. I deleted the function and missed this test — it kept asserting the deleted write, and the
+  full-suite run is what caught it.
 
-    const result = await updateGlobalConcurrency({ globalMaxConcurrent: 10 });
-
-    expect(result.globalMaxConcurrent).toBe(10);
-    expect(globalThis.fetch).toHaveBeenCalledWith("/api/global-concurrency", {
-      headers: { "Content-Type": "application/json" },
-      method: "PUT",
-      body: JSON.stringify({ globalMaxConcurrent: 10 }),
-    });
-  });
+  `fetchGlobalConcurrency` and its cases above SURVIVE: the GET route remains and serves live
+  utilization telemetry to the footer and Command Center. A read, not a limiter.
+  */
 });
 
 describe("fetchProjectTasks", () => {
@@ -1064,7 +1081,7 @@ describe("fetchExecutorStats", () => {
     expect(result.maxConcurrent).toBe(4);
     expect(result.lastActivityAt).toBe("2026-04-01T12:00:00.000Z");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/executor/stats", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
     });
   });
 
@@ -1110,7 +1127,6 @@ describe("ExecutorStats type", () => {
     const stats: ExecutorStats = {
       runningTaskCount: 3,
       blockedTaskCount: 2,
-      stuckTaskCount: 1,
       queuedTaskCount: 10,
       inReviewCount: 4,
       executorState: "running",
@@ -1120,7 +1136,6 @@ describe("ExecutorStats type", () => {
 
     expect(stats.runningTaskCount).toBe(3);
     expect(stats.blockedTaskCount).toBe(2);
-    expect(stats.stuckTaskCount).toBe(1);
     expect(stats.queuedTaskCount).toBe(10);
     expect(stats.inReviewCount).toBe(4);
     expect(stats.executorState).toBe("running");
@@ -1132,7 +1147,6 @@ describe("ExecutorStats type", () => {
     const idleStats: ExecutorStats = {
       runningTaskCount: 0,
       blockedTaskCount: 0,
-      stuckTaskCount: 0,
       queuedTaskCount: 5,
       inReviewCount: 0,
       executorState: "idle",
@@ -1142,7 +1156,6 @@ describe("ExecutorStats type", () => {
     const runningStats: ExecutorStats = {
       runningTaskCount: 2,
       blockedTaskCount: 1,
-      stuckTaskCount: 0,
       queuedTaskCount: 3,
       inReviewCount: 1,
       executorState: "running",
@@ -1152,7 +1165,6 @@ describe("ExecutorStats type", () => {
     const pausedStats: ExecutorStats = {
       runningTaskCount: 1,
       blockedTaskCount: 0,
-      stuckTaskCount: 0,
       queuedTaskCount: 8,
       inReviewCount: 2,
       executorState: "paused",
@@ -1168,7 +1180,6 @@ describe("ExecutorStats type", () => {
     const stats: ExecutorStats = {
       runningTaskCount: 0,
       blockedTaskCount: 0,
-      stuckTaskCount: 0,
       queuedTaskCount: 0,
       inReviewCount: 0,
       executorState: "idle",

@@ -19,7 +19,7 @@ vi.mock("node:https", () => ({
 import * as http from "node:http";
 import * as https from "node:https";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { accumulateSessionTokenUsage } from "../session-token-usage.js";
+import { accumulateSessionTokenUsage } from "../execution/session-token-usage.js";
 import {
   MOCK_PROVIDER_ID,
   MOCK_SYNTHETIC_TOKEN_USAGE,
@@ -123,6 +123,9 @@ describe("MockAgentRuntime", () => {
     if (sessionPurpose === "reviewer" || sessionPurpose === "validation") {
       expect(onText).toHaveBeenCalledWith(expect.stringContaining("Verdict: APPROVE"));
     }
+    if (sessionPurpose === "reviewer") {
+      expect(onText).toHaveBeenCalledWith(expect.stringContaining('{"verdict":"APPROVE","notes":'));
+    }
   });
 
   it("prefers a task-scoped override over the default script", async () => {
@@ -149,7 +152,9 @@ describe("MockAgentRuntime", () => {
     clearMockScript({ sessionPurpose: "executor", taskId });
     updateExecute.mockClear();
     await runtime.promptWithFallback(session, "default");
-    expect(updateExecute).toHaveBeenCalledWith(expect.any(String), { step: 1, status: "done" }, undefined, undefined, expect.anything());
+    // FNXC:MockProvider 2026-07-31-13:00: fn_task_update.step is 0-based (FN-6607); this expectation
+    // previously pinned the mock's 1-based off-by-one, which skipped Step 0 and overran the last step.
+    expect(updateExecute).toHaveBeenCalledWith(expect.any(String), { step: 0, status: "done" }, undefined, undefined, expect.anything());
   });
 
   it("treats graph-owned executor step sessions as successful without lifecycle tools", async () => {
@@ -191,6 +196,7 @@ describe("MockAgentRuntime", () => {
 
     await runtime.promptWithFallback(session, "review");
     expect(deltas.join("")).toContain("Verdict: APPROVE");
+    expect(deltas.join("")).toContain('{"verdict":"APPROVE","notes":');
   });
 
   it("emits an approval verdict for executor-backed workflow steps without lifecycle tools", async () => {

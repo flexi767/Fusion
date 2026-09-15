@@ -5,11 +5,14 @@ import type { ActivityAnalytics, ColorTheme, SignalsAnalytics, ThemeMode, TokenA
 import { api, fetchCodebaseMetrics, withProjectId, type CodebaseMetrics } from "../../api/legacy";
 import { formatBytes } from "../../utils/formatBytes";
 import { DateRangePicker, defaultPresets, rangeFromPreset, type DateRange } from "./DateRangePicker";
+import { CommandCenterSectionNav } from "./CommandCenterSectionNav";
+import { getCommandCenterState, saveCommandCenterState } from "../../hooks/modalPersistence";
 import { LoadingSpinner } from "../LoadingSpinner";
 import { TaskVerificationStatus } from "../TaskVerificationStatus";
 import { TokensArea } from "./areas/TokensArea";
 import { ToolsArea } from "./areas/ToolsArea";
 import { ActivityArea } from "./areas/ActivityArea";
+import { AgentActivityPanel } from "./AgentActivityPanel";
 import { ProductivityArea } from "./areas/ProductivityArea";
 import { ReviewArtifactsArea } from "./areas/ReviewArtifactsArea";
 import { TeamArea } from "./areas/TeamArea";
@@ -24,10 +27,15 @@ import { PluginManager } from "../PluginManager";
 import { MissionControlPanel, useLiveSnapshot } from "./MissionControlPanel";
 import { countLiveAgentsWorking, countLiveInProgressTasks } from "./liveSnapshotMetrics";
 import { CommandCenterControls } from "./CommandCenterControls";
+import { ViewHeader } from "../ViewHeader";
+import { ViewLayout, type ViewLayoutMobilePane } from "../ViewLayout";
+import { ViewSidebar } from "../ViewSidebar";
 import { ReliabilityView } from "../ReliabilityView";
 import { NodesView } from "../NodesView";
 import type { ToastType } from "../../hooks/useToast";
 import type { TaskView } from "../../hooks/useViewState";
+import { useVisibilityAwarePoll } from "../../hooks/visibilitySuspension";
+import { useViewportMode } from "../../hooks/useViewportMode";
 import { SdlcFunnel } from "./SdlcFunnel";
 import { inferProviderIconKey } from "../../utils/providerIconKey";
 import { Bar, type BarDatum } from "./charts/Bar";
@@ -42,6 +50,7 @@ type SubViewId =
   | "tokens"
   | "tools"
   | "activity"
+  | "agent-activity"
   | "productivity"
   | "review-artifacts"
   | "team"
@@ -87,6 +96,7 @@ function useSubViews(nodesEnabled: boolean): SubView[] {
     { id: "tokens", label: t("commandCenter.tabs.tokens", "Tokens") },
     { id: "tools", label: t("commandCenter.tabs.tools", "Tools") },
     { id: "activity", label: t("commandCenter.tabs.activity", "Activity") },
+    { id: "agent-activity", label: t("commandCenter.tabs.agentActivity", "Agent Activity") },
     { id: "productivity", label: t("commandCenter.tabs.productivity", "Productivity") },
     { id: "review-artifacts", label: t("commandCenter.tabs.reviewArtifacts", "Review artifacts") },
     { id: "team", label: t("commandCenter.tabs.team", "Team") },
@@ -100,7 +110,7 @@ function useSubViews(nodesEnabled: boolean): SubView[] {
     ...(nodesEnabled ? [{ id: "nodes" as const, label: t("commandCenter.tabs.nodes", "Nodes") }] : []),
     { id: "reliability", label: t("commandCenter.tabs.reliability", "Reliability") },
     /*
-    FNXC:Navigation 2026-08-01-00:00:
+    FNXC:Navigation 2026-07-19-00:00:
     FN-8352 removes Ideation from Command Center because its experimental
     top-level navigation view is now the single canonical host.
     */
@@ -148,6 +158,8 @@ interface CommandCenterProps {
   The Overview (Command Center landing) surfaces "View Board"/"View Agents" shortcuts directly under the Live activity snapshot (the engine-activity strip, the closest "AI engine" element on Overview). Navigation is owned by App's view router, so thread an optional onChangeView down to OverviewTab rather than letting the Command Center mutate routing state itself. Moved here from the Team-tab Heartbeat card (FN earlier).
   */
   onChangeView?: (view: TaskView) => void;
+  onOpenAgent?: (agentId: string) => void;
+  onOpenTask?: (taskId: string) => void;
 }
 
 function OverviewTab({
@@ -174,15 +186,28 @@ function OverviewTab({
   const [codebaseMetrics, setCodebaseMetrics] = useState<CodebaseMetrics | null>(null);
   const [verificationRequests, setVerificationRequests] = useState<TaskVerificationRequest[]>([]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () => void api<{ requests: TaskVerificationRequest[] }>(withProjectId("/command-center/verification-requests", projectId))
-      .then((response) => { if (!cancelled) setVerificationRequests(response.requests); })
-      .catch(() => { if (!cancelled) setVerificationRequests([]); });
-    refresh();
-    const timer = window.setInterval(refresh, OVERVIEW_TOKEN_REFRESH_MS);
-    return () => { cancelled = true; window.clearInterval(timer); };
+  const verificationRequestsVersionRef = useRef(0);
+  const refreshVerificationRequests = useCallback(() => {
+    const versionAtStart = verificationRequestsVersionRef.current;
+    const isStale = () => verificationRequestsVersionRef.current !== versionAtStart;
+    void api<{ requests: TaskVerificationRequest[] }>(withProjectId("/command-center/verification-requests", projectId))
+      .then((response) => { if (!isStale()) setVerificationRequests(response.requests); })
+      .catch(() => { if (!isStale()) setVerificationRequests([]); });
   }, [projectId]);
+
+  useEffect(() => {
+    refreshVerificationRequests();
+    return () => { verificationRequestsVersionRef.current += 1; };
+  }, [refreshVerificationRequests]);
+
+  /*
+  FNXC:MobileTabRetention 2026-07-26-11:32:
+  Verification-request polling is suspended while the document is hidden. The Overview surface kept this
+  request in flight every refresh cycle in the background, and continuous background network work is a
+  primary reason iOS Safari/PWA and Chrome Android discard the tab, producing the white-splash reload
+  operators saw on return. One refresh fires on the hidden -> visible edge.
+  */
+  useVisibilityAwarePoll(refreshVerificationRequests, OVERVIEW_TOKEN_REFRESH_MS);
 
   useEffect(() => {
     let cancelled = false;
@@ -204,7 +229,7 @@ function OverviewTab({
   const agentRunsTotal = activity.data?.agentRuns?.total ?? 0;
   const tasksDone = activity.data?.funnel?.doneInRange ?? 0;
   /*
-  FNXC:LiveActivity 2026-08-03-00:00:
+  FNXC:LiveActivity 2026-07-20-00:00:
   FN-8429 requires the Overview's live metrics to share Mission Control's
   SSE-plus-poll snapshot and in-progress aliases. Date-range analytics remain
   historical; they must not overwrite current board work with funnel entries.
@@ -378,8 +403,8 @@ function OverviewTab({
   const verificationSection = verificationRequests.length > 0 ? (
     <section className="cc-verification-requests card" data-testid="command-center-verification-requests">
       <div className="cc-overview-chart-header">
-        <h3 className="cc-area-section-title">Task verification</h3>
-        <p>Latest executor-owned verification requests</p>
+        <h3 className="cc-area-section-title">{t("commandCenter.taskVerification", "Task verification")}</h3>
+        <p>{t("commandCenter.verificationRequests", "Latest executor-owned verification requests")}</p>
       </div>
       {verificationRequests.map((request) => (
         <div key={request.requestId} className="cc-verification-requests__item">
@@ -568,56 +593,38 @@ export function CommandCenter({
   addToast = () => {},
   nodesEnabled = false,
   onChangeView,
+  onOpenAgent,
+  onOpenTask,
 }: CommandCenterProps = {}) {
   const { t } = useTranslation("app");
+  const viewportMode = useViewportMode();
   const subViews = useSubViews(nodesEnabled);
-  const [activeTab, setActiveTab] = useState<SubViewId>("overview");
+  /*
+  FNXC:CommandCenter 2026-07-22-13:40:
+  FN remount-churn fix R12: this view unmounts on navigation by design (no keep-alive), so the active sub-tab and date range restore from per-project persisted state on remount. Persisting follows the getPlanningDescription/GitHub-import precedent in modalPersistence.ts; a stored tab that no longer exists (e.g. nodes disabled) falls back to overview via the guard effect below.
+  */
+  const [activeTab, setActiveTab] = useState<SubViewId>(() => (getCommandCenterState(projectId)?.activeTab as SubViewId | undefined) ?? "overview");
+  const [mobilePane, setMobilePane] = useState<ViewLayoutMobilePane>("list");
 
-  const [range, setRange] = useState<DateRange>(() => rangeFromPreset(defaultPresets((_k, f) => f)[1]));
+  const [range, setRange] = useState<DateRange>(() => getCommandCenterState(projectId)?.range ?? rangeFromPreset(defaultPresets((_k, f) => f)[1]));
 
-  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const persistedProjectRef = useRef(projectId);
+  useEffect(() => {
+    if (persistedProjectRef.current === projectId) return;
+    persistedProjectRef.current = projectId;
+    const stored = getCommandCenterState(projectId);
+    setActiveTab((stored?.activeTab as SubViewId | undefined) ?? "overview");
+    setRange(stored?.range ?? rangeFromPreset(defaultPresets((_k, f) => f)[1]));
+    setMobilePane("list");
+  }, [projectId]);
+  useEffect(() => {
+    if (persistedProjectRef.current !== projectId) return;
+    saveCommandCenterState({ activeTab, range }, projectId);
+  }, [activeTab, projectId, range]);
+  useEffect(() => {
+    if (!subViews.some((view) => view.id === activeTab)) setActiveTab("overview");
+  }, [activeTab, subViews]);
 
-  const focusTab = useCallback(
-    (index: number) => {
-      const clamped = (index + subViews.length) % subViews.length;
-      setActiveTab(subViews[clamped].id);
-      tabRefs.current[clamped]?.focus();
-    },
-    [subViews],
-  );
-
-  const onTabKeyDown = useCallback(
-    (e: React.KeyboardEvent, index: number) => {
-      switch (e.key) {
-        case "ArrowRight":
-        case "ArrowDown":
-          e.preventDefault();
-          focusTab(index + 1);
-          break;
-        case "ArrowLeft":
-        case "ArrowUp":
-          e.preventDefault();
-          focusTab(index - 1);
-          break;
-        case "Home":
-          e.preventDefault();
-          focusTab(0);
-          break;
-        case "End":
-          e.preventDefault();
-          focusTab(subViews.length - 1);
-          break;
-        case "Enter":
-        case " ":
-          e.preventDefault();
-          setActiveTab(subViews[index].id);
-          break;
-        default:
-          break;
-      }
-    },
-    [focusTab, subViews],
-  );
 
   function renderActiveTab() {
     switch (activeTab) {
@@ -642,6 +649,8 @@ export function CommandCenter({
         return <ToolsArea range={range} projectId={projectId} />;
       case "activity":
         return <ActivityArea range={range} projectId={projectId} />;
+      case "agent-activity":
+        return <AgentActivityPanel projectId={projectId} range={range} onOpenAgent={onOpenAgent} onOpenTask={onOpenTask} />;
       case "productivity":
         return <ProductivityArea range={range} projectId={projectId} />;
       case "review-artifacts":
@@ -696,56 +705,58 @@ export function CommandCenter({
     }
   }
 
+  const activeSectionLabel = subViews.find((view) => view.id === activeTab)?.label ?? activeTab;
+
   return (
-    <section className="command-center" data-testid="command-center">
-      <header className="cc-header">
-        {/* FNXC:CommandCenter 2026-06-22-01:00: Icon size aligned to 20 to match the shared ViewHeader (cc-header is the model for ViewHeader; title is already 1.125rem with --space-lg padding). */}
-        <h2 className="cc-title">
-          <Gauge size={20} />
-          {t("commandCenter.heading", "Dashboard")}
-        </h2>
-        <DateRangePicker value={range} onChange={setRange} />
-      </header>
-
+    <ViewLayout
+      className="command-center"
+      data-testid="command-center"
+      contentOwnsScroll
+      mobilePane={mobilePane}
+      header={(
+        <ViewHeader
+          className="cc-header"
+          icon={Gauge}
+          title={viewportMode === "mobile" && mobilePane === "detail"
+            ? activeSectionLabel
+            : t("commandCenter.heading", "Dashboard")}
+          backAction={viewportMode === "mobile" && mobilePane === "detail" ? {
+            label: t("commandCenter.backToSections", "Back to dashboard sections"),
+            onClick: () => setMobilePane("list"),
+          } : undefined}
+          actions={<DateRangePicker value={range} onChange={setRange} />}
+        />
+      )}
+      sidebar={(
+        <ViewSidebar
+          ariaLabel={t("commandCenter.tablistLabel", "Dashboard sections")}
+          resizeLabel={t("commandCenter.resizeSections", "Resize dashboard sections")}
+          hostIdentity="command-center"
+          mobile={viewportMode === "mobile"}
+          className="cc-sidebar"
+          panelClassName="cc-sidebar__panel"
+        >
+          <CommandCenterSectionNav
+            sections={subViews}
+            activeId={activeTab}
+            variant="rail"
+            onSelect={(id) => {
+              setActiveTab(id as SubViewId);
+              setMobilePane("detail");
+            }}
+          />
+        </ViewSidebar>
+      )}
+    >
       <div
-        className="cc-tablist"
-        role="tablist"
-        aria-label={t("commandCenter.tablistLabel", "Dashboard sections")}
-      >
-        {subViews.map((sub, index) => {
-          const selected = sub.id === activeTab;
-          return (
-            <button
-              key={sub.id}
-              ref={(el) => {
-                tabRefs.current[index] = el;
-              }}
-              role="tab"
-              id={`cc-tab-${sub.id}`}
-              aria-selected={selected}
-              aria-controls={`cc-tabpanel-${sub.id}`}
-              tabIndex={selected ? 0 : -1}
-              className={`cc-tab${selected ? " active" : ""}`}
-              onClick={() => setActiveTab(sub.id)}
-              onKeyDown={(e) => onTabKeyDown(e, index)}
-              data-testid={`command-center-tab-${sub.id}`}
-            >
-              {sub.label}
-            </button>
-          );
-        })}
-      </div>
-
-      <div
-        role="tabpanel"
-        id={`cc-tabpanel-${activeTab}`}
-        aria-labelledby={`cc-tab-${activeTab}`}
+        role="region"
+        aria-label={activeSectionLabel}
         tabIndex={0}
         className="cc-tabpanel"
         data-testid={`command-center-panel-${activeTab}`}
       >
         {renderActiveTab()}
       </div>
-    </section>
+    </ViewLayout>
   );
 }

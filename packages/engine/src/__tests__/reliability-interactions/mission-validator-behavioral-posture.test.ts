@@ -22,7 +22,7 @@ import type {
   MissionFeature,
   MissionValidatorRun,
 } from "@fusion/core";
-import type { VerificationCapability, VerificationOutcome } from "../../mission-verification.js";
+import type { VerificationCapability, VerificationOutcome } from "../../missions/mission-verification.js";
 
 // ── Mock AI dependencies (mirror mission-execution-loop.test.ts) ───────────────
 const mockSessionHolder: {
@@ -35,11 +35,11 @@ vi.mock("../../pi.js", () => ({
 }));
 
 vi.mock("../../logger.js", () => ({
-  createLogger: vi.fn(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() })),
+  createLogger: vi.fn(() => ({ log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() })),
 }));
 
-vi.mock("../../agent-session-helpers.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../agent-session-helpers.js")>();
+vi.mock("../../agents/agent-session-helpers.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../agents/agent-session-helpers.js")>();
   return {
     ...actual,
     createResolvedAgentSession: vi.fn(async () => ({
@@ -51,8 +51,8 @@ vi.mock("../../agent-session-helpers.js", async (importOriginal) => {
   };
 });
 
-import { createResolvedAgentSession } from "../../agent-session-helpers.js";
-import { MissionExecutionLoop } from "../../mission-execution-loop.js";
+import { createResolvedAgentSession } from "../../agents/agent-session-helpers.js";
+import { MissionExecutionLoop } from "../../missions/mission-execution-loop.js";
 
 type AssertionRow = {
   id: string;
@@ -458,6 +458,12 @@ describe("Validator behavioral posture (U2 + U3)", () => {
     expect(call[2]).toEqual(["CA-1"]);
     expect(typeof call[3]).toBe("string");
     expect(call[3]).toContain("defect still reproduces");
+    expect(call[5]).toMatchObject({
+      assertions: [{
+        assertionId: "CA-1",
+        evidence: [{ kind: "behavioral-verification", text: expect.stringContaining("button still does nothing") }],
+      }],
+    });
   });
 
   it("U6/R16: a verification FAILURE emits a persisted mission event with outcome=fail", async () => {
@@ -529,10 +535,35 @@ describe("Validator behavioral posture (U2 + U3)", () => {
     await loop.processTaskOutcome("FN-TRIAGE");
 
     const triageEvent = (missionStore.logMissionEvent as any).mock.calls.find(
-      (c: any[]) => c[3]?.code === "fix_feature_triage_failed",
+      (c: any[]) => c[3]?.code === "fix_feature_triage_needs_attention",
     );
     expect(triageEvent).toBeDefined();
-    expect(triageEvent[1]).toBe("error");
-    expect(triageEvent[3]?.error).toContain("triage boom");
+    expect(triageEvent[1]).toBe("warning");
+    expect(triageEvent[2]).not.toContain("triage boom");
+    expect(triageEvent[3]).toMatchObject({ state: "needs-triage" });
+  });
+
+  it("silently reuses an already-triaged fix with its canonical linked task", async () => {
+    proveLandedInspection();
+    const verify = vi.fn(async (req): Promise<VerificationOutcome> => ({ verdict: "fail", assertionId: req.assertionId, reason: "defect still reproduces" }));
+    const feature = createMockFeature({ loopState: "implementing", taskId: "FN-DUPLICATE", status: "in-progress" });
+    const existingFix = createMockFeature({
+      id: "FIX-F-001", taskId: "TASK-FIX-F-001", status: "in-progress", loopState: "implementing",
+      generatedFromFeatureId: "F-001", generatedFromRunId: "VR-existing",
+    });
+    missionStore._setFeature(feature);
+    missionStore._setFeature(existingFix);
+    missionStore._setAssertions("F-001", [assertionRow({ id: "CA-1", type: "behavioral" })]);
+    taskStore._setTask(landedTask("FN-DUPLICATE", "duplicate trigger"));
+    taskStore._setTask({ id: "TASK-FIX-F-001", title: "existing remediation" });
+    missionStore.createGeneratedFixFeature = vi.fn(() => existingFix) as any;
+    judgePass(["CA-1"]);
+
+    loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp", verificationCapability: { verifyBehavioralAssertion: verify } });
+    loop.start();
+    await loop.processTaskOutcome("FN-DUPLICATE");
+
+    expect(missionStore.triageFeature).not.toHaveBeenCalled();
+    expect((missionStore.logMissionEvent as any).mock.calls.some((call: any[]) => call[3]?.code === "fix_feature_triage_needs_attention")).toBe(false);
   });
 });

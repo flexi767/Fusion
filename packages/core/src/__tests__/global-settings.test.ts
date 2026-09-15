@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { GlobalSettingsStore, defaultGlobalDir } from "../global-settings.js";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { GlobalSettingsStore, defaultGlobalDir } from "../config/global-settings.js";
 import { DEFAULT_GLOBAL_SETTINGS } from "../types.js";
 import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -197,6 +197,16 @@ describe("GlobalSettingsStore", () => {
       await expect(new GlobalSettingsStore(dir).getSettings()).resolves.toMatchObject({ colorTheme: "ocean" });
     });
 
+    it("resolves an invalid persisted color theme to the canonical default", async () => {
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, "settings.json"),
+        JSON.stringify({ colorTheme: "unknown-theme" }),
+      );
+
+      await expect(store.getSettings()).resolves.toMatchObject({ colorTheme: "shadcn-ember" });
+    });
+
     it("returns defaults on invalid JSON", async () => {
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, "settings.json"), "not-json{{{");
@@ -227,6 +237,49 @@ describe("GlobalSettingsStore", () => {
       const raw = await readFile(join(dir, "settings.json"), "utf-8");
       const parsed = JSON.parse(raw);
       expect(parsed.themeMode).toBe("system");
+    });
+
+    it("round-trips the Liquid Glass color theme through persisted settings", async () => {
+      await store.init();
+      await store.updateSettings({ colorTheme: "liquid-glass" });
+
+      await expect(store.getSettings()).resolves.toMatchObject({ colorTheme: "liquid-glass" });
+      await expect(new GlobalSettingsStore(dir).getSettings()).resolves.toMatchObject({ colorTheme: "liquid-glass" });
+    });
+
+    it("replaces an invalid color theme with the canonical default before persistence", async () => {
+      await store.init();
+
+      await expect(store.updateSettings({ colorTheme: "unknown-theme" as never })).resolves.toMatchObject({
+        colorTheme: "shadcn-ember",
+      });
+
+      const persisted = JSON.parse(await readFile(join(dir, "settings.json"), "utf-8"));
+      expect(persisted.colorTheme).toBe("shadcn-ember");
+    });
+
+    it("round-trips the Aurora color theme through persisted settings", async () => {
+      await store.init();
+      await store.updateSettings({ colorTheme: "aurora" });
+
+      await expect(store.getSettings()).resolves.toMatchObject({ colorTheme: "aurora" });
+      await expect(new GlobalSettingsStore(dir).getSettings()).resolves.toMatchObject({ colorTheme: "aurora" });
+    });
+
+    it("round-trips the Calm color theme through persisted settings", async () => {
+      await store.init();
+      await store.updateSettings({ colorTheme: "calm" });
+
+      await expect(store.getSettings()).resolves.toMatchObject({ colorTheme: "calm" });
+      await expect(new GlobalSettingsStore(dir).getSettings()).resolves.toMatchObject({ colorTheme: "calm" });
+    });
+
+    it("round-trips the Dawn color theme through persisted settings", async () => {
+      await store.init();
+      await store.updateSettings({ colorTheme: "dawn" });
+
+      await expect(store.getSettings()).resolves.toMatchObject({ colorTheme: "dawn" });
+      await expect(new GlobalSettingsStore(dir).getSettings()).resolves.toMatchObject({ colorTheme: "dawn" });
     });
 
     it("persists and clears the planner clarification preference", async () => {
@@ -934,6 +987,45 @@ describe("GlobalSettingsStore", () => {
       const raw = JSON.parse(await readFile(join(dir, "settings.json"), "utf-8"));
       expect(raw.defaultProvider).toBe("anthropic");
       expect(raw.defaultModelId).toBeUndefined();
+    });
+
+    it("discards a snapshot read concurrently with a sibling write", async () => {
+      const sibling = new GlobalSettingsStore(dir);
+      await store.init();
+      let releaseRead!: () => void;
+      const readStarted = new Promise<void>((resolve) => {
+        const originalReadRaw = sibling.readRaw.bind(sibling);
+        vi.spyOn(sibling, "readRaw").mockImplementationOnce(async () => {
+          resolve();
+          await new Promise<void>((release) => { releaseRead = release; });
+          return originalReadRaw();
+        });
+      });
+
+      const pendingRead = sibling.getSettings();
+      await readStarted;
+      await store.updateSettings({ themeMode: "dark" });
+      releaseRead();
+
+      expect((await pendingRead).themeMode).toBe("dark");
+      expect((await sibling.getSettings()).themeMode).toBe("dark");
+    });
+
+    it("refreshes a primed sibling store after a write and preserves its latest snapshot", async () => {
+      const sibling = new GlobalSettingsStore(dir);
+      await store.init();
+      await sibling.getSettings();
+      await store.updateSettings({ themeMode: "dark", futureSetting: "preserve-me" });
+
+      expect((await sibling.getSettings()).themeMode).toBe("dark");
+      await sibling.updateSettings({ colorTheme: "velvet" });
+
+      const raw = await sibling.readRaw();
+      expect(raw).toMatchObject({ themeMode: "dark", colorTheme: "velvet", futureSetting: "preserve-me" });
+      await store.invalidateCache();
+      // @ts-expect-error null intentionally removes an unknown key.
+      await sibling.updateSettings({ futureSetting: null });
+      expect((await store.getSettings() as Record<string, unknown>).futureSetting).toBeUndefined();
     });
   });
 });

@@ -2,7 +2,7 @@ import "./InlineCreateCard.css";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { Brain, Link, ListTree, Zap, ChevronDown, ChevronUp, Bot, Maximize2, Minimize2, Server } from "lucide-react";
+import { Brain, Link, Zap, ChevronDown, ChevronUp, Bot, Maximize2, Minimize2, Server } from "lucide-react";
 import { DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, type Task, type TaskPriority, type Settings, type ResolvedWorkflowOptionalStep, type ThinkingLevel } from "@fusion/core";
 import { getErrorMessage } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
@@ -14,10 +14,10 @@ import { NodeHealthDot } from "./NodeHealthDot";
 import { DuplicateWarningModal } from "./DuplicateWarningModal";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { applyPresetToSelection } from "../utils/modelPresets";
-import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
+import { getScopedItem, MAX_PERSISTED_DRAFT_BYTES, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { WorkflowSelector } from "./WorkflowSelector";
 import { WorkflowOptionalStepsDropdown } from "./WorkflowOptionalStepsDropdown";
-import { PendingImagePreviews } from "./PendingImagePreviews";
+import { PendingAttachmentPreviews } from "./PendingAttachmentPreviews";
 
 const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const STORAGE_KEY = "kb-inline-create-text";
@@ -43,10 +43,6 @@ interface InlineCreateCardProps {
    * Preserved for shared create-surface prop compatibility. Inline quick-create intentionally omits Plan.
    */
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  /**
-   * Called when the user clicks the "Subtask" button to trigger subtask breakdown.
-   */
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
 }
 
 function getNodeStatusLabel(status: NodeInfo["status"], t?: (key: string, defaultValue: string) => string): string {
@@ -91,7 +87,6 @@ export function InlineCreateCard({
   addToast,
   projectId,
   availableModels,
-  onSubtaskBreakdown,
 }: InlineCreateCardProps) {
   const { t } = useTranslation("app");
   const [description, setDescription] = useState(() => {
@@ -118,12 +113,16 @@ export function InlineCreateCard({
   const [settings, setSettings] = useState<Settings | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | undefined>(undefined);
   const [executorProvider, setExecutorProvider] = useState<string | undefined>(undefined);
+  const [credentialInstanceId, setCredentialInstanceId] = useState<string | undefined>(undefined);
   const [executorModelId, setExecutorModelId] = useState<string | undefined>(undefined);
   const [validatorProvider, setValidatorProvider] = useState<string | undefined>(undefined);
+  const [validatorCredentialInstanceId, setValidatorCredentialInstanceId] = useState<string | undefined>(undefined);
   const [validatorModelId, setValidatorModelId] = useState<string | undefined>(undefined);
   const [planningProvider, setPlanningProvider] = useState<string | undefined>(undefined);
+  const [planningCredentialInstanceId, setPlanningCredentialInstanceId] = useState<string | undefined>(undefined);
   const [planningModelId, setPlanningModelId] = useState<string | undefined>(undefined);
   const [mergerProvider, setMergerProvider] = useState<string | undefined>(undefined);
+  const [mergerCredentialInstanceId, setMergerCredentialInstanceId] = useState<string | undefined>(undefined);
   const [mergerModelId, setMergerModelId] = useState<string | undefined>(undefined);
   /* FNXC:Settings-ThinkingLevel 2026-07-09-00:00: quick-create board card carries the same per-task thinking-level override as the full New Task modal; "" means "use default". */
   const [thinkingLevel, setThinkingLevel] = useState<string>("");
@@ -149,6 +148,7 @@ export function InlineCreateCard({
   const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[] | null>(null);
   const [pendingSubmit, setPendingSubmit] = useState<CreateTaskInput | null>(null);
   const justResetRef = useRef(false);
+  const draftPersistenceWarningShownRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
   const agentPickerRef = useRef<HTMLDivElement>(null);
@@ -158,12 +158,26 @@ export function InlineCreateCard({
     setDescription(getScopedItem(STORAGE_KEY, projectId) || "");
   }, [projectId]);
 
-  // Persist description to localStorage whenever it changes
+  /*
+  FNXC:QuickAddDraftPersistence 2026-08-20-00:43:
+  Inline Create keeps its React draft authoritative for submission. The localStorage restore mirror is capped and optional so a large paste never exhausts browser quota or interrupts the composer (Runfusion/Fusion#3477).
+  */
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      setScopedItem(STORAGE_KEY, description, projectId);
+    if (description.length === 0) {
+      removeScopedItem(STORAGE_KEY, projectId);
+      return;
     }
-  }, [description, projectId]);
+
+    const persisted = setScopedItem(STORAGE_KEY, description, projectId, {
+      maxBytes: MAX_PERSISTED_DRAFT_BYTES,
+    });
+    if (persisted) {
+      draftPersistenceWarningShownRef.current = false;
+    } else if (!draftPersistenceWarningShownRef.current) {
+      draftPersistenceWarningShownRef.current = true;
+      addToast(t("tasks.draftTooLargeToSave", "Draft is too large to save in this browser — it will not be restored after a reload."), "warning");
+    }
+  }, [addToast, description, projectId, t]);
 
   // Clear agents cache when projectId changes to prevent stale agents from leaking across projects
   useEffect(() => {
@@ -500,12 +514,16 @@ export function InlineCreateCard({
       ...(selectedAgentId ? { assignedAgentId: selectedAgentId } : {}),
       modelPresetId: selectedPresetId,
       modelProvider: hasExecutorOverride ? executorProvider : undefined,
+      credentialInstanceId: hasExecutorOverride ? credentialInstanceId : undefined,
       modelId: hasExecutorOverride ? executorModelId : undefined,
       validatorModelProvider: hasValidatorOverride ? validatorProvider : undefined,
+      validatorCredentialInstanceId: hasValidatorOverride ? validatorCredentialInstanceId : undefined,
       validatorModelId: hasValidatorOverride ? validatorModelId : undefined,
       planningModelProvider: hasPlanningOverride ? planningProvider : undefined,
+      planningCredentialInstanceId: hasPlanningOverride ? planningCredentialInstanceId : undefined,
       planningModelId: hasPlanningOverride ? planningModelId : undefined,
       mergerModelProvider: hasMergerOverride ? mergerProvider : undefined,
+      mergerCredentialInstanceId: hasMergerOverride ? mergerCredentialInstanceId : undefined,
       mergerModelId: hasMergerOverride ? mergerModelId : undefined,
       validatorThinkingLevel: validatorThinkingLevel !== "" ? validatorThinkingLevel as ThinkingLevel : undefined,
       planningThinkingLevel: planningThinkingLevel !== "" ? planningThinkingLevel as ThinkingLevel : undefined,
@@ -532,7 +550,7 @@ export function InlineCreateCard({
     }
 
     await submitTask(input);
-  }, [description, submitting, selectedWorkflowId, dependencies, selectedAgentId, selectedPresetId, hasExecutorOverride, executorProvider, executorModelId, hasValidatorOverride, validatorProvider, validatorModelId, hasPlanningOverride, planningProvider, planningModelId, hasMergerOverride, mergerProvider, mergerModelId, thinkingLevel, validatorThinkingLevel, planningThinkingLevel, mergerThinkingLevel, optionalSteps.length, enabledOptionalStepIds, priority, effectiveNodeId, projectId, addToast, submitTask]);
+  }, [description, submitting, selectedWorkflowId, dependencies, selectedAgentId, selectedPresetId, hasExecutorOverride, executorProvider, credentialInstanceId, executorModelId, hasValidatorOverride, validatorProvider, validatorCredentialInstanceId, validatorModelId, hasPlanningOverride, planningProvider, planningCredentialInstanceId, planningModelId, hasMergerOverride, mergerProvider, mergerCredentialInstanceId, mergerModelId, thinkingLevel, validatorThinkingLevel, planningThinkingLevel, mergerThinkingLevel, optionalSteps.length, enabledOptionalStepIds, priority, effectiveNodeId, projectId, addToast, submitTask]);
 
   const handleDuplicateProceed = useCallback(async () => {
     const matches = duplicateMatches;
@@ -667,18 +685,21 @@ export function InlineCreateCard({
     const next = parseModelSelection(value);
     setExecutorProvider(next.provider);
     setExecutorModelId(next.modelId);
+    setCredentialInstanceId(undefined);
   }, []);
 
   const handleValidatorChange = useCallback((value: string) => {
     const next = parseModelSelection(value);
     setValidatorProvider(next.provider);
     setValidatorModelId(next.modelId);
+    setValidatorCredentialInstanceId(undefined);
   }, []);
 
   const handlePlanningModelChange = useCallback((value: string) => {
     const next = parseModelSelection(value);
     setPlanningProvider(next.provider);
     setPlanningModelId(next.modelId);
+    setPlanningCredentialInstanceId(undefined);
   }, []);
 
   const handleThinkingLevelChange = useCallback((value: string) => {
@@ -730,47 +751,6 @@ export function InlineCreateCard({
     e.preventDefault();
   }, []);
 
-  /*
-  FNXC:InlineCreate 2026-06-30-00:00:
-  Inline quick-create intentionally omits the Plan button, icon, disabled state, tooltip, and click target while preserving Subtask and task creation controls.
-  */
-  const handleSubtaskClick = useCallback(() => {
-    const trimmed = description.trim();
-    if (!trimmed) {
-      addToast(t("inline.enterDescriptionFirst", "Enter a description first"), "error");
-      return;
-    }
-    if (selectedWorkflowId !== null) {
-      onSubtaskBreakdown?.(trimmed, selectedWorkflowId);
-    } else {
-      onSubtaskBreakdown?.(trimmed);
-    }
-    // Clear the input after triggering subtask breakdown
-    setDescription("");
-    setSelectedWorkflowId(null);
-    setDependencies([]);
-    setExecutorProvider(undefined);
-    setExecutorModelId(undefined);
-    setValidatorProvider(undefined);
-    setValidatorModelId(undefined);
-    setPlanningProvider(undefined);
-    setPlanningModelId(undefined);
-    setMergerProvider(undefined);
-    setMergerModelId(undefined);
-    setThinkingLevel("");
-    setValidatorThinkingLevel("");
-    setPlanningThinkingLevel("");
-    setMergerThinkingLevel("");
-    setEnabledOptionalStepIds([]);
-    setSelectedPresetId(undefined);
-    setSelectedAgentId(null);
-    setNodeId(undefined);
-    setShowDeps(false);
-    setShowAgentPicker(false);
-    setIsModelModalOpen(false);
-    setShowPresets(false);
-    setIsExpanded(false);
-  }, [description, onSubtaskBreakdown, selectedWorkflowId, addToast]);
 
   const truncate = (s: string, len: number) =>
     s.length > len ? s.slice(0, len) + "…" : s;
@@ -890,8 +870,8 @@ export function InlineCreateCard({
           />
         )}
       </div>
-      <PendingImagePreviews
-        images={pendingImages}
+      <PendingAttachmentPreviews
+        attachments={pendingImages}
         onRemove={removeImage}
         disabled={submitting}
         removeLabel={t("inline.removeImage", "Remove image")}
@@ -900,21 +880,6 @@ export function InlineCreateCard({
       {isExpanded && (
         <div id="inline-create-controls" className="inline-create-footer">
           <div className="inline-create-controls">
-            {/* FNXC:QuickAddSubtaskFlag 2026-06-21-00:00: Render no Subtask button or orphaned inline-create click target unless the default-off `subtaskBreakdown` experiment wires this callback. */}
-            {onSubtaskBreakdown && (
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={handleSubtaskClick}
-                onMouseDown={(e) => e.preventDefault()}
-                disabled={!description.trim()}
-                data-testid="subtask-button"
-                title={t("inline.breakDownSubtasks", "Break down into AI-generated subtasks")}
-              >
-                <ListTree size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
-                {t("inline.subtask", "Subtask")}
-              </button>
-            )}
             <div className="dep-trigger-wrap">
               <button
                 type="button"
@@ -1239,7 +1204,15 @@ export function InlineCreateCard({
               onExecutorChange={handleExecutorChange}
               onValidatorChange={handleValidatorChange}
               onPlanningChange={handlePlanningModelChange}
-              onMergerChange={(value) => { const next = parseModelSelection(value); setMergerProvider(next.provider); setMergerModelId(next.modelId); }}
+              onMergerChange={(value) => { const next = parseModelSelection(value); setMergerProvider(next.provider); setMergerModelId(next.modelId); setMergerCredentialInstanceId(undefined); }}
+              credentialInstanceId={credentialInstanceId}
+              onCredentialInstanceChange={(value) => setCredentialInstanceId(value || undefined)}
+              validatorCredentialInstanceId={validatorCredentialInstanceId}
+              onValidatorCredentialInstanceChange={(value) => setValidatorCredentialInstanceId(value || undefined)}
+              planningCredentialInstanceId={planningCredentialInstanceId}
+              onPlanningCredentialInstanceChange={(value) => setPlanningCredentialInstanceId(value || undefined)}
+              mergerCredentialInstanceId={mergerCredentialInstanceId}
+              onMergerCredentialInstanceChange={(value) => setMergerCredentialInstanceId(value || undefined)}
               mergerThinkingLevel={mergerThinkingLevel}
               onMergerThinkingLevelChange={setMergerThinkingLevel}
               validatorThinkingLevel={validatorThinkingLevel}

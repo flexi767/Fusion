@@ -1,0 +1,15 @@
+/*
+FNXC:TaskDetailTabs 2026-09-12-17:32:
+The tab row keeps native horizontal touch panning and shows closed-hand feedback only after shared mouse-pan intent wins. The panning state temporarily owns cursor and text selection without changing the flat tab treatment or stationary control behavior.
+*/
+.detail-tabs.is-mouse-panning,
+.detail-tabs.is-mouse-panning * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+
+@media (max-width: 768px) {
+  .detail-tabs {
+    touch-action: pan-x pan-y;
+  }
+}

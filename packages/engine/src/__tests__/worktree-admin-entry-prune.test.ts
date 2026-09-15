@@ -9,8 +9,12 @@ afterEach(() => {
   vi.resetModules();
   vi.unmock("node:child_process");
   vi.unmock("node:fs");
-  vi.unmock("../worktree-hooks.js");
-  vi.unmock("../worktree-prune.js");
+  /*
+  FNXC:TestHarnessIntegrity 2026-08-12-01:04:
+  Refactors must move `unmock` siblings with their `doMock` targets, or a real-module test silently retains a mock.
+  */
+  vi.unmock("../worktree/worktree-hooks.js");
+  vi.unmock("../worktree/worktree-prune.js");
 });
 
 describe("worktree prune wiring", () => {
@@ -22,15 +26,15 @@ describe("worktree prune wiring", () => {
     execMock.mockRejectedValueOnce(new Error("create failed")).mockResolvedValueOnce({ stdout: "", stderr: "" });
 
     vi.doMock("node:child_process", () => ({ exec: execMock, execFile: vi.fn() }));
-    vi.doMock("../worktree-prune.js", async (importOriginal) => {
-      const actual = await importOriginal<typeof import("../worktree-prune.js")>();
+    vi.doMock("../worktree/worktree-prune.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../worktree/worktree-prune.js")>();
       return { ...actual, pruneWorktreeAdminEntries: pruneSpy };
     });
-    vi.doMock("../worktree-hooks.js", () => ({
+    vi.doMock("../worktree/worktree-hooks.js", () => ({
       installTaskWorktreeIdentityGuard: vi.fn().mockRejectedValue(new Error("guard failed")),
     }));
 
-    const { StepSessionExecutor } = await import("../step-session-executor.js");
+    const { StepSessionExecutor } = await import("../execution/step-session-executor.js");
     const task = {
       id: "FN-5058",
       title: "t",
@@ -62,11 +66,11 @@ describe("worktree prune wiring", () => {
     execMock.mockRejectedValueOnce(new Error("create failed")).mockResolvedValueOnce({ stdout: "", stderr: "" });
 
     vi.doMock("node:child_process", () => ({ exec: execMock, execFile: vi.fn() }));
-    vi.doMock("../worktree-prune.js", async (importOriginal) => {
-      const actual = await importOriginal<typeof import("../worktree-prune.js")>();
+    vi.doMock("../worktree/worktree-prune.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../worktree/worktree-prune.js")>();
       return { ...actual, pruneWorktreeAdminEntries: pruneSpy };
     });
-    const { StepSessionExecutor } = await import("../step-session-executor.js");
+    const { StepSessionExecutor } = await import("../execution/step-session-executor.js");
     const task = {
       id: "FN-5058",
       title: "t",
@@ -92,15 +96,15 @@ describe("worktree prune wiring", () => {
     execMock.mockResolvedValueOnce({ stdout: "", stderr: "" }).mockResolvedValueOnce({ stdout: "", stderr: "" });
 
     vi.doMock("node:child_process", () => ({ exec: execMock, execFile: vi.fn() }));
-    vi.doMock("../worktree-prune.js", async (importOriginal) => {
-      const actual = await importOriginal<typeof import("../worktree-prune.js")>();
+    vi.doMock("../worktree/worktree-prune.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../worktree/worktree-prune.js")>();
       return { ...actual, pruneWorktreeAdminEntries: pruneSpy };
     });
-    vi.doMock("../worktree-hooks.js", () => ({
+    vi.doMock("../worktree/worktree-hooks.js", () => ({
       installTaskWorktreeIdentityGuard: vi.fn().mockRejectedValue(new Error("guard failed")),
     }));
 
-    const { NativeWorktreeBackend } = await import("../worktree-backend.js");
+    const { NativeWorktreeBackend } = await import("../worktree/worktree-backend.js");
     await expect(
       new NativeWorktreeBackend({ audit: { git: vi.fn() } as any }).create({
         rootDir: "/repo",
@@ -125,15 +129,15 @@ describe("pruneWorktreeAdminEntries helper", () => {
       return { ...actual, exec: execMock, execFile: vi.fn() };
     });
 
-    vi.unmock("../worktree-prune.js");
-    const { pruneWorktreeAdminEntries } = await import("../worktree-prune.js");
+    vi.unmock("../worktree/worktree-prune.js");
+    const { pruneWorktreeAdminEntries } = await import("../worktree/worktree-prune.js");
     const audit = vi.fn().mockResolvedValue(undefined);
     await pruneWorktreeAdminEntries({ rootDir: "/repo", auditor: { git: audit }, reason: "test-failure", target: "/repo/.worktrees/x" });
   });
 
   it("runs git worktree prune end-to-end in a real repository", async () => {
-    vi.unmock("../worktree-prune.js");
-    const { pruneWorktreeAdminEntries } = await import("../worktree-prune.js");
+    vi.unmock("../worktree/worktree-prune.js");
+    const { pruneWorktreeAdminEntries } = await import("../worktree/worktree-prune.js");
     const root = mkdtempSync(join(tmpdir(), "fn-5058-prune-"));
     const repo = join(root, "repo");
     const wt = join(root, "repo-wt");

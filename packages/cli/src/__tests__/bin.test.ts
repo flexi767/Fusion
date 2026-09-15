@@ -95,6 +95,11 @@ const commandMocks = vi.hoisted(() => ({
   runNodeShow: vi.fn(),
   runNodeHealth: vi.fn(),
   runMeshStatus: vi.fn(),
+  runCloudPairStart: vi.fn(),
+  runCloudPairComplete: vi.fn(),
+  runCloudHeartbeat: vi.fn(),
+  runCloudStatus: vi.fn(),
+  runCloudUnlink: vi.fn(),
   // Legacy aliases
   runNodeAdd: vi.fn(),
   runNodeRemove: vi.fn(),
@@ -271,6 +276,14 @@ vi.mock("../commands/node.js", () => ({
   runNodeRemove: commandMocks.runNodeRemove,
 }));
 
+vi.mock("../commands/cloud.js", () => ({
+  runCloudPairStart: commandMocks.runCloudPairStart,
+  runCloudPairComplete: commandMocks.runCloudPairComplete,
+  runCloudHeartbeat: commandMocks.runCloudHeartbeat,
+  runCloudStatus: commandMocks.runCloudStatus,
+  runCloudUnlink: commandMocks.runCloudUnlink,
+}));
+
 vi.mock("../commands/agent.js", () => ({
   runAgentStop: commandMocks.runAgentStop,
   runAgentStart: commandMocks.runAgentStart,
@@ -333,7 +346,31 @@ async function runBin(args: string[]) {
   await import(/* @vite-ignore */ `../bin.ts?test=${importCounter}`);
 }
 
+/*
+ * FNXC:CloudLink 2026-09-04-03:44:
+ * Synthesize fixture credentials so code scanning does not treat test data as a
+ * hardcoded credential and a real value cannot be pasted in as a fixture.
+ */
+function fixtureSecret(label: string): string {
+  return ["fixture", label, "value"].join("-");
+}
+
 describe("bin command routing and fallbacks", () => {
+  it("keeps an absent quiet flag undefined while stripping either quiet spelling", async () => {
+    const previous = process.env.FUSION_CLI_SKIP_MAIN;
+    process.env.FUSION_CLI_SKIP_MAIN = "1";
+    try {
+      const { extractGlobalProjectFlag } = await import("../bin.ts?quiet-parser");
+      expect(extractGlobalProjectFlag(["task", "list"]).quiet).toBeUndefined();
+      expect(extractGlobalProjectFlag(["task", "--quiet", "list"]).cleanedArgs).toEqual(["task", "list"]);
+      expect(extractGlobalProjectFlag(["serve", "-q", "--port", "0"]).cleanedArgs).toEqual(["serve", "--port", "0"]);
+      expect(extractGlobalProjectFlag(["--quiet", "serve", "--project", "name"]).cleanedArgs).toEqual(["serve", "--project", "name"]);
+    } finally {
+      if (previous === undefined) delete process.env.FUSION_CLI_SKIP_MAIN;
+      else process.env.FUSION_CLI_SKIP_MAIN = previous;
+    }
+  });
+
   const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
   const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -451,6 +488,90 @@ describe("bin command routing and fallbacks", () => {
     });
   });
 
+  it("dispatches every cloud subcommand", async () => {
+    await runBin(["cloud", "pair-start", "--http", "https://cloud.example.convex.site", "--name", "studio"]);
+    expect(commandMocks.runCloudPairStart).toHaveBeenCalledWith({
+      http: "https://cloud.example.convex.site",
+      name: "studio",
+    });
+
+    await runBin(["cloud", "pair-complete"]);
+    expect(commandMocks.runCloudPairComplete).toHaveBeenCalledWith({
+      http: undefined,
+      code: undefined,
+      pendingSecret: undefined,
+    });
+
+    const pairCompleteBase = [
+      "cloud",
+      "pair-complete",
+      "--http",
+      "https://cloud.example.convex.site",
+      "--code",
+      "ABCD-EFGH",
+    ];
+    for (const pendingSecretArgs of [
+      ["--pending-secret", "argv-value"],
+      ["--pending-secret=argv-value"],
+      ["--pending-secret="],
+      ["--pending-secret"],
+    ]) {
+      const callsBeforeRefusal = commandMocks.runCloudPairComplete.mock.calls.length;
+      await expect(runBin([...pairCompleteBase, ...pendingSecretArgs])).rejects.toThrow("process.exit:1");
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Do not pass --pending-secret"));
+      expect(commandMocks.runCloudPairComplete).toHaveBeenCalledTimes(callsBeforeRefusal);
+    }
+
+    const previousSecret = process.env.FUSION_CLOUD_PENDING_SECRET;
+    const environmentValue = fixtureSecret("environment");
+    process.env.FUSION_CLOUD_PENDING_SECRET = environmentValue;
+    try {
+      await runBin(pairCompleteBase);
+      expect(commandMocks.runCloudPairComplete).toHaveBeenLastCalledWith({
+        http: "https://cloud.example.convex.site",
+        code: "ABCD-EFGH",
+        pendingSecret: environmentValue,
+      });
+    } finally {
+      if (previousSecret === undefined) delete process.env.FUSION_CLOUD_PENDING_SECRET;
+      else process.env.FUSION_CLOUD_PENDING_SECRET = previousSecret;
+    }
+
+    await runBin(pairCompleteBase);
+    expect(commandMocks.runCloudPairComplete).toHaveBeenLastCalledWith({
+      http: "https://cloud.example.convex.site",
+      code: "ABCD-EFGH",
+      pendingSecret: undefined,
+    });
+
+    await runBin([...pairCompleteBase, "--pending-secret-ish"]);
+    expect(commandMocks.runCloudPairComplete).toHaveBeenLastCalledWith({
+      http: "https://cloud.example.convex.site",
+      code: "ABCD-EFGH",
+      pendingSecret: undefined,
+    });
+
+    await runBin(["cloud", "heartbeat", "--url", "https://abc.trycloudflare.com", "--port", "51234"]);
+    expect(commandMocks.runCloudHeartbeat).toHaveBeenCalledWith({
+      url: "https://abc.trycloudflare.com",
+      port: 51234,
+      tunnel: true,
+    });
+
+    await runBin(["cloud", "heartbeat", "--no-tunnel", "--port", "51234"]);
+    expect(commandMocks.runCloudHeartbeat).toHaveBeenLastCalledWith({
+      url: undefined,
+      port: 51234,
+      tunnel: false,
+    });
+
+    await runBin(["cloud", "status", "--json"]);
+    expect(commandMocks.runCloudStatus).toHaveBeenCalledWith({ json: true });
+
+    await runBin(["cloud", "unlink"]);
+    expect(commandMocks.runCloudUnlink).toHaveBeenCalled();
+  });
+
   it("errors when settings import file is missing", async () => {
     await expect(runBin(["settings", "import"])).rejects.toThrow("process.exit:1");
     expect(errorSpy).toHaveBeenCalledWith(
@@ -558,12 +679,16 @@ describe("bin command routing and fallbacks", () => {
     await runBin(["message", "read", "msg-1", "-P", "demo"]);
     await runBin(["message", "delete", "msg-1", "-P", "demo"]);
     await runBin(["message", "inbox", "-P", "demo"]);
+    await runBin(["message", "inbox", "--user", "dashboard", "-P", "demo"]);
     await runBin(["message", "outbox", "-P", "demo"]);
 
     expect(commandMocks.runMessageSend).toHaveBeenCalledWith("agent-7", "hello there", "demo");
     expect(commandMocks.runMessageRead).toHaveBeenCalledWith("msg-1", "demo");
     expect(commandMocks.runMessageDelete).toHaveBeenCalledWith("msg-1", "demo");
-    expect(commandMocks.runMessageInbox).toHaveBeenCalledWith("demo");
+    // FN-8424: `fn message inbox` gained `--user <cli|dashboard>`; without the
+    // flag routing passes undefined so runMessageInbox defaults to the CLI mailbox.
+    expect(commandMocks.runMessageInbox).toHaveBeenNthCalledWith(1, "demo", undefined);
+    expect(commandMocks.runMessageInbox).toHaveBeenNthCalledWith(2, "demo", "dashboard");
     expect(commandMocks.runMessageOutbox).toHaveBeenCalledWith("demo");
   });
 
@@ -832,14 +957,15 @@ describe("bin command routing and fallbacks", () => {
   });
 
   it("routes daemon command with all flags", async () => {
-    await runBin(["daemon", "--port", "5055", "--host", "127.0.0.1", "--token", "fn_abc123", "--paused", "--token-only"]);
+    const daemonToken = fixtureSecret("daemon-token");
+    await runBin(["daemon", "--port", "5055", "--host", "127.0.0.1", "--token", daemonToken, "--paused", "--token-only"]);
 
     expect(commandMocks.runDaemon).toHaveBeenCalledWith({
       port: 5055,
       paused: true,
       interactive: false,
       host: "127.0.0.1",
-      token: "fn_abc123",
+      token: daemonToken,
       tokenOnly: true,
       noAutoRegister: false,
     });

@@ -17,8 +17,10 @@ import type {
   Task,
   TaskCreateInput,
   TaskDetail,
+  TaskColumnSortMode,
   ThemeMode,
   WorkflowStep,
+  TraitFlags,
 } from "@fusion/core";
 import type {
   AiSessionSummary,
@@ -29,28 +31,34 @@ import type {
   ProjectInfoWithSource,
   RevertTaskOptions,
   RevertTaskResult,
+  PluginDashboardViewEntry,
 } from "../../api";
 import type { FusionShellApi } from "../../types/native-shell";
 import type { DetailTaskOpenOptions, DetailTaskTab, ModalManager } from "../../hooks/useModalManager";
 import type { PluginTaskView, TaskView, ViewMode } from "../../hooks/useViewState";
 import type { ToastType } from "../../hooks/useToast";
 import type { QuickChatButtonMode } from "../../hooks/useAppSettings";
+import type { UseNotesController } from "../../hooks/useNotes";
 import type { UseRemoteNodeDataResult } from "../../hooks/useRemoteNodeData";
 import type { SectionId } from "../SettingsModal";
 import type { CliActionId } from "../SessionNotificationBanner";
 import type { ApprovalBannerCandidate } from "../../utils/appLifecycle";
 import type { GraphWorkflowSelection } from "../GraphWorkflowSwitcherSlot";
+import type { ChatReportHandoff } from "../chatReportHandoff";
 // The lazy view components are value exports; importing them as values lets us
 // spell their types via `typeof` so MainContent's JSX gets full prop checking.
 import { SettingsView } from "../SettingsModal";
 import { AgentsView } from "../AgentsView";
 import { ChatView } from "../ChatView";
+import type { ChatSessionInfo } from "../../hooks/useChat";
 import { CommandCenter } from "../command-center/CommandCenter";
 import { DevServerView } from "../DevServerView";
-import { DocumentsView } from "../DocumentsView";
+import { NotesView } from "../NotesView";
+import { WhiteboardView } from "../WhiteboardView";
 import { EvalsView } from "../EvalsView";
 import { GitHubImportModal } from "../GitHubImportModal";
 import { GoalsView } from "../GoalsView";
+import { PatchnodeView } from "../PatchnodeView";
 import { InsightsView } from "../InsightsView";
 import { MemoryView } from "../MemoryView";
 import { PullRequestView } from "../PullRequestView";
@@ -58,10 +66,21 @@ import { ResearchView } from "../ResearchView";
 import { ScheduledTasksModal } from "../ScheduledTasksModal";
 import { SecretsView } from "../SecretsView";
 import { SkillsView } from "../SkillsView";
-import { TodoView } from "../TodoView";
+import { SnippetsView } from "../SnippetsView";
 import { WorkflowNodeEditor } from "../WorkflowNodeEditor";
 
 export interface MainContentProps {
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-07-30-12:15: board-workflow column traits per task id, the
+  same map the footer's live-agent predicate uses. Optional: absent for remote rows and for
+  columns not on the current board, where the consumer degrades to the documented legacy names
+  rather than guessing.
+  */
+  /* FNXC:WorkflowLifecycleColumns 2026-07-31-15:30: widened to the flags the map REALLY carries. It is
+     built from `workflow.columns.find(...).flags` (App.tsx `footerColumnFlagsByTaskId`), so the four-flag
+     declaration was a narrower view than the value — and `countsTowardWip`, which the wip predicates
+     need, was invisible to any consumer typed through here. */
+  columnFlagsByTaskId?: ReadonlyMap<string, Partial<TraitFlags>>;
   showBackendConnectionErrorPage: boolean;
   projectsError: string | null;
   t: TFunction;
@@ -69,6 +88,8 @@ export interface MainContentProps {
   handleRetryProjects: () => Promise<void>;
   shellApi: FusionShellApi | null;
   taskView: TaskView;
+  /** Project-enabled plugin views; static registrations alone must not bypass enablement. */
+  pluginDashboardViews: PluginDashboardViewEntry[];
   modalManager: ModalManager;
   handleChangeTaskView: (newView: TaskView) => void;
   refreshAppSettings: () => Promise<void>;
@@ -102,7 +123,6 @@ export interface MainContentProps {
   remoteData: UseRemoteNodeDataResult;
   tasks: Task[];
   /** Active planning sessions loaded by App before the Planning view mounts. */
-  bgPlanningSessions: AiSessionSummary[];
   workflowSteps: WorkflowStep[];
   subscribePluginEvents: (
     pluginId: string,
@@ -119,13 +139,26 @@ export interface MainContentProps {
   mergeStrategy: string;
   planAutoApproveEnabled: boolean;
   settingsLoaded: boolean;
+  openTasksInRightSidebar: boolean;
   openMobileTasksInPopup: boolean;
+  taskPopupsBoardListOnly: boolean;
+  showCostBadgeOnCards: boolean;
   taskDetailChatFirst: boolean;
+  chatMessageLayout: "bubbles" | "full-width";
+  setOpenTasksInRightSidebarImmediate: (enabled: boolean) => void;
+  setOpenMobileTasksInPopupImmediate: (enabled: boolean) => void;
+  setTaskPopupsBoardListOnlyImmediate: (enabled: boolean) => void;
+  setShowCostBadgeOnCardsImmediate: (enabled: boolean) => void;
+  setTaskDetailChatFirstImmediate: (enabled: boolean) => void;
+  setChatMessageLayoutImmediate: (layout: "bubbles" | "full-width") => void;
   skillsEnabled: boolean;
   experimentalFeatures: Record<string, boolean>;
   setQuickChatOpen: Dispatch<SetStateAction<boolean>>;
+  onOpenSessionInNewWindow?: (session: ChatSessionInfo) => void;
   /** Optional so existing MainContent callers preserve their unseeded Chat behavior. */
   chatComposerPrefill?: { text: string; nonce: number } | null;
+  mailComposerPrefill?: (ChatReportHandoff & { nonce: number }) | null;
+  onSendAsReport?: (handoff: ChatReportHandoff) => void;
   onOpenChatWithPrefill?: (prefillText: string) => void;
   setMailboxUnreadCount: (count: number) => void;
   setMissionTargetId: Dispatch<SetStateAction<string | undefined>>;
@@ -136,6 +169,9 @@ export interface MainContentProps {
   milestoneSliceResumeSessionId: string | undefined;
   setGoalAnchorId: Dispatch<SetStateAction<string | undefined>>;
   goalAnchorId: string | undefined;
+  /** Command Center agent-detail request; optional for existing dashboard prop factories. */
+  agentAnchor?: { agentId: string; requestId: number };
+  setAgentAnchor?: (anchor: { agentId: string; requestId: number } | undefined) => void;
   agentsEnabled: boolean;
   agentOnboardingEnabled: boolean;
   handleOpenTaskLogs: (taskId: string) => Promise<void>;
@@ -148,35 +184,33 @@ export interface MainContentProps {
   researchReadinessVersion: number;
   evalsEnabled: boolean;
   ideationEnabled: boolean;
+  whiteboardEnabled: boolean;
   memoryEnabled: boolean;
   goalsEnabled: boolean;
   handleOpenMission: (missionId: string) => void;
-  todosEnabled: boolean;
-  openPlanningWithInitialPlanWithNav: (initialPlan: string, workflowId?: string | null) => void;
+  openPlanningWithInitialPlanWithNav: (initialPlan: string, workflowId?: string | null, sourceIssue?: { provider: "github"; repository: string; issueNumber: number; url: string; title?: string }) => void;
   ingestCreatedTasks: (tasks: Task[]) => void;
   nodesEnabled: boolean;
   openWorkflowEditorWithNav: (workflowId?: string) => void;
-  handlePlanningTaskCreated: (task: Task) => void;
-  handlePlanningTasksCreated: (tasks: Task[]) => void;
   handleGitHubImport: (task: Task) => void;
   devServerEnabled: boolean;
   mainPanelDetailTask: Task | TaskDetail | null;
   filteredBoardTasks: Task[];
   maxConcurrent: number;
+  /** Execution-worktree ceiling used by the board's Up Next worktree preview. */
+  maxWorktrees: number;
   showWorktreeGrouping: boolean;
   moveTask: (
     id: string,
     column: ColumnId,
-    optionsOrPosition?: { preserveProgress?: boolean } | number,
+    optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
   ) => Promise<Task>;
   pauseTask: (id: string) => Promise<Task>;
   openBoardTaskDetail: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
   openTaskDetailInMainPanel: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
   openGroupModalWithNav: (groupId: string) => void;
   handleBoardQuickCreate: (input: TaskCreateInput) => Promise<Task>;
-  openNewTaskWithNav: () => void;
-  subtaskBreakdownEnabled: boolean;
-  openSubtaskBreakdownWithNav: (description: string, workflowId?: string | null) => void;
+  openNewTaskWithNav: (workflowId?: string | null) => void;
   toggleAutoMerge: () => Promise<void>;
   togglePlanAutoApprove: () => Promise<void>;
   globalPaused: boolean;
@@ -185,13 +219,6 @@ export interface MainContentProps {
     updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean },
   ) => Promise<Task>;
   retryTask: (id: string) => Promise<Task>;
-  archiveTask: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  unarchiveTask: (id: string) => Promise<Task>;
-  /*
-  FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
-  Threaded alongside archiveTask/unarchiveTask; never mutates the source
-  task's column as a side effect (see route + client contract comments).
-  */
   revertTask: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   deleteTask: (
     id: string,
@@ -202,14 +229,25 @@ export interface MainContentProps {
       allowResurrection?: boolean;
     },
   ) => Promise<Task>;
-  archiveAllDone: () => Promise<Task[]>;
-  loadArchivedTasks: () => Promise<void>;
-  /** FNXC:ArchivePagination 2026-07-08-00:00: FN-7659 — fetch the next 100-item page of archived tasks (newest-first). */
-  loadMoreArchivedTasks: () => Promise<void>;
-  /** Whether another page of archived tasks is available beyond what is currently loaded. */
-  archivedHasMore: boolean;
-  /** True while a "Show more" archived page fetch is in flight. */
-  archivedLoadingMore: boolean;
+  loadMoreCurrentTasks: () => Promise<void>;
+  currentTasksTotal: number;
+  currentTasksHasMore: boolean;
+  currentTasksLoadingMore: boolean;
+  currentTasksPaginationError?: "timeout" | "invalid-continuation" | "request-failed" | null;
+  currentTasksProgressKey?: string;
+  retryCurrentTasksPagination?: () => Promise<void>;
+  loadMoreCompletedTasks: () => Promise<void>;
+  completedCounts: {
+    byColumn: Record<string, number>;
+    byWorkflow: Record<string, Record<string, number>>;
+  };
+  completedHasMore: boolean;
+  completedLoadingMore: boolean;
+  completedPaginationError?: "timeout" | "invalid-continuation" | "request-failed" | null;
+  completedProgressKey?: string;
+  retryCompletedTasksPagination?: () => Promise<void>;
+  completedSortMode: TaskColumnSortMode;
+  changeCompletedSortMode: (mode: TaskColumnSortMode) => Promise<void>;
   searchQuery: string;
   availableModels: ModelInfo[];
   favoriteProviders: string[];
@@ -217,18 +255,21 @@ export interface MainContentProps {
   handleOpenDetailWithTab: (task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => void;
   handleToggleFavorite: (provider: string) => Promise<void>;
   handleToggleModelFavorite: (modelId: string) => Promise<void>;
-  taskStuckTimeoutMs: number | undefined;
+  // FNXC:StuckTagRemoval 2026-08-17-22:30: stuck-task tagging removed from the dashboard; taskStuckTimeoutMs is engine-side only now.
   staleHighFanoutBlockerAgeThresholdMs: number;
   lastFetchTimeMs: number | undefined;
   openCreateWorkflowWithNav: () => void;
   sidebarActive: boolean;
+  notesController?: UseNotesController;
+  registerNotesGuard?: (guard: () => boolean | Promise<boolean>, onAccepted?: () => void) => () => void;
   isMobile: boolean;
+  /** Whether the measured Alpha pill is currently rendered and needs drawer clearance. */
   mainPanelDetailInitialTab: DetailTaskTab | undefined;
   closeTaskDetailMainPanel: () => void;
   setMainPanelDetailTask: Dispatch<SetStateAction<Task | TaskDetail | null>>;
   mergeTask: (id: string) => Promise<MergeResult>;
-  resetTask: (id: string) => Promise<Task>;
-  duplicateTask: (id: string) => Promise<Task>;
+  resetTask: (id: string, options?: { description?: string }) => Promise<Task>;
+  duplicateTask: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   unpauseTask: (id: string) => Promise<Task>;
   capacityRiskBannerEnabled: boolean;
   capacityRiskDismissed: boolean;
@@ -239,16 +280,18 @@ export interface MainContentProps {
   ChatView: LazyExoticComponent<typeof ChatView>;
   CommandCenter: LazyExoticComponent<typeof CommandCenter>;
   DevServerView: LazyExoticComponent<typeof DevServerView>;
-  DocumentsView: LazyExoticComponent<typeof DocumentsView>;
+  NotesView: LazyExoticComponent<typeof NotesView>;
+  WhiteboardView: LazyExoticComponent<typeof WhiteboardView>;
   EvalsView: LazyExoticComponent<typeof EvalsView>;
   GoalsView: LazyExoticComponent<typeof GoalsView>;
+  PatchnodeView: LazyExoticComponent<typeof PatchnodeView>;
   InsightsView: LazyExoticComponent<typeof InsightsView>;
   MemoryView: LazyExoticComponent<typeof MemoryView>;
   PullRequestView: LazyExoticComponent<typeof PullRequestView>;
   ResearchView: LazyExoticComponent<typeof ResearchView>;
   SecretsView: LazyExoticComponent<typeof SecretsView>;
   SkillsView: LazyExoticComponent<typeof SkillsView>;
-  TodoView: LazyExoticComponent<typeof TodoView>;
+  SnippetsView: LazyExoticComponent<typeof SnippetsView>;
   _AutomationsView: LazyExoticComponent<typeof ScheduledTasksModal>;
   _ImportTasksView: LazyExoticComponent<typeof GitHubImportModal>;
   _SettingsView: LazyExoticComponent<typeof SettingsView>;

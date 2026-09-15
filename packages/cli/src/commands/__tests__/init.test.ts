@@ -7,9 +7,10 @@ import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInit } from "../init.js";
+import { installShippedSkillsIntoProject, SHIPPED_SKILL_NAMES, type ShippedSkillName } from "../claude-skills.js";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { GitRepositoryInitializationError } from "@fusion/core";
+import { ensureProjectGitReadiness, GitRepositoryInitializationError } from "@fusion/core";
 
 function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) {
   const mock = vi.fn(function () {});
@@ -34,8 +35,14 @@ const mockGetProjectByPath = vi.fn();
 const mockRegisterProject = vi.fn();
 const mockEnsureProjectForPath = vi.fn();
 const mockUpdateProject = vi.fn().mockResolvedValue({});
-const { mockIsValidSqliteDatabaseFile } = vi.hoisted(() => ({
+const { mockIsValidSqliteDatabaseFile, mockInstallSkillsForProject } = vi.hoisted(() => ({
   mockIsValidSqliteDatabaseFile: vi.fn(),
+  mockInstallSkillsForProject: vi.fn(() => []),
+}));
+
+vi.mock("../claude-skills-runner.js", () => ({
+  maybeInstallClaudeSkillForNewProject: mockInstallSkillsForProject,
+  ensureClaudeSkillsForAllProjectsOnStartup: vi.fn(() => []),
 }));
 
 vi.mock("@fusion/core", async () => {
@@ -68,8 +75,9 @@ async function git(command: string, cwd: string): Promise<string> {
 }
 
 const localStorageGitignoreEntries = [
-  ".fusion",
-  ".pi",
+  ".fusion/",
+  ".pi/",
+  ".worktrees/",
   "fusion.db",
   "fusion.db-wal",
   "fusion.db-shm",
@@ -90,6 +98,7 @@ describe("init command", () => {
     tempHomeDir = tempDir("fn-init-home-");
     process.env.HOME = tempHomeDir;
     process.env.USERPROFILE = tempHomeDir;
+    mockInstallSkillsForProject.mockClear();
     mockCentralInit.mockResolvedValue(undefined);
     mockCentralClose.mockResolvedValue(undefined);
     mockGetProjectByPath.mockResolvedValue(undefined);
@@ -102,17 +111,22 @@ describe("init command", () => {
       createdAt: "2026-07-14T00:00:00.000Z",
       updatedAt: "",
     });
-    mockEnsureProjectForPath.mockResolvedValue({
-      outcome: "registered",
-      project: {
-        id: "proj_1234567890abcdef",
-        name: "test-project",
-        path: tempProjectDir,
-        isolationMode: "in-process",
-        status: "initializing",
-        createdAt: "2026-07-14T00:00:00.000Z",
-        updatedAt: "",
-      },
+    mockEnsureProjectForPath.mockImplementation(async ({ path }: { path: string }) => {
+      const gitReadiness = await ensureProjectGitReadiness(path);
+      return {
+        outcome: "registered" as const,
+        gitRepository: gitReadiness.outcome,
+        integrationBranches: gitReadiness.integrationBranches,
+        project: {
+          id: "proj_1234567890abcdef",
+          name: "test-project",
+          path,
+          isolationMode: "in-process" as const,
+          status: "initializing" as const,
+          createdAt: "2026-07-14T00:00:00.000Z",
+          updatedAt: "",
+        },
+      };
     });
     mockIsValidSqliteDatabaseFile.mockImplementation((dbPath: string) => {
       if (!existsSync(dbPath)) {
@@ -185,7 +199,7 @@ describe("init command", () => {
       id: "proj_1234567890abcdef",
       createdAt: "2026-07-14T00:00:00.000Z",
     });
-    expect(mockEnsureProjectForPath).not.toHaveBeenCalled();
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith(expect.objectContaining({ path: tempProjectDir }));
   });
 
   it("should reject existing invalid fusion.db files", async () => {
@@ -305,20 +319,38 @@ describe("init command", () => {
     }
   });
 
-  it("installs the bundled Fusion skill into Claude, Codex, and Gemini homes", async () => {
+  it("C1: fn init reconciles every shipped skill for its new project", async () => {
+    /* FNXC:ComputerUseSkill 2026-08-11-14:30: The init call-site contract is
+     * outcomes, not just delegation: both shipped skills must reconcile. */
+    const sources = Object.fromEntries(SHIPPED_SKILL_NAMES.map((skillName) => {
+      const source = join(tempProjectDir, "sources", skillName);
+      mkdirSync(source, { recursive: true });
+      writeFileSync(join(source, "SKILL.md"), `name: ${skillName}`);
+      return [skillName, source];
+    })) as Record<ShippedSkillName, string>;
+    mockInstallSkillsForProject.mockImplementationOnce((path: string) =>
+      installShippedSkillsIntoProject(path, { enabled: true, sources }));
+
     await runInit({ path: tempProjectDir });
 
-    const skillTargets = [
-      join(tempHomeDir, ".claude", "skills", "fusion"),
-      join(tempHomeDir, ".codex", "skills", "fusion"),
-      join(tempHomeDir, ".gemini", "skills", "fusion"),
-    ];
-
-    for (const target of skillTargets) {
-      expect(existsSync(join(target, "SKILL.md"))).toBe(true);
-      expect(existsSync(join(target, "references", "extension-tools.md"))).toBe(true);
-      expect(existsSync(join(target, "workflows", "task-management.md"))).toBe(true);
+    expect(mockInstallSkillsForProject).toHaveBeenCalledWith(tempProjectDir);
+    expect(mockInstallSkillsForProject.mock.results[0]?.value.map((result: { outcome: string }) => result.outcome)).toEqual(["installed", "installed"]);
+    for (const skillName of SHIPPED_SKILL_NAMES) {
+      expect(existsSync(join(tempProjectDir, ".claude", "skills", skillName, "SKILL.md"))).toBe(true);
     }
+  });
+
+  it("installs both bundled skills into Claude, Codex, and Gemini homes", async () => {
+    await runInit({ path: tempProjectDir });
+
+    for (const client of [".claude", ".codex", ".gemini"]) {
+      for (const skillName of ["fusion", "computer-use"]) {
+        expect(existsSync(join(tempHomeDir, client, "skills", skillName, "SKILL.md"))).toBe(true);
+      }
+    }
+    const fusionTarget = join(tempHomeDir, ".claude", "skills", "fusion");
+    expect(existsSync(join(fusionTarget, "references", "extension-tools.md"))).toBe(true);
+    expect(existsSync(join(fusionTarget, "workflows", "task-management.md"))).toBe(true);
   });
 
   it("preserves existing Fusion skill directories instead of overwriting", async () => {
@@ -363,7 +395,7 @@ describe("init command", () => {
 
     const lines = toLines(readFileSync(gitignorePath, "utf-8"));
     expect(lines.filter((line) => line === ".fusion")).toHaveLength(1);
-    for (const entry of [".pi", "fusion.db", "fusion.db-wal", "fusion.db-shm"]) {
+    for (const entry of [".pi/", ".worktrees/", "fusion.db", "fusion.db-wal", "fusion.db-shm"]) {
       expect(lines.filter((line) => line === entry)).toHaveLength(1);
     }
   });
@@ -379,12 +411,21 @@ describe("init command", () => {
     expect(contentAfterInit).toBe(existingContent);
   });
 
-  it("initializes git when --git is enabled in a non-git directory", async () => {
+  it.each([false, true])("creates execution-ready Git state by default and with --git=%s", async (compatibilityFlag) => {
     expect(existsSync(join(tempProjectDir, ".git"))).toBe(false);
 
-    await runInit({ path: tempProjectDir, git: true });
+    await runInit({ path: tempProjectDir, ...(compatibilityFlag ? { git: true } : {}) });
 
     expect(existsSync(join(tempProjectDir, ".git"))).toBe(true);
+    await expect(git("git rev-parse --verify HEAD^{commit}", tempProjectDir)).resolves.toMatch(/^[0-9a-f]+$/);
+    const tree = await git("git ls-tree -r --name-only HEAD", tempProjectDir);
+    expect(tree).toBe(".gitignore");
+    const worktree = join(tempProjectDir, "task-worktree");
+    await git(`git worktree add -b fusion/init-${compatibilityFlag ? "git" : "default"} ${worktree} HEAD`, tempProjectDir);
+    await git(`git worktree remove --force ${worktree}`, tempProjectDir);
+    for (const entry of localStorageGitignoreEntries) {
+      expect(toLines(readFileSync(join(tempProjectDir, ".gitignore"), "utf8"))).toContain(entry);
+    }
   });
 
   it("creates an initial commit when --git initializes a repository", async () => {
@@ -422,7 +463,7 @@ describe("init command", () => {
       console.log = originalLog;
     }
 
-    expect(existsSync(join(tempProjectDir, ".git"))).toBe(false);
+    expect(existsSync(join(tempProjectDir, ".git"))).toBe(true);
     expect(mockEnsureProjectForPath).toHaveBeenCalledWith(
       expect.objectContaining({
         path: tempProjectDir,
@@ -435,6 +476,7 @@ describe("init command", () => {
     mockEnsureProjectForPath.mockResolvedValueOnce({
       outcome: "registered",
       gitRepository: "initialized",
+      integrationBranches: [{ repoRelPath: ".", branch: "master", source: "well-known-local", action: "existing" }],
       project: {
         id: "proj_1234567890abcdef",
         name: "test-project",
@@ -459,5 +501,42 @@ describe("init command", () => {
     }
 
     expect(logs.join("\n")).toContain("Initialized git repository");
+    expect(logs.join("\n")).toContain("Integration branch: master (existing)");
+  });
+
+  it("reports an unavailable integration-branch reconciliation without failing init", async () => {
+    mockEnsureProjectForPath.mockResolvedValueOnce({
+      outcome: "registered",
+      gitRepository: "existing",
+      integrationBranches: [{
+        repoRelPath: ".",
+        branch: "release/9.9",
+        source: "configured",
+        action: "unavailable",
+        reason: "test branch write failure",
+      }],
+      project: {
+        id: "proj_1234567890abcdef",
+        name: "test-project",
+        path: tempProjectDir,
+        isolationMode: "in-process",
+        status: "initializing",
+        createdAt: "2026-07-14T00:00:00.000Z",
+        updatedAt: "",
+      },
+    });
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (...args: unknown[]) => {
+      logs.push(args.join(" "));
+    };
+
+    try {
+      await runInit({ path: tempProjectDir });
+    } finally {
+      console.log = originalLog;
+    }
+
+    expect(logs.join("\n")).toContain("Integration branch: release/9.9 (unavailable)");
   });
 });

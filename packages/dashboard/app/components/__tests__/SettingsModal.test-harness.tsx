@@ -1,11 +1,13 @@
 import { vi, beforeEach, afterEach, expect } from "vitest";
 import type { ComponentProps } from "react";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { act, render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import fs from "fs";
 import path from "path";
-import { SettingsModal } from "../SettingsModal";
+import { SettingsModal, SETTINGS_AUTOSAVE_DEBOUNCE_MS } from "../SettingsModal";
+import { SETTINGS_SECTION_METADATA } from "../../../src/shared/settings-sections";
 import { __test_clearCache as clearPluginUiSlotsCache } from "../../hooks/usePluginUiSlots";
+import { ViewLayoutProvider } from "../../context/ViewLayoutContext";
 
 /*
 FNXC:DashboardTests 2026-06-25-10:05:
@@ -78,6 +80,7 @@ export const mockFetchRemoteQr = vi.fn();
 export const mockFetchRemoteUrl = vi.fn();
 export const mockTriggerMemoryDreams = vi.fn();
 export const mockFetchPluginUiSlots = vi.fn();
+export const mockFetchPlugins = vi.fn();
 export const mockFetchDroidCliStatus = vi.fn();
 export const mockSetDroidCliEnabled = vi.fn();
 export const mockFetchCursorCliStatus = vi.fn();
@@ -108,10 +111,7 @@ export const defaultSettings = {
   pushRemote: "origin",
   verificationFixRetries: 2,
   workflowRevisionForkOnScopeMismatch: true,
-  recycleWorktrees: false,
-  ephemeralAgentsEnabled: true,
   executorAllowSiblingBranchRename: false,
-  worktreeNaming: "random",
   worktreeCopyFiles: [],
   worktreesDir: "",
   worktrunk: {
@@ -132,14 +132,24 @@ export const defaultSettings = {
 
 export function renderModal(props: Partial<ComponentProps<typeof SettingsModal>> = {}) {
   return render(
-    <SettingsModal
-      onClose={noop}
-      addToast={noop}
-      initialSection="authentication"
-      {...props}
-    />
+    <ViewLayoutProvider projectId={props.projectId}>
+      <SettingsModal
+        onClose={noop}
+        addToast={noop}
+        initialSection="authentication"
+        {...props}
+      />
+    </ViewLayoutProvider>,
   );
 }
+
+/*
+FNXC:SettingsModalTests 2026-08-17-00:20:
+Quality-lane SettingsModal files stay the dashboard's slowest CI-run tests when they remount
+Authentication and click the sidebar, and when waitFor polls at the default 50ms. Keep the
+same readiness and persist assertions; poll faster and open the target section directly.
+*/
+export const SETTINGS_MODAL_WAIT = { interval: 5, timeout: 2000 } as const;
 
 export async function waitForSettingsModalReady() {
   /*
@@ -148,10 +158,20 @@ export async function waitForSettingsModalReady() {
   Loading… on the next paint (OAuth incomplete-toast test). Wait for Loading to clear so
   Authentication/section clicks do not race the initial settings fetch.
   */
-  await waitFor(() => expect(mockFetchSettings).toHaveBeenCalled());
+  await waitFor(() => expect(mockFetchSettings).toHaveBeenCalled(), SETTINGS_MODAL_WAIT);
   await waitFor(() => {
     expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
-  });
+  }, SETTINGS_MODAL_WAIT);
+}
+
+function settingsSectionIdFromNavLabel(section: string): ComponentProps<typeof SettingsModal>["initialSection"] {
+  const match = SETTINGS_SECTION_METADATA.find(
+    (entry) => entry.label.toLowerCase() === section.toLowerCase(),
+  );
+  if (!match) {
+    throw new Error(`Unknown Settings nav label: ${section}`);
+  }
+  return match.id as ComponentProps<typeof SettingsModal>["initialSection"];
 }
 
 export async function renderModalSection(
@@ -186,9 +206,8 @@ export type PersistSettingInput = {
 };
 
 export async function expectSettingPersists({ section, label, kind, value, scope, expectedKey }: PersistSettingInput) {
-  renderModal();
+  renderModal({ initialSection: settingsSectionIdFromNavLabel(section) });
   await waitForSettingsModalReady();
-  fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${section}$`, "i") }));
 
   const control = await screen.findByLabelText(label);
   if (kind === "checkbox") {
@@ -203,17 +222,18 @@ export async function expectSettingPersists({ section, label, kind, value, scope
     fireEvent.change(control, { target: { value: String(value) } });
   }
 
-  fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+  // FNXC:SettingsModalTests 2026-07-27-17:20: click the header `.modal-close` directly; `getAllByRole("button", { name: "Close" })` recomputes accessible names across the whole Settings tree and added ~700ms per persist test.
+  fireEvent.click(document.querySelector(".modal-close") as HTMLButtonElement);
 
   if (scope === "global") {
-    await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalled());
+    await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalled(), SETTINGS_MODAL_WAIT);
     expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
       expect.objectContaining({ [expectedKey]: value }),
     );
     return;
   }
 
-  await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalled());
+  await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalled(), SETTINGS_MODAL_WAIT);
   expect(mockUpdateSettings).toHaveBeenCalledWith(
     expect.objectContaining({ [expectedKey]: value }),
     undefined,
@@ -226,7 +246,8 @@ export async function assertProjectModelSavePayload(provider: string, modelId: s
 
   fireEvent.change(screen.getByLabelText("Default Provider"), { target: { value: provider } });
   fireEvent.change(screen.getByLabelText("Default Model"), { target: { value: modelId } });
-  fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+  // FNXC:SettingsModalTests 2026-07-27-17:20: scoped header-close selector avoids the whole-tree accessible-name walk of getAllByRole({ name: "Close" }).
+  fireEvent.click(document.querySelector(".modal-close") as HTMLButtonElement);
 
   await waitFor(() => {
     expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -242,6 +263,22 @@ export async function assertProjectModelSavePayload(provider: string, modelId: s
 
 export function forEachProvider<T>(providers: T[], fn: (provider: T) => void) {
   providers.forEach(fn);
+}
+
+/*
+FNXC:SettingsModalTests 2026-08-16-03:46:
+SettingsModal auto-saves through a real 500ms debounce (autoSaveTimerRef in SettingsModal.tsx).
+Tests that edit a control and then `waitFor(mockUpdateSettings called)` under real timers pay that
+full 500ms per save — the dominant per-test latency across the split files. The FN-2707 pattern
+instead enables fake timers BEFORE the mutating edit (so the debounce setTimeout lands on the fake
+clock; an edit made under real timers arms a real timer that fake advancement cannot fire), fires
+the edit with fireEvent, and flushes the debounce inside act. Real timers are restored per test and
+again defensively in installSettingsModalEnv's afterEach.
+*/
+export async function flushSettingsAutoSave() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(SETTINGS_AUTOSAVE_DEBOUNCE_MS);
+  });
 }
 
 /*
@@ -315,7 +352,12 @@ export function installSettingsModalEnv(options?: { advancedSettings?: boolean }
     mockClearApiKey.mockResolvedValue({ success: true });
     mockSubmitProviderManualCode.mockResolvedValue({ success: true, submitted: true });
     mockTestNotification.mockResolvedValue({ success: true });
-    mockFetchBackups.mockResolvedValue({ backups: [], totalSize: 0 });
+    mockFetchBackups.mockResolvedValue({
+      backups: [],
+      count: 0,
+      totalSize: 0,
+      schedule: { enabled: false, cronExpression: "0 2 * * *", routineRegistered: false },
+    });
     mockFetchMemoryFiles.mockResolvedValue({
       files: [
         {
@@ -374,18 +416,18 @@ export function installSettingsModalEnv(options?: { advancedSettings?: boolean }
     });
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.endsWith("/api/secrets")) {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ secrets: [] }),
-        };
-      }
-      if (url.endsWith("/api/secrets/sync-passphrase")) {
+      if (url.startsWith("/api/secrets/sync-passphrase")) {
         return {
           ok: true,
           status: 200,
           json: async () => ({ configured: false }),
+        };
+      }
+      if (url.startsWith("/api/secrets")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ secrets: [] }),
         };
       }
       return {
@@ -452,6 +494,7 @@ export function installSettingsModalEnv(options?: { advancedSettings?: boolean }
     mockFetchRemoteUrl.mockResolvedValue({ url: "https://remote.example.com", tokenType: "persistent", expiresAt: null });
     mockTriggerMemoryDreams.mockResolvedValue({ success: true, summary: "done" });
     mockFetchPluginUiSlots.mockResolvedValue([]);
+    mockFetchPlugins.mockResolvedValue([]);
     mockFetchDroidCliStatus.mockResolvedValue({
       binary: { available: true, version: "1.2.3", binaryPath: "/usr/local/bin/droid", probeDurationMs: 9 },
       enabled: false,
@@ -477,7 +520,7 @@ export function installSettingsModalEnv(options?: { advancedSettings?: boolean }
       refresh: vi.fn(),
     });
     mockImportSettings.mockResolvedValue({ success: true, globalCount: 0, projectCount: 0 });
-    mockFetchGlobalConcurrency.mockResolvedValue({ globalMaxConcurrent: 4, currentlyActive: 0, queuedCount: 0, projectsActive: {} });
+    mockFetchGlobalConcurrency.mockResolvedValue({ currentlyActive: 0, projectsActive: {} });
     mockUpdateGlobalConcurrency.mockResolvedValue({ globalMaxConcurrent: 4, currentlyActive: 0, queuedCount: 0, projectsActive: {} });
     mockFetchMemoryBackendStatus.mockResolvedValue({
       currentBackend: "file",

@@ -2,17 +2,11 @@
 FNXC:TaskDetailTabs 2026-06-17-08:20:
 FN-7306 labels the stable internal `chat` tab as Activity and keeps it as the default TaskDetailModal tab. Tests that assert Definition-only sections must opt into `initialTab="definition"` so they verify the intended surface instead of the Activity landing state.
 
-FNXC:PlannerOversight 2026-07-05-00:00:
-FN-7604 — the footer "Actions" dropdown button name is matched EXACTLY
-(`{ name: "Actions" }`) throughout this file, not via a loose `/actions/i`
-regex. The now-universal Oversight overflow trigger's aria-label is
-"Oversight actions", which also matches `/actions/i` and made every such
-query ambiguous once the trigger stopped being a mobile-only affordance.
+FNXC:TaskDetailFooterActions 2026-09-05-23:27:
+FN-300 keeps one header Actions trigger and moves Quick Add controls into its labeled list. Match the trigger by its exact accessible name so action items with descriptive labels cannot make menu-opening queries ambiguous.
 */
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, cleanup, within } from "@testing-library/react";
 
 // FNXC:Markdown 2026-06-23-03:30: Mock the heavy `mermaid` library so the shared
 // markdown pipeline's MermaidDiagram resolves without loading the real renderer.
@@ -23,6 +17,7 @@ vi.mock("mermaid", () => ({
   },
 }));
 import userEvent from "@testing-library/user-event";
+
 import {
   makeTask,
   noop,
@@ -34,16 +29,216 @@ import {
   mockConfirm,
   mockUsePluginUiSlots,
   expectBaseRule,
+  expectSingleStatsRuntimeStatus,
   readDashboardStylesSource,
+  resetTaskDetailFetchMock,
   setupTaskDetailModalHooks,
+  taskDetailSseSubscriptions,
 } from "./TaskDetailModal.test-helpers";
 import { TaskDetailModal, TaskDetailContent } from "../TaskDetailModal";
 import * as dashboardApi from "../../api";
 import { FileBrowserProvider } from "../../context/FileBrowserContext";
+import type { Task } from "@fusion/core";
 
 setupTaskDetailModalHooks();
 
+function openFullPlan(): void {
+  const readPlan = screen.queryByRole("button", { name: "Read plan" });
+  if (readPlan) fireEvent.click(readPlan);
+}
+
 describe("TaskDetailModal", () => {
+  /*
+  FNXC:TaskDetailStateStability 2026-08-05-02:55:
+  A real rendered detail host receives a newer queued-overlap detail and then the stale Todo row
+  produced by a scheduler resync. Rerender without remounting proves the visible lifecycle badge
+  never oscillates and the retained prompt/log survive the slim stale payload.
+  */
+  it("keeps the rendered queued-overlap lifecycle through a stale scheduler rerender", async () => {
+    const queued = makeTask({
+      id: "FN-QUEUED",
+      column: "in-progress",
+      status: "queued",
+      overlapBlockedBy: "FN-OWNER",
+      prompt: "# Preserved prompt",
+      log: [{ timestamp: "2026-08-05T10:02:00.000Z", action: "Queued behind file overlap" }],
+      updatedAt: "2026-08-05T10:02:00.000Z",
+      columnMovedAt: "2026-08-05T10:02:00.000Z",
+    });
+    const staleTodo = makeTask({
+      id: queued.id,
+      column: "todo",
+      status: undefined,
+      prompt: undefined,
+      log: [],
+      updatedAt: "2026-08-05T10:00:00.000Z",
+      columnMovedAt: "2026-08-05T10:00:00.000Z",
+    });
+    const props = {
+      initialTab: "definition" as const,
+      onClose: noop,
+
+      onDeleteTask: noopDelete,
+      onMergeTask: noopMerge,
+      onOpenDetail: noopOpenDetail,
+      addToast: noop,
+    };
+
+    const { rerender } = render(<TaskDetailModal {...props} task={queued} />);
+    openFullPlan();
+    expect(document.querySelector(".detail-column-badge")).toHaveClass("badge-in-progress");
+
+    rerender(<TaskDetailModal {...props} task={staleTodo} />);
+
+    expect(document.querySelector(".detail-column-badge")).toHaveClass("badge-in-progress");
+    expect(screen.getByText("Preserved prompt")).toBeInTheDocument();
+  });
+
+  /*
+  FNXC:TaskDetailStateStability 2026-08-05-04:05:
+  Definition ticks must not publish a full task snapshot. Drive repeated planning ticks against
+  the production detail host and preserve the queued lifecycle and resolved workflow badge node.
+  */
+  it("keeps queued lifecycle and workflow badge continuous across active Details ticks", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(dashboardApi.fetchBoardWorkflows).mockResolvedValue({
+        flagEnabled: true, defaultWorkflowId: "builtin:coding",
+        workflows: [{ id: "builtin:coding", name: "Coding", columns: [], fields: [] }], taskWorkflowIds: {},
+      });
+      const promptFetch = vi.mocked(dashboardApi.fetchTaskPrompt);
+      promptFetch.mockResolvedValue({ id: "FN-POLL", prompt: "# Updated definition" });
+      const fullFetch = vi.mocked(dashboardApi.fetchTaskDetail);
+      const queued = makeTask({ id: "FN-POLL", column: "in-progress", status: "queued", prompt: "# Initial definition", workflowStepResults: [{ workflowStepId: "plan-review", status: "running", startedAt: "2026-08-05T00:00:00.000Z" }] });
+      render(<TaskDetailContent embedded active initialTab="details" task={queued} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+
+      await act(async () => {});
+      const badge = screen.getByTestId("task-detail-workflow-badge");
+      const initialPromptRequests = promptFetch.mock.calls.length;
+      expect(document.querySelector(".detail-column-badge")).toHaveClass("badge-in-progress");
+      for (let tick = 1; tick <= 3; tick++) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+        expect(fullFetch).not.toHaveBeenCalled();
+        expect(promptFetch).toHaveBeenCalledTimes(initialPromptRequests);
+        expect(document.querySelector(".detail-column-badge")).toHaveClass("badge-in-progress");
+        expect(screen.getByTestId("task-detail-workflow-badge")).toBe(badge);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /*
+  FNXC:TaskDetailStateStability 2026-08-05-05:01:
+  Done cards use the same Definition timer as queued work. Keep both the resolved workflow badge and
+  applicable Actions control mounted through every narrow response so the fix cannot merely hide the
+  queued Todo rollback while completed-task controls still flash.
+  */
+  it("keeps done workflow badge and action controls continuous across active Details ticks", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(dashboardApi.fetchBoardWorkflows).mockResolvedValue({
+        flagEnabled: true, defaultWorkflowId: "builtin:coding",
+        workflows: [{ id: "builtin:coding", name: "Coding", columns: [], fields: [] }], taskWorkflowIds: {},
+      });
+      vi.mocked(dashboardApi.fetchTaskPrompt).mockResolvedValue({ id: "FN-DONE-POLL", prompt: "# Refreshed definition" });
+      const done = makeTask({ id: "FN-DONE-POLL", column: "done", status: "done", prompt: "# Original definition", workflowStepResults: [{ workflowStepId: "plan-review", status: "running", startedAt: "2026-08-05T00:00:00.000Z" }] });
+      render(<TaskDetailContent embedded active initialTab="details" task={done} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+
+      await act(async () => {});
+      const badge = screen.getByTestId("task-detail-workflow-badge");
+      const actions = screen.getByRole("button", { name: "Actions" });
+      const initialPromptRequests = vi.mocked(dashboardApi.fetchTaskPrompt).mock.calls.length;
+      for (let tick = 1; tick <= 3; tick++) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+        expect(dashboardApi.fetchTaskDetail).not.toHaveBeenCalled();
+        expect(dashboardApi.fetchTaskPrompt).toHaveBeenCalledTimes(initialPromptRequests);
+        expect(screen.getByTestId("task-detail-workflow-badge")).toBe(badge);
+        expect(screen.getByRole("button", { name: "Actions" })).toBe(actions);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("revalidates column actions without clearing same-task workflow metadata", async () => {
+    const payload = {
+      flagEnabled: true, defaultWorkflowId: "wf-columns", taskWorkflowIds: {},
+      workflows: [{ id: "wf-columns", name: "Column workflow", columns: [
+        { id: "in-progress", name: "Building", flags: { countsTowardWip: true } },
+        { id: "done", name: "Shipped", flags: { complete: true } },
+      ], fields: [] }],
+    };
+    let settleColumnMove: (value: typeof payload) => void = () => undefined;
+    vi.mocked(dashboardApi.fetchBoardWorkflows)
+      .mockResolvedValueOnce(payload)
+      .mockImplementationOnce(() => new Promise<typeof payload>((resolve) => { settleColumnMove = resolve; }));
+    const task = makeTask({ id: "FN-COLUMN-MOVE", column: "in-progress", status: "queued" });
+    const props = { embedded: true, active: true, initialTab: "details" as const, onDeleteTask: noopDelete, onMergeTask: noopMerge, onOpenDetail: noopOpenDetail, addToast: noop };
+    const { rerender } = render(<TaskDetailContent {...props} task={task} />);
+
+    const badge = await screen.findByTestId("task-detail-workflow-badge");
+    const actions = screen.getByRole("button", { name: "Actions" });
+    rerender(<TaskDetailContent {...props} task={{ ...task, column: "done", status: "done" }} />);
+
+    expect(screen.getByTestId("task-detail-workflow-badge")).toBe(badge);
+    expect(screen.getByRole("button", { name: "Actions" })).toBe(actions);
+    await act(async () => { settleColumnMove(payload); });
+  });
+
+  it("keeps a prompt-only response when slim initial detail resolves later", async () => {
+    let resolveDetail: (detail: TaskDetail) => void = () => undefined;
+    vi.mocked(dashboardApi.fetchTaskDetail).mockImplementationOnce(() => new Promise<TaskDetail>((resolve) => {
+      resolveDetail = resolve;
+    }));
+    vi.mocked(dashboardApi.fetchTaskPrompt).mockResolvedValueOnce({ id: "FN-slim-prompt", prompt: "# Newer narrow prompt" });
+    const slimTask = makeTask({ id: "FN-slim-prompt", prompt: undefined }) as Task;
+
+    render(<TaskDetailContent embedded active initialTab="definition" task={slimTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+    openFullPlan();
+    await waitFor(() => expect(dashboardApi.fetchTaskPrompt).toHaveBeenCalledWith("FN-slim-prompt", undefined));
+
+    await act(async () => {
+      resolveDetail(makeTask({ id: "FN-slim-prompt", prompt: "# Older full prompt" }));
+    });
+
+    expect(await screen.findByText("Newer narrow prompt")).toBeInTheDocument();
+    expect(screen.queryByText("Older full prompt")).toBeNull();
+  });
+
+  it("revalidates selected workflow metadata after its workflow SSE revision", async () => {
+    vi.mocked(dashboardApi.fetchBoardWorkflows).mockResolvedValueOnce({
+      flagEnabled: true, defaultWorkflowId: "builtin:coding",
+      workflows: [{ id: "builtin:coding", name: "Coding", columns: [], fields: [] }],
+      taskWorkflowIds: { "FN-workflow-revision": "builtin:coding" },
+    });
+    let resolveRevalidation: (payload: Awaited<ReturnType<typeof dashboardApi.fetchBoardWorkflows>>) => void = () => undefined;
+    vi.mocked(dashboardApi.fetchBoardWorkflows).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveRevalidation = resolve;
+    }));
+    render(<TaskDetailContent embedded active initialTab="details" task={makeTask({ id: "FN-workflow-revision", column: "todo" })} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+
+    expect(await screen.findByText("Coding")).toBeInTheDocument();
+    const badge = screen.getByTestId("task-detail-workflow-badge");
+    const workflowSubscription = taskDetailSseSubscriptions.find((subscription) => subscription.options.events?.["workflow:updated"]);
+    expect(workflowSubscription).toBeDefined();
+
+    await act(async () => {
+      workflowSubscription?.options.events?.["workflow:updated"](new MessageEvent("workflow:updated"));
+    });
+    expect(screen.getByTestId("task-detail-workflow-badge")).toBe(badge);
+    expect(screen.getByText("Coding")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveRevalidation({
+        flagEnabled: true, defaultWorkflowId: "wf-docs",
+        workflows: [{ id: "wf-docs", name: "Docs", columns: [], fields: [] }],
+        taskWorkflowIds: { "FN-workflow-revision": "wf-docs" },
+      });
+    });
+    expect(await screen.findByText("Docs")).toBeInTheDocument();
+  });
+
   describe("workflow timestamp badge", () => {
     const workflowPayload = {
       flagEnabled: true,
@@ -68,10 +263,10 @@ describe("TaskDetailModal", () => {
     function renderDetail(task = makeTask({ id: "FN-101", column: "todo", title: "Docs task" })) {
       return render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -89,7 +284,7 @@ describe("TaskDetailModal", () => {
       expect(badge).toHaveTextContent("Docs");
       expect(badge.closest(".detail-timestamps")).toBeTruthy();
       expect(badge.closest(".detail-title-row")).toBeNull();
-      expect(container.querySelector(".detail-title-row .detail-workflow-badge")).toBeNull();
+      expect(document.querySelector(".detail-title-row .detail-workflow-badge")).toBeNull();
       expect(screen.getAllByTestId("task-detail-workflow-badge")).toHaveLength(1);
       expect(screen.getByText("FN-101")).toBeInTheDocument();
       expect(screen.getByText("Todo")).toBeInTheDocument();
@@ -121,9 +316,9 @@ describe("TaskDetailModal", () => {
         .mockResolvedValueOnce(workflowPayload)
         .mockResolvedValueOnce(workflowPayload);
       const props = {
-        initialTab: "definition" as const,
+        initialTab: "details" as const,
         task: makeTask({ id: "FN-101", column: "todo", title: "Docs task" }),
-        onMoveTask: noopMove,
+
         onDeleteTask: noopDelete,
         onMergeTask: noopMerge,
         onOpenDetail: noopOpenDetail,
@@ -134,6 +329,7 @@ describe("TaskDetailModal", () => {
       expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Docs");
 
       rerender(<TaskDetailContent {...props} task={makeTask({ id: "FN-default", column: "in-review", title: "Coding task" })} embedded onRequestClose={noop} />);
+      fireEvent.click(screen.getByRole("button", { name: "Details" }));
       await waitFor(() => expect(screen.getByTestId("task-detail-workflow-badge")).toHaveTextContent("Coding"));
     });
 
@@ -145,9 +341,9 @@ describe("TaskDetailModal", () => {
           resolveNextPayload = resolve;
         }));
       const props = {
-        initialTab: "definition" as const,
+        initialTab: "details" as const,
         task: makeTask({ id: "FN-101", column: "todo", title: "Docs task" }),
-        onMoveTask: noopMove,
+
         onDeleteTask: noopDelete,
         onMergeTask: noopMerge,
         onOpenDetail: noopOpenDetail,
@@ -158,6 +354,7 @@ describe("TaskDetailModal", () => {
       expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Docs");
 
       rerender(<TaskDetailContent {...props} task={makeTask({ id: "FN-default", column: "in-review", title: "Coding task" })} embedded onRequestClose={noop} />);
+      fireEvent.click(screen.getByRole("button", { name: "Details" }));
       await waitFor(() => expect(dashboardApi.fetchBoardWorkflows).toHaveBeenCalledTimes(2));
       expect(screen.queryByTestId("task-detail-workflow-badge")).toBeNull();
 
@@ -179,7 +376,7 @@ describe("TaskDetailModal", () => {
 
       await waitFor(() => expect(dashboardApi.fetchBoardWorkflows).toHaveBeenCalledTimes(1));
       expect(screen.queryByTestId("task-detail-workflow-badge")).toBeNull();
-      expect(container.querySelector(".detail-workflow-badge")).toBeNull();
+      expect(document.querySelector(".detail-workflow-badge")).toBeNull();
     });
 
     it("renders the canonical badge beside the Updated timestamp in the mobile back-header variant", async () => {
@@ -187,11 +384,11 @@ describe("TaskDetailModal", () => {
 
       const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           mobileHeaderMode="back"
           task={makeTask({ id: "FN-101", column: "todo", title: "Docs task" })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -200,31 +397,37 @@ describe("TaskDetailModal", () => {
       );
 
       const badge = await screen.findByTestId("task-detail-workflow-badge");
-      const timestamps = container.querySelector(".detail-timestamps");
+      const timestamps = document.querySelector(".detail-timestamps");
       const updatedLabel = screen.getByText("Updated").closest(".detail-timestamp-item");
       expect(badge).toHaveTextContent("Docs");
       expect(badge.parentElement).toBe(timestamps);
       expect(updatedLabel?.nextElementSibling).toBe(badge);
       expect(screen.getAllByTestId("task-detail-workflow-badge")).toHaveLength(1);
       expect(screen.queryByTestId("task-detail-workflow-badge-mobile")).toBeNull();
-      expect(container.querySelector(".detail-title-row .detail-workflow-badge")).toBeNull();
-      expect(screen.getByRole("button", { name: "Back to task list" })).toBeInTheDocument();
+      expect(document.querySelector(".detail-title-row .detail-workflow-badge")).toBeNull();
+      expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
     });
   });
 
-  it("renders clickable file links in markdown inline code while preserving code wrappers", async () => {
+  it("keeps refreshed prompt and summary file links interactive in code wrappers", async () => {
     const openFile = vi.fn();
+    const initialDetail = makeTask({
+      column: "done",
+      summary: "See `packages/dashboard/app/App.tsx:25:3` for context.",
+      prompt: "# Prompt\n\nInspect `packages/dashboard/app/App.tsx:11`.",
+    });
+    vi.mocked(dashboardApi.fetchTaskPrompt).mockResolvedValue({
+      id: initialDetail.id,
+      prompt: "# Prompt\n\nInspect `packages/dashboard/app/App.tsx:12`.",
+    });
+
     render(
       <FileBrowserProvider openFile={openFile}>
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({
-            column: "done",
-            summary: "See `packages/dashboard/app/App.tsx:12` for context.",
-            prompt: "# Prompt\n\nInspect `packages/dashboard/app/App.tsx:12`."
-          })}
+          task={initialDetail}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -233,14 +436,27 @@ describe("TaskDetailModal", () => {
       </FileBrowserProvider>,
     );
 
-    const fileLinks = screen.getAllByRole("button", { name: "packages/dashboard/app/App.tsx:12" });
-    expect(fileLinks.length).toBeGreaterThan(0);
-    const code = fileLinks[0]?.closest("code");
-    expect(code).toBeTruthy();
-    expect(code?.querySelector("button.file-path-link")).toBe(fileLinks[0]);
+    /*
+    FNXC:DashboardTests 2026-08-05-04:05:
+    Definition refresh updates only its prompt tree. Query after the narrow response settles so
+    this integration test clicks the live prompt link, then assert the separately rendered
+    completed-summary surface retains the same FileBrowser contract.
+    */
+    await waitFor(() => expect(dashboardApi.fetchTaskPrompt).toHaveBeenCalledWith("FN-099", undefined));
+    openFullPlan();
+    const promptLink = await screen.findByRole("button", { name: "packages/dashboard/app/App.tsx:12" });
+    expect(screen.queryByRole("button", { name: "packages/dashboard/app/App.tsx:11" })).toBeNull();
+    expect(promptLink.closest("code")?.querySelector("button.file-path-link")).toBe(promptLink);
+    await userEvent.click(promptLink);
 
-    await userEvent.click(fileLinks[0]!);
-    expect(openFile).toHaveBeenCalledWith("packages/dashboard/app/App.tsx", { line: 12, col: undefined });
+    await userEvent.click(screen.getByRole("button", { name: "Back to definition" }));
+    await userEvent.click(screen.getByRole("button", { name: "Summary" }));
+    const summaryLink = screen.getByRole("button", { name: "packages/dashboard/app/App.tsx:25:3" });
+    expect(summaryLink.closest("code")?.querySelector("button.file-path-link")).toBe(summaryLink);
+    await userEvent.click(summaryLink);
+
+    expect(openFile).toHaveBeenNthCalledWith(1, "packages/dashboard/app/App.tsx", { line: 12, col: undefined });
+    expect(openFile).toHaveBeenNthCalledWith(2, "packages/dashboard/app/App.tsx", { line: 25, col: 3 });
   });
 
   /*
@@ -269,9 +485,9 @@ describe("TaskDetailModal", () => {
       <FileBrowserProvider openFile={vi.fn()}>
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({ prompt })}
+          task={makeTask({ description: prompt })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -281,7 +497,7 @@ describe("TaskDetailModal", () => {
     );
 
     // Raw <details>/<summary> renders as a real disclosure element.
-    const details = container.querySelector(".markdown-body details");
+    const details = document.querySelector(".markdown-body details");
     expect(details).not.toBeNull();
     expect(details?.querySelector("summary")?.textContent).toBe("Disclosure title");
     expect(details?.textContent).toContain("Hidden detail body.");
@@ -290,7 +506,7 @@ describe("TaskDetailModal", () => {
     expect(container.textContent).not.toContain("secret comment");
 
     // <script> is stripped by sanitize: not rendered and never executed.
-    expect(container.querySelector("script")).toBeNull();
+    expect(document.querySelector("script")).toBeNull();
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
 
     // ```mermaid fence renders the diagram container (lazy MermaidDiagram).
@@ -305,10 +521,10 @@ describe("TaskDetailModal", () => {
     ] as const)("renders provenance text for %s", (sourceType, sourceAgentId, expectedText) => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ sourceType, sourceAgentId })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -322,13 +538,18 @@ describe("TaskDetailModal", () => {
       }
     });
 
-    it("renders parent task link for refinement provenance", async () => {
+    // FNXC:TaskDetailModal 2026-08-15-00:00 (slow-test trim): refinement and API-created
+    // parent-link cases shared one body; converted to it.each with both cases kept.
+    it.each([
+      ["refinement provenance", "task_refine", "FN-001", /Created via Refinement/],
+      ["API-created planning tasks", "api", "FN-PLANNER", /Created via API/],
+    ] as const)("renders parent task link for %s", async (_label, sourceType, parentId, expectedText) => {
       render(
         <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ sourceType: "task_refine", sourceParentTaskId: "FN-001" })}
+          initialTab="details"
+          task={makeTask({ sourceType, sourceParentTaskId: parentId })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -336,8 +557,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText(/Created via Refinement/)).toBeInTheDocument();
-      const link = screen.getByRole("button", { name: "FN-001" });
+      expect(screen.getByText(expectedText)).toBeInTheDocument();
+      const link = screen.getByRole("button", { name: parentId });
       expect(link).toBeInTheDocument();
       await userEvent.click(link);
       await waitFor(() => {
@@ -345,36 +566,20 @@ describe("TaskDetailModal", () => {
       });
     });
 
-    it("renders parent task link for API-created planning tasks", async () => {
-      render(
+    it.each([
+      ["desktop", undefined],
+      ["compact/mobile", "back"],
+    ] as const)("links only the GitHub Import label to the source issue on %s markup", (_layout, mobileHeaderMode) => {
+      const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ sourceType: "api", sourceParentTaskId: "FN-PLANNER" })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
-
-      expect(screen.getByText(/Created via API/)).toBeInTheDocument();
-      const link = screen.getByRole("button", { name: "FN-PLANNER" });
-      await userEvent.click(link);
-      await waitFor(() => expect(noopOpenDetail).toHaveBeenCalled());
-    });
-
-    it("renders compact github issue link for github import provenance", () => {
-      render(
-        <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
+          mobileHeaderMode={mobileHeaderMode}
           task={makeTask({
             sourceType: "github_import",
             sourceMetadata: { issueUrl: "https://github.com/owner/repo/issues/42" },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -382,28 +587,29 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText(/Created via GitHub Import/).closest(".detail-provenance")).toHaveTextContent(
-        "Created via GitHub Import (owner/repo#42)",
-      );
+      const issueLink = screen.getByRole("link", { name: "GitHub Import" });
+      const provenance = issueLink.closest(".detail-provenance");
+      expect(provenance).toHaveTextContent("Created via GitHub Import");
+      expect(provenance?.textContent).not.toMatch(/[()]/);
+      expect(provenance?.querySelectorAll("a")).toHaveLength(1);
+      expect(document.querySelector(".detail-provenance-context")).toBeNull();
 
-      const issueLink = screen.getByRole("link", { name: "owner/repo#42" });
       expect(issueLink).toHaveAttribute("href", "https://github.com/owner/repo/issues/42");
       expect(issueLink).toHaveAttribute("target", "_blank");
-      expect(issueLink).toHaveAttribute("rel", expect.stringContaining("noopener"));
-      expect(issueLink).toHaveAttribute("rel", expect.stringContaining("noreferrer"));
-      expect(issueLink).toHaveAttribute("title", "https://github.com/owner/repo/issues/42");
+      expect(issueLink).toHaveAttribute("rel", "noopener noreferrer");
+      expect(issueLink).not.toHaveAttribute("title");
     });
 
-    it("falls back to 'Open issue' label for unparseable github import URL", () => {
+    it("keeps GitHub Import as the sole link for a populated nonstandard source URL", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             sourceType: "github_import",
             sourceMetadata: { issueUrl: "https://example.com/something" },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -411,23 +617,21 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const issueLink = screen.getByRole("link", { name: "Open issue" });
+      const issueLink = screen.getByRole("link", { name: "GitHub Import" });
+      const provenance = issueLink.closest(".detail-provenance");
       expect(issueLink).toHaveAttribute("href", "https://example.com/something");
-      expect(screen.getByText(/Created via GitHub Import/).closest(".detail-provenance")).toHaveTextContent(
-        "Created via GitHub Import (Open issue)",
-      );
+      expect(provenance?.querySelectorAll("a")).toHaveLength(1);
+      expect(provenance?.textContent).toBe("Created via GitHub Import");
+      expect(screen.queryByText("Open issue")).toBeNull();
     });
 
-    it("renders github import provenance with no issue URL as plain label", () => {
-      render(
+    it("renders a URL-absent GitHub import as plain text without a link shell", () => {
+      const { container, rerender } = render(
         <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({
-            sourceType: "github_import",
-            sourceMetadata: {},
-          })}
+          initialTab="details"
+          task={makeTask({ sourceType: "github_import", sourceMetadata: undefined })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -435,14 +639,33 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText("Created via GitHub Import")).toBeInTheDocument();
-      expect(screen.queryByRole("link")).not.toBeInTheDocument();
+      const assertPlainFallback = () => {
+        const provenance = screen.getByText("Created via GitHub Import").closest(".detail-provenance");
+        expect(provenance?.textContent).toBe("Created via GitHub Import");
+        expect(provenance?.querySelector("a")).toBeNull();
+        expect(document.querySelector(".detail-provenance-context")).toBeNull();
+      };
+
+      assertPlainFallback();
+      rerender(
+        <TaskDetailModal
+          initialTab="details"
+          task={makeTask({ sourceType: "github_import", sourceMetadata: {} })}
+          onClose={noop}
+
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+      assertPlainFallback();
     });
 
     it("renders finding label for research provenance", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             sourceType: "research",
             sourceMetadata: {
@@ -451,7 +674,7 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -467,13 +690,13 @@ describe("TaskDetailModal", () => {
     it("falls back to run id for research provenance context", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             sourceType: "research",
             sourceMetadata: { runId: "RR-456" },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -489,10 +712,10 @@ describe("TaskDetailModal", () => {
     it.each(["unknown", undefined] as const)("omits provenance for %s source", (sourceType) => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ sourceType })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -510,16 +733,16 @@ describe("TaskDetailModal", () => {
      * "Created to undo <id>" link. Reverse: a source task shows an "Undo task: <id>"
      * link only when an OPEN undo task referencing it exists in the loaded `tasks`
      * list — mirroring `TaskStore.findOpenRevertTaskForSource`'s open-only semantics
-     * (done/archived/soft-deleted undo tasks must not surface as an active link).
+     * (done or soft-deleted undo tasks must not surface as an active link).
      */
     describe("undo/revert provenance", () => {
       it("renders a clickable 'Created to undo <id>' link for an AI-undo task", async () => {
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={makeTask({ id: "FN-200", sourceType: "recovery", sourceMetadata: { revertOf: "FN-100" } })}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -539,10 +762,10 @@ describe("TaskDetailModal", () => {
       it("renders nothing for the forward link when sourceMetadata.revertOf is absent", () => {
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={makeTask({ id: "FN-200", sourceType: "recovery", sourceMetadata: {} })}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -556,10 +779,10 @@ describe("TaskDetailModal", () => {
       it("does not throw and renders nothing for malformed revertOf metadata", () => {
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={makeTask({ id: "FN-200", sourceMetadata: { revertOf: 999 as any } })}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -576,11 +799,11 @@ describe("TaskDetailModal", () => {
 
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={sourceTask}
             tasks={[sourceTask, undoTask]}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -596,18 +819,17 @@ describe("TaskDetailModal", () => {
         });
       });
 
-      it("renders no reverse link when the only undo task for this source is done/archived (open-only invariant)", () => {
+      it("renders no reverse link when the only undo task for this source is done (open-only invariant)", () => {
         const sourceTask = makeTask({ id: "FN-100", column: "done" });
         const doneUndoTask = makeTask({ id: "FN-202", column: "done", sourceType: "recovery", sourceMetadata: { revertOf: "FN-100" } });
-        const archivedUndoTask = makeTask({ id: "FN-203", column: "archived", sourceType: "recovery", sourceMetadata: { revertOf: "FN-100" } });
 
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={sourceTask}
-            tasks={[sourceTask, doneUndoTask, archivedUndoTask]}
+            tasks={[sourceTask, doneUndoTask]}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -624,11 +846,11 @@ describe("TaskDetailModal", () => {
 
         const { container } = render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={sourceTask}
             tasks={[sourceTask]}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -636,7 +858,7 @@ describe("TaskDetailModal", () => {
           />,
         );
 
-        expect(container.querySelector(".detail-undo-task-row")).toBeNull();
+        expect(document.querySelector(".detail-undo-task-row")).toBeNull();
       });
 
       it("picks the most recently created open undo task when multiple exist", async () => {
@@ -646,11 +868,11 @@ describe("TaskDetailModal", () => {
 
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={sourceTask}
             tasks={[sourceTask, olderUndo, newerUndo]}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -666,10 +888,10 @@ describe("TaskDetailModal", () => {
     it("FN-3755 renders provenance before created-updated timestamps", () => {
       const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ sourceType: "dashboard_ui" })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -678,20 +900,20 @@ describe("TaskDetailModal", () => {
       );
 
       const provenance = screen.getByText("Created via Dashboard").closest(".detail-provenance");
-      const timestamps = container.querySelector(".detail-timestamps");
+      const timestamps = document.querySelector(".detail-timestamps");
 
       expect(provenance).toBeTruthy();
       expect(timestamps).toBeTruthy();
       expect(provenance?.compareDocumentPosition(timestamps as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
-    it("keeps inline controls, provenance, and timestamps as direct detail-meta children", () => {
+    it("groups provenance and timestamps in the Details metadata section without inline controls", () => {
       const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ sourceType: "task_refine", sourceParentTaskId: "FN-001" })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -699,27 +921,26 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const meta = container.querySelector(".detail-meta");
-      const controls = container.querySelector(".detail-meta-inline-controls");
+      const metadataSection = document.querySelector(".detail-section--task-metadata");
       const provenance = screen.getByText(/Created via Refinement/).closest(".detail-provenance");
-      const timestamps = container.querySelector(".detail-timestamps");
+      const timestamps = document.querySelector(".detail-timestamps");
 
-      expect(meta).toBeTruthy();
-      expect(controls?.parentElement).toBe(meta);
-      expect(provenance?.parentElement).toBe(meta);
-      expect(timestamps?.parentElement).toBe(meta);
+      expect(metadataSection).toBeTruthy();
+      expect(document.querySelector(".detail-meta-inline-controls")).toBeNull();
+      expect(provenance?.parentElement).toBe(metadataSection);
+      expect(timestamps?.parentElement).toBe(metadataSection);
     });
 
-    it("keeps the optional PR link row in the same detail-meta row as provenance and timestamps", () => {
+    it("keeps the optional PR link with provenance and timestamps in Details metadata", () => {
       const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             sourceType: "dashboard_ui",
             prInfo: { number: 42, url: "https://github.com/owner/repo/pull/42" },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -727,17 +948,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const meta = container.querySelector(".detail-meta");
-      const controls = container.querySelector(".detail-meta-inline-controls");
+      const metadataSection = document.querySelector(".detail-section--task-metadata");
       const provenance = screen.getByText("Created via Dashboard").closest(".detail-provenance");
-      const prRow = container.querySelector(".detail-pr-link-row");
-      const timestamps = container.querySelector(".detail-timestamps");
+      const prRow = document.querySelector(".detail-pr-link-row");
+      const timestamps = document.querySelector(".detail-timestamps");
 
-      expect(meta).toBeTruthy();
-      expect(controls?.parentElement).toBe(meta);
-      expect(provenance?.parentElement).toBe(meta);
-      expect(prRow?.parentElement).toBe(meta);
-      expect(timestamps?.parentElement).toBe(meta);
+      expect(metadataSection).toBeTruthy();
+      expect(document.querySelector(".detail-meta-inline-controls")).toBeNull();
+      expect(provenance?.parentElement).toBe(metadataSection);
+      expect(prRow?.parentElement).toBe(metadataSection);
+      expect(timestamps?.parentElement).toBe(metadataSection);
     });
 
     describe("compact timestamp metadata", () => {
@@ -753,14 +973,14 @@ describe("TaskDetailModal", () => {
       it("renders compact relative timestamps for recent tasks", () => {
         render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={makeTask({
               sourceType: "dashboard_ui",
               createdAt: "2026-05-09T12:00:00.000Z",
               updatedAt: "2026-05-11T09:00:00.000Z",
             })}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -779,40 +999,20 @@ describe("TaskDetailModal", () => {
         expect(times[1]?.getAttribute("dateTime")).toBe("2026-05-11T09:00:00.000Z");
       });
 
-      it("renders short calendar date for older timestamps", () => {
-        render(
-          <TaskDetailModal
-            initialTab="definition"
-            task={makeTask({
-              sourceType: "dashboard_ui",
-              createdAt: "2026-05-01T12:00:00.000Z",
-              updatedAt: "2026-05-02T12:00:00.000Z",
-            })}
-            onClose={noop}
-            onMoveTask={noopMove}
-            onDeleteTask={noopDelete}
-            onMergeTask={noopMerge}
-            onOpenDetail={noopOpenDetail}
-            addToast={noop}
-          />,
-        );
-
-        const timestamps = screen.getByLabelText("Task timestamps");
-        expect(timestamps).toHaveTextContent("Created May 1");
-        expect(timestamps).toHaveTextContent("Updated May 2");
-      });
-
+      // FNXC:TaskDetailModal 2026-08-15-00:00 (slow-test trim): the standalone
+      // "short calendar date for older timestamps" case was one more bucket permutation of the
+      // same formatter; folded into the bucket/edge-case test below as an extra rerender.
       it("preserves byte-identical timestamp buckets and edge cases", () => {
         const { rerender } = render(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={makeTask({
               sourceType: "dashboard_ui",
               createdAt: "2026-05-11T11:59:30.000Z",
               updatedAt: "2026-05-11T11:55:00.000Z",
             })}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -826,14 +1026,14 @@ describe("TaskDetailModal", () => {
 
         rerender(
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={makeTask({
               sourceType: "dashboard_ui",
               createdAt: "not-a-date",
               updatedAt: "2026-05-11T12:00:01.000Z",
             })}
             onClose={noop}
-            onMoveTask={noopMove}
+
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -844,6 +1044,27 @@ describe("TaskDetailModal", () => {
         timestamps = screen.getByLabelText("Task timestamps");
         expect(timestamps).toHaveTextContent("Created Invalid Date");
         expect(timestamps).toHaveTextContent("Updated just now");
+
+        rerender(
+          <TaskDetailModal
+            initialTab="details"
+            task={makeTask({
+              sourceType: "dashboard_ui",
+              createdAt: "2026-05-01T12:00:00.000Z",
+              updatedAt: "2026-05-02T12:00:00.000Z",
+            })}
+            onClose={noop}
+
+            onDeleteTask={noopDelete}
+            onMergeTask={noopMerge}
+            onOpenDetail={noopOpenDetail}
+            addToast={noop}
+          />,
+        );
+
+        timestamps = screen.getByLabelText("Task timestamps");
+        expect(timestamps).toHaveTextContent("Created May 1");
+        expect(timestamps).toHaveTextContent("Updated May 2");
       });
     });
   });
@@ -851,14 +1072,14 @@ describe("TaskDetailModal", () => {
   it("shows active file scope overlap blocker in Dependencies section", () => {
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER" })}
         tasks={[
           makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER" }),
           makeTask({ id: "FN-OVER", column: "in-progress" }),
         ]}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -873,10 +1094,10 @@ describe("TaskDetailModal", () => {
   it("keeps clear overlap blocker button when slim live task omits overlapBlockedBy", () => {
     const { rerender } = render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -888,10 +1109,10 @@ describe("TaskDetailModal", () => {
 
     rerender(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: undefined })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -916,10 +1137,10 @@ describe("TaskDetailModal", () => {
 
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER", status: "queued" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -956,10 +1177,10 @@ describe("TaskDetailModal", () => {
 
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OLD", status: "queued" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -980,10 +1201,10 @@ describe("TaskDetailModal", () => {
 
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER", status: "queued" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -999,10 +1220,46 @@ describe("TaskDetailModal", () => {
     expect(screen.getByText("File scope overlap blocker: FN-OVER (stale)")).toBeInTheDocument();
   });
 
+  it("counts the overlap blockedBy summary using the board's OWN lane names", () => {
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-23:35:
+    The case below renamed and nothing else. Without resolved traits the count is taken against the
+    literal `todo`, which no card is in, so this line read "blocking 0 todo task(s)" while two cards
+    were in fact blocked. The dependent LIST stayed correct throughout (core builds it without
+    consulting lanes), which is what made the wrong number easy to miss.
+    */
+    const tasks = [
+      makeTask({ id: "FN-B", column: "building" }),
+      makeTask({ id: "FN-1", column: "drafting", blockedBy: "FN-B" }),
+      makeTask({ id: "FN-2", column: "drafting", blockedBy: "FN-B" }),
+    ];
+    const columnFlagsByTaskId = new Map(tasks.map((task) => [
+      task.id,
+      task.column === "building" ? { countsTowardWip: true } : { hold: true },
+    ]));
+
+    render(
+      <TaskDetailModal
+        initialTab="dependencies"
+        task={makeTask({ id: "FN-B", column: "building" })}
+        tasks={tasks}
+        columnFlagsByTaskId={columnFlagsByTaskId}
+        onClose={noop}
+
+        onDeleteTask={noopDelete}
+        onMergeTask={noopMerge}
+        onOpenDetail={noopOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.getByText("FN-B is blocking 2 todo task(s) via blockedBy overlap")).toBeInTheDocument();
+  });
+
   it("shows overlap blockedBy summary in Blocking section", () => {
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="dependencies"
         task={makeTask({ id: "FN-B", column: "in-progress" })}
         tasks={[
           makeTask({ id: "FN-B", column: "in-progress" }),
@@ -1010,7 +1267,7 @@ describe("TaskDetailModal", () => {
           makeTask({ id: "FN-2", column: "todo", blockedBy: "FN-B" }),
         ]}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1027,7 +1284,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask()}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1035,19 +1292,31 @@ describe("TaskDetailModal", () => {
       />,
     );
 
-    expect(container.querySelector(".modal-overlay.open")).toBeTruthy();
-    expect(container.querySelector(".modal.modal-lg.task-detail-modal")).toBeTruthy();
+    /*
+    FNXC:TaskDetailModal 2026-07-30-22:50 (#2895 review — greptile, "obsolete modal overlay selector"):
+    THE SHELL IS `FloatingWindow`, NOT A `.modal-overlay`.
+
+    `TaskDetailModal` renders `<FloatingWindow modal>`, whose overlay class is
+    `floating-window-overlay--modal`. The only `.modal-overlay` left in this component is the refine
+    SUB-overlay at ~line 6801, which this case does not open — so the assertion was querying a class
+    that is never in the tree for the default render and failed outright.
+
+    Asserting the modal-ness (`--modal`), not just the overlay: a non-modal FloatingWindow renders the
+    same base class, so the bare selector would keep passing if the `modal` prop were dropped.
+    */
+    expect(document.querySelector(".floating-window-overlay--modal")).toBeTruthy();
+    expect(document.querySelector(".modal.modal-lg.task-detail-modal")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Back to task list" })).toBeNull();
   });
 
-  it("renders mobile back control variant when requested", () => {
+  it("uses physical viewport chrome instead of the obsolete header-mode hint", () => {
     render(
       <TaskDetailModal
         initialTab="definition"
         task={makeTask()}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1056,15 +1325,14 @@ describe("TaskDetailModal", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "Back to task list" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
   });
 
   it("omits close control in embedded mode while rendering shared content", () => {
     const { container } = render(
       <TaskDetailContent
         task={makeTask()}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1073,7 +1341,7 @@ describe("TaskDetailModal", () => {
       />,
     );
 
-    expect(container.querySelector(".task-detail-content--embedded")).toBeTruthy();
+    expect(document.querySelector(".task-detail-content--embedded")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
     expect(screen.getByRole("button", { name: "Plan" })).toBeInTheDocument();
   });
@@ -1083,7 +1351,7 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailContent
         task={makeTask()}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1106,9 +1374,9 @@ describe("TaskDetailModal", () => {
     expect(screen.queryByText(/isn't currently attached to a fusion branch/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Reattached branch/i)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Reattach branch/i })).not.toBeInTheDocument();
-    expect(container.querySelector(".rebind-banner")).toBeNull();
-    expect(container.querySelector(".rebind-banner-actions")).toBeNull();
-    expect(container.querySelector(".rebind-banner-result")).toBeNull();
+    expect(document.querySelector(".rebind-banner")).toBeNull();
+    expect(document.querySelector(".rebind-banner-actions")).toBeNull();
+    expect(document.querySelector(".rebind-banner-result")).toBeNull();
   }
 
   function renderTaskDetail(task: ReturnType<typeof makeTask>, mobileHeaderMode?: "back") {
@@ -1117,7 +1385,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={task}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1155,10 +1423,10 @@ describe("TaskDetailModal", () => {
       expectNoBranchReattachmentAffordance(container);
     });
 
-    it("keeps the removed mobile rebind action shell absent in narrow task detail rendering", () => {
+    it("keeps the removed rebind action shell absent when legacy mobile intent is supplied", () => {
       const { container } = renderTaskDetail(makeTask({ column: "in-review", branch: null, worktree: null }), "back");
 
-      expect(screen.getByRole("button", { name: "Back to task list" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
       expectNoBranchReattachmentAffordance(container);
     });
 
@@ -1166,7 +1434,7 @@ describe("TaskDetailModal", () => {
       const { container } = render(
         <TaskDetailContent
           task={makeTask({ column: "in-review", branch: null, worktree: null })}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1179,7 +1447,10 @@ describe("TaskDetailModal", () => {
     });
   });
 
-  it("styles detail-body scrollbar rules", () => {
+  // FNXC:TaskDetailModal 2026-08-15-00:00 (slow-test trim): the detail-body and
+  // agent-log-viewer scrollbar rules were two copies of the same structural CSS-string
+  // pattern; merged into one case with identical assertions.
+  it("styles detail-body and agent log viewer scrollbar rules", () => {
     const css = readDashboardStylesSource();
 
     expectBaseRule(css, ".detail-body", "scrollbar-color: var(--border) transparent;");
@@ -1188,10 +1459,6 @@ describe("TaskDetailModal", () => {
     expectBaseRule(css, ".detail-body::-webkit-scrollbar-track", "background: transparent;");
     expectBaseRule(css, ".detail-body::-webkit-scrollbar-thumb", "background: var(--border);");
     expectBaseRule(css, ".detail-body::-webkit-scrollbar-thumb:hover", "background: var(--text-muted);");
-  });
-
-  it("styles agent log viewer scroll container scrollbar rules", () => {
-    const css = readDashboardStylesSource();
 
     expectBaseRule(css, ".agent-log-viewer", "overflow: hidden;");
     expectBaseRule(css, ".agent-log-viewer-scroll", "scrollbar-color: var(--border) transparent;");
@@ -1201,42 +1468,30 @@ describe("TaskDetailModal", () => {
     expectBaseRule(css, ".agent-log-model-header", "background: var(--bg-tertiary);");
   });
 
-  it("renders markdown-body without detail-prompt class when prompt exists", () => {
-    const { container } = render(
+  // FNXC:TaskDetailModal 2026-08-15-00:00 (slow-test trim): the markdown-body class shape,
+  // heading stripping, and PROMPT.md-heading absence cases were three separate renders of the
+  // same prompt-bearing props; merged into one render with all assertions intact.
+  it("opens the complete prompt markdown with its heading and PROMPT.md back navigation", () => {
+    render(
       <TaskDetailModal
         initialTab="definition"
         task={makeTask({ prompt: "# Hello\n\nSome **bold** text" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
+        onOpenDetail={noopOpenDetail}
         addToast={noop}
       />,
     );
 
-    const markdownDiv = container.querySelector(".markdown-body");
-    expect(markdownDiv).toBeTruthy();
-    expect(markdownDiv!.classList.contains("detail-prompt")).toBe(false);
-  });
-
-  it("strips the leading heading from prompt and renders remaining markdown", () => {
-    const { container } = render(
-      <TaskDetailModal
-        initialTab="definition"
-        task={makeTask({ prompt: "# Hello\n\nSome **bold** text" })}
-        onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={noopDelete}
-        onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-        addToast={noop}
-      />,
-    );
-
-    // The leading # heading should be stripped (modal has its own header)
-    expect(container.querySelector(".markdown-body h1")).toBeNull();
-    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(screen.queryByText("bold")).toBeNull();
+    openFullPlan();
+    const markdownDiv = screen.getByTestId("task-detail-plan-full");
+    expect(markdownDiv.classList.contains("detail-prompt")).toBe(false);
+    expect(within(markdownDiv).getByRole("heading", { level: 1, name: "Hello" })).toBeInTheDocument();
+    expect(within(markdownDiv).getByText("bold")).toBeInTheDocument();
+    expect(screen.getByText("PROMPT.md")).toBeInTheDocument();
   });
 
   it("renders (no prompt) with detail-prompt class when prompt is absent", () => {
@@ -1245,7 +1500,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask({ prompt: undefined })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1253,27 +1508,11 @@ describe("TaskDetailModal", () => {
       />,
     );
 
+    openFullPlan();
     const fallback = screen.getByText("(no prompt)");
     expect(fallback).toBeTruthy();
     expect(fallback.classList.contains("detail-prompt")).toBe(true);
     expect(fallback.classList.contains("markdown-body")).toBe(false);
-  });
-
-  it("does not render a PROMPT.md heading", () => {
-    render(
-      <TaskDetailModal
-        initialTab="definition"
-        task={makeTask({ prompt: "# Some prompt content" })}
-        onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={noopDelete}
-        onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-        addToast={noop}
-      />,
-    );
-
-    expect(screen.queryByText("PROMPT.md")).toBeNull();
   });
 
   it("renders Review and Comments tabs", () => {
@@ -1282,7 +1521,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask()}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1300,7 +1539,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask({ reviewState: { source: "reviewer-agent", items: [], addressing: [] } })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1349,7 +1588,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask({ reviewState: { source: "pull-request", summary: { reviewDecision: "REVIEW_REQUIRED", reviewers: [], blockingReasons: [], checks: [] }, items: [], addressing: [] } })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1388,7 +1627,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask({ reviewState: { source: "pull-request", summary: { reviewDecision: "CHANGES_REQUESTED", reviewers: [{ login: "octocat", state: "CHANGES_REQUESTED" }], blockingReasons: ["changes requested review is active"], checks: [] }, items: [], addressing: [] } })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1401,47 +1640,34 @@ describe("TaskDetailModal", () => {
     expect(screen.getByText(/No review items yet\./i)).toBeTruthy();
   });
 
-  describe("inline action row icon-only controls", () => {
-    it("renders priority and Fast controls as accessible icon-only Quick Add buttons", () => {
-      render(<TaskDetailModal initialTab="definition" task={makeTask({ column: "todo", priority: "high", executionMode: "fast" })} onClose={noop} onMoveTask={noopMove} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
-      const priority = screen.getByTestId("detail-priority-trigger");
-      const fast = screen.getByRole("button", { name: "Execution mode: fast" });
-      expect(priority).toHaveClass("btn", "btn-icon", "btn-sm");
-      expect(priority).toHaveAttribute("title", "Priority: High");
-      expect(fast).toHaveClass("btn", "btn-icon", "btn-sm", "btn-primary");
-      expect(fast).toHaveAttribute("title", "Execution mode: fast");
-      expect(fast).not.toHaveTextContent("Fast");
+  describe("footer quick actions", () => {
+    it("renders Priority and Fast as labeled Actions menu items with selected state", async () => {
+      render(<TaskDetailModal initialTab="details" task={makeTask({ column: "todo", priority: "high", executionMode: "fast" })} onClose={noop} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+      fireEvent.click(screen.getByRole("button", { name: "Actions" }));
+
+      const priority = screen.getByTestId("detail-priority-option-high");
+      const fast = screen.getByTestId("detail-execution-mode-toggle");
+      expect(priority).toHaveTextContent("High");
+      expect(priority).toHaveAttribute("aria-pressed", "true");
+      expect(fast).toHaveAccessibleName("Execution mode: fast");
+      expect(fast).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("keeps every inline action icon-only with the production size-prop contracts", () => {
-      const source = readFileSync(resolve(__dirname, "../TaskDetailModal.tsx"), "utf8");
-      const rowStart = source.indexOf('data-testid="detail-meta-inline-controls"');
-      const rowEnd = source.indexOf('className="detail-hidden-file-input"', rowStart);
-      const row = source.slice(rowStart, rowEnd);
+    it("keeps Attach, GitHub, Oversight, Priority, and Fast in Quick Add order", async () => {
+      render(<TaskDetailModal initialTab="details" task={makeTask({ column: "todo", plannerOversightLevel: "observe" })} onClose={noop} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+      fireEvent.click(screen.getByRole("button", { name: "Actions" }));
 
-      // FNXC:TaskDetailModalResponsive 2026-07-19-12:00: The row stays ordered
-      // attach → GitHub → Oversight → priority → Fast; CSS owns icon parity.
-      expect(row).toMatch(/<Paperclip size=\{12\}[^>]*aria-hidden="true"/);
-      expect(row).toMatch(/<ProviderIcon provider="github" size="sm"/);
-      expect(row).toMatch(/<PriorityIcon size=\{14\}[^>]*aria-hidden="true"/);
-      expect(row).toMatch(/<Zap size=\{14\}[^>]*aria-hidden="true"/);
-      expect(row).toMatch(/overseerTriggerOn \? <Eye aria-hidden="true"\s*\/> : <EyeOff aria-hidden="true"\s*\/>/);
-      expect(row).not.toMatch(/<(?:Eye|EyeOff)\s+[^>]*\bsize=/);
-      expect(row.indexOf("detail-inline-attach")).toBeLessThan(row.indexOf("detail-inline-github-toggle"));
-      expect(row.indexOf("detail-inline-github-toggle")).toBeLessThan(row.indexOf("detail-oversight-menu-trigger"));
-      expect(row.indexOf("detail-oversight-menu-trigger")).toBeLessThan(row.indexOf("detail-priority-trigger"));
-      expect(row.indexOf("detail-priority-trigger")).toBeLessThan(row.indexOf("detail-execution-mode-toggle"));
-      // FNXC:QuickAddActionRow 2026-07-20-12:00: Every test-id affordance must
-      // also carry its FN-8287 sizing class, including optional GitHub and
-      // Oversight surfaces, so mounted tablet controls share one compact box.
-      expect(row).toMatch(/className="btn btn-icon btn-sm detail-inline-attach"/);
-      expect(row).toMatch(/className=\{`btn btn-icon btn-sm detail-inline-github-toggle/);
-      expect(row).toMatch(/className="btn btn-icon btn-sm detail-oversight-menu-trigger"/);
-      expect(row).toMatch(/className="btn btn-icon btn-sm detail-priority-trigger"/);
-      expect(row).toMatch(/className=\{`btn btn-icon btn-sm detail-execution-mode-toggle/);
-      for (const label of ["aria-label", "title"]) {
-        expect(row.match(new RegExp(label, "g"))?.length).toBeGreaterThanOrEqual(5);
+      const orderedItems = [
+        screen.getByTestId("detail-inline-attach"),
+        screen.getByTestId("detail-inline-github-toggle"),
+        screen.getByTestId("detail-actions-oversight-heading"),
+        screen.getByTestId("detail-actions-priority-heading"),
+        screen.getByTestId("detail-execution-mode-toggle"),
+      ];
+      for (let index = 1; index < orderedItems.length; index += 1) {
+        expect(orderedItems[index - 1]?.compareDocumentPosition(orderedItems[index] as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       }
+      expect(document.querySelector(".detail-meta-inline-controls")).toBeNull();
     });
 
     it("removes bespoke toolbar SVG sizing rules", () => {
@@ -1456,7 +1682,7 @@ describe("TaskDetailModal", () => {
 
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="attachments"
         task={makeTask({
           attachments: [
             {
@@ -1469,7 +1695,7 @@ describe("TaskDetailModal", () => {
           ],
         })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1491,7 +1717,7 @@ describe("TaskDetailModal", () => {
   it("leaves attachment href/src URLs unchanged when no daemon token is present", () => {
     render(
       <TaskDetailModal
-        initialTab="definition"
+        initialTab="attachments"
         task={makeTask({
           attachments: [
             {
@@ -1504,7 +1730,7 @@ describe("TaskDetailModal", () => {
           ],
         })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1525,7 +1751,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask({ status: "failed" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1538,16 +1764,16 @@ describe("TaskDetailModal", () => {
     const actionsBtn = screen.getByRole("button", { name: "Actions" });
     fireEvent.click(actionsBtn);
 
-    expect(screen.getByRole("menuitem", { name: "Retry" })).toBeTruthy();
+    expect(screen.getByTestId("task-detail-header-action-retry")).toBeTruthy();
   });
 
-  it("does NOT render Retry button when task status is not 'failed'", () => {
+  it("renders Retry for a live task even when its status is not failed", () => {
     render(
       <TaskDetailModal
         initialTab="definition"
         task={makeTask({ status: "executing" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1556,10 +1782,9 @@ describe("TaskDetailModal", () => {
       />,
     );
 
-    // No Retry should be visible in the Actions dropdown
     const actionsBtn = screen.getByRole("button", { name: "Actions" });
     fireEvent.click(actionsBtn);
-    expect(screen.queryByRole("menuitem", { name: "Retry" })).toBeNull();
+    expect(screen.getByTestId("task-detail-header-action-retry")).toBeInTheDocument();
   });
 
   it("does NOT render Retry button when onRetryTask is not provided", () => {
@@ -1568,7 +1793,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={makeTask({ status: "failed" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1579,7 +1804,7 @@ describe("TaskDetailModal", () => {
     expect(screen.queryByText("Retry")).toBeNull();
   });
 
-  it("suppresses failure alert and Retry actions while a stale failed task has automatic recovery pending", () => {
+  it("shows the failure alert and Retry actions while automatic recovery is pending", () => {
     render(
       <TaskDetailModal
         initialTab="definition"
@@ -1590,7 +1815,7 @@ describe("TaskDetailModal", () => {
           nextRecoveryAt: new Date(Date.now() + 60_000).toISOString(),
         })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1599,20 +1824,26 @@ describe("TaskDetailModal", () => {
       />,
     );
 
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("Transient provider error");
+    expect(screen.getByText("Automatic recovery is pending. You can Retry now to restart this stage.")).toBeInTheDocument();
+    expect(screen.getByTestId("task-detail-header-action-retry")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry with a different model/node" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Actions" }));
-    expect(screen.queryByRole("menuitem", { name: "Retry" })).toBeNull();
-    expect(screen.queryByText("Retry with a different model/node")).toBeNull();
+    expect(screen.getByTestId("task-detail-header-action-retry")).toBeInTheDocument();
   });
 
   describe("retry action uniqueness for in-review failed tasks", () => {
-    it("shows exactly one Retry button when task is in-review AND failed (in Actions dropdown)", () => {
+    // FNXC:TaskDetailModal 2026-08-15-00:00 (slow-test trim): the failed and stuck-killed
+    // in-review uniqueness cases shared one body; converted to it.each with both statuses kept.
+    it.each(["failed", "stuck-killed"] as const)(
+      "shows exactly one Retry button when task is in-review AND %s (in Actions dropdown)",
+      (status) => {
       render(
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({ column: "in-review", status: "failed" })}
+          task={makeTask({ column: "in-review", status })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1625,30 +1856,7 @@ describe("TaskDetailModal", () => {
       const actionsBtn = screen.getByRole("button", { name: "Actions" });
       fireEvent.click(actionsBtn);
 
-      const retryButtons = screen.getAllByRole("menuitem", { name: "Retry" });
-      expect(retryButtons).toHaveLength(1);
-    });
-
-    it("shows exactly one Retry button when task is in-review AND stuck-killed (in Actions dropdown)", () => {
-      render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ column: "in-review", status: "stuck-killed" })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          onRetryTask={noopRetry}
-          addToast={noop}
-        />,
-      );
-
-      // Open Actions dropdown and check for exactly one Retry
-      const actionsBtn = screen.getByRole("button", { name: "Actions" });
-      fireEvent.click(actionsBtn);
-
-      const retryButtons = screen.getAllByRole("menuitem", { name: "Retry" });
+      const retryButtons = screen.getAllByTestId("task-detail-header-action-retry");
       expect(retryButtons).toHaveLength(1);
     });
 
@@ -1658,7 +1866,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "triage", status: "planning", stuckKillCount: 6 })}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1670,7 +1878,7 @@ describe("TaskDetailModal", () => {
       const actionsBtn = screen.getByRole("button", { name: "Actions" });
       fireEvent.click(actionsBtn);
 
-      const retryButtons = screen.getAllByRole("menuitem", { name: "Retry" });
+      const retryButtons = screen.getAllByTestId("task-detail-header-action-retry");
       expect(retryButtons).toHaveLength(1);
     });
 
@@ -1683,7 +1891,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review", status: "failed" })}
           onClose={onClose}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1698,7 +1906,7 @@ describe("TaskDetailModal", () => {
         fireEvent.click(actionsBtn);
       });
 
-      const retryBtn = screen.getByRole("menuitem", { name: "Retry" });
+      const retryBtn = screen.getByTestId("task-detail-header-action-retry");
       await act(async () => {
         fireEvent.click(retryBtn);
       });
@@ -1719,7 +1927,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review", status: "failed" })}
           onClose={onClose}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1734,7 +1942,7 @@ describe("TaskDetailModal", () => {
         fireEvent.click(actionsBtn);
       });
 
-      const retryBtn = screen.getByRole("menuitem", { name: "Retry" });
+      const retryBtn = screen.getByTestId("task-detail-header-action-retry");
       await act(async () => {
         fireEvent.click(retryBtn);
       });
@@ -1744,7 +1952,7 @@ describe("TaskDetailModal", () => {
 
       // Only one toast — the success toast, no info toast
       expect(addToast).toHaveBeenCalledTimes(1);
-      expect(addToast).toHaveBeenCalledWith("Retried FN-099", "success");
+      expect(addToast).toHaveBeenCalledWith("This stage will restart in its current column.", "success");
     });
 
     it("shows exactly one error toast when retry fails", async () => {
@@ -1759,7 +1967,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review", status: "failed" })}
           onClose={onClose}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1774,7 +1982,7 @@ describe("TaskDetailModal", () => {
         fireEvent.click(actionsBtn);
       });
 
-      const retryBtn = screen.getByRole("menuitem", { name: "Retry" });
+      const retryBtn = screen.getByTestId("task-detail-header-action-retry");
       await act(async () => {
         fireEvent.click(retryBtn);
       });
@@ -1787,378 +1995,33 @@ describe("TaskDetailModal", () => {
       expect(addToast).toHaveBeenCalledWith("Server error", "error");
     });
 
-    it("shows in-review split button with primary action and secondary move option", () => {
-      const { container } = render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ column: "in-review" })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
-
-      const moveBtn = screen.getByRole("button", { name: "Move to Todo" });
-      expect(moveBtn).toBeTruthy();
-      const chevronZone = container.querySelector(".detail-move-btn__arrow");
-      expect(chevronZone).toBeTruthy();
-
-      fireEvent.keyDown(moveBtn, { key: "ArrowDown" });
-      expect(screen.getByRole("menuitem", { name: "Back to In Progress" })).toBeTruthy();
-      expect(screen.queryByRole("menuitem", { name: "Move to Todo" })).toBeNull();
-
-      const actionsBtn = screen.getByRole("button", { name: "Actions" });
-      fireEvent.click(actionsBtn);
-      expect(screen.queryByRole("menuitem", { name: "Retry" })).toBeNull();
-    });
-
-    it("in-review failed task shows both Retry action and secondary move option", async () => {
-      render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ column: "in-review", status: "failed" })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          onRetryTask={noopRetry}
-          addToast={noop}
-        />,
-      );
-
-      const actionsBtn = screen.getByRole("button", { name: "Actions" });
-      await act(async () => {
-        fireEvent.click(actionsBtn);
-      });
-      expect(screen.getByRole("menuitem", { name: "Retry" })).toBeTruthy();
-      expect(screen.getAllByRole("menuitem", { name: "Retry" })).toHaveLength(1);
-
-      const chevronZone = document.querySelector(".detail-move-btn__arrow");
-      await act(async () => {
-        fireEvent.click(chevronZone!);
-      });
-      expect(screen.getByRole("menuitem", { name: "Back to In Progress" })).toBeTruthy();
-      expect(screen.queryByRole("menuitem", { name: "Move to Todo" })).toBeNull();
-    });
-
-    it("split-button renders with chevron when multiple transitions exist", async () => {
-      const { container } = render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ column: "in-progress" })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
-
-      const moveBtn = screen.getByRole("button", { name: "Move to In Review" });
-      expect(moveBtn).toBeTruthy();
-      const chevronZone = container.querySelector(".detail-move-btn__arrow");
-      expect(chevronZone).toBeTruthy();
-
-      await act(async () => {
-        fireEvent.click(chevronZone!);
-      });
-      expect(screen.getByRole("menuitem", { name: "Move to Todo" })).toBeTruthy();
-      expect(screen.getByRole("menuitem", { name: "Move to Planning" })).toBeTruthy();
-      expect(screen.getByRole("menuitem", { name: "Move to Done" })).toBeTruthy();
-      expect(screen.queryByRole("menuitem", { name: "Move to In Review" })).toBeNull();
-    });
-
-    // Skipped: triage column currently has multiple transitions, so the
-    // chevron arrow still renders. Re-enable once the triage transition
-    // map is reduced to a single target.
-    // Replaced with stub: original assertions deferred (see git history). Restore once underlying feature/bug work lands.
-    it("split-button renders without chevron when only one transition", () => { expect(true).toBe(true); });
-
-    it("clicking main button executes primary transition immediately", async () => {
-      const onMoveTask = vi.fn().mockResolvedValue(undefined);
-
-      render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ column: "in-progress" })}
-          onClose={noop}
-          onMoveTask={onMoveTask}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
-
-      await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "Move to In Review" }));
-      });
-
-      expect(onMoveTask).toHaveBeenCalledWith("FN-099", "in-review", undefined);
-      expect(screen.queryByRole("menu")).toBeNull();
-    });
-
-    it("chevron dropdown includes only secondary transitions", async () => {
-      render(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({ column: "in-progress" })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
-
-      const moveBtn = screen.getByRole("button", { name: "Move to In Review" });
-      fireEvent.keyDown(moveBtn, { key: "ArrowDown" });
-
-      expect(screen.getByRole("menuitem", { name: "Move to Todo" })).toBeTruthy();
-      expect(screen.getByRole("menuitem", { name: "Move to Planning" })).toBeTruthy();
-      expect(screen.getByRole("menuitem", { name: "Move to Done" })).toBeTruthy();
-      expect(screen.queryByRole("menuitem", { name: "Move to In Review" })).toBeNull();
-
-      fireEvent.keyDown(screen.getByRole("menuitem", { name: "Move to Todo" }), { key: "Escape" });
-      expect(screen.queryByRole("menuitem", { name: "Move to Todo" })).toBeNull();
-      expect(document.activeElement).toBe(moveBtn);
-    });
   });
 
-  it("shows description exactly once for a task without title", () => {
-    const { container } = render(
-      <TaskDetailModal
-        initialTab="definition"
-        task={makeTask({
-          title: undefined,
-          description: "Fix the login bug",
-          prompt: "# KB-099\n\nFix the login bug\n",
-        })}
-        onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={noopDelete}
-        onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-        addToast={noop}
-      />,
-    );
-
-    // The heading "FN-099" should be stripped from the markdown
-    const markdownBody = container.querySelector(".markdown-body");
-    expect(markdownBody?.innerHTML).not.toContain("FN-099");
-    // Description appears in the markdown body
-    expect(markdownBody?.textContent).toContain("Fix the login bug");
-    // The detail header shows the ID (not duplicated as markdown heading)
-    expect(container.querySelector(".detail-id")?.textContent).toBe("FN-099");
-    // The h2 title shows description, not the task ID
-    const h2 = container.querySelector("h2.detail-title");
-    expect(h2?.textContent).toBe("Fix the login bug");
-  });
-
-  it("shows the title in <h2> when task.title is set", () => {
-    const { container } = render(
-      <TaskDetailModal
-        initialTab="definition"
-        task={makeTask({
-          title: "Implement dark mode",
-          description: "Add dark mode toggle to the settings page",
-        })}
-        onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={noopDelete}
-        onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-        addToast={noop}
-      />,
-    );
-
-    const h2 = container.querySelector("h2.detail-title");
-    expect(h2?.textContent).toBe("Implement dark mode");
-  });
-
-  describe("description truncation", () => {
-    let titleScrollHeight = 0;
-    let titleClientHeight = 0;
-    const originalScrollHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
-    const originalClientHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
-
-    const setTitleLayout = ({ scrollHeight, clientHeight }: { scrollHeight: number; clientHeight: number }) => {
-      titleScrollHeight = scrollHeight;
-      titleClientHeight = clientHeight;
-    };
-
-    const renderDetail = (taskOverrides: Parameters<typeof makeTask>[0] = {}) => render(
-      <TaskDetailModal
-        initialTab="definition"
-        task={makeTask(taskOverrides)}
-        onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={noopDelete}
-        onMergeTask={noopMerge}
-        onOpenDetail={noopOpenDetail}
-        addToast={noop}
-      />,
-    );
-
-    beforeEach(() => {
-      setTitleLayout({ scrollHeight: 120, clientHeight: 40 });
-      Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
-        configurable: true,
-        get() {
-          return this instanceof HTMLElement && this.classList.contains("detail-title") ? titleScrollHeight : 0;
-        },
-      });
-      Object.defineProperty(HTMLElement.prototype, "clientHeight", {
-        configurable: true,
-        get() {
-          return this instanceof HTMLElement && this.classList.contains("detail-title") ? titleClientHeight : 0;
-        },
-      });
-    });
-
-    afterEach(() => {
-      if (originalScrollHeight) {
-        Object.defineProperty(HTMLElement.prototype, "scrollHeight", originalScrollHeight);
-      } else {
-        Reflect.deleteProperty(HTMLElement.prototype, "scrollHeight");
-      }
-      if (originalClientHeight) {
-        Object.defineProperty(HTMLElement.prototype, "clientHeight", originalClientHeight);
-      } else {
-        Reflect.deleteProperty(HTMLElement.prototype, "clientHeight");
-      }
-    });
-
-    it("collapses long triage title by default with Show more button and expands on demand", async () => {
-      const longTitle = "Triage title ".repeat(25);
-      const { container } = renderDetail({
-        column: "triage",
-        title: longTitle,
-        description: "Triage planning context",
-      });
-
-      const h2 = container.querySelector("h2.detail-title");
-      expect(h2?.textContent).toBe(longTitle);
-      expect(h2).toHaveClass("detail-title--collapsed");
-      const toggle = await screen.findByRole("button", { name: "Show more" });
-      expect(toggle).toHaveClass("detail-description-toggle");
-
-      await userEvent.click(toggle);
-
-      expect(container.querySelector("h2.detail-title")?.textContent).toBe(longTitle);
-      expect(container.querySelector("h2.detail-title")).not.toHaveClass("detail-title--collapsed");
-      expect(screen.getByRole("button", { name: "Show less" })).toBeInTheDocument();
-    });
-
-    it("collapses long triage description by default when title is missing", async () => {
-      const longDescription = "Triage description ".repeat(20);
-      const { container } = renderDetail({
-        column: "triage",
+  describe("title-free Task Detail header", () => {
+    const cases = [
+      {
+        name: "populated title and description",
+        title: "Header title must stay hidden",
+        description: "Definition description remains visible",
+      },
+      {
+        name: "description without title",
         title: undefined,
-        description: longDescription,
-      });
-
-      const h2 = container.querySelector("h2.detail-title");
-      expect(h2?.textContent).toBe(longDescription);
-      expect(h2).toHaveClass("detail-title--collapsed");
-      expect(await screen.findByRole("button", { name: "Show more" })).toHaveClass("detail-description-toggle");
-    });
-
-    it("uses the title, description, and id fallback chain for the clamped heading", async () => {
-      const { container: withTitle } = renderDetail({
-        title: "Title wins",
-        description: "Description loses",
-      });
-      expect(withTitle.querySelector("h2.detail-title")?.textContent).toBe("Title wins");
-      expect(withTitle.querySelector("h2.detail-title")).toHaveClass("detail-title--collapsed");
-      expect(await screen.findByRole("button", { name: "Show more" })).toBeInTheDocument();
-
-      setTitleLayout({ scrollHeight: 40, clientHeight: 40 });
-      const { container: withDescription } = renderDetail({
-        title: undefined,
-        description: "Description fallback",
-      });
-      expect(withDescription.querySelector("h2.detail-title")?.textContent).toBe("Description fallback");
-      expect(withDescription.querySelector(".detail-description-toggle")).toBeNull();
-
-      const { container: withId } = renderDetail({
-        id: "FN-FALLBACK",
+        description: "Description-only task remains readable",
+      },
+      {
+        name: "empty title and description",
         title: undefined,
         description: undefined,
-      });
-      expect(withId.querySelector("h2.detail-title")?.textContent).toBe("FN-FALLBACK");
-      expect(withId.querySelector(".detail-description-toggle")).toBeNull();
-    });
-
-    it.each(["todo", "in-progress", "in-review", "done", "archived"] as const)(
-      "collapses overflowing non-triage %s title by default",
-      async (column) => {
-        const longTitle = `${column} title `.repeat(25);
-        const { container } = renderDetail({
-          column,
-          title: longTitle,
-        });
-
-        const h2 = container.querySelector("h2.detail-title");
-        expect(h2?.textContent).toBe(longTitle);
-        expect(h2).toHaveClass("detail-title--collapsed");
-        expect(await screen.findByRole("button", { name: "Show more" })).toBeInTheDocument();
       },
-    );
+    ] as const;
 
-    it("does not render an empty toggle shell when the title fits within two lines", () => {
-      setTitleLayout({ scrollHeight: 40, clientHeight: 40 });
-      const { container } = renderDetail({
-        title: "Short title",
-        description: "This is a longer description that is not shown as the heading while title is present",
-      });
-
-      const h2 = container.querySelector("h2.detail-title");
-      expect(h2?.textContent).toBe("Short title");
-      expect(h2).toHaveClass("detail-title--collapsed");
-      expect(container.querySelector(".detail-description-toggle")).toBeNull();
-    });
-
-    it("collapses again when Show less is clicked", async () => {
-      const longDescription = "C".repeat(250);
-      const { container } = renderDetail({
-        title: undefined,
-        description: longDescription,
-      });
-
-      const toggle = await screen.findByRole("button", { name: "Show more" });
-      await userEvent.click(toggle);
-      expect(container.querySelector("h2.detail-title")?.textContent).toBe(longDescription);
-      expect(container.querySelector("h2.detail-title")).not.toHaveClass("detail-title--collapsed");
-
-      await userEvent.click(screen.getByRole("button", { name: "Show less" }));
-
-      const h2 = container.querySelector("h2.detail-title");
-      expect(h2?.textContent).toBe(longDescription);
-      expect(h2).toHaveClass("detail-title--collapsed");
-      expect(screen.getByRole("button", { name: "Show more" })).toBeInTheDocument();
-    });
-
-    it("resets to collapsed when switching from a non-triage task to a triage task", async () => {
-      const todoDescription = "G".repeat(250);
-      const triageDescription = "H".repeat(250);
-      const { container, rerender } = render(
+    it.each(cases)("keeps the header title-free for $name across tabs and editing", async ({ title, description }) => {
+      render(
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({
-            id: "FN-TODO",
-            column: "todo",
-            title: undefined,
-            description: todoDescription,
-          })}
+          task={makeTask({ id: "FN-TITLE-FREE", column: "todo", title, description })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2166,132 +2029,173 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      await userEvent.click(await screen.findByRole("button", { name: "Show more" }));
-      expect(container.querySelector("h2.detail-title")).not.toHaveClass("detail-title--collapsed");
+      const dialog = screen.getByRole("dialog", { name: "Task detail" });
+      const header = dialog.querySelector<HTMLElement>(".task-detail-content > .modal-header");
+      expect(header).toBeInTheDocument();
+      expect(header).toHaveTextContent("FN-TITLE-FREE");
+      expect(header?.querySelector("h1, h2, h3, h4, h5, h6")).toBeNull();
+      expect(header?.querySelector(".detail-heading-row, .detail-title, .detail-title-control, .detail-title-measurement")).toBeNull();
+      if (title) expect(header).not.toHaveTextContent(title);
+      if (description) {
+        expect(header).not.toHaveTextContent(description);
+        expect(screen.getByTestId("task-detail-definition-description")).toHaveTextContent(description);
+      } else {
+        expect(screen.getByText("(no description)")).toBeInTheDocument();
+      }
 
-      rerender(
-        <TaskDetailModal
-          initialTab="definition"
-          task={makeTask({
-            id: "FN-TRIAGE",
-            column: "triage",
-            title: undefined,
-            description: triageDescription,
-          })}
-          onClose={noop}
-          onMoveTask={noopMove}
-          onDeleteTask={noopDelete}
-          onMergeTask={noopMerge}
-          onOpenDetail={noopOpenDetail}
-          addToast={noop}
-        />,
-      );
+      await userEvent.click(screen.getByRole("button", { name: "Activity" }));
+      expect(header?.querySelector("h1, h2, h3, h4, h5, h6")).toBeNull();
+      if (title) expect(header).not.toHaveTextContent(title);
+      if (description) expect(screen.queryByTestId("task-detail-definition-description")).toBeNull();
 
-      await waitFor(() => {
-        expect(container.querySelector("h2.detail-title")?.textContent).toBe(triageDescription);
-      });
-      expect(container.querySelector("h2.detail-title")).toHaveClass("detail-title--collapsed");
-      expect(screen.getByRole("button", { name: "Show more" })).toBeInTheDocument();
-    });
-
-    it("keeps the editing title form unaffected by the read-only clamp", async () => {
-      const longTitle = "Editable title ".repeat(25);
-      const { container } = renderDetail({
-        column: "todo",
-        title: longTitle,
-        description: "Editable description",
-      });
-
-      expect(await screen.findByRole("button", { name: "Show more" })).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Plan" }));
       await userEvent.click(screen.getByRole("button", { name: "Edit task" }));
-
-      expect(container.querySelector("h2.detail-title")).toBeNull();
-      expect(container.querySelector(".detail-description-toggle")).toBeNull();
-      expect(screen.getByLabelText("Title")).toHaveValue(longTitle);
+      expect(header?.querySelector("h1, h2, h3, h4, h5, h6")).toBeNull();
+      expect(screen.getByLabelText("Title")).toHaveValue(title ?? "");
+      expect(screen.getByLabelText("Description")).toHaveValue(description ?? "");
+      expect(screen.queryByTestId("summarize-title-btn")).toBeNull();
     });
 
-    it("keeps the summarize-title affordance aligned next to the clamped title", async () => {
-      const { container } = renderDetail({
-        column: "todo",
-        title: "Summarize me ".repeat(25),
-        description: "Description available for summarization",
-      });
-
-      expect(container.querySelector(".detail-heading-row h2.detail-title--collapsed")).toBeInTheDocument();
-      expect(screen.getByTestId("summarize-title-btn")).toBeInTheDocument();
-      expect(await screen.findByRole("button", { name: "Show more" })).toBeInTheDocument();
-    });
-
-    it("keeps the clamp available in chat-expanded layout", async () => {
-      const { container } = render(
-        <TaskDetailContent
-          task={makeTask({
-            column: "todo",
-            title: "Chat expanded title ".repeat(25),
-            description: "Description",
-          })}
-          onMoveTask={noopMove}
+    it("keeps Summarize beside Description without recreating title chrome", async () => {
+      vi.mocked(dashboardApi.summarizeTitle).mockResolvedValueOnce("Generated hidden title");
+      vi.mocked(dashboardApi.updateTask).mockResolvedValueOnce(makeTask({ id: "FN-SUMMARY", title: "Generated hidden title" }));
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ id: "FN-SUMMARY", column: "todo", title: "Existing hidden title", description: "Summarize this description" })}
+          onClose={noop}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
           addToast={noop}
-          initialTab="chat"
         />,
       );
 
-      await userEvent.click(screen.getByRole("button", { name: "Expand activity to full modal" }));
-
-      expect(container.querySelector(".task-detail-content--chat-expanded")).toBeInTheDocument();
-      expect(container.querySelector("h2.detail-title")).toHaveClass("detail-title--collapsed");
-      expect(await screen.findByRole("button", { name: "Show more" })).toBeInTheDocument();
+      const summarizeButton = screen.getByTestId("summarize-title-btn");
+      expect(summarizeButton.closest(".detail-definition-header")).toBeInTheDocument();
+      expect(summarizeButton.closest(".modal-header")).toBeNull();
+      await userEvent.click(summarizeButton);
+      await waitFor(() => expect(dashboardApi.updateTask).toHaveBeenCalledWith("FN-SUMMARY", { title: "Generated hidden title" }, undefined));
+      expect(document.querySelector(".modal-header")).not.toHaveTextContent("Generated hidden title");
+      expect(document.querySelector(".detail-title, .detail-title-control, .detail-title-measurement")).toBeNull();
     });
 
-    it("has desktop and mobile CSS rules that preserve the two-line title clamp", () => {
+    it("renders no Summarize shell without a description or edit permission", () => {
+      const first = render(
+        <TaskDetailContent
+          initialTab="definition"
+          embedded
+          task={makeTask({ id: "FN-NO-DESCRIPTION", column: "todo", title: "Still editable", description: "" })}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+      expect(screen.queryByTestId("summarize-title-btn")).toBeNull();
+      expect(first.container.querySelector(".detail-definition-header")).toHaveTextContent("Description");
+      first.unmount();
+
+      render(
+        <TaskDetailContent
+          initialTab="definition"
+          embedded
+          task={makeTask({ id: "FN-READ-ONLY", column: "in-progress", description: "Read-only description" })}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+      expect(screen.queryByTestId("summarize-title-btn")).toBeNull();
+    });
+
+    it("contains no title clamp selectors after removing the title click target", () => {
       const css = readDashboardStylesSource();
-      expect(css).toContain(".detail-title--collapsed");
-      expectBaseRule(css, ".detail-title--collapsed", "-webkit-line-clamp: 2");
-      expectBaseRule(css, ".detail-title--collapsed", "line-clamp: 2");
+      for (const removedSelector of [
+        ".detail-heading-row",
+        ".detail-title {",
+        ".detail-title--collapsed",
+        ".detail-title-measurement",
+        ".detail-title-control",
+      ]) {
+        expect(css).not.toContain(removedSelector);
+      }
       expect(css).toContain("@media (max-width: 768px)");
-      expectBaseRule(css, ".detail-title", "font-size: 16px");
+      expect(css).not.toContain(".detail-description-toggle");
     });
   });
 
   it("always shows task.id in the detail-id badge regardless of title", () => {
     // With title
-    const { container: withTitle } = render(
+    render(
       <TaskDetailModal
         initialTab="definition"
         task={makeTask({ title: "Some title" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
         addToast={noop}
       />,
     );
-    expect(withTitle.querySelector(".detail-id")?.textContent).toBe("FN-099");
+    /* Portaled, and rendered twice — see the cleanup note on the clamped-heading case. */
+    expect(document.querySelector(".detail-id")?.textContent).toBe("FN-099");
+    cleanup();
 
     // Without title
-    const { container: withoutTitle } = render(
+    render(
       <TaskDetailModal
         initialTab="definition"
         task={makeTask({ title: undefined, description: "A description" })}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
         addToast={noop}
       />,
     );
-    expect(withoutTitle.querySelector(".detail-id")?.textContent).toBe("FN-099");
+    expect(document.querySelector(".detail-id")?.textContent).toBe("FN-099");
   });
 
   describe("optimistic opening with Task", () => {
     beforeEach(async () => {
+      await resetTaskDetailFetchMock();
+      vi.mocked(dashboardApi.fetchTaskPrompt).mockReset();
+      vi.mocked(dashboardApi.fetchTaskPrompt).mockResolvedValue({ id: "FN-099", prompt: "# Task FN-099" });
+    });
+
+    it("restores a resolved detail Promise after an override is reset", async () => {
       const { fetchTaskDetail } = await import("../../api");
-      vi.mocked(fetchTaskDetail).mockReset();
+      const mockFetch = vi.mocked(fetchTaskDetail);
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(makeTask({ id: "FN-override", prompt: "# Override" }));
+
+      await expect(mockFetch("FN-override", undefined)).resolves.toMatchObject({ id: "FN-override" });
+      await resetTaskDetailFetchMock();
+
+      /*
+      FNXC:DashboardTests 2026-08-04-15:05:
+      The reproducing reset sequence must never leave Definition refresh with
+      Vitest's undefined return value instead of the API's Promise contract.
+      */
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ prompt: "# Restored default prompt" })}
+          onClose={noop}
+
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      await waitFor(() => expect(dashboardApi.fetchTaskPrompt).toHaveBeenCalledWith("FN-099", undefined));
+      await waitFor(() => expect(screen.queryByText("Restored default prompt")).toBeNull());
     });
 
     it("renders immediately when opened with a Task prop (no prompt)", async () => {
@@ -2326,7 +2230,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2334,8 +2238,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // Modal renders immediately without crashing
-      expect(container.querySelector(".modal-overlay")).toBeTruthy();
+      /* Same obsolete selector as the wrapper case: the shell is FloatingWindow, not `.modal-overlay`. */
+      expect(document.querySelector(".floating-window-overlay--modal")).toBeTruthy();
       expect(screen.getByText("FN-200")).toBeDefined();
     });
 
@@ -2372,7 +2276,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2385,9 +2289,9 @@ describe("TaskDetailModal", () => {
       });
     });
 
-    it("does NOT call fetchTaskDetail when prop is already a TaskDetail with prompt", async () => {
-      const { fetchTaskDetail } = await import("../../api");
-      const mockFetch = vi.mocked(fetchTaskDetail);
+    it("uses a prompt-only Definition refresh when prop is already a TaskDetail with prompt", async () => {
+      const mockPromptFetch = vi.mocked(dashboardApi.fetchTaskPrompt);
+      const mockFetch = vi.mocked(dashboardApi.fetchTaskDetail);
 
       const detail: TaskDetail = {
         id: "FN-202",
@@ -2407,7 +2311,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={detail}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2415,10 +2319,125 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // Give a tick for any async operations
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // A full detail skips the full client; Definition reads only its prompt.
+      await waitFor(() => expect(mockPromptFetch).toHaveBeenCalledWith("FN-202", undefined));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
 
-      expect(mockFetch).not.toHaveBeenCalledWith("FN-202", undefined);
+    it("retains the last good prompt when Definition refresh rejects", async () => {
+      const mockFetch = vi.mocked(dashboardApi.fetchTaskPrompt);
+      const detail = makeTask({ id: "FN-202-rejected", prompt: "# Last good prompt" });
+      mockFetch.mockRejectedValueOnce(new Error("refresh failed"));
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={detail}
+          onClose={noop}
+
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledWith("FN-202-rejected", undefined));
+      openFullPlan();
+      expect(screen.getByText("Last good prompt")).toBeInTheDocument();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    /*
+    FNXC:TaskDetailPlan 2026-08-04-15:21:
+    Definition refresh is lifecycle-owned, not modal-owned: embedded kept-alive hosts
+    must defer while hidden, refresh immediately on reveal, keep one request during a
+    pending interval tick, and stop polling again when hidden. Exercise that actual
+    visibility sequence so a mock-default repair cannot hide a broken refresh fence.
+    */
+    it("defers embedded refresh while inactive, deduplicates pending interval work, and resumes on re-show", async () => {
+      vi.useFakeTimers();
+      try {
+        const mockFetch = vi.mocked(dashboardApi.fetchTaskPrompt);
+        let resolveFirstRequest: (detail: { id: string; prompt?: string }) => void = () => undefined;
+        mockFetch.mockImplementationOnce(() => new Promise<{ id: string; prompt?: string }>((resolve) => {
+          resolveFirstRequest = resolve;
+        }));
+        mockFetch.mockResolvedValueOnce({ id: "FN-lifecycle", prompt: "# Interval refresh" });
+        mockFetch.mockResolvedValue({ id: "FN-lifecycle", prompt: "# Re-shown refresh" });
+        const props = {
+          embedded: true,
+          initialTab: "definition" as const,
+          task: makeTask({ id: "FN-lifecycle", status: "planning", prompt: "# Initial prompt" }),
+
+          onDeleteTask: noopDelete,
+          onMergeTask: noopMerge,
+          onOpenDetail: noopOpenDetail,
+          addToast: noop,
+        };
+
+        const { rerender } = render(<TaskDetailContent {...props} active={false} />);
+        expect(mockFetch).not.toHaveBeenCalled();
+
+        rerender(<TaskDetailContent {...props} active />);
+        await act(async () => {});
+        openFullPlan();
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+
+        await act(async () => { resolveFirstRequest({ id: "FN-lifecycle", prompt: "# First refresh" }); });
+        expect(screen.getByText("First refresh")).toBeInTheDocument();
+
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+
+        rerender(<TaskDetailContent {...props} active={false} />);
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+
+        rerender(<TaskDetailContent {...props} active />);
+        await act(async () => {});
+        expect(mockFetch).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("fences a cancelled embedded refresh after a visible task switch", async () => {
+      const mockFetch = vi.mocked(dashboardApi.fetchTaskPrompt);
+      let resolveStaleRequest: (detail: { id: string; prompt?: string }) => void = () => undefined;
+      let resolveCurrentRequest: (detail: { id: string; prompt?: string }) => void = () => undefined;
+      mockFetch
+        .mockImplementationOnce(() => new Promise<{ id: string; prompt?: string }>((resolve) => { resolveStaleRequest = resolve; }))
+        .mockImplementationOnce(() => new Promise<{ id: string; prompt?: string }>((resolve) => { resolveCurrentRequest = resolve; }));
+      const sharedProps = {
+        embedded: true,
+        initialTab: "definition" as const,
+
+        onDeleteTask: noopDelete,
+        onMergeTask: noopMerge,
+        onOpenDetail: noopOpenDetail,
+        addToast: noop,
+      };
+      const staleTask = makeTask({ id: "FN-stale-detail", prompt: "# Stale initial" });
+      const currentTask = makeTask({ id: "FN-current-detail", prompt: "# Current initial" });
+
+      const { rerender } = render(<TaskDetailContent {...sharedProps} task={staleTask} active />);
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledWith("FN-stale-detail", undefined));
+
+      rerender(<TaskDetailContent {...sharedProps} task={staleTask} active={false} />);
+      rerender(<TaskDetailContent {...sharedProps} task={currentTask} active />);
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledWith("FN-current-detail", undefined));
+      openFullPlan();
+
+      await act(async () => { resolveCurrentRequest({ id: "FN-current-detail", prompt: "# Current response" }); });
+      expect(await screen.findByText("Current response")).toBeInTheDocument();
+
+      await act(async () => { resolveStaleRequest({ id: "FN-stale-detail", prompt: "# Stale response" }); });
+      expect(screen.queryByText("Stale response")).toBeNull();
+      expect(screen.getByText("Current response")).toBeInTheDocument();
     });
 
     it("shows loading state in spec area when detailLoading is true", async () => {
@@ -2447,7 +2466,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2455,15 +2474,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
+      openFullPlan();
       expect(screen.getByText("Loading specification…")).toBeDefined();
-      // Token stats now live in their own Stats tab — switch to it before
-      // asserting on token-loading text.
+      // Token stats now live in their own Stats tab — return before switching.
+      fireEvent.click(screen.getByRole("button", { name: "Back to definition" }));
       fireEvent.click(screen.getByRole("button", { name: "Stats" }));
       expect(screen.getByText("Execution Timing")).toBeInTheDocument();
       expect(screen.getByText("Execution Details")).toBeInTheDocument();
       expect(screen.getByText("Loading token statistics…")).toBeDefined();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
-      expect(screen.getByText("executing")).toBeInTheDocument();
+      expectSingleStatsRuntimeStatus("executing");
     });
 
     it("shows spec content after fetchTaskDetail resolves", async () => {
@@ -2523,7 +2543,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2531,12 +2551,13 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // Initially shows loading
+      // Initially shows loading in the internal plan view.
+      openFullPlan();
       expect(screen.getByText("Loading specification…")).toBeDefined();
 
       // After fetch resolves, spec content appears
       await waitFor(() => {
-        const markdownBody = container.querySelector(".markdown-body");
+        const markdownBody = document.querySelector(".markdown-body");
         expect(markdownBody).toBeTruthy();
       }, { timeout: 3000 });
 
@@ -2544,6 +2565,7 @@ describe("TaskDetailModal", () => {
       expect(screen.queryByText("Loading specification…")).toBeNull();
 
       // Token stats live behind the Stats tab now.
+      fireEvent.click(screen.getByRole("button", { name: "Back to definition" }));
       fireEvent.click(screen.getByRole("button", { name: "Stats" }));
       expect(screen.queryByText("Loading token statistics…")).toBeNull();
       expect(screen.getByText("Execution Timing")).toBeInTheDocument();
@@ -2553,13 +2575,14 @@ describe("TaskDetailModal", () => {
       expect(screen.getByText("Execution mode")).toBeInTheDocument();
       expect(screen.getByText("Runtime status")).toBeInTheDocument();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
-      expect(screen.getByText("executing")).toBeInTheDocument();
-      expect(screen.getByText((1200).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((450).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((210).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((1860).toLocaleString())).toBeInTheDocument();
-      const firstUsed = container.querySelector('time[datetime="2026-04-24T09:00:00.000Z"]');
-      const lastUsed = container.querySelector('time[datetime="2026-04-24T10:15:00.000Z"]');
+      expectSingleStatsRuntimeStatus("executing");
+      const statsPanel = screen.getByRole("region", { name: "Task execution statistics" });
+      expect(within(statsPanel).getByText((1200).toLocaleString())).toBeInTheDocument();
+      expect(within(statsPanel).getByText((450).toLocaleString())).toBeInTheDocument();
+      expect(within(statsPanel).getByText((210).toLocaleString())).toBeInTheDocument();
+      expect(within(statsPanel).getByText((1860).toLocaleString())).toBeInTheDocument();
+      const firstUsed = document.querySelector('time[datetime="2026-04-24T09:00:00.000Z"]');
+      const lastUsed = document.querySelector('time[datetime="2026-04-24T10:15:00.000Z"]');
       expect(firstUsed).toBeTruthy();
       expect(lastUsed).toBeTruthy();
     });
@@ -2598,7 +2621,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={strippedTask}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2608,15 +2631,15 @@ describe("TaskDetailModal", () => {
 
       // Wait for fetchTaskDetail to resolve.
       await waitFor(() => {
-        expect(container.querySelector(".markdown-body")).toBeTruthy();
+        expect(document.querySelector(".markdown-body")).toBeTruthy();
       }, { timeout: 3000 });
 
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       fireEvent.click(screen.getByRole("menuitem", { name: "Feed" }));
 
-      const activityList = container.querySelector(".detail-activity-list");
+      const activityList = document.querySelector(".detail-activity-list");
       expect(activityList).toBeTruthy();
-      const logEntries = container.querySelectorAll(".detail-log-entry");
+      const logEntries = document.querySelectorAll(".detail-log-entry");
       expect(logEntries).toHaveLength(2);
       expect(logEntries[0].textContent).toContain("Started executor");
       expect(logEntries[1].textContent).toContain("Created task");
@@ -2649,7 +2672,7 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
+
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2669,7 +2692,7 @@ describe("TaskDetailModal", () => {
     });
   });
 
-  it("shows near-duplicate banner and keeps warning on Keep click", async () => {
+  it("clears the duplicate flag from the near-duplicate banner", async () => {
     const { updateTask } = await import("../../api");
     const mockUpdateTask = vi.mocked(updateTask);
     mockUpdateTask.mockResolvedValueOnce(makeTask({
@@ -2683,7 +2706,7 @@ describe("TaskDetailModal", () => {
         task={makeTask({ sourceMetadata: { nearDuplicateOf: "FN-1234" } })}
         tasks={[makeTask({ id: "FN-1234" })]}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -2699,6 +2722,7 @@ describe("TaskDetailModal", () => {
     });
   });
 
+
   it("hides near-duplicate banner once dismissed", () => {
     render(
       <TaskDetailModal
@@ -2706,7 +2730,7 @@ describe("TaskDetailModal", () => {
         task={makeTask({ sourceMetadata: { nearDuplicateOf: "FN-1234", nearDuplicateDismissed: true } })}
         tasks={[makeTask({ id: "FN-1234" })]}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -2718,7 +2742,6 @@ describe("TaskDetailModal", () => {
   });
 
   it.each([
-    ["archived", makeTask({ id: "FN-1234", column: "archived" })],
     ["done", makeTask({ id: "FN-1234", column: "done" })],
     ["missing", undefined],
   ])("hides near-duplicate decision banner when canonical is %s", (_label, canonical) => {
@@ -2728,7 +2751,7 @@ describe("TaskDetailModal", () => {
         task={makeTask({ sourceMetadata: { nearDuplicateOf: "FN-1234" } })}
         tasks={canonical ? [canonical] : []}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -2737,12 +2760,13 @@ describe("TaskDetailModal", () => {
     );
 
     expect(screen.queryByText("Potential duplicate detected")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Keep" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete duplicate task" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /keep/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Mark the duplicate flag for FN-1234 as read" })).toBeNull();
   });
 
-  it("archives from near-duplicate banner when confirmed", async () => {
-    const onArchiveTask = vi.fn().mockResolvedValue(makeTask({ column: "archived" }));
+  it("deletes from the near-duplicate banner when confirmed", async () => {
+    const onDeleteTask = vi.fn().mockResolvedValue(makeTask());
     mockConfirm.mockResolvedValueOnce(true);
 
     render(
@@ -2751,19 +2775,19 @@ describe("TaskDetailModal", () => {
         task={makeTask({ sourceMetadata: { nearDuplicateOf: "FN-1234" } })}
         tasks={[makeTask({ id: "FN-1234" })]}
         onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={noopDelete}
+
+        onDeleteTask={onDeleteTask}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
-        onArchiveTask={onArchiveTask}
         addToast={noop}
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Archive" }));
+    const duplicateBanner = screen.getByText("Potential duplicate detected").closest(".detail-near-duplicate-banner")!;
+    await userEvent.click(within(duplicateBanner).getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
-      expect(onArchiveTask).toHaveBeenCalledWith("FN-099");
+      expect(onDeleteTask).toHaveBeenCalledWith("FN-099", { removeLineageReferences: true });
     });
   });
 
@@ -2777,7 +2801,7 @@ describe("TaskDetailModal", () => {
         task={makeTask({ sourceMetadata: { nearDuplicateOf: "FN-1234", duplicateSource: "triage-marker" } })}
         tasks={[makeTask({ id: "FN-1234" })]}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={onDeleteTask}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -2785,8 +2809,9 @@ describe("TaskDetailModal", () => {
       />,
     );
 
-    expect(screen.getByRole("status")).toHaveTextContent("Choose Delete to remove this duplicate, or Keep to continue anyway.");
-    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Keep it to clear this flag, or delete it if the work is already covered.");
+    const duplicateBanner = screen.getByText("Potential duplicate detected").closest(".detail-near-duplicate-banner")!;
+    await userEvent.click(within(duplicateBanner).getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
       expect(onDeleteTask).toHaveBeenCalledWith("FN-099", { removeLineageReferences: true });
@@ -2831,7 +2856,7 @@ describe("TaskDetailModal", () => {
         initialTab="definition"
         task={task}
         onClose={noop}
-        onMoveTask={noopMove}
+
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -2850,5 +2875,6 @@ describe("TaskDetailModal", () => {
       expect(metric).toHaveTextContent("4m 0s");
     });
   });
+
 
 });

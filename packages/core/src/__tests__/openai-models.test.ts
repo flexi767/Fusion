@@ -6,7 +6,7 @@ import {
   OPENAI_CODEX_PROVIDER_ID,
   SUPPLEMENTAL_OPENAI_CODEX_PROVIDER_REGISTRATION,
   mergeSupplementalOpenAiCodexModels,
-} from "../openai-models.js";
+} from "../ai/openai-models.js";
 
 const EXPECTED_IDS = [GPT_5_6_LUNA_MODEL_ID, GPT_5_6_SOL_MODEL_ID, GPT_5_6_TERRA_MODEL_ID];
 const BUILT_IN_CODEX_IDS = ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"];
@@ -206,6 +206,7 @@ describe("mergeSupplementalOpenAiCodexModels", () => {
         maxTokens: 128_000,
       });
       expect(row?.thinkingLevelMap).toMatchObject({ xhigh: "xhigh", max: "max", minimal: "low" });
+      expect(Object.keys(row?.thinkingLevelMap ?? {})).toContain("max");
     }
   });
 });

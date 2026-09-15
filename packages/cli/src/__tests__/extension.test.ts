@@ -22,7 +22,7 @@ vi.mock("../commands/task.js", () => ({
 }));
 
 import { __setCachedStoreForTesting, closeCachedStores, resolveTaskListFormatter } from "../extension.js";
-import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, MAX_TASK_LIST_TEXT_CHARS, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
+import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, MAX_TASK_LIST_TEXT_CHARS, MAX_TASK_MESSAGE_LENGTH, MissionBlockedClearConflictError, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
 import type { WorkflowIr } from "@fusion/core";
 import { isGhAvailable, isGhAuthenticated, runGhJsonAsync } from "@fusion/core/gh-cli";
 import { runTaskPlan } from "../commands/task.js";
@@ -87,11 +87,57 @@ describe("fn pi extension session lifecycle", () => {
     await expect(shutdownPromise).resolves.toBeUndefined();
   });
 });
+describe("fn_task_refine extension schema", () => {
+  afterEach(async () => {
+    await closeCachedStores();
+  });
+
+  it("uses the shared task-message maxLength", () => {
+    const api = createMockApi();
+    registerExtension(api);
+
+    const tool = requireTool(api, "fn_task_refine") as ToolWithParameters;
+    expect(tool.parameters?.properties?.feedback?.maxLength).toBe(MAX_TASK_MESSAGE_LENGTH);
+  });
+});
+
+describe("fn_task_logs_read extension payload bounds", () => {
+  afterEach(async () => {
+    await closeCachedStores();
+  });
+
+  it("uses the shared bounded builder for oversized default-preview pages", async () => {
+    const cwd = "/fn-253-extension-log-reader";
+    const entries = Array.from({ length: 100 }, (_, index) => ({
+      taskId: "FN-253",
+      timestamp: "2026-08-29T00:00:00.000Z",
+      text: `tool-${index}`,
+      type: "tool_result" as const,
+      detail: "x".repeat(4_096),
+    }));
+    __setCachedStoreForTesting(cwd, {
+      getAgentLogs: vi.fn().mockResolvedValue(entries),
+      getAgentLogCount: vi.fn().mockResolvedValue(entries.length),
+    } as unknown as TaskStore);
+
+    const api = createMockApi();
+    registerExtension(api);
+    const tool = requireTool(api, "fn_task_logs_read");
+    const result = await tool.execute("call", { id: "FN-253", detail: "preview" }, undefined, undefined, makeCtx(cwd));
+    const text = result.content[0]?.text ?? "";
+
+    expect(text.length).toBeLessThanOrEqual(12_000);
+    expect(text).toContain("Detail preview truncated:");
+    expect(text).toContain("smaller limit, offset, or type filter");
+  });
+});
+
 interface ToolMeta {
   description?: string;
   promptGuidelines?: string[];
 }
 interface ToolParameterSchema {
+  maxLength?: number;
   enum?: unknown[];
   anyOf?: { const?: string; enum?: unknown[] }[];
 }
@@ -270,6 +316,7 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
         "fn_task_unpause",
         "fn_task_retry",
         "fn_task_bypass_review",
+        "fn_workflow_step_resume",
         "fn_task_duplicate",
         "fn_task_refine",
         "fn_task_import_github",
@@ -281,8 +328,6 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
         "fn_task_import_gitlab_group_issues",
         "fn_task_browse_gitlab_merge_requests",
         "fn_task_import_gitlab_merge_requests",
-        "fn_task_archive",
-        "fn_task_unarchive",
         "fn_task_delete",
         "fn_task_plan",
         "fn_insight_list",
@@ -295,6 +340,8 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
         "fn_mission_backfill_assertions",
         "fn_mission_delete",
         "fn_mission_update",
+        "fn_mission_set_status",
+        "fn_mission_clear_blocked",
         "fn_milestone_add",
         "fn_slice_add",
         "fn_feature_add",
@@ -303,7 +350,11 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
         "fn_milestone_delete",
         "fn_slice_activate",
         "fn_feature_link_task",
+        "fn_feature_repoint_task",
+        "fn_feature_unlink_task",
         "fn_feature_update",
+        "fn_feature_repair_validation",
+        "fn_feature_set_status",
         "fn_milestone_update",
         "fn_agent_stop",
         "fn_agent_start",
@@ -325,6 +376,8 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
       expect(api.tools.has("fn_task_update_step")).toBe(false);
       expect(api.tools.has("fn_task_log")).toBe(false);
       expect(api.tools.has("fn_task_merge")).toBe(false);
+      expect(api.tools.has("fn_task_archive")).toBe(false);
+      expect(api.tools.has("fn_task_unarchive")).toBe(false);
     });
 
     it("registers the /fn command", () => {
@@ -1126,20 +1179,18 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
       expect(dashboardResult.content[0].text).toContain("Created via: Dashboard");
     });
 
-    it("shows duplicate lineage with archived annotation", async () => {
+    it("shows duplicate lineage", async () => {
       const store = h.store();
 
-      const archivedSource = await store.createTask({ description: "Archived source" });
-      await store.moveTask(archivedSource.id, "done");
-      await store.archiveTask(archivedSource.id);
+      const source = await store.createTask({ description: "Duplicate source" });
       await store.createTask({
         description: "Dup task",
-        source: { sourceType: "chat_session", sourceMetadata: { duplicateOfTaskIds: [archivedSource.id, "FN-404"] } },
+        source: { sourceType: "chat_session", sourceMetadata: { duplicateOfTaskIds: [source.id, "FN-404"] } },
       });
 
       const showTool = api.tools.get("fn_task_show")!;
       const result = await showTool.execute("call-4", { id: "FN-002" }, undefined, undefined, makeCtx(tmpDir));
-      expect(result.content[0].text).toContain(`Duplicate of: ${archivedSource.id} (archived), FN-404`);
+      expect(result.content[0].text).toContain(`Duplicate of: ${source.id}, FN-404`);
     });
   });
 
@@ -1360,6 +1411,10 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
         makeCtx(tmpDir),
       );
       expect(pauseResult.content[0].text).toContain("Paused FN-001");
+      await expect(h.store().getTask("FN-001")).resolves.toMatchObject({
+        paused: true,
+        userPaused: true,
+      });
 
       // Verify it's paused
       const showTool = api.tools.get("fn_task_show")!;
@@ -1918,55 +1973,6 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Task FN-999 not found");
-    });
-
-    it("returns clear error when task is archived/non-active", async () => {
-      const missionTool = api.tools.get("fn_mission_create")!;
-      const milestoneTool = api.tools.get("fn_milestone_add")!;
-      const sliceTool = api.tools.get("fn_slice_add")!;
-      const featureTool = api.tools.get("fn_feature_add")!;
-      const linkTool = api.tools.get("fn_feature_link_task")!;
-
-      const store = h.store();
-      const archivedTask = await store.createTask({ description: "Archived task" });
-      await store.moveTask(archivedTask.id, "done");
-      await store.archiveTask(archivedTask.id);
-
-      const mission = await missionTool.execute("m1", { title: "Mission" }, undefined, undefined, makeCtx(tmpDir));
-      const milestone = await milestoneTool.execute(
-        "ms1",
-        { missionId: mission.details.missionId, title: "Milestone" },
-        undefined,
-        undefined,
-        makeCtx(tmpDir),
-      );
-      const slice = await sliceTool.execute(
-        "sl1",
-        { milestoneId: milestone.details.milestoneId, title: "Slice" },
-        undefined,
-        undefined,
-        makeCtx(tmpDir),
-      );
-      const feature = await featureTool.execute(
-        "f1",
-        { sliceId: slice.details.sliceId, title: "Feature" },
-        undefined,
-        undefined,
-        makeCtx(tmpDir),
-      );
-
-      const result = await linkTool.execute(
-        "l0b",
-        { featureId: feature.details.featureId, taskId: archivedTask.id },
-        undefined,
-        undefined,
-        makeCtx(tmpDir),
-      );
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("task is not on the active board");
-      expect(result.content[0].text).toContain(`Cannot link feature ${feature.details.featureId} to task ${archivedTask.id}`);
-      expect(result.details.error).toContain("Only active tasks can be linked to features");
     });
 
     it("links feature to task", async () => {
@@ -2551,7 +2557,7 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
       );
 
       const store = h.store();
-      const tasks = await store.listTasks({ includeArchived: true });
+      const tasks = await store.listTasks({ includeArchived: false });
       expect(tasks).toHaveLength(2);
       const issueOneTask = tasks.find((task) => task.sourceIssue?.issueNumber === 1);
       expect(issueOneTask?.githubTracking?.enabled).toBeUndefined();
@@ -2585,7 +2591,7 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
       await tool.execute("gh-tracked-bulk", { ownerRepo: "acme/demo" }, undefined, undefined, makeCtx(tmpDir));
 
       const verifyStore = h.store();
-      const tasks = await verifyStore.listTasks({ includeArchived: true });
+      const tasks = await verifyStore.listTasks({ includeArchived: false });
       const imported = tasks.find((task) => task.sourceIssue?.issueNumber === 7);
       expect(imported?.githubTracking?.enabled).toBe(true);
       expect(imported?.sourceIssue).toEqual(expect.objectContaining({
@@ -2615,7 +2621,7 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
       await tool.execute("gh-import-linked-bulk", { ownerRepo: "acme/demo" }, undefined, undefined, makeCtx(tmpDir));
 
       const verifyStore = h.store();
-      const tasks = await verifyStore.listTasks({ includeArchived: true });
+      const tasks = await verifyStore.listTasks({ includeArchived: false });
       const imported = tasks.find((task) => task.sourceIssue?.issueNumber === 9);
       expect(imported?.description).toContain("(no description)");
       expect(imported?.githubTracking?.enabled).toBe(true);
@@ -2888,6 +2894,219 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
     expect(result.content[0].text).toContain(result.details.taskId);
   });
 
+  it("executes the dedicated mission status tools with linked-feature protection", async () => {
+    const context = makeCtx(tmpDir);
+    const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Mission" }, undefined, undefined, context);
+    const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+    const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+    const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+    const setFeatureStatus = api.tools.get("fn_feature_set_status")!;
+
+    const unlinked = await setFeatureStatus.execute("unlinked", { id: feature.details.featureId, status: "done" }, undefined, undefined, context);
+    expect(unlinked.isError).toBe(true);
+    expect(unlinked.content[0].text).toContain("linked task");
+    expect((await h.store().getMissionStore().getMissionEvents(mission.details.missionId, { limit: 10 })).events
+      .filter((event) => event.eventType === "feature_status_changed")).toHaveLength(0);
+
+    const invalidFeature = await setFeatureStatus.execute("invalid-feature", { id: feature.details.featureId, status: "invalid" }, undefined, undefined, context);
+    expect(invalidFeature.isError).toBe(true);
+    expect(invalidFeature.content[0].text).toContain("Invalid status. Must be one of:");
+
+    const task = await api.tools.get("fn_task_create")!.execute("task", { description: "Linked delivery" }, undefined, undefined, context);
+    await api.tools.get("fn_feature_link_task")!.execute("link", { featureId: feature.details.featureId, taskId: task.details.taskId }, undefined, undefined, context);
+    const changed = await setFeatureStatus.execute("status", { id: feature.details.featureId, status: "done", reason: "completed" }, undefined, undefined, context);
+    expect(changed.isError).not.toBe(true);
+    expect((await h.store().getMissionStore().getFeature(feature.details.featureId))?.status).toBe("done");
+    expect((await h.store().getMissionStore().getMissionEvents(mission.details.missionId, { limit: 10 })).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: "feature_status_changed",
+        metadata: expect.objectContaining({ reason: "completed", actor: { type: "operator", id: "cli-operator", source: "pi-extension" } }),
+      }),
+    ]));
+
+    const missionChanged = await api.tools.get("fn_mission_set_status")!.execute("mission-status", { id: mission.details.missionId, status: "blocked", reason: "waiting" }, undefined, undefined, context);
+    expect(missionChanged.isError).not.toBe(true);
+    expect((await h.store().getMissionStore().getMission(mission.details.missionId))?.status).toBe("blocked");
+    expect((await h.store().getMissionStore().getMissionEvents(mission.details.missionId, { limit: 10 })).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: "mission_status_changed",
+        metadata: expect.objectContaining({ reason: "waiting", actor: { type: "operator", id: "cli-operator", source: "pi-extension" } }),
+      }),
+    ]));
+    const invalidMission = await api.tools.get("fn_mission_set_status")!.execute("invalid-mission", { id: mission.details.missionId, status: "invalid" }, undefined, undefined, context);
+    expect(invalidMission.isError).toBe(true);
+    expect(invalidMission.content[0].text).toContain("Invalid status. Must be one of:");
+  });
+
+  /*
+  FNXC:MissionValidationRepair 2026-08-11-01:46:
+  The pi registration must drive the real cached PostgreSQL store, not merely expose a schema.
+  This preserves the archived-link repair guarantee through the CLI adapter.
+  */
+  it("clears a soft-deleted linked feature through the real validation repair tool", async () => {
+    __setCachedStoreForTesting(tmpDir, h.store());
+    const missionStore = h.store().getMissionStore();
+    const mission = await missionStore.createMission({ title: "CLI repair" });
+    const milestone = await missionStore.addMilestone(mission.id, { title: "Milestone" });
+    const slice = await missionStore.addSlice(milestone.id, { title: "Slice" });
+    const feature = await missionStore.addFeature(slice.id, { title: "Feature" });
+    const task = await h.store().createTask({ description: "Deleted CLI delivery", column: "done" });
+    await h.store().deleteTask(task.id);
+    await missionStore.updateFeature(feature.id, { taskId: task.id, status: "blocked", loopState: "blocked" });
+
+    const result = await api.tools.get("fn_feature_repair_validation")!.execute(
+      "repair-deleted", { id: feature.id, action: "clear" }, undefined, undefined, makeCtx(tmpDir),
+    );
+    expect(result.isError).not.toBe(true);
+    expect(await missionStore.getFeature(feature.id)).toMatchObject({ status: "defined", loopState: "idle" });
+  });
+
+  describe("fn_feature_repoint_task / fn_feature_unlink_task", () => {
+    it("re-points a linked feature to a second delivery task atomically", async () => {
+      const context = makeCtx(tmpDir);
+      const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Repoint Mission" }, undefined, undefined, context);
+      const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+      const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+      const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+      const taskA = await api.tools.get("fn_task_create")!.execute("ta", { description: "wrong task" }, undefined, undefined, context);
+      const taskB = await api.tools.get("fn_task_create")!.execute("tb", { description: "right delivery task" }, undefined, undefined, context);
+
+      // Original symptom reproduction: first pin to the wrong task (as fn_feature_link_task
+      // would naively do for the wrong target).
+      const link = await api.tools.get("fn_feature_link_task")!.execute("link", { featureId: feature.details.featureId, taskId: taskA.details.taskId }, undefined, undefined, context);
+      expect(link.isError).not.toBe(true);
+
+      const store = h.store();
+      const missionStore = store.getMissionStore();
+      expect((await missionStore.getFeature(feature.details.featureId))?.taskId).toBe(taskA.details.taskId);
+      const taskARow = (await store.getTask(taskA.details.taskId)) as any;
+      expect(taskARow.sliceId).toBe(slice.details.sliceId);
+      /*
+      FNXC:MissionFeatureRepointContract 2026-08-19-23:26 (RUFU-134 / PR #3491):
+      CodeRabbit flagged that this test asserted only ONE reverse field (`sliceId`).
+      `setTaskMissionLinkage` writes BOTH `missionId` AND `sliceId` onto the task row, so
+      the proof that the repoint moved the reverse link must assert BOTH fields on the new
+      task (set) and on the old task (cleared); asserting only `sliceId` would miss a
+      repoint that silently dropped `missionId`.
+      */
+      expect(taskARow.missionId).toBe(mission.details.missionId);
+
+      const repoint = await api.tools.get("fn_feature_repoint_task")!.execute("repoint", { featureId: feature.details.featureId, taskId: taskB.details.taskId }, undefined, undefined, context);
+      expect(repoint.isError).not.toBe(true);
+      expect(repoint.details.taskId).toBe(taskB.details.taskId);
+
+      const afterFeature = (await missionStore.getFeature(feature.details.featureId))!;
+      expect(afterFeature.taskId).toBe(taskB.details.taskId);
+      expect(afterFeature.status).toBe("triaged");
+      // Old reverse linkage cleared, new set. BOTH reverse fields (missionId + sliceId).
+      const oldTaskRow = (await store.getTask(taskA.details.taskId)) as any;
+      expect(oldTaskRow.sliceId).toBeUndefined();
+      expect(oldTaskRow.missionId).toBeUndefined();
+      const newTaskRow = (await store.getTask(taskB.details.taskId)) as any;
+      expect(newTaskRow.sliceId).toBe(slice.details.sliceId);
+      expect(newTaskRow.missionId).toBe(mission.details.missionId);
+    });
+
+    it("unlinks a linked feature (clearing taskId and demoting to defined) and errors on an already-unlinked feature", async () => {
+      const context = makeCtx(tmpDir);
+      const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Unlink Mission" }, undefined, undefined, context);
+      const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+      const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+      const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+      const task = await api.tools.get("fn_task_create")!.execute("t", { description: "linked delivery" }, undefined, undefined, context);
+      const store = h.store();
+      const missionStore = store.getMissionStore();
+
+      await api.tools.get("fn_feature_link_task")!.execute("link", { featureId: feature.details.featureId, taskId: task.details.taskId }, undefined, undefined, context);
+      expect((await missionStore.getFeature(feature.details.featureId))?.status).toBe("triaged");
+
+      const unlink = await api.tools.get("fn_feature_unlink_task")!.execute("unlink", { featureId: feature.details.featureId }, undefined, undefined, context);
+      expect(unlink.isError).not.toBe(true);
+      const after = (await missionStore.getFeature(feature.details.featureId))!;
+      expect(after.taskId).toBeUndefined();
+      expect(after.status).toBe("defined");
+      const taskRow = (await store.getTask(task.details.taskId)) as any;
+      expect(taskRow.sliceId).toBeUndefined();
+
+      const second = await api.tools.get("fn_feature_unlink_task")!.execute("unlink2", { featureId: feature.details.featureId }, undefined, undefined, context);
+      expect(second.isError).toBe(true);
+      expect(second.content[0].text).toContain("not linked");
+    });
+
+    it("re-points to a missing task with a clear error and handles an unknown feature", async () => {
+      const context = makeCtx(tmpDir);
+      const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Repoint Err Mission" }, undefined, undefined, context);
+      const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+      const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+      const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+
+      const toMissing = await api.tools.get("fn_feature_repoint_task")!.execute(
+        "repoint-missing-task", { featureId: feature.details.featureId, taskId: "FN-999" }, undefined, undefined, context,
+      );
+      expect(toMissing.isError).toBe(true);
+      expect(toMissing.content[0].text).toMatch(/not found|not on the active board/i);
+
+      const unknownFeature = await api.tools.get("fn_feature_repoint_task")!.execute(
+        "repoint-missing-feature", { featureId: "F-NOPE", taskId: "FN-1" }, undefined, undefined, context,
+      );
+      expect(unknownFeature.isError).toBe(true);
+      expect(unknownFeature.content[0].text).toContain("not found");
+    });
+  });
+
+  describe("fn_mission_clear_blocked", () => {
+    it("calls the attributed repair primitive and reports residual blockers", async () => {
+      const clearMissionBlockedStatus = vi.fn().mockResolvedValue({
+        mission: { id: "M-1", status: "planning" },
+        blockers: [{ source: "lineage", reason: "pending delivery" }],
+      });
+      const missionStore = {
+        getMission: vi.fn().mockResolvedValue({ id: "M-1", status: "blocked" }),
+        clearMissionBlockedStatus,
+      };
+      __setCachedStoreForTesting(tmpDir, { getMissionStore: () => missionStore } as never);
+
+      const result = await api.tools.get("fn_mission_clear_blocked")!.execute(
+        "clear", { id: "M-1", reason: "stale badge" }, undefined, undefined, makeCtx(tmpDir),
+      );
+
+      expect(clearMissionBlockedStatus).toHaveBeenCalledWith("M-1", {
+        actor: { type: "operator", id: "cli-operator", displayName: "CLI operator", source: "pi-extension" },
+        reason: "stale badge",
+      });
+      expect(result.details).toMatchObject({ mission: { id: "M-1", status: "planning" }, blockers: [{ source: "lineage" }] });
+      expect(result.content[0]?.text).toContain("Cleared blocked status for M-1 → planning");
+      expect(result.content[0]?.text).toContain("1 blocker(s) remain; automation stays gated");
+      __setCachedStoreForTesting(tmpDir, h.store());
+    });
+
+    it("reports missing, non-blocked, and PostgreSQL-required mission stores without writing", async () => {
+      const tool = api.tools.get("fn_mission_clear_blocked")!;
+      const missingStore = { getMission: vi.fn().mockResolvedValue(null), clearMissionBlockedStatus: vi.fn() };
+      __setCachedStoreForTesting(tmpDir, { getMissionStore: () => missingStore } as never);
+      await expect(tool.execute("missing", { id: "M-missing" }, undefined, undefined, makeCtx(tmpDir))).resolves.toMatchObject({
+        isError: true, details: { code: "MISSION_NOT_FOUND" },
+      });
+      expect(missingStore.clearMissionBlockedStatus).not.toHaveBeenCalled();
+
+      const conflictStore = {
+        getMission: vi.fn().mockResolvedValue({ id: "M-1", status: "active" }),
+        clearMissionBlockedStatus: vi.fn().mockRejectedValue(new MissionBlockedClearConflictError("active")),
+      };
+      __setCachedStoreForTesting(tmpDir, { getMissionStore: () => conflictStore } as never);
+      await expect(tool.execute("conflict", { id: "M-1" }, undefined, undefined, makeCtx(tmpDir))).resolves.toMatchObject({
+        isError: true, details: { code: "MISSION_NOT_BLOCKED", status: "active" },
+      });
+      expect(conflictStore.clearMissionBlockedStatus).toHaveBeenCalledTimes(1);
+
+      __setCachedStoreForTesting(tmpDir, { getMissionStore: () => ({ getMission: vi.fn() }) } as never);
+      await expect(tool.execute("postgres", { id: "M-1" }, undefined, undefined, makeCtx(tmpDir))).resolves.toMatchObject({
+        isError: true, details: { code: "POSTGRES_REQUIRED" },
+      });
+      __setCachedStoreForTesting(tmpDir, h.store());
+    });
+  });
+
   describe("fn_task_list", () => {
     const HOST_SAFE_TASK_LIST_TEXT_CEILING = 3_000;
 
@@ -3000,10 +3219,19 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
             dependencies: [todoFirst.id],
           });
         }
+        /*
+        FNXC:WorkflowResolvedColumns 2026-07-30-20:40:
+        Seeded explicitly in a THIRD distinct column. These used to be created with no `column` and
+        relied on landing in `triage`, which post-U11 no longer exists — they landed in `todo`
+        instead, so the board became Todo (20) / Done (6) and the "Planning (8)" group the
+        assertions looked for never existed. Naming a real column keeps this case covering a
+        three-way column filter rather than collapsing it to two groups.
+        */
         for (let i = 1; i <= 8; i += 1) {
           await store.createTask({
-            title: `${realisticTaskTitle("triage", i)} ${"x".repeat(1_000)}`,
-            description: `Realistic triage task ${String(i).padStart(3, "0")}`,
+            title: `${realisticTaskTitle("in-progress", i)} ${"x".repeat(1_000)}`,
+            description: `Realistic in-progress task ${String(i).padStart(3, "0")}`,
+            column: "in-progress",
           });
         }
         for (let i = 1; i <= 6; i += 1) {
@@ -3026,7 +3254,18 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       );
       expectSingleBoundedTextBlock(broadResult);
       expect(broadResult.content.some((block: { type: string }) => block.type === "image")).toBe(false);
-      expect(broadResult.content[0].text).toContain("Planning (8):");
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-20:55:
+      Assert the group that actually LEADS the broad listing, not one truncation may cut. This
+      previously asserted "Planning (8):" and passed only incidentally: `triage` sorts before `todo`
+      in COLUMNS order, so its group fitted before the text budget truncated the rest. Post-U11
+      `todo` leads, fills the budget, and the later groups collapse into the "... and N more tasks"
+      notice — so a second group header here is a fixture-ordering assertion, not a bounding one.
+      Per-column coverage of every group is asserted by the three filtered cases below, which do not
+      truncate.
+      */
+      expect(broadResult.content[0].text).toContain("Todo (12):");
+      expect(broadResult.content[0].text).toContain("truncated to fit; narrow with column/limit");
       expect(broadResult.details.count).toBe(26);
 
       for (const { callId, params, header, ids } of [
@@ -3037,9 +3276,9 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
           ids: ["FN-001", "FN-002"],
         },
         {
-          callId: "list-realistic-triage",
-          params: { column: "triage", limit: 8 },
-          header: "Planning (8):",
+          callId: "list-realistic-in-progress",
+          params: { column: "in-progress", limit: 8 },
+          header: "In Progress (8):",
           ids: ["FN-013", "FN-014"],
         },
         {
@@ -3090,7 +3329,13 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(result.content.some((block: { type: string }) => block.type === "image")).toBe(false);
       expect(text).toBeTruthy();
       expect(text.length).toBeLessThanOrEqual(MAX_TASK_LIST_TEXT_CHARS);
-      expect(text).toContain("Planning (15):");
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-20:45:
+      These 15 are created with no `column`, so they land in the DEFAULT lineage's intake column,
+      which post-U11 is `todo` — labelled "Todo". The old expectation "Planning (15):" came from
+      `triage`'s label back when a column-less create landed there; `triage` is no longer declared.
+      */
+      expect(text).toContain("Todo (15):");
       expect(text).toContain("FN-001");
       expect(text).toContain("truncated to fit; narrow with column/limit");
       expect(result.details.count).toBe(15);
@@ -3265,6 +3510,58 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+  });
+
+  it("fn_task_create persists per-task github tracking overrides from github_tracking/github_repo", async () => {
+    const createTool = api.tools.get("fn_task_create")!;
+    const result = await createTool.execute(
+      "create-gh-on",
+      { description: "Track me on GitHub", github_tracking: true, github_repo: "acme/widgets" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+    const task = await h.store().getTask(result.details.taskId);
+    expect(task.githubTracking?.enabled).toBe(true);
+    expect(task.githubTracking?.repoOverride).toBe("acme/widgets");
+
+    const invalid = await createTool.execute(
+      "create-gh-bad-repo",
+      { description: "Bad repo slug", github_repo: "not a slug" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content[0].text).toContain("owner/repo");
+  });
+
+  it("fn_task_create persists an explicit github_tracking:false even when the project default enables tracking", async () => {
+    await h.store().updateSettings({ githubTrackingEnabledByDefault: true });
+    try {
+      const createTool = api.tools.get("fn_task_create")!;
+      const offResult = await createTool.execute(
+        "create-gh-off",
+        { description: "Opt out of GitHub tracking", github_tracking: false },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      const offTask = await h.store().getTask(offResult.details.taskId);
+      expect(offTask.githubTracking?.enabled).toBe(false);
+
+      const defaultResult = await createTool.execute(
+        "create-gh-default",
+        { description: "Inherit project GitHub tracking default" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      const defaultTask = await h.store().getTask(defaultResult.details.taskId);
+      expect(defaultTask.githubTracking?.enabled).toBe(true);
+    } finally {
+      await h.store().updateSettings({ githubTrackingEnabledByDefault: false });
+    }
   });
 
   it("fn_task_update rejects reviewer assignment for implementation tasks", async () => {
@@ -3563,6 +3860,8 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
         error: "Refusing to start coding agent in missing worktree: /tmp/fusion-missing-worktree",
         worktree: "/tmp/fusion-missing-worktree",
         branch: `fusion/${task.id}`,
+        // FNXC:CliTests 2026-08-23-16:02: FN-107 requires branchWriteOrigin provenance on every branch write; this engine-simulated fixture predates that guard.
+        branchWriteOrigin: "engine",
         sessionFile: "/tmp/fusion-session.json",
         mergeRetries: 3,
         worktreeSessionRetryCount: 3,
@@ -4159,12 +4458,19 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(text).not.toMatch(new RegExp(`Current Task: ${triageTask.id}(?! \\()`));
     });
 
-    it("returns empty list message when no agents", async () => {
+    // FNXC:BuiltinAgents 2026-08-14-00:10: FN-8932 added the durable Memory Keeper owner alongside the
+    // four routed workflow principals, so a fresh project now seeds five built-in agents. Assert both the
+    // four workflow owners AND the Memory Keeper are present so the built-in-owner invariant stays fully covered.
+    it("lists the mandatory built-in workflow owners plus the Memory Keeper on a fresh project", async () => {
       const tool = api.tools.get("fn_list_agents")!;
       const result = await tool.execute("la-5", {}, undefined, undefined, makeCtx(tmpDir));
 
-      expect(result.content[0].text).toContain("No agents found");
-      expect(result.details.count).toBe(0);
+      expect(result.content[0].text).toContain("Workflow Planner");
+      expect(result.content[0].text).toContain("Workflow Executor");
+      expect(result.content[0].text).toContain("Workflow Reviewer");
+      expect(result.content[0].text).toContain("Workflow Merger");
+      expect(result.content[0].text).toContain("Memory Keeper");
+      expect(result.details.count).toBe(5);
     });
   });
 
@@ -4220,6 +4526,486 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(task.assignedAgentId).toBe(agentId);
       expect(selection?.workflowId).toBe(workflowId);
       expect(task.enabledWorkflowSteps).toHaveLength(2);
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-22:05:
+    THE INVARIANT: delegation lands in the selected workflow's HOLD lane, whatever it is named.
+
+    `fn_delegate_task` passed the literal `"todo"`. Its contract is the ready-to-work lane — the tool
+    tells the caller the target agent will pick the card up on its next heartbeat — so on a workflow
+    that names that lane `queued` the card went to a column the workflow does not declare: written,
+    reported as delegated, and never visible to the agent it was delegated to.
+
+    Note the seed IR: `queued` carries the `hold` trait, and `start` sits on it, so intake and hold
+    are the same lane here. That is deliberate — it keeps the case about the RESOLUTION and not about
+    which of the two roles wins, which the neighbouring cases already cover with the built-in board.
+
+    REVERT PROOF, measured: restore `column: "todo"` and this case fails with
+    `expected 'todo' to be 'queued'`. The two cases above it stay green, because the built-in and
+    `linearWorkflowIr` boards both call the lane `todo` — which is exactly why the literal survived.
+    */
+    it("delegates into the workflow's own hold lane, not the literal todo", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-renamed-lane" });
+      const store = h.store();
+      const renamed = await store.createWorkflowDefinition({
+        name: "Renamed hold lane",
+        ir: {
+          version: "v2",
+          name: "Renamed hold lane",
+          columns: [{ id: "queued", name: "Queued", traits: [{ trait: "intake" }, { trait: "hold" }] }],
+          nodes: [
+            { id: "start", kind: "start", column: "queued" },
+            { id: "end", kind: "end", column: "queued" },
+          ],
+          edges: [{ from: "start", to: "end", condition: "success" }],
+        } as unknown as WorkflowIr,
+      });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-renamed-lane",
+        { agent_id: agentId, description: "Work in a renamed lane", workflow_id: renamed.id },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      const { task } = await readTaskWorkflowState(tmpDir, result.details.taskId);
+      expect(task.column).toBe("queued");
+      expect(task.assignedAgentId).toBe(agentId);
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-23:55:
+    THE INVARIANT: when intake and hold are DIFFERENT lanes, delegation ends on hold.
+
+    The case above cannot see this: its workflow carries both traits on one column, so the card
+    arrives on the right lane through `createTask`'s entry resolution and the move never runs. Here
+    the two roles are separate columns, so the card lands on `ideas` and must be moved to `queued` —
+    which is the behaviour the old `column: "todo"` literal was providing (skip intake, go straight
+    to the lane the agent picks up from) and the part that would silently regress if the move were
+    dropped as redundant.
+
+    `workflow_id` is deliberately EXPLICIT here rather than set as the project default: the point
+    under test is the move, and pinning the workflow keeps the case from depending on default
+    resolution as well.
+
+    REVERT PROOF, measured: delete the post-create move and this fails with
+    `expected 'ideas' to be 'queued'`; the sibling case above stays green, which is exactly why it
+    is not sufficient on its own.
+    */
+    it("moves the card off intake onto hold when the workflow separates the two", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-split-lanes" });
+      const store = h.store();
+      const split = await store.createWorkflowDefinition({
+        name: "Split intake and hold",
+        ir: {
+          version: "v2",
+          name: "Split intake and hold",
+          columns: [
+            { id: "ideas", name: "Ideas", traits: [{ trait: "intake" }] },
+            { id: "queued", name: "Queued", traits: [{ trait: "hold" }] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "ideas" },
+            { id: "end", kind: "end", column: "queued" },
+          ],
+          edges: [{ from: "start", to: "end", condition: "success" }],
+        } as unknown as WorkflowIr,
+      });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-split-lanes",
+        { agent_id: agentId, description: "Work past intake", workflow_id: split.id },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      // No WARNING in the text: a move that fails must say so rather than report a ready card.
+      expect(result.content[0].text).not.toContain("WARNING");
+      const { task } = await readTaskWorkflowState(tmpDir, result.details.taskId);
+      expect(task.column).toBe("queued");
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-15:02 (#2843 review — greptile P1, "failed move reports
+    successful delegation"):
+
+    A FAILED LANDING MUST NOT LEAD WITH A SUCCESS CLAIM.
+
+    The first version kept "will be picked up by X on their next heartbeat cycle" and appended a
+    ` WARNING: ...`. Assigned-agent selection skips cards outside the workflow's hold lane, so a card
+    stranded on intake is never dispatched — and the caller, usually another agent, reads the first
+    sentence and moves on. "Success with a caveat" is how a delegation silently goes nowhere.
+
+    WHAT THIS PROVES AND WHAT IT DOES NOT, stated because the distinction matters. It pins the
+    HANDLING — the branch returns `isError`, never claims pickup, and still surfaces the task id so a
+    caller can finish by hand. It does NOT prove the failure is reachable in production, and I could
+    not make it so: `holdColumn` comes from the task's OWN resolved IR, so `moveTask`'s declared-column
+    check passes by construction. I tried a workflow declaring a `hold` column with no node on it,
+    expecting rejection; the move SUCCEEDED and the card landed there — `moveTask` accepts any column
+    the workflow declares, and node reachability does not gate it.
+
+    So the store method is stubbed for exactly one call. Stubbing is normally how a test proves only
+    that a catch block runs, which is why it is worth being explicit: the catch is DEFENSIVE, and what
+    changed — and what regresses silently — is the shape of the message it produces.
+    */
+    it("reports a failed landing as an ERROR and never claims the agent will pick it up", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-landing-fails" });
+      const store = h.store();
+      const split = await store.createWorkflowDefinition({
+        name: "Split lanes (landing fails)",
+        ir: {
+          version: "v2",
+          name: "Split lanes (landing fails)",
+          columns: [
+            { id: "ideas", name: "Ideas", traits: [{ trait: "intake" }] },
+            { id: "queued", name: "Queued", traits: [{ trait: "hold" }] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "ideas" },
+            { id: "end", kind: "end", column: "queued" },
+          ],
+          edges: [{ from: "start", to: "end", condition: "success" }],
+        } as unknown as WorkflowIr,
+      });
+
+      const moveTask = vi.spyOn(store, "moveTask").mockRejectedValueOnce(
+        new Error("unknown-column: queued"),
+      );
+      let result: Awaited<ReturnType<typeof tool.execute>>;
+      const tool = api.tools.get("fn_delegate_task")!;
+      try {
+        result = await tool.execute(
+          "dt-landing-fails",
+          { agent_id: agentId, description: "Landing will fail", workflow_id: split.id },
+          undefined,
+          undefined,
+          makeCtx(tmpDir),
+        );
+      } finally {
+        moveTask.mockRestore();
+      }
+
+      expect(result.isError).toBe(true);
+      /* The claim that must never survive a failed landing. */
+      expect(result.content[0].text).not.toContain("will be picked up");
+      expect(result.content[0].text).toContain("stranded on intake");
+      /* The card exists either way, so the caller keeps what it needs to finish the job by hand. */
+      expect(result.details.taskId).toBeTruthy();
+      expect(result.details.error).toContain("unknown-column");
+
+      /* And it really is still on intake — the message is not merely pessimistic. */
+      const { task } = await readTaskWorkflowState(tmpDir, result.details.taskId);
+      expect(task.column).toBe("ideas");
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-15:45 (#2843 review — coderabbit, "fail the delegation
+    when the hold lane cannot be resolved"):
+
+    THE COLLAPSE WAS REAL; THE PATH THAT REACHES IT IS ALL BUT UNREACHABLE. Both halves stated.
+
+    `resolveTaskLifecycleColumns` returns `undefined` when resolution THREW, and a struct whose `hold`
+    is `undefined` when the board resolved fine and declares no hold lane. Reading it as
+    `(await ...)?.hold` collapsed the two, so a resolver failure would skip the move and fall into the
+    SUCCESS response — the same "stranded on intake, reported as ready" outcome the error branch exists
+    to prevent, by a path that never enters it. Splitting them is correct and costs nothing.
+
+    BUT I COULD NOT MAKE THE THROW HAPPEN, and the reason generalises: `resolveWorkflowIrForTask` does
+    not fail, it SUBSTITUTES the built-in IR. Making the selection read reject (below) is swallowed
+    there, so the resolve succeeds with the default board, `hold` comes back as `todo`, and on the
+    built-in board that already equals the card's column — no move, and success is the right answer.
+
+    So this asserts the outcome that IS reachable: a degraded resolve that yields the card's own lane
+    reports success, because nothing went wrong. The `undefined` guard remains as defence, and it is
+    documented as defence rather than counted as covered.
+    */
+    it("a resolve that DEGRADES to the built-in board still reports success — nothing was stranded", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-resolve-degrades" });
+      const store = h.store();
+
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-08-23-16:03:
+      THE UNREADABLE SELECTION MUST STAY UNREADABLE FOR THE WHOLE CALL. `createTask` itself now
+      resolves the task's workflow IR (`createTaskBackendImpl` -> `resolveWorkflowIrForTask`), so a
+      `...Once` rejection was consumed by the CREATE and the tool's own resolve then succeeded —
+      the degraded-resolve branch under test was never entered. A store whose selection read fails
+      fails it for every reader, which is what this scenario models.
+      */
+      const resolve = vi.spyOn(store, "getTaskWorkflowSelectionAsync").mockRejectedValue(
+        new Error("workflow selection unreadable"),
+      );
+      const tool = api.tools.get("fn_delegate_task")!;
+      let result: Awaited<ReturnType<typeof tool.execute>>;
+      try {
+        result = await tool.execute(
+          "dt-resolve-degrades",
+          { agent_id: agentId, description: "Resolve degrades" },
+          undefined,
+          undefined,
+          makeCtx(tmpDir),
+        );
+      } finally {
+        resolve.mockRestore();
+      }
+
+      expect(result.isError).not.toBe(true);
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-30-22:25 (#2894 review, second round):
+      NO PICKUP PROMISE ON A DEGRADED RESOLVE. This asserted the confident sentence, which is exactly
+      the claim the review says must not be made when the landing could not be verified. The card is
+      still created, assigned and left where it belongs — success — but the text now says the lane is
+      unconfirmed rather than promising dispatch, and `landingVerified: false` carries the same fact
+      structurally.
+      */
+      expect(result.content[0].text).not.toContain("will be picked up");
+      expect(result.content[0].text).toContain("could NOT confirm");
+      expect(result.details.landingVerified).toBe(false);
+
+      /* The lane is still the built-in hold column — unconfirmed is not the same as wrong. */
+      const { task } = await readTaskWorkflowState(tmpDir, result.details.taskId);
+      expect(task.column).toBe("todo");
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-18:50 (#2843 review — the race, and the fix that removed
+    it rather than detecting it):
+
+    NO TEST FOR A TORN SELECTION SNAPSHOT, because the shape it would test no longer exists.
+
+    I wrote one against a version that read the selection on both sides of the resolve and refused when
+    they disagreed. The version that shipped is better: it drops the second read entirely and judges
+    the substitution by whether it would MOVE the card, so there is no window for two reads to
+    disagree. A test asserting "refuses on a torn snapshot" would have been asserting the mechanism I
+    removed.
+
+    The negative below survives, and matters more under either design: a selection read that FAILS must
+    not fail the delegation.
+    */
+
+    /*
+    The paired negative, and the one that keeps the tear check from becoming "refuse whenever the
+    selection store is flaky": an UNREADABLE selection is unknown, not changed. Failing here would
+    turn every selection-store hiccup into a failed delegation.
+    */
+    it("still lands the card when a selection read FAILS — unreadable is unknown, not changed", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-selection-unreadable" });
+      const store = h.store();
+
+      const sel = vi.spyOn(store, "getTaskWorkflowSelectionAsync").mockRejectedValue(
+        new Error("selection store unavailable"),
+      );
+      const tool = api.tools.get("fn_delegate_task")!;
+      let result: Awaited<ReturnType<typeof tool.execute>>;
+      try {
+        result = await tool.execute(
+          "dt-selection-unreadable",
+          { agent_id: agentId, description: "Selection unreadable" },
+          undefined,
+          undefined,
+          makeCtx(tmpDir),
+        );
+      } finally {
+        sel.mockRestore();
+      }
+
+      expect(result.isError).not.toBe(true);
+      /* Same reason as the degraded-resolve case above: unverified landings do not promise pickup. */
+      expect(result.content[0].text).not.toContain("will be picked up");
+      expect(result.details.landingVerified).toBe(false);
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-15:55 (#2843 review — greptile, "missing hold reports
+    successful delegation"):
+
+    A BOARD WITH NO HOLD LANE STILL CANNOT DISPATCH THE CARD.
+
+    I first treated this as a benign no-op — the board declares no hold lane, there is nowhere to move
+    the card, staying on intake is correct. Both halves true, conclusion wrong: assigned-agent
+    selection picks cards OUT OF the hold lane, so on a board that has none, nothing ever dispatches
+    this card and "will be picked up on their next heartbeat cycle" is false.
+
+    Unlike the two cases above, this one needs NO stub. A workflow that simply declares no hold-trait
+    column is an ordinary board someone can build, which is what makes it the reachable one of the
+    three and worth the most.
+    */
+    it("reports an ERROR when the workflow declares NO hold lane, instead of promising pickup", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-no-hold" });
+      const store = h.store();
+      const noHold = await store.createWorkflowDefinition({
+        name: "No hold lane",
+        ir: {
+          version: "v2",
+          name: "No hold lane",
+          columns: [
+            { id: "ideas", name: "Ideas", traits: [{ trait: "intake" }] },
+            { id: "building", name: "Building", traits: [{ trait: "wip" }] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "ideas" },
+            { id: "end", kind: "end", column: "building" },
+          ],
+          edges: [{ from: "start", to: "end", condition: "success" }],
+        } as unknown as WorkflowIr,
+      });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-no-hold",
+        { agent_id: agentId, description: "Nowhere to land", workflow_id: noHold.id },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).not.toContain("will be picked up");
+      expect(result.content[0].text).toContain("no hold");
+      /* The card exists and is assigned; only the dispatch claim is withheld. */
+      expect(result.details.taskId).toBeTruthy();
+      expect(result.details.agentId).toBe(agentId);
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-17:45 (#2843 review — greptile P1, third round):
+    THE INVARIANT: a SUBSTITUTED workflow is not the board's answer, even when its lane exists.
+
+    `resolveWorkflowIrForTask` never throws — it substitutes the default coding IR — so a failed
+    resolution surfaced as the BUILT-IN lanes, `hold: "todo"`. I argued that was harmless because
+    `todo` would be undeclared on such a board and the move would be rejected. Right about the
+    mechanism, wrong about the population: a workflow that holds work in `queued` and ALSO declares a
+    `todo` column for something else gets a move that SUCCEEDS into a lane nothing dispatches from,
+    and a success message with it.
+
+    The fixture is exactly that shape — `ideas` (intake), `queued` (hold), and a plain `todo` that
+    carries no lifecycle trait — which is why the older cases could not have caught this: theirs
+    declared no `todo` at all, so the wrong move was rejected for the wrong reason.
+
+    The stub targets `getTaskWorkflowSelectionAsync`, the READER, not the writer `createTask` uses,
+    so creation is untouched and only the post-create resolution sees a workflow id that resolves to
+    nothing. That is what makes this the first case to reach the "could not be resolved" arm rather
+    than defending it in a comment.
+
+    REVERT PROOF, measured: resolve through `resolveTaskLifecycleColumns` again (no provenance) and
+    this fails — the tool moves the card to `todo` and reports a successful delegation.
+    */
+    it("does not trust a SUBSTITUTED workflow's lanes even when the board declares that column", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-substituted-workflow" });
+      const store = h.store();
+      const declaresTodo = await store.createWorkflowDefinition({
+        name: "Queued hold, unrelated todo",
+        ir: {
+          version: "v2",
+          name: "Queued hold, unrelated todo",
+          columns: [
+            { id: "ideas", name: "Ideas", traits: [{ trait: "intake" }] },
+            { id: "queued", name: "Queued", traits: [{ trait: "hold" }] },
+            /* Declared, carries no lifecycle role — the column the built-in fallback would name. */
+            { id: "todo", name: "Someday", traits: [] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "ideas" },
+            { id: "end", kind: "end", column: "queued" },
+          ],
+          edges: [{ from: "start", to: "end", condition: "success" }],
+        } as unknown as WorkflowIr,
+      });
+
+      /* Reader only: `createTask` writes the selection, it does not read it through this method. */
+      const selection = vi.spyOn(store, "getTaskWorkflowSelectionAsync")
+        .mockResolvedValue({ workflowId: "wf-vanished", stepIds: [] });
+      const tool = api.tools.get("fn_delegate_task")!;
+      let result: Awaited<ReturnType<typeof tool.execute>>;
+      try {
+        result = await tool.execute(
+          "dt-substituted",
+          { agent_id: agentId, description: "Workflow resolves to a substitute", workflow_id: declaresTodo.id },
+          undefined,
+          undefined,
+          makeCtx(tmpDir),
+        );
+      } finally {
+        selection.mockRestore();
+      }
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).not.toContain("will be picked up");
+      /* The card must NOT have been moved into the built-in fallback's lane. */
+      const { task } = await readTaskWorkflowState(tmpDir, result.details.taskId);
+      expect(task.column).not.toBe("todo");
+    });
+
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-20:30 (#2843 review — greptile P1, "fallback equality
+    masks wrong hold"):
+    EQUALITY WITH A FABRICATED LANE IS NOT EVIDENCE.
+
+    The board the review names, and the one every earlier case here misses: `todo` is INTAKE and
+    `queued` is hold. `createTask` puts the card on `todo`; a degraded lookup fabricates the built-in
+    `hold: "todo"`; the two match, so the "no move needed" rule accepted it and reported a delegation
+    for a card assigned-agent dispatch will never select, because the real hold lane is `queued`.
+
+    Settled with `params.workflow_id` — caller INPUT, so there is no second snapshot to race. A
+    caller that named a workflow proves a real one exists, so a substitution proves we failed to read
+    it, and its hold lane cannot be inferred from the built-in vocabulary.
+
+    The neighbouring degraded-resolve cases stay green precisely because they pass NO `workflow_id`:
+    there, "substituted" and "this project has no resolvable workflow" are the same observation and
+    the card belongs where it is. That distinction is the whole content of the fix.
+
+    REVERT PROOF, measured: drop the `substituted && workflowId` arm and this fails on `isError` —
+    the tool reports a successful delegation for a card sitting on intake.
+    */
+    it("refuses to claim pickup when the NAMED workflow could not be resolved, even if lanes match", async () => {
+      const agentId = await seedAgent(tmpDir, { name: "delegate-todo-intake-queued-hold" });
+      const store = h.store();
+      const todoIntake = await store.createWorkflowDefinition({
+        name: "Todo intake, queued hold",
+        ir: {
+          version: "v2",
+          name: "Todo intake, queued hold",
+          columns: [
+            /* `todo` is INTAKE here — the id the built-in fallback would call hold. */
+            { id: "todo", name: "Inbox", traits: [{ trait: "intake" }] },
+            { id: "queued", name: "Queued", traits: [{ trait: "hold" }] },
+          ],
+          nodes: [
+            { id: "start", kind: "start", column: "todo" },
+            { id: "end", kind: "end", column: "queued" },
+          ],
+          edges: [{ from: "start", to: "end", condition: "success" }],
+        } as unknown as WorkflowIr,
+      });
+
+      /* Reader only — `createTask` writes the selection rather than reading it through this method. */
+      const selection = vi.spyOn(store, "getTaskWorkflowSelectionAsync")
+        .mockResolvedValue({ workflowId: "wf-vanished", stepIds: [] });
+      const tool = api.tools.get("fn_delegate_task")!;
+      let result: Awaited<ReturnType<typeof tool.execute>>;
+      try {
+        result = await tool.execute(
+          "dt-todo-intake",
+          { agent_id: agentId, description: "Intake is called todo here", workflow_id: todoIntake.id },
+          undefined,
+          undefined,
+          makeCtx(tmpDir),
+        );
+      } finally {
+        selection.mockRestore();
+      }
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).not.toContain("will be picked up");
+      /* Still on intake, and the message must be about the workflow rather than about a move. */
+      const { task } = await readTaskWorkflowState(tmpDir, result.details.taskId);
+      expect(task.column).toBe("todo");
     });
 
     it("rejects unknown agent", async () => {
@@ -4469,12 +5255,18 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(result.content[0].text).toContain("org-report");
     });
 
-    it("returns empty message when no agents", async () => {
+    // FNXC:BuiltinAgents 2026-08-14-00:10: FN-8932 added the durable Memory Keeper owner alongside the
+    // four routed workflow principals, so the fresh-project org chart now enumerates five built-in agents.
+    it("shows the mandatory built-in workflow owners plus the Memory Keeper in a fresh project", async () => {
       const tool = api.tools.get("fn_agent_org_chart")!;
       const result = await tool.execute("oc-3", {}, undefined, undefined, makeCtx(tmpDir));
 
-      expect(result.content[0].text).toContain("No agents found");
-      expect(result.details.count).toBe(0);
+      expect(result.content[0].text).toContain("Workflow Planner");
+      expect(result.content[0].text).toContain("Workflow Executor");
+      expect(result.content[0].text).toContain("Workflow Reviewer");
+      expect(result.content[0].text).toContain("Workflow Merger");
+      expect(result.content[0].text).toContain("Memory Keeper");
+      expect(result.details.count).toBe(5);
     });
 
     it("returns single agent for lone agent", async () => {

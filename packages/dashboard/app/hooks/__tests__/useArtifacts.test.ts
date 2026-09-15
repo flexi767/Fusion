@@ -360,6 +360,9 @@ describe("useArtifacts", () => {
         "message:received": expect.any(Function),
         "message:sent": expect.any(Function),
       }),
+      // FNXC:ArtifactRegistry 2026-07-26-15:52: the subscription must also carry the sse-bus
+      // missed-event resync (onReconnect); assert it rather than letting the shape drift.
+      onReconnect: expect.any(Function),
     });
 
     unmount();
@@ -369,7 +372,7 @@ describe("useArtifacts", () => {
 
   /*
    * FNXC:ArtifactRegistry 2026-07-10-00:00:
-   * The operator-visible "Artifacts tab always shows 0" repro was a single-project/default-scope dashboard mount where no currentProject id was threaded into useArtifacts. The server's real /api/artifacts route listed the agent-created image, but the hook short-circuited before fetch/SSE, so DocumentsView rendered a permanent 0 count.
+   * The operator-visible "Artifacts tab always shows 0" repro was a single-project/default-scope dashboard mount where no currentProject id was threaded into useArtifacts. The server's real /api/artifacts route listed the agent-created image, but the hook short-circuited before fetch/SSE, so the artifact consumer rendered a permanent 0 count.
    */
   it("fetches and subscribes to the default artifact scope when no projectId is available", async () => {
     const { result } = renderHook(() => useArtifacts());
@@ -387,6 +390,9 @@ describe("useArtifacts", () => {
         "message:received": expect.any(Function),
         "message:sent": expect.any(Function),
       }),
+      // FNXC:ArtifactRegistry 2026-07-26-15:52: the subscription must also carry the sse-bus
+      // missed-event resync (onReconnect); assert it rather than letting the shape drift.
+      onReconnect: expect.any(Function),
     });
   });
 

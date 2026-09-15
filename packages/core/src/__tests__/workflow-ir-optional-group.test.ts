@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { WorkflowIrError, parseWorkflowIr, serializeWorkflowIr } from "../workflow-ir.js";
-import { resolveOptionalStepRevisionBudget } from "../workflow-ir-types.js";
-import type { WorkflowIrEdge, WorkflowIrNode, WorkflowIrV2 } from "../workflow-ir-types.js";
+import { WorkflowIrError, parseWorkflowIr, serializeWorkflowIr } from "../workflows/workflow-ir.js";
+import {
+  ABSOLUTE_MAX_AUTOMATIC_REVIEW_REVISIONS,
+  resolveOptionalStepRevisionBudget,
+} from "../workflows/workflow-ir-types.js";
+import type { WorkflowIrEdge, WorkflowIrNode, WorkflowIrV2 } from "../workflows/workflow-ir-types.js";
 
 /*
 FNXC:WorkflowOptionalGroup 2026-06-21-11:00:
@@ -88,9 +91,34 @@ describe("optional-group validation", () => {
   it("resolves optional-step revision budgets from numeric, unbounded, and fallback states", () => {
     expect(resolveOptionalStepRevisionBudget(2, 3)).toEqual({ unbounded: false, max: 2 });
     expect(resolveOptionalStepRevisionBudget(0, 3)).toEqual({ unbounded: false, max: 0 });
-    expect(resolveOptionalStepRevisionBudget("unbounded", 3)).toEqual({ unbounded: true, max: Number.POSITIVE_INFINITY });
+    expect(resolveOptionalStepRevisionBudget("unbounded", 3)).toEqual({
+      unbounded: true,
+      max: ABSOLUTE_MAX_AUTOMATIC_REVIEW_REVISIONS,
+    });
+    expect(resolveOptionalStepRevisionBudget(ABSOLUTE_MAX_AUTOMATIC_REVIEW_REVISIONS + 4, 3)).toEqual({
+      unbounded: false,
+      max: ABSOLUTE_MAX_AUTOMATIC_REVIEW_REVISIONS,
+    });
     expect(resolveOptionalStepRevisionBudget(undefined, 3)).toEqual({ unbounded: false, max: 3 });
     expect(resolveOptionalStepRevisionBudget("sometimes", 3)).toEqual({ unbounded: false, max: 3 });
+    expect(resolveOptionalStepRevisionBudget(undefined, Number.POSITIVE_INFINITY)).toEqual({ unbounded: false, max: 0 });
+  });
+
+  it.each(["plan", "code"] as const)("rejects valid reviewKind in every optional-group template node as unsupported placement", (reviewKind) => {
+    const template = groupTemplate();
+    template.nodes = template.nodes.map((node, index) => ({
+      ...node,
+      id: `nested-review-${index}`,
+      kind: index === 0 ? "prompt" : "gate",
+      config: { ...node.config, reviewKind },
+    }));
+    expect(() => parseWorkflowIr(groupIr({ template }))).toThrow(/nested-review-0.*unsupported nested template placement/);
+  });
+
+  it.each(["", "review", true, null])("rejects malformed optional-group template reviewKind before placement", (reviewKind) => {
+    const template = groupTemplate();
+    template.nodes[0] = { ...template.nodes[0], id: "nested-review", config: { reviewKind } };
+    expect(() => parseWorkflowIr(groupIr({ template }))).toThrow(/nested-review.*invalid reviewKind/);
   });
 
   it("rejects an empty template", () => {

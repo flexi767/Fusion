@@ -1,9 +1,17 @@
+import { ViewHeader } from "./ViewHeader";
 import "./NewTaskModal.css";
-import { useState, useCallback, useEffect, useRef, type CSSProperties, type ChangeEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type ChangeEvent } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { DEFAULT_TASK_PRIORITY, type Task, type TaskPriority } from "@fusion/core";
-import { getErrorMessage } from "@fusion/core";
+import {
+  DEFAULT_TASK_PRIORITY,
+  getErrorMessage,
+  isValidTaskBranchName,
+  type ColumnId,
+  type Task,
+  type TaskPriority,
+  type ThinkingLevel,
+} from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
 import {
   apiFetchGitHubIssues,
@@ -11,6 +19,8 @@ import {
   checkDuplicateTasks,
   fetchGitRemotes,
   uploadAttachment,
+  fetchBoardWorkflows,
+  type BoardWorkflowsPayload,
   type CreateTaskInput,
   type DuplicateMatch,
   type GitHubIssue,
@@ -21,7 +31,7 @@ import { Bot } from "lucide-react";
 import { useSetupReadiness } from "../hooks/useSetupReadiness";
 import { SetupWarningBanner } from "./SetupWarningBanner";
 import { LoadingSpinner } from "./LoadingSpinner";
-import { TaskForm, type BranchSelectionMode, type EnabledWorkflowStepsChangeMeta, type PendingImage } from "./TaskForm";
+import { TaskForm, type BranchSelectionMode, type EnabledWorkflowStepsChangeMeta, type PendingImage, type TaskFormValueChangeMeta } from "./TaskForm";
 import { DuplicateWarningModal } from "./DuplicateWarningModal";
 import { REPO_OVERRIDE_RE } from "./githubTracking";
 import { useConfirm } from "../hooks/useConfirm";
@@ -30,7 +40,8 @@ import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useNodes } from "../hooks/useNodes";
 import { useViewportMode } from "../hooks/useViewportMode";
 import { useAgentsMapCache } from "../hooks/useAgentsMapCache";
-import { nextFloatingZ, currentFloatingZ } from "./floatingWindowStack";
+import { FloatingWindow } from "./FloatingWindow";
+import { resolveQuickAddStartInitialColumn, resolveQuickAddStartTargetColumn, resolveQuickAddStartWorkflowTarget, validateQuickAddStartWorkflow, workflowSupportsQuickAddStart, type ValidatedQuickAddWorkflow } from "../utils/quickAddStart";
 
 type NewTaskCreateInput = Omit<CreateTaskInput, "branchSelection"> & {
   branchSelection?: {
@@ -46,103 +57,23 @@ interface NewTaskModalProps {
   projectId?: string;
   tasks: Task[]; // for dependency selection
   onCreateTask: (input: NewTaskCreateInput) => Promise<Task>;
+  onMoveTask?: (taskId: string, column: ColumnId) => Promise<Task>;
   addToast: (message: string, type?: ToastType) => void;
   initialDescription?: string;
   initialWorkflowId?: string | null;
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
 }
 
 /*
-FNXC:NewTask 2026-06-22-20:30:
-The New Task dialog is a FLOATING, DRAGGABLE, RESIZABLE, NON-BLOCKING window matching the right-dock pop-out (RightDockExpandModal). The overlay is transparent and `pointer-events: none` so the app behind stays usable and behind-clicks pass through — there is therefore NO overlay click-to-dismiss; the header close (X) and Cancel button are the only dismissals (plus Escape). The panel is `position: fixed; pointer-events: auto`, dragged by its header and resized from corner/edge handles, with rAF-batched position/size state and a single teardown ref invoked on pointerup/pointercancel AND on unmount so no document/element listeners or pending rAF leak. Size/position persist to localStorage. On mobile we keep the full-screen sheet behavior (no floating) so the keyboard-aware layout still works.
+FNXC:ModalTouchGeometry 2026-07-27-18:00:
+FN-8620 replaces New Task's bespoke pointer geometry with FloatingWindow. The single shared
+geometry key intentionally supersedes the former size/position pair; old values reset once.
 */
-const NEW_TASK_MODAL_SIZE_STORAGE_KEY = "fusion:new-task-modal-size";
-const NEW_TASK_MODAL_POSITION_STORAGE_KEY = "fusion:new-task-modal-position";
-
 const NEW_TASK_DEFAULT_WIDTH = 720;
 const NEW_TASK_DEFAULT_HEIGHT = 640;
 const NEW_TASK_MIN_WIDTH = 420;
 const NEW_TASK_MIN_HEIGHT = 360;
-const NEW_TASK_VIEWPORT_PADDING = 16;
 
-interface FloatSize {
-  width: number;
-  height: number;
-}
-
-interface FloatPosition {
-  x: number;
-  y: number;
-}
-
-function clampFloatSize(size: FloatSize): FloatSize {
-  if (typeof window === "undefined") return size;
-  return {
-    width: Math.min(Math.max(size.width, NEW_TASK_MIN_WIDTH), Math.max(NEW_TASK_MIN_WIDTH, window.innerWidth - NEW_TASK_VIEWPORT_PADDING * 2)),
-    height: Math.min(Math.max(size.height, NEW_TASK_MIN_HEIGHT), Math.max(NEW_TASK_MIN_HEIGHT, window.innerHeight - NEW_TASK_VIEWPORT_PADDING * 2)),
-  };
-}
-
-function clampFloatPosition(position: FloatPosition, size: FloatSize): FloatPosition {
-  if (typeof window === "undefined") return position;
-  return {
-    x: Math.min(Math.max(position.x, NEW_TASK_VIEWPORT_PADDING), Math.max(NEW_TASK_VIEWPORT_PADDING, window.innerWidth - size.width - NEW_TASK_VIEWPORT_PADDING)),
-    y: Math.min(Math.max(position.y, NEW_TASK_VIEWPORT_PADDING), Math.max(NEW_TASK_VIEWPORT_PADDING, window.innerHeight - size.height - NEW_TASK_VIEWPORT_PADDING)),
-  };
-}
-
-function readFloatSize(): FloatSize {
-  if (typeof window === "undefined") return { width: NEW_TASK_DEFAULT_WIDTH, height: NEW_TASK_DEFAULT_HEIGHT };
-  try {
-    const raw = window.localStorage.getItem(NEW_TASK_MODAL_SIZE_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<FloatSize>;
-      if (typeof parsed.width === "number" && typeof parsed.height === "number") {
-        return clampFloatSize({ width: parsed.width, height: parsed.height });
-      }
-    }
-  } catch {
-    // ignore corrupted persisted size
-  }
-  return clampFloatSize({ width: NEW_TASK_DEFAULT_WIDTH, height: NEW_TASK_DEFAULT_HEIGHT });
-}
-
-function writeFloatSize(size: FloatSize): FloatSize {
-  const clamped = clampFloatSize(size);
-  if (typeof window !== "undefined") {
-    window.localStorage.setItem(NEW_TASK_MODAL_SIZE_STORAGE_KEY, JSON.stringify(clamped));
-  }
-  return clamped;
-}
-
-function readFloatPosition(size: FloatSize): FloatPosition {
-  if (typeof window === "undefined") return { x: NEW_TASK_VIEWPORT_PADDING, y: NEW_TASK_VIEWPORT_PADDING };
-  try {
-    const raw = window.localStorage.getItem(NEW_TASK_MODAL_POSITION_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<FloatPosition>;
-      if (typeof parsed.x === "number" && typeof parsed.y === "number") {
-        return clampFloatPosition({ x: parsed.x, y: parsed.y }, size);
-      }
-    }
-  } catch {
-    // ignore corrupted persisted position
-  }
-  // Default: roughly centered.
-  return clampFloatPosition({ x: (window.innerWidth - size.width) / 2, y: (window.innerHeight - size.height) / 2 }, size);
-}
-
-function writeFloatPosition(position: FloatPosition, size: FloatSize): FloatPosition {
-  const clamped = clampFloatPosition(position, size);
-  if (typeof window !== "undefined") {
-    window.localStorage.setItem(NEW_TASK_MODAL_POSITION_STORAGE_KEY, JSON.stringify(clamped));
-  }
-  return clamped;
-}
-
-type FloatResizeDirection = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
-const NEW_TASK_RESIZE_DIRECTIONS: FloatResizeDirection[] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 /*
 FNXC:GitHubImport 2026-07-16-15:20:
 Reference picker must surface all of a normal repo's open issues/PRs, not just the first 30.
@@ -165,6 +96,14 @@ function buildGitHubIssuePrompt(issue: GitHubReferenceOption): string {
 
 function buildGitHubPullPrompt(pull: GitHubReferenceOption): string {
   return `Fetch and read this GitHub pull request, inspect the conversation, review comments, check failures, and changed files as needed, then resolve or address all actionable PR review comments.\n\nPR: ${pull.url}\n\nKeep the PR intent intact while making the requested fixes, and verify the result with targeted tests.`;
+}
+
+function isUsableBoardWorkflowsPayload(value: unknown): value is BoardWorkflowsPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const payload = value as Partial<BoardWorkflowsPayload>;
+  return payload.flagEnabled === true
+    && typeof payload.defaultWorkflowId === "string"
+    && Array.isArray(payload.workflows);
 }
 
 function defaultGitHubRemote(remotes: GitRemote[]): GitRemote | undefined {
@@ -403,7 +342,7 @@ function NewTaskGitHubReferencePicker({ isOpen, projectId, disabled = false, onS
   );
 }
 
-export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, addToast, initialDescription = "", initialWorkflowId, onPlanningMode, onSubtaskBreakdown }: NewTaskModalProps) {
+export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, onMoveTask, addToast, initialDescription = "", initialWorkflowId, onPlanningMode }: NewTaskModalProps) {
   const { t } = useTranslation("app");
   const { confirm } = useConfirm();
   const viewportMode = useViewportMode();
@@ -421,149 +360,14 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   const [description, setDescription] = useState("");
   const githubGeneratedDescriptionRef = useRef("");
   const wasOpenRef = useRef(false);
+  const floatingFormRef = useRef<HTMLDivElement>(null);
 
   /*
-  FNXC:NewTask 2026-06-22-20:30:
-  Floating window position/size state (desktop only). Mobile keeps the full-screen sheet, so we only apply the floating panel style and drag/resize handlers when not mobile. A single active-drag teardown (drag OR resize) lives in dragTeardownRef; pointerup/pointercancel AND the unmount effect run it so an interrupted drag never leaks element pointer listeners or a pending rAF.
+  FNXC:ModalTouchGeometry 2026-07-27-18:00:
+  Phones and short viewports retain the keyboard-aware full-screen sheet. Desktop and tablet
+  presentations delegate drag, resize, clamping, persistence, and stacking to FloatingWindow.
   */
   const isFloating = viewportMode !== "mobile";
-  const [size, setSizeState] = useState<FloatSize>(() => readFloatSize());
-  const [position, setPositionState] = useState<FloatPosition>(() => readFloatPosition(readFloatSize()));
-  const dragTeardownRef = useRef<(() => void) | null>(null);
-  // FNXC:FloatingWindow 2026-06-22-21:30: Floating (desktop) New Task dialog shares the SINGLE cross-type floating z-index stack (floatingWindowStack). Mounting claims the front; tapping the panel (pointerdown/focus capture) raises it above every other floating modal regardless of type. Mobile keeps the full-screen sheet so this z-index is harmless there.
-  const [zIndex, setZIndex] = useState<number>(() => nextFloatingZ());
-  const bringToFront = useCallback(() => {
-    setZIndex((current) => (current >= currentFloatingZ() ? current : nextFloatingZ()));
-  }, []);
-
-  const persistSize = useCallback((next: FloatSize) => {
-    setSizeState(writeFloatSize(next));
-  }, []);
-
-  const persistPosition = useCallback((next: FloatPosition, withSize: FloatSize) => {
-    setPositionState(writeFloatPosition(next, withSize));
-  }, []);
-
-  // FNXC:NewTask 2026-06-22-20:30: Header drag. setPointerCapture redirects the pointer stream to the captured header element, so element-scoped pointermove/up listeners receive the full drag even off the header; moves are rAF-batched; the panel is clamped on-screen. Close button clicks are excluded so dragging never swallows close.
-  const handleFloatingDragPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if ((event.target as HTMLElement).closest("button")) return;
-    event.preventDefault();
-    const captureTarget = event.currentTarget;
-    const pointerId = event.pointerId;
-    captureTarget.setPointerCapture?.(pointerId);
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const startPosition = position;
-    const currentSize = size;
-    const previousUserSelect = document.body.style.userSelect;
-    document.body.style.userSelect = "none";
-
-    let latest = startPosition;
-    let frame = 0;
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      if (moveEvent.pointerId !== pointerId) return;
-      latest = { x: startPosition.x + moveEvent.clientX - startX, y: startPosition.y + moveEvent.clientY - startY };
-      if (frame) return;
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        setPositionState(clampFloatPosition(latest, currentSize));
-      });
-    };
-    const detachListeners = () => {
-      captureTarget.releasePointerCapture?.(pointerId);
-      captureTarget.removeEventListener("pointermove", handlePointerMove);
-      captureTarget.removeEventListener("pointerup", handlePointerUp);
-      captureTarget.removeEventListener("pointercancel", handlePointerUp);
-    };
-    function handlePointerUp() {
-      if (frame) cancelAnimationFrame(frame);
-      persistPosition(latest, currentSize);
-      document.body.style.userSelect = previousUserSelect;
-      detachListeners();
-      dragTeardownRef.current = null;
-    }
-
-    dragTeardownRef.current = () => {
-      if (frame) cancelAnimationFrame(frame);
-      document.body.style.userSelect = previousUserSelect;
-      detachListeners();
-      dragTeardownRef.current = null;
-    };
-
-    captureTarget.addEventListener("pointermove", handlePointerMove);
-    captureTarget.addEventListener("pointerup", handlePointerUp);
-    captureTarget.addEventListener("pointercancel", handlePointerUp);
-  }, [persistPosition, position, size]);
-
-  // FNXC:NewTask 2026-06-22-20:30: Corner/edge resize, rAF-batched. West/north handles also shift the panel origin so the opposite edge stays pinned. Same teardown discipline as the drag.
-  const handleFloatingResizePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>, direction: FloatResizeDirection) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const captureTarget = event.currentTarget;
-    const pointerId = event.pointerId;
-    captureTarget.setPointerCapture?.(pointerId);
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const startSize = size;
-    const startPosition = position;
-    const previousUserSelect = document.body.style.userSelect;
-    document.body.style.userSelect = "none";
-
-    let latestSize = startSize;
-    let latestPosition = startPosition;
-    let frame = 0;
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      if (moveEvent.pointerId !== pointerId) return;
-      const dx = moveEvent.clientX - startX;
-      const dy = moveEvent.clientY - startY;
-      const nextSize = clampFloatSize({
-        width: startSize.width + (direction.includes("e") ? dx : direction.includes("w") ? -dx : 0),
-        height: startSize.height + (direction.includes("s") ? dy : direction.includes("n") ? -dy : 0),
-      });
-      const nextPosition = {
-        x: startPosition.x + (direction.includes("w") ? startSize.width - nextSize.width : 0),
-        y: startPosition.y + (direction.includes("n") ? startSize.height - nextSize.height : 0),
-      };
-      latestSize = nextSize;
-      latestPosition = nextPosition;
-      if (frame) return;
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        setSizeState(latestSize);
-        setPositionState(clampFloatPosition(latestPosition, latestSize));
-      });
-    };
-    const detachListeners = () => {
-      captureTarget.releasePointerCapture?.(pointerId);
-      captureTarget.removeEventListener("pointermove", handlePointerMove);
-      captureTarget.removeEventListener("pointerup", handlePointerUp);
-      captureTarget.removeEventListener("pointercancel", handlePointerUp);
-    };
-    function handlePointerUp() {
-      if (frame) cancelAnimationFrame(frame);
-      persistSize(latestSize);
-      persistPosition(latestPosition, latestSize);
-      document.body.style.userSelect = previousUserSelect;
-      detachListeners();
-      dragTeardownRef.current = null;
-    }
-
-    dragTeardownRef.current = () => {
-      if (frame) cancelAnimationFrame(frame);
-      document.body.style.userSelect = previousUserSelect;
-      detachListeners();
-      dragTeardownRef.current = null;
-    };
-
-    captureTarget.addEventListener("pointermove", handlePointerMove);
-    captureTarget.addEventListener("pointerup", handlePointerUp);
-    captureTarget.addEventListener("pointercancel", handlePointerUp);
-  }, [persistPosition, persistSize, position, size]);
-
-  // FNXC:NewTask 2026-06-22-20:30: Run any active drag/resize teardown on unmount so element pointer listeners + a pending rAF never outlive the modal.
-  useEffect(() => () => dragTeardownRef.current?.(), []);
 
   const [dependencies, setDependencies] = useState<string[]>([]);
   const [branchMode, setBranchMode] = useState<BranchSelectionMode>("project-default");
@@ -571,10 +375,20 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   const [baseBranch, setBaseBranch] = useState("");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  /*
+  FNXC:NewTaskWorkflowStart 2026-08-27-10:50:
+  FN-196 keeps Start visible during ordinary creation, so its in-flight label must track the
+  submitted action rather than shared submit state. State, not the pending workflow ref, rerenders
+  the button while duplicate acknowledgement preserves a pending Start label.
+  */
+  const [startSubmitInFlight, setStartSubmitInFlight] = useState(false);
   const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[] | null>(null);
   const [executorModel, setExecutorModel] = useState("");
+  const [credentialInstanceId, setCredentialInstanceId] = useState<string | undefined>(undefined);
   const [validatorModel, setValidatorModel] = useState("");
+  const [validatorCredentialInstanceId, setValidatorCredentialInstanceId] = useState<string | undefined>(undefined);
   const [planningModel, setPlanningModel] = useState("");
+  const [planningCredentialInstanceId, setPlanningCredentialInstanceId] = useState<string | undefined>(undefined);
   const [thinkingLevel, setThinkingLevel] = useState<string>("");
   // FNXC:PlannerOversight 2026-07-04-00:00: Per-task override of the workflow-native plannerOversightLevel setting (FN-7508). "" means inherit from workflow.
   const [plannerOversightLevel, setPlannerOversightLevel] = useState<string>("");
@@ -585,10 +399,20 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   // `null` = explicit "No workflow", `string` = a specific workflow. Materialized
   // atomically at create time via the `workflowId` create parameter.
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null | undefined>(undefined);
+  /*
+  FNXC:NewTaskWorkflowStart 2026-08-19-00:16:
+  Preserve the tri-state workflow choice across duplicate acknowledgement. The modal locks the
+  controls while checking duplicates, but this snapshot also prevents a late rerender from
+  replacing the operator's explicit string, null opt-out, or omitted default intent.
+  */
+  const pendingWorkflowSelectionRef = useRef<string | null | undefined>(undefined);
+  const pendingStartWorkflowRef = useRef<ValidatedQuickAddWorkflow | null>(null);
   // Optional workflow steps the user opted into; TaskForm fetches + seeds these
   // from the selected workflow's defaultOn and lifts the enabled set up here.
   const [enabledWorkflowSteps, setEnabledWorkflowSteps] = useState<string[]>([]);
   const [shouldSubmitEnabledWorkflowSteps, setShouldSubmitEnabledWorkflowSteps] = useState(false);
+  const [hasUserSelectedEnabledWorkflowSteps, setHasUserSelectedEnabledWorkflowSteps] = useState(false);
+  const [boardWorkflows, setBoardWorkflows] = useState<BoardWorkflowsPayload | null>(null);
   const [reviewLevel, setReviewLevel] = useState<number | undefined>(undefined);
   const [autoMerge, setAutoMerge] = useState<boolean | undefined>(undefined);
   const [priority, setPriority] = useState<TaskPriority>(DEFAULT_TASK_PRIORITY);
@@ -603,15 +427,35 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   const [executionMode, setExecutionMode] = useState<"standard" | "fast">("standard");
   const [githubTrackingEnabled, setGithubTrackingEnabled] = useState(false);
   /*
+  FNXC:NewTaskDirtyState 2026-07-24-14:00:
+  Asynchronous model-preset and GitHub-tracking defaults are create-form initialization,
+  not operator edits. Preserve their settled values as the pristine baseline so a blank
+  modal closes directly, while a later operator change still retains discard protection.
+  */
+  const [initialDefaultValues, setInitialDefaultValues] = useState({
+    executorModel: "",
+    validatorModel: "",
+    githubTrackingEnabled: false,
+  });
+  /*
   FNXC:FastOptionalSteps 2026-06-30-09:10:
   New task create payloads must distinguish omitted optional-step intent (no controls/no workflow; allow store defaults) from explicit `[]` (operator chose Fast or deselected all; do not re-seed default-on groups) and non-empty manual selections.
 
   FNXC:FastOptionalSteps 2026-06-30-10:42:
   Fast is itself explicit optional-step intent. Submit the current enabledWorkflowSteps array even before optional-step metadata finishes loading so default-on workflow gates cannot revive through an omitted field.
   */
+  /*
+  FNXC:NewTaskDirtyState 2026-07-24-12:15:
+  TaskForm asynchronously seeds inherited workflow defaults so creation can submit an explicit
+  optional-step selection. That initialization is not operator input and must not trigger the
+  discard dialog; only a user optional-step action is dirty while the seeded payload is preserved.
+  */
   const handleEnabledWorkflowStepsChange = useCallback((ids: string[], meta?: EnabledWorkflowStepsChangeMeta) => {
     setEnabledWorkflowSteps(ids);
     setShouldSubmitEnabledWorkflowSteps(meta?.optionalStepsAvailable === true);
+    if (meta?.source === "user") {
+      setHasUserSelectedEnabledWorkflowSteps(true);
+    }
   }, []);
   const [githubRepoOverride, setGithubRepoOverride] = useState("");
 
@@ -649,6 +493,31 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     }
     wasOpenRef.current = isOpen;
   }, [initialDescription, initialWorkflowId, isOpen]);
+
+  /*
+  FNXC:NewTaskWorkflowStart 2026-08-19-00:17:
+  Start eligibility comes from the board endpoint's resolved manualIntake metadata, not the
+  editable workflow picker catalog. Clear it on every modal open so stale project/workflow data
+  cannot expose a lifecycle action after a project switch or metadata failure.
+  */
+  useEffect(() => {
+    if (!isOpen) {
+      setBoardWorkflows(null);
+      return;
+    }
+    let cancelled = false;
+    setBoardWorkflows(null);
+    fetchBoardWorkflows(projectId)
+      .then((payload) => {
+        if (!cancelled && isUsableBoardWorkflowsPayload(payload)) setBoardWorkflows(payload);
+      })
+      .catch(() => {
+        if (!cancelled) setBoardWorkflows(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, projectId]);
 
   // Load agents for agent picker
   const loadAgents = useCallback(() => {
@@ -709,7 +578,59 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   const githubRepoOverrideTrimmed = githubRepoOverride.trim();
   const githubRepoOverrideInvalid = githubRepoOverrideTrimmed.length > 0 && !REPO_OVERRIDE_RE.test(githubRepoOverrideTrimmed);
   const isBranchNameRequired = branchMode === "existing" || branchMode === "custom-new" || branchMode === "shared-group";
-  const hasInvalidBranchSelection = isBranchNameRequired && !branch.trim();
+  /*
+  FNXC:WorkspaceBranchInput 2026-08-20-03:38:
+  FN-9161 accepts an operator branch for workspace reuse, but the dashboard must
+  reject malformed refs before it submits the create request. Match core's write
+  boundary predicate so the client help and server outcome cannot drift.
+  */
+  const hasInvalidBranchSelection = isBranchNameRequired && (!branch.trim() || !isValidTaskBranchName(branch.trim()));
+
+  const resolvedStartWorkflowId = selectedWorkflowId === null
+    ? null
+    : selectedWorkflowId ?? boardWorkflows?.defaultWorkflowId;
+  const startWorkflowCandidate = resolvedStartWorkflowId && boardWorkflows
+    ? boardWorkflows.workflows.find((workflow) => workflow.id === resolvedStartWorkflowId)
+    : undefined;
+  const validatedStartWorkflow = validateQuickAddStartWorkflow(startWorkflowCandidate);
+  const startInitialColumn = validatedStartWorkflow
+    ? resolveQuickAddStartInitialColumn(validatedStartWorkflow)
+    : null;
+  const startWorkflowTarget = resolveQuickAddStartWorkflowTarget(validatedStartWorkflow);
+  /*
+  FNXC:NewTaskWorkflowStart 2026-08-27-10:50:
+  FN-196 keeps Start hidden only when server-derived workflow metadata cannot prove a destination.
+  Eligible workflows render a disabled empty-description affordance so it remains discoverable and
+  matches Quick Add; an atomic initial column does not require a follow-up move callback.
+  */
+  const canStartTask = Boolean(
+    validatedStartWorkflow
+    && workflowSupportsQuickAddStart(validatedStartWorkflow)
+    && startWorkflowTarget
+    && (startInitialColumn || onMoveTask),
+  );
+  const canStartTaskNow = canStartTask && Boolean(description.trim()) && !isSubmitting;
+
+  const handleExecutorModelChange = useCallback((value: string, meta?: TaskFormValueChangeMeta) => {
+    setExecutorModel(value);
+    if (meta?.source === "initialization") {
+      setInitialDefaultValues((defaults) => ({ ...defaults, executorModel: value }));
+    }
+  }, []);
+
+  const handleValidatorModelChange = useCallback((value: string, meta?: TaskFormValueChangeMeta) => {
+    setValidatorModel(value);
+    if (meta?.source === "initialization") {
+      setInitialDefaultValues((defaults) => ({ ...defaults, validatorModel: value }));
+    }
+  }, []);
+
+  const handleGithubTrackingEnabledChange = useCallback((value: boolean, meta?: TaskFormValueChangeMeta) => {
+    setGithubTrackingEnabled(value);
+    if (meta?.source === "initialization") {
+      setInitialDefaultValues((defaults) => ({ ...defaults, githubTrackingEnabled: value }));
+    }
+  }, []);
 
   // Track dirty state
   useEffect(() => {
@@ -718,13 +639,11 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
       dependencies.length > 0 ||
       pendingImages.length > 0 ||
       selectedWorkflowId !== undefined ||
-      // Optional workflow steps the user toggled count as unsaved work. (Workflows
-      // whose steps are defaultOn:false — today's only shipped step — seed an empty
-      // set, so this stays false until the user actually opts a step in.)
-      shouldSubmitEnabledWorkflowSteps ||
-      enabledWorkflowSteps.length > 0 ||
-      executorModel !== "" ||
-      validatorModel !== "" ||
+      // The create payload preserves asynchronously seeded defaultOn steps, but only
+      // an operator toggle should require discard confirmation.
+      hasUserSelectedEnabledWorkflowSteps ||
+      executorModel !== initialDefaultValues.executorModel ||
+      validatorModel !== initialDefaultValues.validatorModel ||
       planningModel !== "" ||
       thinkingLevel !== "" ||
       plannerOversightLevel !== "" ||
@@ -737,10 +656,10 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
       branchMode !== "project-default" ||
       branch !== "" ||
       baseBranch !== "" ||
-      githubTrackingEnabled ||
+      githubTrackingEnabled !== initialDefaultValues.githubTrackingEnabled ||
       githubRepoOverrideTrimmed !== "";
     setHasDirtyState(isDirty);
-  }, [description, dependencies, pendingImages, selectedWorkflowId, shouldSubmitEnabledWorkflowSteps, enabledWorkflowSteps, executorModel, validatorModel, planningModel, thinkingLevel, plannerOversightLevel, selectedAgentId, reviewLevel, autoMerge, priority, nodeId, executionMode, branchMode, branch, baseBranch, githubTrackingEnabled, githubRepoOverrideTrimmed]);
+  }, [description, dependencies, pendingImages, selectedWorkflowId, hasUserSelectedEnabledWorkflowSteps, executorModel, validatorModel, planningModel, thinkingLevel, plannerOversightLevel, selectedAgentId, reviewLevel, autoMerge, priority, nodeId, executionMode, branchMode, branch, baseBranch, githubTrackingEnabled, githubRepoOverrideTrimmed, initialDefaultValues]);
 
   const resetForm = useCallback(() => {
     // Clean up object URLs
@@ -750,8 +669,11 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     setDescription("");
     setDependencies([]);
     setExecutorModel("");
+    setCredentialInstanceId(undefined);
     setValidatorModel("");
+    setValidatorCredentialInstanceId(undefined);
     setPlanningModel("");
+    setPlanningCredentialInstanceId(undefined);
     setThinkingLevel("");
     setPlannerOversightLevel("");
     setSelectedPresetId("");
@@ -759,6 +681,7 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     setSelectedWorkflowId(undefined);
     setEnabledWorkflowSteps([]);
     setShouldSubmitEnabledWorkflowSteps(false);
+    setHasUserSelectedEnabledWorkflowSteps(false);
     setSelectedAgentId(null);
     setShowAgentPicker(false);
     setReviewLevel(undefined);
@@ -771,8 +694,10 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     setBaseBranch("");
     setHasDirtyState(false);
     setGithubTrackingEnabled(false);
+    setInitialDefaultValues({ executorModel: "", validatorModel: "", githubTrackingEnabled: false });
     setGithubRepoOverride("");
     setDuplicateMatches(null);
+    setStartSubmitInFlight(false);
     githubGeneratedDescriptionRef.current = "";
   }, [pendingImages]);
 
@@ -791,14 +716,19 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
 
   /**
    * FNXC:NewTaskDialogAffordances 2026-06-21-17:50:
-   * The New Task dialog must expose the same Plan and Subtask quick-add handoff affordances as QuickEntryBox. Close without the dirty-state discard confirmation because the typed description is intentionally handed off to the planning/subtask modal instead of discarded.
+   * The New Task dialog must expose the Plan quick-add handoff affordance as QuickEntryBox. Close without the dirty-state discard confirmation because the typed description is intentionally handed off to the planning modal instead of discarded.
    */
   const handleAiAssistClose = useCallback(() => {
     resetForm();
     onClose();
   }, [onClose, resetForm]);
 
-  const performCreate = useCallback(async (trimmedDesc: string, acknowledgedDuplicates?: string[]) => {
+  const performCreate = useCallback(async (
+    trimmedDesc: string,
+    acknowledgedDuplicates: string[] | undefined,
+    workflowSelection: string | null | undefined,
+    startWorkflow: ValidatedQuickAddWorkflow | null,
+  ) => {
     const executorSlashIdx = executorModel.indexOf("/");
     const validatorSlashIdx = validatorModel.indexOf("/");
     const planningSlashIdx = planningModel.indexOf("/");
@@ -815,18 +745,31 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
       //  - undefined → omit (store inherits the project default, today's behavior)
       //  - null      → explicit "No workflow" (store skips default materialization)
       //  - string    → that workflow, materialized atomically at create time.
-      ...(selectedWorkflowId !== undefined ? { workflowId: selectedWorkflowId } : {}),
+      ...(startWorkflow
+        ? { workflowId: startWorkflow.id }
+        : workflowSelection !== undefined
+          ? { workflowId: workflowSelection }
+          : {}),
+      ...(startWorkflow
+        ? (() => {
+            const initialColumn = resolveQuickAddStartInitialColumn(startWorkflow);
+            return initialColumn ? { column: initialColumn as ColumnId } : {};
+          })()
+        : {}),
       // Optional steps are omitted only when no controls were available. Fast always submits explicit []/ids so async metadata races cannot fall back to store defaultOn gates.
       ...(shouldSubmitEnabledWorkflowSteps || executionMode === "fast" ? { enabledWorkflowSteps } : {}),
       ...(selectedAgentId ? { assignedAgentId: selectedAgentId } : {}),
       modelPresetId: presetMode === "preset" ? selectedPresetId || undefined : undefined,
       modelProvider: executorModel && executorSlashIdx !== -1 ? executorModel.slice(0, executorSlashIdx) : undefined,
       modelId: executorModel && executorSlashIdx !== -1 ? executorModel.slice(executorSlashIdx + 1) : undefined,
+      ...(credentialInstanceId ? { credentialInstanceId } : {}),
       validatorModelProvider: validatorModel && validatorSlashIdx !== -1 ? validatorModel.slice(0, validatorSlashIdx) : undefined,
       validatorModelId: validatorModel && validatorSlashIdx !== -1 ? validatorModel.slice(validatorSlashIdx + 1) : undefined,
+      ...(validatorCredentialInstanceId ? { validatorCredentialInstanceId } : {}),
       planningModelProvider: planningModel && planningSlashIdx !== -1 ? planningModel.slice(0, planningSlashIdx) : undefined,
       planningModelId: planningModel && planningSlashIdx !== -1 ? planningModel.slice(planningSlashIdx + 1) : undefined,
-      thinkingLevel: thinkingLevel !== "" ? thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" : undefined,
+      ...(planningCredentialInstanceId ? { planningCredentialInstanceId } : {}),
+      thinkingLevel: thinkingLevel !== "" ? thinkingLevel as ThinkingLevel : undefined,
       // FNXC:PlannerOversight 2026-07-04-00:00: omit when "Inherit from workflow" ("") is selected so the task falls back to the workflow's effective plannerOversightLevel.
       ...(plannerOversightLevel !== "" ? { plannerOversightLevel: plannerOversightLevel as "off" | "observe" | "steer" | "autonomous" } : {}),
       reviewLevel,
@@ -855,6 +798,33 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     // the executor can never observe the task with the wrong step set.
     const task = await onCreateTask(createInput);
 
+    let startSucceeded = false;
+    if (startWorkflow) {
+      const initialColumn = resolveQuickAddStartInitialColumn(startWorkflow);
+      if (initialColumn) {
+        // Coding (Ideas) has a proven direct destination in the atomic create request.
+        startSucceeded = true;
+      } else if (
+        onMoveTask
+        && typeof task.id === "string"
+        && task.id.trim()
+        && typeof task.column === "string"
+        && task.column.trim()
+        && typeof (task as Task & { workflowId?: unknown }).workflowId === "string"
+        && (task as Task & { workflowId?: string }).workflowId === startWorkflow.id
+      ) {
+        const target = resolveQuickAddStartTargetColumn(startWorkflow, task.column);
+        if (target) {
+          try {
+            await onMoveTask(task.id, target as ColumnId);
+            startSucceeded = true;
+          } catch {
+            // The created task remains visible; the final toast reports this partial outcome.
+          }
+        }
+      }
+    }
+
     // Upload pending images as attachments
     if (pendingImages.length > 0) {
       const failures: string[] = [];
@@ -871,14 +841,27 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     }
 
     resetForm();
-    addToast(t("newTaskModal.taskCreated", "Created {{taskId}}", { taskId: task.id }), "success");
+    if (startWorkflow) {
+      addToast(
+        startSucceeded
+          ? t("newTaskModal.taskQueued", "Queued {{taskId}} for planning", { taskId: task.id })
+          : t("newTaskModal.taskCreatedNotStarted", "Created {{taskId}}, but could not start it", { taskId: task.id }),
+        startSucceeded ? "success" : "error",
+      );
+    } else {
+      addToast(t("newTaskModal.taskCreated", "Created {{taskId}}", { taskId: task.id }), "success");
+    }
     onClose();
-  }, [executorModel, validatorModel, planningModel, thinkingLevel, plannerOversightLevel, dependencies, selectedWorkflowId, shouldSubmitEnabledWorkflowSteps, enabledWorkflowSteps, selectedAgentId, presetMode, selectedPresetId, reviewLevel, autoMerge, priority, nodeId, executionMode, branchMode, isBranchNameRequired, branch, baseBranch, githubTrackingEnabled, githubRepoOverrideTrimmed, onCreateTask, pendingImages, resetForm, addToast, t, onClose, projectId]);
+  }, [executorModel, credentialInstanceId, validatorModel, validatorCredentialInstanceId, planningModel, planningCredentialInstanceId, thinkingLevel, plannerOversightLevel, dependencies, shouldSubmitEnabledWorkflowSteps, enabledWorkflowSteps, selectedAgentId, presetMode, selectedPresetId, reviewLevel, autoMerge, priority, nodeId, executionMode, branchMode, isBranchNameRequired, branch, baseBranch, githubTrackingEnabled, githubRepoOverrideTrimmed, onCreateTask, onMoveTask, pendingImages, resetForm, addToast, t, onClose, projectId]);
 
-  const handleSubmit = useCallback(async () => {
+  const handleSubmit = useCallback(async (startWorkflow: ValidatedQuickAddWorkflow | null = null) => {
+    const workflowSelection = selectedWorkflowId;
+    pendingWorkflowSelectionRef.current = workflowSelection;
+    pendingStartWorkflowRef.current = startWorkflow;
     const trimmedDesc = description.trim();
     if (!trimmedDesc || isSubmitting || githubRepoOverrideInvalid || hasInvalidBranchSelection) return;
 
+    setStartSubmitInFlight(Boolean(startWorkflow));
     setIsSubmitting(true);
     let keepSubmittingForDuplicateChoice = false;
     try {
@@ -893,15 +876,23 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     }
 
     try {
-      await performCreate(trimmedDesc);
+      await performCreate(trimmedDesc, undefined, workflowSelection, startWorkflow);
     } catch (err) {
       addToast(getErrorMessage(err) || t("newTaskModal.failedToCreate", "Failed to create task"), "error");
     } finally {
       if (!keepSubmittingForDuplicateChoice) {
+        pendingWorkflowSelectionRef.current = undefined;
+        pendingStartWorkflowRef.current = null;
+        setStartSubmitInFlight(false);
         setIsSubmitting(false);
       }
     }
-  }, [description, isSubmitting, githubRepoOverrideInvalid, hasInvalidBranchSelection, projectId, addToast, t, performCreate]);
+  }, [description, isSubmitting, githubRepoOverrideInvalid, hasInvalidBranchSelection, projectId, addToast, t, performCreate, selectedWorkflowId]);
+
+  const handleStartSubmit = useCallback(() => {
+    if (!canStartTaskNow || !validatedStartWorkflow) return;
+    void handleSubmit(validatedStartWorkflow);
+  }, [canStartTaskNow, handleSubmit, validatedStartWorkflow]);
 
   const handleDuplicateOpen = useCallback((taskId: string) => {
     setDuplicateMatches(null);
@@ -916,7 +907,10 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     const trimmedDesc = description.trim();
     const matches = duplicateMatches;
     if (!trimmedDesc || !matches || matches.length === 0) {
+      pendingWorkflowSelectionRef.current = undefined;
+      pendingStartWorkflowRef.current = null;
       setDuplicateMatches(null);
+      setStartSubmitInFlight(false);
       setIsSubmitting(false);
       return;
     }
@@ -924,16 +918,27 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     setDuplicateMatches(null);
     setIsSubmitting(true);
     try {
-      await performCreate(trimmedDesc, matches.map((match) => match.id));
+      await performCreate(
+        trimmedDesc,
+        matches.map((match) => match.id),
+        pendingWorkflowSelectionRef.current,
+        pendingStartWorkflowRef.current,
+      );
     } catch (err) {
       addToast(getErrorMessage(err) || t("newTaskModal.failedToCreate", "Failed to create task"), "error");
     } finally {
+      pendingWorkflowSelectionRef.current = undefined;
+      pendingStartWorkflowRef.current = null;
+      setStartSubmitInFlight(false);
       setIsSubmitting(false);
     }
   }, [description, duplicateMatches, performCreate, addToast, t]);
 
   const handleDuplicateCancel = useCallback(() => {
+    pendingWorkflowSelectionRef.current = undefined;
+    pendingStartWorkflowRef.current = null;
     setDuplicateMatches(null);
+    setStartSubmitInFlight(false);
     setIsSubmitting(false);
   }, []);
 
@@ -964,6 +969,58 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
       handleClose();
     }
   }, [handleClose]);
+
+  /*
+  FNXC:ModalTouchGeometry 2026-07-27-18:20:
+  FloatingWindow owns the desktop host, so New Task must route document Escape through its
+  existing discard-aware close path rather than bypassing the FN-8563 abandon-changes confirmation.
+  */
+  useEffect(() => {
+    if (!isOpen || !isFloating) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      handleClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [handleClose, isFloating, isOpen]);
+
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-18:01:
+  New Task keeps its keyboard focus boundary without opting into FloatingWindow's blocking
+  backdrop. Desktop clicks must pass through the transparent overlay, while Tab remains inside
+  the composer and every close route continues through the discard-aware handler. A blocking
+  duplicate-warning child temporarily owns Tab so its Cancel/Create controls remain reachable.
+  */
+  useEffect(() => {
+    if (!isOpen || !isFloating) return;
+    const form = floatingFormRef.current;
+    if (!form) return;
+    const priorFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      // A duplicate warning is a blocking child dialog and owns keyboard traversal while open.
+      if (document.querySelector(".duplicate-warning-modal")) return;
+      const focusable = Array.from(form.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((element) => !element.hasAttribute("hidden"));
+      if (focusable.length === 0) return;
+      const index = focusable.indexOf(document.activeElement as HTMLElement);
+      if (event.shiftKey && (index <= 0 || !form.contains(document.activeElement))) {
+        event.preventDefault();
+        focusable.at(-1)?.focus();
+      } else if (!event.shiftKey && (index === focusable.length - 1 || !form.contains(document.activeElement))) {
+        event.preventDefault();
+        focusable[0]?.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      priorFocus?.focus();
+    };
+  }, [isFloating, isOpen]);
 
   // Compute selected agent label for display
   const selectedAgent = selectedAgentId ? agents.find((agent) => agent.id === selectedAgentId) : undefined;
@@ -1112,144 +1169,163 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
 
   if (!isOpen) return null;
 
-  // FNXC:NewTask 2026-06-22-20:30: Desktop = floating fixed panel positioned by state-driven left/top/width/height. Mobile keeps the keyboard-aware full-screen sheet (no floating). The transparent click-through overlay never dismisses on click; the header X / Cancel / Escape are the only dismissals.
-  const panelStyle: CSSProperties = isFloating
-    ? { left: `${position.x}px`, top: `${position.y}px`, width: `${size.width}px`, height: `${size.height}px`, zIndex }
-    : keyboardStyle;
+  /*
+  FNXC:ModalTouchGeometry 2026-07-27-18:00:
+  Close routes remain handleClose so Escape, the header X, and Cancel all preserve the
+  abandon-changes confirmation. FloatingWindow intentionally keeps outside dismissal disabled.
+  */
+  const duplicateWarning = duplicateMatches ? (
+    <DuplicateWarningModal
+      matches={duplicateMatches}
+      onOpen={handleDuplicateOpen}
+      onProceed={handleDuplicateProceed}
+      onCancel={handleDuplicateCancel}
+    />
+  ) : null;
 
-  // FNXC:FloatingWindow 2026-06-22-22:30: Portaled to document.body so the floating New Task dialog shares the ONE root stacking context with the other floating modals; the shared cross-type z stack only orders correctly at the document root. Mobile sheet is position:fixed, unaffected.
-  return createPortal(
-    <>
-      <div
-        className="modal-overlay open new-task-modal-overlay"
-        onKeyDown={handleKeyDown}
-        role="dialog"
-        aria-modal="false"
-        aria-label={t("newTaskModal.title", "New Task")}
-        data-testid="new-task-modal-overlay"
-        /* FNXC:FloatingWindow 2026-06-22-23:00: In floating mode the z-index lives on the fixed overlay (it owns the stacking context); a panel z is trapped and loses to page stacking contexts like the right dock. Mobile keeps its CSS z. */
-        style={isFloating ? { zIndex } : undefined}
-      >
-        <div
-          className={`modal modal-lg new-task-modal${isFloating ? " new-task-modal--floating" : ""}`}
-          style={panelStyle}
-          onPointerDownCapture={isFloating ? bringToFront : undefined}
-          onFocusCapture={isFloating ? bringToFront : undefined}
-        >
-          {isFloating && NEW_TASK_RESIZE_DIRECTIONS.map((direction) => (
-            <div
-              key={direction}
-              className={`new-task-resize-handle new-task-resize-handle--${direction}`}
-              data-testid={`new-task-resize-${direction}`}
-              role="separator"
-              aria-label={t("newTaskModal.resize", "Resize new task window")}
-              onPointerDown={(event) => handleFloatingResizePointerDown(event, direction)}
-            />
-          ))}
-          <div
-            className={`modal-header${isFloating ? " new-task-modal__header--draggable" : ""}`}
-            data-testid="new-task-drag-handle"
-            onPointerDown={isFloating ? handleFloatingDragPointerDown : undefined}
-          >
-          <h3>{t("newTaskModal.title", "New Task")}</h3>
-          <button className="modal-close" onClick={handleClose} disabled={isSubmitting} aria-label={t("actions.close", "Close")}>
-            &times;
-          </button>
-        </div>
+  const taskFormContents = (
+    <div ref={floatingFormRef}>
+      {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: Shared chrome; the drag-handle class and test hook stay on the shared header element. */}
+      <ViewHeader
+        className="modal-header new-task-modal__header--draggable"
+        data-testid="new-task-drag-handle"
+        headingLevel={3}
+        title={t("newTaskModal.title", "New Task")}
+        onClose={handleClose}
+        closeButtonProps={{ disabled: isSubmitting, "aria-label": t("actions.close", "Close") }}
+      />
 
         <div className="modal-body">
-          {!setupReadinessLoading && visibleSetupHasWarnings && (
-            <SetupWarningBanner
-              hasAiProvider={hasAiProvider}
-              hasGithub={hasGithub}
-              showGithubWarning={false}
-            />
-          )}
+      {!setupReadinessLoading && visibleSetupHasWarnings && (
+        <SetupWarningBanner
+          hasAiProvider={hasAiProvider}
+          hasGithub={hasGithub}
+          showGithubWarning={false}
+        />
+      )}
 
-          <TaskForm
-            mode="create"
-            description={description}
-            onDescriptionChange={setDescription}
-            dependencies={dependencies}
-            onDependenciesChange={setDependencies}
-            executorModel={executorModel}
-            onExecutorModelChange={setExecutorModel}
-            validatorModel={validatorModel}
-            onValidatorModelChange={setValidatorModel}
-            presetMode={presetMode}
-            onPresetModeChange={setPresetMode}
-            selectedPresetId={selectedPresetId}
-            onSelectedPresetIdChange={setSelectedPresetId}
-            selectedWorkflowId={selectedWorkflowId}
-            onWorkflowIdChange={setSelectedWorkflowId}
-            enabledWorkflowSteps={enabledWorkflowSteps}
-            onEnabledWorkflowStepsChange={handleEnabledWorkflowStepsChange}
-            pendingImages={pendingImages}
-            onImagesChange={setPendingImages}
-            tasks={tasks}
-            projectId={projectId}
-            disabled={isSubmitting}
-            addToast={addToast}
-            isActive={isOpen}
-            onClose={handleAiAssistClose}
-            onPlanningMode={onPlanningMode}
-            onSubtaskBreakdown={onSubtaskBreakdown}
-            planningModel={planningModel}
-            onPlanningModelChange={setPlanningModel}
-            thinkingLevel={thinkingLevel}
-            plannerOversightLevel={plannerOversightLevel}
-            onPlannerOversightLevelChange={setPlannerOversightLevel}
-            onThinkingLevelChange={setThinkingLevel}
-            reviewLevel={reviewLevel}
-            onReviewLevelChange={setReviewLevel}
-            autoMerge={autoMerge}
-            onAutoMergeChange={setAutoMerge}
-            priority={priority}
-            onPriorityChange={setPriority}
-            branch={branch}
-            onBranchChange={setBranch}
-            branchMode={branchMode}
-            onBranchModeChange={setBranchMode}
-            baseBranch={baseBranch}
-            onBaseBranchChange={setBaseBranch}
-            nodeId={nodeId}
-            onNodeIdChange={setNodeId}
-            nodeOptions={nodes}
-            executionMode={executionMode}
-            onExecutionModeChange={setExecutionMode}
-            githubTrackingEnabled={githubTrackingEnabled}
-            onGithubTrackingEnabledChange={setGithubTrackingEnabled}
-            githubRepoOverride={githubRepoOverride}
-            onGithubRepoOverrideChange={setGithubRepoOverride}
-            onCreateSubmit={handleSubmit}
-            createSubmitLabel={isSubmitting ? t("newTaskModal.creating", "Creating...") : t("newTaskModal.createTask", "Create Task")}
-            createSubmitDisabled={!description.trim() || isSubmitting || githubRepoOverrideInvalid || hasInvalidBranchSelection}
-            renderBelowPrimary={quickFields}
-            hideDependencies={true}
-            autoExpandMoreOptionsOnSelection={false}
-          />
+      <TaskForm
+        mode="create"
+        description={description}
+        onDescriptionChange={setDescription}
+        dependencies={dependencies}
+        onDependenciesChange={setDependencies}
+        executorModel={executorModel}
+        onExecutorModelChange={(value, meta) => { setCredentialInstanceId(undefined); handleExecutorModelChange(value, meta); }}
+        credentialInstanceId={credentialInstanceId}
+        onCredentialInstanceIdChange={(instanceId) => setCredentialInstanceId(instanceId || undefined)}
+        validatorModel={validatorModel}
+        onValidatorModelChange={(value, meta) => { setValidatorCredentialInstanceId(undefined); handleValidatorModelChange(value, meta); }}
+        validatorCredentialInstanceId={validatorCredentialInstanceId}
+        onValidatorCredentialInstanceIdChange={(instanceId) => setValidatorCredentialInstanceId(instanceId || undefined)}
+        presetMode={presetMode}
+        onPresetModeChange={setPresetMode}
+        selectedPresetId={selectedPresetId}
+        onSelectedPresetIdChange={setSelectedPresetId}
+        selectedWorkflowId={selectedWorkflowId}
+        onWorkflowIdChange={setSelectedWorkflowId}
+        enabledWorkflowSteps={enabledWorkflowSteps}
+        onEnabledWorkflowStepsChange={handleEnabledWorkflowStepsChange}
+        pendingImages={pendingImages}
+        onImagesChange={setPendingImages}
+        tasks={tasks}
+        projectId={projectId}
+        disabled={isSubmitting}
+        addToast={addToast}
+        isActive={isOpen}
+        onClose={handleAiAssistClose}
+        onPlanningMode={onPlanningMode}
+                planningModel={planningModel}
+        onPlanningModelChange={(value) => { setPlanningCredentialInstanceId(undefined); setPlanningModel(value); }}
+        planningCredentialInstanceId={planningCredentialInstanceId}
+        onPlanningCredentialInstanceIdChange={(instanceId) => setPlanningCredentialInstanceId(instanceId || undefined)}
+        thinkingLevel={thinkingLevel}
+        plannerOversightLevel={plannerOversightLevel}
+        onPlannerOversightLevelChange={setPlannerOversightLevel}
+        onThinkingLevelChange={setThinkingLevel}
+        reviewLevel={reviewLevel}
+        onReviewLevelChange={setReviewLevel}
+        autoMerge={autoMerge}
+        onAutoMergeChange={setAutoMerge}
+        priority={priority}
+        onPriorityChange={setPriority}
+        branch={branch}
+        onBranchChange={setBranch}
+        branchMode={branchMode}
+        onBranchModeChange={setBranchMode}
+        baseBranch={baseBranch}
+        onBaseBranchChange={setBaseBranch}
+        nodeId={nodeId}
+        onNodeIdChange={setNodeId}
+        nodeOptions={nodes}
+        executionMode={executionMode}
+        onExecutionModeChange={setExecutionMode}
+        githubTrackingEnabled={githubTrackingEnabled}
+        onGithubTrackingEnabledChange={handleGithubTrackingEnabledChange}
+        githubRepoOverride={githubRepoOverride}
+        onGithubRepoOverrideChange={setGithubRepoOverride}
+        onCreateSubmit={() => { void handleSubmit(); }}
+        createSubmitLabel={isSubmitting ? t("newTaskModal.creating", "Creating...") : t("newTaskModal.createTask", "Create Task")}
+        createSubmitDisabled={!description.trim() || isSubmitting || githubRepoOverrideInvalid || hasInvalidBranchSelection}
+        onStartSubmit={canStartTask ? handleStartSubmit : undefined}
+        startSubmitLabel={startSubmitInFlight ? t("newTaskModal.starting", "Starting...") : t("newTaskModal.startTask", "Start")}
+        startSubmitDisabled={!canStartTaskNow}
+        renderBelowPrimary={quickFields}
+        hideDependencies={true}
+        autoExpandMoreOptionsOnSelection={false}
+      />
 
         </div>
 
         {hasInvalidBranchSelection && (
-          <div className="form-error new-task-branch-error">{t("newTaskModal.branchRequired", "Branch name is required for this branch strategy.")}</div>
+      <div className="form-error new-task-branch-error">
+        {!branch.trim()
+          ? t("newTaskModal.branchRequired", "Branch name is required for this branch strategy.")
+          : t("newTaskModal.branchInvalid", "Enter a valid Git branch name (no spaces or ref punctuation).")}
+      </div>
         )}
 
-          <div className="modal-actions">
-            <button className="btn btn-sm" onClick={handleClose} disabled={isSubmitting}>
-              {t("actions.cancel", "Cancel")}
-            </button>
-          </div>
+      <div className="modal-actions">
+        <button className="btn btn-sm" onClick={handleClose} disabled={isSubmitting}>
+          {t("actions.cancel", "Cancel")}
+        </button>
+      </div>
+    </div>
+  );
+
+  if (isFloating) {
+    return (
+      <>
+        <FloatingWindow
+          title={t("newTaskModal.title", "New Task")}
+          onClose={handleClose}
+          windowKey="new-task"
+          defaultSize={{ width: NEW_TASK_DEFAULT_WIDTH, height: NEW_TASK_DEFAULT_HEIGHT }}
+          minSize={{ width: NEW_TASK_MIN_WIDTH, height: NEW_TASK_MIN_HEIGHT }}
+          hideHeader
+          dragHandleSelector=".new-task-modal__header--draggable"
+          persistGeometryKey="fusion:new-task-modal-geometry"
+          suspendGeometryPersistenceOnMobile
+          suspendGeometryPersistenceOnShortViewport
+          ariaLabel={t("newTaskModal.title", "New Task")}
+          className={`modal modal-lg new-task-modal new-task-modal--floating${viewportMode === "tablet" ? " task-modal--tablet" : ""}`}
+          testId="new-task-modal-overlay"
+        >
+          {taskFormContents}
+        </FloatingWindow>
+        {duplicateWarning}
+      </>
+    );
+  }
+
+  return createPortal(
+    <>
+      <div className="modal-overlay open new-task-modal-overlay" onKeyDown={handleKeyDown} role="dialog" aria-modal="true" aria-label={t("newTaskModal.title", "New Task")} data-testid="new-task-modal-overlay" style={keyboardStyle}>
+        <div className="modal modal-lg new-task-modal" style={keyboardStyle}>
+          {taskFormContents}
         </div>
       </div>
-      {duplicateMatches && (
-        <DuplicateWarningModal
-          matches={duplicateMatches}
-          onOpen={handleDuplicateOpen}
-          onProceed={handleDuplicateProceed}
-          onCancel={handleDuplicateCancel}
-        />
-      )}
+      {duplicateWarning}
     </>,
     document.body,
   );

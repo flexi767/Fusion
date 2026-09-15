@@ -71,8 +71,8 @@ html {
    recommended by Apple HIG and WCAG 2.5.8. Apply to interactive
    elements that are too small on mobile (links, small buttons, icons). */
 .touch-target {
-  min-width: 44px;
-  min-height: 44px;
+  min-width: var(--touch-target-min-size);
+  min-height: var(--touch-target-min-size);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -137,14 +137,41 @@ html {
   --font-size-md: 1.125rem;
   --font-size-lg: 1.25rem;
   --line-height-tight: 1.25;
+  /* FNXC:DashboardStyling 2026-08-21-13:35: normal-body line-height token (was a raw 1.4 literal in ChatFocusSelector.css). */
+  --line-height-normal: 1.4;
+  /*
+  FNXC:DashboardStyling 2026-09-01-08:39:
+  Ten declarations across nine component stylesheets named these weight rungs without definitions, making each declaration invalid so text inherited its weight. Define the complete scale here, matching the earlier font-size repair above, rather than adding component literals.
+  */
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
 
   /* Spacing Scale */
+  /* FNXC:DashboardStyling 2026-08-23-16:00: FN-9198 uses this 2px token for chat title-switcher focus-ring widths and offsets. */
+  --space-3xs: 2px;
   --space-xs: 4px;
   --space-sm: 8px;
   --space-md: 12px;
   --space-lg: 16px;
   --space-xl: 24px;
   --space-2xl: 32px;
+
+  /*
+  FNXC:DashboardStyling 2026-07-23-13:05:
+  Mobile action controls need one shared minimum hit-area token so compact layouts can retain the
+  44px accessibility floor without embedding a raw dimension in component-specific rules.
+  */
+  --touch-target-min-size: 44px;
+  /*
+  FNXC:TaskModalResize 2026-07-26-10:40:
+  Task-modal resize targets use the accessibility floor as an explicit hit-area
+  contract. The painted grip remains compact; only the tablet-class touch guard
+  opts into this token so phones and desktop coarse-pointer layouts do not gain
+  invisible resize chrome.
+  */
+  --modal-resize-touch-target: var(--touch-target-min-size);
 
   /*
   FNXC:QuickAddActionRow 2026-07-16-14:00:
@@ -165,6 +192,10 @@ html {
 
   /* Component-specific tokens */
   --btn-padding: var(--space-sm) var(--space-lg);
+  /*
+  FNXC:DashboardStyling 2026-09-01-08:39:
+  Border shorthands must use this existing theme-aware width token, not an alias such as --border-width. Its 29 theme overrides, including Cozy Cartoon's thicker borders, keep all component outlines consistent.
+  */
   --btn-border-width: 1px;
   --card-padding: 10px 12px;
   --modal-padding: var(--space-lg) 20px;
@@ -192,6 +223,14 @@ html {
   Canonical content-row height (28px = btn-sm box: 4+4 padding + 1+1 border + ~18px line). ViewHeader bounds every action child to this so taller controls (touch-target 44px close buttons, view-toggle 32px segmented switches, base .btn 36px primary buttons) collapse to the canonical row instead of stretching the header past --view-header-min-height. Skills (was 77px / 44px touch-target), Goals (was 69px / 36px primary btn), and Agents (was 65px / 32px view-toggle) all clamp to ~61px without clipping their 16-18px icons, which stay centered.
   */
   --view-header-content-row: 28px;
+  /*
+  FNXC:StandardizedViewLayout 2026-09-13-16:12:
+  Every full dashboard destination shares a 300px preferred collection rail, one 220–560px resize range, and one row rhythm. Component CSS consumes these tokens instead of copying per-view widths or typography.
+  */
+  --view-sidebar-width: calc(var(--space-lg) * 18.75);
+  --view-sidebar-min-width: calc(var(--space-lg) * 13.75);
+  --view-sidebar-max-width: calc(var(--space-lg) * 35);
+  --view-sidebar-row-min-height: calc(var(--space-lg) * 2.25);
   --column-gap: var(--space-md);
   --board-padding: var(--space-lg) var(--space-xl);
   --icon-size-md: 16px;
@@ -219,9 +258,24 @@ html {
   previously referenced undefined tokens, silently resolving z-index to auto
   and letting dashboard scroll owners clip or cover guided report actions.
   */
+  /*
+  FNXC:DashboardStyling 2026-08-23-22:35:
+  FN-9202's shared `.banner--chrome` shell referenced `--z-sticky`, which nothing defined — the same
+  undefined-token defect FN-8406 records above, silently resolving z-index to auto so a sticky
+  top banner no longer sat in the documented stacking order. 30 restores the value the per-banner
+  shells carried before the unification, staying below the popover/modal scale and the 100
+  `.modal-overlay` floor that must cover it.
+  */
+  --z-sticky: 30;
   --z-popover: 60;
   --z-dropdown: 1000;
   --z-modal: 1100;
+
+  /*
+  FNXC:PluginOverlayLayering 2026-07-23-01:21:
+  Plugin overlays need a stable ceiling above the dashboard's 10000–10001 page-overlay band, 10100+ session-monotonic utility-window stack, the 10500 toast/feedback layer, and the 11000 body-portaled model-combobox dropdown. The 11001 boot floor is available before JavaScript runs; floatingWindowStack.ts raises an inline documentElement value when its utility counter grows past this floor.
+  */
+  --fusion-max-z: 11001;
 
   --shadow-glow: 0 0 8px color-mix(in srgb, var(--todo) 30%, transparent);
   --glow-success: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
@@ -376,8 +430,12 @@ svg.spinning {
   --provider-openai: #10a37f;
   --provider-gemini: #4285f4;
   --provider-openrouter: #6f4cff;
+  --provider-orcarouter: #0e7c86;
+  --provider-brave: #fb542b;
+  --provider-tavily: #4f46e5;
   --provider-minimax: #e73562;
   --provider-zai: #1a6dff;
+  --provider-xiaomi: #ff6900;
   --provider-kimi: #6c5ce7;
   --provider-bedrock: #ff9900;
   --provider-opencode: #38bdf8;
@@ -396,9 +454,16 @@ svg.spinning {
   --provider-cursor-cli: #7c3aed;
   --provider-ollama: #d4a27f;
   /* Runtime-plugin marks. */
-  --provider-omp: var(--text);
+  --provider-omp-gradient-start: #ed4abf;
+  --provider-omp-gradient-mid: #9b4dff;
+  --provider-omp-gradient-end: #5ad8e6;
+  --provider-omp: var(--provider-omp-gradient-mid);
   --provider-hermes: #d4961c;
   --provider-openclaw: #ff4f40;
+  --provider-openclaw-outline: #3a0a0d;
+  --provider-openclaw-highlight: #ff775f;
+  --provider-openclaw-eye: #081016;
+  --provider-openclaw-eye-highlight: #f5fbff;
   --provider-paperclip: var(--text);
   --provider-icon-contrast: var(--bg);
 
@@ -676,16 +741,6 @@ html *::after {
     box-shadow var(--transition-normal);
 }
 
-html .card.dragging,
-html .card.dragging *,
-html .list-row.dragging,
-html .list-row.dragging *,
-html .column.drag-over,
-html .column.drag-over * {
-  transition: none !important;
-}
-
-[data-theme="light"] .agent-detail-overlay,
 [data-theme="light"] .agent-dialog-overlay,
 [data-theme="light"] .chat-new-dialog-backdrop {
   background: transparent;
@@ -1107,6 +1162,14 @@ body {
 }
 
 /* === Board === */
+/*
+FNXC:BoardNavigation 2026-07-24-10:05:
+Desktop board scrolling must be free-panning: no scroll snapping at all. Trackpad/wheel scrolls
+were being captured by the browser's proximity-snap settle animation, which reads as a slow,
+sticky drag toward a column center. Snapping stays a phone-tier affordance only (re-declared in
+the mobile media block alongside the JS column pager), so the base rule turns it off explicitly
+rather than relying on the absence of a declaration.
+*/
 .board {
   box-sizing: border-box;
   display: grid;
@@ -1120,7 +1183,7 @@ body {
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
-  scroll-snap-type: x proximity;
+  scroll-snap-type: none;
   scroll-padding-inline: 50%;
   scrollbar-color: var(--border) transparent;
   scrollbar-width: thin;
@@ -1150,11 +1213,6 @@ body {
   scroll-snap-align: center;
 }
 
-.column.drag-over {
-  border-color: var(--todo);
-  box-shadow: inset 0 0 0 1px var(--todo);
-}
-
 .column-header {
   display: flex;
   align-items: center;
@@ -1172,6 +1230,15 @@ body {
 .dot-triage {
   background: var(--triage);
 }
+
+/*
+FNXC:CodingIdeasWorkflow 2026-07-21-23:42:
+The non-legacy Coding (Ideas) manual-intake ID already uses the shared Column dot.
+Map it to the established triage token so the decorative header indicator remains visible across themes.
+*/
+.dot-ideas {
+  background: var(--triage);
+}
 .dot-todo {
   background: var(--todo);
 }
@@ -1183,9 +1250,6 @@ body {
 }
 .dot-done {
   background: var(--done);
-}
-.dot-archived {
-  background: var(--text-muted);
 }
 
 .column-header h2 {
@@ -1221,10 +1285,18 @@ body {
   animation: count-flash-bg 1400ms ease-out;
 }
 
+/*
+FNXC:WorkflowColumnDescriptions 2026-07-22-12:35:
+Custom workflow descriptions are author-entered explanatory text shared by selected and
+aggregate board columns. Preserve explicit line breaks and break long
+unspaced values so narrow desktop and mobile lanes do not clip the copy.
+*/
 .column-desc {
   font-size: 0.6875rem;
   color: var(--text-dim);
   padding: var(--space-xs) calc(var(--space-lg) - 2px) calc(var(--space-md) - 2px);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .column-body {
@@ -1272,6 +1344,31 @@ Modal and dock pop-out surfaces should not darken or blur the app behind them. K
   display: flex;
 }
 
+/*
+FNXC:DashboardTheming 2026-08-20-00:49:
+Operator feedback requires one readable pixel face for ordinary prose, links, dates, and native or role-based controls. Scope the override to those UI semantics rather than every descendant, so direct mono contracts for paths, identifiers, logs, code, editors, and terminals continue to describe machine-readable content.
+*/
+[data-color-theme="medieval"] {
+  font-family: var(--font-primary);
+}
+
+[data-color-theme="medieval"] :where(a, time, button, label, input, textarea, select, option, [role="button"], [role="link"], [role="textbox"], [role="option"]) {
+  font-family: var(--font-primary);
+}
+
+[data-color-theme="medieval"] :is(pre, pre *, code, code *, kbd, kbd *, samp, samp *, .cm-editor, .cm-editor *, .xterm, .xterm *, .terminal, .terminal *, .session-terminal, .session-terminal *) {
+  font-family: var(--font-mono) !important;
+}
+
+/*
+FNXC:DashboardTheming 2026-08-28-07:45:
+The shared .btn rule hardcodes its font size, so Cozy Cartoon needs this single token-backed typography override to make ordinary buttons visibly larger. The compact exclusions preserve every .btn-sm/.btn--sm control, including the height-pinned Quick Add action row, while omitting height and min-height lets the desktop ViewHeader clamp keep trimming enlarged button padding without stretching headers.
+*/
+[data-color-theme="cozy-cartoon"] .btn:not(.btn-sm):not(.btn--sm) {
+  font-size: var(--cozy-cartoon-btn-font-size);
+  font-weight: var(--cozy-cartoon-btn-font-weight);
+}
+
 .modal {
   position: relative;
   background: var(--surface);
@@ -1284,6 +1381,22 @@ Modal and dock pop-out surfaces should not darken or blur the app behind them. K
   flex-direction: column;
 }
 
+/*
+FNXC:DashboardTheming 2026-08-20-00:29:
+Medieval modal chrome must follow the generic modal shorthand reset so its border-box grain remains visible. Paint-only layers keep sizing, dismissal, focus, touch, and mobile behavior owned by the existing modal contract.
+*/
+[data-color-theme="medieval"] .modal {
+  border-color: transparent;
+  border-width: var(--btn-border-width);
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(var(--surface), var(--surface)),
+    repeating-linear-gradient(90deg, var(--medieval-wood-dark) 0, var(--medieval-wood-light) var(--space-xs), var(--medieval-wood-dark) var(--space-sm), var(--medieval-wood-light) var(--space-md));
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+  box-shadow: var(--shadow-lg);
+}
+
 .modal-resize-grip {
   position: absolute;
   right: 0;
@@ -1294,6 +1407,14 @@ Modal and dock pop-out surfaces should not darken or blur the app behind them. K
   cursor: se-resize;
   touch-action: none;
   background: transparent;
+}
+
+.modal-resize-grip--touch-target {
+  width: var(--modal-resize-touch-target);
+  height: var(--modal-resize-touch-target);
+  right: calc((var(--modal-resize-touch-target) - var(--space-lg)) * -1);
+  bottom: calc((var(--modal-resize-touch-target) - var(--space-lg)) * -1);
+  z-index: 3;
 }
 
 .modal-resize-grip::after {
@@ -1333,24 +1454,6 @@ Modal and dock pop-out surfaces should not darken or blur the app behind them. K
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 0.3px;
-}
-
-.modal-close {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  font-size: 22px;
-  cursor: pointer;
-  padding: 0 4px;
-  line-height: 1;
-}
-.modal-close:hover {
-  color: var(--text);
-}
-.modal-close:focus-visible {
-  box-shadow: var(--focus-ring-strong);
-  outline: none;
-  border-radius: var(--radius-sm);
 }
 
 .modal-send-to-background {
@@ -1806,14 +1909,6 @@ FN-7825 makes .settings-navigation the sole owner of Settings rail width and rem
 }
 
 
-/* Scope indicators in sidebar nav items */
-.settings-scope-icon {
-  margin-right: 6px;
-  display: inline-flex;
-  vertical-align: middle;
-  color: var(--text-muted);
-}
-
 /* Scope banner above section content */
 
 /* Helper note styling for Settings sections — aligns with form-group horizontal gutters */
@@ -2180,7 +2275,17 @@ FN-7825 makes .settings-navigation the sole owner of Settings rail width and rem
   height: var(--card-chip-height);
   min-height: var(--card-chip-height);
   border-radius: var(--radius-pill);
-  border: 1px solid transparent;
+  /*
+  FNXC:TaskCardParity 2026-07-31-01:05:
+  TOKENIZED so chip geometry survives a theme change. This was a hardcoded `1px` while the sibling
+  chips (.card-time-indicator and friends, TaskCard.css) use `var(--btn-border-width)`. The default
+  token IS 1px, so the two matched on the default theme — but `factory` and `factory-mono` set
+  --btn-border-width: 2px (theme-data.css), and under those themes the timer chip grew to 2px while
+  this badge stayed at 1px. That is exactly the footer-chip misalignment FN-4511 exists to prevent,
+  and it was invisible to the parity test because the fixture does not mount theme-data.css.
+  Found via greptile on PR #2782.
+  */
+  border: var(--btn-border-width) solid transparent;
   box-sizing: border-box;
   color: inherit;
   text-decoration: none;
@@ -2656,87 +2761,132 @@ Task cards reuse the compact badge chip dimensions for GitLab links, but stale G
 }
 
 /* === Step Progress === */
+/*
+FNXC:TaskDetailDefinition 2026-09-12-22:52:
+La progression de Définition est une liste lisible plutôt qu’une rangée de segments sans libellé. La barre résume l’avancement et chaque ligne conserve nom, origine et statut accessibles avec les couleurs sémantiques existantes.
+*/
 .detail-step-progress {
   margin-top: var(--space-lg);
 }
 
-.detail-step-progress h4 {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-muted);
+.detail-progress-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-md);
   margin-bottom: var(--space-sm);
 }
 
-.step-progress-wrapper {
-  display: flex;
-  align-items: center;
-  gap: var(--space-md);
-}
-
-.step-progress-bar {
-  flex: 1;
-  display: flex;
-  gap: 2px;
-  height: 8px;
-}
-
-.step-progress-segment {
-  flex: 1;
-  height: 100%;
-  border-radius: 2px;
-  transition: filter 0.15s ease, transform 0.15s ease;
-  cursor: pointer;
-  position: relative;
-}
-
-.step-progress-segment:hover {
-  filter: brightness(1.2);
-  transform: scaleY(1.1);
-}
-
-.step-progress-segment[data-tooltip]:hover::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  bottom: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: var(--space-xs) var(--space-sm);
-  font-size: 11px;
-  white-space: nowrap;
-  z-index: 10;
-  pointer-events: none;
-  margin-bottom: var(--space-xs);
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--text) 20%, transparent);
-}
-
-.step-progress-label {
-  font-size: 0.6875rem;
-  font-weight: 600;
+.detail-step-progress h4,
+.detail-definition-description h4 {
+  margin: 0;
   color: var(--text-muted);
-  font-family: var(--font-mono);
-  flex-shrink: 0;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.step-progress-track {
+  block-size: var(--space-xs);
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--bg-tertiary);
+}
+
+.step-progress-track > span {
+  display: block;
+  block-size: 100%;
+  border-radius: inherit;
+  background: var(--color-success);
+  transition: inline-size var(--transition-normal);
+}
+
+.detail-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin: var(--space-md) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.detail-step-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border-radius: var(--radius-md);
+  color: var(--text);
+}
+
+.detail-step-item:is(:hover, :focus-within) {
+  background: var(--surface-hover);
+}
+
+.detail-step-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: var(--space-lg);
+  block-size: var(--space-lg);
+  border: var(--border-width) solid currentColor;
+  border-radius: var(--radius-sm);
+}
+
+.detail-step-indicator .status-dot {
+  background: currentColor;
+}
+
+.detail-step-name {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail-step-origin,
+.detail-step-status,
+.step-progress-label {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.detail-step-origin {
+  padding: calc(var(--space-xs) / 2) var(--space-sm);
+  border-radius: var(--radius-pill);
+  background: var(--bg-secondary);
+}
+
+.detail-step-status {
+  min-inline-size: max-content;
 }
 
 .step-progress-empty {
-  font-size: 13px;
   color: var(--text-dim);
-  opacity: 0.7;
+  font-size: var(--font-size-sm);
+}
+
+@media (max-width: 768px) {
+  .detail-step-item {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .detail-step-origin {
+    display: none;
+  }
 }
 
 /* === Activity Timeline === */
+/*
+FNXC:TaskDetailActivity 2026-09-12-22:52:
+Feed est une timeline de cartes scannables: action dominante, temps relatif puis précis, résultat séparé et agent uniquement lorsqu’un runContext.agentId réel existe. L’ordre newest-first, les doublons et le texte multiligne restent inchangés.
+*/
 .detail-activity {
-  margin-top: 20px;
+  margin-top: var(--space-lg);
 }
 
 .detail-activity-list {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: var(--space-sm);
 }
 
 .detail-log-truncated {
@@ -2749,61 +2899,127 @@ Task cards reuse the compact badge chip dimensions for GitLab links, but stale G
 }
 
 .detail-log-entry {
-  padding: 8px 0 8px 14px;
-  border-left: 2px solid var(--border);
   position: relative;
+  margin-inline-start: var(--space-sm);
+  padding: var(--space-md);
+  border: var(--btn-border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
 }
 
 .detail-log-entry::before {
   content: "";
   position: absolute;
-  left: -4px;
-  top: 13px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--text-dim);
+  inset-block: calc(var(--space-md) * -1);
+  inset-inline-start: calc((var(--space-sm) + var(--btn-border-width)) * -1);
+  inline-size: var(--btn-border-width);
+  background: var(--border);
 }
 
-.detail-log-entry:first-child::before {
-  background: var(--todo);
+.detail-log-marker {
+  position: absolute;
+  inset-block-start: var(--space-lg);
+  inset-inline-start: calc((var(--space-md) + var(--btn-border-width)) * -1);
+  inline-size: var(--space-sm);
+  block-size: var(--space-sm);
+  border: var(--btn-border-width) solid var(--surface);
+  border-radius: var(--radius-pill);
+  background: var(--text-dim);
+  box-shadow: 0 0 0 var(--btn-border-width) var(--border);
+}
+
+.detail-log-entry:first-child .detail-log-marker {
+  background: var(--in-progress);
 }
 
 .detail-log-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-xs) var(--space-md);
+}
+
+.detail-log-timestamps {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  grid-column: 2;
+  grid-row: 1;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: var(--space-xs);
 }
 
 .detail-log-timestamp {
-  font-size: 11px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
 }
 
 .detail-log-action {
-  font-size: 13px;
+  grid-column: 1;
+  grid-row: 1;
   color: var(--text);
-  line-height: 1.4;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  line-height: var(--line-height-normal);
+  overflow-wrap: anywhere;
+}
+
+.detail-log-agent {
+  display: inline-flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: var(--space-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
 }
 
 .detail-log-outcome {
-  margin-top: 6px;
+  margin-top: var(--space-sm);
   padding: var(--space-sm) var(--space-md);
-  background: var(--surface);
-  border-left: 3px solid var(--border);
-  border-radius: 0 var(--radius) var(--radius) 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text);
+  background: var(--bg-secondary);
+  border-inline-start: var(--space-xs) solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-normal);
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .detail-log-empty {
-  font-size: 13px;
+  padding: var(--space-md) 0;
   color: var(--text-dim);
-  padding: 12px 0;
+  font-size: var(--font-size-sm);
+}
+
+@media (max-width: 768px) {
+  .detail-log-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .detail-log-timestamps,
+  .detail-log-action {
+    grid-column: 1;
+  }
+
+  .detail-log-timestamps {
+    grid-row: 2;
+    justify-content: flex-start;
+  }
+}
+
+/*
+FNXC:PluginOverlayLayering 2026-07-23-01:21:
+The supported plugin overlay mount spans the viewport in the root stacking context and follows the live dashboard ceiling through --fusion-max-z. It is empty and click-through by default, so existing layout and interactions remain unchanged; interactive plugin children must opt back into pointer events.
+*/
+#plugin-overlay-root {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--fusion-max-z, 11001) + 1);
+  pointer-events: none;
 }
 
 /* === Toasts === */
@@ -2943,16 +3159,6 @@ Toast text must contrast its status background across every dashboard theme and 
 .card.queued:active {
   cursor: default;
 }
-
-.queued-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  font-size: 11px;
-  color: var(--todo);
-}
-
-
 
 /* === Dependency Dropdown (shared: InlineCreateCard, NewTaskModal, TaskDetailModal, TaskForm) === */
 .dep-trigger-wrap {
@@ -3608,7 +3814,13 @@ Toast text must contrast its status background across every dashboard theme and 
     scroll-snap-type: x proximity;
     overflow-anchor: none;
     scroll-padding-inline: calc(50% - 150px);
-    scroll-behavior: smooth;
+    /*
+    FNXC:BoardNavigation 2026-07-22-14:20:
+    Mobile board column paging uses a short JS ease-out snap. CSS scroll-behavior:smooth
+    stacked with browser smooth scroll made settle feel laggy; keep auto so free-pan
+    inertia and the hook's animation stay snappy.
+    */
+    scroll-behavior: auto;
     scrollbar-width: none;
     padding: var(--space-md);
     padding-bottom: var(--space-md);
@@ -3697,7 +3909,6 @@ Toast text must contrast its status background across every dashboard theme and 
 
   /* Modal: full-screen on mobile (cross-cutting overlay/modal base chrome) */
   .modal-overlay:not(.confirm-dialog-overlay),
-  .agent-detail-overlay,
   .agent-dialog-overlay,
   .workflow-output-modal-overlay {
     padding-top: 0;
@@ -3732,6 +3943,28 @@ Toast text must contrast its status background across every dashboard theme and 
 
   .modal-resize-grip {
     display: none;
+  }
+
+  /*
+  FNXC:DashboardTheming 2026-08-19-19:52:
+  Mobile's generic modal reset removes all borders, which would erase Medieval's shared wood frame at the
+  actual narrow viewport. Restore only tokenized border paint here; sizing, touch, dismissal, and the
+  fullscreen mobile modal contract remain owned by the generic rule above.
+  */
+  [data-color-theme="medieval"] .modal:not(.confirm-dialog),
+  [data-color-theme="medieval"] .modal-lg,
+  [data-color-theme="medieval"] .modal-md,
+  [data-color-theme="medieval"] .gm-modal {
+    border-color: transparent;
+    border-width: var(--btn-border-width);
+    border-style: solid;
+    background-color: var(--surface);
+    background-image:
+      linear-gradient(var(--surface), var(--surface)),
+      repeating-linear-gradient(90deg, var(--medieval-wood-dark) 0, var(--medieval-wood-light) var(--space-xs), var(--medieval-wood-dark) var(--space-sm), var(--medieval-wood-light) var(--space-md));
+    background-origin: border-box;
+    background-clip: padding-box, border-box;
+    box-shadow: var(--shadow-lg);
   }
 
   /* Settings modal: use the section picker as the only mobile navigation */
@@ -3794,10 +4027,6 @@ Toast text must contrast its status background across every dashboard theme and 
   /* Hide group headers on mobile - they don't fit well in horizontal scroll row */
   .settings-group-header {
     display: none;
-  }
-
-  .settings-scope-icon {
-    margin-right: 0;
   }
 
   .settings-content {
@@ -3906,7 +4135,7 @@ Toast text must contrast its status background across every dashboard theme and 
 .text-secondary { color: var(--text-muted); }
 .text-dim { color: var(--text-dim, var(--text-muted)); }
 
-/* === Column header dropdown menu (todo column "Respecify All", etc.) ====== */
+/* === Column header dropdown menu actions ================================ */
 .column-menu {
   position: relative;
   display: inline-flex;
@@ -3989,8 +4218,8 @@ Toast text must contrast its status background across every dashboard theme and 
 FNXC:Navigation 2026-06-22-00:00:
 Board card clicks open task detail as a full main-content view that replaces the board ("Full main panel" design). This layout fills the main content area with a scrollable embedded TaskDetailContent body. Theme tokens only; mobile shell renders it unchanged because the panel just fills its host.
 
-FNXC:TaskDetail 2026-06-22-18:40:
-The panel and its body must be width-bounded (width:100%; min-width:0; max-width:100%) so the embedded detail content cannot exceed the full-width host and get clipped on the right; the body scrolls vertically only (overflow-x:hidden). The separate back-row was removed; "Back to board" now lives inside TaskDetailContent's gray header (see .task-detail-header-back-btn).
+FNXC:TaskDetailDrawerNavigation 2026-09-12-20:37:
+The panel and its body remain width-bounded so embedded detail cannot exceed the full-width host; the body scrolls vertically only. Desktop Board presentation keeps Back to board inside the TaskDetailContent header, while Alpha mobile uses its canonical Close action instead.
 */
 .task-detail-main-panel {
   display: flex;
@@ -4013,36 +4242,54 @@ The panel and its body must be width-bounded (width:100%; min-width:0; max-width
 }
 
 /*
-FNXC:TaskDetailSwipeBack 2026-07-05-12:30:
-FN-7587 — non-interactive predictive-back polish: a short slide/fade enter animation for the
-mobile full-panel task detail, layered purely on top of the unchanged FN-7583/FN-7586 dismissal
-routing (popstate / fusion:native-back / useNavigationHistory stack). Mobile-only (gated by the
-existing `isMobile` prop in MainContent.tsx); desktop never receives this class. A true
-finger-tracked interactive predictive-back is not feasible from a Capacitor single-page WebView
-on either platform today (WKWebView exposes no interactive-progress callback to JS; Android's
-system predictive-back preview is not driveable from the in-page DOM) — see task FN-7587 notes
-and the filed interactive-predictive-back follow-up task.
-*/
-@media (max-width: 768px) {
-  .task-detail-main-panel--mobile-transition {
-    animation: task-detail-mobile-slide-fade-in var(--duration-normal) ease-out;
-  }
-}
+FNXC:MobileDrawerMotion 2026-09-12-20:37:
+All mobile drawer presentations share one bottom-edge entry contract. Animate the individual translate property so FloatingWindow geometry and drag-dismiss transforms remain independent; nested Task Detail content opts out when the Alpha shell already owns this motion. The mobile gate and reduced-motion override preserve desktop, tablet, and motion-sensitive presentations.
 
-@keyframes task-detail-mobile-slide-fade-in {
+FNXC:MobileDrawerMotion 2026-09-12-21:02:
+Task Detail motion follows the canonical viewport-mode attribute rather than the width breakpoint. A phone-class physical screen remains mobile in a short landscape viewport wider than 768 CSS pixels and must retain the same bottom-edge entry.
+*/
+@keyframes alpha-mobile-drawer-rise-in {
   from {
     opacity: 0;
-    transform: translateX(var(--space-xl, 24px));
+    translate: 0 var(--space-xl);
   }
 
   to {
     opacity: 1;
-    transform: translateX(0);
+    translate: 0 0;
   }
 }
 
+html[data-viewport-mode="mobile"] .task-detail-main-panel--mobile-transition {
+  animation: alpha-mobile-drawer-rise-in var(--duration-normal) ease-out;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .task-detail-main-panel--mobile-transition {
+  html[data-viewport-mode="mobile"] .task-detail-main-panel--mobile-transition {
     animation: none;
   }
+}
+
+/*
+FNXC:AlphaMobileDrawer 2026-09-10-04:41:
+Every Alpha mobile destination and utility must fit the shared narrow drawer without making the viewport its horizontal scroller. Existing responsive components keep their own semantic layout; this cross-component boundary only supplies shrinkability, wrapped headers/actions, local table overflow, and one-column form containment.
+*/
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] {
+  --alpha-mobile-drawer-block-size: calc(100dvh - env(safe-area-inset-top, 0px) - var(--space-2xl));
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] :is(.alpha-mobile-drawer__body, .floating-window--alpha-mobile-drawer .floating-window__body) {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] :is(.alpha-mobile-drawer__body, .floating-window--alpha-mobile-drawer) :is(.view-header, .modal-header, .modal-actions) {
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] :is(.alpha-mobile-drawer__body, .floating-window--alpha-mobile-drawer) :is(table, form, fieldset, .settings-layout, .github-import-content) {
+  min-width: 0;
+  max-width: 100%;
 }

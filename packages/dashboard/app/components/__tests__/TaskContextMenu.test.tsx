@@ -1,15 +1,15 @@
 import React from "react";
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { Task } from "@fusion/core";
 import { TaskContextMenu, buildTaskActionMenuModel } from "../TaskContextMenu";
+import { AlphaProvider, AlphaBoundary } from "../../context/AlphaContext";
 
 const t = ((key: string, fallback: string, vars?: Record<string, string>) => {
   if (!vars) return fallback;
   return fallback.replace(/{{(\w+)}}/g, (_, name: string) => vars[name] ?? "");
 }) as any;
-const columnLabel = (column: string) => column;
-
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: "FN-7255",
@@ -24,28 +24,61 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 function actionIds(task: Task, overrides: Partial<Parameters<typeof buildTaskActionMenuModel>[0]> = {}): string[] {
-  return buildTaskActionMenuModel({ task, t, columnLabel: columnLabel as any, ...overrides }).actions.map((action) => action.id);
+  return buildTaskActionMenuModel({ task, t, ...overrides }).actions.map((action) => action.id);
 }
 
 describe("TaskContextMenu shared task action model", () => {
-  it("mirrors detail Actions menu availability across lifecycle states", () => {
-    expect(actionIds(makeTask({ column: "triage" }))).toEqual(["respecify", "pause", "delete"]);
-    expect(buildTaskActionMenuModel({ task: makeTask({ column: "triage" }), t, columnLabel: columnLabel as any }).shouldShowActionsMenu).toBe(false);
+  it("mirrors Retry, Reset, and Delete availability across lifecycle states", () => {
+    const onRetry = vi.fn();
+    const onTogglePause = vi.fn();
+    expect(actionIds(makeTask({ column: "triage" }), { onRetry, onTogglePause })).toEqual(["retry", "pause", "delete"]);
+    expect(buildTaskActionMenuModel({ task: makeTask({ column: "triage" }), t, onRetry, onTogglePause }).shouldShowActionsMenu).toBe(true);
+    expect(actionIds(makeTask({ column: "in-review" }), { onRetry, onReset: vi.fn(), onOpenRefine: vi.fn(), onTogglePause })).toEqual(["refine", "retry", "pause", "reset", "delete"]);
+    expect(actionIds(makeTask({ column: "done" }), { onRetry, onReset: vi.fn(), onOpenRefine: vi.fn() })).toEqual(["refine", "delete"]);
+  });
 
-    expect(actionIds(makeTask({ column: "triage", status: "failed" as any }), { canRetryTask: true, hasRetryHandler: true })).toEqual(["respecify", "retry", "pause", "delete"]);
-    expect(buildTaskActionMenuModel({ task: makeTask({ column: "triage", status: "failed" as any }), t, columnLabel: columnLabel as any, canRetryTask: true, hasRetryHandler: true }).shouldShowActionsMenu).toBe(true);
+  it("offers Bypass failed review for live and eligible archived pre-merge failures only", () => {
+    const onBypassReview = vi.fn();
+    const archivedFailure = {
+      workflowStepId: "plan-review",
+      phase: "pre-merge" as const,
+      status: "skipped" as const,
+      remediationArchivedAt: "2026-09-02T00:00:00.000Z",
+      remediationArchivedFromStatus: "failed" as const,
+    };
+    const withBypass = (workflowStepResults: Task["workflowStepResults"], overrides: Partial<Task> = {}) => actionIds(
+      makeTask({ column: "in-review", workflowStepResults, ...overrides }),
+      { onBypassReview },
+    );
 
-    expect(actionIds(makeTask({ column: "in-review" }), { hasDuplicateHandler: true, hasResetHandler: true, onOpenRefine: vi.fn() })).toEqual([
-      "duplicate",
-      "refine",
-      "respecify",
-      "pause",
-      "reset",
-      "delete",
-    ]);
-    expect(actionIds(makeTask({ column: "done" }), { hasResetHandler: true, onOpenRefine: vi.fn() })).toEqual(["refine", "respecify", "delete"]);
-    expect(actionIds(makeTask({ column: "done" }), { hasResetHandler: true })).toEqual(["respecify", "delete"]);
-    expect(actionIds(makeTask({ column: "archived" }), { hasResetHandler: true })).toEqual(["delete"]);
+    expect(withBypass([archivedFailure])).toContain("bypass-review");
+    expect(withBypass([{ ...archivedFailure, status: "failed", remediationArchivedAt: undefined }])).toContain("bypass-review");
+    expect(withBypass([{ ...archivedFailure, bypassedBy: "operator" }])).not.toContain("bypass-review");
+    expect(withBypass([{ ...archivedFailure, remediationArchivedFromStatus: "passed" }])).not.toContain("bypass-review");
+    expect(withBypass([{ ...archivedFailure, phase: "post-merge" }])).not.toContain("bypass-review");
+    expect(withBypass([archivedFailure], { column: "in-progress" })).not.toContain("bypass-review");
+    expect(actionIds(makeTask({ column: "in-review", workflowStepResults: [archivedFailure] }))).not.toContain("bypass-review");
+  });
+
+  it("offers exactly the supported recovery actions", () => {
+    const supported = buildTaskActionMenuModel({
+      task: makeTask({ column: "in-progress" }),
+      t,
+      onRetry: vi.fn(),
+      onReset: vi.fn(),
+      onTogglePause: vi.fn(),
+    });
+    expect(supported.actions.map((action) => action.id)).toEqual(["retry", "pause", "reset", "delete"]);
+  });
+
+  it("offers Retry for every mutable live column, including pending recovery", () => {
+    const onRetry = vi.fn();
+    const onReset = vi.fn();
+    const onTogglePause = vi.fn();
+    for (const task of [makeTask(), makeTask({ status: null as any, nextRecoveryAt: new Date(Date.now() + 60_000).toISOString() })]) {
+      expect(actionIds(task, { onRetry, onReset, onTogglePause })).toEqual(["retry", "pause", "reset", "delete"]);
+    }
+    expect(actionIds(makeTask({ column: "done" }), { onRetry, onReset })).toEqual(["delete"]);
   });
 
   it("exposes Plan only for pre-execution hold columns with a host callback", () => {
@@ -61,7 +94,7 @@ describe("TaskContextMenu shared task action model", () => {
       const model = buildTaskActionMenuModel({
         task: makeTask({ column: column as any }),
         t,
-        columnLabel: columnLabel as any,
+
         onPlan,
         ...overrides,
       });
@@ -73,10 +106,9 @@ describe("TaskContextMenu shared task action model", () => {
       expect(actionIds(makeTask({ column }), { onPlan })).not.toContain("plan");
     }
     expect(actionIds(makeTask({ column: "complete" as any }), { onPlan, currentColumnFlags: { hold: true, complete: true } })).not.toContain("plan");
-    expect(actionIds(makeTask({ column: "cold-storage" as any }), { onPlan, currentColumnFlags: { hold: true, archived: true } })).not.toContain("plan");
     expect(actionIds(makeTask({ column: "triage" }))).not.toContain("plan");
 
-    buildTaskActionMenuModel({ task: makeTask({ column: "triage" }), t, columnLabel: columnLabel as any, onPlan }).actions.find((action) => action.id === "plan")?.onSelect?.();
+    buildTaskActionMenuModel({ task: makeTask({ column: "triage" }), t, onPlan }).actions.find((action) => action.id === "plan")?.onSelect?.();
     expect(onPlan).toHaveBeenCalledTimes(1);
   });
 
@@ -85,31 +117,31 @@ describe("TaskContextMenu shared task action model", () => {
     const untracked = buildTaskActionMenuModel({
       task: makeTask({ githubTracking: undefined }),
       t,
-      columnLabel: columnLabel as any,
+
       onEnableGithubTracking,
     });
     const disabled = buildTaskActionMenuModel({
       task: makeTask({ githubTracking: { enabled: false } as any }),
       t,
-      columnLabel: columnLabel as any,
+
       onEnableGithubTracking,
     });
     const enabled = buildTaskActionMenuModel({
       task: makeTask({ githubTracking: { enabled: true } as any }),
       t,
-      columnLabel: columnLabel as any,
+
       onEnableGithubTracking,
     });
     const linked = buildTaskActionMenuModel({
       task: makeTask({ githubTracking: { enabled: true, issue: { owner: "o", repo: "r", number: 1 } } as any }),
       t,
-      columnLabel: columnLabel as any,
+
       onEnableGithubTracking,
     });
-    const noCallback = buildTaskActionMenuModel({ task: makeTask(), t, columnLabel: columnLabel as any });
+    const noCallback = buildTaskActionMenuModel({ task: makeTask(), t });
 
     expect(untracked.actions.find((action) => action.id === "enable-github-tracking")?.label).toBe("Enable GitHub tracking");
-    expect(untracked.actions.map((action) => action.id)).toEqual(["respecify", "enable-github-tracking", "pause", "delete"]);
+    expect(untracked.actions.map((action) => action.id)).toEqual(["enable-github-tracking", "delete"]);
     expect(disabled.actions.map((action) => action.id)).toContain("enable-github-tracking");
     expect(enabled.actions.map((action) => action.id)).not.toContain("enable-github-tracking");
     expect(linked.actions.map((action) => action.id)).not.toContain("enable-github-tracking");
@@ -119,15 +151,16 @@ describe("TaskContextMenu shared task action model", () => {
     expect(onEnableGithubTracking).toHaveBeenCalledTimes(1);
   });
 
-  it("exposes pause, unpause, and paused-by-agent note with detail labels", () => {
-    const active = buildTaskActionMenuModel({ task: makeTask(), t, columnLabel: columnLabel as any });
-    expect(active.actions.map((action) => action.id)).toEqual(["respecify", "pause", "delete"]);
+  it("exposes wired pause, unpause, and paused-by-agent note with detail labels", () => {
+    const onTogglePause = vi.fn();
+    const active = buildTaskActionMenuModel({ task: makeTask(), t, onTogglePause });
+    expect(active.actions.map((action) => action.id)).toEqual(["pause", "delete"]);
     expect(active.actions.find((action) => action.id === "pause")?.label).toBe("Pause");
 
     const paused = buildTaskActionMenuModel({
       task: makeTask({ paused: true, pausedByAgentId: "agent-1" } as Partial<Task>),
       t,
-      columnLabel: columnLabel as any,
+      onTogglePause,
     });
     expect(paused.actions.map((action) => [action.id, action.label, action.tone])).toContainEqual([
       "unpause",
@@ -141,70 +174,16 @@ describe("TaskContextMenu shared task action model", () => {
     ]);
   });
 
-  it("uses VALID_TRANSITIONS and in-review back-to-progress labels for move actions", () => {
-    const todoMoves = buildTaskActionMenuModel({ task: makeTask({ column: "todo" }), t, columnLabel: columnLabel as any }).moveTransitions;
-    expect(todoMoves.map((action) => action.column)).toEqual(["in-progress", "triage", "archived"]);
-    expect(todoMoves.map((action) => action.label)).toEqual(["Move to in-progress", "Move to triage", "Move to archived"]);
-
-    const reviewMoves = buildTaskActionMenuModel({ task: makeTask({ column: "in-review" }), t, columnLabel: columnLabel as any }).moveTransitions;
-    expect(reviewMoves.map((action) => [action.column, action.label])).toEqual([
-      ["todo", "Move to todo"],
-      ["in-progress", "Back to In Progress"],
-    ]);
-  });
-
-  it("derives custom workflow moves and terminal action availability from column metadata", () => {
-    const workflowMoveColumns = [
-      { id: "intake", label: "Intake", flags: { intake: true } },
-      { id: "build", label: "Build", flags: { countsTowardWip: true } },
-      { id: "qa", label: "QA", flags: { humanReview: true } },
-      { id: "complete", label: "Complete", flags: { complete: true } },
-      { id: "cold-storage", label: "Cold Storage", flags: { archived: true } },
-    ];
-
-    const buildModel = buildTaskActionMenuModel({
-      task: makeTask({ column: "build" }),
-      t,
-      columnLabel: columnLabel as any,
-      currentColumnFlags: workflowMoveColumns[1].flags,
-      workflowMoveColumns,
-      hasResetHandler: true,
-    });
-    expect(buildModel.moveTransitions.map((action) => [action.column, action.label])).toEqual([
-      ["intake", "Move to Intake"],
-      ["qa", "Move to QA"],
-    ]);
-    expect(buildModel.actions.map((action) => action.id)).toEqual(["respecify", "pause", "reset", "delete"]);
-    expect(buildModel.actions.at(-2)?.id).toBe("reset");
-    expect(buildModel.actions.at(-1)?.id).toBe("delete");
-
-    const completeModel = buildTaskActionMenuModel({
-      task: makeTask({ column: "complete" }),
-      t,
-      columnLabel: columnLabel as any,
-      currentColumnFlags: workflowMoveColumns[3].flags,
-      workflowMoveColumns,
-      hasResetHandler: true,
-      onOpenRefine: vi.fn(),
-    });
-    expect(completeModel.actions.map((action) => action.id)).toEqual(["refine", "respecify", "delete"]);
-    expect(completeModel.actions.map((action) => action.id)).not.toContain("reset");
-    expect(completeModel.moveTransitions.map((action) => action.column)).toEqual(["qa", "cold-storage"]);
-
-    const archivedModel = buildTaskActionMenuModel({
-      task: makeTask({ column: "cold-storage" }),
-      t,
-      columnLabel: columnLabel as any,
-      currentColumnFlags: workflowMoveColumns[4].flags,
-      workflowMoveColumns,
-      hasResetHandler: true,
-    });
-    expect(archivedModel.actions.map((action) => action.id)).toEqual(["delete"]);
-    expect(archivedModel.actions.map((action) => action.id)).not.toContain("reset");
+  it("does not expose move transitions in lifecycle action models", () => {
+    for (const column of ["in-progress", "in-review"] as const) {
+      const model = buildTaskActionMenuModel({ task: makeTask({ column }), t });
+      expect(model).not.toHaveProperty("moveTransitions");
+      expect(model.actions.map((action) => action.id)).not.toContainEqual(expect.stringMatching(/^move-/));
+    }
   });
 
   it("mirrors in-review merge and manual PR status actions", () => {
-    expect(buildTaskActionMenuModel({ task: makeTask({ column: "in-review" }), t, columnLabel: columnLabel as any }).reviewAction).toMatchObject({
+    expect(buildTaskActionMenuModel({ task: makeTask({ column: "in-review" }), t }).reviewAction).toMatchObject({
       id: "merge",
       label: "Merge & Close",
     });
@@ -214,7 +193,7 @@ describe("TaskContextMenu shared task action model", () => {
     const startPrReviewAction = buildTaskActionMenuModel({
       task: makeTask({ column: "in-review" }),
       t,
-      columnLabel: columnLabel as any,
+
       mergeStrategy: "pull-request",
       autoMergeEnabled: false,
       onMerge,
@@ -228,7 +207,7 @@ describe("TaskContextMenu shared task action model", () => {
     expect(buildTaskActionMenuModel({
       task: makeTask({ column: "in-review", prInfo: { status: "open" } as any }),
       t,
-      columnLabel: columnLabel as any,
+
       mergeStrategy: "pull-request",
       autoMergeEnabled: false,
       isCheckingPrStatus: true,
@@ -237,28 +216,9 @@ describe("TaskContextMenu shared task action model", () => {
     expect(buildTaskActionMenuModel({
       task: makeTask({ column: "in-review", status: "merging-pr" as any }),
       t,
-      columnLabel: columnLabel as any,
+
       prAutomationLabel: "Merging PR…",
     }).reviewAction).toMatchObject({ id: "pr-automation", label: "Merging PR…", disabled: true });
-  });
-
-  it("keeps archived delete available without live-only destructive shells", () => {
-    const onDelete = vi.fn();
-    const archivedModel = buildTaskActionMenuModel({
-      task: makeTask({ column: "archived" }),
-      t,
-      columnLabel: columnLabel as any,
-      hasResetHandler: true,
-      onReset: vi.fn(),
-      onTogglePause: vi.fn(),
-      onDelete,
-    });
-
-    expect(archivedModel.actions.map((action) => action.id)).toEqual(["delete"]);
-    expect(archivedModel.actions.map((action) => action.id)).not.toContain("pause");
-    expect(archivedModel.actions.map((action) => action.id)).not.toContain("reset");
-    archivedModel.actions.find((action) => action.id === "delete")?.onSelect?.();
-    expect(onDelete).toHaveBeenCalledTimes(1);
   });
 
   it("renders descriptors and delegates selection to injected host handlers", () => {
@@ -274,6 +234,51 @@ describe("TaskContextMenu shared task action model", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
     expect(onActionSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "delete" }));
     expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps action markup unchanged when optional test and pressed metadata is absent", () => {
+    render(<TaskContextMenu actions={[{ id: "plain", label: "Plain action" }]} />);
+
+    const action = screen.getByRole("menuitem", { name: "Plain action" });
+    expect(action).not.toHaveAttribute("data-testid");
+    expect(action).not.toHaveAttribute("aria-pressed");
+  });
+
+  it("forwards test ids to action and note items without making notes selectable", () => {
+    const onActionSelect = vi.fn();
+    const onNoteSelect = vi.fn();
+    render(
+      <TaskContextMenu
+        actions={[
+          { id: "action", label: "Action", testId: "menu-action" },
+          { id: "note", label: "Section heading", tone: "note", testId: "menu-note", onSelect: onNoteSelect },
+        ]}
+        onActionSelect={onActionSelect}
+      />,
+    );
+
+    expect(screen.getByTestId("menu-action")).toHaveRole("menuitem", { name: "Action" });
+    const note = screen.getByTestId("menu-note");
+    expect(note).toHaveRole("note");
+    fireEvent.click(note);
+    expect(onActionSelect).not.toHaveBeenCalled();
+    expect(onNoteSelect).not.toHaveBeenCalled();
+  });
+
+  it("renders aria-pressed only when an action descriptor defines pressed", () => {
+    render(
+      <TaskContextMenu
+        actions={[
+          { id: "on", label: "On", pressed: true },
+          { id: "off", label: "Off", pressed: false },
+          { id: "unset", label: "Unset" },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("menuitem", { name: "On" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("menuitem", { name: "Off" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("menuitem", { name: "Unset" })).not.toHaveAttribute("aria-pressed");
   });
 
   it("selects enabled touch menu items on pointer release exactly once", () => {
@@ -318,5 +323,118 @@ describe("TaskContextMenu shared task action model", () => {
     expect(del).toHaveFocus();
     fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowDown" });
     expect(pause).toHaveFocus();
+  });
+
+  it("renders generic submenus without coupling them to task movement", () => {
+    const onSelect = vi.fn();
+    render(<TaskContextMenu actions={[{ id: "more", label: "More", items: [{ id: "nested", label: "Nested", onSelect }] }]} />);
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: "More" }), { key: "ArrowRight" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Nested" }));
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses one navigable Alpha menu with a native homemade Alpha submenu", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(<AlphaProvider enabled><AlphaBoundary><TaskContextMenu actions={[{ id: "pause", label: "Pause" }, { id: "delete", label: "Delete" }, { id: "more", label: "More", items: [{ id: "nested", label: "Nested", onSelect }] }]} /></AlphaBoundary></AlphaProvider>);
+    const pause = screen.getByRole("menuitem", { name: "Pause" });
+    const del = screen.getByRole("menuitem", { name: "Delete" });
+    pause.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(del).toHaveFocus();
+    const more = screen.getByRole("menuitem", { name: "More" });
+    more.focus();
+    await user.keyboard("{ArrowRight}");
+    const nested = await screen.findByRole("menuitem", { name: "Nested" });
+    expect(nested.closest('[data-alpha-ui="menu"]')?.querySelector('[data-alpha-ui="menu"]')).toBeNull();
+    await user.click(nested);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+});
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-30-10:20 (PR #2626 review — greptile P2):
+The intake-only vs intake+hold distinction, covered per workflow SHAPE rather than per column id.
+
+`shouldShowActionsMenu` follows the generated action list, so a pure intake lane remains an
+operator-recoverable planning stage rather than a hidden menu special case. Cover both trait and
+legacy fallbacks so first paint never withdraws the shared actions.
+*/
+describe("shouldShowActionsMenu by workflow shape (not by column id)", () => {
+  const model = (column: string, flags: Record<string, boolean>) =>
+    buildTaskActionMenuModel({
+      task: makeTask({ column: column as never }),
+      t,
+      currentColumnFlags: flags as never,
+    }).shouldShowActionsMenu;
+
+  it("SHOWS the menu on a Coding (Ideas) capture — intake with no hold, non-legacy id", () => {
+    expect(model("ideas", { intake: true })).toBe(true);
+  });
+
+  it("SHOWS the menu on a merged Planning column — intake AND hold", () => {
+    // Post-U11 the default Planning column carries both traits. Cards rest here waiting for
+    // capacity and do have real actions, so suppressing would remove affordances that existed
+    // when this was the separate `todo` lane.
+    expect(model("todo", { intake: true, hold: true })).toBe(true);
+  });
+
+  it("SHOWS the menu on a hold-only lane, as the pre-merge `todo` column did", () => {
+    expect(model("todo", { hold: true })).toBe(true);
+  });
+
+  it("SHOWS on a RENAMED pure-intake lane, proving no id is consulted", () => {
+    expect(model("backlog", { intake: true })).toBe(true);
+  });
+});
+
+/*
+FNXC:WorkflowLifecycleColumns 2026-07-30-08:00 (U12 — the last `triage` column guard):
+THE INVERSION. `isPreExecutionHoldColumn` ORed the legacy id with the traits unconditionally, so a
+resolved column merely NAMED `triage` answered true even when its own traits said work was underway
+— offering Plan, which re-plans, on a card that is already executing.
+
+The existing cases here all pass a column with no flags or with hold/intake set, so every one of them
+agrees under both the old and new form. That is why this defect survived the file's earlier
+conversion: nothing exercised a resolved column whose name and traits disagree.
+
+REVERT CHECK: restore the `column === "triage" ||` prefix and the first case fails — Plan reappears
+on a mid-flight card.
+*/
+describe("pre-execution hold resolves traits, not the column's name", () => {
+  it("does NOT treat a mid-flight column NAMED `triage` as a planning target", () => {
+    const model = buildTaskActionMenuModel({
+      task: makeTask({ column: "triage" }),
+      t,
+
+      currentColumnFlags: { intake: false, hold: false, countsTowardWip: true } as any,
+      onPlan: vi.fn(),
+    } as never);
+    expect(model.actions.map((a: { id: string }) => a.id)).not.toContain("plan");
+  });
+
+  it("still offers Plan on a RENAMED hold column", () => {
+    // The narrowing guard: traits decide, so a board that never uses the legacy name still works.
+    const model = buildTaskActionMenuModel({
+      task: makeTask({ column: "backlog" as never }),
+      t,
+
+      currentColumnFlags: { intake: true, hold: true } as any,
+      onPlan: vi.fn(),
+    } as never);
+    expect(model.actions.map((a: { id: string }) => a.id)).toContain("plan");
+  });
+
+  it("keeps the flagless degraded answer for `triage` and withholds it for flagless `todo`", () => {
+    /*
+    The asymmetry the file documents: with no flags, `triage` is the only pre-execution hold. A
+    flagless `todo` must NOT offer Plan, because re-planning an already-planned card is not
+    recoverable by the operator.
+    */
+    const forColumn = (column: string) =>
+      buildTaskActionMenuModel({ task: makeTask({ column: column as never }), t, onPlan: vi.fn() } as never)
+        .actions.map((a: { id: string }) => a.id);
+    expect(forColumn("triage")).toContain("plan");
+    expect(forColumn("todo")).not.toContain("plan");
   });
 });

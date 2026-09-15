@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsModal, SettingsView } from "../SettingsModal";
+import { __test_resetPendingUpdateInstall } from "../../hooks/usePendingUpdateInstall";
 import type { Settings } from "@fusion/core";
 
 
@@ -18,7 +19,6 @@ const defaultSettings = {
   directMergeCommitStrategy: "auto",
   pushAfterMerge: false,
   pushRemote: "origin",
-  recycleWorktrees: false,
   worktreeInitCommand: "",
   testCommand: "",
   buildCommand: "",
@@ -42,6 +42,7 @@ const defaultSettings = {
 
 vi.mock("../../api", () => ({
   fetchProjects: vi.fn(() => Promise.resolve([])),
+  fetchPlugins: vi.fn(() => Promise.resolve([])),
   fetchGitRemotes: vi.fn(() => Promise.resolve({ remotes: [] })),
   fetchGitRemotesDetailed: vi.fn(() => Promise.resolve([])),
   fetchGitBranches: vi.fn(() => Promise.resolve([])),
@@ -53,7 +54,11 @@ vi.mock("../../api", () => ({
     { id: "anthropic-subscription", name: "Anthropic Subscription", authenticated: false, type: "oauth" },
     { id: "anthropic-api-key", name: "Anthropic API Key", authenticated: false, type: "api_key" },
   ] })),
+  // FNXC:SettingsCredentialInstance 2026-08-01-17:06: Mobile Authentication uses the same default-or-named instance key as desktop so responsive rendering cannot collapse provider action state.
+  formatProviderInstanceKey: ({ providerId, instanceId }: { providerId: string; instanceId: string }) => instanceId === "default" ? providerId : `${providerId}[${instanceId}]`,
   loginProvider: vi.fn(() => Promise.resolve({ url: "https://auth.example.com/login" })),
+  submitProviderManualCode: vi.fn(() => Promise.resolve({ success: true, submitted: true })),
+  cancelProviderLogin: vi.fn(() => Promise.resolve({ success: true, cancelled: true })),
   logoutProvider: vi.fn(() => Promise.resolve({ success: true })),
   saveApiKey: vi.fn(() => Promise.resolve({ success: true })),
   clearApiKey: vi.fn(() => Promise.resolve({ success: true })),
@@ -64,7 +69,7 @@ vi.mock("../../api", () => ({
   deleteCustomProvider: vi.fn(() => Promise.resolve(undefined)),
   testNtfyNotification: vi.fn(() => Promise.resolve({ success: true })),
   testNotification: vi.fn(() => Promise.resolve({ success: true })),
-  fetchBackups: vi.fn(() => Promise.resolve({ count: 0, totalSize: 0, backups: [] })),
+  fetchBackups: vi.fn(() => Promise.resolve({ count: 0, totalSize: 0, backups: [], schedule: { enabled: false, cronExpression: "0 2 * * *", routineRegistered: false } })),
   createBackup: vi.fn(() => Promise.resolve({ success: true })),
   exportSettings: vi.fn(() => Promise.resolve({ version: 1, exportedAt: new Date().toISOString(), global: undefined, project: {} })),
   importSettings: vi.fn(() => Promise.resolve({ success: true, globalCount: 0, projectCount: 0 })),
@@ -113,10 +118,12 @@ vi.mock("../../api", () => ({
   })),
   fetchDashboardHealth: vi.fn(() => Promise.resolve({ status: "ok", version: "1.2.3", uptime: 120 })),
   checkForUpdates: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: "2.0.0", updateAvailable: true })),
+  checkForUpdate: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: "2.0.0", updateAvailable: true })),
   installUpdate: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: "2.0.0", updated: true })),
   fetchSystemInfo: vi.fn(() => Promise.resolve({ supervised: true, restartSupported: true })),
   requestSystemRestart: vi.fn(() => Promise.resolve({ scheduled: true })),
   fetchGlobalSettings: vi.fn(() => Promise.resolve({ ...defaultSettings })),
+  listDiscussionCategories: vi.fn(() => Promise.resolve({ categories: [] })),
   // SettingsModal renders ProjectDefaultWorkflowField → WorkflowSelector, which loads these on mount.
   fetchWorkflows: vi.fn(() => Promise.resolve([])),
   fetchProjectDefaultWorkflow: vi.fn(() => Promise.resolve({ workflowId: null })),
@@ -153,7 +160,7 @@ vi.mock("../../hooks/useMemoryBackendStatus", () => ({
   })),
 }));
 
-import { fetchDashboardHealth, fetchSettings, updateSettings } from "../../api";
+import { checkForUpdates, fetchAuthStatus, fetchDashboardHealth, fetchSettings, loginProvider, saveApiKey, updateSettings } from "../../api";
 
 function setDocumentHidden(hidden: boolean): void {
   Object.defineProperty(document, "hidden", { configurable: true, value: hidden });
@@ -161,6 +168,15 @@ function setDocumentHidden(hidden: boolean): void {
 }
 
 function mockSettingsViewport(matches: boolean): void {
+  /*
+  FNXC:ViewportMode 2026-07-24-02:20:
+  FN-8557 (973c978f9) made isMobileViewport treat `window.innerWidth <= 768` as a
+  mobile signal alongside matchMedia. Individual mobile tests here stamp
+  innerWidth=375 via defineProperty without restoring it, which leaked mobile
+  mode into later desktop assertions. The viewport mock now owns innerWidth in
+  both directions so each test's declared viewport is authoritative.
+  */
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: matches ? 375 : 1280 });
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -218,6 +234,37 @@ function expectNoMobileRule(css: string, selector: string, declaration: string):
   expect(offendingBlock).toBeUndefined();
 }
 
+/**
+ * Returns the full text of the first `@media` block whose body satisfies `predicate`.
+ *
+ * Note: this brace-matches from the block's OPENING brace outward (unlike `getMobileMediaBlocks`
+ * above, which starts its depth counter before the `@media` prelude and therefore terminates at the
+ * first character), so the returned string is the real block and assertions against it can fail.
+ */
+function findMediaBlock(css: string, predicate: (block: string) => boolean): string | undefined {
+  const mediaPattern = /@media[^{]*\{/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = mediaPattern.exec(css)) !== null) {
+    const open = match.index + match[0].length - 1;
+    let depth = 0;
+    let end = open;
+    for (; end < css.length; end += 1) {
+      if (css[end] === "{") depth += 1;
+      if (css[end] === "}") depth -= 1;
+      if (depth === 0) {
+        end += 1;
+        break;
+      }
+    }
+    const block = css.slice(match.index, end);
+    if (predicate(block)) return block;
+    mediaPattern.lastIndex = end;
+  }
+
+  return undefined;
+}
+
 function expectBaseRule(css: string, selector: string, declaration: string): void {
   const pattern = new RegExp(
     `${escapeRegExp(selector)}\\s*\\{[^}]*${escapeRegExp(declaration)}`,
@@ -227,6 +274,7 @@ function expectBaseRule(css: string, selector: string, declaration: string): voi
 
 describe("SettingsModal mobile adaptations", () => {
   beforeEach(() => {
+    __test_resetPendingUpdateInstall();
     vi.clearAllMocks();
     setDocumentHidden(false);
     localStorage.removeItem("fusion_github_star_count");
@@ -243,9 +291,9 @@ describe("SettingsModal mobile adaptations", () => {
     const { container } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-    expect(container.querySelector(".settings-layout")).toBeTruthy();
-    expect(container.querySelector(".settings-sidebar")).toBeTruthy();
-    expect(container.querySelector(".settings-content")).toBeTruthy();
+    expect(document.querySelector(".settings-layout")).toBeTruthy();
+    expect(document.querySelector(".settings-sidebar")).toBeTruthy();
+    expect(document.querySelector(".settings-content")).toBeTruthy();
   });
 
   /*
@@ -265,7 +313,7 @@ describe("SettingsModal mobile adaptations", () => {
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
     const resetBtn = await findByTestId("settings-reset");
-    expect(container.querySelector(".modal-actions")?.contains(resetBtn)).toBe(true);
+    expect(document.querySelector(".modal-actions")?.contains(resetBtn)).toBe(true);
     expect(resetBtn).toHaveTextContent(/^Reset$/);
     expect(resetBtn).not.toHaveTextContent("Reset Settings");
 
@@ -314,8 +362,8 @@ describe("SettingsModal mobile adaptations", () => {
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
     const version = await findByText("v1.2.3");
-    const modalActions = container.querySelector(".modal-actions");
-    const modalHeader = container.querySelector(".modal-header");
+    const modalActions = document.querySelector(".modal-actions");
+    const modalHeader = document.querySelector(".modal-header");
 
     expect(version).toBeTruthy();
     expect(queryByText("Version 1.2.3")).toBeNull();
@@ -331,7 +379,7 @@ describe("SettingsModal mobile adaptations", () => {
     const version = await findByText("Version 1.2.3");
     expect(version).toBeTruthy();
     expect(queryByText("v1.2.3")).toBeNull();
-    expect(container.querySelector(".modal-actions")?.contains(version)).toBe(true);
+    expect(document.querySelector(".modal-actions")?.contains(version)).toBe(true);
   });
 
   it("keeps update-check button clickable from the standalone and embedded mobile footers", async () => {
@@ -340,7 +388,7 @@ describe("SettingsModal mobile adaptations", () => {
     const standalone = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-    const standaloneActions = standalone.container.querySelector(".settings-modal:not(.settings-modal--embedded) .modal-actions");
+    const standaloneActions = document.querySelector(".settings-modal:not(.settings-modal--embedded) .modal-actions");
     expect(standaloneActions).toBeTruthy();
 
     const standaloneUpdateButton = within(standaloneActions as HTMLElement).getByRole("button", { name: "Check for updates" });
@@ -353,7 +401,7 @@ describe("SettingsModal mobile adaptations", () => {
     const embedded = render(<SettingsView onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-    const embeddedActions = embedded.container.querySelector(".settings-modal--embedded .modal-actions");
+    const embeddedActions = document.querySelector(".settings-modal--embedded .modal-actions");
     expect(embeddedActions).toBeTruthy();
     const embeddedUpdateButton = within(embeddedActions as HTMLElement).getByRole("button", { name: "Check for updates" });
     await user.click(embeddedUpdateButton);
@@ -367,12 +415,34 @@ describe("SettingsModal mobile adaptations", () => {
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     await waitFor(() => expect(fetchDashboardHealth).toHaveBeenCalled());
 
-    const modalActions = container.querySelector(".settings-modal:not(.settings-modal--embedded) .modal-actions");
+    const modalActions = document.querySelector(".settings-modal:not(.settings-modal--embedded) .modal-actions");
     expect(modalActions).toBeTruthy();
     expect(within(modalActions as HTMLElement).getByRole("link", { name: "Help and discussions" })).toBeTruthy();
     expect(queryByRole("button", { name: "Check for updates" })).toBeNull();
-    expect(container.querySelector(".settings-modal-footer-version")).toBeTruthy();
-    expect(container.querySelector(".settings-update-check")).toBeTruthy();
+    expect(document.querySelector(".settings-modal-footer-version")).toBeTruthy();
+    expect(document.querySelector(".settings-update-check")).toBeTruthy();
+  });
+
+  it("renders managed update guidance without an update-now shell in the mobile footer", async () => {
+    mockSettingsViewport(true);
+    vi.mocked(checkForUpdates).mockResolvedValueOnce({
+      currentVersion: "1.2.3",
+      latestVersion: null,
+      updateAvailable: false,
+      disabled: true,
+      externallyManaged: true,
+      message: "Managed deployment updates must be installed through its release pipeline.",
+    });
+    const user = userEvent.setup();
+    const { findByText, queryByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+
+    const modalActions = document.querySelector(".modal-actions");
+    await user.click(within(modalActions as HTMLElement).getByRole("button", { name: "Check for updates" }));
+
+    expect(await findByText(/Managed deployment updates/)).toBeTruthy();
+    expect(queryByRole("button", { name: "Update now" })).toBeNull();
+    expect(document.querySelector(".settings-update-now-btn")).toBeNull();
   });
 
   it("keeps update-now button reachable from the mobile footer", async () => {
@@ -381,15 +451,43 @@ describe("SettingsModal mobile adaptations", () => {
     const { container, findByRole, findByText } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-    const modalActions = container.querySelector(".modal-actions");
+    const modalActions = document.querySelector(".modal-actions");
     expect(modalActions).toBeTruthy();
 
     await user.click(within(modalActions as HTMLElement).getByRole("button", { name: "Check for updates" }));
     const updateNow = await findByRole("button", { name: "Update now" });
-    expect((modalActions as HTMLElement).contains(updateNow)).toBe(true);
+
+    /*
+    The mobile footer rail is a single nowrap horizontal scroller, so the update banner must live in its own
+    full-width row directly above it — inside the rail it clipped itself and pushed Import/Export/Reset/Close
+    off-screen. Assert both halves of that invariant: banner outside the rail, banner present in the footer row.
+    */
+    const updateRow = document.querySelector(".settings-modal-footer-update-row");
+    expect(updateRow).toBeTruthy();
+    expect((updateRow as HTMLElement).contains(updateNow)).toBe(true);
+    expect((modalActions as HTMLElement).contains(updateNow)).toBe(false);
+    expect(modalActions?.querySelector(".settings-update-result")).toBeNull();
+    expect(updateRow?.nextElementSibling).toBe(modalActions);
 
     await user.click(updateNow);
     expect(await findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeTruthy();
+  });
+
+  it("keeps the update result inline in the footer rail on desktop", async () => {
+    mockSettingsViewport(false);
+    const user = userEvent.setup();
+    const { container, findByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+
+    const modalActions = document.querySelector(".modal-actions");
+    expect(modalActions).toBeTruthy();
+
+    await user.click(within(modalActions as HTMLElement).getByRole("button", { name: "Check for updates" }));
+    const updateNow = await findByRole("button", { name: "Update now" });
+
+    expect(document.querySelector(".settings-modal-footer-update-row")).toBeNull();
+    expect((modalActions as HTMLElement).contains(updateNow)).toBe(true);
+    expect(document.querySelector(".settings-update-check .settings-update-result")).toBeTruthy();
   });
 
   it("preserves the mobile section picker accessible name without rendering a visible label", async () => {
@@ -400,8 +498,9 @@ describe("SettingsModal mobile adaptations", () => {
     const picker = getByLabelText("Settings Section") as HTMLSelectElement;
     expect(picker.id).toBe("settings-mobile-section");
     expect(picker.getAttribute("aria-label")).toBe("Settings Section");
-    expect(container.querySelector('label[for="settings-mobile-section"]')).toBeNull();
+    expect(document.querySelector('label[for="settings-mobile-section"]')).toBeNull();
     expect(queryByText("Settings Section", { selector: "label" })).toBeNull();
+    expect(picker.closest(".settings-mobile-section-picker")?.querySelector(".settings-scope-icon")).toBeNull();
   });
 
   /*
@@ -429,7 +528,25 @@ describe("SettingsModal mobile adaptations", () => {
 
     await user.selectOptions(picker, "cli-binary");
     expect(await findByText(/Installing the global CLI lets you run fn and fusion/)).toBeTruthy();
-    expect(container.querySelector(".cli-binary-panel")).toBeTruthy();
+    expect(document.querySelector(".cli-binary-panel")).toBeTruthy();
+  });
+
+  it("keeps Remote Access in the Basic-mode Infrastructure picker without an empty group", async () => {
+    localStorage.removeItem("fusion:settings:show-advanced");
+    mockSettingsViewport(true);
+    const user = userEvent.setup();
+    const { getByLabelText, getByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+
+    expect(getByRole("checkbox", { name: "Advanced settings" })).not.toBeChecked();
+    const picker = getByLabelText("Settings Section") as HTMLSelectElement;
+    const remoteOptions = Array.from(picker.options).filter((option) => option.value === "remote");
+    expect(remoteOptions).toHaveLength(1);
+    expect(remoteOptions[0]?.parentElement).toHaveAttribute("label", "Infrastructure");
+    expect(picker.querySelector('optgroup[label="Infrastructure"] option')).not.toBeNull();
+
+    await user.selectOptions(picker, "remote");
+    expect(getByRole("heading", { name: "Remote Access" })).toBeInTheDocument();
   });
 
   it("excludes research sections from mobile picker when researchView is disabled", async () => {
@@ -539,7 +656,6 @@ describe("SettingsModal mobile adaptations", () => {
     expect(queryByLabelText("Push Remote")).toBeNull();
     expect(queryByText("Git remote to push to")).toBeNull();
 
-    await user.click(getByRole("button", { name: "Save" }));
     await waitFor(() => expect(updateSettings).toHaveBeenCalled());
 
     const payload = vi.mocked(updateSettings).mock.calls[0][0] as Record<string, unknown>;
@@ -593,9 +709,9 @@ describe("SettingsModal mobile adaptations", () => {
     const { container } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-    const navItems = container.querySelectorAll(".settings-nav-item");
+    const navItems = document.querySelectorAll(".settings-nav-item");
     expect(navItems.length).toBeGreaterThan(0);
-    expect(container.querySelector(".settings-nav-item.active")).toBeTruthy();
+    expect(document.querySelector(".settings-nav-item.active")).toBeTruthy();
   });
 
   it("renders form controls inside settings-content for 16px mobile targeting", async () => {
@@ -613,7 +729,7 @@ describe("SettingsModal mobile adaptations", () => {
     const generalTabs = await findAllByText("General · Project");
     await user.click(generalTabs[0]);
 
-    const controls = container.querySelectorAll(".settings-content input, .settings-content select, .settings-content textarea");
+    const controls = document.querySelectorAll(".settings-content input, .settings-content select, .settings-content textarea");
     expect(controls.length).toBeGreaterThan(0);
   });
 
@@ -627,19 +743,19 @@ describe("SettingsModal mobile adaptations", () => {
     const { container, getByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-    expect(container.querySelectorAll(".settings-scope-icon").length).toBeGreaterThan(0);
+    expect(document.querySelectorAll(".settings-scope-icon").length).toBeGreaterThan(0);
 
     await user.click(getByRole("button", { name: /Appearance$/ }));
 
     // The banner is gone for good — it asserted a single scope for a section
     // that genuinely mixes them.
-    expect(container.querySelector(".settings-scope-banner")).toBeNull();
-    expect(container.querySelector(".settings-scope-project")).toBeNull();
-    expect(container.querySelector(".settings-scope-global")).toBeNull();
+    expect(document.querySelector(".settings-scope-banner")).toBeNull();
+    expect(document.querySelector(".settings-scope-project")).toBeNull();
+    expect(document.querySelector(".settings-scope-global")).toBeNull();
 
     // Appearance is exactly the mixed case: global theme controls above,
     // project-scoped task-presentation toggles below, each badged for itself.
-    const badges = container.querySelectorAll('[data-testid="settings-field-row-scope"]');
+    const badges = document.querySelectorAll('[data-testid="settings-field-row-scope"]');
     expect(badges.length).toBeGreaterThan(0);
     expect(Array.from(badges).map((b) => b.textContent)).toContain("project");
   });
@@ -654,10 +770,47 @@ describe("SettingsModal mobile adaptations", () => {
 
     const subscriptionCard = (await findByTestId("auth-provider-icon-anthropic-subscription")).closest(".auth-provider-card") as HTMLElement;
     const apiKeyCard = (await findByTestId("auth-provider-icon-anthropic-api-key")).closest(".auth-provider-card") as HTMLElement;
-    expect(within(subscriptionCard).getByRole("button", { name: "Login" })).toBeTruthy();
+    await user.click(within(subscriptionCard).getByRole("button", { name: "Login" }));
+    expect(loginProvider).toHaveBeenCalledWith("anthropic-subscription");
     expect(within(subscriptionCard).queryByPlaceholderText("Enter API key")).toBeNull();
-    expect(within(apiKeyCard).getByPlaceholderText("Enter API key")).toBeTruthy();
-    expect(within(apiKeyCard).getByRole("button", { name: "Save" })).toBeTruthy();
+    await user.type(within(apiKeyCard).getByPlaceholderText("Enter API key"), "sk-mobile");
+    await user.click(within(apiKeyCard).getByRole("button", { name: "Save" }));
+    expect(saveApiKey).toHaveBeenCalledWith("anthropic-api-key", "sk-mobile");
+  });
+
+  it.each([
+    ["modal", (props: { onClose: () => void; addToast: () => void }) => <SettingsModal {...props} />],
+    ["embedded", (props: { onClose: () => void; addToast: () => void }) => <SettingsView {...props} />],
+  ])("keeps the Anthropic OAuth loginError banner inside the card on mobile %s Settings", async (_surface, Surface) => {
+    mockSettingsViewport(true);
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });
+    vi.mocked(fetchAuthStatus).mockResolvedValue({
+      providers: [
+        {
+          id: "anthropic-subscription",
+          name: "Anthropic Subscription",
+          authenticated: false,
+          type: "oauth",
+          expired: true,
+          loginError: "This OAuth session expired and could not be refreshed. Re-login to restore model access.",
+        },
+        { id: "anthropic-api-key", name: "Anthropic API Key", authenticated: false, type: "api_key" },
+      ],
+    } as Awaited<ReturnType<typeof fetchAuthStatus>>);
+
+    const user = userEvent.setup();
+    const { findByTestId, getByLabelText } = render(<Surface onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    await user.selectOptions(getByLabelText("Settings Section"), "authentication");
+
+    const subscriptionCard = (await findByTestId("auth-provider-icon-anthropic-subscription")).closest(".auth-provider-card") as HTMLElement;
+    const alert = within(subscriptionCard).getByRole("alert");
+    const header = subscriptionCard.querySelector(".auth-provider-header");
+    expect(alert).toHaveClass("auth-provider-login-error");
+    expect(alert).toHaveTextContent("Re-login to restore model access");
+    expect(header).not.toContainElement(alert);
+    expect(header?.nextElementSibling).toBe(alert);
+    expect(subscriptionCard.querySelector(".auth-provider-actions")).toBeTruthy();
   });
 
   it("renders notification provider cards responsively on mobile", async () => {
@@ -671,7 +824,7 @@ describe("SettingsModal mobile adaptations", () => {
 
     expect(await findByText("ntfy")).toBeTruthy();
     expect(await findByText("Webhook")).toBeTruthy();
-    expect(container.querySelectorAll(".notification-provider-card").length).toBeGreaterThan(1);
+    expect(document.querySelectorAll(".notification-provider-card").length).toBeGreaterThan(1);
   });
 
   it("keeps the GitHub star count visible in the mobile Settings header", async () => {
@@ -685,7 +838,7 @@ describe("SettingsModal mobile adaptations", () => {
 
     const modalRender = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
-    const modalCount = modalRender.container.querySelector(".settings-github-star-btn__count");
+    const modalCount = document.querySelector(".settings-github-star-btn__count");
     expect(modalCount).toBeTruthy();
     expect(modalCount?.textContent).toBe("1.2k");
     modalRender.unmount();
@@ -693,7 +846,7 @@ describe("SettingsModal mobile adaptations", () => {
     vi.mocked(fetchSettings).mockClear();
     const embeddedRender = render(<SettingsView onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
-    const embeddedCount = embeddedRender.container.querySelector(".settings-github-star-btn__count");
+    const embeddedCount = document.querySelector(".settings-github-star-btn__count");
     expect(embeddedCount).toBeTruthy();
     expect(embeddedCount?.textContent).toBe("1.2k");
     embeddedRender.unmount();
@@ -716,10 +869,10 @@ describe("SettingsModal mobile adaptations", () => {
     const renderResult = render(<Surface onClose={vi.fn()} addToast={vi.fn()} />);
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     await waitFor(() => expect(githubFetch).toHaveBeenCalledTimes(1));
-    expect(renderResult.container.querySelector(".settings-github-star-btn__count")?.textContent).toBe("999");
+    expect(document.querySelector(".settings-github-star-btn__count")?.textContent).toBe("999");
 
     resolveGitHubFetch?.({ ok: true, json: async () => ({ stargazers_count: 123 }) } as Response);
-    await waitFor(() => expect(renderResult.container.querySelector(".settings-github-star-btn__count")?.textContent).toBe("123"));
+    await waitFor(() => expect(document.querySelector(".settings-github-star-btn__count")?.textContent).toBe("123"));
     renderResult.unmount();
   });
 
@@ -742,7 +895,7 @@ describe("SettingsModal mobile adaptations", () => {
 
     setDocumentHidden(false);
     document.dispatchEvent(new Event("visibilitychange"));
-    await waitFor(() => expect(renderResult.container.querySelector(".settings-github-star-btn__count")?.textContent).toBe("456"));
+    await waitFor(() => expect(document.querySelector(".settings-github-star-btn__count")?.textContent).toBe("456"));
     expect(githubFetch).toHaveBeenCalledTimes(1);
     renderResult.unmount();
   });
@@ -783,14 +936,27 @@ describe("SettingsModal mobile adaptations", () => {
     expectMobileRule(css, ".settings-modal .modal-actions", "padding-block: var(--space-xs);");
     expectMobileRule(css, ".settings-modal .modal-actions", "flex-wrap: nowrap;");
     expectMobileRule(css, ".settings-modal .modal-actions", "align-items: center;");
+    // Mobile footer is a centered button cluster (not the desktop left/right edge split).
+    expectMobileRule(css, ".settings-modal .modal-actions", "justify-content: center;");
+    expectMobileRule(css, ".settings-modal .modal-actions", "justify-content: safe center;");
+    expectMobileRule(css, ".settings-modal .modal-actions", "gap: var(--space-sm);");
     expectMobileRule(css, ".settings-modal .modal-actions", "overflow-x: auto;");
     expectMobileRule(css, ".settings-modal .modal-actions-left", "align-items: center;");
+    expectMobileRule(css, ".settings-modal .modal-actions-left", "margin-right: 0;");
+    expectMobileRule(css, ".settings-modal .modal-actions-left", "gap: var(--space-xs);");
     expectMobileRule(css, ".settings-modal .modal-actions-right", "align-items: center;");
+    expectMobileRule(css, ".settings-modal .modal-actions-right", "margin-left: 0;");
+    expectMobileRule(css, ".settings-modal .modal-actions-right", "gap: var(--space-xs);");
     expectMobileRule(css, ".settings-modal .settings-modal-footer-version", "align-self: center;");
     expectMobileRule(css, ".settings-modal .settings-modal-footer-version", "flex: 0 0 auto;");
     expectMobileRule(css, ".settings-modal .settings-modal-footer-version", "min-width: max-content;");
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-version", "margin-right: 0;");
     expectMobileRule(css, ".settings-modal .settings-update-check", "align-items: center;");
     expectMobileRule(css, ".settings-modal .settings-update-check", "flex-wrap: wrap;");
+    // The update banner owns a full-width row above the nowrap footer rail, and the rail drops its duplicate divider.
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-update-row", "border-top: 1px solid var(--border);");
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-update-row", "justify-content: center;");
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-update-row + .modal-actions", "border-top: none;");
     expectMobileRule(css, ".settings-modal .settings-version-check-btn", "line-height: 1;");
     expectMobileRule(css, ".settings-modal .settings-version-check-btn", "white-space: nowrap;");
     expectMobileRule(css, ".settings-modal .settings-modal-version", "display: inline-flex;");
@@ -806,7 +972,12 @@ describe("SettingsModal mobile adaptations", () => {
     // Custom Provider cards render outside .auth-panel-body and retain their mobile gutter.
     expectMobileRule(css, ".auth-provider-card", "margin: 0 var(--space-sm) var(--space-sm);");
     expectMobileRule(css, ".auth-provider-header", "padding: var(--space-sm);");
-    expectMobileRule(css, ".auth-provider-header > div:not(.auth-provider-info):not(.auth-apikey-section)", "margin-left: auto;");
+    expectMobileRule(css, ".auth-provider-header > div:not(.auth-provider-info):not(.auth-apikey-section):not(.auth-provider-actions)", "margin-left: auto;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "width: 100%;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "flex-basis: 100%;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "min-width: 0;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "max-width: 100%;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "margin-left: 0;");
     expectMobileRule(css, ".auth-apikey-section", "align-items: flex-end;");
     expectMobileRule(css, ".auth-apikey-input-row", "justify-content: flex-end;");
     expectMobileRule(css, ".auth-apikey-input-row .btn", "margin-left: auto;");
@@ -840,6 +1011,49 @@ describe("SettingsModal mobile adaptations", () => {
     // Settings header actions keep compact controls on a shared height contract on desktop; mobile inherits this height (FN-4354 reverted prior mobile inflation).
     expectBaseRule(css, ".settings-header-actions", "--settings-header-action-height: calc(var(--space-md) * 2 + var(--space-xs) / 2);");
     expectBaseRule(css, ".settings-header-actions > .settings-header-discord-btn", "height: var(--settings-header-action-height);");
+  });
+
+  it("makes the mobile settings footer rail touch-scrollable at both mobile orientations", () => {
+    const css = loadAllAppCss();
+
+    /*
+    Surface enumeration for "the footer scrolls horizontally on touch, but only when it overflows":
+      1. the media query gating the footer must be the app-wide mobile breakpoint (portrait width AND
+         landscape height), because SettingsModal.tsx picks the mobile footer markup off that same query;
+      2. the rail itself must opt back into horizontal panning past the global `* { touch-action: pan-y }`;
+      3. every touch target INSIDE the rail must opt in too (touch-action is not inherited, and the buttons
+         cover most of the rail's surface);
+      4. scrolling stays conditional — `overflow-x: auto`, never `scroll`, so a fitting cluster has no
+         scroll range and keeps its centered layout;
+      5. the non-shrinking button groups must escape the mobile `* { max-width: 100% }` reset, otherwise the
+         rail has nothing wider than itself to scroll to.
+    Both presentations (standalone modal + embedded SettingsView) share these `.settings-modal` selectors.
+    */
+    const footerBlock = findMediaBlock(css, (block) => /\.settings-modal \.modal-actions\s*\{[^}]*overflow-x:/.test(block));
+    expect(footerBlock).toBeTruthy();
+
+    // 1. Landscape phones (width > 768px, height <= 480px) resolve to viewportMode "mobile" in TSX.
+    const footerQuery = footerBlock!.slice(0, footerBlock!.indexOf("{"));
+    expect(footerQuery).toContain("max-width: 768px");
+    expect(footerQuery).toContain("max-height: 480px");
+
+    const railRule = footerBlock!.match(/\.settings-modal \.modal-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+    // 2 + 4.
+    expect(railRule).toContain("touch-action: pan-x pan-y;");
+    expect(railRule).toContain("overscroll-behavior-x: contain;");
+    expect(railRule).toContain("-webkit-overflow-scrolling: touch;");
+    expect(railRule).toContain("overflow-x: auto;");
+    expect(railRule).not.toContain("overflow-x: scroll;");
+
+    // 3.
+    const targetsRule = footerBlock!.match(/\.settings-modal \.modal-actions \*\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(targetsRule).toContain("touch-action: pan-x pan-y;");
+
+    // 5.
+    for (const selector of [".settings-modal .modal-actions-left", ".settings-modal .modal-actions-right", ".settings-modal .settings-modal-footer-version"]) {
+      const groupRule = footerBlock!.match(new RegExp(`${escapeRegExp(selector)}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+      expect(groupRule).toContain("max-width: none;");
+    }
   });
 
   it("FN-4354: settings header actions and modal-close have no mobile touch-target inflation", () => {
@@ -944,7 +1158,7 @@ describe("SettingsModal mobile adaptations", () => {
       expect(getByTestId("settings-search-input")).toBeTruthy();
       expect(queryByLabelText("Show search")).toBeNull();
       expect(queryByLabelText("Hide search")).toBeNull();
-      expect(container.querySelector(".settings-mobile-section-picker .settings-search-toggle")).toBeNull();
+      expect(document.querySelector(".settings-mobile-section-picker .settings-search-toggle")).toBeNull();
     });
 
     it("keeps the inline toggle reachable when mobile search has no section results", async () => {
@@ -989,7 +1203,8 @@ describe("SettingsModal mobile adaptations", () => {
       const scopedPairs = [
         ["global-models", "project-models"],
         ["research-global", "research-project"],
-        ["scheduling-global", "scheduling"],
+        // FNXC:CapacityModel 2026-07-29-00:40: scheduling is no longer a scoped PAIR —
+        // its global half hosted only the deleted machine-wide concurrency cap.
         ["source-control-global", "source-control"],
         ["backups-global", "backups"],
       ];
@@ -997,7 +1212,6 @@ describe("SettingsModal mobile adaptations", () => {
       const visibleScopedPairs = scopedPairs.filter(([globalId, projectId]) => optionIds.includes(globalId) && optionIds.includes(projectId));
       expect(visibleScopedPairs).toEqual(expect.arrayContaining([
         ["global-models", "project-models"],
-        ["scheduling-global", "scheduling"],
         ["source-control-global", "source-control"],
       ]));
       for (const [globalId, projectId] of visibleScopedPairs) {
@@ -1038,8 +1252,8 @@ describe("SettingsModal mobile adaptations", () => {
       await user.clear(getByTestId("settings-search-input"));
       await user.type(getByTestId("settings-search-input"), "zzzzzz-no-match");
       await findByText("No sections match this search.");
-      expect(container.querySelector("#settings-mobile-section")).toBeNull();
-      expect(container.querySelector(".settings-mobile-section-picker optgroup")).toBeNull();
+      expect(document.querySelector("#settings-mobile-section")).toBeNull();
+      expect(document.querySelector(".settings-mobile-section-picker optgroup")).toBeNull();
     });
 
     it("leaves desktop navigation as the sidebar without a mobile picker", async () => {
@@ -1047,8 +1261,8 @@ describe("SettingsModal mobile adaptations", () => {
       const { container } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
       await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
 
-      expect(container.querySelector(".settings-sidebar")).toBeTruthy();
-      expect(container.querySelector(".settings-mobile-section-picker")).toBeNull();
+      expect(document.querySelector(".settings-sidebar")).toBeTruthy();
+      expect(document.querySelector(".settings-mobile-section-picker")).toBeNull();
     });
   });
 });

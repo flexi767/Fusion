@@ -24,7 +24,10 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # FNXC:Release 2026-07-23-23:05: 45 min (was 30): the desktop pnpm-deploy closure staging
+    # inside the CLI full-package build can take >10 min alone on cold-store macOS runners
+    # (killed every v0.73.0-beta.* bun-darwin-arm64 leg); tsup now allows it 30 min.
+    timeout-minutes: 45
     # Job-level env so the signing steps' `if:` can detect whether the
     # signing certificate secrets are configured (secrets can't be read in `if:` directly).
     env:
@@ -52,7 +55,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node and install dependencies
         uses: ./.github/actions/setup-node-pnpm
@@ -152,7 +155,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ matrix.binary }}
           path: |
@@ -173,7 +176,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node and install dependencies
         uses: ./.github/actions/setup-node-pnpm
@@ -197,7 +200,10 @@ jobs:
         # FNXC:UpdateChannels 2026-07-19-13:30: beta tags (v*-beta.N) build with
         # publish.channel=beta so electron-builder emits beta*.yml update manifests;
         # beta-channel desktop installs read those, stable installs keep latest*.yml.
-        run: pnpm --filter @fusion/desktop exec electron-builder --projectDir deploy --win --publish never ${{ contains(github.ref_name, '-beta') && '-c.publish.channel=beta' || '' }}
+        # FNXC:UpdateChannels 2026-07-23-21:35: the flag must be quoted on Windows —
+        # pwsh tokenizes bare `-c.publish.channel=beta` into `-c` + `.publish.channel=beta`,
+        # which electron-builder then reads as a config FILE path (ENOENT, v0.73.0-beta.5).
+        run: pnpm --filter @fusion/desktop exec electron-builder --projectDir deploy --win --publish never ${{ contains(github.ref_name, '-beta') && '"-c.publish.channel=beta"' || '' }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -221,7 +227,7 @@ jobs:
           }
 
       - name: Upload desktop Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fusion-desktop-windows
           path: |
@@ -238,7 +244,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node and install dependencies
         uses: ./.github/actions/setup-node-pnpm
@@ -325,7 +331,7 @@ jobs:
           done
 
       - name: Upload desktop macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fusion-desktop-macos
           path: |
@@ -344,7 +350,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node and install dependencies
         uses: ./.github/actions/setup-node-pnpm
@@ -416,7 +422,7 @@ jobs:
           done
 
       - name: Upload desktop Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           # Single glob set covers both linux-x64 and linux-arm64 artifact filenames.
           name: fusion-desktop-linux
@@ -460,7 +466,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node and install dependencies
         uses: ./.github/actions/setup-node-pnpm
@@ -468,13 +474,13 @@ jobs:
       # FNXC:MobileAndroidBuild 2026-06-28-00:00:
       # Capacitor 7 @capacitor/android compiles its Android library with JavaVersion.VERSION_21; release APK/AAB Gradle builds must provision JDK 21 because JDK 17 fails with `invalid source release: 21`.
       - name: Setup Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6.0.0
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Android Gradle caches
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -575,7 +581,7 @@ jobs:
           done
 
       - name: Upload Android artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fusion-android-apk
           path: |
@@ -606,13 +612,13 @@ jobs:
       # binaries on v0.47.0 even though every bun build leg succeeded. Sparse-checkout
       # only CHANGELOG.md to keep the job lean; no submodules or full history needed.
       - name: Checkout CHANGELOG for release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           sparse-checkout: CHANGELOG.md
           sparse-checkout-cone-mode: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -676,7 +682,7 @@ jobs:
       # of truth so tag-push-triggered binary builds do the right thing.
       - name: Create GitHub Release
         if: ${{ steps.collect.outputs.count != '0' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: /tmp/release-notes.md
           fail_on_unmatched_files: true

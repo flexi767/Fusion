@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { OverflowViewKey } from "../overflowViewRegistry";
+import { useCallback, useState } from "react";
 import {
   RightDock,
+  persistRightDockViewSelection,
+  readStoredRightDockView,
   RIGHT_DOCK_OPEN_STORAGE_KEY,
   RIGHT_DOCK_PINNED_STORAGE_KEY,
   RIGHT_DOCK_VIEW_STORAGE_KEY,
@@ -13,13 +17,20 @@ import {
 } from "../RightDock";
 import { RightDockExpandModal } from "../RightDockExpandModal";
 import { useRightDockController, type RightDockControllerInput } from "../useRightDockController";
-import { DOCK_FILES_CURRENT_KEY } from "../DockFilesView";
-import { setScopedItem } from "../../utils/projectStorage";
+import { AppFilesModal, openAppFileInBrowser } from "../AppModals";
+import { useModalManager } from "../../hooks/useModalManager";
+
+const { taskDetailRenderSpy, fetchWorkspaceFileListMock, fetchWorkspaceFileContentMock } = vi.hoisted(() => ({
+  taskDetailRenderSpy: vi.fn(),
+  fetchWorkspaceFileListMock: vi.fn(),
+  fetchWorkspaceFileContentMock: vi.fn(),
+}));
 
 vi.mock("../TaskDetailModal", () => ({
-  TaskDetailContent: ({ task }: { task: { id: string; title?: string } }) => (
-    <div data-testid="dock-task-detail">{task.title ?? task.id}</div>
-  ),
+  TaskDetailContent: ({ task, projectId }: { task: { id: string; title?: string }; projectId?: string }) => {
+    taskDetailRenderSpy({ taskId: task.id, title: task.title, projectId });
+    return <div data-testid="dock-task-detail">{task.title ?? task.id}</div>;
+  },
 }));
 
 vi.mock("../TaskCard", () => ({
@@ -34,7 +45,8 @@ vi.mock("../../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api")>();
   return {
     ...actual,
-    fetchWorkspaceFileList: vi.fn().mockResolvedValue({ entries: [], currentPath: "." }),
+    fetchWorkspaceFileList: fetchWorkspaceFileListMock,
+    fetchWorkspaceFileContent: fetchWorkspaceFileContentMock,
   };
 });
 
@@ -45,23 +57,43 @@ const renderProps = {
 
 const rightDockCss = readFileSync(resolve(__dirname, "../RightDock.css"), "utf8");
 
-function TestRightDock(props: Omit<RightDockProps, "pinned" | "onTogglePin"> & Partial<Pick<RightDockProps, "pinned" | "onTogglePin">>) {
-  return <RightDock pinned={false} onTogglePin={vi.fn()} {...props} />;
+/*
+FN-382: the selected tool is owned OUTSIDE the dock (useRightDockController) so navigation can open one from
+elsewhere. This harness mirrors that owner — initial value read from storage, persisted on change — so these tests
+exercise the real controlled contract rather than a second, dock-local source of truth.
+*/
+function TestRightDock(props: Omit<RightDockProps, "pinned" | "onTogglePin" | "selectedKey" | "onSelectKey"> & Partial<Pick<RightDockProps, "pinned" | "onTogglePin" | "selectedKey" | "onSelectKey">>) {
+  const { selectedKey: controlledKey, onSelectKey, visibilityOptions, ...rest } = props;
+  const [ownedKey, setOwnedKey] = useState<OverflowViewKey>(() => readStoredRightDockView(visibilityOptions ?? {}));
+  const selectedKey = controlledKey ?? ownedKey;
+  const handleSelect = useCallback((key: OverflowViewKey) => {
+    setOwnedKey(key);
+    persistRightDockViewSelection(key);
+    onSelectKey?.(key);
+  }, [onSelectKey]);
+  return (
+    <RightDock
+      pinned={false}
+      onTogglePin={vi.fn()}
+      visibilityOptions={visibilityOptions}
+      selectedKey={selectedKey}
+      onSelectKey={handleSelect}
+      {...rest}
+    />
+  );
 }
 
 /*
 FNXC:Navigation 2026-06-22-16:00:
-The right dock is now an all-inline tools rail sourced from STATIC_OVERFLOW_VIEW_ENTRIES in overflowViewRegistry. The roster, in registry order, is tasks, files, chat, activity-log, git-manager, devserver (gated on devServerView), secrets, todos (gated on todosEnabled), pull-requests. The earlier usage/github-import/automation launcher actions were removed, so every visible tab is an inline view that switches the dock body and can expand into the modal.
+The right dock is an all-inline tools rail sourced from STATIC_OVERFLOW_VIEW_ENTRIES. Todos is plugin-provided, so it appears only in the project-enabled plugin view list rather than as a static entry.
 */
 const toolTabIds = [
-  "right-dock-tab-tasks",
   "right-dock-tab-files",
   "right-dock-tab-chat",
   "right-dock-tab-activity-log",
   "right-dock-tab-git-manager",
   "right-dock-tab-devserver",
   "right-dock-tab-secrets",
-  "right-dock-tab-todos",
   "right-dock-tab-pull-requests",
 ];
 
@@ -83,6 +115,8 @@ describe("RightDock", () => {
   beforeEach(() => {
     window.localStorage.clear();
     vi.clearAllMocks();
+    fetchWorkspaceFileListMock.mockResolvedValue({ entries: [], currentPath: "." });
+    fetchWorkspaceFileContentMock.mockResolvedValue({ content: "Guide de production", mtime: "2026-09-13T08:37:00Z" });
     // FNXC:Navigation 2026-07-03-09:40: the dock now defaults to HIDDEN, so controller-driven Harness
     // tests below (which exercise open-dock behavior) represent an opted-in operator and must seed the
     // stored "open" preference. Tests that render <RightDock open={...}/> directly are unaffected.
@@ -148,63 +182,25 @@ describe("RightDock", () => {
     expect(screen.getByTestId("right-dock-tab-git-manager")).toHaveAttribute("aria-selected", "true");
   });
 
-  /*
-  FNXC:RightDockFiles 2026-06-23-00:50:
-  Deterministic dock two-pane decision: the dock threads its measured width to the Files registry render as `dockWidth`, and the Files entry forces DockFilesView layout="two-pane" once that width crosses 640px (no @container gate). A narrow dock (default 360px) stays layout="auto" (stacked single-panel). Assert both via the data-layout attribute the view exposes.
-  */
-  it("forces the Files two-pane layout when the dock is dragged wide, and stays stacked when narrow", () => {
-    // Narrow default width (360px) -> stacked single-panel.
+  it("conserve Files comme liste unique aux largeurs étroite et large", () => {
     const { unmount } = render(<TestRightDock open={true} renderProps={renderProps} />);
-    expect(screen.getByTestId("right-dock-files-view")).toHaveAttribute("data-layout", "auto");
+    expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("right-dock-files-viewer")).toBeNull();
     unmount();
 
-    // Wide persisted width (>= 640px) -> deterministic LEFT|RIGHT two-pane.
     window.localStorage.setItem(RIGHT_DOCK_WIDTH_STORAGE_KEY, "900");
     render(<TestRightDock open={true} renderProps={renderProps} />);
-    expect(screen.getByTestId("right-dock-files-view")).toHaveAttribute("data-layout", "two-pane");
-  });
-
-  it("threads delete into the compact Tasks tab cards", () => {
-    const tasks = [
-      { id: "FN-DELETE", title: "Right dock delete", column: "triage" },
-    ];
-    const onDeleteTask = vi.fn();
-
-    render(<TestRightDock open={true} renderProps={{ ...renderProps, tasks, onDeleteTask }} />);
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-
-    expect(screen.getByTestId("mock-task-card-FN-DELETE")).toHaveAttribute("data-has-delete", "true");
-  });
-
-  it("renders the filtered Tasks tab list at both narrow and wide dock widths", () => {
-    const tasks = [
-      { id: "FN-ACTIVE", title: "Active dock task", column: "todo" },
-      { id: "FN-DONE", title: "Done dock task", column: "done" },
-      { id: "FN-ARCHIVED", title: "Archived dock task", column: "archived" },
-    ];
-    const { unmount } = render(<TestRightDock open={true} renderProps={{ ...renderProps, tasks }} />);
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-    expect(screen.getByTestId("dock-task-list-row-FN-ACTIVE")).toBeInTheDocument();
-    expect(screen.queryByTestId("dock-task-list-row-FN-DONE")).toBeNull();
-    expect(screen.queryByTestId("dock-task-list-row-FN-ARCHIVED")).toBeNull();
-    unmount();
-
-    window.localStorage.setItem(RIGHT_DOCK_WIDTH_STORAGE_KEY, "900");
-    render(<TestRightDock open={true} renderProps={{ ...renderProps, tasks }} />);
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-    expect(screen.getByTestId("dock-task-list-row-FN-ACTIVE")).toBeInTheDocument();
-    expect(screen.queryByTestId("dock-task-list-row-FN-ARCHIVED")).toBeNull();
+    expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("right-dock-files-viewer")).toBeNull();
   });
 
   it("falls back to Files when storage points at a removed right-dock view", () => {
-    window.localStorage.setItem(RIGHT_DOCK_VIEW_STORAGE_KEY, "documents");
+    window.localStorage.setItem(RIGHT_DOCK_VIEW_STORAGE_KEY, "tasks");
     render(<TestRightDock open={true} renderProps={renderProps} />);
 
     expect(screen.getByTestId("right-dock-tab-files")).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
-    expect(screen.queryByTestId("right-dock-tab-documents")).toBeNull();
+    expect(screen.queryByTestId("right-dock-tab-tasks")).toBeNull();
   });
 
   it("exposes localized right-dock affordance labels without an in-dock collapse shell", () => {
@@ -218,198 +214,34 @@ describe("RightDock", () => {
     expect(screen.getByTestId("right-dock-pin")).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByTestId("right-dock-expand")).toHaveAttribute("aria-label", "Expand Files");
     expect(screen.getByTestId("right-dock-expand")).toHaveAttribute("title", "Expand Files");
+    expect(screen.getByRole("tabpanel", { name: "Files" })).toBeInTheDocument();
+    expect(document.querySelector(".right-dock__header")).toBeNull();
     expect(screen.queryByTestId("right-dock-collapse-toggle")).toBeNull();
   });
 
-  /*
-  FNXC:RightDockTasks 2026-06-28-18:48:
-  Dock task detail exposes two visible return affordances. The header back button and toolbar return button must share the same close callback and leave only the Tasks list mounted after the controller clears the dock snapshot.
-  */
   it.each([
     ["right-dock-close-task"],
     ["right-dock-header-back-task"],
-  ])("anchors dock task detail to Tasks and returns to the task list from %s", (buttonTestId) => {
+  ])("returns temporary task detail to the selected tool from %s", (buttonTestId) => {
     const onCloseDockTask = vi.fn();
     const { rerender } = render(
-      <TestRightDock
-        open={true}
-        renderProps={{ ...renderProps, tasks: [] }}
-        dockTask={{ id: "FN-7169", title: "Sidebar task" } as never}
-        dockTaskContent={<div data-testid="dock-task-detail">Sidebar task</div>}
-        onCloseDockTask={onCloseDockTask}
-      />,
+      <TestRightDock open={true} renderProps={{ ...renderProps, tasks: [] }} dockTask={{ id: "FN-7169", title: "Sidebar task" } as never} dockTaskContent={<div data-testid="dock-task-detail">Sidebar task</div>} onCloseDockTask={onCloseDockTask} />,
     );
-
-    expect(screen.getByTestId("right-dock-tab-tasks")).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByTestId("right-dock-tab-tasks")).toBeNull();
+    expect(screen.getByTestId("right-dock-tab-files")).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("right-dock-body")).toHaveTextContent("Sidebar task");
-    expect(screen.queryByTestId("right-dock-files-view")).toBeNull();
-    expect(screen.getAllByTestId("right-dock-header-back-task")).toHaveLength(1);
-    expect(screen.getByTestId("right-dock-header-back-task")).toHaveAttribute("aria-label", screen.getByTestId("right-dock-close-task").getAttribute("aria-label"));
-    expect(screen.getByText("Task detail")).toBeInTheDocument();
-
     fireEvent.click(screen.getByTestId(buttonTestId));
     expect(onCloseDockTask).toHaveBeenCalledTimes(1);
-
     rerender(<TestRightDock open={true} renderProps={{ ...renderProps, tasks: [] }} dockTask={null} dockTaskContent={null} onCloseDockTask={onCloseDockTask} />);
-    expect(screen.getByTestId("right-dock-tab-tasks")).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
+    expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
     expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.queryByTestId("right-dock-header-back-task")).toBeNull();
-    expect(screen.queryByTestId("right-dock-close-task")).toBeNull();
-    expect(screen.queryByText("Task detail")).toBeNull();
-    expect(screen.queryByTestId("right-dock-files-view")).toBeNull();
   });
 
-  it("preserves dock task detail across normal right-dock tab switches", () => {
-    const onCloseDockTask = vi.fn();
-    render(
-      <TestRightDock
-        open={true}
-        renderProps={{ ...renderProps, tasks: [] }}
-        dockTask={{ id: "FN-7169", title: "Sidebar task" } as never}
-        dockTaskContent={<div data-testid="dock-task-detail">Sidebar task</div>}
-        onCloseDockTask={onCloseDockTask}
-      />,
-    );
-
-    expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("Sidebar task");
+  it("keeps temporary task detail visible while the underlying tool selection changes", () => {
+    render(<TestRightDock open={true} renderProps={{ ...renderProps, tasks: [] }} dockTask={{ id: "FN-7169", title: "Sidebar task" } as never} dockTaskContent={<div data-testid="dock-task-detail">Sidebar task</div>} onCloseDockTask={vi.fn()} />);
     fireEvent.click(screen.getByTestId("right-dock-tab-git-manager"));
-
-    expect(onCloseDockTask).not.toHaveBeenCalled();
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.getByText("Git Manager")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
     expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("Sidebar task");
-  });
-
-  it("routes right-dock Tasks list clicks to popups when task popups are enabled", () => {
-    const firstTask = { id: "FN-1", title: "First task", column: "todo" };
-    const openDetailTask = vi.fn();
-    const openTaskPopup = vi.fn();
-    const controllerInput = {
-      active: true,
-      projectId: "project-1",
-      addToast: vi.fn(),
-      settingsLoaded: true,
-      researchReadinessVersion: 0,
-      tasks: [firstTask],
-      workflowSteps: [],
-      subscribePluginEvents: () => () => {},
-      openDetailTask,
-      openTaskPopup,
-      openMobileTasksInPopup: true,
-      openFileInBrowser: vi.fn(),
-      onMoveTask: vi.fn(),
-      onDeleteTask: vi.fn(),
-      onMergeTask: vi.fn(),
-      openSettings: vi.fn(),
-      onSendSelectionToTask: vi.fn(),
-      onCreateTaskFromInsight: vi.fn(),
-      onNavigateToMission: vi.fn(),
-      onTaskCreated: vi.fn(),
-      prAuthAvailable: false,
-      autoMerge: false,
-      taskDetailChatFirst: false,
-      visibilityOptions: {},
-      footerVisible: false,
-    } as unknown as RightDockControllerInput;
-
-    function Harness() {
-      const controller = useRightDockController(controllerInput);
-      return (
-        <>
-          {controller.dock}
-          {controller.modal}
-        </>
-      );
-    }
-
-    render(<Harness />);
-
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("mock-task-card-FN-1"));
-
-    expect(openTaskPopup).toHaveBeenCalledTimes(1);
-    expect(openTaskPopup).toHaveBeenCalledWith(firstTask);
-    expect(openDetailTask).not.toHaveBeenCalled();
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.queryByTestId("right-dock-close-task")).toBeNull();
-    expect(screen.queryByTestId("right-dock-header-back-task")).toBeNull();
-
-    fireEvent.click(screen.getByTestId("right-dock-expand"));
-    expect(screen.getByTestId("right-dock-expand-modal")).toHaveAttribute("aria-label", "Tasks expanded");
-    fireEvent.click(screen.getByTestId("mock-task-card-FN-1"));
-    expect(openTaskPopup).toHaveBeenCalledTimes(2);
-    expect(openTaskPopup).toHaveBeenLastCalledWith(firstTask);
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-  });
-
-  it("keeps right-dock Tasks list clicks embedded when task popups are disabled", () => {
-    const firstTask = { id: "FN-1", title: "First task", column: "todo" };
-    const openDetailTask = vi.fn();
-    const openTaskPopup = vi.fn();
-    const controllerInput = {
-      active: true,
-      projectId: "project-1",
-      addToast: vi.fn(),
-      settingsLoaded: true,
-      researchReadinessVersion: 0,
-      tasks: [firstTask],
-      workflowSteps: [],
-      subscribePluginEvents: () => () => {},
-      openDetailTask,
-      openTaskPopup,
-      openMobileTasksInPopup: false,
-      openFileInBrowser: vi.fn(),
-      onMoveTask: vi.fn(),
-      onDeleteTask: vi.fn(),
-      onMergeTask: vi.fn(),
-      openSettings: vi.fn(),
-      onSendSelectionToTask: vi.fn(),
-      onCreateTaskFromInsight: vi.fn(),
-      onNavigateToMission: vi.fn(),
-      onTaskCreated: vi.fn(),
-      prAuthAvailable: false,
-      autoMerge: false,
-      taskDetailChatFirst: false,
-      visibilityOptions: {},
-      footerVisible: false,
-    } as unknown as RightDockControllerInput;
-
-    function Harness() {
-      const controller = useRightDockController(controllerInput);
-      return <>{controller.dock}</>;
-    }
-
-    const { rerender } = render(<Harness />);
-
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    fireEvent.click(screen.getByTestId("mock-task-card-FN-1"));
-
-    expect(openTaskPopup).not.toHaveBeenCalled();
-    expect(openDetailTask).not.toHaveBeenCalled();
-    expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
-    expect(screen.getByTestId("right-dock-close-task")).toBeInTheDocument();
-    expect(screen.getByTestId("right-dock-header-back-task")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("right-dock-tab-files"));
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
-
-    fireEvent.click(screen.getByTestId("right-dock-header-back-task"));
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("mock-task-card-FN-1"));
-    expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
-    fireEvent.click(screen.getByTestId("right-dock-close-task"));
-    rerender(<Harness />);
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
+    expect(screen.getByTestId("right-dock-tab-git-manager")).toHaveAttribute("aria-selected", "true");
   });
 
   it("controller dock task opens, replaces, persists across tabs, and clears on close or inactive teardown", () => {
@@ -441,8 +273,8 @@ describe("RightDock", () => {
       footerVisible: false,
     } as unknown as RightDockControllerInput;
 
-    function Harness({ active, tasks = [firstTask, secondTask] }: { active: boolean; tasks?: Array<typeof firstTask> }) {
-      const controller = useRightDockController({ ...controllerInput, active, tasks });
+    function Harness({ active, projectId = "project-1", tasks = [firstTask, secondTask] }: { active: boolean; projectId?: string; tasks?: Array<typeof firstTask> }) {
+      const controller = useRightDockController({ ...controllerInput, active, projectId, tasks });
       return (
         <>
           <button type="button" data-testid="open-first" onClick={() => controller.openTaskInDock(firstTask as never)}>open first</button>
@@ -456,16 +288,12 @@ describe("RightDock", () => {
     const { rerender } = render(<Harness active={true} />);
     expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("mock-task-card-FN-1"));
+    expect(screen.queryByTestId("right-dock-tab-tasks")).toBeNull();
+    fireEvent.click(screen.getByTestId("open-first"));
     expect(openDetailTask).not.toHaveBeenCalled();
     expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
 
-    fireEvent.click(screen.getByTestId("right-dock-tab-files"));
-    expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
-    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
+    fireEvent.click(screen.getByTestId("right-dock-tab-git-manager"));
     expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
 
     fireEvent.click(screen.getByTestId("open-second"));
@@ -477,15 +305,24 @@ describe("RightDock", () => {
 
     fireEvent.click(screen.getByTestId("close-dock-task"));
     expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
+    expect(screen.getByRole("tabpanel", { name: "Git Manager" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("open-first"));
     expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
-    rerender(<Harness active={false} />);
-    expect(screen.queryByTestId("right-dock")).toBeNull();
-    rerender(<Harness active={true} />);
+    taskDetailRenderSpy.mockClear();
+    rerender(<Harness active={true} projectId="project-2" tasks={[{ ...firstTask, title: "Same ID in second project" }]} />);
     expect(screen.queryByTestId("dock-task-detail")).toBeNull();
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
+    expect(screen.queryByText("Same ID in second project")).toBeNull();
+    expect(taskDetailRenderSpy).not.toHaveBeenCalled();
+    expect(screen.getByRole("tabpanel", { name: "Git Manager" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("open-first"));
+    expect(screen.getByTestId("dock-task-detail")).toHaveTextContent("First task");
+    rerender(<Harness active={false} projectId="project-2" />);
+    expect(screen.queryByTestId("right-dock")).toBeNull();
+    rerender(<Harness active={true} projectId="project-2" />);
+    expect(screen.queryByTestId("dock-task-detail")).toBeNull();
+    expect(screen.getByRole("tabpanel", { name: "Git Manager" })).toBeInTheDocument();
   });
 
   it("renders the pin affordance for both states and delegates the toggle", () => {
@@ -631,38 +468,40 @@ describe("RightDock", () => {
             goalsView: true,
           },
           showSkillsTab: true,
-          todosEnabled: true,
+          pluginDashboardViews: [{ pluginId: "fusion-plugin-todos", view: { viewId: "todos", label: "Todos", placement: "overflow", order: 70 } }],
         }}
       />,
     );
 
     /*
     FNXC:Navigation 2026-06-22-16:00:
-    With devServerView and todosEnabled both on, the full nine-entry roster renders in registry order. Tasks, Files, Chat, Activity Log, Git Manager, Dev Server, Secrets, Todos, and Pull Requests are all inline views.
+    With Dev Server enabled and Todo supplied by the enabled plugin list, the nine-entry roster renders in registry order.
     */
-    expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("data-testid"))).toEqual(toolTabIds);
-    expect(screen.getByTestId("right-dock-tab-tasks")).toHaveAttribute("aria-label", "Tasks");
+    expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("data-testid"))).toEqual([
+      ...toolTabIds,
+      "right-dock-tab-plugin-fusion-plugin-todos-todos",
+    ]);
+    expect(screen.queryByTestId("right-dock-tab-tasks")).toBeNull();
     expect(screen.getByTestId("right-dock-tab-files")).toHaveAttribute("aria-label", "Files");
     expect(screen.getByTestId("right-dock-tab-chat")).toHaveAttribute("aria-label", "Chat");
     expect(screen.getByTestId("right-dock-tab-activity-log")).toHaveAttribute("aria-label", "Activity Log");
     expect(screen.getByTestId("right-dock-tab-git-manager")).toHaveAttribute("aria-label", "Git Manager");
     expect(screen.getByTestId("right-dock-tab-devserver")).toHaveAttribute("aria-label", "Dev Server");
     expect(screen.getByTestId("right-dock-tab-secrets")).toHaveAttribute("aria-label", "Secrets");
-    expect(screen.getByTestId("right-dock-tab-todos")).toHaveAttribute("aria-label", "Todos");
+    expect(screen.getByTestId("right-dock-tab-plugin-fusion-plugin-todos-todos")).toHaveAttribute("aria-label", "Todos");
     expect(screen.getByTestId("right-dock-tab-pull-requests")).toHaveAttribute("aria-label", "Pull Requests");
     for (const removedId of removedViewTabIds) {
       expect(screen.queryByTestId(removedId)).toBeNull();
     }
   });
 
-  it("gates devserver and todos tabs behind their visibility flags", () => {
+  it("gates devserver behind its visibility flag and omits disabled Todo plugins", () => {
     /*
     FNXC:Navigation 2026-06-22-16:00:
-    devserver is gated on experimentalFeatures.devServerView and todos on todosEnabled. With both unset (default renderProps), the dock renders only the seven always-on inline tools.
+    Dev Server is feature-gated, while Todo is absent unless the project-enabled plugin list supplies it. With neither, the dock renders seven static inline tools.
     */
     render(<TestRightDock open={true} renderProps={renderProps} />);
     expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("data-testid"))).toEqual([
-      "right-dock-tab-tasks",
       "right-dock-tab-files",
       "right-dock-tab-chat",
       "right-dock-tab-activity-log",
@@ -674,6 +513,33 @@ describe("RightDock", () => {
     expect(screen.queryByTestId("right-dock-tab-todos")).toBeNull();
   });
 
+  it("shows non-expandable Notes only in the explicit Alpha desktop host", () => {
+    const { rerender } = render(<TestRightDock open renderProps={{ ...renderProps, hostMode: "standard" }} visibilityOptions={{ hostMode: "standard" }} />);
+    expect(screen.queryByTestId("right-dock-tab-notes")).toBeNull();
+
+    rerender(<TestRightDock open renderProps={{ ...renderProps, hostMode: "alpha-desktop" }} visibilityOptions={{ hostMode: "alpha-desktop" }} />);
+    fireEvent.click(screen.getByTestId("right-dock-tab-notes"));
+    expect(screen.getByTestId("right-dock-tab-notes")).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByTestId("right-dock-expand")).toBeNull();
+    expect(screen.getByTestId("right-dock-body")).toBeInTheDocument();
+  });
+
+  it("disables Chat expansion only for the explicit Alpha desktop host", () => {
+    window.localStorage.setItem(RIGHT_DOCK_VIEW_STORAGE_KEY, "chat");
+    const onExpand = vi.fn();
+    const { rerender } = render(<TestRightDock open renderProps={{ ...renderProps, hostMode: "alpha-desktop" }} visibilityOptions={{ hostMode: "alpha-desktop" }} onExpand={onExpand} />);
+    expect(screen.getByTestId("right-dock-tab-chat")).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByTestId("right-dock-expand")).toBeNull();
+
+    rerender(<TestRightDock open renderProps={{ ...renderProps, hostMode: "standard" }} visibilityOptions={{ hostMode: "standard" }} onExpand={onExpand} />);
+    fireEvent.click(screen.getByTestId("right-dock-expand"));
+    expect(onExpand).toHaveBeenCalledWith("chat");
+
+    const modal = render(<RightDockExpandModal viewKey="chat" renderProps={{ ...renderProps, hostMode: "alpha-desktop" }} visibilityOptions={{ hostMode: "alpha-desktop" }} onClose={vi.fn()} />);
+    expect(screen.queryByTestId("right-dock-expand-modal")).toBeNull();
+    modal.unmount();
+  });
+
   it("clicking an inline tool tab switches the dock body and selection, and Files returns home", () => {
     /*
     FNXC:Navigation 2026-06-22-16:00:
@@ -683,10 +549,6 @@ describe("RightDock", () => {
 
     expect(screen.getByTestId("right-dock-tab-files")).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("right-dock-files-view")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("right-dock-tab-tasks"));
-    expect(screen.getByTestId("right-dock-tab-tasks")).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
 
     for (const tabId of ["right-dock-tab-activity-log", "right-dock-tab-git-manager", "right-dock-tab-secrets"]) {
       fireEvent.click(screen.getByTestId(tabId));
@@ -771,48 +633,17 @@ describe("RightDock", () => {
     FNXC:RightDock 2026-06-22-17:40:
     The pop-out is a floating, non-blocking window: the overlay carries the non-blocking class (transparent + pointer-events:none in CSS so behind-clicks pass through), a drag handle (header) exists, and the panel is the floating variant. There is no overlay click-to-dismiss; the explicit close button is the only dismissal.
     */
-    expect(screen.getByTestId("right-dock-expand-modal")).toHaveClass("right-dock-expand-modal-overlay");
+    expect(screen.getByTestId("right-dock-expand-modal")).toHaveClass("floating-window-overlay");
     expect(screen.getByTestId("right-dock-expand-modal")).toHaveAttribute("aria-modal", "false");
     expect(screen.getByTestId("right-dock-expand-drag-handle")).toBeInTheDocument();
-    expect(screen.getByTestId("right-dock-expand-modal").querySelector(".right-dock-expand-modal--floating")).not.toBeNull();
-    expect(screen.getByTestId("right-dock-expand-resize-se")).toHaveAttribute("aria-label", "Resize expanded right dock window");
+    expect(screen.getByTestId("floating-window-right-dock-expand")).toHaveClass("right-dock-expand-modal--floating");
+    expect(screen.getByTestId("floating-window-resize-se")).toHaveAttribute("aria-label", "Resize floating window");
     expect(screen.getByTestId("right-dock-expand-close")).toHaveAttribute("aria-label", "Close expanded right dock view");
     fireEvent.click(screen.getByTestId("right-dock-expand-close"));
     expect(onClose).toHaveBeenCalledTimes(1);
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     expect(focusSpy).toHaveBeenCalled();
     focusButton.remove();
-  });
-
-  /*
-  FNXC:RightDockTasks 2026-06-28-18:54:
-  The expanded Tasks modal is a registry-rendered DockTaskList surface, not a separate task renderer, so it inherits active-by-default filtering and the archived-never-shown contract while preserving dock row routing.
-  */
-  it("renders the filtered Tasks list in the expanded modal and routes row clicks back to the dock", () => {
-    const onOpenTaskInDock = vi.fn();
-    const task = { id: "FN-EXPAND", title: "Expanded task", column: "todo" };
-    const doneTask = { id: "FN-EXPAND-DONE", title: "Expanded done task", column: "done" };
-    const archivedTask = { id: "FN-EXPAND-ARCHIVED", title: "Expanded archived task", column: "archived" };
-    render(
-      <RightDockExpandModal
-        viewKey="tasks"
-        renderProps={{ ...renderProps, tasks: [task, doneTask, archivedTask], onOpenTaskInDock }}
-        onClose={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByTestId("right-dock-expand-modal")).toHaveAttribute("aria-label", "Tasks expanded");
-    expect(screen.getByTestId("dock-task-list")).toBeInTheDocument();
-    expect(screen.getByTestId("dock-task-list-row-FN-EXPAND")).toBeInTheDocument();
-    expect(screen.queryByTestId("dock-task-list-row-FN-EXPAND-DONE")).toBeNull();
-    expect(screen.queryByTestId("dock-task-list-row-FN-EXPAND-ARCHIVED")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Show Done" }));
-    expect(screen.getByTestId("dock-task-list-row-FN-EXPAND-DONE")).toBeInTheDocument();
-    expect(screen.queryByTestId("dock-task-list-row-FN-EXPAND-ARCHIVED")).toBeNull();
-
-    fireEvent.click(screen.getByTestId("mock-task-card-FN-EXPAND"));
-    expect(onOpenTaskInDock).toHaveBeenCalledWith(task);
   });
 
   it("does not render the expanded modal for action entries", () => {
@@ -828,7 +659,7 @@ describe("RightDock", () => {
   });
 
   it("restores the expanded modal's persisted size", () => {
-    window.localStorage.setItem("fusion:right-dock-expand-modal-size", JSON.stringify({ width: 640, height: 480 }));
+    window.localStorage.setItem("fusion:right-dock-expand-modal-geometry", JSON.stringify({ size: { width: 640, height: 480 }, position: { x: 32, y: 32 } }));
     render(
       <RightDockExpandModal
         viewKey="files"
@@ -837,7 +668,7 @@ describe("RightDock", () => {
       />,
     );
 
-    expect(screen.getByTestId("right-dock-expand-modal").querySelector(".right-dock-expand-modal")).toHaveStyle({
+    expect(screen.getByTestId("floating-window-right-dock-expand")).toHaveStyle({
       width: "640px",
       height: "480px",
     });
@@ -864,11 +695,11 @@ describe("RightDock", () => {
     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 60, clientY: 140 });
     fireEvent.pointerUp(handle, { pointerId: 1, clientX: 60, clientY: 140 });
 
-    const persisted = window.localStorage.getItem("fusion:right-dock-expand-modal-position");
+    const persisted = window.localStorage.getItem("fusion:right-dock-expand-modal-geometry");
     expect(persisted).not.toBeNull();
-    const parsed = JSON.parse(persisted as string) as { x: number; y: number };
-    expect(parsed.x).toBeGreaterThanOrEqual(0);
-    expect(parsed.y).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(persisted as string) as { position: { x: number; y: number } };
+    expect(parsed.position.x).toBeGreaterThanOrEqual(16);
+    expect(parsed.position.y).toBeGreaterThanOrEqual(16);
   });
 
   it("fires expand for the currently selected inline entry", () => {
@@ -942,9 +773,74 @@ describe("RightDock", () => {
     expect(screen.queryByTestId("right-dock-expand-modal")).toBeNull();
   });
 
-  it("routes Files expand to the file browser modal when an individual file is selected", () => {
+  it.each([
+    ["compact", 1024],
+    ["compact", 375],
+    ["expanded", 1024],
+    ["expanded", 375],
+  ] as const)("ouvre depuis l’hôte Files %s à %ipx via la chaîne App sans seconde liste", async (host, width) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    fetchWorkspaceFileListMock.mockResolvedValue({
+      entries: [{ name: "docs/guide.md", type: "file", size: 42, mtime: "2026-09-13T08:37:00Z" }],
+      currentPath: ".",
+    });
+    const pushNav = vi.fn();
+
+    function Harness() {
+      const modalManager = useModalManager({ projectId: "project-1", planningSessions: [] });
+      const controller = useRightDockController({
+        active: true,
+        projectId: "project-1",
+        addToast: vi.fn(),
+        settingsLoaded: true,
+        researchReadinessVersion: 0,
+        tasks: [],
+        workflowSteps: [],
+        subscribePluginEvents: () => () => {},
+        openDetailTask: vi.fn(),
+        openFileInBrowser: (path, opts) => openAppFileInBrowser(modalManager, pushNav, path, opts),
+        openSettings: vi.fn(),
+        onSendSelectionToTask: vi.fn(),
+        onCreateTaskFromInsight: vi.fn(),
+        onNavigateToMission: vi.fn(),
+        onTaskCreated: vi.fn(),
+        prAuthAvailable: false,
+        autoMerge: false,
+        visibilityOptions: {},
+        footerVisible: false,
+      } as unknown as RightDockControllerInput);
+      return (
+        <>
+          {controller.dock}
+          {controller.modal}
+          <AppFilesModal modalManager={modalManager} projectId="project-1" onClose={modalManager.closeFiles} />
+        </>
+      );
+    }
+
+    render(<Harness />);
+    if (host === "expanded") {
+      fireEvent.click(screen.getByTestId("right-dock-expand"));
+    }
+
+    const source = host === "expanded"
+      ? screen.getByTestId("right-dock-expand-body")
+      : screen.getByTestId("right-dock-files-view");
+    fireEvent.click(await within(source).findByText("docs/guide.md"));
+
+    await waitFor(() => expect(screen.getByLabelText("Editor for docs/guide.md")).toBeInTheDocument());
+    expect(fetchWorkspaceFileContentMock).toHaveBeenCalledWith("project", "docs/guide.md", "project-1");
+    expect(pushNav).toHaveBeenCalledWith(expect.objectContaining({ type: "modal" }));
+    const fileModal = document.querySelector(".file-browser-modal");
+    expect(fileModal).toBeInTheDocument();
+    expect(fileModal?.querySelector(".file-browser-sidebar")).not.toBeInTheDocument();
+    expect(fileModal?.querySelector(".file-browser-resize-handle")).not.toBeInTheDocument();
+    expect(fileModal?.querySelector(".file-browser-back-button")).not.toBeInTheDocument();
+    expect(within(source).getByText("docs/guide.md")).toBeInTheDocument();
+  });
+
+  it("développe la liste Files sans rouvrir une sélection inline obsolète", () => {
     const openFileInBrowser = vi.fn();
-    setScopedItem(DOCK_FILES_CURRENT_KEY, "readme.md", "project-1");
     const controllerInput = {
       active: true,
       projectId: "project-1",
@@ -981,7 +877,10 @@ describe("RightDock", () => {
 
     fireEvent.click(screen.getByTestId("right-dock-expand"));
 
-    expect(openFileInBrowser).toHaveBeenCalledWith("readme.md", { workspace: "project" });
-    expect(screen.queryByTestId("right-dock-expand-modal")).toBeNull();
+    expect(openFileInBrowser).not.toHaveBeenCalled();
+    const modal = screen.getByTestId("right-dock-expand-modal");
+    expect(modal).toBeInTheDocument();
+    expect(modal).toContainElement(screen.getByTestId("right-dock-files-view"));
+    expect(screen.queryByTestId("right-dock-files-viewer")).toBeNull();
   });
 });

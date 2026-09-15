@@ -189,6 +189,16 @@ export interface WorkflowWorkItemRow {
   leaseExpiresAt: string | null;
   lastError: string | null;
   blockedReason: string | null;
+  stableWorkflowRunId: string | null;
+  continuationSequence: number | null;
+  waitReason: string | null;
+  sourceColumn: string | null;
+  targetColumn: string | null;
+  irHash: string | null;
+  principalAgentId: string | null;
+  workflowRole: string | null;
+  authorityKind: string | null;
+  nodeInstanceId: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { useEffect, useRef, useState } from "react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { loadAllAppCss } from "../../test/cssFixture";
 import { CustomModelDropdown } from "../CustomModelDropdown";
+import { AlphaProvider, AlphaBoundary } from "../../context/AlphaContext";
 
 vi.mock("../ProviderIcon", () => ({
   ProviderIcon: ({ provider }: { provider: string }) => <span data-testid={`provider-icon-${provider}`} />, 
@@ -22,6 +24,26 @@ const COLLAPSIBLE_MODELS = [
   { provider: "openai", id: "gpt-4o-mini", name: "GPT-4o mini", reasoning: false, contextWindow: 128000 },
 ];
 
+/** Mirrors dashboard hosts that mistake the document.body portal for an outside click. */
+function UnGuardedOutsideCloseHost() {
+  const [isMounted, setIsMounted] = useState(true);
+  const hostRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const closeOnOutsideMouseDown = (event: MouseEvent) => {
+      if (!hostRef.current?.contains(event.target as Node)) setIsMounted(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsideMouseDown);
+    return () => document.removeEventListener("mousedown", closeOnOutsideMouseDown);
+  }, []);
+
+  return isMounted ? (
+    <div ref={hostRef}>
+      <CustomModelDropdown label="Model" value="" onChange={vi.fn()} models={COLLAPSIBLE_MODELS} />
+    </div>
+  ) : null;
+}
+
 describe("CustomModelDropdown", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -37,6 +59,47 @@ describe("CustomModelDropdown", () => {
       removeEventListener: vi.fn(),
       dispatchEvent: vi.fn(),
     } as MediaQueryList));
+  });
+
+  it("uses one Alpha listbox before provider and favorite actions", async () => {
+    const user = userEvent.setup();
+    render(
+      <AlphaProvider enabled><AlphaBoundary>
+        <CustomModelDropdown label="Model" value="" onChange={vi.fn()} models={MOCK_MODELS} onToggleFavorite={vi.fn()} onToggleModelFavorite={vi.fn()} />
+      </AlphaBoundary></AlphaProvider>,
+    );
+    await user.click(screen.getByRole("button", { name: "Model" }));
+    await waitFor(() => expect(screen.getByPlaceholderText("Filter models…")).toHaveFocus());
+    const listbox = screen.getByRole("listbox", { name: "Model" });
+    const options = within(listbox).getAllByRole("option");
+    options[0]?.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(options[1]).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Add anthropic to favorites" })).toHaveFocus();
+    expect(listbox).not.toContainElement(screen.getByRole("button", { name: "Add anthropic to favorites" }));
+  });
+
+  it("stops portal touch events without stopping model option clicks", async () => {
+    const onChange = vi.fn();
+    const documentTouchStart = vi.fn();
+    const documentTouchEnd = vi.fn();
+    document.addEventListener("touchstart", documentTouchStart);
+    document.addEventListener("touchend", documentTouchEnd);
+    render(<CustomModelDropdown label="Model" value="" onChange={onChange} models={MOCK_MODELS} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    const portal = await screen.findByTestId("model-combobox-portal");
+    expect(portal).toHaveAttribute("data-portal-surface", "model-menu");
+    fireEvent.touchStart(portal);
+    fireEvent.touchEnd(portal);
+    expect(documentTouchStart).not.toHaveBeenCalled();
+    expect(documentTouchEnd).not.toHaveBeenCalled();
+
+    fireEvent.click(within(portal).getByText("GPT-4o"));
+    expect(onChange).toHaveBeenCalledWith("openai/gpt-4o");
+    document.removeEventListener("touchstart", documentTouchStart);
+    document.removeEventListener("touchend", documentTouchEnd);
   });
 
   it("keeps the search wrapper background opaque to prevent list bleed-through", () => {
@@ -111,6 +174,73 @@ describe("CustomModelDropdown", () => {
     }
   });
 
+  it.each([
+    { breakpoint: "desktop", mobile: false },
+    { breakpoint: "mobile", mobile: true },
+  ])("keeps the portaled provider toggle interactive in an unguarded outside-close host at $breakpoint", async ({ mobile }) => {
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: mobile && (query === "(max-width: 768px)" || query === "(max-width: 640px)"),
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    } as MediaQueryList));
+    const user = userEvent.setup();
+    render(<UnGuardedOutsideCloseHost />);
+
+    await user.click(screen.getByRole("button", { name: "Model" }));
+    const toggle = await screen.findByTestId("model-combobox-provider-toggle-anthropic");
+
+    await user.click(toggle);
+
+    expect(screen.getByTestId("model-combobox-portal")).toBeInTheDocument();
+    expect(screen.getByTestId("model-combobox-provider-toggle-anthropic")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Claude Sonnet")).toBeNull();
+
+    await user.click(screen.getByTestId("model-combobox-provider-toggle-anthropic"));
+    expect(screen.getByTestId("model-combobox-portal")).toBeInTheDocument();
+    expect(screen.getByTestId("model-combobox-provider-toggle-anthropic")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Claude Sonnet")).toBeTruthy();
+  });
+
+  it("keeps independently mounted portaled dropdown instances interactive", async () => {
+    const user = userEvent.setup();
+    render(
+      <>
+        <CustomModelDropdown label="First model" value="" onChange={vi.fn()} models={COLLAPSIBLE_MODELS} />
+        <CustomModelDropdown label="Second model" value="" onChange={vi.fn()} models={COLLAPSIBLE_MODELS} />
+      </>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "First model" }));
+    const firstPortal = await screen.findByTestId("model-combobox-portal");
+    await user.click(within(firstPortal).getByTestId("model-combobox-provider-toggle-anthropic"));
+    expect(within(firstPortal).queryByText("Claude Sonnet")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Second model" }));
+    const secondPortal = await screen.findByTestId("model-combobox-portal");
+    await user.click(within(secondPortal).getByTestId("model-combobox-provider-toggle-anthropic"));
+    expect(within(secondPortal).queryByText("Claude Sonnet")).toBeNull();
+  });
+
+  it("keeps the provider toggle interactive in a modal-style host", async () => {
+    const user = userEvent.setup();
+    render(
+      <div role="dialog" aria-label="Model settings">
+        <CustomModelDropdown label="Modal model" value="" onChange={vi.fn()} models={COLLAPSIBLE_MODELS} />
+      </div>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Modal model" }));
+    await user.click(screen.getByTestId("model-combobox-provider-toggle-anthropic"));
+
+    expect(screen.getByTestId("model-combobox-portal")).toBeInTheDocument();
+    expect(screen.queryByText("Claude Sonnet")).toBeNull();
+  });
+
   it("collapses provider rows, preserves special rows, and persists the preference", async () => {
     const user = userEvent.setup();
 
@@ -151,9 +281,14 @@ describe("CustomModelDropdown", () => {
     expect(screen.queryByText("Claude Sonnet")).toBeNull();
     expect(screen.getByRole("button", { name: "Expand anthropic" })).toBeTruthy();
 
-    await user.type(screen.getByPlaceholderText("Filter models…"), "sonnet");
+    const filter = screen.getByPlaceholderText("Filter models…");
+    await user.type(filter, "sonnet");
     expect(screen.getByText("Claude Sonnet")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Collapse anthropic" })).toHaveAttribute("aria-expanded", "true");
+
+    await user.clear(filter);
+    expect(screen.queryByText("Claude Sonnet")).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand anthropic" })).toHaveAttribute("aria-expanded", "false");
 
     view.unmount();
     window.localStorage.setItem("fusion-dashboard-model-dropdown-collapsed-providers", "not-json");
@@ -266,7 +401,7 @@ describe("CustomModelDropdown", () => {
     expect(thinkingSelect).toHaveAccessibleName("Thinking Level");
     expect(thinkingSelect.closest(".model-combobox-dropdown")).not.toBeNull();
     expect(within(thinkingSelect).getByRole("option", { name: "Default (off)" })).toBeTruthy();
-    for (const optionName of ["Off", "Minimal", "Low", "Medium", "High", "Very High"]) {
+    for (const optionName of ["Off", "Minimal", "Low", "Medium", "High", "Very High", "Max"]) {
       expect(within(thinkingSelect).getByRole("option", { name: optionName })).toBeTruthy();
     }
 
@@ -274,6 +409,35 @@ describe("CustomModelDropdown", () => {
     expect(onThinkingLevelChange).toHaveBeenLastCalledWith("xhigh");
     await user.selectOptions(thinkingSelect, "");
     expect(onThinkingLevelChange).toHaveBeenLastCalledWith("");
+  });
+
+  it("filters model-bound thinking options to documented max support without clearing the persisted value", async () => {
+    const user = userEvent.setup();
+    const onThinkingLevelChange = vi.fn();
+    render(
+      <CustomModelDropdown
+        label="Codex Model"
+        value="openai-codex/gpt-5.6-luna"
+        onChange={vi.fn()}
+        models={[{
+          provider: "openai-codex",
+          id: "gpt-5.6-luna",
+          name: "GPT-5.6 Luna",
+          reasoning: true,
+          contextWindow: 372000,
+          supportedThinkingLevels: ["off", "minimal", "low", "medium", "high", "max"],
+        }]}
+        showThinkingLevel
+        thinkingLevel=""
+        onThinkingLevelChange={onThinkingLevelChange}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Codex Model" }));
+    const select = await screen.findByTestId("custom-model-dropdown-thinking");
+    expect(within(select).queryByRole("option", { name: "Max" })).toBeTruthy();
+    expect(within(select).queryByRole("option", { name: "Very High" })).toBeNull();
+    await user.selectOptions(select, "max");
+    expect(onThinkingLevelChange).toHaveBeenCalledWith("max");
   });
 
   it("renders concrete-only thinking control without Default when no defaultThinkingLevel is supplied", async () => {
@@ -294,7 +458,7 @@ describe("CustomModelDropdown", () => {
     const thinkingSelect = await screen.findByTestId("custom-model-dropdown-thinking");
 
     expect(within(thinkingSelect).queryByRole("option", { name: /Default/ })).toBeNull();
-    expect(within(thinkingSelect).getAllByRole("option")).toHaveLength(6);
+    expect(within(thinkingSelect).getAllByRole("option")).toHaveLength(7);
   });
 
   it("keeps thinking control inert when callers do not opt in", async () => {
@@ -572,8 +736,39 @@ describe("CustomModelDropdown", () => {
     const portal = await screen.findByTestId("model-combobox-portal");
     expect(portal.style.left).toBe("239px");
     expect(portal.style.width).toBe("120px");
-    expect(portal.style.top).toBe("196px");
+    expect(portal.style.top).toBe("auto");
+    expect(portal.style.bottom).toBe("111px");
     expect(portal.style.maxHeight).toBe("360px");
+  });
+
+  it.each([
+    { name: "desktop", width: 1024, height: 760 },
+    { name: "mobile", width: 375, height: 760 },
+  ])("bottom-anchors an empty model list upward on $name", async ({ width, height }) => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(width);
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(height);
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: width <= 768 && query === "(max-width: 768px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    } as MediaQueryList));
+
+    render(<CustomModelDropdown label="Empty Model" value="" onChange={vi.fn()} models={[]} />);
+    const trigger = screen.getByRole("button", { name: "Empty Model" });
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({
+      top: 700, bottom: 728, left: 24, width: 120, right: 144, height: 28, x: 24, y: 700, toJSON: () => ({}),
+    });
+
+    await user.click(trigger);
+    const portal = await screen.findByTestId("model-combobox-portal");
+    expect(portal.style.top).toBe("auto");
+    expect(portal.style.bottom).toBe(`${height - 700 + 4}px`);
   });
 
   describe("Readable menu sizing", () => {
@@ -1070,10 +1265,9 @@ describe("CustomModelDropdown", () => {
         await user.click(screen.getByRole("button", { name: "Executor Model" }));
 
         const portal = await screen.findByTestId("model-combobox-portal");
-        const top = parseFloat(portal.style.top);
-
-        // Should position upward: rect.top - estimatedHeight - 4 = 710 - 320 - 4 = 386
-        expect(top).toBe(386);
+        // Upward placement must be independent of the max-height scroll cap.
+        expect(portal.style.top).toBe("auto");
+        expect(portal.style.bottom).toBe("94px");
       } finally {
         restore();
         Object.defineProperty(window, "innerHeight", {

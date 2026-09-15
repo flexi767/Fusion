@@ -174,6 +174,80 @@ describe("useTheme", () => {
     expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("forest");
   });
 
+  it("hydrates, caches, and applies Liquid Glass from backend settings", async () => {
+    mockFetchGlobalSettings.mockResolvedValue({ colorTheme: "liquid-glass" });
+
+    const { result } = renderHook(() => useTheme());
+
+    await waitFor(() => {
+      expect(result.current.colorTheme).toBe("liquid-glass");
+    });
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("liquid-glass");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("liquid-glass");
+  });
+
+  it("hydrates, caches, and applies Aurora from backend settings", async () => {
+    mockFetchGlobalSettings.mockResolvedValue({ colorTheme: "aurora" });
+
+    const { result } = renderHook(() => useTheme());
+
+    await waitFor(() => {
+      expect(result.current.colorTheme).toBe("aurora");
+    });
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("aurora");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("aurora");
+  });
+
+  it("hydrates, caches, and applies Calm from backend settings", async () => {
+    mockFetchGlobalSettings.mockResolvedValue({ colorTheme: "calm" });
+
+    const { result } = renderHook(() => useTheme());
+
+    await waitFor(() => {
+      expect(result.current.colorTheme).toBe("calm");
+    });
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("calm");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("calm");
+  });
+
+  it("hydrates, caches, and applies Dawn from backend settings", async () => {
+    mockFetchGlobalSettings.mockResolvedValue({ colorTheme: "dawn" });
+
+    const { result } = renderHook(() => useTheme());
+
+    await waitFor(() => {
+      expect(result.current.colorTheme).toBe("dawn");
+    });
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("dawn");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("dawn");
+  });
+
+  it("hydrates, caches, and applies Medieval from backend settings", async () => {
+    mockFetchGlobalSettings.mockResolvedValue({ colorTheme: "medieval" });
+
+    const { result } = renderHook(() => useTheme());
+
+    await waitFor(() => {
+      expect(result.current.colorTheme).toBe("medieval");
+    });
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("medieval");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("medieval");
+  });
+
+  it.each(["dark", "light"] as const)("preserves Medieval's selected font scales in %s mode", (themeMode) => {
+    localStorageMock[THEME_MODE_STORAGE_KEY] = themeMode;
+    localStorageMock[COLOR_THEME_STORAGE_KEY] = "medieval";
+
+    const { result } = renderHook(() => useTheme());
+    for (const fontScale of [90, 100, 110, 120]) {
+      act(() => result.current.setDashboardFontScalePct(fontScale));
+      expect(result.current.dashboardFontScalePct).toBe(fontScale);
+      expect(document.documentElement.style.fontSize).toBe(`${fontScale}%`);
+      expect(document.documentElement.getAttribute("data-color-theme")).toBe("medieval");
+      expect(document.documentElement.getAttribute("data-theme")).toBe(themeMode);
+    }
+  });
+
   it("hydrates dashboard font scale from backend on mount", async () => {
     mockFetchGlobalSettings.mockResolvedValue({ dashboardFontScalePct: 110 });
 
@@ -234,11 +308,12 @@ describe("useTheme", () => {
     // User changes both fields before initial backend hydration resolves.
     act(() => {
       result.current.setThemeMode("light");
-      result.current.setColorTheme("ocean");
+      result.current.setColorTheme("liquid-glass");
     });
 
     expect(result.current.themeMode).toBe("light");
-    expect(result.current.colorTheme).toBe("ocean");
+    expect(result.current.colorTheme).toBe("liquid-glass");
+    expect(mockUpdateGlobalSettings).toHaveBeenCalledWith({ colorTheme: "liquid-glass" });
 
     // Hydration resolves with stale values from backend cache.
     resolveHydration!({ themeMode: "dark", colorTheme: "forest" } as Settings);
@@ -249,9 +324,9 @@ describe("useTheme", () => {
 
     // Regression expectation: user selections remain authoritative.
     expect(result.current.themeMode).toBe("light");
-    expect(result.current.colorTheme).toBe("ocean");
+    expect(result.current.colorTheme).toBe("liquid-glass");
     expect(localStorageMock[THEME_MODE_STORAGE_KEY]).toBe("light");
-    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("ocean");
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("liquid-glass");
 
     // Ensure stale hydration values did not leak through.
     expect(localStorageMock[THEME_MODE_STORAGE_KEY]).not.toBe("dark");
@@ -790,7 +865,31 @@ describe("useTheme", () => {
     expect(document.documentElement.getAttribute("data-color-theme")).toBe("shadcn-mono");
   });
 
-  it("preserves explicit Glass and Glass Silver color themes from localStorage", () => {
+  it("preserves explicit Medieval color theme from localStorage and writes it through", () => {
+    localStorageMock[COLOR_THEME_STORAGE_KEY] = "medieval";
+
+    const { result } = renderHook(() => useTheme());
+
+    expect(result.current.colorTheme).toBe("medieval");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("medieval");
+
+    act(() => {
+      result.current.setColorTheme("medieval");
+    });
+
+    expect(localStorageMock[COLOR_THEME_STORAGE_KEY]).toBe("medieval");
+    expect(mockUpdateGlobalSettings).toHaveBeenCalledWith({ colorTheme: "medieval" });
+  });
+
+  it("preserves explicit Glass, Glass Silver, and Liquid Glass color themes from localStorage", () => {
+    localStorageMock[COLOR_THEME_STORAGE_KEY] = "liquid-glass";
+
+    const liquidGlass = renderHook(() => useTheme());
+
+    expect(liquidGlass.result.current.colorTheme).toBe("liquid-glass");
+    expect(document.documentElement.getAttribute("data-color-theme")).toBe("liquid-glass");
+    liquidGlass.unmount();
+
     localStorageMock[COLOR_THEME_STORAGE_KEY] = "glass-silver";
 
     const { result, rerender } = renderHook(() => useTheme());

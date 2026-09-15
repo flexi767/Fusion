@@ -25,12 +25,19 @@ const createPauseRouteHarness = (initialTaskState: any) => {
   let taskState = initialTaskState;
   const store: TaskStore = {
     getRootDir: vi.fn(() => process.cwd()),
+    /*
+    FNXC:PluginMcpServers 2026-07-24-01:25:
+    FN-8491 (3cd023fa4) binds a project-scoped plugin-MCP provider on every getProjectContext.
+    Exposing getProjectScopedPluginMcpServers marks this mock as runtime-owned so the binder
+    short-circuits instead of calling getPluginStore().
+    */
+    getProjectScopedPluginMcpServers: vi.fn(async () => []),
     getTask: vi.fn(async () => taskState),
-    pauseTask: vi.fn(async (_id: string, paused: boolean) => {
+    pauseTask: vi.fn(async (_id: string, paused: boolean, _runContext, options) => {
       taskState = {
         ...taskState,
         paused: paused ? true : undefined,
-        userPaused: paused ? taskState.userPaused : undefined,
+        userPaused: paused ? (options?.userPaused ? true : taskState.userPaused) : undefined,
         pausedByAgentId: paused ? taskState.pausedByAgentId : undefined,
       };
       return taskState;
@@ -83,6 +90,7 @@ describe("task workflow pause routes", () => {
 
     expect(res.status).toBe(200);
     expect(getTaskState().paused).toBe(true);
-    expect(store.pauseTask).toHaveBeenCalledWith("FN-001", true);
+    expect(getTaskState().userPaused).toBe(true);
+    expect(store.pauseTask).toHaveBeenCalledWith("FN-001", true, undefined, { userPaused: true });
   });
 });

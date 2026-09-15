@@ -44,7 +44,7 @@
   max-width: 100%;
   height: 100%;
   max-height: 100%;
-  overflow-y: auto;
+  overflow: hidden;
   /* Keep pull-down/overscroll inside the Mission view so iOS pull-to-refresh and Android overscroll cannot reload the dashboard or snap the page to the top. */
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
@@ -184,63 +184,47 @@ Title metric matches the shared ViewHeader (1.125rem) so the Missions header rea
   overflow: hidden;
 }
 
+/*
+FNXC:StandardizedMissionLayout 2026-09-13-16:30:
+ViewSidebar owns the shared project width and separator. Mission content fills that rail without publishing a second independent width.
+*/
+.view-sidebar__panel > .mission-manager__sidebar {
+  width: 100%;
+  height: 100%;
+  border-right: 0;
+}
+
 .mission-manager__sidebar {
-  width: calc(var(--space-lg) * 18.75);
+  width: 100%;
   min-width: 0;
-  flex-shrink: 0;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  border-right: var(--btn-border-width) solid var(--border);
+  border-right: 0;
   background: var(--surface);
   overflow: hidden;
 }
 
-.mission-manager__sidebar-resize-handle {
-  position: relative;
-  width: var(--space-sm);
-  flex-shrink: 0;
-  cursor: col-resize;
-  background: transparent;
-  touch-action: none;
-  transition: background var(--transition-fast);
+/*
+FNXC:MissionAutoMerge 2026-08-08-17:21:
+Manual creation is a secondary text link so Plan New Mission remains the sole
+primary CTA while every production presentation can open the merge-aware form.
+*/
+.mission-list__manual-create-link {
+  align-self: center;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  text-decoration: underline;
+  text-underline-offset: var(--space-xxs);
 }
 
-.mission-manager__sidebar-resize-handle::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: var(--space-xs);
-  transform: translateX(-50%);
+.mission-list__manual-create-link:hover {
+  color: var(--text);
 }
 
-.mission-manager__sidebar-resize-handle:hover::before,
-.mission-manager__sidebar-resize-handle:active::before {
-  background: color-mix(in srgb, var(--todo) 30%, transparent);
-}
-
-.mission-manager__sidebar-resize-handle:focus-visible {
+.mission-list__manual-create-link:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring-strong);
-}
-
-/* Desktop split-only sidebar footer action bar for mission creation CTA. */
-.mission-manager__sidebar-footer {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-sm);
-  padding: var(--space-md);
-  border-top: var(--btn-border-width) solid var(--border);
-}
-
-.mission-manager__sidebar-cta {
-  width: 100%;
-  min-height: calc(var(--space-lg) * 2 + var(--space-xs));
-  justify-content: center;
-  gap: var(--space-sm);
-  font-size: inherit;
 }
 
 /* Hide duplicate sidebar title; the shared header already labels this view. */
@@ -267,6 +251,49 @@ Title metric matches the shared ViewHeader (1.125rem) so the Missions header rea
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
   padding: var(--space-sm);
+}
+
+.mission-manager__create-menu {
+  position: relative;
+}
+
+.mission-manager__create-menu-popover {
+  position: absolute;
+  z-index: var(--z-popover);
+  inset-block-start: calc(100% + var(--space-xs));
+  inset-inline-end: 0;
+  display: grid;
+  min-inline-size: calc(var(--space-2xl) * 6);
+  padding: var(--space-xs);
+  border: var(--btn-border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.mission-manager__create-menu-popover > button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: transparent;
+  text-align: start;
+  cursor: pointer;
+}
+
+.mission-manager__create-menu-popover > button:hover {
+  background: var(--card-hover);
+}
+
+.mission-list__filters {
+  display: flex;
+  justify-content: flex-end;
+  margin: calc(var(--space-sm) * -1) calc(var(--space-sm) * -1) var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: var(--btn-border-width) solid var(--border);
 }
 
 .mission-manager__detail-pane {
@@ -364,11 +391,6 @@ Title metric matches the shared ViewHeader (1.125rem) so the Missions header rea
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-muted);
-}
-
-.mission-manager__empty-cta {
-  margin-top: var(--space-sm);
-  gap: var(--space-sm);
 }
 
 /* ── Status Badge ── */
@@ -534,11 +556,12 @@ Title metric matches the shared ViewHeader (1.125rem) so the Missions header rea
 }
 
 /*
-FNXC:MissionsMobile 2026-06-22-18:00:
-Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using the same compact primary button proportions as Chat's New Chat action instead of a large top CTA.
+FNXC:MissionsUI 2026-08-16-14:48:
+Mobile Missions keeps Plan New Mission above the list for immediate reachability. The shared tokenized height matches the desktop sidebar CTA while preserving the compact button treatment.
 */
 .mission-list__primary-cta {
   width: 100%;
+  min-height: calc(var(--space-lg) * 2 + var(--space-sm));
   justify-content: center;
   gap: var(--space-sm);
 }
@@ -558,12 +581,6 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   font-weight: 600;
 }
 
-.mission-list__footer {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
-}
-
 .mission-list__resume-actions {
   display: flex;
   flex-wrap: wrap;
@@ -572,13 +589,17 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   margin-inline-start: auto;
 }
 
-.mission-list__footer-actions {
+.mission-list__header-actions {
   display: flex;
+  flex-direction: column;
   gap: var(--space-sm);
 }
 
-/* Desktop split-only: list footer actions live in sidebar header, so hide duplicated footer buttons. */
-.mission-manager__sidebar .mission-list__footer-actions {
+/*
+FNXC:MissionsUI 2026-08-16-14:48:
+Desktop owns the CTA in its sidebar bar, so the shared list header cannot duplicate it.
+*/
+.mission-manager__sidebar .mission-list__header-actions {
   display: none;
 }
 
@@ -1085,6 +1106,44 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   color: var(--text-muted);
 }
 
+.mission-detail__reconcile-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  width: 100%;
+  padding: var(--space-sm);
+  border: var(--btn-border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-warning) 10%, var(--surface));
+  color: var(--text);
+}
+
+.mission-detail__reconcile-summary,
+.mission-detail__reconcile-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.mission-detail__reconcile-summary {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.mission-detail__reconcile-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin: 0;
+  padding-inline-start: var(--space-lg);
+  font-size: var(--font-size-sm);
+}
+
+.mission-detail__reconcile-actions {
+  justify-content: flex-start;
+}
+
 .mission-detail__management-actions {
   display: inline-flex;
   align-items: center;
@@ -1459,6 +1518,27 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
 .mission-event__timestamp {
   font-size: 11px;
   color: var(--text-dim);
+}
+
+.mission-event__diagnostics,
+.mission-event__diagnostic {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  overflow-wrap: anywhere;
+}
+
+.mission-event__diagnostics {
+  padding: var(--space-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+}
+
+.mission-event__diagnostic + .mission-event__diagnostic {
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
 }
 
 .mission-event__metadata {
@@ -2031,6 +2111,27 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   flex-wrap: wrap;
 }
 
+/*
+FNXC:SpecLockMissionAlignment 2026-08-09-19:34:
+FN-8845 renders delivery state and retained spec alignment independently. Semantic token colors make
+needs-review and unavailable visible without suggesting that a re-lock is a quality or completion result.
+*/
+.mission-spec-alignment--on-plan,
+.mission-spec-alignment--diverged-relocked-approved {
+  color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+}
+
+.mission-spec-alignment--diverged-needs-review {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+}
+
+.mission-spec-alignment--unavailable {
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+}
+
 .mission-feature__icon {
   flex-shrink: 0;
   color: var(--text-muted);
@@ -2052,6 +2153,15 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   align-items: center;
   gap: calc(var(--space-xs) / 2);
   flex-shrink: 0;
+}
+
+.mission-icon-btn--repair {
+  color: var(--warning);
+}
+
+.mission-icon-btn--repair:hover:not(:disabled) {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
 }
 
 .mission-feature__description {
@@ -2485,6 +2595,17 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   flex-wrap: wrap;
 }
 
+/*
+FNXC:MissionValidationRepair 2026-08-11-00:07:
+Generated fix features can carry the same stale blocked state as ordinary rows. Keep their repair controls in the existing header layout so both presentations expose the identical, predicate-gated escape.
+*/
+.mission-fix-feature__actions {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--space-xs) / 2);
+  margin-left: auto;
+}
+
 .mission-fix-feature__title {
   border: none;
   background: transparent;
@@ -2704,9 +2825,20 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   .mission-list__item-actions .mission-btn,
   .mission-milestone__actions .mission-icon-btn,
   .mission-slice__actions .mission-icon-btn,
-  .mission-feature__actions .mission-icon-btn {
+  .mission-feature__actions .mission-icon-btn,
+  .mission-fix-feature__actions .mission-icon-btn {
     min-width: 36px;
     min-height: 36px;
+  }
+
+  .mission-detail__run-controls > [data-testid="mission-reconcile-now"],
+  .mission-detail__reconcile-actions .mission-btn {
+    min-width: 36px;
+    min-height: 36px;
+  }
+
+  .mission-detail__reconcile-panel {
+    max-width: 100%;
   }
 
   /* Prevent iOS zoom on focus */
@@ -2740,7 +2872,8 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
   .mission-list__item-actions .mission-btn,
   .mission-milestone__actions .mission-icon-btn,
   .mission-slice__actions .mission-icon-btn,
-  .mission-feature__actions .mission-icon-btn {
+  .mission-feature__actions .mission-icon-btn,
+  .mission-fix-feature__actions .mission-icon-btn {
     min-width: 36px;
     min-height: 36px;
   }
@@ -2902,3 +3035,9 @@ Narrow/mobile Missions puts Plan New Mission at the bottom of the list, using th
 [data-theme="light"] .mission-manager__header {
   background: color-mix(in srgb, var(--surface) 80%, transparent);
 }
+
+/* FNXC:MissionBlockedRepair 2026-08-11-02:56: Keep stale-badge diagnostics adjacent to existing run controls without creating a parallel button system. */
+.mission-blocked-repair { display: grid; gap: var(--space-2); color: var(--text-muted); }
+.mission-blocked-repair ul { margin: 0; padding-inline-start: var(--space-4); }
+.mission-blocked-repair .input { max-inline-size: 100%; }
+@media (max-width: 768px) { .mission-manager__body--stacked .mission-blocked-repair { inline-size: 100%; } }

@@ -3,7 +3,7 @@ import {
   computeAccessState,
   isValidPermission,
   normalizePermissions,
-} from "../agent-permissions.js";
+} from "../agents/agent-permissions.js";
 import { AGENT_PERMISSIONS } from "../types.js";
 import type { Agent, AgentCapability, AgentPermission } from "../types.js";
 
@@ -79,6 +79,18 @@ describe("computeAccessState", () => {
     expect(state.canAssignTasks).toBe(false);
     expect(state.taskAssignSource).toBe("denied");
     expect(state.resolvedPermissions.has("tasks:execute")).toBe(true);
+  });
+
+  it("unions defaults across canonical multi-role tags", () => {
+    const state = computeAccessState({
+      ...makeAgent("reviewer"),
+      role: "reviewer",
+      roles: ["executor", "reviewer", "merger"],
+    });
+
+    expect(state.canExecuteTasks).toBe(true);
+    expect(state.canReviewTasks).toBe(true);
+    expect(state.canMergeTasks).toBe(true);
   });
 
   it("scheduler role gets assign by default", () => {

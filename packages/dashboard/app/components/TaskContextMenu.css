@@ -46,6 +46,51 @@
   cursor: default;
 }
 
+/*
+FNXC:AlphaCollections 2026-09-10-20:00:
+Alpha task actions use one valid homemade Alpha menu collection per visual row. The row menu is layout-transparent, while a submenu remains anchored to the row that opened it instead of being moved behind the complete parent collection.
+*/
+.task-context-menu__row-menu {
+  display: contents;
+}
+
+.task-context-menu__submenu-parent {
+  position: relative;
+}
+
+.task-context-menu__submenu-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.task-context-menu__submenu-toggle::after {
+  content: "›";
+  color: var(--text-muted);
+}
+
+.task-context-menu__submenu {
+  position: absolute;
+  top: 0;
+  left: calc(100% - var(--space-xs));
+  min-width: var(--task-context-menu-min-width);
+  padding: var(--space-xs) 0;
+  border: var(--btn-border-width) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.task-context-menu__submenu--opens-left {
+  right: calc(100% - var(--space-xs));
+  left: auto;
+}
+
+.task-context-menu__submenu-item {
+  padding-left: var(--space-lg);
+}
+
 @media (max-width: 768px) {
   .task-context-menu {
     --task-context-menu-min-width: min(calc(100vw - var(--space-xl)), calc(var(--space-xl) * 6));

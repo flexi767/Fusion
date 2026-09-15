@@ -2,11 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 
-const { execMock, existsSyncMock } = vi.hoisted(() => ({
-  execMock: vi.fn(),
-  existsSyncMock: vi.fn(() => false),
-}));
-vi.mock("node:child_process", () => ({ exec: execMock, execSync: vi.fn(), execFile: vi.fn() }));
+const { execMock, execFileMock, existsSyncMock } = vi.hoisted(() => {
+  const execFileMock = vi.fn();
+  (execFileMock as any)[Symbol.for("nodejs.util.promisify.custom")] = execFileMock;
+  return {
+    execMock: vi.fn(),
+    execFileMock,
+    existsSyncMock: vi.fn(() => false),
+  };
+});
+vi.mock("node:child_process", () => ({ exec: execMock, execSync: vi.fn(), execFile: execFileMock }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -16,17 +21,27 @@ vi.mock("node:fs", async (importOriginal) => {
 const { uniqueCommitsMock } = vi.hoisted(() => ({
   uniqueCommitsMock: vi.fn(async () => ({ commits: [], mainRef: "main", degraded: false })),
 }));
-vi.mock("../branch-conflicts.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../branch-conflicts.js")>();
+vi.mock("../execution/branch-conflicts.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../execution/branch-conflicts.js")>();
   return { ...actual, listUniqueBranchCommits: uniqueCommitsMock };
 });
 
 const { logger } = vi.hoisted(() => ({
-  logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  /*
+  FNXC:TestInfrastructure 2026-07-29-13:10 (U9):
+  `debug` is part of createLogger's real shape and SelfHealingManager.start /
+  startMaintenance both call it. Omitting it here threw "log.debug is not a
+  function" out of start(), so "wires and unwires task:moved listener" was
+  permanently red AND leaked an unhandled rejection from startMaintenance that
+  vitest warns can cause false positives in the rest of the file.
+  */
+  logger: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
-vi.mock("../logger.js", () => ({ createLogger: vi.fn(() => logger) }));
+vi.mock("../logger.js", () => ({ createLogger: vi.fn(() => logger), schedulerLog: logger, runtimeLog: logger }));
 
+import { Scheduler } from "../scheduler.js";
 import { SelfHealingManager } from "../self-healing.js";
+import { createRuntimeSelfHealingManager } from "../runtimes/in-process-runtime.js";
 
 function makeTask(id: string, overrides: Partial<Task> = {}): Task {
   return {
@@ -51,6 +66,10 @@ function createStore(tasks: Task[], settings?: Partial<Settings>): TaskStore & E
   Object.assign(cfg, settings ?? {});
   return Object.assign(emitter, {
     getSettings: vi.fn(async () => cfg),
+    updateSettings: vi.fn(async () => cfg),
+    getRootDir: vi.fn(() => "/repo"),
+    getTasksDir: vi.fn(() => "/repo/.fusion/tasks"),
+    recordRunAuditEvent: vi.fn(async () => undefined),
     listTasks: vi.fn(async (opts?: { column?: Task["column"]; includeArchived?: boolean }) => {
       const all = [...map.values()];
       if (!opts?.column) return all;
@@ -61,6 +80,29 @@ function createStore(tasks: Task[], settings?: Partial<Settings>): TaskStore & E
       const task = map.get(id)!;
       map.set(id, { ...task, ...patch } as Task);
       return map.get(id);
+    }),
+    updateTaskAtomic: vi.fn(async (id: string, buildPatch: (live: Task) => Partial<Task> | null) => {
+      const live = map.get(id)!;
+      const patch = buildPatch(live);
+      if (patch) map.set(id, { ...live, ...patch } as Task);
+      return map.get(id)!;
+    }),
+    transitionQueuedEpisode: vi.fn(async (id: string, transition: { signature: string; blockedBy: string | null; overlapBlockedBy: string | null; action: string }) => {
+      const task = map.get(id)!;
+      const appended = !(task.status === "queued"
+        && (task.blockedBy ?? null) === transition.blockedBy
+        && (task.overlapBlockedBy ?? null) === transition.overlapBlockedBy
+        && task.queuedLogEpisodeSignature === transition.signature);
+      const updated = {
+        ...task,
+        status: "queued",
+        blockedBy: transition.blockedBy,
+        overlapBlockedBy: transition.overlapBlockedBy,
+        queuedLogEpisodeSignature: transition.signature,
+        log: appended ? [...(task.log ?? []), { timestamp: new Date().toISOString(), action: transition.action }] : task.log,
+      } as Task;
+      map.set(id, updated);
+      return { appended, task: updated };
     }),
     moveTask: vi.fn(async (id: string, column: Task["column"]) => {
       const task = map.get(id)!;
@@ -73,9 +115,34 @@ function createStore(tasks: Task[], settings?: Partial<Settings>): TaskStore & E
   }) as unknown as TaskStore & EventEmitter;
 }
 
+function configureTaskWorkflowSelections(
+  store: TaskStore,
+  definitions: ReadonlyArray<{ id: string; ir: unknown }>,
+  workflowIdByTaskId: Readonly<Record<string, string>>,
+): void {
+  const definitionById = new Map(definitions.map((definition) => [definition.id, definition]));
+  const mutable = store as unknown as {
+    listWorkflowDefinitions: ReturnType<typeof vi.fn>;
+    getTaskWorkflowSelection: ReturnType<typeof vi.fn>;
+    getTaskWorkflowSelectionAsync: ReturnType<typeof vi.fn>;
+    getWorkflowDefinition: ReturnType<typeof vi.fn>;
+  };
+  mutable.listWorkflowDefinitions = vi.fn(async () => definitions);
+  mutable.getTaskWorkflowSelection = vi.fn((taskId: string) => {
+    const workflowId = workflowIdByTaskId[taskId];
+    return workflowId ? { workflowId, stepIds: [] } : undefined;
+  });
+  mutable.getTaskWorkflowSelectionAsync = vi.fn(async (taskId: string) => {
+    const workflowId = workflowIdByTaskId[taskId];
+    return workflowId ? { workflowId, stepIds: [] } : undefined;
+  });
+  mutable.getWorkflowDefinition = vi.fn(async (workflowId: string) => definitionById.get(workflowId));
+}
+
 describe("self-healing completion fan-out", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    execFileMock.mockResolvedValue({ stdout: "", stderr: "" });
     execMock.mockImplementation((cmd: string, _opts: unknown, cb: (err: unknown, stdout: string, stderr: string) => void) => {
       cb(null, "", "");
     });
@@ -105,6 +172,326 @@ describe("self-healing completion fan-out", () => {
     );
   });
 
+  it("requests scheduling only after a stale overlap blocker is durably cleared", async () => {
+    const blocker = makeTask("FN-B", { column: "done" });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      overlapBlockedBy: blocker.id,
+    });
+    const store = createStore([blocker, dependent], { groupOverlappingFiles: true });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    const releasedStates: Array<Pick<Task, "status" | "overlapBlockedBy">> = [];
+    const onOverlapBlockersReleased = vi.fn(async () => {
+      const live = await store.getTask(dependent.id);
+      releasedStates.push({ status: live?.status, overlapBlockedBy: live?.overlapBlockedBy });
+    });
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo", onOverlapBlockersReleased });
+
+    await mgr.reconcileCompletedTask(blocker.id);
+    await mgr.reconcileCompletedTask(blocker.id);
+
+    expect(await store.getTask(dependent.id)).toMatchObject({
+      status: null,
+      overlapBlockedBy: null,
+    });
+    expect(onOverlapBlockersReleased).toHaveBeenCalledTimes(1);
+    expect(onOverlapBlockersReleased).toHaveBeenCalledWith([{ taskId: dependent.id, blockerId: blocker.id }]);
+    expect(releasedStates).toEqual([{ status: null, overlapBlockedBy: null }]);
+  });
+
+  it("runtime composition releases the matching continuation before publishing both wakes", async () => {
+    const blocker = makeTask("FN-B", { column: "done" });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      overlapBlockedBy: blocker.id,
+    });
+    const store = createStore([blocker, dependent], { groupOverlappingFiles: true });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    let item = {
+      id: "wi-plan-review",
+      taskId: dependent.id,
+      kind: "task",
+      state: "held",
+      leaseOwner: null,
+      blockedReason: `file-scope:${blocker.id}`,
+    };
+    (store as any).listWorkflowWorkItemsForTask = vi.fn(async () => [item]);
+    (store as any).transitionWorkflowWorkItem = vi.fn(async (_id: string, state: string, patch: Record<string, unknown>) => {
+      if (item.state === patch.expectedState && item.leaseOwner === patch.expectedLeaseOwner) {
+        item = { ...item, ...patch, state } as typeof item;
+      }
+      return item;
+    });
+    const order: string[] = [];
+    const scheduler = { requestImmediateSchedule: vi.fn(() => { order.push("scheduler"); }) };
+    const kick = vi.fn(() => { order.push("continuation"); });
+    const mgr = createRuntimeSelfHealingManager(store, scheduler as Pick<Scheduler, "requestImmediateSchedule">, {
+      rootDir: "/repo",
+    }, { kick });
+
+    await mgr.reconcileCompletedTask(blocker.id);
+
+    expect(item).toMatchObject({ state: "runnable", leaseOwner: null, blockedReason: null });
+    expect((store as any).transitionWorkflowWorkItem).toHaveBeenCalledWith(item.id, "runnable", expect.objectContaining({
+      expectedState: "held",
+      expectedLeaseOwner: null,
+    }));
+    expect(order).toEqual(["continuation", "scheduler"]);
+  });
+
+  it("runs the runtime-composed scheduler follow-up after the real terminal event races ahead of CAS", async () => {
+    const blocker = makeTask("FN-B", { column: "in-review" });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      overlapBlockedBy: blocker.id,
+    });
+    const store = createStore([blocker, dependent], { groupOverlappingFiles: true, pollIntervalMs: 60_000 });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    const scheduler = new Scheduler(store);
+    const wakeSpy = vi.spyOn(scheduler, "requestImmediateSchedule");
+    const releaseFirstPass = (() => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      return { promise, resolve };
+    })();
+    const releaseOverlapCas = (() => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      return { promise, resolve };
+    })();
+    const overlapCasEntered = (() => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      return { promise, resolve };
+    })();
+    const baseAtomic = (store as any).updateTaskAtomic;
+    (store as any).updateTaskAtomic = vi.fn(async (id: string, buildPatch: (live: Task) => Partial<Task> | null) => {
+      if (id === dependent.id) {
+        overlapCasEntered.resolve();
+        await releaseOverlapCas.promise;
+      }
+      return baseAtomic(id, buildPatch);
+    });
+    let passCount = 0;
+    let released = false;
+    (scheduler as unknown as { running: boolean }).running = true;
+    (scheduler as unknown as { runHoldReleaseSweepPass: () => Promise<void> }).runHoldReleaseSweepPass = vi.fn(async () => {
+      passCount++;
+      if (passCount === 1) await releaseFirstPass.promise;
+      const live = await store.getTask(dependent.id);
+      if (!live?.overlapBlockedBy && live?.status == null) released = true;
+    });
+    const mgr = createRuntimeSelfHealingManager(store, scheduler, {
+      rootDir: "/repo",
+    });
+    mgr.start();
+
+    const firstSchedule = scheduler.schedule();
+    await vi.waitFor(() => expect(passCount).toBe(1));
+    await store.moveTask(blocker.id, "done");
+    await overlapCasEntered.promise;
+    await vi.waitFor(() => expect(wakeSpy).toHaveBeenCalledTimes(1));
+    expect(await store.getTask(dependent.id)).toMatchObject({ status: "queued", overlapBlockedBy: blocker.id });
+
+    releaseOverlapCas.resolve();
+    await vi.waitFor(async () => {
+      expect(await store.getTask(dependent.id)).toMatchObject({ status: null, overlapBlockedBy: null });
+      expect(wakeSpy).toHaveBeenCalledTimes(2);
+    });
+    expect(passCount).toBe(1);
+
+    releaseFirstPass.resolve();
+    await firstSchedule;
+    await vi.waitFor(() => expect(passCount).toBe(2));
+
+    expect(released).toBe(true);
+    mgr.stop();
+    scheduler.stop();
+  });
+
+  it("does not clear queued state or wake when another holder replaces the inspected blocker during CAS", async () => {
+    const completed = makeTask("FN-COMPLETED", { column: "done" });
+    const replacement = makeTask("FN-REPLACEMENT", { column: "in-progress" });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      overlapBlockedBy: completed.id,
+    });
+    const store = createStore([completed, replacement, dependent], { groupOverlappingFiles: true });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    (store as any).updateTaskAtomic = vi.fn(async (id: string, buildPatch: (live: Task) => Partial<Task> | null) => {
+      await store.updateTask(id, { overlapBlockedBy: replacement.id });
+      const live = await store.getTask(id);
+      const patch = live ? buildPatch(live) : null;
+      return patch ? store.updateTask(id, patch) : live;
+    });
+    const onOverlapBlockersReleased = vi.fn();
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo", onOverlapBlockersReleased });
+
+    await mgr.reconcileCompletedTask(completed.id);
+
+    expect(await store.getTask(dependent.id)).toMatchObject({
+      status: "queued",
+      overlapBlockedBy: replacement.id,
+    });
+    expect(onOverlapBlockersReleased).not.toHaveBeenCalled();
+  });
+
+  it("preserves a replacement overlap holder when an unmet dependency is queued during the atomic transition", async () => {
+    const completed = makeTask("FN-COMPLETED", { column: "done" });
+    const unmet = makeTask("FN-UNMET", { column: "todo" });
+    const replacement = makeTask("FN-REPLACEMENT", { column: "in-progress" });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      blockedBy: completed.id,
+      overlapBlockedBy: completed.id,
+      dependencies: [completed.id, unmet.id],
+    });
+    const store = createStore([completed, unmet, replacement, dependent], { groupOverlappingFiles: true });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    const baseAtomic = (store as any).updateTaskAtomic;
+    let replacementInstalled = false;
+    (store as any).updateTaskAtomic = vi.fn(async (id: string, buildPatch: (live: Task) => Partial<Task> | null) => {
+      if (!replacementInstalled) {
+        replacementInstalled = true;
+        await store.updateTask(id, { overlapBlockedBy: replacement.id });
+      }
+      return baseAtomic(id, buildPatch);
+    });
+    const onOverlapBlockersReleased = vi.fn();
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo", onOverlapBlockersReleased });
+
+    await mgr.reconcileCompletedTask(completed.id);
+
+    expect(await store.getTask(dependent.id)).toMatchObject({
+      status: "queued",
+      blockedBy: unmet.id,
+      overlapBlockedBy: replacement.id,
+      queuedLogEpisodeSignature: `dependency:${unmet.id}`,
+    });
+    expect(onOverlapBlockersReleased).not.toHaveBeenCalled();
+    expect((store as any).transitionQueuedEpisode).not.toHaveBeenCalled();
+  });
+
+  it("preserves an overlap block held by a failed review task with a worktree", async () => {
+    const completed = makeTask("FN-COMPLETED", { column: "done" });
+    const overlapHolder = makeTask("FN-OVERLAP", {
+      column: "in-review",
+      status: "failed",
+      worktree: "/wt/fn-overlap",
+    });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      blockedBy: completed.id,
+      overlapBlockedBy: overlapHolder.id,
+    });
+    const store = createStore([completed, overlapHolder, dependent], { groupOverlappingFiles: true });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    const onOverlapBlockersReleased = vi.fn();
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo", onOverlapBlockersReleased });
+
+    await mgr.reconcileCompletedTask(completed.id);
+
+    expect(await store.getTask(dependent.id)).toMatchObject({
+      status: "queued",
+      blockedBy: null,
+      overlapBlockedBy: overlapHolder.id,
+    });
+    expect((store as any).transitionQueuedEpisode).toHaveBeenCalledWith(
+      dependent.id,
+      expect.objectContaining({ signature: `file-scope:${overlapHolder.id}` }),
+    );
+    expect(onOverlapBlockersReleased).not.toHaveBeenCalled();
+  });
+
+  it("uses the holder workflow rather than a project-wide terminal column union", async () => {
+    const completed = makeTask("FN-254-COMPLETED", { column: "done" });
+    const overlapHolder = makeTask("FN-254-HOLDER", {
+      column: "shared",
+      priority: "high",
+      worktree: "/wt/fn-254-holder",
+    });
+    const dependent = makeTask("FN-254-DEPENDENT", {
+      column: "todo",
+      priority: "normal",
+      status: "queued",
+      blockedBy: completed.id,
+      overlapBlockedBy: overlapHolder.id,
+    });
+    const store = createStore([completed, overlapHolder, dependent], { groupOverlappingFiles: true });
+    (store as any).parseFileScopeFromPrompt = vi.fn(async () => ["packages/core/src/store.ts"]);
+    configureTaskWorkflowSelections(
+      store,
+      [
+        {
+          id: "wf-holder",
+          ir: {
+            version: "v2",
+            name: "holder-workflow",
+            columns: [
+              { id: "todo", name: "Todo", traits: [{ trait: "hold" }] },
+              { id: "shared", name: "Shared", traits: [] },
+              { id: "done", name: "Done", traits: [{ trait: "complete" }] },
+            ],
+            nodes: [],
+            edges: [],
+          },
+        },
+        {
+          id: "wf-other",
+          ir: {
+            version: "v2",
+            name: "other-workflow",
+            columns: [
+              { id: "shared", name: "Shared", traits: [{ trait: "complete" }] },
+            ],
+            nodes: [],
+            edges: [],
+          },
+        },
+      ],
+      { [overlapHolder.id]: "wf-holder" },
+    );
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+
+    await mgr.reconcileCompletedTask(completed.id);
+
+    expect(await store.getTask(dependent.id)).toMatchObject({
+      status: "queued",
+      blockedBy: null,
+      overlapBlockedBy: overlapHolder.id,
+    });
+    expect((store as any).transitionQueuedEpisode).toHaveBeenCalledWith(
+      dependent.id,
+      expect.objectContaining({ signature: `file-scope:${overlapHolder.id}` }),
+    );
+  });
+
+  it("deduplicates concurrent completion fanout that leaves a dependent behind the same queue episode", async () => {
+    const blocker = makeTask("FN-B", { column: "done" });
+    const other = makeTask("FN-OTHER", { column: "todo" });
+    const dependent = makeTask("FN-DEPENDENT", {
+      column: "todo",
+      status: "queued" as any,
+      blockedBy: "FN-B",
+      dependencies: ["FN-B", "FN-OTHER"],
+    });
+    const store = createStore([blocker, other, dependent]);
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+
+    await Promise.all([mgr.reconcileCompletedTask("FN-B"), mgr.reconcileCompletedTask("FN-B")]);
+
+    const updated = await store.getTask("FN-DEPENDENT");
+    expect(updated?.blockedBy).toBe("FN-OTHER");
+    expect(updated?.queuedLogEpisodeSignature).toBe("dependency:FN-OTHER");
+    expect(updated?.log?.filter((entry) => entry.action.includes("FN-4523"))).toHaveLength(1);
+  });
+
   it("prefers worktree hint and is idempotent when missing", async () => {
     (existsSyncMock as any).mockImplementation((p: string) => p === "/wt/fn-b");
     const blocker = makeTask("FN-B", { column: "done", branch: "fusion/fn-b" });
@@ -113,12 +500,12 @@ describe("self-healing completion fan-out", () => {
 
     const first = await mgr.reconcileCompletedTask("FN-B", { worktreeHint: "/wt/fn-b" });
     expect(first.worktreeRemoved).toBe(true);
-    expect(execMock.mock.calls.some((c) => String(c[0]).includes("git worktree remove --force") && String(c[0]).includes("/wt/fn-b"))).toBe(true);
+    expect(execMock.mock.calls.some((c) => String(c[0]).includes('git worktree remove "/wt/fn-b"'))).toBe(true);
 
     existsSyncMock.mockReturnValue(false);
     const second = await mgr.reconcileCompletedTask("FN-B");
     expect(second.worktreeRemoved).toBe(false);
-    const rmCalls = execMock.mock.calls.filter((c) => String(c[0]).includes("git worktree remove --force") && String(c[0]).includes("/wt/fn-b"));
+    const rmCalls = execMock.mock.calls.filter((c) => String(c[0]).includes('git worktree remove "/wt/fn-b"'));
     expect(rmCalls).toHaveLength(1);
   });
 
@@ -134,20 +521,44 @@ describe("self-healing completion fan-out", () => {
     const out = await mgr.reconcileCompletedTask("FN-C");
     expect(out.worktreeRemoved).toBe(true);
     expect(findSpy).not.toHaveBeenCalled();
-    expect(execMock.mock.calls.some((c) => String(c[0]).includes("git worktree remove --force") && String(c[0]).includes("/wt/fn-c"))).toBe(true);
+    expect(execMock.mock.calls.some((c) => String(c[0]).includes('git worktree remove "/wt/fn-c"'))).toBe(true);
     expect((await store.getTask("FN-C"))?.worktree).toBeNull();
     expect((await store.getTask("FN-C"))?.branch).toBeNull();
-    expect(out.branchRemoved).toBe(false);
+    /*
+    FNXC:StaleActiveBranchDoneSpam 2026-08-03-01:47:
+    Post-completion branch cleanup force-deletes even when the tip still has unique commits vs main
+    (squash/AI-merge shape). Previously this case expected branchRemoved=false and left fusion/* forever.
+    */
+    expect(out.branchRemoved).toBe(true);
+    expect(execMock.mock.calls.some((c) => String(c[0]).includes("git branch -D") && String(c[0]).includes("fusion/fn-c"))).toBe(true);
+  });
+
+  it("force-deletes completion branch when unique commits remain after squash", async () => {
+    uniqueCommitsMock.mockResolvedValue({
+      commits: [{ sha: "deadbeef", subject: "feat: pre-squash tip" }] as any,
+      mainRef: "main",
+      degraded: false,
+    });
+    const blocker = makeTask("FN-SQUASH", { column: "done", branch: "fusion/fn-squash" });
+    const store = createStore([blocker]);
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+
+    const out = await mgr.reconcileCompletedTask("FN-SQUASH");
+    expect(out.branchRemoved).toBe(true);
+    expect(execMock.mock.calls.some((c) => String(c[0]).includes("git branch -D") && String(c[0]).includes("fusion/fn-squash"))).toBe(true);
+    expect(logger.log).toHaveBeenCalledWith(expect.stringContaining("force-deleting post-completion"));
   });
 
   it("globalPause short-circuits", async () => {
     const blocker = makeTask("FN-B", { column: "done" });
     const dependent = makeTask("FN-D", { blockedBy: "FN-B", column: "todo" });
     const store = createStore([blocker, dependent], { globalPause: true });
-    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+    const onOverlapBlockersReleased = vi.fn();
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo", onOverlapBlockersReleased });
     const out = await mgr.reconcileCompletedTask("FN-B");
     expect(out).toEqual({ blockedByCleared: 0, worktreeRemoved: false, branchRemoved: false });
     expect((store as any).updateTask).not.toHaveBeenCalled();
+    expect(onOverlapBlockersReleased).not.toHaveBeenCalled();
   });
 
   it("recoverAlreadyMergedReviewTasks calls reconcile with worktreeHint", async () => {
@@ -168,16 +579,25 @@ describe("self-healing completion fan-out", () => {
 
     mgr.start();
     store.emit("task:moved", { task: t, from: "in-review", to: "done", source: "user" });
-    store.emit("task:moved", { task: t, from: "done", to: "archived", source: "engine" });
     store.emit("task:moved", { task: t, from: "in-review", to: "todo", source: "user" });
-    await Promise.resolve();
-    expect(spy).toHaveBeenCalledTimes(2);
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-23:40:
+    `await Promise.resolve()` was draining exactly one microtask, which coupled this case to the
+    number of awaits inside a FIRE-AND-FORGET path. The listener does not await the fan-out and never
+    did, so how many microtasks it takes is not the contract — "it ran, twice, for the right
+    transitions" is. Resolving the lanes adds an await, so the drain is now written against the
+    invariant instead of against the old await count. Only entry into Complete triggers fan-out;
+    historical sentinel movement is no longer a lifecycle event.
+    */
+    await vi.waitFor(() => { expect(spy).toHaveBeenCalledOnce(); });
     expect(spy).toHaveBeenNthCalledWith(1, "FN-L", { worktreeHint: undefined });
 
     mgr.stop();
     store.emit("task:moved", { task: t, from: "in-review", to: "done", source: "user" });
-    await Promise.resolve();
-    expect(spy).toHaveBeenCalledTimes(2);
+    /* The negative keeps a real drain: an unwired listener must stay silent after several ticks,
+       not merely after one. */
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(spy).toHaveBeenCalledOnce();
   });
 
   it("clears task.worktree and matching task.branch after successful removal", async () => {
@@ -191,5 +611,183 @@ describe("self-healing completion fan-out", () => {
     expect(out.worktreeRemoved).toBe(true);
     expect((await store.getTask("FN-D"))?.worktree).toBeNull();
     expect((await store.getTask("FN-D"))?.branch).toBeNull();
+  });
+});
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-23:45:
+THE `task:moved` FAN-OUT ON A RENAMED BOARD.
+
+Two of this listener's guards were keyed on `in-review`/`done`/`archived`, so on a board using none
+of those ids a card entering its own review lane never had its branch rebound, and a card reaching
+its own complete or archive lane never ran the completion fan-out — the worktree was never reclaimed
+and dependents kept a `blockedBy` pointing at a blocker that had already finished.
+
+The SYNC-IR conversion of this listener is inert and was withdrawn. These two guards gate work the
+listener already `void`s, so they can ask the ASYNC resolver instead without changing anything an
+observer can see; the resolution reads `listWorkflowDefinitions()`, which is answerable under
+PostgreSQL.
+
+The board-stall counter above them is deliberately NOT converted here: it mutates in-memory state in
+the handler's own tick, so it is the one guard that genuinely needs a synchronous answer.
+*/
+describe("the task:moved fan-out resolves the board's own lanes", () => {
+  /** Review `checking`, complete `shipped`, archive `filed` — no legacy id anywhere. */
+  const RENAMED_IR = {
+    version: "v2", id: "wf-renamed", name: "renamed", nodes: [], edges: [],
+    columns: [
+      { id: "building", name: "Building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+      { id: "checking", name: "Checking", traits: [{ trait: "merge" }] },
+      { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
+    ],
+  };
+
+  function renamedStore(task: Task) {
+    const base = createStore([task]) as unknown as TaskStore & EventEmitter;
+    (base as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions =
+      vi.fn(async () => [{ ir: RENAMED_IR }]);
+    return base;
+  }
+
+  it("runs the completion fan-out for the board's own review -> complete transition", async () => {
+    const t = makeTask("FN-R1", { column: "shipped" });
+    const store = renamedStore(t);
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+    const spy = vi.spyOn(mgr, "reconcileCompletedTask").mockResolvedValue({ blockedByCleared: 0, worktreeRemoved: false, branchRemoved: false });
+
+    mgr.start();
+    store.emit("task:moved", { task: t, from: "checking", to: "shipped", source: "engine" });
+
+    await vi.waitFor(() => { expect(spy).toHaveBeenCalledWith("FN-R1", { worktreeHint: undefined }); });
+    mgr.stop();
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-19:30:
+  `completedReviewColumns` was UNCOVERED on the #3115 map. It reads the DEPENDENTS resting in review
+  when a blocker completes; no case here put a dependent in a renamed review lane, so blinding it left
+  the file green.
+
+  What the literal costs: a dependent sitting in review is never read, so its `blockedBy` is never
+  cleared when the blocker finishes. It stays blocked by work that is already done — the most visible
+  form of this class, because the board simply stops moving.
+  */
+  it("clears blockedBy for a dependent resting in the board's own review lane", async () => {
+    const blocker = makeTask("FN-BLOCKER", { column: "shipped" });
+    const dependent = makeTask("FN-DEP", { column: "checking", blockedBy: "FN-BLOCKER", status: "queued" });
+    const store = createStore([blocker, dependent]) as unknown as TaskStore & EventEmitter;
+    (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions =
+      vi.fn(async () => [{ id: "wf-renamed", ir: RENAMED_IR }]);
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+
+    await mgr.reconcileCompletedTask("FN-BLOCKER");
+
+    expect(await store.getTask("FN-DEP")).toMatchObject({ blockedBy: null });
+    mgr.stop();
+  });
+
+  it("rebinds the branch on a move into the board's own review lane", async () => {
+    const t = makeTask("FN-R2", { column: "checking" });
+    const store = renamedStore(t);
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+    const rebind = vi.spyOn(mgr, "reconcileInReviewBranchRebind").mockResolvedValue(0 as never);
+
+    mgr.start();
+    store.emit("task:moved", { task: t, from: "building", to: "checking", source: "engine" });
+
+    await vi.waitFor(() => { expect(rebind).toHaveBeenCalledWith({ includeTaskIds: new Set(["FN-R2"]) }); });
+    mgr.stop();
+  });
+
+  /*
+  The paired negative. The conversion widens membership, so it must not fan out on every move: a
+  `checking -> building` bounce is not a completion, and reconciling it would remove the worktree of
+  a card that is about to run again.
+  */
+  it("does NOT run the completion fan-out for a bounce back into the wip lane", async () => {
+    const t = makeTask("FN-R3", { column: "building" });
+    const store = renamedStore(t);
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+    const spy = vi.spyOn(mgr, "reconcileCompletedTask").mockResolvedValue({ blockedByCleared: 0, worktreeRemoved: false, branchRemoved: false });
+
+    mgr.start();
+    store.emit("task:moved", { task: t, from: "checking", to: "building", source: "engine" });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(spy).not.toHaveBeenCalled();
+    mgr.stop();
+  });
+});
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-23:45:
+THE BOARD-STALL COUNTER, the last fan-out guard and the only one that needed a SYNCHRONOUS answer.
+
+It increments in-memory state in the handler's own tick, so it could not follow the other two guards
+onto the async resolver, and the sync IR path cannot resolve a custom workflow at all — a conversion
+through it would have been inert. #3109's emitter-carried `lanes` removes the dilemma: reading them
+needs no await, so the increment stays in the same tick and the guard becomes correct.
+
+On a renamed board this counter read ZERO, so the board-stall watchdog was blind to a board whose
+cards were moving out of implementation the whole time.
+
+Asserted through the counter itself rather than a downstream alert: the increment IS what the guard
+decides, and routing the assertion through the watchdog would let an unrelated threshold change mask
+a regression here.
+*/
+describe("the board-stall counter follows the board's own lanes", () => {
+  const RENAMED_LANES = { hold: "drafting", intake: "inbox", wip: "building", review: "checking", complete: "shipped", archived: "filed" };
+
+  function startedManager(store: TaskStore & EventEmitter) {
+    const mgr = new SelfHealingManager(store, { rootDir: "/repo" });
+    vi.spyOn(mgr as unknown as { startMaintenance: () => void }, "startMaintenance").mockImplementation(() => {});
+    vi.spyOn(mgr, "reconcileCompletedTask").mockResolvedValue({ blockedByCleared: 0, worktreeRemoved: false, branchRemoved: false });
+    vi.spyOn(mgr, "reconcileInReviewBranchRebind").mockResolvedValue(0 as never);
+    mgr.start();
+    (mgr as unknown as { boardStallWindow: { transitionsOutOfInProgressInWindow: number } }).boardStallWindow =
+      { transitionsOutOfInProgressInWindow: 0 };
+    return mgr;
+  }
+
+  const counterOf = (mgr: SelfHealingManager) =>
+    (mgr as unknown as { boardStallWindow: { transitionsOutOfInProgressInWindow: number } }).boardStallWindow
+      .transitionsOutOfInProgressInWindow;
+
+  it("counts a move out of the RENAMED wip lane into the renamed review lane", () => {
+    const t = makeTask("FN-C1", { column: "checking" });
+    const store = createStore([t]);
+    const mgr = startedManager(store);
+
+    store.emit("task:moved", { task: t, from: "building", to: "checking", source: "engine", lanes: RENAMED_LANES });
+
+    expect(counterOf(mgr)).toBe(1);
+    mgr.stop();
+  });
+
+  /*
+  The paired negative. The guard is "left implementation for somewhere that is NOT implementation",
+  so a move BETWEEN two non-wip lanes must not count — otherwise the watchdog's denominator inflates
+  and it stops firing for the opposite reason.
+  */
+  it("does NOT count a move that did not leave the wip lane", () => {
+    const t = makeTask("FN-C2", { column: "shipped" });
+    const store = createStore([t]);
+    const mgr = startedManager(store);
+
+    store.emit("task:moved", { task: t, from: "checking", to: "shipped", source: "engine", lanes: RENAMED_LANES });
+
+    expect(counterOf(mgr)).toBe(0);
+    mgr.stop();
+  });
+
+  it("falls back to the legacy ids when the emitter sent no lanes", () => {
+    const t = makeTask("FN-C3", { column: "in-review" });
+    const store = createStore([t]);
+    const mgr = startedManager(store);
+
+    store.emit("task:moved", { task: t, from: "in-progress", to: "in-review", source: "engine" });
+
+    expect(counterOf(mgr)).toBe(1);
+    mgr.stop();
   });
 });

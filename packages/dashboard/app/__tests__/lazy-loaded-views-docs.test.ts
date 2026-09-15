@@ -31,18 +31,20 @@ import { resolve } from "node:path";
 const EXPECTED_DOCUMENTED_VIEWS = new Set([
   "AgentsView",
   "ChatView",
+  "WhiteboardView",
   "MemoryView",
   "DevServerView",
   "SecretsView",
   "InsightsView",
-  "DocumentsView",
+  "NotesView",
   "SkillsView",
+  "SnippetsView",
   "ResearchView",
   "CommandCenter",
   "EvalsView",
-  "TodoView",
   "GoalsView",
   "PullRequestView",
+  "PatchnodeView",
   "SetupWizardModal",
   "SettingsModal",
   "WorkflowNodeEditor",
@@ -53,19 +55,21 @@ const EXPECTED_DOCUMENTED_VIEWS = new Set([
 
 const EXPECTED_APP_LEVEL_VIEWS = new Set([
   "AgentsView",
-  "DocumentsView",
+  "NotesView",
+  "WhiteboardView",
   "InsightsView",
   "ResearchView",
   "EvalsView",
   "ChatView",
   "SkillsView",
+  "SnippetsView",
   "MemoryView",
   "SecretsView",
   "CommandCenter",
   "DevServerView",
-  "TodoView",
   "GoalsView",
   "PullRequestView",
+  "PatchnodeView",
 ]);
 
 /*
@@ -120,7 +124,7 @@ const EXPECTED_EXCLUDED_LAZY = [
      * FNXC:DashboardLazyViews 2026-06-27-00:00:
      * The right-dock chat tab re-imports ChatView through the overflow registry, but ChatView remains counted once as the App-level Chat chunk in the curated AGENTS inventory.
      */
-    symbols: ["DevServerView", "SecretsView", "TodoView", "PullRequestView", "ChatView"],
+    symbols: ["DevServerView", "SecretsView", "PullRequestView", "ChatView"],
     reason: "right-dock overflow re-imports of App-level chunks already counted once",
     countedBy: "../App.tsx",
   },
@@ -134,7 +138,14 @@ const EXPECTED_CURATED_LAZY_SOURCES = [
 ] as const;
 
 function extractLazyLoadedSection(agentsDoc: string): string {
-  const match = agentsDoc.match(/### Lazy-Loaded Heavy Views[\s\S]*?(?=\n### |\n---|$)/);
+  /*
+  FNXC:LazyViewDocs 2026-07-31-21:40:
+  Stop at ANY next heading, not only H3. The section after the inventory is the H2 `## FNXC_LOG
+  comments:`, so a lookahead of only `\n### ` ran the parse window into it — and when that section
+  gained a bullet with backticked tokens (`date -u`, `pnpm lint`, ...), this test reported six
+  phantom "views" and went red on every shard while the inventory itself was perfectly in sync.
+  */
+  const match = agentsDoc.match(/### Lazy-Loaded Heavy Views[\s\S]*?(?=\n#{1,6} |\n---|$)/);
   if (!match) {
     throw new Error("Lazy-Loaded Heavy Views section not found in AGENTS.md");
   }
@@ -171,7 +182,7 @@ function expectDocumentedViews(include: Iterable<string>, section: string): void
 }
 
 describe("AGENTS lazy-loaded views inventory", () => {
-  it("documents the App-level and AppModals lazy views accurately and keeps the curated 20-view list in sync", () => {
+  it("documents the App-level and AppModals lazy views accurately and keeps the curated 22-view list in sync", () => {
     const agentsDoc = readFileSync(resolve(__dirname, "../../../../AGENTS.md"), "utf-8");
     const appSource = readFileSync(resolve(__dirname, "../App.tsx"), "utf-8");
     const appModalsSource = readFileSync(resolve(__dirname, "../components/AppModals.tsx"), "utf-8");
@@ -181,14 +192,13 @@ describe("AGENTS lazy-loaded views inventory", () => {
     const section = extractLazyLoadedSection(agentsDoc);
     const countMatch = section.match(/These\s+(\d+)\s+views\s+are lazy-loaded/);
     expect(countMatch).toBeTruthy();
-    expect(Number(countMatch?.[1])).toBe(20);
+    expect(Number(countMatch?.[1])).toBe(22);
 
     const documentedViews = extractBacktickedNamesFromBullets(section);
     expect(new Set(documentedViews)).toEqual(EXPECTED_DOCUMENTED_VIEWS);
-    expect(documentedViews).toHaveLength(20);
+    expect(documentedViews).toHaveLength(22);
 
     expect(section).toContain("`ResearchView`");
-    expect(section).toContain("`TodoView`");
     expect(section).toContain("`SettingsModal`");
     expect(section).toContain("`WorkflowNodeEditor`");
     expect(section).toContain("`_ImportTasksView`");

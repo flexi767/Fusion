@@ -4,6 +4,27 @@
 
 Fusion’s command-line interface is exposed through the `fn` command.
 
+## `fn computer` — local desktop automation
+
+`fn computer` discovers and operates local desktop application windows through an enforced **snapshot → act → snapshot** loop: each successful action consumes its capture, so a fresh `get-app-state` is required before the next element action. It is supported on macOS only; other platforms report an honest unsupported capability. Every command supports `--json` and returns the versioned computer-use envelope. See the full [Computer Use reference](./computer-use.md) for setup, permissions, output shapes, snapshot safety, and error handling.
+
+```bash
+fn computer capabilities --json
+fn computer permissions --json
+fn computer list-apps --json
+fn computer list-windows --app <app> --json
+fn computer get-app-state --app <app> [--window-id <id> | --window-index <n>] [--no-screenshot] [--restore-window] --json
+fn computer click --app <app> --element-index <n> [--snapshot-id <id>] [--window-id <id> | --window-index <n>] --json
+fn computer set-value --app <app> --element-index <n> (--value <text> | --value-stdin) [--snapshot-id <id>] --json
+fn computer type-text --app <app> (--text <text> | --text-stdin) [--element-index <n>] [--snapshot-id <id>] --json
+fn computer press-key --app <app> --key <name> [--element-index <n>] [--snapshot-id <id>] --json
+fn computer hotkey --app <app> --keys <combo> --json
+fn computer scroll --app <app> --direction <up|down|left|right> [--amount <n>] [--element-index <n>] [--snapshot-id <id>] --json
+fn computer drag --app <app> (--from-x <n> --from-y <n> --to-x <n> --to-y <n> | --from-element-index <n> --to-element-index <n>) [--snapshot-id <id>] --json
+```
+
+Element actions use the latest persisted app snapshot unless `--snapshot-id` supplies a current-snapshot concurrency fence. Element indexes are sparse and snapshot-scoped; read `snapshot.elements[].index`, then re-snapshot after UI changes. Use `--value-stdin` and `--text-stdin` for secrets. Screenshots return a filesystem path, never image bytes.
+
 <!--
 FNXC:AgentTools 2026-06-29-22:31:
 The published CLI/pi extension must document its agent-facing workflow authoring surface so operators know agents can inspect, create, update, configure, and delete custom workflows without using the dashboard editor.
@@ -30,6 +51,24 @@ The published `@runfusion/fusion` CLI bundle also exposes the pi extension tool 
 
 Agents should still use `fn_workflow_select` only when the user explicitly requested that workflow or when assigning a workflow to a task they created; they must not reroute arbitrary existing tasks just because another workflow appears more suitable. Prompt-injectable lanes strip workflow approval-bypass flags during `fn_workflow_create` / `fn_workflow_update`; executor-owner paths are the only authoring path that may preserve those flags.
 
+## Runtime task-document publication
+
+`fn_task_document_write` is an agent-extension/runtime tool, not an `fn task` binary subcommand. Task-bound lanes supply `key`, `content`, optional `author`, and optional `expected_revision` / `expected_content_hash`; dashboard chat and planning use the same fields plus required `task_id` for explicit cross-task publication.
+
+For safe publication, first call `fn_task_document_read`, then write with the returned revision and hash:
+
+```json
+{
+  "task_id": "FX-002",
+  "key": "evidence",
+  "content": "rebased evidence",
+  "expected_revision": 3,
+  "expected_content_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+Revision zero means create only if absent. On success the tool returns the new revision and content hash. A stale expectation returns an error result with code `TASK_DOCUMENT_PRECONDITION_FAILED` and current revision/hash; re-read, reconcile the newer content, and submit a deliberate rebased write. The tool never retries or overwrites automatically. Omitting both expectations retains the legacy unconditional contract. These ordinary tools reject soft-deleted parents and historical sentinel rows; there is no task-archive publication path.
+
 ## Workflow commands
 
 ```bash
@@ -50,7 +89,15 @@ fn <command> <subcommand> [options]
 | Option | Description |
 |---|---|
 | `--project <name>`, `-P <name>` | Target a specific registered project. |
+| `--quiet`, `-q` | Suppress informational stdout chatter for non-interactive commands. |
+| `FUSION_QUIET=1` | Enable quiet mode from the environment (`1`, `true`, `yes`, or `on`). |
 | `--help`, `-h` | Show help output. |
+
+### Quiet mode
+
+`fn --quiet <command>` (or `FUSION_QUIET=1 fn <command>`) suppresses console chatter and raw stdout progress writers without changing exit codes. Stderr, every interactive prompt, and command output whose stdout is the machine-consumable result (such as IDs, paths, and exported payloads) always remain visible. An explicit `--quiet` flag wins over the environment.
+
+Quiet suppression is disabled for `--json`, help/version requests (including delegated subcommand help), and the live `serve`, `daemon`, `dashboard`, `desktop`, `chat`, and Ink dashboard-TUI surfaces. These commands still accept either quiet flag and strip it before command routing.
 
 ### Project resolution order
 
@@ -71,10 +118,9 @@ fn init
 fn init --name my-project --path /absolute/path/to/project
 ```
 
-When the target directory is not already a Git repository, Fusion initializes
-minimal Git metadata during registration so task worktrees can be created. Use
-`fn init --git` only when you also want Fusion to create the explicit starter
-commit used by that flag.
+Project initialization is always execution-ready. When the target directory is not already a Git repository, Fusion runs `git init`, creates a verifiable baseline `HEAD` containing only the managed `.gitignore`, and verifies that task worktrees can be created. An existing committed repository keeps its history, branch, remotes, configuration, index, and user changes; missing managed ignore rules are left visible as user changes rather than committed automatically.
+
+The managed ignore entries are `.fusion/`, `.pi/`, `.worktrees/`, `fusion.db`, `fusion.db-wal`, and `fusion.db-shm`. Git readiness is required before registration or activation, so Git and filesystem failures fail the command instead of reporting a usable local project. For a single repository, successful readiness also prints `✓ Integration branch: <branch> (<action>)`, where the action is `existing`, `created-from-remote`, `created-from-head`, or `unavailable`; this shows the local ref Fusion adopted or attempted to materialize. `fn init --git` remains accepted for script compatibility and has the same behavior as the default; it is no longer a separate Git initialization path.
 
 During fresh initialization, Fusion also installs the bundled `fusion` skill into supported local agent homes when the target skill does not already exist:
 
@@ -110,6 +156,19 @@ FUSION_SKIP_ONBOARDING=1 fn dashboard
 
 On successful completion, Fusion records `cliOnboardingCompletedAt` in global
 settings.
+
+### Custom / Local OpenAI-compatible providers
+
+The **AI provider setup** picker includes **Custom / Local (OpenAI-compatible)**,
+for llama.cpp server, vLLM, LM Studio, and other OpenAI-compatible endpoints. The
+wizard collects a provider ID/name, an absolute `http:` or `https:` base URL, an
+optional API key, comma-separated model IDs, and optional reasoning/Qwen
+chat-template compatibility. Blank API keys remain absent for unauthenticated
+local servers. The entry is merged safely into the path selected by the existing
+registry compatibility resolver: `~/.fusion/agent/models.json`, or an existing
+legacy `~/.pi/agent/models.json` / `~/.pi/models.json`. Re-running onboarding
+preserves unrelated providers and unknown fields; malformed registry JSON stops
+without overwriting it.
 
 Auto-launch behavior: before interactive commands, Fusion auto-launches onboarding
 only when the central DB at `getDefaultCentralDbPath()` is missing and CLI
@@ -153,7 +212,11 @@ fn upgrade
 | `--channel <stable\|beta>` | Select the release track and persist it to global settings (`updateChannel`), shared with the dashboard and desktop updater. `stable` follows the npm `latest` dist-tag; `beta` follows the newer of `latest` and `beta`. |
 | `--force` | Install the resolved channel target even when it is not newer than the current version — the explicit beta → stable downgrade path. |
 
-`fn upgrade` is an alias for `fn update`. Installs always pin the exact resolved version rather than a dist-tag, so a beta-channel install can never silently land on stable (or vice versa).
+Unknown options and positional arguments are rejected with an error and non-zero exit code. Repeating any option, including `--channel`, is also rejected rather than silently choosing a value.
+
+If your installed CLI predates `--channel`, bootstrap onto beta with `npm install -g @runfusion/fusion@beta`. Once installed, use `fn update --channel beta` to persist the beta track.
+
+`fn upgrade` is an alias for `fn update`. Installs always pin the exact resolved version rather than a dist-tag, so a beta-channel install can never silently land on stable (or vice versa). When `FUSION_UPDATES_EXTERNALLY_MANAGED` is `1`, `true`, `yes`, or `on`, `fn update` refuses installation so a deployment-owned release pipeline remains authoritative; use the deployment's normal update process instead.
 
 ---
 
@@ -263,7 +326,7 @@ fn dashboard --lang zh-TW                   # force a UI locale for this run
 ```
 
 The terminal UI is localized. `--lang <code>` (one of `en`, `zh-CN`, `zh-TW`,
-`fr`, `es`, `ko`) takes precedence over the saved dashboard language setting and the
+`fr`, `es`, `ko`, `pt-BR`) takes precedence over the saved dashboard language setting and the
 `LC_ALL`/`LC_MESSAGES`/`LANG`/`LANGUAGE` environment. See
 [Localization contributor guide](./i18n-contributing.md).
 
@@ -295,6 +358,7 @@ Remote actions support:
 > ⚠️ Remote URL/QR payloads include tokenized query data. Treat them like credentials and avoid sharing them in screenshots/chat/logs. Prefer short-lived links for ad-hoc phone login.
 
 Settings pane navigation and editing:
+- The TUI shows the live project **Max Concurrent Tasks** and **Max Worktrees** values. Max Concurrent Tasks defaults to 2; when worktree limiting is on, admission uses the lower value and dashboard status surfaces identify the binding setting.
 - `Tab` switches focus between the settings list and the detail/edit pane.
 - In the settings list, `↑`/`↓` or `k`/`j` moves the selected setting.
 - In the detail/edit pane, `←`/`→` or `h`/`l` cycles enum values such as **Remote Provider**; `Space` toggles booleans; `+`/`-` adjusts numbers.
@@ -542,6 +606,7 @@ Task lifecycle and task operations.
 fn task create "Fix login race condition"
 fn task create "Fix bug" --attach screenshot.png --depends FN-010
 fn task create "Investigate flaky runner" --node edge-runner
+fn task create "Fix workspace revert" --github --github-repo acme/kb
 fn task plan "Design a new authentication flow"
 ```
 
@@ -593,7 +658,7 @@ fn task show FN-001
 fn task logs FN-001 --follow --limit 50 --type tool
 ```
 
-`fn task logs` now exposes full agent-log content for each entry type. In particular, `thinking`, `tool_result`, and `tool_error` entries preserve full multiline output (including stderr/stack details) so you can inspect raw tool responses directly from the CLI stream.
+`fn task logs` exposes full agent-log content for each entry type. Tool argument rows, successful `tool_result` rows, and `tool_error` rows preserve complete bounded detail, including stderr and stack details. Short single-line values stay inline beside the tool name; longer or multiline values render as an indented block under the same CLI log entry.
 
 `fn task show <id>` includes routing and provenance context when available:
 - task node override
@@ -717,14 +782,11 @@ fn task attach FN-001 ./trace.log
 fn task merge FN-001
 fn task duplicate FN-001
 fn task refine FN-001 --feedback "Add rollback handling"
-fn task archive FN-001
-fn task unarchive FN-001
 fn task delete FN-001 --force
 ```
 
 Notes:
-- `fn task archive` accepts any live-board task (`triage`, `todo`, `in-progress`, `in-review`, or `done`) and preserves the original column for restore.
-- `fn task unarchive` restores to the saved pre-archive column when available, with legacy archives falling back to `done`.
+- Interrupting `fn task merge` aborts its merge and clears its transient merge status: Ctrl-C (`SIGINT`) exits 130, `SIGTERM` exits 143, and a closed terminal (`SIGHUP`) exits 129. Unlike `fn serve`, `fn dashboard`, and the daemon, this one-shot foreground command deliberately does not survive terminal disconnects.
 
 ### Branch conflict handling
 
@@ -786,9 +848,7 @@ Subcommands: `list|ls`, `add`, `remove|rm`, `show`, `info`, `set-default|default
 
 `fn project list` and `fn project show/info` report `In-Flight Agents` from live task state: in-progress executors plus triage planners whose task is in `triage` with `status === "planning"` and is not paused. The readout intentionally ignores stale persisted `projectHealth.inFlightAgentCount` bookkeeping.
 
-`fn project add` registers an existing directory with Fusion. If the directory
-does not contain a Git repository yet, Fusion runs a minimal `git init` during
-registration and fails the registration if Git is unavailable.
+`fn project add` registers an existing directory with Fusion. Registration first establishes the shared Git-readiness contract: non-Git and unborn repositories receive a baseline `HEAD`, managed Fusion-local paths are ignored, and committed repositories are preserved. For a single repository, its output also reports the reconciled local integration branch and action. If Git, ignore reconciliation, or baseline creation fails, the project is not registered or activated.
 
 ---
 
@@ -817,6 +877,30 @@ fn mesh status [--json]
 ```
 
 Subcommands: `status`.
+
+---
+
+## `fn cloud`
+
+Link a local Fusion engine to a cloud control plane. Set `FUSION_CLOUD_HTTP_URL` to the HTTPS control-plane base URL, or pass `--http <url>` to `pair-start` or `pair-complete`. Plain HTTP is accepted only for loopback development endpoints.
+
+```bash
+fn cloud pair-start --http https://cloud.example.com [--name <engine-name>]
+fn cloud pair-complete [--http https://cloud.example.com] [--code <pairing-code>]
+fn cloud heartbeat [--url <engine-origin>] [--port <port>] [--no-tunnel]
+fn cloud status [--json]
+fn cloud unlink
+```
+
+Subcommands: `pair-start`, `pair-complete`, `heartbeat`, `status`, `unlink`.
+
+- `pair-start` requests a pairing code and stores its pending pairing data in `~/.fusion/cloud-link-pending.json`.
+- `pair-complete` promotes a claimed pairing to `~/.fusion/cloud-link.json`. It refuses `--pending-secret` in both `--flag value` and `--flag=value` forms so a pairing password is never exposed in a process listing or shell history. It reads the password from the mode-`0600` pending file by default, or from `FUSION_CLOUD_PENDING_SECRET` when an override is necessary.
+- `heartbeat --url <engine-origin>` and `heartbeat --no-tunnel` each send one reachability update. A bare `heartbeat` starts a Cloudflare Quick Tunnel and publishes presence every 20 seconds until you press Ctrl+C. `fn serve` and `fn dashboard` use the same tunnel-and-publish behavior for their process lifetime when the engine is linked.
+- `status --json` prints `{ linked, engineId, name, httpBaseUrl, linkedAt }`; when unlinked it prints `{ "linked": false }`.
+- `unlink` removes both the linked credential file and the pending pairing file.
+
+The linked device credential and pending pairing files are written with mode `0600`, limiting access to the owning operating-system user. They are local credentials in the same threat class as `~/.fusion/auth.json`; they are not encrypted at rest because cloud pairing must work before Fusion's PostgreSQL-backed SecretsStore is available, and any same-user process that can read the file can also read a local wrapping key.
 
 ---
 
@@ -1206,14 +1290,41 @@ fn git push --yes
 
 ## `fn backup`
 
-Database backup lifecycle.
+PostgreSQL backup lifecycle.
 
 ```bash
 fn backup --create
 fn backup --list
-fn backup --restore .fusion/backups/fusion-2026-04-08.db
+fn backup --restore .fusion/backups/fusion-pg-20260831-120000.dump
+fn backup --restore .fusion/backups/fusion-central-pg-20260831-120000.dump
 fn backup --cleanup
 ```
+
+`--create` writes a same-stem `fusion-pg-<timestamp>.dump` containing the
+`project` and `archive` schemas, a `fusion-central-pg-<timestamp>.dump`
+containing the `central` schema, and a `fusion-migrations-pg-<timestamp>.dump`
+containing `public.fusion_schema_migrations`. Dumps are written through private in-progress
+artifacts and atomically published, so `--list` never offers an in-progress
+artifact; it shows complete pairs and either kind of orphan without treating
+legacy `.db` files as PostgreSQL backups. `--cleanup` also removes abandoned
+in-progress artifacts from a crashed backup, but never a live backup claim.
+
+Restoring a project/archive dump validates all available source archives, retains a
+new current-state `fusion-pre-restore-pg-*` + `fusion-central-pre-restore-pg-*` +
+`fusion-migrations-pre-restore-pg-*` stem, then restores project/archive, central,
+and migration bookkeeping in that order. Migration bookkeeping restoration is refused
+before mutation if a caller disables the pre-restore capture, because that capture is
+the rollback source. If bookkeeping restore fails, Fusion rolls every committed group
+back from the retained stem. Selecting a `fusion-central-pg-*` dump is the explicit
+central-only operation and leaves bookkeeping untouched. Legacy two-member stems remain
+restorable and report bookkeeping as unavailable; Fusion then rewinds
+`public.fusion_schema_migrations` from the earliest missing CREATE-TABLE sentinel
+and replays pending migrations so an older dump cannot skip later schema upgrades.
+
+Native backup commands do not provide cross-process locking or cluster-wide
+quiescence. Before list, create, cleanup, or especially restore, quiesce other
+Fusion writers and prevent competing native backup commands. Preserve every
+pre-restore dump after failure until recovery is reviewed.
 
 ---
 
@@ -1258,9 +1369,13 @@ Browse and install agent skills from [skills.sh](https://skills.sh).
 ```bash
 fn skills search <query> [--limit <n>]
 fn skills install <owner/repo> [--skill <name>]
+fn skills get <skill-name>
 ```
 
-Subcommands: `search`, `install`.
+`fn skills get computer-use` prints Fusion's in-process, version-matched computer-use guide. Unknown or missing names exit non-zero and list known built-in skills.
+
+
+Subcommands: `search`, `install`, `get`.
 
 | Option | Description |
 |---|---|
@@ -1284,6 +1399,8 @@ Subcommands: `search`, `install`.
 | `--attach` | `fn task create` |
 | `--depends` | `fn task create` |
 | `--node` | `fn task create` |
+| `--github` / `--no-github` | `fn task create` (per-task GitHub issue tracking override; default comes from project/global settings) |
+| `--github-repo` | `fn task create` (`owner/repo` override for the tracking issue) |
 | `--feedback` | `fn task refine` |
 | `--yes` | confirmation-skipping flows (`task plan`, `settings import`, git pull/push, etc.) |
 | `--limit`, `-l` | `fn task import`, `fn task import-gitlab` (default: 30, max: 100), `fn skills search` (default: 10, max: 50) |
@@ -1309,3 +1426,13 @@ For configuration details used by these commands, see [Settings Reference](./set
 - `fn org-import <file> [--project <name>] [--dry-run] [--collision-mode skip|suffix]`
   materializes a bundle. `--dry-run` reports the plan without modifying stores or files;
   collision mode defaults to `skip` and `suffix` creates deterministically named copies.
+
+Agent create/update payloads accept `roles` (a non-empty role-tag array) and optional `runtimeConfig.maxWorkflowSessions`. The legacy singular `role` input remains accepted for migration compatibility.
+
+## MCP memory transport
+
+`fn mcp serve-memory --project-root <path>` is an internal stdio transport command used by Fusion's built-in `fusion-memory` MCP server. It is not intended for direct interactive use. The built-in name is reserved; configure it through MCP enable/disable controls rather than add, edit, or remove commands. Disabling writes an `enabled: false` tombstone; normal re-enable deletes that tombstone, while a project enable may write a marker only to cancel a global tombstone.
+
+## Knowledge graph
+
+`fn knowledge-graph build [--force] [--dir <path>] [--json]` refreshes the deterministic, committable structure graph. `--force` bypasses incremental reuse; `--dir` overrides the project `knowledgeGraphDir`; `--json` prints build statistics as JSON.

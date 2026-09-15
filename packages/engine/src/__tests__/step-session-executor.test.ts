@@ -1,24 +1,27 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   parseStepFileScopes,
+  normalizeAuthoredStepScopes,
+  resolveAuthoredStepHeadingOffset,
   buildConflictMatrix,
   determineParallelWaves,
   buildStepPrompt,
+  buildFastLanePrompt,
   buildReducedStepPrompt,
   StepSessionExecutor,
-} from "../step-session-executor.js";
-import { AgentLogger } from "../agent-logger.js";
+} from "../execution/step-session-executor.js";
+import { AgentLogger } from "../agents/agent-logger.js";
 import { expectAppendAgentLog } from "./agent-log-assertions.js";
-import * as worktreeBackendModule from "../worktree-backend.js";
+import * as worktreeBackendModule from "../worktree/worktree-backend.js";
 import type { TaskDetail, Settings, TaskStore } from "@fusion/core";
-import { installTaskWorktreeIdentityGuard } from "../worktree-hooks.js";
+import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
 
-vi.mock("../worktree-hooks.js", () => ({
+vi.mock("../worktree/worktree-hooks.js", () => ({
   installTaskWorktreeIdentityGuard: vi.fn().mockResolvedValue(undefined),
   IDENTITY_GUARD_BYPASS_ENV: "FUSION_MERGER_BYPASS_IDENTITY_GUARD",
 }));
 
-vi.mock("../worktree-hooks.js", () => ({
+vi.mock("../worktree/worktree-hooks.js", () => ({
   installTaskWorktreeIdentityGuard: vi.fn().mockResolvedValue(undefined),
   IDENTITY_GUARD_BYPASS_ENV: "FUSION_MERGER_BYPASS_IDENTITY_GUARD",
 }));
@@ -109,6 +112,14 @@ describe("parseStepFileScopes", () => {
     expect(scopes.get(2)).toEqual([
       "packages/engine/src/new-module.test.ts",
     ]);
+  });
+
+  it("keeps file scopes under dependency-annotated headings", () => {
+    const scopes = parseStepFileScopes(makePrompt([
+      "### Step 0: Preflight\n- prepare",
+      "### Step 1 (depends: 0): Implement\n\n**Artifacts:**\n- `packages/engine/src/annotated.ts` (new)",
+    ]));
+    expect(scopes.get(1)).toEqual(["packages/engine/src/annotated.ts"]);
   });
 
   it("returns empty arrays for steps with no file scope", () => {
@@ -215,6 +226,38 @@ describe("parseStepFileScopes", () => {
 
     const result = parseStepFileScopes(prompt);
     expect([...result.keys()]).toEqual([0, 1, 2]);
+  });
+
+  it("normalizes only a contiguous 1-based authored sequence", () => {
+    expect(resolveAuthoredStepHeadingOffset([1, 2, 3])).toBe(1);
+    expect(resolveAuthoredStepHeadingOffset([1, 1, 2])).toBe(0);
+    expect(resolveAuthoredStepHeadingOffset([1, 3])).toBe(0);
+
+    const normalized = normalizeAuthoredStepScopes(new Map([
+      [1, ["first.ts"]],
+      [2, ["second.ts"]],
+      [3, ["third.ts"]],
+    ]), 3);
+    expect([...normalized.entries()]).toEqual([
+      [0, ["first.ts"]],
+      [1, ["second.ts"]],
+      [2, ["third.ts"]],
+    ]);
+  });
+
+  it("clamps malformed headings, fills missing task indices, and preserves zero-step maps", () => {
+    expect([...normalizeAuthoredStepScopes(new Map([
+      [0, ["first.ts"]],
+      [2, ["third.ts"]],
+      [9, ["phantom.ts"]],
+    ]), 3).entries()]).toEqual([
+      [0, ["first.ts"]],
+      [1, []],
+      [2, ["third.ts"]],
+    ]);
+
+    const zeroStepScopes = new Map([[1, ["legacy.ts"]]]);
+    expect(normalizeAuthoredStepScopes(zeroStepScopes, 0)).toBe(zeroStepScopes);
   });
 });
 
@@ -474,6 +517,37 @@ Do important work.
 
 ## Review level: 2`;
 
+  it("builds a compact Fast prompt from the original request without step scaffolding", () => {
+    const task = makeTaskDetail({
+      executionMode: "fast",
+      description: "Change the primary button to red.",
+      prompt: fullPrompt,
+      attachments: [{
+        filename: "button.png",
+        originalName: "button.png",
+        mimeType: "image/png",
+        size: 1,
+        createdAt: new Date().toISOString(),
+      }],
+      steeringComments: [{ author: "Operator", text: "Keep the hover state.", createdAt: new Date().toISOString() }],
+    });
+    const result = buildFastLanePrompt(task, "/repo", { testCommand: "pnpm test", buildCommand: "pnpm build" } as Settings, "/repo/.worktrees/fast");
+
+    expect(result).toContain("Change the primary button to red.");
+    expect(result).toContain("button.png");
+    expect(result).toContain("pnpm test");
+    expect(result).toContain("Keep the hover state.");
+    expect(result).toContain("/repo/.worktrees/fast");
+    expect(result).toContain("fix(FN-001): <short summary>");
+    expect(result).not.toContain("Work through each step in order");
+    expect(result).not.toContain("## Review level:");
+    expect(result).not.toContain("## Step Content");
+
+    const routed = buildStepPrompt(task, 0, "/repo", { testCommand: "pnpm test", buildCommand: "pnpm build" } as Settings, "/repo/.worktrees/fast");
+    expect(routed).toContain("Change the primary button to red.");
+    expect(routed).not.toContain("## Step Content");
+  });
+
   it("includes step-specific section text", () => {
     const task = makeTaskDetail({ prompt: fullPrompt });
     const result = buildStepPrompt(task, 1);
@@ -727,6 +801,76 @@ Some freeform text without checkboxes.`;
     expect(result).not.toContain("Project Commands");
   });
 
+  it("synthesizes actionable content for an appended remediation step", () => {
+    const task = makeTaskDetail({
+      prompt: fullPrompt,
+      steps: [
+        { name: "Preflight", status: "done" },
+        { name: "Implement", status: "done" },
+        { name: "Test", status: "done" },
+        {
+          name: "Fix: repair retry guard",
+          status: "pending",
+          remediation: {
+            wave: 1,
+            gate: "Code Review",
+            gateStepId: "code-review",
+            detail: "Reverse the retry guard condition",
+            filePath: "packages/engine/src/retry.ts",
+            line: 42,
+          },
+        },
+      ],
+    });
+
+    const result = buildStepPrompt(task, 3);
+    expect(result).toContain("### Appended Step: Fix: repair retry guard");
+    expect(result).toContain("**Gate:** Code Review");
+    expect(result).toContain("**Required fix:** Reverse the retry guard condition");
+    expect(result).toContain("**File:** `packages/engine/src/retry.ts`");
+    expect(result).toContain("**Line:** 42");
+  });
+
+  it("synthesizes a mandatory checklist for an appended verification step", () => {
+    const task = makeTaskDetail({
+      prompt: fullPrompt,
+      steps: [
+        { name: "Preflight", status: "done" },
+        { name: "Implement", status: "done" },
+        { name: "Test", status: "done" },
+        { name: "Fix: repair retry guard", status: "done" },
+        { name: "Testing & Verification", status: "pending" },
+      ],
+    });
+    const settings = { testCommand: "pnpm test:gate", buildCommand: "pnpm build" } as Settings;
+
+    const result = buildStepPrompt(task, 4, undefined, settings);
+    expect(result).toContain("### Appended Step: Testing & Verification");
+    expect(result).toContain("Run the project's configured test and build commands listed under Project Commands.");
+    expect(result).toContain("Run the tests impacted by this task's changes.");
+    expect(result).toContain("Fix every failure before completing this step.");
+    expect(result).toContain("Never weaken, skip, or delete assertions merely to make verification pass.");
+    expect(result).toContain("pnpm test:gate");
+    expect(result).toContain("pnpm build");
+  });
+
+  it("does not synthesize over an index inside the authored heading range", () => {
+    const prompt = "### Step 1: Authored first\n\nKeep this authored content.\n\n### Step 2: Authored second";
+    const task = makeTaskDetail({
+      prompt,
+      steps: [{
+        name: "Fix: must not mask authored numbering",
+        status: "pending",
+        remediation: { wave: 1, gate: "Code Review", gateStepId: "code-review", detail: "fallback detail" },
+      }],
+    });
+
+    const result = buildStepPrompt(task, 0);
+    expect(result).toContain("Authored first");
+    expect(result).not.toContain("### Appended Step");
+    expect(result).not.toContain("fallback detail");
+  });
+
   it("includes user steering comments as next-session fallback when no active step session existed", () => {
     const task = makeTaskDetail({
       prompt: fullPrompt,
@@ -920,6 +1064,25 @@ describe("buildReducedStepPrompt", () => {
     expect(result).not.toContain("attachment(s) available");
     expect(result).not.toContain(".fusion/tasks/FN-001/attachments/");
   });
+
+  it("keeps synthesized verification instructions during context-limit recovery", () => {
+    const task = makeTaskDetail({
+      prompt: reducedPrompt,
+      steps: [
+        { name: "Preflight", status: "done" },
+        { name: "Implement", status: "done" },
+        { name: "Test", status: "done" },
+        { name: "Fix: repair retry guard", status: "done" },
+        { name: "Testing & Verification", status: "pending" },
+      ],
+    });
+
+    const result = buildReducedStepPrompt(task, 4);
+    expect(result).toContain("### Appended Step: Testing & Verification");
+    expect(result).toContain("Run the tests impacted by this task's changes.");
+    expect(result).toContain("Fix every failure before completing this step.");
+    expect(result).toContain("Never weaken, skip, or delete assertions merely to make verification pass.");
+  });
 });
 
 // ── StepSessionExecutor test helpers ───────────────────────────────────
@@ -934,7 +1097,7 @@ vi.mock("../pi.js", () => ({
   compactSessionContext: vi.fn(),
 }));
 
-vi.mock("../agent-session-helpers.js", async () => {
+vi.mock("../agents/agent-session-helpers.js", async () => {
   const pi = await import("../pi.js");
   return {
     createResolvedAgentSession: vi.fn(async (options: any) => {
@@ -950,13 +1113,16 @@ vi.mock("../agent-session-helpers.js", async () => {
       pi.promptWithFallback(session, prompt, options as any),
     ),
     describeAgentModel: vi.fn(async (session: any) => pi.describeModel(session)),
-    resolveExecutorSessionModel: vi.fn((taskModelProvider?: string, taskModelId?: string, settings?: any, assignedAgentRuntimeConfig?: Record<string, unknown>) => {
+    resolveExecutorSessionModel: vi.fn((taskModelProvider?: string, taskModelId?: string, settings?: any, assignedAgentRuntimeConfig?: Record<string, unknown>, _credentialInstanceId?: string, executionMode?: string | null) => {
       const model = typeof assignedAgentRuntimeConfig?.model === "string" ? assignedAgentRuntimeConfig.model : "";
       const slash = model.indexOf("/");
       if (slash > 0 && slash < model.length - 1) {
         return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
       }
       if (taskModelProvider && taskModelId) return { provider: taskModelProvider, modelId: taskModelId };
+      if (executionMode === "fast" && settings?.fastCheapProvider && settings?.fastCheapModelId) {
+        return { provider: settings.fastCheapProvider, modelId: settings.fastCheapModelId };
+      }
       if (settings?.executionProvider && settings?.executionModelId) {
         return { provider: settings.executionProvider, modelId: settings.executionModelId };
       }
@@ -991,7 +1157,7 @@ vi.mock("../agent-session-helpers.js", async () => {
 // Mock logger
 vi.mock("../logger.js", () => {
   const createMockLogger = () => ({
-    log: vi.fn(),
+    log: vi.fn(), debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   });
@@ -1022,20 +1188,21 @@ vi.mock("../logger.js", () => {
 });
 
 // Mock context-limit-detector
-vi.mock("../context-limit-detector.js", () => ({
+vi.mock("../errors/context-limit-detector.js", () => ({
   isContextLimitError: vi.fn().mockImplementation((msg: string) =>
     /context\s+window\s+exceeds/i.test(msg),
   ),
 }));
 
 // Mock usage-limit-detector
-vi.mock("../usage-limit-detector.js", () => ({
+vi.mock("../errors/usage-limit-detector.js", () => ({
   checkSessionError: vi.fn(),
+  isUsageLimitError: (message: string) => /usage limit|rate limit|\b429\b/i.test(message),
 }));
 
 // Mock worktree-names
-vi.mock("../worktree-names.js", async () => {
-  const actual = await vi.importActual<typeof import("../worktree-names.js")>("../worktree-names.js");
+vi.mock("../worktree/worktree-names.js", async () => {
+  const actual = await vi.importActual<typeof import("../worktree/worktree-names.js")>("../worktree/worktree-names.js");
   return {
     ...actual,
     generateWorktreeName: vi.fn().mockReturnValue("test-worktree"),
@@ -1082,12 +1249,14 @@ vi.mock("node:fs", () => ({
 }));
 
 import { createFnAgent } from "../pi.js";
-import { generateWorktreeName } from "../worktree-names.js";
+import { generateWorktreeName } from "../worktree/worktree-names.js";
 import { execSync } from "node:child_process";
-import { AgentSemaphore } from "../concurrency.js";
+import { AgentSemaphore } from "../concurrency/concurrency.js";
 import { createLogger } from "../logger.js";
+import { promptWithAutoRetry, resolveExecutorSessionModel } from "../agents/agent-session-helpers.js";
 
 const mockedCreateFnAgent = vi.mocked(createFnAgent);
+const mockedResolveExecutorSessionModel = vi.mocked(resolveExecutorSessionModel);
 const mockedExecSync = vi.mocked(execSync);
 const mockedInstallTaskWorktreeIdentityGuard = vi.mocked(installTaskWorktreeIdentityGuard);
 const mockedGenerateWorktreeName = vi.mocked(generateWorktreeName);
@@ -1211,12 +1380,15 @@ describe("StepSessionExecutor", () => {
       const prompt = makeStepPrompt("FN-001", 2);
       const task = makeTaskDetail({
         prompt,
+        assignedAgentId: "durable-step-agent",
+        effectiveNodeId: "mesh-node-1",
         steps: [
           { name: "Step 0", status: "pending" },
           { name: "Step 1", status: "pending" },
         ],
       });
       const settings = makeSettings({ maxParallelSteps: 1, runStepsInNewSessions: false });
+      const emitUsageEvent = vi.fn().mockResolvedValue(undefined);
       let statsCall = 0;
       const session = {
         ...makeMockSession(),
@@ -1233,7 +1405,11 @@ describe("StepSessionExecutor", () => {
           };
         }),
       };
-      mockedCreateFnAgent.mockResolvedValue({ session } as any);
+      mockedCreateFnAgent.mockImplementationOnce(async (options: any) => {
+        options.onToolStart("Read", { path: "private-step-input" });
+        options.onToolEnd("Read", false, "private-step-output");
+        return { session } as any;
+      });
 
       const executor = new StepSessionExecutor({
         taskDetail: task,
@@ -1241,6 +1417,7 @@ describe("StepSessionExecutor", () => {
         rootDir: "/project",
         settings,
         pluginRunner: undefined,
+        store: { emitUsageEvent, appendAgentLog: vi.fn().mockResolvedValue(undefined) },
       } as any);
 
       const result = await executor.executeAll();
@@ -1249,6 +1426,30 @@ describe("StepSessionExecutor", () => {
       expect(result).toHaveLength(2);
       expect(result.every((step) => step.success)).toBe(true);
       expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
+      /*
+      FNXC:CommandCenterActivity 2026-08-09-15:06:
+      Reused workflow steps share one AgentSession, so their production execution path must
+      publish one session_start rather than counting each prompt as a new Activity session.
+      */
+      expect(emitUsageEvent.mock.calls.filter(([event]) => event.kind === "session_start")).toHaveLength(1);
+      /*
+      FNXC:CommandCenterActivity 2026-08-09-16:38:
+      Execute a real workflow-step construction path, including provider tool callbacks, so the
+      durable-agent telemetry regression cannot be hidden by testing the shared seam in isolation.
+      */
+      expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({
+        kind: "session_start", category: "agent-session", agentId: "durable-step-agent",
+        taskId: "FN-001", nodeId: "mesh-node-1",
+        meta: expect.objectContaining({ lane: "workflow-step", ephemeral: true }),
+      }));
+      expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({
+        kind: "tool_call", toolName: "Read", agentId: "durable-step-agent",
+        taskId: "FN-001", nodeId: "mesh-node-1",
+      }));
+      expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({
+        kind: "tool_result", toolName: "Read", agentId: "durable-step-agent",
+        taskId: "FN-001", nodeId: "mesh-node-1",
+      }));
       expect(session.prompt).toHaveBeenCalledTimes(2);
       expect(session.dispose).toHaveBeenCalledTimes(1);
       expect(result[0]?.tokenUsage?.inputTokens).toBe(10);
@@ -1266,6 +1467,7 @@ describe("StepSessionExecutor", () => {
         ],
       });
       const settings = makeSettings({ maxParallelSteps: 1, runStepsInNewSessions: true });
+      const emitUsageEvent = vi.fn().mockResolvedValue(undefined);
       const sessions = [makeMockSession(), makeMockSession()];
       mockedCreateFnAgent
         .mockResolvedValueOnce({ session: sessions[0] } as any)
@@ -1277,6 +1479,7 @@ describe("StepSessionExecutor", () => {
         rootDir: "/project",
         settings,
         pluginRunner: undefined,
+        store: { emitUsageEvent },
       } as any);
 
       const result = await executor.executeAll();
@@ -1284,6 +1487,7 @@ describe("StepSessionExecutor", () => {
       expect(result).toHaveLength(2);
       expect(result.every((step) => step.success)).toBe(true);
       expect(mockedCreateFnAgent).toHaveBeenCalledTimes(2);
+      expect(emitUsageEvent.mock.calls.filter(([event]) => event.kind === "session_start")).toHaveLength(2);
       expect(sessions[0]?.prompt).toHaveBeenCalledTimes(1);
       expect(sessions[1]?.prompt).toHaveBeenCalledTimes(1);
       expect(sessions[0]?.dispose).toHaveBeenCalledTimes(1);
@@ -1350,7 +1554,7 @@ describe("StepSessionExecutor", () => {
         worktreePath: "/project/.worktrees/main",
         rootDir: "/project",
         settings: makeSettings({ maxParallelSteps: 1 }),
-        agentStore: { saveRun } as any,
+        agentStore: { saveRun, getAgent: vi.fn(async (id) => id === "column-agent" ? { id } : null) } as any,
         effectiveAgentId: "column-agent",
       } as any);
 
@@ -1410,7 +1614,7 @@ describe("StepSessionExecutor", () => {
         worktreePath: "/project/.worktrees/main",
         rootDir: "/project",
         settings: makeSettings({ maxParallelSteps: 1 }),
-        agentStore: { saveRun } as any,
+        agentStore: { saveRun, getAgent: vi.fn(async (id) => id === "assigned-agent" ? { id } : null) } as any,
       } as any);
 
       // FNXC:EngineTests 2026-07-09-06:00:
@@ -1436,24 +1640,25 @@ describe("StepSessionExecutor", () => {
       expect(saveRun.mock.calls.map((call) => call[0].status)).toEqual(["active", "failed"]);
     });
 
-    it("uses assigned-agent and fallback executor identities for workflow activity runs", async () => {
+    it("uses roster-proven assigned-agent and executor-role identities for workflow activity runs", async () => {
       const prompt = makeStepPrompt("FN-7402", 1);
       const runExecutor = async (taskOverrides: Partial<TaskDetail>) => {
         const saveRun = vi.fn().mockResolvedValue(undefined);
+        const roster = [{ id: "assigned-agent" }, { id: "built-in-executor", role: "executor", roles: ["executor"], metadata: { builtInWorkflowRole: true, workflowRole: "executor" } }];
         mockedCreateFnAgent.mockResolvedValueOnce({ session: makeMockSession() } as any);
         const executor = new StepSessionExecutor({
           taskDetail: makeTaskDetail({ id: "FN-7402", prompt, steps: [{ name: "Step 0", status: "pending" }], ...taskOverrides }),
           worktreePath: "/project/.worktrees/main",
           rootDir: "/project",
           settings: makeSettings({ maxParallelSteps: 1 }),
-          agentStore: { saveRun } as any,
+          agentStore: { saveRun, getAgent: vi.fn(async (id) => roster.find((agent) => agent.id === id) ?? null), listAgents: vi.fn(async () => roster) } as any,
         } as any);
         await executor.executeAll();
         return saveRun.mock.calls[0]?.[0];
       };
 
       await expect(runExecutor({ assignedAgentId: "assigned-agent" })).resolves.toMatchObject({ agentId: "assigned-agent" });
-      await expect(runExecutor({ assignedAgentId: undefined })).resolves.toMatchObject({ agentId: "executor" });
+      await expect(runExecutor({ assignedAgentId: undefined })).resolves.toMatchObject({ agentId: "built-in-executor" });
     });
 
     it("continues workflow execution when workflow activity publication is unavailable or failing", async () => {
@@ -1476,7 +1681,7 @@ describe("StepSessionExecutor", () => {
         worktreePath: "/project/.worktrees/main",
         rootDir: "/project",
         settings: makeSettings({ maxParallelSteps: 1 }),
-        agentStore: { saveRun } as any,
+        agentStore: { saveRun, getAgent: vi.fn(async () => ({ id: "assigned-agent" })) } as any,
       } as any);
 
       await expect(withFailingStore.executeAll()).resolves.toMatchObject([{ success: true }]);
@@ -1523,6 +1728,127 @@ describe("StepSessionExecutor", () => {
       expect(onStepStart).toHaveBeenNthCalledWith(1, 0);
       expect(onStepStart).toHaveBeenNthCalledWith(2, 1);
       expect(onStepStart).toHaveBeenNthCalledWith(3, 2);
+    });
+
+    it("rebases 1-based authored headings without scheduling a phantom step", async () => {
+      const prompt = makePrompt([
+        "### Step 1: First authored work",
+        "### Step 2: Second authored work",
+        "### Step 3: Final authored work",
+      ]);
+      const task = makeTaskDetail({
+        prompt,
+        steps: makeIndependentSteps(3),
+      });
+      const onStepStart = vi.fn();
+      mockedCreateFnAgent.mockResolvedValue({ session: makeMockSession() } as any);
+
+      const executor = new StepSessionExecutor({
+        taskDetail: task,
+        worktreePath: "/project/.worktrees/main",
+        rootDir: "/project",
+        settings: makeSettings({ maxParallelSteps: 1 }),
+        onStepStart,
+      });
+
+      await executor.executeAll();
+
+      expect(onStepStart.mock.calls.map(([index]) => index)).toEqual([0, 1, 2]);
+      expect(onStepStart).not.toHaveBeenCalledWith(3);
+      expect(buildStepPrompt(task, 0)).toContain("First authored work");
+      expect(buildStepPrompt(task, 2)).toContain("Final authored work");
+    });
+
+    it("awaits an asynchronous completion callback before the session run resolves", async () => {
+      const task = makeTaskDetail({
+        prompt: makeStepPrompt("FN-255", 1),
+        steps: [{ name: "Deferred completion", status: "pending" }],
+      });
+      mockedCreateFnAgent.mockResolvedValue({ session: makeMockSession() } as any);
+
+      let releaseCompletion!: () => void;
+      const completionGate = new Promise<void>((resolve) => { releaseCompletion = resolve; });
+      let markCompletionStarted!: () => void;
+      const completionStarted = new Promise<void>((resolve) => { markCompletionStarted = resolve; });
+      const onStepComplete = vi.fn(async () => {
+        markCompletionStarted();
+        await completionGate;
+      });
+      const executor = new StepSessionExecutor({
+        taskDetail: task,
+        worktreePath: "/project/.worktrees/main",
+        rootDir: "/project",
+        settings: makeSettings({ maxParallelSteps: 1 }),
+        onStepComplete,
+      });
+
+      const run = executor.executeAll();
+      await completionStarted;
+      let settled = false;
+      void run.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      releaseCompletion();
+      await expect(run).resolves.toMatchObject([{ stepIndex: 0, success: true }]);
+      expect(onStepComplete).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not create or complete a step session when the persisted start is rejected", async () => {
+      const prompt = makeStepPrompt("FN-8490", 1);
+      const task = makeTaskDetail({
+        id: "FN-8490",
+        prompt,
+        steps: [{ name: "Ordered step", status: "pending" }],
+      });
+      const onStepStart = vi.fn().mockResolvedValue(false);
+      const onStepComplete = vi.fn();
+
+      const executor = new StepSessionExecutor({
+        taskDetail: task,
+        worktreePath: "/project/.worktrees/main",
+        rootDir: "/project",
+        settings: makeSettings({ maxParallelSteps: 1 }),
+        onStepStart,
+        onStepComplete,
+      });
+
+      const results = await executor.executeAll();
+
+      expect(results).toEqual([
+        expect.objectContaining({
+          stepIndex: 0,
+          success: false,
+          error: expect.stringContaining("start was rejected"),
+          retries: 0,
+        }),
+      ]);
+      expect(onStepStart).toHaveBeenCalledWith(0);
+      expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(onStepComplete).not.toHaveBeenCalled();
+    });
+
+    it("preserves notification-only start callbacks that return void", async () => {
+      const task = makeTaskDetail({
+        prompt: makeStepPrompt("FN-8490-LEGACY", 1),
+        steps: [{ name: "Legacy callback step", status: "pending" }],
+      });
+      const session = makeMockSession();
+      mockedCreateFnAgent.mockResolvedValue({ session } as any);
+      const onStepStart = vi.fn(() => undefined);
+
+      const executor = new StepSessionExecutor({
+        taskDetail: task,
+        worktreePath: "/project/.worktrees/main",
+        rootDir: "/project",
+        settings: makeSettings({ maxParallelSteps: 1 }),
+        onStepStart,
+      });
+
+      const results = await executor.executeAll();
+
+      expect(results[0]?.success).toBe(true);
+      expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
     });
 
     it("skips live-terminal steps before starting resumed sessions", async () => {
@@ -2523,6 +2849,22 @@ describe("StepSessionExecutor", () => {
   });
 
   describe("cleanup failure diagnostics", () => {
+    it("awaits asynchronous session disposal before the step boundary completes", async () => {
+      const task = makeTaskDetail({ prompt: makeStepPrompt("FN-ASYNC-DISPOSE", 1), steps: [{ name: "Step 0", status: "pending" }] });
+      let resolveDispose!: () => void;
+      const session = makeMockSession();
+      session.dispose = vi.fn(() => new Promise<void>((resolve) => { resolveDispose = resolve; }));
+      mockedCreateFnAgent.mockResolvedValue({ session } as any);
+      const executor = new StepSessionExecutor({ taskDetail: task, worktreePath: "/project/.worktrees/main", rootDir: "/project", settings: makeSettings() });
+      let completed = false;
+      const execution = executor.executeAll().then((result) => { completed = true; return result; });
+      await vi.waitFor(() => expect(session.dispose).toHaveBeenCalledOnce());
+      expect(completed).toBe(false);
+      resolveDispose();
+      await execution;
+      expect(completed).toBe(true);
+    });
+
     it("logs warning when session dispose fails during error cleanup", async () => {
       const task = makeTaskDetail({
         prompt: makeStepPrompt("FN-001", 1),
@@ -3069,7 +3411,14 @@ describe("StepSessionExecutor tool availability", () => {
     return captured;
   }
 
-  it("includes fn_list_agents, fn_delegate_task, and fn_task_assign when agentStore is available", async () => {
+  /*
+  FNXC:EphemeralAgentTaskCreation 2026-08-23-22:05:
+  FN-125 (0b4dbd219b) structurally withholds board CREATION from this lane: a workflow model-node
+  step session receives neither `fn_task_create` nor `fn_delegate_task` (delegation creates a task
+  through the same primitive), rather than being handed a tool that only refuses when called. The
+  read/assign half of the agent surface is unchanged, so assert both halves.
+  */
+  it("includes fn_list_agents and fn_task_assign — but never fn_delegate_task — when agentStore is available", async () => {
     const mockAgentStore = {
       listAgents: vi.fn().mockResolvedValue([]),
       getAgent: vi.fn().mockResolvedValue(null),
@@ -3081,8 +3430,8 @@ describe("StepSessionExecutor tool availability", () => {
 
     const toolNames = tools.map((t: any) => t.name);
     expect(toolNames).toContain("fn_list_agents");
-    expect(toolNames).toContain("fn_delegate_task");
     expect(toolNames).toContain("fn_task_assign");
+    expect(toolNames).not.toContain("fn_delegate_task");
   });
 
   it("excludes delegation tools when agentStore is not provided", async () => {
@@ -3135,12 +3484,13 @@ describe("StepSessionExecutor tool availability", () => {
     expect(toolNames).not.toContain("fn_read_messages");
   });
 
-  it("includes fn_task_log and fn_task_create when store is available", async () => {
+  /* FN-125 (0b4dbd219b) withheld `fn_task_create` from this lane; the task-log surface is unchanged. */
+  it("includes fn_task_log — but never fn_task_create — when store is available", async () => {
     const tools = await captureCustomTools({});
 
     const toolNames = tools.map((t: any) => t.name);
     expect(toolNames).toContain("fn_task_log");
-    expect(toolNames).toContain("fn_task_create");
+    expect(toolNames).not.toContain("fn_task_create");
   });
 });
 
@@ -3188,6 +3538,23 @@ describe("StepSessionExecutor executor model lane hierarchy", () => {
     vi.clearAllMocks();
   });
 
+  it("uses the Fast & Cheap pair for a Fast step session while standard keeps execution", async () => {
+    const settings = {
+      executionProvider: "anthropic",
+      executionModelId: "claude-sonnet-4-5",
+      fastCheapProvider: "openai",
+      fastCheapModelId: "gpt-4.1-mini",
+    };
+    await expect(captureAgentModel(settings, { executionMode: "fast" })).resolves.toEqual({
+      provider: "openai",
+      modelId: "gpt-4.1-mini",
+    });
+    await expect(captureAgentModel(settings, { executionMode: "standard" })).resolves.toEqual({
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-5",
+    });
+  });
+
   it("uses project default override pair when execution lanes are absent", async () => {
     const resolved = await captureAgentModel({
       executionProvider: undefined,
@@ -3222,5 +3589,213 @@ describe("StepSessionExecutor executor model lane hierarchy", () => {
       provider: "anthropic",
       modelId: "claude-sonnet-4-5",
     });
+  });
+});
+
+describe("StepSessionExecutor credential-instance retargeting", () => {
+  function makeCredentialExecutor(options: {
+    steps?: number;
+    runStepsInNewSessions?: boolean;
+    credentialInstanceId?: string;
+    maxParallelSteps?: number;
+    resolveCredentialInstanceRetarget?: () => Promise<{ providerId: string; instanceId: string } | undefined>;
+  } = {}) {
+    const stepCount = options.steps ?? 1;
+    return new StepSessionExecutor({
+      taskDetail: makeTaskDetail({
+        prompt: makeStepPrompt("FN-CREDENTIAL", stepCount),
+        steps: Array.from({ length: stepCount }, (_, index) => ({ name: `Step ${index}`, status: "pending" as const })),
+      }),
+      worktreePath: "/project/.worktrees/main",
+      rootDir: "/project",
+      settings: makeSettings({ maxParallelSteps: options.maxParallelSteps ?? 1, runStepsInNewSessions: options.runStepsInNewSessions }),
+      credentialInstanceId: options.credentialInstanceId,
+      resolveCredentialInstanceRetarget: options.resolveCredentialInstanceRetarget,
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(promptWithAutoRetry).mockImplementation(async (session: any, prompt: string, options?: unknown) =>
+      session.prompt(prompt, options),
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("omits an unset credential instance from legacy session creation", async () => {
+    mockedCreateFnAgent.mockResolvedValue({ session: makeMockSession() } as any);
+    const executor = makeCredentialExecutor();
+
+    await executor.executeAll();
+
+    expect(mockedCreateFnAgent.mock.calls[0]?.[0]).not.toHaveProperty("credentialInstanceId");
+  });
+
+  it("forwards the initial instance to each newly-created sequential session", async () => {
+    mockedCreateFnAgent.mockResolvedValue({ session: makeMockSession() } as any);
+    const executor = makeCredentialExecutor({ steps: 2, runStepsInNewSessions: true, credentialInstanceId: "account-a" });
+
+    await executor.executeAll();
+
+    expect(mockedCreateFnAgent).toHaveBeenCalledTimes(2);
+    expect(mockedCreateFnAgent.mock.calls.map(([options]) => options.credentialInstanceId)).toEqual(["account-a", "account-a"]);
+    expect(mockedResolveExecutorSessionModel.mock.calls.map((args) => args[4])).toEqual(["account-a", "account-a"]);
+  });
+
+  it("forwards the initial instance to every fresh session in a parallel wave", async () => {
+    mockedCreateFnAgent.mockResolvedValue({ session: makeMockSession() } as any);
+    const executor = makeCredentialExecutor({ steps: 2, maxParallelSteps: 2, credentialInstanceId: "account-a" });
+
+    await executor.executeAll();
+
+    expect(mockedCreateFnAgent).toHaveBeenCalledTimes(2);
+    expect(mockedCreateFnAgent.mock.calls.map(([options]) => options.credentialInstanceId)).toEqual(["account-a", "account-a"]);
+  });
+
+  it("retargets only subsequent fresh sessions and clears back to omitted resolution", async () => {
+    const first = makeMockSession();
+    const second = makeMockSession();
+    const third = makeMockSession();
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: first } as any)
+      .mockResolvedValueOnce({ session: second } as any)
+      .mockResolvedValueOnce({ session: third } as any);
+    const executor = makeCredentialExecutor({ steps: 3, runStepsInNewSessions: true, credentialInstanceId: "account-a" });
+
+    await (executor as any).executeStep(0, "/project/.worktrees/main");
+    await executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "account-b" });
+    await (executor as any).executeStep(1, "/project/.worktrees/main");
+    await executor.retargetCredentialInstance(undefined);
+    await (executor as any).executeStep(2, "/project/.worktrees/main");
+
+    expect(mockedCreateFnAgent.mock.calls.map(([options]) => options.credentialInstanceId)).toEqual([
+      "account-a",
+      "account-b",
+      undefined,
+    ]);
+    expect(mockedCreateFnAgent.mock.calls[2]?.[0]).not.toHaveProperty("credentialInstanceId");
+  });
+
+  it("defers reusable-primary disposal until an active prompt completes, then uses the retargeted instance", async () => {
+    let finishFirstPrompt: (() => void) | undefined;
+    let firstSession: ReturnType<typeof makeMockSession> | undefined;
+    const firstPromptStarted = new Promise<void>((resolve) => {
+      firstSession = {
+        ...makeMockSession(),
+        abortBash: vi.fn(),
+        prompt: vi.fn(() => new Promise<void>((finish) => {
+          finishFirstPrompt = finish;
+          resolve();
+        })),
+      };
+      const second = { ...makeMockSession(), abortBash: vi.fn() };
+      mockedCreateFnAgent
+        .mockResolvedValueOnce({ session: firstSession } as any)
+        .mockResolvedValueOnce({ session: second } as any);
+    });
+    const executor = makeCredentialExecutor({ steps: 2, runStepsInNewSessions: false, credentialInstanceId: "account-a" });
+    const execution = executor.executeAll();
+
+    await firstPromptStarted;
+    await executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "account-b" });
+
+    expect(firstSession?.abortBash).not.toHaveBeenCalled();
+    expect(firstSession?.dispose).not.toHaveBeenCalled();
+    finishFirstPrompt?.();
+
+    await expect(execution).resolves.toEqual([
+      expect.objectContaining({ stepIndex: 0, success: true, retries: 0 }),
+      expect.objectContaining({ stepIndex: 1, success: true, retries: 0 }),
+    ]);
+    expect(firstSession?.dispose).toHaveBeenCalledTimes(1);
+    expect(mockedCreateFnAgent.mock.calls[1]?.[0]).toMatchObject({ credentialInstanceId: "account-b" });
+  });
+
+  it("clears a deferred retarget during cleanup", async () => {
+    let finishPrompt: (() => void) | undefined;
+    const promptStarted = new Promise<void>((resolve) => {
+      const session = {
+        ...makeMockSession(),
+        abortBash: vi.fn(),
+        prompt: vi.fn(() => new Promise<void>((finish) => {
+          finishPrompt = finish;
+          resolve();
+        })),
+      };
+      mockedCreateFnAgent.mockResolvedValue({ session } as any);
+    });
+    const executor = makeCredentialExecutor({ runStepsInNewSessions: false, credentialInstanceId: "account-a" });
+    const execution = executor.executeAll();
+
+    await promptStarted;
+    await executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "account-b" });
+    await executor.cleanup();
+
+    expect((executor as any).reusablePrimaryRetargetPending).toBe(false);
+    finishPrompt?.();
+    await execution;
+  });
+
+  it("immediately disposes an idle reusable primary session and ignores equivalent or invalid retargets", async () => {
+    const session = { ...makeMockSession(), abortBash: vi.fn() };
+    mockedCreateFnAgent.mockResolvedValue({ session } as any);
+    const executor = makeCredentialExecutor({ runStepsInNewSessions: false, credentialInstanceId: "account-a" });
+
+    await (executor as any).executeStep(0, "/project/.worktrees/main");
+    await executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "account-a" });
+    expect(session.dispose).not.toHaveBeenCalled();
+    await executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "account-b" });
+    expect(session.abortBash).toHaveBeenCalledTimes(1);
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+    await expect(executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "bad id" })).resolves.toBeUndefined();
+    expect(getStepSessionLogger().warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring invalid credential instance id"));
+  });
+
+  it("retargets a usage-limit retry through the owning executor's live selection", async () => {
+    const first = {
+      ...makeMockSession(),
+      prompt: vi.fn()
+        .mockRejectedValueOnce(new Error("429 usage limit reached"))
+        .mockResolvedValueOnce(undefined),
+    };
+    const second = makeMockSession();
+    const resolveCredentialInstanceRetarget = vi.fn().mockResolvedValue({ providerId: "anthropic", instanceId: "account-b" });
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: first } as any)
+      .mockResolvedValueOnce({ session: second } as any);
+    const executor = makeCredentialExecutor({ credentialInstanceId: "account-a", resolveCredentialInstanceRetarget });
+
+    const execution = executor.executeAll();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(execution).resolves.toEqual([expect.objectContaining({ success: true, retries: 1 })]);
+    expect(resolveCredentialInstanceRetarget).toHaveBeenCalledTimes(1);
+    expect(mockedCreateFnAgent.mock.calls[1]?.[0]).toMatchObject({ credentialInstanceId: "account-b" });
+  });
+
+  it("applies a manual retarget before a retry without changing retry accounting", async () => {
+    let rejectFirstPrompt: ((error: Error) => void) | undefined;
+    const first = {
+      ...makeMockSession(),
+      prompt: vi.fn(() => new Promise<void>((_resolve, reject) => { rejectFirstPrompt = reject; })),
+    };
+    const second = makeMockSession();
+    mockedCreateFnAgent
+      .mockResolvedValueOnce({ session: first } as any)
+      .mockResolvedValueOnce({ session: second } as any);
+    const executor = makeCredentialExecutor({ credentialInstanceId: "account-a" });
+    const execution = executor.executeAll();
+    await vi.waitFor(() => expect(rejectFirstPrompt).toBeTypeOf("function"));
+
+    await executor.retargetCredentialInstance({ providerId: "anthropic", instanceId: "account-b" });
+    rejectFirstPrompt?.(new Error("retry me"));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(execution).resolves.toEqual([expect.objectContaining({ success: true, retries: 1 })]);
+    expect(mockedCreateFnAgent.mock.calls[1]?.[0]).toMatchObject({ credentialInstanceId: "account-b" });
   });
 });

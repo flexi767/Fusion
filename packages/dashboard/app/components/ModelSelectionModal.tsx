@@ -1,3 +1,4 @@
+import { ViewHeader } from "./ViewHeader";
 import { useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
@@ -5,8 +6,9 @@ import type { ModelPreset, ThinkingLevel } from "@fusion/core";
 import type { ModelInfo } from "../api";
 import { applyPresetToSelection } from "../utils/modelPresets";
 import { CustomModelDropdown } from "./CustomModelDropdown";
-import { Brain, X } from "lucide-react";
+import { Brain } from "lucide-react";
 import { LoadingSpinner } from "./LoadingSpinner";
+import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 
 const PRESET_OPTION_SEPARATOR = "──────────";
 
@@ -22,6 +24,15 @@ interface ModelSelectionModalProps {
   onValidatorChange: (value: string) => void;
   onPlanningChange?: (value: string) => void;
   onMergerChange?: (value: string) => void;
+  /** Optional persisted instance overrides for task model lanes. */
+  credentialInstanceId?: string;
+  validatorCredentialInstanceId?: string;
+  planningCredentialInstanceId?: string;
+  mergerCredentialInstanceId?: string;
+  onCredentialInstanceChange?: (value: string) => void;
+  onValidatorCredentialInstanceChange?: (value: string) => void;
+  onPlanningCredentialInstanceChange?: (value: string) => void;
+  onMergerCredentialInstanceChange?: (value: string) => void;
   mergerThinkingLevel?: string;
   onMergerThinkingLevelChange?: (value: string) => void;
   validatorThinkingLevel?: string;
@@ -77,6 +88,14 @@ export function ModelSelectionModal({
   onValidatorChange,
   onPlanningChange,
   onMergerChange,
+  credentialInstanceId = "",
+  validatorCredentialInstanceId = "",
+  planningCredentialInstanceId = "",
+  mergerCredentialInstanceId = "",
+  onCredentialInstanceChange,
+  onValidatorCredentialInstanceChange,
+  onPlanningCredentialInstanceChange,
+  onMergerCredentialInstanceChange,
   mergerThinkingLevel = "",
   onMergerThinkingLevelChange,
   validatorThinkingLevel = "",
@@ -113,15 +132,11 @@ export function ModelSelectionModal({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, onClose]);
 
-  // Handle overlay click
-  const handleOverlayClick = useCallback(
-    (event: React.MouseEvent) => {
-      if (event.target === event.currentTarget) {
-        onClose();
-      }
-    },
-    [onClose],
-  );
+  /*
+  FNXC:ModalDismissal 2026-08-15-12:27:
+  Model controls render their listbox through document.body. Pair overlay press and release so a re-anchored portal gesture cannot be mistaken for a backdrop click.
+  */
+  const overlayDismiss = useOverlayDismiss(onClose, { enabled: true });
 
   const showPresets = !!(presets && presets.length > 0 && onPresetChange);
   const selectedPreset = presets?.find((p) => p.id === selectedPresetId);
@@ -192,17 +207,17 @@ export function ModelSelectionModal({
   const hasMergerOverride = Boolean(mergerValue);
 
   return (
-    <div className="modal-overlay open" onClick={handleOverlayClick} role="dialog" aria-modal="true" data-testid="model-selection-modal">
+    <div className="modal-overlay open" {...overlayDismiss} role="dialog" aria-modal="true" data-testid="model-selection-modal">
       <div className="modal modal-lg">
-        <div className="modal-header">
-          <div className="detail-title-row">
-            <Brain size={20} style={{ color: "var(--todo)" }} />
-            <h3>{t("modelSelection.title", "Select Models")}</h3>
-          </div>
-          <button className="modal-close" onClick={onClose} aria-label={t("actions.close", "Close")} data-testid="model-selection-close">
-            <X size={20} />
-          </button>
-        </div>
+        {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: Shared dialog chrome owns the icon, title, and canonical close. */}
+        <ViewHeader
+          className="modal-header"
+          headingLevel={3}
+          icon={Brain}
+          title={t("modelSelection.title", "Select Models")}
+          onClose={onClose}
+          closeButtonProps={{ "aria-label": t("actions.close", "Close"), "data-testid": "model-selection-close" }}
+        />
 
         <div className="planning-modal-body">
           {modelsLoading ? (
@@ -288,6 +303,8 @@ export function ModelSelectionModal({
                           onToggleModelFavorite={onToggleModelFavorite}
                           thinkingLevel={planningThinkingLevel}
                           onThinkingLevelChange={onPlanningThinkingLevelChange}
+                          credentialInstanceId={planningCredentialInstanceId}
+                          onCredentialInstanceChange={onPlanningCredentialInstanceChange}
                           defaultThinkingLevel={defaultThinkingLevel ?? "off"}
                         />
                       </div>
@@ -318,6 +335,8 @@ export function ModelSelectionModal({
                         onToggleModelFavorite={onToggleModelFavorite}
                         thinkingLevel={thinkingLevel}
                         onThinkingLevelChange={onThinkingLevelChange}
+                        credentialInstanceId={credentialInstanceId}
+                        onCredentialInstanceChange={onCredentialInstanceChange}
                         defaultThinkingLevel={defaultThinkingLevel ?? "off"}
                       />
                     </div>
@@ -326,7 +345,7 @@ export function ModelSelectionModal({
                   {onMergerChange ? <div className="task-detail-section"><div className="inline-create-model-row">
                     <label htmlFor="model-selection-merger" className="inline-create-model-label">{t("tasks.mergerModel", "Merger Model")}</label>
                     <span className={`model-badge ${hasMergerOverride ? "model-badge-custom" : "model-badge-default"}`}>{getModelBadgeLabel(models, mergerValue, t)}</span>
-                    <CustomModelDropdown id="model-selection-merger" label={t("tasks.mergerModel", "Merger Model")} value={mergerValue} onChange={onMergerChange} models={models} placeholder={t("tasks.usingDefault", "Using default")} favoriteProviders={favoriteProviders} onToggleFavorite={onToggleFavorite} favoriteModels={favoriteModels} onToggleModelFavorite={onToggleModelFavorite} thinkingLevel={mergerThinkingLevel} onThinkingLevelChange={onMergerThinkingLevelChange} defaultThinkingLevel={defaultThinkingLevel ?? "off"} />
+                    <CustomModelDropdown id="model-selection-merger" label={t("tasks.mergerModel", "Merger Model")} value={mergerValue} onChange={onMergerChange} models={models} placeholder={t("tasks.usingDefault", "Using default")} favoriteProviders={favoriteProviders} onToggleFavorite={onToggleFavorite} favoriteModels={favoriteModels} onToggleModelFavorite={onToggleModelFavorite} thinkingLevel={mergerThinkingLevel} onThinkingLevelChange={onMergerThinkingLevelChange} credentialInstanceId={mergerCredentialInstanceId} onCredentialInstanceChange={onMergerCredentialInstanceChange} defaultThinkingLevel={defaultThinkingLevel ?? "off"} />
                   </div></div> : null}
 
                   <div className="task-detail-section">
@@ -353,6 +372,8 @@ export function ModelSelectionModal({
                         onToggleModelFavorite={onToggleModelFavorite}
                         thinkingLevel={validatorThinkingLevel}
                         onThinkingLevelChange={onValidatorThinkingLevelChange}
+                        credentialInstanceId={validatorCredentialInstanceId}
+                        onCredentialInstanceChange={onValidatorCredentialInstanceChange}
                         defaultThinkingLevel={defaultThinkingLevel ?? "off"}
                       />
                     </div>

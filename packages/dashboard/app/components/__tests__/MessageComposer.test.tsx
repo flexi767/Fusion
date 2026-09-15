@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { MessageComposer } from "../MessageComposer";
+import { MessageComposer, resolveDroppedNativeStructureRef } from "../MessageComposer";
 import * as apiModule from "../../api";
 import type { Agent } from "../../api";
-import { NATIVE_STRUCTURE_DRAG_MIME } from "../../utils/nativeStructureDrag";
+import { isNativeStructureDragEnabled, NATIVE_STRUCTURE_DRAG_MIME } from "../../utils/nativeStructureDrag";
+
+const composeChatProps = vi.fn();
 
 // Mock the API module
 vi.mock("../../api", () => ({
@@ -13,6 +15,13 @@ vi.mock("../../api", () => ({
 
 vi.mock("../NativeStructurePreview", () => ({
   NativeStructurePreview: ({ capturedLabel }: { capturedLabel?: string }) => <span>{capturedLabel ?? "Structure"}</span>,
+}));
+
+vi.mock("../ComposeChatPanel", () => ({
+  ComposeChatPanel: (props: { embeds: Array<{ kind: string; id: string; label?: string }> }) => {
+    composeChatProps(props);
+    return <output data-testid="compose-chat-embed-context">{props.embeds.map((embed) => `${embed.kind}: ${embed.label ?? embed.id} (${embed.id})`).join("\n")}</output>;
+  },
 }));
 
 // Mock lucide-react icons
@@ -73,9 +82,15 @@ describe("MessageComposer", () => {
     });
   });
 
-  it("renders the composer with header", () => {
+  /*
+  FNXC:StandardizedMailboxLayout 2026-09-14-10:24:
+  FN-379 remediation: the composer is hosted form content. Its identity title moved to the owning Mailbox header, so the
+  composer itself renders only its form body and footer commands.
+  */
+  it("renders the composer form body without its own identity title", () => {
     render(<MessageComposer {...defaultProps} />);
-    expect(screen.getByText("New Message")).toBeDefined();
+    expect(screen.getByTestId("message-composer-content")).toBeDefined();
+    expect(screen.queryByText("New Message")).toBeNull();
   });
 
   it("shows agent dropdown when agents are provided", () => {
@@ -141,10 +156,113 @@ describe("MessageComposer", () => {
     expect(composer).not.toHaveClass("message-composer--native-structure-drag-over");
   });
 
+  it("attaches roadmap drops once, preserves them in sent metadata, and gives compose chat roadmap context", async () => {
+    render(<MessageComposer {...defaultProps} agents={mockAgents} projectId="proj-a" />);
+    const composer = screen.getByTestId("message-composer");
+    const nativeTransfer = {
+      types: [NATIVE_STRUCTURE_DRAG_MIME],
+      getData: (type: string) => type === NATIVE_STRUCTURE_DRAG_MIME
+        ? JSON.stringify({ kind: "roadmap-item", id: "RF-1", projectId: "proj-a" }) : "",
+    } as unknown as DataTransfer;
+
+    fireEvent.drop(composer, { dataTransfer: nativeTransfer });
+    fireEvent.drop(composer, { dataTransfer: nativeTransfer });
+    expect(screen.getByTestId("message-composer-attached-structures").querySelectorAll("li")).toHaveLength(1);
+    expect(screen.getByTestId("message-composer-attached-structures")).toHaveTextContent("Structure");
+
+    fireEvent.click(screen.getByRole("button", { name: "Draft with AI" }));
+    expect(screen.getByTestId("compose-chat-embed-context")).toHaveTextContent("roadmap-item: RF-1 (RF-1)");
+    expect(composeChatProps).toHaveBeenLastCalledWith(expect.objectContaining({
+      embeds: [{ kind: "roadmap-item", id: "RF-1", projectId: "proj-a" }],
+    }));
+
+    fireEvent.change(screen.getByTestId("message-composer-recipient"), { target: { value: "agent-001" } });
+    fireEvent.change(screen.getByTestId("message-composer-content"), { target: { value: "Review roadmap" } });
+    fireEvent.click(screen.getByTestId("message-composer-send"));
+    await waitFor(() => expect(mockSendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: { nativeStructures: [{ kind: "roadmap-item", id: "RF-1", projectId: "proj-a" }] },
+    }), "proj-a"));
+  });
+
+  it("attaches roadmap candidates from the keyboard and touch-safe picker", () => {
+    render(<MessageComposer {...defaultProps} nativeStructureCandidates={[
+      { ref: { kind: "roadmap-item", id: "RF-1", projectId: "proj-a" }, label: "Roadmap feature" },
+    ]} />);
+
+    fireEvent.change(screen.getByTestId("message-composer-attach-structure"), { target: { value: "0" } });
+    expect(screen.getByTestId("message-composer-attached-structures")).toHaveTextContent("Roadmap feature");
+  });
+
+  it.each(["mission", "roadmap-item"] as const)("rejects a foreign project %s drop", (kind) => {
+    render(<MessageComposer {...defaultProps} projectId="proj-a" />);
+    fireEvent.drop(screen.getByTestId("message-composer"), { dataTransfer: {
+      types: [NATIVE_STRUCTURE_DRAG_MIME],
+      getData: (type: string) => type === NATIVE_STRUCTURE_DRAG_MIME
+        ? JSON.stringify({ kind, id: "foreign-id", projectId: "proj-b" }) : "",
+    } as unknown as DataTransfer });
+
+    expect(screen.queryByTestId("message-composer-attached-structures")).not.toBeInTheDocument();
+  });
+
+  it("stamps unscoped drops, accepts matching projects, and preserves refs for single-project hosts", async () => {
+    const { unmount } = render(<MessageComposer {...defaultProps} agents={mockAgents} projectId="proj-a" />);
+    const drop = (ref: object) => fireEvent.drop(screen.getByTestId("message-composer"), { dataTransfer: {
+      types: [NATIVE_STRUCTURE_DRAG_MIME],
+      getData: (type: string) => type === NATIVE_STRUCTURE_DRAG_MIME ? JSON.stringify(ref) : "",
+    } as unknown as DataTransfer });
+    drop({ kind: "mission", id: "M-unscoped" });
+    drop({ kind: "mission", id: "M-matching", projectId: "proj-a" });
+    fireEvent.change(screen.getByTestId("message-composer-recipient"), { target: { value: "agent-001" } });
+    fireEvent.change(screen.getByTestId("message-composer-content"), { target: { value: "Review" } });
+    fireEvent.click(screen.getByTestId("message-composer-send"));
+    await waitFor(() => expect(mockSendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: { nativeStructures: [
+        { kind: "mission", id: "M-unscoped", projectId: "proj-a" },
+        { kind: "mission", id: "M-matching", projectId: "proj-a" },
+      ] },
+    }), "proj-a"));
+
+    unmount();
+    render(<MessageComposer {...defaultProps} />);
+    fireEvent.drop(screen.getByTestId("message-composer"), { dataTransfer: {
+      types: [NATIVE_STRUCTURE_DRAG_MIME],
+      getData: (type: string) => type === NATIVE_STRUCTURE_DRAG_MIME
+        ? JSON.stringify({ kind: "mission", id: "M-single", projectId: "proj-b" }) : "",
+    } as unknown as DataTransfer });
+    expect(resolveDroppedNativeStructureRef({ kind: "mission", id: "M-single", projectId: "proj-b" })).toEqual({ kind: "mission", id: "M-single", projectId: "proj-b" });
+    expect(screen.getByTestId("message-composer-attached-structures")).toBeInTheDocument();
+  });
+
+  it("keeps the roadmap picker available when coarse pointers disable native drag", () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+    render(<MessageComposer {...defaultProps} nativeStructureCandidates={[
+      { ref: { kind: "roadmap-item", id: "RF-mobile" }, label: "Mobile roadmap item" },
+    ]} />);
+
+    expect(isNativeStructureDragEnabled()).toBe(false);
+    fireEvent.change(screen.getByTestId("message-composer-attach-structure"), { target: { value: "0" } });
+    expect(screen.getByTestId("message-composer-attached-structures")).toHaveTextContent("Mobile roadmap item");
+    vi.unstubAllGlobals();
+  });
+
   it("disables structural attachment selection when no candidates are available", () => {
     render(<MessageComposer {...defaultProps} />);
     expect(screen.getByTestId("message-composer-attach-structure")).toBeDisabled();
     expect(screen.getByText("No structures available")).toBeInTheDocument();
+  });
+
+  it("preserves a long structure label when attaching from the shared picker", () => {
+    const longLabel = "A deliberately long structure label that must remain available without changing attachment metadata";
+    render(<MessageComposer {...defaultProps} nativeStructureCandidates={[
+      { ref: { kind: "mission-with-a-deliberately-long-kind", id: "M-long" }, label: longLabel },
+    ]} />);
+
+    const picker = screen.getByTestId("message-composer-attach-structure");
+    expect(picker).not.toBeDisabled();
+    expect(picker).toHaveTextContent(`mission-with-a-deliberately-long-kind: ${longLabel}`);
+    fireEvent.change(picker, { target: { value: "0" } });
+
+    expect(screen.getByTestId("message-composer-attached-structures")).toHaveTextContent(longLabel);
   });
 
   it("disables send button when content is empty", () => {
@@ -219,10 +337,16 @@ describe("MessageComposer", () => {
     expect(screen.getByTestId("message-composer-error").textContent).toContain("Network error");
   });
 
-  it("calls onCancel when clicking cancel button", () => {
-    render(<MessageComposer {...defaultProps} />);
-    fireEvent.click(screen.getByTestId("message-composer-cancel"));
-    expect(defaultProps.onCancel).toHaveBeenCalledOnce();
+  /*
+  FNXC:StandardizedMailboxLayout 2026-09-14-10:24:
+  FN-379 remediation deleted the composer's local header row and its X exit; the owning Mailbox header now carries the
+  composer identity and abandon action, so that case lives in the Mailbox host suites instead of here.
+  */
+  it("renders no local header row and no local close control", () => {
+    const { container } = render(<MessageComposer {...defaultProps} />);
+    expect(container.querySelector(".message-composer-header")).toBeNull();
+    expect(screen.queryByTestId("message-composer-cancel")).toBeNull();
+    expect(screen.queryByText("New Message")).toBeNull();
   });
 
   it("calls onCancel when clicking cancel footer button", () => {

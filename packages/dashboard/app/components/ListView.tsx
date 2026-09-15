@@ -3,45 +3,55 @@ import { useState, useCallback, useMemo, Fragment, useEffect, useLayoutEffect, u
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { ArrowUpDown, ArrowUp, ArrowDown, Link, Columns3, EyeOff, Eye, ChevronRight, Zap, Trash2, Pause, Play, Archive } from "lucide-react";
-import type { Task, TaskDetail, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, PrInfo, ThinkingLevel } from "@fusion/core";
-import { COLUMNS, DEFAULT_COLUMN, THINKING_LEVELS, getErrorMessage, isColumn } from "@fusion/core";
-import { resolveEffectiveAutoMerge } from "../../../core/src/task-merge";
+import { ArrowUpDown, ArrowUp, ArrowDown, Link, Columns3, EyeOff, Eye, ChevronRight, Zap, Trash2, Pause, Play, ListChecks, Pencil } from "lucide-react";
+import { DEFAULT_COLUMN, THINKING_LEVELS, getErrorMessage, isColumn, sortTasksForDisplayColumn, type Task, type TaskDetail, type Column, type ColumnId, type MergeResult, type GithubIssueAction, type PrInfo, type ThinkingLevel } from "@fusion/core";
+import { resolveEffectiveAutoMerge } from "../../../core/src/merge/task-merge";
 import { useColumnLabel } from "../i18n/labels";
-import { sortTasksForDisplayColumn } from "./taskSorting";
-import { batchUpdateTaskModels, fetchNodes, fetchTaskDetail, rebuildTaskSpec, refreshPrStatus, updateTask } from "../api";
-import { TaskDetailContent } from "./TaskDetailModal";
+import { isCompleteColumnRole, isIntakeColumnRole, isPreImplementationColumnRole, isReviewColumnRole, isWipColumnRole } from "../utils/columnRoles";
+import { batchUpdateTaskModels, fetchNodes, refreshPrStatus, updateTask } from "../api";
+import { ExternalBlockNotice, PlanApprovalNotice } from "./TaskCard";
 import { PrCreateModal } from "./PrCreateModal";
+import { TaskResetDialog } from "./TaskResetDialog";
 import type { BoardWorkflowColumn, BoardWorkflowsPayload, ModelInfo, NodeInfo, RevertTaskOptions, RevertTaskResult } from "../api";
-import { QuickEntryBox } from "./QuickEntryBox";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { NodeHealthDot } from "./NodeHealthDot";
-import { isTaskStuck } from "../utils/taskStuck";
-import { hasPendingAutomaticRecovery, isTaskManuallyRetryable } from "../utils/taskRecovery";
+import { hasPendingAutomaticRecovery } from "../utils/taskRecovery";
+import { resolveRetryStageCopy } from "../utils/taskRetryCopy";
 import type { ToastType } from "../hooks/useToast";
 import { useViewportMode } from "../hooks/useViewportMode";
+import { useVirtualizedList } from "../hooks/useVirtualizedList";
+import { useAutoPaginationSentinel } from "../hooks/useAutoPaginationSentinel";
 import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { ALL_WORKFLOWS_BOARD_VIEW_ID } from "../utils/boardWorkflowSelection";
-import { getRunningWorkflowStepLabel, getUnifiedTaskProgress, isPlanReviewRunning } from "../utils/taskProgress";
+import {
+  getRunningOptionalGateBadge,
+  getRunningWorkflowStepLabel,
+  getUnifiedTaskProgress,
+  isNonPlanningOptionalGateBadge,
+} from "../utils/taskProgress";
 import { isTaskAgentActive } from "../utils/taskActivity";
-import { getTaskStatusBadgeLabel, shouldSuppressPlanningStatusBadge } from "../utils/taskStatusBadgeLabel";
+import { getTaskStatusBadgeLabel, getTaskWipLifecycleBadgeLabel, hasTaskStatusBadge, isTaskPlanningActive, type TaskStatusBadgeContext } from "../utils/taskStatusBadgeLabel";
 import { isReviewBudgetExhaustedApproval } from "../utils/reviewBudgetApproval";
 import { useConfirm } from "../hooks/useConfirm";
 import { extractDependencyDeleteConflict, extractLineageDeleteConflict } from "../utils/taskDelete";
 import { WorkflowSwitcher } from "./WorkflowSwitcher";
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewHeader } from "./ViewHeader";
 import { computeWorkflowStatusCounts } from "./workflowStatusCounts";
-import { writeBoardWorkflowsCache } from "../utils/boardWorkflowsCache";
 import { useBoardWorkflows } from "../hooks/useBoardWorkflows";
-import { TaskContextMenu, buildTaskActionMenuModel, getTaskPrAutomationLabel, type TaskContextMenuColumnMetadata, type TaskMenuActionDescriptor } from "./TaskContextMenu";
+import { useUnmappedWorkflowRefetch } from "../hooks/useUnmappedWorkflowRefetch";
+import { TaskContextMenu, buildTaskActionMenuModel, getTaskPrAutomationLabel, type TaskContextMenuColumnMetadata, type TaskMenuItemDescriptor } from "./TaskContextMenu";
 import type { DetailTaskOpenOptions } from "../hooks/useModalManager";
+import { isTaskReverted } from "../utils/taskRevert";
+import { getTaskTitleDisplay } from "../utils/taskTitleDisplay";
+import { runDuplicateTaskAction } from "../utils/duplicateTaskAction";
 
-const COLUMN_COLOR_MAP: Record<Column, string> = {
+const COLUMN_COLOR_MAP: Partial<Record<Column, string>> = {
   triage: "var(--triage)",
   todo: "var(--todo)",
   "in-progress": "var(--in-progress)",
   "in-review": "var(--in-review)",
   done: "var(--done)",
-  archived: "var(--text-dim)",
 };
 
 /** #1403: resolve a column color by id; workflow-defined custom columns that
@@ -69,9 +79,9 @@ type SortField = "title" | "status" | "column" | "retries";
 FNXC:MergeQueue 2026-07-15-10:45:
 List status column used to print raw engine statuses (landing/reviewing). Share the board badge mapper so list and card never diverge.
 */
-function getTaskStatusLabel(status: string, t: TFunction<"app">, workflowStepLabel?: string): string {
+function getTaskStatusLabel(status: string, t: TFunction<"app">, workflowStepLabel?: string, context?: TaskStatusBadgeContext): string {
   if (status === "awaiting-approval") return t("tasks.awaitingApproval", "Awaiting Approval");
-  return getTaskStatusBadgeLabel(status, t, workflowStepLabel);
+  return getTaskStatusBadgeLabel(status, t, workflowStepLabel, context);
 }
 type SortDirection = "asc" | "desc";
 
@@ -83,6 +93,14 @@ First-run list view users should see only the Title column by default for a clea
 */
 const DEFAULT_LIST_COLUMNS = ["title"] as const;
 type ListColumn = typeof ALL_LIST_COLUMNS[number];
+
+/*
+FNXC:ListViewWindowing 2026-09-07-17:38:
+Mobile browsers can reclaim a backgrounded tab when thousands of grouped task rows remain mounted. ListView therefore feeds the complete filtered, sorted and expanded task sequence into the shared variable-height virtualizer and mounts at most its fixed row cap in both table and card modes.
+
+Filtering and section counts still describe the full data set, while collapse state controls membership in the virtual sequence. Selection remains ID-based outside the window; opening a persisted selection scrolls that key into view. Bulk select-all intentionally targets only the currently rendered window so destructive actions never include invisible rows.
+*/
+const LIST_MAX_RENDERED_TASKS = 60;
 
 function getNodeStatusLabel(status: NodeInfo["status"], t: TFunction<"app">): string {
   if (status === "online") return t("listView.nodeStatusOnline", "Online");
@@ -187,39 +205,20 @@ function readSelectedTaskId(projectId?: string): string | null {
   return null;
 }
 
-function readSidebarWidth(projectId?: string): number {
-  const fallbackWidth = 400;
-  try {
-    const saved = getScopedItem("kb-dashboard-list-sidebar-width", projectId);
-    if (!saved) return fallbackWidth;
-    const parsed = Number(saved);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return parsed;
-    }
-  } catch {
-    // Invalid localStorage data - fall through to default
-  }
+const LIST_MINIMUM_USABLE_TASK_LIST_WIDTH = 320;
+const LIST_MINIMUM_USABLE_DETAIL_WIDTH = 480;
+export const LIST_MINIMUM_SPLIT_LAYOUT_WIDTH = LIST_MINIMUM_USABLE_TASK_LIST_WIDTH + LIST_MINIMUM_USABLE_DETAIL_WIDTH;
 
-  return fallbackWidth;
-}
-
-const LIST_SIDEBAR_MIN_WIDTH = 64; // FNXC:ListView 2026-06-22-00:00: The desktop task-list split sidebar minimum is 64 (was 120) so users can shrink the left panel much further; task titles wrap to two lines (.list-split-sidebar .list-cell-title) so they stay legible at narrow widths. Resize, keyboard, and ARIA paths share one clamp value.
-const LIST_SIDEBAR_MAX_RATIO = 0.65;
-const LIST_SIDEBAR_KEYBOARD_STEP = 16;
-
-function getSidebarMaxWidth(containerWidth: number): number {
-  return Math.max(LIST_SIDEBAR_MIN_WIDTH, containerWidth * LIST_SIDEBAR_MAX_RATIO);
-}
-
-function clampSidebarWidth(width: number, containerWidth: number): number {
-  const maxWidth = getSidebarMaxWidth(containerWidth);
-  return Math.min(Math.max(width, LIST_SIDEBAR_MIN_WIDTH), maxWidth);
+/** Returns whether the List surface can keep both its task list and embedded detail usable. */
+export function canUseListSplitLayout(containerWidth: number): boolean {
+  return containerWidth >= LIST_MINIMUM_SPLIT_LAYOUT_WIDTH;
 }
 
 interface ListViewProps {
   tasks: Task[];
-  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
   onRetryTask?: (id: string) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
+  onReviseTask?: (task: Task) => void;
   onDeleteTask: (id: string, options?: {
     removeDependencyReferences?: boolean;
     removeLineageReferences?: boolean;
@@ -227,12 +226,11 @@ interface ListViewProps {
   }) => Promise<Task>;
   onPauseTask?: (id: string) => Promise<Task>;
   onUnpauseTask?: (id: string) => Promise<Task>;
-  onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside onArchiveTask; never mutates the source task's column. */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   onMergeTask: (id: string) => Promise<MergeResult>;
-  onResetTask?: (id: string) => Promise<Task>;
-  onDuplicateTask?: (id: string) => Promise<Task>;
+  onResetTask?: (id: string, options?: { description?: string }) => Promise<Task>;
+  onDuplicateTask?: (id: string, options?: { workflowId?: string }) => Promise<Task>;
+  /** App-owned ingestion seam for successful split-detail refinements. */
   onOpenDetail: (task: Task | TaskDetail, options?: DetailTaskOpenOptions) => void;
   /*
   FNXC:FloatingWindow 2026-06-22-20:45:
@@ -243,8 +241,7 @@ interface ListViewProps {
   openMobileTasksInPopup?: boolean;
   addToast: (message: string, type?: ToastType) => void;
   globalPaused?: boolean;
-  onNewTask?: () => void;
-  onQuickCreate?: (input: TaskCreateInput) => Promise<Task | void>;
+  onNewTask?: (workflowId?: string | null) => void;
   availableModels?: ModelInfo[];
   favoriteProviders?: string[];
   favoriteModels?: string[];
@@ -255,10 +252,6 @@ interface ListViewProps {
    */
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
   /**
-   * Called when the user clicks the "Subtask" button in the quick entry box.
-   */
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
-  /**
    * Called when tasks are updated (e.g., after bulk model update).
    * Allows parent to refresh task list or handle optimistically.
    */
@@ -267,45 +260,84 @@ interface ListViewProps {
   projectId?: string;
   /** Project name for display (optional) */
   projectName?: string;
-  /** Project-level stuck task timeout in milliseconds (undefined = disabled) */
-  taskStuckTimeoutMs?: number;
+  /*
+  FNXC:StuckTagRemoval 2026-08-17-22:30: Operator removed stuck-task tagging from the dashboard; engine recovery sweeps still consume taskStuckTimeoutMs server-side.
+  ListView no longer takes taskStuckTimeoutMs or renders stuck rows/badges; lastFetchTimeMs stays for failed-state recovery freshness.
+  */
   /** External search query from header search (defaults to "") */
   searchQuery?: string;
-  /** Timestamp (ms) when task data was last confirmed fresh from the server. Used for freshness-aware stuck detection. */
+  /** Shared current-task page state; search and ordinary list scopes use the same fenced cursor owner. */
+  currentTasksHasMore?: boolean;
+  currentTasksLoadingMore?: boolean;
+  currentTasksPaginationError?: "timeout" | "invalid-continuation" | "request-failed" | null;
+  currentTasksProgressKey?: string;
+  onLoadMoreCurrentTasks?: () => Promise<void>;
+  onRetryCurrentTasks?: () => Promise<void>;
+  /** Timestamp (ms) when task data was last confirmed fresh from the server. */
   lastFetchTimeMs?: number;
-  prAuthAvailable?: boolean;
   autoMerge?: boolean;
-  taskDetailChatFirst?: boolean;
   /** Project merge strategy so list context menus match Task Detail before a PR exists. */
   mergeStrategy?: string;
   onOpenWorkflowEditor?: (workflowId?: string) => void;
   onCreateWorkflow?: () => void;
-  workflowColumnsEnabled?: boolean;
-  settingsLoaded?: boolean;
   /** Relocates workflow controls into the Header portal slot when sidebar navigation owns the inline chrome. */
   workflowControlsInHeader?: boolean;
+  /*
+  FNXC:ListInRightDock 2026-09-14-05:42:
+  A compact host (the right dock) renders the card list, never the wide table, whatever its measured width reports,
+  and shows NO workflow selector: the workflow is whatever the board already selected, read from the same
+  project-scoped selection that useBoardWorkflows persists for every surface.
+  */
+  compact?: boolean;
+  /*
+  FNXC:MainViewKeepAlive 2026-08-30-19:05:
+  A kept-alive host leaves ListView mounted while hidden. Inactive preserves local filters and
+  selection, but must release the shared workflow-header slot until this is the visible view.
+  */
+  active?: boolean;
 }
 
-const LEGACY_LIST_COLUMNS: BoardWorkflowColumn[] = COLUMNS.map((column) => ({
-  id: column,
-  name: column,
-  flags: {
-    intake: column === "triage",
-    countsTowardWip: column === "in-progress",
-    mergeBlocker: column === "in-review",
-    complete: column === "done",
-    archived: column === "archived",
-    hold: column === "todo",
-  },
-}));
 
-function shouldShowTaskProgress(task: Task): boolean {
-  return task.status === "executing" || task.column === "in-progress";
+/**
+ * FNXC:WorkflowResolvedColumns 2026-07-30-00:10:
+ * The progress bar shows for an EXECUTING card or one resting in a wip lane.
+ *
+ * `flags` is threaded from the caller's per-column map. Keyed on the literal, a renamed wip column
+ * showed no progress bar for any card whose status had not yet flipped to `executing` — the row
+ * looked idle while an agent was working in it.
+ */
+function shouldShowTaskProgress(task: Task, flags?: Parameters<typeof isWipColumnRole>[0]): boolean {
+  /*
+  FNXC:TaskCardWorkflowProgress 2026-08-25-11:40:
+  The review lane reports its stage through the running-gate BADGE, not a progress count, matching
+  TaskCard. A review-column workflow has few milestones in a fixed order, so a count adds noise
+  without answering anything the badge does not. It also avoids rendering a milestone that no longer
+  exists: the count comes from `enabledWorkflowSteps`, which is frozen on the card at planning time.
+  */
+  return task.status === "executing" || isWipColumnRole(flags, task.column);
 }
 
-function getTaskProgress(task: Task): { label: string; percent: number; hasProgress: boolean } {
-  const progress = getUnifiedTaskProgress(task);
-  if (progress.total === 0 || !shouldShowTaskProgress(task)) {
+function getTaskProgress(
+  task: Task,
+  columnFlags?: Parameters<typeof isWipColumnRole>[0],
+): { label: string; percent: number; hasProgress: boolean } {
+  /*
+  FNXC:TaskCardWorkflowProgress 2026-07-21-22:26:
+  List progress for WIP matches TaskCard: only implementation steps, not Todo Plan Review or In-review Code Review gates.
+
+  FNXC:TaskCardWorkflowProgress 2026-08-24-19:30:
+  ...but that match was only half-implemented: TaskCard switches to the full pipeline once the card
+  reaches its review lane (`scope: task.column === "in-review" ? "full" : "implementation"`), while
+  this list stayed on implementation scope unconditionally. A review-column workflow such as
+  builtin:coding-ideas-v2 promotes Verification and Documentation & Delivery from hidden checklist
+  entries into first-class review-lane gates, so a list row showed `-` or a stale count for exactly
+  the stage the operator moved them there to watch. Resolve the lane by TRAIT, not by the hardcoded
+  `in-review` id, so a renamed board behaves the same.
+  */
+  const progress = getUnifiedTaskProgress(task, {
+    scope: isReviewColumnRole(columnFlags, task.column) ? "full" : "implementation",
+  });
+  if (progress.total === 0 || !shouldShowTaskProgress(task, columnFlags)) {
     return { label: "-", percent: 0, hasProgress: false };
   }
 
@@ -318,12 +350,12 @@ function getTaskProgress(task: Task): { label: string; percent: number; hasProgr
 
 export function ListView({
   tasks,
-  onMoveTask,
   onRetryTask,
+  onOpenChatWithPrefill,
   onDeleteTask,
+  onReviseTask,
   onPauseTask,
   onUnpauseTask,
-  onArchiveTask,
   onRevertTask,
   onMergeTask,
   onResetTask,
@@ -334,51 +366,50 @@ export function ListView({
   addToast,
   globalPaused,
   onNewTask,
-  onQuickCreate,
   availableModels,
   favoriteProviders = [],
   favoriteModels = [],
   onToggleFavorite,
   onToggleModelFavorite,
   onPlanningMode,
-  onSubtaskBreakdown,
   onTasksUpdated,
   projectId,
   projectName: _projectName,
-  taskStuckTimeoutMs,
   searchQuery = "",
+  currentTasksHasMore = false,
+  currentTasksLoadingMore = false,
+  currentTasksPaginationError = null,
+  currentTasksProgressKey,
+  onLoadMoreCurrentTasks,
+  onRetryCurrentTasks,
   lastFetchTimeMs,
-  prAuthAvailable,
   autoMerge,
-  taskDetailChatFirst = false,
   mergeStrategy = "direct",
   onOpenWorkflowEditor,
   onCreateWorkflow,
-  workflowColumnsEnabled,
-  settingsLoaded,
   workflowControlsInHeader = false,
+  compact = false,
+  active = true,
 }: ListViewProps) {
   const { t } = useTranslation("app");
   const columnLabel = useColumnLabel();
   const [sortField, setSortField] = useState<SortField | null>(null);
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
-  const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
-  const [dragOverColumn, setDragOverColumn] = useState<ColumnId | null>(null);
   const [selectedColumn, setSelectedColumn] = useState<ColumnId | null>(null);
   const [contextMenuState, setContextMenuState] = useState<ListContextMenuState>(null);
   const [prCreateState, setPrCreateState] = useState<ListPrCreateState>(null);
+  const [resetDialogTask, setResetDialogTask] = useState<Task | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
   const suppressNextRowClickRef = useRef(false);
   /*
-  FNXC:BoardWorkflows 2026-06-20-09:07:
-  ListView shares the board-workflows first-paint invariant with Board: hydrate per-project workflow metadata from sessionStorage and gate legacy list columns while workflowColumns settings or uncached lane metadata are still unknown.
-
   FNXC:BoardWorkflowSelection 2026-06-29-12:35:
   ListView must use the same project-scoped durable workflow selection invariant as Board/Header/Graph so task refreshes, respecification route returns, and remounts do not reset operators from a custom workflow back to the default workflow. Keep this separate from list task-selection storage keys.
+
+  FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R9):
+  The `shouldHydrateCache` gate is DELETED alongside Board's. It read `workflowColumnsEnabled === true || settingsLoaded === false`, and MainContent passed `workflowColumnsEnabled` as a literal `true`, so it was unconditionally true — the hook's own default.
   */
-  const shouldHydrateBoardWorkflowsCache = workflowColumnsEnabled === true || settingsLoaded === false;
   const {
     boardWorkflows,
     workflowMode,
@@ -388,28 +419,35 @@ export function ListView({
     isAllWorkflowsSelected,
     setSelectedWorkflowId,
     refreshBoardWorkflows,
-    setBoardWorkflowsState,
-  } = useBoardWorkflows({ projectId, shouldHydrateCache: shouldHydrateBoardWorkflowsCache });
+  } = useBoardWorkflows({ projectId });
   const [headerWorkflowSlot, setHeaderWorkflowSlot] = useState<HTMLElement | null>(() => {
     if (typeof document === "undefined") return null;
     return document.getElementById("header-workflow-slot");
   });
   const viewportMode = useViewportMode();
   const isMobile = viewportMode === "mobile";
+  const [listContainerWidth, setListContainerWidth] = useState<number | null>(null);
   /*
-  FNXC:ListView 2026-07-10-00:00 (FN-7809):
-  Tablet-width List view must use the same single-pane layout as mobile because the desktop two-pane sidebar leaves too little horizontal room and clips the primary actions plus expanded QuickEntryBox. Keep touch-only long-press behavior on `isMobile`; this gate only controls split-vs-single-pane structure and detail routing.
+  FNXC:ListView 2026-08-03-05:47:
+  Available List width—not the global viewport label—owns split-versus-modal routing. A measured
+  surface must leave 320px for task navigation and 480px for the existing embedded detail; real
+  phones remain single-pane even when a synthetic measurement is large. When measurement support is
+  unavailable, retain the established desktop split and constrained tablet modal fallbacks.
   */
-  const useSinglePaneList = viewportMode === "mobile" || viewportMode === "tablet";
-  const { confirm, confirmWithChoice } = useConfirm();
+  const canRenderSplitLayout = viewportMode !== "mobile"
+    && (listContainerWidth !== null
+      ? canUseListSplitLayout(listContainerWidth)
+      : viewportMode === "desktop");
+  const useSinglePaneList = compact || !canRenderSplitLayout;
+  const { confirm, confirmWithSelect } = useConfirm();
 
   useEffect(() => {
-    if (!workflowControlsInHeader || typeof document === "undefined") {
+    if (!active || !workflowControlsInHeader || typeof document === "undefined") {
       setHeaderWorkflowSlot(null);
       return;
     }
     setHeaderWorkflowSlot(document.getElementById("header-workflow-slot"));
-  }, [workflowControlsInHeader, viewportMode]);
+  }, [active, workflowControlsInHeader, viewportMode]);
 
   // Column visibility state - initialize from localStorage or reduced default columns
   const [visibleColumns, setVisibleColumns] = useState<Set<ListColumn>>(() => readVisibleColumns(projectId));
@@ -458,15 +496,12 @@ export function ListView({
   const [bulkEditEnabled, setBulkEditEnabled] = useState(false);
   const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(() => readSelectedTaskIds(projectId));
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(() => readSelectedTaskId(projectId));
-  const [selectedTaskSnapshot, setSelectedTaskSnapshot] = useState<Task | TaskDetail | null>(() => {
-    const persistedSelection = readSelectedTaskId(projectId);
-    return persistedSelection ? tasks.find((task) => task.id === persistedSelection) ?? null : null;
-  });
-  const [sidebarWidth, setSidebarWidth] = useState<number>(() => readSidebarWidth(projectId));
   const splitLayoutRef = useRef<HTMLDivElement>(null);
-  const splitSidebarRef = useRef<HTMLDivElement>(null);
-  // FNXC:ListView 2026-06-22-18:00: Holds the active pointer-drag teardown so move/up/cancel/unmount all detach the same listeners — prevents the "window mousemove with no cleanup" leak called out by the frontend-races review.
-  const splitResizeTeardownRef = useRef<(() => void) | null>(null);
+  const [splitLayoutContainer, setSplitLayoutContainer] = useState<HTMLDivElement | null>(null);
+  const setSplitLayoutRef = useCallback((node: HTMLDivElement | null) => {
+    splitLayoutRef.current = node;
+    setSplitLayoutContainer(node);
+  }, []);
   const previousStorageProjectIdRef = useRef(projectId);
 
   useEffect(() => {
@@ -480,11 +515,7 @@ export function ListView({
     setSelectedTaskIds(readSelectedTaskIds(projectId));
     const persistedSelection = readSelectedTaskId(projectId);
     setSelectedTaskId(persistedSelection);
-    setSelectedTaskSnapshot(
-      persistedSelection ? tasks.find((task) => task.id === persistedSelection) ?? null : null,
-    );
-    setSidebarWidth(readSidebarWidth(projectId));
-  }, [projectId, tasks]);
+  }, [projectId]);
 
   // Persist selection to localStorage
   useEffect(() => {
@@ -503,84 +534,29 @@ export function ListView({
     removeScopedItem("kb-dashboard-list-selected-task", projectId);
   }, [projectId, selectedTaskId]);
 
-  useEffect(() => {
-    if (!selectedTaskId) {
-      setSelectedTaskSnapshot(null);
-      return;
-    }
+  useLayoutEffect(() => {
+    if (!splitLayoutContainer) return;
 
-    const liveTask = tasks.find((task) => task.id === selectedTaskId);
-    if (!liveTask) return;
-
-    setSelectedTaskSnapshot((previous) => {
-      if (!previous || previous.id !== selectedTaskId) {
-        return liveTask;
-      }
-      if (previous === liveTask) return previous;
-      return { ...previous, ...liveTask };
-    });
-  }, [selectedTaskId, tasks]);
-
-  useEffect(() => {
-    if (useSinglePaneList || typeof ResizeObserver === "undefined") return;
-    const container = splitLayoutRef.current;
-    if (!container) return;
-
-    const applyClamp = () => {
-      /*
-      FNXC:ListView 2026-06-22-18:00:
-      A zero/unmeasurable container width must NOT clamp the persisted sidebar width down to the 64px
-      min — that collapse made the resize handle appear broken (drag snapped the pane to the minimum
-      and refused to widen). Only re-clamp when the container reports a real width.
-      */
-      const containerWidth = container.clientWidth;
-      if (containerWidth <= 0) return;
-      // Keep width valid when viewport/container size changes.
-      const clamped = clampSidebarWidth(sidebarWidth, containerWidth);
-      if (clamped !== sidebarWidth) {
-        setSidebarWidth(clamped);
-      }
+    const measureContainer = (observedWidth?: number) => {
+      const width = observedWidth ?? (splitLayoutContainer.getBoundingClientRect().width || splitLayoutContainer.clientWidth);
+      setListContainerWidth(width > 0 ? width : null);
     };
 
-    applyClamp();
-    const observer = new ResizeObserver(applyClamp);
-    observer.observe(container);
+    measureContainer();
+    if (typeof ResizeObserver === "undefined") return;
+
+    const observer = new ResizeObserver((entries) => {
+      measureContainer(entries[0]?.contentRect.width);
+    });
+    observer.observe(splitLayoutContainer);
     return () => observer.disconnect();
-  }, [sidebarWidth, useSinglePaneList]);
-
-  useEffect(() => {
-    if (useSinglePaneList || typeof ResizeObserver === "undefined") return;
-    const sidebar = splitSidebarRef.current;
-    const container = splitLayoutRef.current;
-    if (!sidebar || !container) return;
-
-    let saveTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastSavedWidth = sidebar.offsetWidth;
-
-    const observer = new ResizeObserver(() => {
-      const nextWidth = clampSidebarWidth(sidebar.offsetWidth, container.clientWidth);
-      if (nextWidth === lastSavedWidth) return;
-      lastSavedWidth = nextWidth;
-      if (saveTimer) clearTimeout(saveTimer);
-      saveTimer = setTimeout(() => {
-        try {
-          setScopedItem("kb-dashboard-list-sidebar-width", String(nextWidth), projectId);
-        } catch {
-          // localStorage persistence is best-effort.
-        }
-      }, 200);
-    });
-
-    observer.observe(sidebar);
-    return () => {
-      observer.disconnect();
-      if (saveTimer) clearTimeout(saveTimer);
-    };
-  }, [projectId, useSinglePaneList]);
+  }, [splitLayoutContainer]);
 
   // Bulk edit state and handlers (declared before clearSelection so every clear path resets pending lane edits)
   const [executorModel, setExecutorModel] = useState<string>("__no_change__");
+  const [credentialInstanceId, setCredentialInstanceId] = useState<string>("__no_change__");
   const [validatorModel, setValidatorModel] = useState<string>("__no_change__");
+  const [validatorCredentialInstanceId, setValidatorCredentialInstanceId] = useState<string>("__no_change__");
   const [bulkThinkingLevel, setBulkThinkingLevel] = useState<string>("__no_change__");
   const [nodeOverride, setNodeOverride] = useState<string>("__no_change__");
 
@@ -589,7 +565,9 @@ export function ListView({
       if (prev) {
         setSelectedTaskIds(new Set());
         setExecutorModel("__no_change__");
+        setCredentialInstanceId("__no_change__");
         setValidatorModel("__no_change__");
+        setValidatorCredentialInstanceId("__no_change__");
         setBulkThinkingLevel("__no_change__");
         setNodeOverride("__no_change__");
       }
@@ -614,7 +592,9 @@ export function ListView({
   const clearSelection = useCallback(() => {
     setSelectedTaskIds(new Set());
     setExecutorModel("__no_change__");
+    setCredentialInstanceId("__no_change__");
     setValidatorModel("__no_change__");
+    setValidatorCredentialInstanceId("__no_change__");
     setBulkThinkingLevel("__no_change__");
     setNodeOverride("__no_change__");
   }, []);
@@ -640,7 +620,17 @@ export function ListView({
   }, [selectedWorkflowId]);
 
   const listColumns = useMemo<BoardWorkflowColumn[]>(() => {
-    if (!workflowMode || !selectedWorkflow) return LEGACY_LIST_COLUMNS;
+    /*
+    FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R9, R8):
+    `LEGACY_LIST_COLUMNS` is DELETED. It synthesised trait flags onto the six
+    hardcoded legacy column ids (synthesising `intake` onto the legacy intake id,
+    `hold` onto `todo`, …) — the same defect U10 removed from Board's aggregate lane union,
+    surviving in the ListView copy. It only ever fed this arm, which the skeleton
+    gate below makes unreachable: that gate returns unless a lane resolved, and a
+    resolved lane always yields a non-null `selectedWorkflow`. Empty columns render
+    nothing, matching what the skeleton already shows.
+    */
+    if (!workflowMode || !selectedWorkflow) return [];
     if (!isAllWorkflowsSelected || !boardWorkflows) {
       return selectedWorkflow.columns.filter((column) => !column.flags.hiddenFromBoard);
     }
@@ -664,6 +654,51 @@ export function ListView({
     return [...columnsById.values()];
   }, [boardWorkflows, isAllWorkflowsSelected, selectedWorkflow, workflowMode]);
 
+  /**
+   * FNXC:WorkflowResolvedColumns 2026-07-27-14:45 (U10 / R8):
+   * Display-only landing lane for a row whose stored column the resolved workflow does not
+   * declare. Prefers the intake lane (where an operator expects unplaced work), then the first
+   * non-complete lane, then the first lane at all.
+   */
+  const pickFallbackColumnId = useCallback((columns: readonly BoardWorkflowColumn[]): ColumnId | undefined => {
+    const placeable = columns.filter((column) => !column.flags.hiddenFromBoard);
+    return placeable.find((column) => column.flags.intake)?.id
+      ?? placeable.find((column) => !column.flags.complete)?.id
+      ?? placeable[0]?.id
+      ?? columns[0]?.id;
+  }, []);
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-27-18:40 (U10 / R8 — greptile P1 on PR #2492):
+  Per-WORKFLOW landing lanes. In the All-workflows list, `listColumns` is a cross-workflow union
+  ordered default-workflow-first, so one global fallback filed every stranded row under the DEFAULT
+  workflow's intake — a card from another workflow rendered under a lifecycle it does not belong to.
+  Resolve the landing lane from the card's own workflow; the global fallback below is only the last
+  resort for a card whose workflow cannot be resolved at all.
+  */
+  const fallbackColumnIdByWorkflowId = useMemo(() => {
+    const map = new Map<string, ColumnId>();
+    for (const workflow of boardWorkflows?.workflows ?? []) {
+      const fallback = pickFallbackColumnId(workflow.columns);
+      if (fallback !== undefined) map.set(workflow.id, fallback);
+    }
+    return map;
+  }, [boardWorkflows, pickFallbackColumnId]);
+
+  const listFallbackColumnId = useMemo<ColumnId | undefined>(
+    () => pickFallbackColumnId(listColumns),
+    [listColumns, pickFallbackColumnId],
+  );
+
+  /** The workflow a rendered card belongs to, resolved the same way the lane filter resolves it. */
+  const resolveTaskWorkflowId = useCallback((taskId: string): string | undefined => {
+    if (!boardWorkflows) return undefined;
+    const raw = boardWorkflows.taskWorkflowIds[taskId];
+    return raw && boardWorkflows.workflows.some((workflow) => workflow.id === raw)
+      ? raw
+      : boardWorkflows.defaultWorkflowId;
+  }, [boardWorkflows]);
+
   const columnNameById = useMemo(() => {
     const map = new Map<ColumnId, string>();
     for (const column of listColumns) {
@@ -684,10 +719,110 @@ export function ListView({
     return columnNameById.get(column) ?? columnLabel(column);
   }, [columnLabel, columnNameById]);
 
-  const listContextMenuColumns = useMemo<readonly TaskContextMenuColumnMetadata[] | undefined>(() => {
-    if (!workflowMode) return undefined;
-    return listColumns.map((column) => ({ id: column.id, label: column.name, flags: column.flags }));
-  }, [listColumns, workflowMode]);
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-08-27-13:09:
+  FN-198 keeps per-task workflow metadata for column labels and role flags, not for a
+  destination picker. An unresolved mapping may use the shared display union until the
+  board-workflows refresh settles, but it must never create a manual relocation path.
+  */
+  useUnmappedWorkflowRefetch({ boardWorkflows, tasks, workflowMode, refreshBoardWorkflows, projectId });
+
+  const taskContextMenuColumnsByTaskId = useMemo(() => {
+    const map = new Map<string, readonly TaskContextMenuColumnMetadata[]>();
+    if (!workflowMode || !boardWorkflows) return map;
+    const byWorkflowId = new Map<string, readonly TaskContextMenuColumnMetadata[]>();
+    for (const workflow of boardWorkflows.workflows) {
+      byWorkflowId.set(
+        workflow.id,
+        workflow.columns
+          .filter((column) => column.flags?.hiddenFromBoard !== true)
+          .map((column) => ({
+            id: column.id,
+            label: column.name,
+            flags: column.flags,
+          })),
+      );
+    }
+    for (const task of tasks) {
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (PR #2528 review — greptile):
+      VALIDATE the mapped id before trusting it. `taskWorkflowIds` can carry a STALE or
+      unknown entry — a workflow deleted since the payload was built, or an id the
+      client has not seen — and a bare `?? defaultWorkflowId` only covers the MISSING
+      case, not the invalid one. An unknown id then resolves to no columns, the task
+      silently drops back to the adjacency-free shared union, and the menu is wrong in
+      exactly the way this whole change exists to prevent.
+
+      Mirrors Board's `getEffectiveTaskWorkflowId`, which already validates against the
+      known-workflow set for the same reason.
+      */
+      const assigned = boardWorkflows.taskWorkflowIds[task.id];
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (PR #2525 review — greptile):
+      An UNMAPPED task is unknown, not default. `buildBoardWorkflowsPayload` writes an
+      entry for every task it is given (null selection included), so a MISSING entry
+      does not mean "no selection" — it means this task is NEWER than the payload,
+      which happens routinely because the SSE task list updates before board-workflows
+      does. Assuming the default workflow there would assert the default's adjacency on
+      a card that may belong to another workflow entirely — precisely the wrong answer,
+      confidently stated, for the cards most likely to be affected (freshly created
+      ones, which is exactly when a workflow was chosen).
+
+      Leave such a task without per-workflow metadata: it falls back to the shared
+      union and the neighbour approximation, which is the pre-existing behaviour and an
+      admitted guess rather than a false claim. Board additionally forces one
+      board-workflows refetch when it sees unmapped rendered tasks (FN-7591); porting
+      that self-heal to List is a real improvement and its own change.
+
+      A PRESENT but unknown id (stale/deleted workflow) still falls back to the default
+      — there the entry is a real answer that has simply gone out of date.
+      */
+      if (assigned === undefined) continue;
+      const workflowId = byWorkflowId.has(assigned) ? assigned : boardWorkflows.defaultWorkflowId;
+      const columns = workflowId ? byWorkflowId.get(workflowId) : undefined;
+      if (columns) map.set(task.id, columns);
+    }
+    return map;
+  }, [boardWorkflows, tasks, workflowMode]);
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-08-27-13:09:
+  Per-task column flags avoid serving the shared union's semantics to a different
+  workflow when two workflows reuse a column id.
+
+  The row context menu and progress bar ask per-task questions. A cross-workflow union can serve one
+  workflow's complete or WIP semantics to another workflow's card, so resolve flags per task here.
+
+  Same validated mapping as `taskContextMenuColumnsByTaskId` (unmapped task -> no metadata, stale id
+  -> default), and the same fallback: the shared union, which is the pre-existing approximation
+  rather than a confidently wrong answer.
+  */
+  const getTaskColumnFlags = useCallback((
+    task: Task,
+  ): Parameters<typeof isCompleteColumnRole>[0] | undefined => {
+    const own = taskContextMenuColumnsByTaskId.get(task.id);
+    const fromOwnWorkflow = own?.find((column) => column.id === task.column)?.flags;
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-03:30 (PR #2738 review — greptile P1):
+    KNOWING the task's workflow and finding no such column is an ANSWER, not a miss.
+
+    The first version fell through to the union in both cases, which put back the bug one level down:
+    a task mapped to workflow A whose column A no longer declares — the stranded card this whole
+    change is about — picked up workflow B's traits for the same id. Revert, progress, the Planning
+    badge and agent-active styling all followed a workflow the card does not belong to.
+
+    Absent flags is the RIGHT answer there: the role helpers then degrade to the legacy id, which is
+    exactly the documented no-metadata path and the same argument this PR makes for `Column.tsx`. The
+    union is an approximation reserved for the case where we have no per-task metadata AT ALL.
+    */
+    return fromOwnWorkflow ?? (own ? undefined : columnFlagsById.get(task.column));
+  }, [columnFlagsById, taskContextMenuColumnsByTaskId]);
+
+  const getTaskColumnDisplayLabel = useCallback((task: Task): string => {
+    return taskContextMenuColumnsByTaskId.get(task.id)?.find((column) => column.id === task.column)?.label
+      ?? getListColumnLabel(task.column);
+  }, [getListColumnLabel]);
 
   const getTaskPlanningWorkflowId = useCallback((task: Task): string | null => {
     const taskWorkflowId = (task as Task & { workflowId?: string | null }).workflowId;
@@ -698,13 +833,41 @@ export function ListView({
     return null;
   }, [boardWorkflows, workflowMode]);
 
-  const isArchivedColumn = useCallback((column: ColumnId): boolean => {
-    return workflowMode ? Boolean(columnFlagsById.get(column)?.archived) : column === "archived";
-  }, [columnFlagsById, workflowMode]);
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (U12 — R8 drift conversion):
+  The card's INTAKE role, from its own column's traits. Both grouped-list render paths
+  gated the transient Planning badge on the legacy intake id, which U11 deletes — the
+  badge would simply stop appearing on planning rows, with nothing failing.
 
-  const isCompleteColumn = useCallback((column: ColumnId): boolean => {
-    return workflowMode ? Boolean(columnFlagsById.get(column)?.complete) : column === "done";
-  }, [columnFlagsById, workflowMode]);
+  The id fallback now lives once in `isIntakeColumnRole`, together with the reason it
+  cannot be deleted; see `utils/columnRoles.ts`.
+  */
+  /* Found by the PR #2738 ratchet, and it PREDATES this change: the name says "ForTask" while the
+     lookup went to the cross-workflow union, so the Planning badge followed a neighbouring
+     workflow's `intake` trait. Same one-line fix as the sites below. */
+  const isIntakeColumnForTask = useCallback((task: Task): boolean => {
+    return isIntakeColumnRole(getTaskColumnFlags(task), task.column);
+  }, [getTaskColumnFlags]);
+  const isPlanningLaneForTask = useCallback((task: Task): boolean => {
+    return isPreImplementationColumnRole(getTaskColumnFlags(task), task.column);
+  }, [getTaskColumnFlags]);
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-14:00 (PR #2738 review — greptile P1):
+  PER-TASK twins of the two column-level predicates above.
+
+  The column-level predicate answers whether a whole list section is Complete, where the cross-workflow
+  union is harmless. Per-task call sites must instead use the task's own workflow so bulk select-all,
+  delete, pause, unpause and model updates never follow a neighbouring workflow's semantics.
+
+  These evaded the ratchet I added for the same defect one round ago, because that guard forbade
+  reading `columnFlagsById.get(task.column)` DIRECTLY and these reach the union through a callback.
+  The guard is widened accordingly — the rule is the QUESTION being asked (per task), not the syntax
+  used to ask it.
+  */
+  const isTaskCompleteColumn = useCallback((task: Task): boolean => {
+    return isCompleteColumnRole(getTaskColumnFlags(task), task.column);
+  }, [getTaskColumnFlags]);
 
   const selectedWorkflowTaskIds = useMemo(() => {
     if (!workflowMode || !boardWorkflows || !selectedWorkflow || isAllWorkflowsSelected) return null;
@@ -723,83 +886,10 @@ export function ListView({
     [boardWorkflows, tasks],
   );
 
-  const createTargetWorkflowId = useMemo(() => {
-    if (!workflowMode || !boardWorkflows) return null;
-    if (!isAllWorkflowsSelected) return selectedWorkflow?.id ?? null;
-    return boardWorkflows.workflows.find((workflow) => workflow.id === boardWorkflows.defaultWorkflowId)?.id
-      ?? boardWorkflows.workflows[0]?.id
-      ?? null;
-  }, [boardWorkflows, isAllWorkflowsSelected, selectedWorkflow, workflowMode]);
 
-  const createTargetColumn = useMemo(() => {
-    if (workflowMode && boardWorkflows && createTargetWorkflowId) {
-      const workflow = boardWorkflows.workflows.find((candidate) => candidate.id === createTargetWorkflowId);
-      const target = workflow?.columns.find((column) => column.flags.intake && !column.flags.archived && !column.flags.hiddenFromBoard)
-        ?? workflow?.columns.find((column) => !column.flags.archived && !column.flags.hiddenFromBoard);
-      if (target) return target.id;
-    }
-    const target = listColumns.find((column) => column.flags.intake && !column.flags.archived)
-      ?? listColumns.find((column) => !column.flags.archived);
-    return target?.id;
-  }, [boardWorkflows, createTargetWorkflowId, listColumns, workflowMode]);
 
-  /**
-   * FNXC:WorkflowList 2026-06-21-21:37:
-   * List quick-create shares Board's workflow filtering invariant: when taskWorkflowIds lags task creation, optimistically recording the selected workflow keeps the newly-created row visible in the active workflow lane until the authoritative refetch reconciles it (FN-6903).
-   */
-  const applyOptimisticTaskWorkflow = useCallback((taskId: string, workflowId: string) => {
-    setBoardWorkflowsState((previous) => {
-      if (!previous || previous.projectId !== projectId) return previous;
-      if (previous.payload.taskWorkflowIds[taskId]) return previous;
 
-      const payload: BoardWorkflowsPayload = {
-        ...previous.payload,
-        taskWorkflowIds: {
-          ...previous.payload.taskWorkflowIds,
-          [taskId]: workflowId,
-        },
-      };
-      writeBoardWorkflowsCache(projectId, payload);
-      return { projectId, payload };
-    });
-  }, [projectId]);
 
-  const resolveListQuickCreateTarget = useCallback((targetWorkflowId: string, preferredColumnId?: string | null): ColumnId | undefined => {
-    const workflow = boardWorkflows?.workflows.find((candidate) => candidate.id === targetWorkflowId);
-    if (!workflow) return undefined;
-    const visibleColumns = workflow.columns.filter((column) => !column.flags.archived && !column.flags.hiddenFromBoard);
-    const preferredColumn = preferredColumnId ? visibleColumns.find((column) => column.id === preferredColumnId) : undefined;
-    const column = preferredColumn
-      ?? visibleColumns.find((candidate) => candidate.flags.intake)
-      ?? visibleColumns[0];
-    return column?.id as ColumnId | undefined;
-  }, [boardWorkflows]);
-
-  const handleListQuickCreate = useCallback(async (input: TaskCreateInput) => {
-    const create = onQuickCreate ?? (async () => addToast(t("listView.taskCreationUnavailable", "Task creation not available"), "error"));
-    if (workflowMode && createTargetWorkflowId && createTargetColumn) {
-      const workflowId = typeof input.workflowId === "string" && input.workflowId !== ALL_WORKFLOWS_BOARD_VIEW_ID ? input.workflowId : createTargetWorkflowId;
-      const targetColumn = resolveListQuickCreateTarget(workflowId, input.column) ?? createTargetColumn;
-      const created = await create({
-        ...input,
-        column: targetColumn,
-        workflowId,
-      });
-      if (created?.id) {
-        const createdWorkflowId = (created as Task & { workflowId?: string }).workflowId ?? workflowId;
-        applyOptimisticTaskWorkflow(created.id, createdWorkflowId);
-        refreshBoardWorkflows();
-      }
-      return created;
-    }
-    return create(input);
-  }, [addToast, applyOptimisticTaskWorkflow, createTargetColumn, createTargetWorkflowId, onQuickCreate, refreshBoardWorkflows, resolveListQuickCreateTarget, t, workflowMode]);
-
-  /*
-  FNXC:ListWorkflowSelection 2026-06-29-00:00:
-  List quick-add Plan/Subtask handoffs must inherit the same active workflow as direct quick-create. Passing null only while workflow mode has no selected workflow preserves stale-id fallback behavior without reverting to the project default lane.
-  */
-  const listQuickEntryWorkflowId = workflowMode ? createTargetWorkflowId : undefined;
 
   // Column display labels
   const COLUMN_LABELS_MAP: Record<ListColumn, string> = {
@@ -837,10 +927,6 @@ export function ListView({
     });
   }, []);
 
-  const clearColumnFilter = useCallback(() => {
-    setSelectedColumn(null);
-  }, []);
-
   const groupedTasks = useMemo(() => {
     // First apply text filter
     let filtered = searchQuery
@@ -858,11 +944,11 @@ export function ListView({
 
     const hiddenCompletedColumns = new Set(
       listColumns
-        .filter((column) => column.flags.complete || column.flags.archived)
+        .filter((column) => column.flags.complete)
         .map((column) => column.id),
     );
 
-    // Then filter out done and archived tasks if hideDoneTasks is enabled
+    // Then filter out completed tasks if hideDoneTasks is enabled
     // BUT only when no specific column is selected (strict hide semantics)
     if (hideDoneTasks && !selectedColumn) {
       filtered = filtered.filter((t) => !hiddenCompletedColumns.has(t.column));
@@ -884,15 +970,46 @@ export function ListView({
     const groups: Record<string, Task[]> = {};
     for (const column of listColumns) groups[column.id] = [];
 
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-27-14:45 (U10 / R8):
+    A row whose stored column the resolved workflow no longer declares must NOT vanish. The
+    previous `if (groups[column])` guard silently dropped it — no lane, no row, no error — which
+    is exactly what a removed column (U11 merging Todo into Planning) or a workflow edited to
+    drop a lane produces for cards already resting there. Re-home it for DISPLAY into the
+    workflow's intake/first visible lane, mirroring the safety nets Board already carries for its
+    selected-workflow and aggregate groupings. Display-only: the task's stored column is untouched,
+    so the move menu and any engine rebound still see the real column.
+    */
+    /*
+    FNXC:TaskRevert 2026-08-27-02:34:
+    The removed reverted section previously deduplicated ids. Keep that protection while grouping
+    rows in their own columns so duplicate optimistic/refetch data cannot duplicate reverted work.
+    */
+    const seenRevertedTaskIds = new Set<string>();
     columnFiltered.forEach((task) => {
+      if (isTaskReverted(task.sourceMetadata)) {
+        if (seenRevertedTaskIds.has(task.id)) return;
+        seenRevertedTaskIds.add(task.id);
+      }
       const column = workflowMode ? task.column : (isColumn(task.column) ? task.column : DEFAULT_COLUMN);
-      if (groups[column]) groups[column].push(task);
+      if (groups[column] !== undefined) {
+        groups[column].push(task);
+        return;
+      }
+      const ownWorkflowId = workflowMode ? resolveTaskWorkflowId(task.id) : undefined;
+      const ownFallback = ownWorkflowId ? fallbackColumnIdByWorkflowId.get(ownWorkflowId) : undefined;
+      const columnId = (ownFallback !== undefined && groups[ownFallback] !== undefined)
+        ? ownFallback
+        : listFallbackColumnId;
+      if (columnId !== undefined && groups[columnId] !== undefined) groups[columnId].push(task);
     });
 
     for (const column of listColumns) {
       const columnId = column.id;
       if (!sortField) {
-        groups[columnId] = sortTasksForDisplayColumn(groups[columnId], columnId as Column);
+        groups[columnId] = sortTasksForDisplayColumn(groups[columnId], columnId, {
+          columnFlags: column.flags,
+        });
         continue;
       }
 
@@ -916,53 +1033,123 @@ export function ListView({
       });
     }
     return groups;
-  }, [tasks, searchQuery, selectedWorkflowTaskIds, listColumns, workflowMode, hideDoneTasks, selectedColumn, staleOnlyFilter, stalePausedReviewOnlyFilter, sortField, sortDirection]);
+  }, [tasks, searchQuery, selectedWorkflowTaskIds, listColumns, workflowMode, hideDoneTasks, selectedColumn, staleOnlyFilter, stalePausedReviewOnlyFilter, sortField, sortDirection, fallbackColumnIdByWorkflowId, listFallbackColumnId, resolveTaskWorkflowId]);
 
   // Calculate total filtered count from groups
   const filteredCount = useMemo(() => {
     return Object.values(groupedTasks).reduce((sum, group) => sum + group.length, 0);
   }, [groupedTasks]);
 
-  // Selection logic that depends on groupedTasks (must be after groupedTasks definition)
-  // Toggle all visible tasks
-  const toggleSelectAll = useCallback(() => {
-    const visibleTaskIds = Object.values(groupedTasks)
-      .flat()
-      .filter((t) => !isArchivedColumn(t.column)) // Can't bulk edit archived
-      .map((t) => t.id);
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualTaskKeys = useMemo(() => listColumns.flatMap((columnDef) => {
+    const column = columnDef.id;
+    if (selectedColumn && column !== selectedColumn) return [];
+    if (hideDoneTasks && columnDef.flags.complete && !selectedColumn) return [];
+    if (collapsedSections.has(column)) return [];
+    const group = groupedTasks[column] ?? [];
+    if (searchQuery && group.length === 0) return [];
+    return group.map((task) => task.id);
+  }), [collapsedSections, groupedTasks, hideDoneTasks, listColumns, searchQuery, selectedColumn]);
+  const virtualList = useVirtualizedList({
+    collectionKey: `${projectId ?? "default"}:${selectedWorkflowId}:${selectedColumn ?? "all"}:${searchQuery}:${sortField ?? "default"}:${sortDirection}:${useSinglePaneList ? "cards" : "table"}`,
+    keys: virtualTaskKeys,
+    scrollRef: listScrollRef,
+    initialAlign: "start",
+    maxRenderedRows: LIST_MAX_RENDERED_TASKS,
+  });
+  const visibleVirtualTaskIds = useMemo(() => new Set(virtualList.visibleKeys), [virtualList.visibleKeys]);
+  /*
+  FNXC:TaskSearchPagination 2026-09-07-18:20:
+  ListView owns the same automatic current-task continuation as Board. Its sentinel is rooted in the real list scroller, remains active for server-side search, and is disabled while the kept-alive view is hidden so navigation cannot drain pages in the background.
+  */
+  const autoPagination = useAutoPaginationSentinel({
+    rootRef: listScrollRef,
+    hasMore: currentTasksHasMore,
+    loading: currentTasksLoadingMore,
+    onLoadMore: onLoadMoreCurrentTasks ?? (() => undefined),
+    direction: "end",
+    enabled: active && !currentTasksPaginationError,
+    progressKey: currentTasksProgressKey,
+    collectionKey: `${projectId ?? "default"}:list:${searchQuery}`,
+  });
 
-    setSelectedTaskIds((prev) => {
-      const allSelected = visibleTaskIds.every((id) => prev.has(id));
-      if (allSelected) {
-        // Deselect all visible
-        const next = new Set(prev);
-        visibleTaskIds.forEach((id) => next.delete(id));
-        return next;
-      } else {
-        // Select all visible
-        return new Set([...prev, ...visibleTaskIds]);
+  /*
+  FNXC:ListViewWindowing 2026-09-07-17:38:
+  List table and card modes retain the full filtered/grouped data model but mount only the shared variable-height virtual window. Top and bottom spacers preserve scroll extent, measured rows refine estimates, and the constant row cap prevents a complete 1,000-task traversal from accumulating DOM nodes.
+  */
+  const listSectionWindows = useMemo(() => {
+    const windows: Record<string, { tasks: Task[]; hiddenCount: number }> = {};
+    for (const [columnId, group] of Object.entries(groupedTasks)) {
+      windows[columnId] = { tasks: group.filter((task) => visibleVirtualTaskIds.has(task.id)), hiddenCount: 0 };
+    }
+    return windows;
+  }, [groupedTasks, visibleVirtualTaskIds]);
+
+  useLayoutEffect(() => {
+    if (selectedTaskId && virtualTaskKeys.includes(selectedTaskId) && !visibleVirtualTaskIds.has(selectedTaskId)) {
+      virtualList.scrollToKey(selectedTaskId, "center");
+    }
+  }, [selectedTaskId, virtualList.scrollToKey, virtualTaskKeys, visibleVirtualTaskIds]);
+
+  /*
+  FNXC:ListViewSelectAll 2026-07-26-14:05:
+  The header checkbox is labelled "Select all visible tasks" and the bulk bar behind it performs
+  DESTRUCTIVE actions (bulk delete, bulk column move). Before render windowing it flattened
+  `groupedTasks` and that was honest, because every filtered row was in the DOM. Windowing broke the
+  label: on a 3000-task project the operator sees 50 rows and the old handler armed 3000 for deletion.
+  Correction of a false claim: the earlier windowing FNXC block enumerated filtering, grouping and
+  single-selection invariants and asserted nothing about bulk selection — it did NOT hold. A bulk
+  action must never reach a row the operator cannot see, so select-all is scoped to what is actually
+  rendered.
+
+  "Rendered" here mirrors the two render loops (single-pane cards and the table) exactly: the
+  selected-column filter, the hide-done section skip, the collapsed-section skip (a collapsed section
+  renders no rows), and the per-section window slice. Keep this in sync with both loops — if a loop grows another skip, it
+  belongs here too, or the label lies again.
+  */
+  const selectAllTaskIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const columnDef of listColumns) {
+      const column = columnDef.id;
+      if (selectedColumn && column !== selectedColumn) continue;
+      if (hideDoneTasks && columnDef.flags.complete && !selectedColumn) continue;
+      if (collapsedSections.has(column)) continue;
+      const group = groupedTasks[column];
+      if (!group || group.length === 0) continue;
+      const windowed = listSectionWindows[column]?.tasks ?? group;
+      for (const task of windowed) {
+        ids.push(task.id);
       }
+    }
+    return ids;
+  }, [collapsedSections, groupedTasks, hideDoneTasks, listColumns, listSectionWindows, selectedColumn]);
+
+  // Toggle every rendered (windowed) task
+  const toggleSelectAll = useCallback(() => {
+    setSelectedTaskIds((prev) => {
+      const allSelected = selectAllTaskIds.every((id) => prev.has(id));
+      if (allSelected) {
+        // Deselect the rendered rows, leaving any selection made outside the current window intact.
+        const next = new Set(prev);
+        selectAllTaskIds.forEach((id) => next.delete(id));
+        return next;
+      }
+      return new Set([...prev, ...selectAllTaskIds]);
     });
-  }, [groupedTasks, isArchivedColumn]);
+  }, [selectAllTaskIds]);
 
-  // Check if all visible tasks are selected
+  // Check if all rendered tasks are selected
   const isSelectAll = useMemo(() => {
-    const visibleTaskIds = Object.values(groupedTasks)
-      .flat()
-      .filter((t) => !isArchivedColumn(t.column));
-    if (visibleTaskIds.length === 0) return false;
-    return visibleTaskIds.every((t) => selectedTaskIds.has(t.id));
-  }, [groupedTasks, isArchivedColumn, selectedTaskIds]);
+    if (selectAllTaskIds.length === 0) return false;
+    return selectAllTaskIds.every((id) => selectedTaskIds.has(id));
+  }, [selectAllTaskIds, selectedTaskIds]);
 
-  // Check if some (but not all) visible tasks are selected
+  // Check if some (but not all) rendered tasks are selected
   const isSelectIndeterminate = useMemo(() => {
-    const visibleTaskIds = Object.values(groupedTasks)
-      .flat()
-      .filter((t) => !isArchivedColumn(t.column));
-    if (visibleTaskIds.length === 0) return false;
-    const selectedCount = visibleTaskIds.filter((t) => selectedTaskIds.has(t.id)).length;
-    return selectedCount > 0 && selectedCount < visibleTaskIds.length;
-  }, [groupedTasks, isArchivedColumn, selectedTaskIds]);
+    if (selectAllTaskIds.length === 0) return false;
+    const selectedCount = selectAllTaskIds.filter((id) => selectedTaskIds.has(id)).length;
+    return selectedCount > 0 && selectedCount < selectAllTaskIds.length;
+  }, [selectAllTaskIds, selectedTaskIds]);
 
   // Bulk edit state and handlers (must be after groupedTasks and clearSelection definition)
   const [availableNodes, setAvailableNodes] = useState<NodeInfo[]>([]);
@@ -1010,91 +1197,24 @@ export function ListView({
     const selectedTasks = Array.from(selectedTaskIds)
       .map((id) => tasks.find((task) => task.id === id))
       .filter((task): task is Task => Boolean(task));
-    const archivedTasks = selectedTasks.filter((task) => isArchivedColumn(task.column));
-    const deletableTasks = selectedTasks.filter((task) => !isArchivedColumn(task.column));
+    const deletableTasks = selectedTasks;
 
-    if (deletableTasks.length === 0) {
-      addToast(t("listView.bulkDeleteNoTasks", "No selected tasks can be deleted (archived tasks are excluded)"), "error");
-      return;
-    }
-
-    const doneTasks = deletableTasks.filter((task) => isCompleteColumn(task.column));
-    const otherTasks = deletableTasks.filter((task) => !isCompleteColumn(task.column));
-
-    let shouldDeleteAll = false;
-    let shouldArchiveDoneInstead = false;
-
-    if (doneTasks.length > 0 && onArchiveTask) {
-      const choice = await confirmWithChoice({
-        title: t("listView.bulkDeleteTitle", "Delete Selected Tasks"),
-        message: t("listView.bulkDeleteWithDoneMessage", "Delete {{deletable}} task(s), or archive the {{done}} done task(s) and delete the rest?", { deletable: deletableTasks.length, done: doneTasks.length }),
-        confirmLabel: t("listView.bulkDeleteAll", "Delete All"),
-        cancelLabel: t("common.cancel", "Cancel"),
-        tertiaryLabel: t("listView.bulkArchiveDone", "Archive {{count}} Done", { count: doneTasks.length }),
-        danger: true,
-      });
-      if (choice === "cancel") return;
-      shouldDeleteAll = choice === "primary";
-      shouldArchiveDoneInstead = choice === "tertiary";
-    } else {
-      const confirmed = await confirm({
-        title: t("listView.bulkDeleteTitle", "Delete Selected Tasks"),
-        message: t("listView.bulkDeleteMessage", "Delete {{count}} selected task(s)?", { count: deletableTasks.length }),
-        confirmLabel: t("common.delete", "Delete"),
-        cancelLabel: t("common.cancel", "Cancel"),
-        danger: true,
-      });
-
-      if (!confirmed) return;
-      shouldDeleteAll = true;
-    }
+    if (deletableTasks.length === 0) return;
+    const confirmed = await confirm({
+      title: t("listView.bulkDeleteTitle", "Delete Selected Tasks"),
+      message: t("listView.bulkDeleteMessage", "Delete {{count}} selected task(s)?", { count: deletableTasks.length }),
+      confirmLabel: t("common.delete", "Delete"),
+      cancelLabel: t("common.cancel", "Cancel"),
+      danger: true,
+    });
+    if (!confirmed) return;
 
     setIsApplying(true);
     const deletedIds: string[] = [];
-    const archivedIds: string[] = [];
     const failedIds: string[] = [];
-    const skippedIds = archivedTasks.map((task) => task.id);
 
     try {
-      const tasksToDelete = shouldDeleteAll ? deletableTasks : otherTasks;
-
-      if (shouldArchiveDoneInstead && onArchiveTask) {
-        for (const task of doneTasks) {
-          try {
-            await onArchiveTask(task.id);
-            archivedIds.push(task.id);
-          } catch (err) {
-            const lineageConflict = extractLineageDeleteConflict(err);
-            if (!lineageConflict || lineageConflict.lineageChildIds.length === 0) {
-              failedIds.push(task.id);
-              continue;
-            }
-
-            const confirmedArchive = await confirm({
-              title: t("listView.forceDeleteTitle", "Force Delete Task"),
-              message:
-                t("listView.lineageArchiveMessage", "{{taskId}} has lineage children ({{children}}) that reference it as a source parent.\n\nArchive anyway by unlinking these references first?", { taskId: task.id, children: lineageConflict.lineageChildIds.join(", ") }),
-              confirmLabel: t("common.archive", "Archive"),
-              cancelLabel: t("common.skip", "Skip"),
-              danger: true,
-            });
-
-            if (!confirmedArchive) {
-              failedIds.push(task.id);
-              continue;
-            }
-
-            try {
-              await onArchiveTask(task.id, { removeLineageReferences: true });
-              archivedIds.push(task.id);
-            } catch {
-              failedIds.push(task.id);
-            }
-          }
-        }
-      }
-
-      for (const task of tasksToDelete) {
+      for (const task of deletableTasks) {
         try {
           await onDeleteTask(task.id);
           deletedIds.push(task.id);
@@ -1189,25 +1309,19 @@ export function ListView({
       setIsApplying(false);
     }
 
-    if (deletedIds.length > 0 || archivedIds.length > 0) {
+    if (deletedIds.length > 0) {
       setSelectedTaskIds((previous) => {
         const next = new Set(previous);
-        for (const id of deletedIds) {
-          next.delete(id);
-        }
-        for (const id of archivedIds) {
-          next.delete(id);
-        }
+        for (const id of deletedIds) next.delete(id);
         return next;
       });
     }
 
-    const summaryMessage = shouldArchiveDoneInstead
-      ? t("listView.bulkDeleteArchiveSummary", "Archived {{archived}}, deleted {{deleted}}, failed {{failed}}", { archived: archivedIds.length, deleted: deletedIds.length, failed: failedIds.length })
-      : t("listView.bulkDeleteSummary", { count: deletedIds.length, skipped: skippedIds.length, failed: failedIds.length, defaultValue_one: "Deleted {{count}} task · {{skipped}} archived skipped · {{failed}} failed", defaultValue_other: "Deleted {{count}} tasks · {{skipped}} archived skipped · {{failed}} failed" });
-
-    addToast(summaryMessage, failedIds.length > 0 ? "error" : "success");
-  }, [addToast, confirm, confirmWithChoice, isArchivedColumn, isCompleteColumn, onArchiveTask, onDeleteTask, selectedTaskIds, tasks]);
+    addToast(
+      t("listView.bulkDeleteSummary", "Deleted {{deleted}} · {{failed}} failed", { deleted: deletedIds.length, failed: failedIds.length }),
+      failedIds.length > 0 ? "error" : "success",
+    );
+  }, [addToast, confirm, onDeleteTask, selectedTaskIds, tasks]);
 
   const handleBulkPause = useCallback(async () => {
     if (selectedTaskIds.size === 0) return;
@@ -1219,7 +1333,7 @@ export function ListView({
     const selectedTasks = Array.from(selectedTaskIds)
       .map((id) => tasks.find((task) => task.id === id))
       .filter((task): task is Task => Boolean(task));
-    const actionableTasks = selectedTasks.filter((task) => !isArchivedColumn(task.column) && task.paused !== true);
+    const actionableTasks = selectedTasks.filter((task) => task.paused !== true);
     const skippedCount = selectedTasks.length - actionableTasks.length;
 
     if (actionableTasks.length === 0) {
@@ -1258,7 +1372,7 @@ export function ListView({
       t("listView.bulkPauseSummary", "Paused {{paused}} · {{skipped}} skipped · {{failed}} failed", { paused: pausedIds.length, skipped: skippedCount, failed: failedIds.length }),
       failedIds.length > 0 ? "error" : "success",
     );
-  }, [addToast, isArchivedColumn, onPauseTask, selectedTaskIds, tasks]);
+  }, [addToast, onPauseTask, selectedTaskIds, tasks]);
 
   const handleBulkUnpause = useCallback(async () => {
     if (selectedTaskIds.size === 0) return;
@@ -1270,7 +1384,7 @@ export function ListView({
     const selectedTasks = Array.from(selectedTaskIds)
       .map((id) => tasks.find((task) => task.id === id))
       .filter((task): task is Task => Boolean(task));
-    const actionableTasks = selectedTasks.filter((task) => !isArchivedColumn(task.column) && task.paused === true);
+    const actionableTasks = selectedTasks.filter((task) => task.paused === true);
     const skippedCount = selectedTasks.length - actionableTasks.length;
 
     if (actionableTasks.length === 0) {
@@ -1309,104 +1423,19 @@ export function ListView({
       t("listView.bulkUnpauseSummary", "Unpaused {{unpaused}} · {{skipped}} skipped · {{failed}} failed", { unpaused: unpausedIds.length, skipped: skippedCount, failed: failedIds.length }),
       failedIds.length > 0 ? "error" : "success",
     );
-  }, [addToast, isArchivedColumn, onUnpauseTask, selectedTaskIds, tasks]);
+  }, [addToast, onUnpauseTask, selectedTaskIds, tasks]);
 
-  const handleBulkArchive = useCallback(async () => {
-    if (selectedTaskIds.size === 0) return;
-    if (!onArchiveTask) {
-      addToast(t("listView.archiveUnavailable", "Archive action is unavailable"), "error");
-      return;
-    }
-
-    const selectedTasks = Array.from(selectedTaskIds)
-      .map((id) => tasks.find((task) => task.id === id))
-      .filter((task): task is Task => Boolean(task));
-    const actionableTasks = selectedTasks.filter((task) => isCompleteColumn(task.column));
-    const skippedCount = selectedTasks.length - actionableTasks.length;
-
-    if (actionableTasks.length === 0) {
-      addToast(t("listView.bulkArchiveNoTasks", "No selected tasks can be archived (only done tasks)"), "error");
-      return;
-    }
-
-    const confirmed = await confirm({
-      title: t("listView.bulkArchiveTitle", "Archive Selected Tasks"),
-      message: t("listView.bulkArchiveMessage", "Archive {{count}} selected task(s)?", { count: actionableTasks.length }),
-      confirmLabel: t("common.archive", "Archive"),
-      cancelLabel: t("common.cancel", "Cancel"),
-      danger: false,
-    });
-
-    if (!confirmed) return;
-
-    setIsApplying(true);
-    const archivedIds: string[] = [];
-    const failedIds: string[] = [];
-
-    try {
-      for (const task of actionableTasks) {
-        try {
-          await onArchiveTask(task.id);
-          archivedIds.push(task.id);
-        } catch (err) {
-          const lineageConflict = extractLineageDeleteConflict(err);
-          if (!lineageConflict || lineageConflict.lineageChildIds.length === 0) {
-            failedIds.push(task.id);
-            continue;
-          }
-
-          const confirmedArchive = await confirm({
-            title: t("listView.forceDeleteTitle", "Force Delete Task"),
-            message:
-              t("listView.lineageArchiveMessage", "{{taskId}} has lineage children ({{children}}) that reference it as a source parent.\n\nArchive anyway by unlinking these references first?", { taskId: task.id, children: lineageConflict.lineageChildIds.join(", ") }),
-            confirmLabel: t("common.archive", "Archive"),
-            cancelLabel: t("common.skip", "Skip"),
-            danger: true,
-          });
-
-          if (!confirmedArchive) {
-            failedIds.push(task.id);
-            continue;
-          }
-
-          try {
-            await onArchiveTask(task.id, { removeLineageReferences: true });
-            archivedIds.push(task.id);
-          } catch {
-            failedIds.push(task.id);
-          }
-        }
-      }
-    } finally {
-      setIsApplying(false);
-    }
-
-    if (archivedIds.length > 0) {
-      setSelectedTaskIds((previous) => {
-        const next = new Set(previous);
-        for (const id of archivedIds) {
-          next.delete(id);
-        }
-        return next;
-      });
-    }
-
-    addToast(
-      t("listView.bulkArchiveSummary", "Archived {{archived}} · {{skipped}} skipped · {{failed}} failed", { archived: archivedIds.length, skipped: skippedCount, failed: failedIds.length }),
-      failedIds.length > 0 ? "error" : "success",
-    );
-  }, [addToast, confirm, isCompleteColumn, onArchiveTask, selectedTaskIds, tasks]);
 
   const handleApplyBulkUpdate = useCallback(async () => {
     if (selectedTaskIds.size === 0) return;
 
     const taskIds = Array.from(selectedTaskIds).filter((id) => {
       const task = tasks.find((t) => t.id === id);
-      return task && !isArchivedColumn(task.column);
+      return Boolean(task);
     });
 
     if (taskIds.length === 0) {
-      addToast(t("listView.bulkUpdateNoTasks", "No valid tasks to update (archived tasks cannot be modified)"), "error");
+      addToast(t("listView.bulkUpdateNoTasks", "No valid tasks to update"), "error");
       return;
     }
 
@@ -1419,6 +1448,8 @@ export function ListView({
       validatorModelId?: string | null;
       nodeId?: string | null;
       thinkingLevel?: ThinkingLevel | null;
+      credentialInstanceId?: string | null;
+      validatorCredentialInstanceId?: string | null;
     } = { taskIds };
 
     if (executorModel !== "__no_change__") {
@@ -1426,11 +1457,13 @@ export function ListView({
         // "Use default" - clear override
         payload.modelProvider = null;
         payload.modelId = null;
+        payload.credentialInstanceId = null;
       } else {
         const slashIdx = executorModel.indexOf("/");
         if (slashIdx !== -1) {
           payload.modelProvider = executorModel.slice(0, slashIdx);
           payload.modelId = executorModel.slice(slashIdx + 1);
+          payload.credentialInstanceId = null;
         }
       }
     }
@@ -1440,14 +1473,19 @@ export function ListView({
         // "Use default" - clear override
         payload.validatorModelProvider = null;
         payload.validatorModelId = null;
+        payload.validatorCredentialInstanceId = null;
       } else {
         const slashIdx = validatorModel.indexOf("/");
         if (slashIdx !== -1) {
           payload.validatorModelProvider = validatorModel.slice(0, slashIdx);
           payload.validatorModelId = validatorModel.slice(slashIdx + 1);
+          payload.validatorCredentialInstanceId = null;
         }
       }
     }
+
+    if (credentialInstanceId !== "__no_change__") payload.credentialInstanceId = credentialInstanceId || null;
+    if (validatorCredentialInstanceId !== "__no_change__") payload.validatorCredentialInstanceId = validatorCredentialInstanceId || null;
 
     if (nodeOverride !== "__no_change__") {
       if (nodeOverride === "") {
@@ -1480,6 +1518,8 @@ export function ListView({
         payload.nodeId,
         payload.thinkingLevel,
         projectId,
+        payload.credentialInstanceId,
+        payload.validatorCredentialInstanceId,
       );
 
       if (onTasksUpdated) {
@@ -1491,7 +1531,9 @@ export function ListView({
       // Reset state
       clearSelection();
       setExecutorModel("__no_change__");
+      setCredentialInstanceId("__no_change__");
       setValidatorModel("__no_change__");
+      setValidatorCredentialInstanceId("__no_change__");
       setBulkThinkingLevel("__no_change__");
       setNodeOverride("__no_change__");
     } catch (err) {
@@ -1499,7 +1541,7 @@ export function ListView({
     } finally {
       setIsApplying(false);
     }
-  }, [selectedTaskIds, tasks, executorModel, validatorModel, bulkThinkingLevel, nodeOverride, projectId, addToast, clearSelection, isArchivedColumn, onTasksUpdated]);
+  }, [addToast, bulkThinkingLevel, clearSelection, credentialInstanceId, executorModel, nodeOverride, onTasksUpdated, projectId, selectedTaskIds, tasks, validatorCredentialInstanceId, validatorModel]);
 
   const closeContextMenu = useCallback(() => {
     setContextMenuState(null);
@@ -1549,33 +1591,6 @@ export function ListView({
     }
   }, [addToast, confirm, onDeleteTask, t]);
 
-  const handleListTaskArchive = useCallback(async (task: Task) => {
-    if (!onArchiveTask) return;
-    try {
-      await onArchiveTask(task.id);
-      addToast(t("tasks.archived", "Archived {{taskId}}", { taskId: task.id }), "success");
-    } catch (err) {
-      const lineageConflict = extractLineageDeleteConflict(err);
-      if (!lineageConflict?.lineageChildIds.length) {
-        addToast(t("tasks.archiveFailed", "Failed to archive {{taskId}}: {{error}}", { taskId: task.id, error: getErrorMessage(err) }), "error");
-        return;
-      }
-      const confirmed = await confirm({
-        title: t("tasks.forceDeleteTitle", "Force Delete Task"),
-        message: t("tasks.lineageArchiveMessage", "{{taskId}} has lineage children ({{children}}) that reference it as a source parent.\n\nArchive anyway by unlinking these references first?", { taskId: task.id, children: lineageConflict.lineageChildIds.join(", ") }),
-        confirmLabel: t("common.archive", "Archive"),
-        cancelLabel: t("common.skip", "Skip"),
-        danger: true,
-      });
-      if (!confirmed) return;
-      try {
-        await onArchiveTask(task.id, { removeLineageReferences: true });
-        addToast(t("tasks.archivedUnlinked", "Archived {{taskId}} after unlinking lineage references", { taskId: task.id }), "success");
-      } catch (retryErr) {
-        addToast(t("tasks.archiveFailed", "Failed to archive {{taskId}}: {{error}}", { taskId: task.id, error: getErrorMessage(retryErr) }), "error");
-      }
-    }
-  }, [addToast, confirm, onArchiveTask, t]);
 
   /*
   FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
@@ -1635,44 +1650,6 @@ export function ListView({
     }
   }, [addToast, confirm, onRevertTask, t]);
 
-  const handleListContextMove = useCallback(async (task: Task, column: ColumnId) => {
-    try {
-      const hasStepProgress = task.steps.some((step) => step.status !== "pending");
-      const targetFlags = columnFlagsById.get(column);
-      const shouldPrompt = hasStepProgress && (
-        column === "todo" || column === "triage" || Boolean(targetFlags?.intake || targetFlags?.hold)
-      );
-      let moveOptions: { preserveProgress?: boolean } | undefined;
-
-      if (shouldPrompt) {
-        const keepProgress = await confirm({
-          title: t("taskDetail.move.preserveProgressTitle", "Preserve Progress?"),
-          message: t("taskDetail.move.preserveProgressMessage", "This task has completed steps. Keep progress before moving?"),
-          confirmLabel: t("taskDetail.move.keepProgress", "Keep Progress"),
-          cancelLabel: t("taskDetail.move.resetProgress", "Reset Progress"),
-        });
-
-        if (keepProgress) {
-          moveOptions = { preserveProgress: true };
-        } else {
-          const resetProgress = await confirm({
-            title: t("taskDetail.move.resetProgressTitle", "Reset Progress?"),
-            message: t("taskDetail.move.resetProgressMessage", "Reset all step progress before moving this task?"),
-            confirmLabel: t("taskDetail.move.resetProgress", "Reset Progress"),
-            cancelLabel: t("taskDetail.move.cancelMove", "Cancel Move"),
-            danger: true,
-          });
-          if (!resetProgress) return;
-        }
-      }
-
-      await onMoveTask(task.id, column, moveOptions);
-      addToast(t("taskDetail.move.movedTo", "Moved to {{column}}", { column: getListColumnLabel(column) }), "success");
-    } catch (err) {
-      addToast(getErrorMessage(err), "error");
-    }
-  }, [addToast, columnFlagsById, getListColumnLabel, confirm, onMoveTask, t]);
-
   const handleListContextCheckPrStatus = useCallback(async (task: Task) => {
     try {
       await refreshPrStatus(task.id, projectId);
@@ -1690,7 +1667,6 @@ export function ListView({
     try {
       const updatedTask = await updateTask(task.id, { githubTracking: { enabled: true } }, projectId);
       onTasksUpdated?.([updatedTask]);
-      setSelectedTaskSnapshot((previous) => previous?.id === updatedTask.id ? ({ ...previous, ...updatedTask, githubTracking: updatedTask.githubTracking } as Task | TaskDetail) : previous);
       addToast(t("taskDetail.githubTracking.issueCreationRequested", "Requested GitHub tracking issue creation"), "info");
     } catch (err) {
       addToast(t("taskDetail.updateFailed", "Failed to update {{id}}: {{error}}", { id: task.id, error: getErrorMessage(err) }), "error");
@@ -1704,17 +1680,13 @@ export function ListView({
     addToast(t("tasks.createdPr", "Created PR #{{number}}", { number: prInfo.number }), "success");
   }, [addToast, onTasksUpdated, t]);
 
-  const buildListContextMenuActions = useCallback((task: Task): TaskMenuActionDescriptor[] => {
-    const canRetryTask = isTaskManuallyRetryable(task, lastFetchTimeMs);
+  const buildListContextMenuActions = useCallback((task: Task): TaskMenuItemDescriptor[] => {
     const isTaskPaused = Boolean(task.paused || task.userPaused);
     const effectiveAutoMerge = resolveEffectiveAutoMerge({ autoMerge: task.autoMerge }, { autoMerge: autoMerge ?? false });
     const model = buildTaskActionMenuModel({
       task,
       t,
-      columnLabel: getListColumnLabel,
-      currentColumnFlags: columnFlagsById.get(task.column),
-      workflowMoveColumns: listContextMenuColumns,
-      canRetryTask,
+      currentColumnFlags: getTaskColumnFlags(task),
       hasDuplicateHandler: Boolean(onDuplicateTask),
       hasRetryHandler: Boolean(onRetryTask),
       hasResetHandler: Boolean(onResetTask),
@@ -1728,55 +1700,35 @@ export function ListView({
         onPlanningMode(seed, getTaskPlanningWorkflowId(task));
       } : undefined,
       onDuplicate: onDuplicateTask ? async () => {
-        const shouldDuplicate = await confirm({
-          title: t("taskDetail.duplicate.title", "Duplicate Task"),
-          message: t("taskDetail.duplicate.message", "Duplicate {{id}}? This will create a new task in Triage with the same description and prompt.", { id: task.id }),
+        await runDuplicateTaskAction({
+          taskId: task.id,
+          t,
+          addToast,
+          confirmWithSelect,
+          confirm,
+          duplicateTask: onDuplicateTask,
+          loadBoardWorkflows: () => boardWorkflows,
         });
-        if (!shouldDuplicate) return;
-        try {
-          const newTask = await onDuplicateTask(task.id);
-          addToast(t("taskDetail.duplicate.success", "Duplicated {{id}} → {{newId}}", { id: task.id, newId: newTask.id }), "success");
-        } catch (err) {
-          addToast(getErrorMessage(err), "error");
-        }
       } : undefined,
       onOpenRefine: () => onOpenDetail(task, { origin: useSinglePaneList ? "list-mobile" : undefined, initialAction: "refine" }),
-      onRespecify: async () => {
-        const shouldRebuild = await confirm({
-          title: t("taskDetail.plan.rebuildTitle", "Rebuild Plan"),
-          message: t("taskDetail.plan.rebuildMessage", "Rebuild the plan for this task? The task will move to planning for replanning."),
-        });
-        if (!shouldRebuild) return;
-        try {
-          await rebuildTaskSpec(task.id, projectId);
-          addToast(t("taskDetail.plan.replanning", "Replanning {{id}}…", { id: task.id }), "info");
-        } catch (err) {
-          addToast(getErrorMessage(err), "error");
-        }
-      },
       onRetry: onRetryTask ? async () => {
+        const copy = resolveRetryStageCopy(t, getTaskColumnFlags(task), task.column);
+        const confirmed = await confirm({
+          title: copy.confirmTitle,
+          message: copy.confirmMessage,
+          confirmLabel: copy.confirmLabel,
+          cancelLabel: t("common.cancel", "Cancel"),
+          danger: true,
+        });
+        if (!confirmed) return;
         try {
           await onRetryTask(task.id);
+          addToast(copy.successMessage, "success");
         } catch (err) {
           addToast(t("tasks.retryFailed", "Failed to retry {{taskId}}: {{error}}", { taskId: task.id, error: getErrorMessage(err) }), "error");
         }
       } : undefined,
-      onReset: onResetTask ? async () => {
-        const shouldReset = await confirm({
-          title: t("taskDetail.reset.btn", "Reset"),
-          message: t("taskDetail.reset.confirmMessage", "This will erase all progress for {{id}} and start the task from scratch. Continue?", { id: task.id }),
-          confirmLabel: t("taskDetail.reset.btn", "Reset"),
-          cancelLabel: t("common.cancel", "Cancel"),
-          danger: true,
-        });
-        if (!shouldReset) return;
-        try {
-          await onResetTask(task.id);
-          addToast(t("taskDetail.reset.resetSuccess", "Reset {{id}} — fresh run will be allocated", { id: task.id }), "success");
-        } catch (err) {
-          addToast(getErrorMessage(err), "error");
-        }
-      } : undefined,
+      onReset: onResetTask ? () => setResetDialogTask(task) : undefined,
       onTogglePause: (isTaskPaused ? onUnpauseTask : onPauseTask) ? async () => {
         try {
           if (isTaskPaused) {
@@ -1810,17 +1762,14 @@ export function ListView({
       onEnableGithubTracking: onTasksUpdated ? () => void handleListContextEnableGithubTracking(task) : undefined,
     });
 
-    const actions = [...model.actions];
-    if (task.column === "done" && onArchiveTask) {
-      actions.push({ id: "archive", label: t("tasks.archive", "Archive"), onSelect: () => void handleListTaskArchive(task) });
-    }
+    const actions: TaskMenuItemDescriptor[] = [...model.actions];
+    const taskColumnFlags = getTaskColumnFlags(task);
     /*
     FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
-    List-view Revert menu entry for done/archived rows, mirroring the `archive`
-    entry above. Disabled (rather than omitted) when the task lacks a landed
+    List-view Revert menu entry for completed rows. Disabled (rather than omitted) when the task lacks a landed
     commit to revert.
     */
-    if ((task.column === "done" || task.column === "archived") && onRevertTask) {
+    if (isCompleteColumnRole(taskColumnFlags, task.column) && onRevertTask) {
       const isRevertable = Boolean(task.mergeDetails?.commitSha);
       actions.push({
         id: "revert",
@@ -1829,18 +1778,19 @@ export function ListView({
         onSelect: isRevertable ? () => void handleListTaskRevert(task) : undefined,
       });
     }
-    for (const transition of model.moveTransitions) {
-      actions.push({
-        id: `move-${transition.column}`,
-        label: transition.label,
-        onSelect: () => void handleListContextMove(task, transition.column),
-      });
+    /*
+    FNXC:TaskRevert 2026-08-27-02:18:
+    The removed list reverted section exposed Delete and Revise actions. Delete remains in the
+    shared menu model; Revise belongs here so desktop right-click and mobile long-press retain it.
+    */
+    if (onReviseTask && isTaskReverted(task.sourceMetadata) && isCompleteColumnRole(taskColumnFlags, task.column)) {
+      actions.push({ id: "revise", label: t("tasks.revise", "Revise"), onSelect: () => onReviseTask(task) });
     }
     if (model.reviewAction) {
       actions.push({ id: model.reviewAction.id, label: model.reviewAction.label, disabled: model.reviewAction.disabled, onSelect: model.reviewAction.onSelect });
     }
-    return actions.filter((action) => action.tone === "note" || action.disabled === true || Boolean(action.onSelect));
-  }, [addToast, autoMerge, columnFlagsById, confirm, getListColumnLabel, getTaskPlanningWorkflowId, handleListContextCheckPrStatus, handleListContextEnableGithubTracking, handleListContextMove, handleListTaskArchive, handleListTaskDelete, handleListTaskRevert, isMobile, lastFetchTimeMs, listContextMenuColumns, mergeStrategy, onDuplicateTask, onMergeTask, onOpenDetail, onPlanningMode, onPauseTask, onResetTask, onRetryTask, onUnpauseTask, onArchiveTask, onRevertTask, onTasksUpdated, projectId, t, useSinglePaneList]);
+    return actions.filter((action) => "items" in action || action.tone === "note" || action.disabled === true || Boolean(action.onSelect));
+  }, [addToast, autoMerge, boardWorkflows, getTaskColumnFlags, confirm, confirmWithSelect, getTaskPlanningWorkflowId, handleListContextCheckPrStatus, handleListContextEnableGithubTracking, handleListTaskDelete, handleListTaskRevert, isMobile, lastFetchTimeMs, mergeStrategy, onDuplicateTask, onMergeTask, onOpenDetail, onPlanningMode, onPauseTask, onResetTask, onRetryTask, onUnpauseTask, onRevertTask, onReviseTask, onTasksUpdated, projectId, t, useSinglePaneList]);
 
   const contextMenuActions = useMemo(
     () => (contextMenuState ? buildListContextMenuActions(contextMenuState.task) : []),
@@ -1956,13 +1906,13 @@ export function ListView({
         onPopOut(task);
         return;
       }
-      if (useSinglePaneList) {
-        onOpenDetail(task, { origin: "list-mobile" });
-        return;
-      }
-
+      /*
+      FNXC:ListNoSidePanel 2026-09-14-07:20:
+      No embedded pane to select into: a row always hands the task to the host's detail owner and keeps the row
+      highlighted through selectedTaskId.
+      */
       setSelectedTaskId(task.id);
-      setSelectedTaskSnapshot(task);
+      onOpenDetail(task, useSinglePaneList ? { origin: "list-mobile" } : undefined);
     },
     [closeContextMenu, onOpenDetail, onPopOut, openMobileTasksInPopup, useSinglePaneList]
   );
@@ -1988,241 +1938,7 @@ export function ListView({
     );
   }, [handleRowClick, openContextMenuAt]);
 
-  // Debounce detail fetches so rapid keyboard/mouse navigation through a
-  // long task list doesn't issue a heavy /tasks/:id request (with log +
-  // comments) per row. Only the task the user lands on triggers a fetch.
-  const detailFetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const detailFetchTargetRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    return () => {
-      if (detailFetchTimerRef.current) {
-        clearTimeout(detailFetchTimerRef.current);
-      }
-    };
-  }, []);
-
-  const closeEmbeddedTaskDetail = useCallback(() => {
-    /*
-    FNXC:TaskDetailDelete 2026-07-01-09:46:
-    List split-detail is an embedded TaskDetailContent host, so optimistic delete close must clear the selected task synchronously and remove the persisted selection before the delete request settles. Clear any pending detail fetch so a delayed response cannot resurrect the closed split panel.
-    */
-    detailFetchTargetRef.current = null;
-    if (detailFetchTimerRef.current) {
-      clearTimeout(detailFetchTimerRef.current);
-      detailFetchTimerRef.current = null;
-    }
-    setSelectedTaskId(null);
-    setSelectedTaskSnapshot(null);
-  }, []);
-
-  const handleEmbeddedOpenDetail = useCallback((nextTask: Task | TaskDetail) => {
-    setSelectedTaskId(nextTask.id);
-    setSelectedTaskSnapshot(nextTask);
-
-    if ("prompt" in nextTask) {
-      detailFetchTargetRef.current = null;
-      if (detailFetchTimerRef.current) {
-        clearTimeout(detailFetchTimerRef.current);
-        detailFetchTimerRef.current = null;
-      }
-      return;
-    }
-
-    detailFetchTargetRef.current = nextTask.id;
-    if (detailFetchTimerRef.current) {
-      clearTimeout(detailFetchTimerRef.current);
-    }
-    detailFetchTimerRef.current = setTimeout(() => {
-      detailFetchTimerRef.current = null;
-      const targetId = detailFetchTargetRef.current;
-      if (targetId !== nextTask.id) {
-        return;
-      }
-      fetchTaskDetail(nextTask.id, projectId)
-        .then((detail) => {
-          if (detailFetchTargetRef.current !== detail.id) {
-            return;
-          }
-          setSelectedTaskSnapshot((previous) => {
-            if (!previous || previous.id !== detail.id) {
-              return previous;
-            }
-            return { ...previous, ...detail };
-          });
-        })
-        .catch(() => {
-          // Keep optimistic inline selection when detail fetch fails.
-        });
-    }, 200);
-  }, [projectId]);
-
-  const handleDragStart = useCallback(
-    (e: React.DragEvent, task: Task) => {
-      if (task.paused) {
-        e.preventDefault();
-        return;
-      }
-      e.dataTransfer.setData("text/plain", task.id);
-      e.dataTransfer.effectAllowed = "move";
-      setDraggingTaskId(task.id);
-    },
-    []
-  );
-
-  const handleDragEnd = useCallback(() => {
-    setDraggingTaskId(null);
-    setDragOverColumn(null);
-  }, []);
-
-  /*
-  FNXC:ListView 2026-06-22-18:00:
-  Pointer-based split resize. setPointerCapture keeps move/up events flowing to the handle even when
-  the cursor leaves it, and a single teardown ref (cleared on pointerup/pointercancel/unmount) detaches
-  every listener exactly once. Width is measured from a live rect per move (re-reading rect.left/width
-  each frame) and clamped between LIST_SIDEBAR_MIN_WIDTH (64) and 65% of the container so the inline
-  style={{ width }} — which wins over the grid `auto` track — updates live and persists.
-  */
-  const handleSplitResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    if (useSinglePaneList) return;
-    const container = splitLayoutRef.current;
-    if (!container) return;
-    event.preventDefault();
-
-    // Detach any prior drag (defensive against a missed pointerup).
-    splitResizeTeardownRef.current?.();
-
-    const handle = event.currentTarget;
-    const pointerId = event.pointerId;
-    try {
-      handle.setPointerCapture(pointerId);
-    } catch {
-      // setPointerCapture is best-effort (e.g. synthetic events in tests).
-    }
-
-    const onPointerMove = (moveEvent: PointerEvent) => {
-      const rect = container.getBoundingClientRect();
-      // Guard against an unmeasurable container so a drag never collapses the pane to the min.
-      const containerWidth = rect.width > 0 ? rect.width : container.clientWidth;
-      if (containerWidth <= 0) return;
-      const proposedWidth = moveEvent.clientX - rect.left;
-      setSidebarWidth(clampSidebarWidth(proposedWidth, containerWidth));
-    };
-
-    const teardown = () => {
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", teardown);
-      window.removeEventListener("pointercancel", teardown);
-      try {
-        handle.releasePointerCapture(pointerId);
-      } catch {
-        // Capture may already be released.
-      }
-      splitResizeTeardownRef.current = null;
-    };
-
-    splitResizeTeardownRef.current = teardown;
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", teardown);
-    window.addEventListener("pointercancel", teardown);
-  }, [useSinglePaneList]);
-
-  // FNXC:ListView 2026-06-22-18:00: Tear down any in-flight resize drag on unmount so window pointer listeners never leak.
-  useEffect(() => () => splitResizeTeardownRef.current?.(), []);
-
-  const handleSplitResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (useSinglePaneList) return;
-    const measuredWidth = splitLayoutRef.current?.clientWidth ?? 0;
-    const fallbackWidth = sidebarWidth / LIST_SIDEBAR_MAX_RATIO + LIST_SIDEBAR_KEYBOARD_STEP;
-    const containerWidth = Math.max(measuredWidth, fallbackWidth);
-
-    const maxWidth = getSidebarMaxWidth(containerWidth);
-
-    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-      event.preventDefault();
-      const delta = event.key === "ArrowLeft" ? -LIST_SIDEBAR_KEYBOARD_STEP : LIST_SIDEBAR_KEYBOARD_STEP;
-      setSidebarWidth((current) => clampSidebarWidth(current + delta, containerWidth));
-      return;
-    }
-
-    if (event.key === "Home") {
-      event.preventDefault();
-      setSidebarWidth(LIST_SIDEBAR_MIN_WIDTH);
-      return;
-    }
-
-    if (event.key === "End") {
-      event.preventDefault();
-      setSidebarWidth(maxWidth);
-    }
-  }, [sidebarWidth, useSinglePaneList]);
-
-  const handleColumnDragOver = useCallback(
-    (e: React.DragEvent, column: ColumnId) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      setDragOverColumn(column);
-    },
-    []
-  );
-
-  const handleColumnDragLeave = useCallback(() => {
-    setDragOverColumn(null);
-  }, []);
-
-  const handleColumnDrop = useCallback(
-    async (e: React.DragEvent, column: ColumnId) => {
-      e.preventDefault();
-      setDragOverColumn(null);
-      const taskId = e.dataTransfer.getData("text/plain");
-      if (!taskId) return;
-
-      // Prevent dropping into archived column
-      if (isArchivedColumn(column)) {
-        addToast(t("listView.archiveViaButton", "Tasks can only be archived via the archive button"), "error");
-        return;
-      }
-
-      try {
-        const task = tasks.find((candidate) => candidate.id === taskId);
-        const hasStepProgress = task?.steps.some((step) => step.status !== "pending") ?? false;
-        const targetFlags = columnFlagsById.get(column);
-        const shouldPrompt = hasStepProgress && (
-          column === "todo" || column === "triage" || Boolean(targetFlags?.intake || targetFlags?.hold)
-        );
-
-        let moveOptions: { preserveProgress?: boolean } | undefined;
-        if (shouldPrompt) {
-          const keepProgress = await confirm({
-            title: t("listView.preserveProgressTitle", "Preserve Progress?"),
-            message: t("listView.preserveProgressMessage", "This task has completed steps. Keep progress before moving?"),
-            confirmLabel: t("listView.keepProgress", "Keep Progress"),
-            cancelLabel: t("listView.resetProgress", "Reset Progress"),
-          });
-
-          if (keepProgress) {
-            moveOptions = { preserveProgress: true };
-          } else {
-            const resetProgress = await confirm({
-              title: t("listView.resetProgressTitle", "Reset Progress?"),
-              message: t("listView.resetProgressMessage", "Reset all step progress before moving this task?"),
-              confirmLabel: t("listView.resetProgress", "Reset Progress"),
-              cancelLabel: t("listView.cancelMove", "Cancel Move"),
-              danger: true,
-            });
-            if (!resetProgress) {
-              return;
-            }
-          }
-        }
-
-        await onMoveTask(taskId, column, moveOptions);
-      } catch (err) {
-        addToast(getErrorMessage(err), "error");
-      }
-    },
-    [addToast, columnFlagsById, confirm, isArchivedColumn, onMoveTask, tasks, t]
-  );
 
   const getSortIcon = (field: SortField) => {
     if (!sortField || sortField !== field) return <ArrowUpDown size={14} className="sort-icon" />;
@@ -2234,6 +1950,7 @@ export function ListView({
   };
 
   const renderWorkflowSelector = () => {
+    if (compact) return null;
     if (!workflowMode || !selectedWorkflow) return null;
     const shouldRenderWorkflowControls = workflowOptions.length > 1 || Boolean(onCreateWorkflow || onOpenWorkflowEditor);
     if (!shouldRenderWorkflowControls || workflowOptions.length === 0) return null;
@@ -2248,6 +1965,7 @@ export function ListView({
           onOpen={refreshBoardWorkflows}
           label={t("listView.workflowLabel", "Workflow")}
           onEditWorkflow={onOpenWorkflowEditor}
+          /* FNXC:ListNoWorkflowCreate 2026-09-14-05:42: creation stays inside the selector popover, like every other switcher host. */
           onCreateWorkflow={onCreateWorkflow}
         />
       </div>
@@ -2258,8 +1976,13 @@ export function ListView({
 
     FNXC:WorkflowControls 2026-06-20-15:43:
     ListView now has edit parity through WorkflowSwitcher row actions and no longer renders a standalone create icon, preventing empty button shells across desktop and mobile header placements.
+
+    FNXC:MainViewKeepAlive 2026-08-31-14:54:
+    A cached header slot survives the render where a retained List becomes inactive, before its
+    active-gate effect clears state. Restrict the portal at render time so that commit leaves the
+    shared slot empty and keeps the hidden toolbar inline.
     */
-    return workflowControlsInHeader && headerWorkflowSlot
+    return active && workflowControlsInHeader && headerWorkflowSlot
       ? createPortal(workflowControl, headerWorkflowSlot)
       : workflowControl;
   };
@@ -2318,18 +2041,15 @@ export function ListView({
           const totalCount = selectedWorkflowTaskIds
             ? tasks.filter((task) => task.column === column && selectedWorkflowTaskIds.has(task.id)).length
             : tasks.filter((task) => task.column === column).length;
-          const isCompletedColumn = Boolean(columnDef.flags.complete || columnDef.flags.archived);
+          const isCompletedColumn = Boolean(columnDef.flags.complete);
           const visibleCount = hideDoneTasks && isCompletedColumn ? 0 : totalCount;
           const showPartial = hideDoneTasks && isCompletedColumn && totalCount > 0;
 
           return (
             <div
               key={column}
-              className={`list-drop-zone${dragOverColumn === column ? " drag-over" : ""}${selectedColumn === column ? " active" : ""}`}
+              className={`list-drop-zone${selectedColumn === column ? " active" : ""}`}
               onClick={() => handleColumnFilter(column)}
-              onDragOver={(e) => handleColumnDragOver(e, column)}
-              onDragLeave={handleColumnDragLeave}
-              onDrop={(e) => handleColumnDrop(e, column)}
               data-column={column}
             >
               <span className={`list-section-dot dot-${column}`} style={{ backgroundColor: columnColor(column) }} />
@@ -2346,12 +2066,8 @@ export function ListView({
 
   const renderListWorkflowSkeleton = (empty = false) => (
     <div className="list-view list-view--workflow-skeleton" aria-busy={!empty} aria-label={empty ? t("listView.noWorkflowLanes", "No workflow lanes available") : t("listView.loadingWorkflowLanes", "Loading workflow lanes")} data-testid={empty ? "list-workflows-empty" : "list-workflows-skeleton"}>
-      <div className="list-view-header">
-        <div>
-          <h2>{t("listView.title", "List View")}</h2>
-          <p className="list-subtitle">{empty ? t("listView.noWorkflowLanes", "No workflow lanes available") : t("listView.loadingWorkflowLanes", "Loading workflow lanes")}</p>
-        </div>
-      </div>
+      <ViewHeader icon={ListChecks} title={t("listView.title", "List View")} />
+      <p className="list-subtitle">{empty ? t("listView.noWorkflowLanes", "No workflow lanes available") : t("listView.loadingWorkflowLanes", "Loading workflow lanes")}</p>
       <div className="list-workflow-skeleton card" aria-hidden="true">
         <div className="list-workflow-skeleton__row list-workflow-skeleton__row--header" />
         <div className="list-workflow-skeleton__row" />
@@ -2362,23 +2078,34 @@ export function ListView({
 
   const renderPrimaryActionCluster = () => (
     <div className="list-action-cluster" data-testid="list-primary-action-cluster">
-      <button className="btn btn-sm" onClick={toggleBulkEdit} aria-pressed={bulkEditEnabled}>
-        {bulkEditEnabled ? t("listView.doneEditing", "Done Editing") : t("listView.bulkEdit", "Bulk Edit")}
-      </button>
-      <button
-        className="btn btn-sm list-view-options-toggle"
+      <ViewActionButton
+        icon={Pencil}
+        label={bulkEditEnabled ? t("listView.doneEditing", "Done Editing") : t("listView.bulkEdit", "Bulk Edit")}
+        onClick={toggleBulkEdit}
+        aria-pressed={bulkEditEnabled}
+      />
+      <ViewActionButton
+        icon={Columns3}
+        className="list-view-options-toggle"
+        label={t("listView.viewOptions", "View")}
         onClick={() => setViewOptionsOpen((prev) => !prev)}
         aria-expanded={viewOptionsOpen}
         aria-controls={useSinglePaneList ? "list-view-options-panel-mobile" : "list-view-options-panel"}
-      >
-        <Columns3 size={14} />
-        {t("listView.viewOptions", "View")}
-      </button>
+      />
       {onNewTask ? (
-        <button className="btn btn-task-create btn-sm list-new-task-action" onClick={onNewTask}>
-          {t("listView.newTask", "+ New Task")}
-        </button>
+        <ViewActionButton
+          className="btn-task-create list-new-task-action"
+          kind="create"
+          label={t("listView.newTask", "New Task")}
+          onClick={() => onNewTask(isAllWorkflowsSelected ? undefined : selectedWorkflow?.id)}
+        />
       ) : null}
+      {/*
+      FNXC:ListNoWorkflowCreate 2026-09-14-05:42:
+      Workflow creation belongs to the workflow selector that owns workflow lifecycle, not to the task list's action
+      row. A second entry point here duplicated the affordance on phones, where it sat beside New Task and read as a
+      second way to create a task.
+      */}
     </div>
   );
 
@@ -2393,10 +2120,6 @@ export function ListView({
           <Play size={14} />
           {t("listView.unpauseSelected", "Unpause selected")}
         </button>
-        <button className="btn btn-sm" onClick={handleBulkArchive} disabled={isApplying} title={t("listView.archiveSelectedTitle", "Archive selected tasks that are in Done")}>
-          <Archive size={14} />
-          {t("listView.archiveSelected", "Archive selected")}
-        </button>
         <button className="btn btn-danger btn-sm" onClick={handleBulkDelete} disabled={isApplying} title={t("listView.deleteSelectedTitle", "Delete selected tasks")}>
           <Trash2 size={14} />
           {t("listView.deleteSelected", "Delete selected")}
@@ -2409,7 +2132,9 @@ export function ListView({
             <CustomModelDropdown
               models={availableModels}
               value={executorModel}
-              onChange={setExecutorModel}
+              onChange={(value) => { setCredentialInstanceId("__no_change__"); setExecutorModel(value); }}
+              credentialInstanceId={credentialInstanceId === "__no_change__" ? undefined : credentialInstanceId}
+              onCredentialInstanceChange={setCredentialInstanceId}
               label={t("listView.executorModel", "Executor Model")}
               noChangeValue="__no_change__"
               noChangeLabel={t("listView.noChange", "No change")}
@@ -2423,7 +2148,9 @@ export function ListView({
             <CustomModelDropdown
               models={availableModels}
               value={validatorModel}
-              onChange={setValidatorModel}
+              onChange={(value) => { setValidatorCredentialInstanceId("__no_change__"); setValidatorModel(value); }}
+              credentialInstanceId={validatorCredentialInstanceId === "__no_change__" ? undefined : validatorCredentialInstanceId}
+              onCredentialInstanceChange={setValidatorCredentialInstanceId}
               label={t("listView.reviewerModel", "Reviewer Model")}
               noChangeValue="__no_change__"
               noChangeLabel={t("listView.noChange", "No change")}
@@ -2483,16 +2210,29 @@ export function ListView({
     </>
   );
 
-  const shouldGateLegacyList = boardWorkflows === null
-    ? (workflowColumnsEnabled === true || settingsLoaded === false)
-    : boardWorkflows.flagEnabled === true && boardWorkflows.workflows.length === 0;
-
-  if (shouldGateLegacyList) {
-    return renderListWorkflowSkeleton(boardWorkflows?.flagEnabled === true);
+  /*
+  FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R9):
+  Behaviour-identical to the former `shouldGateLegacyList`, with the two retired
+  flag reads spelled out of it: the null arm was always true (literal prop), and
+  the loaded arm's `flagEnabled === true` conjunct is a server constant. The
+  argument distinguishes "loaded but no lane" from "still loading".
+  */
+  if (boardWorkflows === null || boardWorkflows.workflows.length === 0) {
+    return renderListWorkflowSkeleton(boardWorkflows !== null);
   }
 
   return (
-    <div className={`list-view${useSinglePaneList ? " list-view--single-pane" : ""}`}>
+    /*
+    FNXC:ListView 2026-07-30-07:00:
+    `list-view-body` marks the REAL list, distinct from the workflow skeleton above which carries the
+    same `list-view` class for styling. Tests waited on `.list-view` to mean "the list rendered"; the
+    skeleton satisfied that, so the wait passed and the assertion inside failed against a DOM that
+    looked healthy. That cost five days of App.test.tsx being red and two wrong root causes. Wait on
+    this marker instead — it exists only when the list actually has lanes to draw.
+    */
+    <div className={`list-view${useSinglePaneList ? " list-view--single-pane list-view--cards" : ""}`} data-testid="list-view-body">
+      {/* FNXC:StandardizedViewActions 2026-09-13-21:43: List keeps workflow-aware task creation, bulk mode, and view options in one canonical header; mobile hides action labels visually while preserving the same callbacks and accessible names. */}
+      <ViewHeader icon={ListChecks} title={t("listView.title", "List View")} actions={renderPrimaryActionCluster()} />
       {contextMenuState && hasContextMenuActions && createPortal(
         <div
           ref={contextMenuRef}
@@ -2509,6 +2249,15 @@ export function ListView({
         </div>,
         document.body,
       )}
+      {resetDialogTask && onResetTask && (
+        <TaskResetDialog
+          taskId={resetDialogTask.id}
+          initialDescription={resetDialogTask.description}
+          onReset={onResetTask}
+          addToast={addToast}
+          onClose={() => setResetDialogTask(null)}
+        />
+      )}
       {prCreateState && (
         <PrCreateModal
           open={true}
@@ -2519,11 +2268,32 @@ export function ListView({
           addToast={addToast}
         />
       )}
-      {useSinglePaneList && (
+      {/*
+      FNXC:ListNoSidePanel 2026-09-14-07:20:
+      One toolbar for every host. The selector and the state chips used to live in a desktop-only rail beside the
+      table; with the rail gone this row is the single place that carries them, so a wide host cannot end up with no
+      selector at all.
+      */}
+      {(
         <>
           <div className="list-toolbar">
             {renderWorkflowSelector()}
-            {renderPrimaryActionCluster()}
+            <div className="list-toolbar-chips">
+              {selectedColumn ? (
+                <button className="btn btn-sm" onClick={() => setSelectedColumn(null)} aria-label={t("listView.clearColumnFilter", "Clear column filter")}>
+                  {t("listView.filterChip", "Filter: {{column}}", { column: getListColumnLabel(selectedColumn) })}
+                </button>
+              ) : null}
+              {hideDoneTasks ? <span className="list-sidebar-chip">{t("listView.doneHiddenChip", "Done hidden")}</span> : null}
+              {staleOnlyFilter ? <span className="list-sidebar-chip">{t("listView.staleOnly", "Stale only")}</span> : null}
+              {stalePausedReviewOnlyFilter ? <span className="list-sidebar-chip">{t("listView.stalePausedReview", "Stale paused review")}</span> : null}
+              {bulkEditEnabled ? <span className="list-sidebar-chip">{t("listView.bulkEdit", "Bulk edit")}</span> : null}
+              {bulkEditEnabled && selectedTaskIds.size > 0 ? (
+                <button className="btn btn-sm" onClick={clearSelection}>
+                  {t("listView.selectedCount", "{{count}} selected", { count: selectedTaskIds.size })}
+                </button>
+              ) : null}
+            </div>
           </div>
           {viewOptionsOpen ? (
             <div className="list-toolbar-mobile-options">{renderViewOptionsPanel("list-view-options-panel-mobile")}</div>
@@ -2543,93 +2313,38 @@ export function ListView({
         </>
       )}
 
-      <div className="list-table-container">
-        <div className={useSinglePaneList ? "" : "list-split-layout"} data-testid={useSinglePaneList ? undefined : "list-split-layout"} ref={splitLayoutRef}>
-          <div
-            className={useSinglePaneList ? "" : "list-split-sidebar"}
-            data-testid={useSinglePaneList ? undefined : "list-split-sidebar"}
-            ref={splitSidebarRef}
-            style={useSinglePaneList ? undefined : { width: `${sidebarWidth}px` }}
-          >
-            {!useSinglePaneList && (
-              <aside className="list-sidebar-controls" aria-label={t("listView.listControlsLabel", "List controls")}>
-                {/*
-                FNXC:ListView 2026-06-23-23:42:
-                The List view top controls should not show the aggregate task count. Keep only action groups and state chips near quick-add; section/drop-zone counts remain lower in the list where they are contextual.
-                */}
-                <div className="list-sidebar-controls__header">
-                  {renderWorkflowSelector()}
-                  <div className="list-sidebar-controls__toolbar">
-                    {renderPrimaryActionCluster()}
-                  </div>
-                  <div className="list-sidebar-summary-chips">
-                    {selectedColumn ? (
-                      <button className="btn btn-sm" onClick={clearColumnFilter} aria-label={t("listView.clearColumnFilter", "Clear column filter")}>
-                        {t("listView.filterChip", "Filter: {{column}}", { column: getListColumnLabel(selectedColumn) })}
-                      </button>
-                    ) : null}
-                    {hideDoneTasks ? <span className="list-sidebar-chip">{t("listView.doneHiddenChip", "Done hidden")}</span> : null}
-                    {staleOnlyFilter ? <span className="list-sidebar-chip">{t("listView.staleOnly", "Stale only")}</span> : null}
-                    {stalePausedReviewOnlyFilter ? <span className="list-sidebar-chip">{t("listView.stalePausedReview", "Stale paused review")}</span> : null}
-                    {bulkEditEnabled ? (
-                      <span className="list-sidebar-chip">{t("listView.bulkEdit", "Bulk edit")}</span>
-                    ) : null}
-                    {bulkEditEnabled && selectedTaskIds.size > 0 ? (
-                      <button className="btn btn-sm" onClick={clearSelection}>
-                        {t("listView.selectedCount", "{{count}} selected", { count: selectedTaskIds.size })}
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
-                {viewOptionsOpen && renderViewOptionsPanel("list-view-options-panel")}
-                {bulkEditEnabled && selectedTaskIds.size > 0 ? renderBulkEditToolbars() : null}
-              </aside>
-            )}
-            <div className="list-quick-entry-above-table">
-              <QuickEntryBox 
-                onCreate={handleListQuickCreate}
-                addToast={addToast}
-                tasks={tasks}
-                availableModels={availableModels}
-                onPlanningMode={onPlanningMode}
-                onSubtaskBreakdown={onSubtaskBreakdown}
-                workflowId={listQuickEntryWorkflowId}
-                workflowOptions={workflowMode ? workflowOptions : undefined}
-                defaultWorkflowId={workflowMode ? createTargetWorkflowId ?? boardWorkflows?.defaultWorkflowId ?? null : undefined}
-                projectId={projectId}
-                autoExpand={false}
-                defaultExpanded={false}
-                singleLine /* FNXC:QuickEntry 2026-06-22-19:25: List view uses the compact single-line quick-add so the box stays one line tall. */
-                favoriteProviders={favoriteProviders}
-                favoriteModels={favoriteModels}
-                onToggleFavorite={onToggleFavorite}
-                onToggleModelFavorite={onToggleModelFavorite}
-                onOpenTask={(taskId) => {
-                  const matchingTask = tasks.find((candidate) => candidate.id === taskId);
-                  if (matchingTask) {
-                    onOpenDetail(matchingTask);
-                    return;
-                  }
-                  if (typeof window !== "undefined") {
-                    window.location.hash = `#/tasks/${taskId}`;
-                  }
-                }}
-              />
-            </div>
+      <div className="list-table-container" ref={listScrollRef} onScroll={virtualList.onScroll}>
+        {/*
+        FNXC:ListNoSidePanel 2026-09-14-07:20:
+        The list renders DIRECTLY. It used to wrap itself in a collection rail beside an embedded detail pane — a rail
+        holding a table, plus a second task-detail host competing with whatever detail layer the host already owns.
+        Every host (right dock, phone drawer, modal) owns that layer, so a row hands the task to it instead.
+        */}
+        <div className="list-direct-body" ref={setSplitLayoutRef}>
+            {/*
+            FNXC:ListNoQuickEntry 2026-09-14-06:40:
+            List has no composer of its own. Creation belongs to the header New Task action and to the Board column
+            composers; a second Quick Entry inside the list competed with them for the same project-scoped draft.
+            */}
         {filteredCount === 0 ? (
           <div className="list-empty">
             {searchQuery ? t("listView.noTasksMatch", "No tasks match your filter") : t("listView.noTasksYet", "No tasks yet")}
           </div>
         ) : useSinglePaneList ? (
           <div className="list-cards">
+            <div aria-hidden="true" className="list-virtual-spacer" style={{ height: virtualList.topSpacerHeight }} />
             {listColumns.map((columnDef) => {
               const column = columnDef.id;
               if (selectedColumn && column !== selectedColumn) return null;
-              if (hideDoneTasks && (columnDef.flags.complete || columnDef.flags.archived) && !selectedColumn) return null;
+              if (hideDoneTasks && (columnDef.flags.complete) && !selectedColumn) return null;
 
               const columnTasks = groupedTasks[column];
               const isEmpty = columnTasks.length === 0;
               if (searchQuery && isEmpty) return null;
+
+              // FNXC:ListViewWindowing 2026-07-26-11:32: header count stays the FULL group size; only the rendered slice is windowed.
+              const sectionWindow = listSectionWindows[column] ?? { tasks: columnTasks, hiddenCount: 0 };
+              const windowedTasks = sectionWindow.tasks;
 
               const isCollapsed = collapsedSections.has(column);
 
@@ -2662,31 +2377,73 @@ export function ListView({
                       {isEmpty ? (
                         <div className="list-empty-cell list-card-empty">{t("listView.noTasks", "No tasks")}</div>
                       ) : (
-                        columnTasks.map((task) => {
-                          const isDoneColumn = isCompleteColumn(task.column);
+                        windowedTasks.map((task) => {
+                          const isDoneColumn = isTaskCompleteColumn(task);
                           const visualStatus = isDoneColumn ? "done" : task.status;
                           const isFailed = !isDoneColumn && task.status === "failed" && !hasPendingAutomaticRecovery(task, lastFetchTimeMs);
                           const isPaused = !isDoneColumn && task.paused === true;
-                          const isStuckState = isTaskStuck(task, taskStuckTimeoutMs, lastFetchTimeMs);
-                          const isAgentActive = isTaskAgentActive(task, { globalPaused, isStuck: isStuckState });
+                          const isAgentActive = isTaskAgentActive(task, { globalPaused, columnFlags: getTaskColumnFlags(task) });
                           // FNXC:TaskStatusBadge 2026-07-28-12:00: FN-8300 renders the same transient Planning badge as TaskCard so fresh planner logs never make grouped-list cards appear idle.
-                          const isTransientPlannerActive = task.column === "triage"
+                          const isTransientPlannerActive = isIntakeColumnForTask(task)
                             && !visualStatus
                             && Boolean(task.recentAgentActivityAt)
                             && isAgentActive;
-                          const hasStatus = (typeof visualStatus === "string" && visualStatus.trim().length > 0
-                            || isTransientPlannerActive)
-                            && !shouldSuppressPlanningStatusBadge({ status: visualStatus, column: task.column });
+                          const isLivePlanning = isTaskPlanningActive(task, { globalPaused });
                           const isReviewBudgetExhausted = isReviewBudgetExhaustedApproval(task);
-                          const planReviewRunning = isPlanReviewRunning(task);
+                          /*
+                          FNXC:WorkflowLifecycleColumns 2026-07-30-01:10 (corrected): pass the resolved flags so the
+                          badge's review-lane gate is not the literal — but through `getTaskColumnFlags(task)`, NOT
+                          `columnFlagsById`. "This list already owns columnFlagsById" was the original reasoning and
+                          it is the trap: that map is a UNION across workflows keyed by column id, so for a task whose
+                          own workflow does not declare this column it hands back a NEIGHBOUR workflow's traits and
+                          the badge claims a role the card's board never gave it. The accessor degrades to absent
+                          flags instead. Enforced by column-role-degraded-flags.test.ts, which caught this.
+                          */
+                          const optionalGateBadge = getRunningOptionalGateBadge(task, getTaskColumnFlags(task));
+                          const showOptionalGateBadge = Boolean(optionalGateBadge) && isAgentActive;
+                          /*
+                          FNXC:TaskCardBadgePrecedence 2026-08-06-14:53:
+                          Keep card and both list render paths on the shared precedence rule: a visible
+                          non-planning review gate displaces only Planning, while Plan Review remains
+                          additive and pause/approval states keep their existing render branches. The table
+                          path also omits its otherwise-empty dash shell when the gate is the sole badge.
+                          */
+                          const suppressPlanningStatusBadge = showOptionalGateBadge && isNonPlanningOptionalGateBadge(optionalGateBadge);
+                          const isPlanningStatusBadge = !isReviewBudgetExhausted
+                            && (isLivePlanning || isTransientPlannerActive || visualStatus === "planning");
+                          const wipLifecycleBadgeLabel = !isPaused
+                            && !isReviewBudgetExhausted
+                            && !showOptionalGateBadge
+                            ? getTaskWipLifecycleBadgeLabel(visualStatus, t, {
+                              isWipColumn: isWipColumnRole(getTaskColumnFlags(task), task.column),
+                              lifecycleLabel: getTaskColumnDisplayLabel(task),
+                            })
+                            : null;
+                          const hasStatus = ((hasTaskStatusBadge(visualStatus) && visualStatus !== "queued")
+                            || isTransientPlannerActive
+                            || Boolean(wipLifecycleBadgeLabel))
+                            && !(suppressPlanningStatusBadge && isPlanningStatusBadge);
+                          /*
+                          FNXC:TaskStatusBadge 2026-07-26-14:05:
+                          Same rule as TaskCard: the gate badge owns the gate's name ("Plan Review"), so the
+                          status badge drops U12's workflow-step-name override while that badge renders and
+                          states the row's own status instead — never the same words twice on one row.
+                          */
+                          const statusBadgeLabel = isReviewBudgetExhausted
+                            ? t("tasks.reviewBudgetExhausted", "Review budget exhausted")
+                            : isLivePlanning || isTransientPlannerActive
+                              ? t("tasks.statusPlanning", "Planning")
+                              : wipLifecycleBadgeLabel
+                                ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null });
                           const hasDependencies = Boolean(task.dependencies && task.dependencies.length > 0);
-                          const taskProgress = getTaskProgress(task);
+                          const taskProgress = getTaskProgress(task, getTaskColumnFlags(task));
                           const hasProgress = taskProgress.hasProgress;
                           const isSelectionMode = bulkEditEnabled;
 
                           return (
                             <div
                               key={task.id}
+                              ref={virtualList.measureRow(task.id)}
                               className={`list-card${isAgentActive ? " agent-active" : ""}${isSelectionMode ? " list-card--selectable" : ""}`}
                               onClick={() => handleRowClick(task)}
                               onContextMenu={(event) => handleListContextMenu(event, task)}
@@ -2709,7 +2466,6 @@ export function ListView({
                                       toggleTaskSelection(task.id);
                                     }}
                                     onClick={(e) => e.stopPropagation()}
-                                    disabled={isArchivedColumn(task.column)}
                                     aria-label={t("listView.selectTask", "Select {{taskId}}", { taskId: task.id })}
                                   />
                                 </label>
@@ -2730,8 +2486,6 @@ export function ListView({
                                 <span className="list-card-spacer" />
                                 {isPaused && task.pausedByAgentId ? (
                                   <span className="list-status-badge paused">{t("listView.pausedByAgent", "paused by agent")}</span>
-                                ) : isStuckState ? (
-                                  <span className="list-status-badge stuck">{t("listView.stuck", "Stuck")}</span>
                                 ) : hasStatus ? (
                                   <span
                                     className={`list-status-badge list-status-badge--${task.column}${isReviewBudgetExhausted ? " list-status-badge--review-budget-exhausted" : ""}${isFailed ? " failed" : ""}${isAgentActive ? " pulsing" : ""}`}
@@ -2739,27 +2493,43 @@ export function ListView({
                                     aria-label={isTransientPlannerActive ? t("tasks.statusPlanning", "Planning") : undefined}
                                     data-testid={isReviewBudgetExhausted ? `list-review-budget-exhausted-${task.id}` : undefined}
                                   >
-                                    {isReviewBudgetExhausted
-                                      ? t("tasks.reviewBudgetExhausted", "Review budget exhausted")
-                                      : isTransientPlannerActive
-                                        ? t("tasks.statusPlanning", "Planning")
-                                        : getTaskStatusLabel(visualStatus ?? "", t, getRunningWorkflowStepLabel(task))}
+                                    {statusBadgeLabel}
                                   </span>
                                 ) : null}
-                                {planReviewRunning && isAgentActive && (
+                                {isTaskReverted(task.sourceMetadata) && (isCompleteColumnRole(getTaskColumnFlags(task), task.column)) && (
+                                  <span className="list-status-badge list-status-badge--reverted" title={t("tasks.revertedBadgeTitle", "This task's changes were reverted")} aria-label={t("tasks.revertedBadgeTitle", "This task's changes were reverted")}>{t("tasks.revertedBadge", "Reverted")}</span>
+                                )}
+                                {showOptionalGateBadge && optionalGateBadge && (
                                   /*
                                   FNXC:TaskCardPlanReviewBadge 2026-07-11-12:10:
                                   Grouped ListView cards must show the same active Plan Review "Reviewing" badge as TaskCard so board and list surfaces remain visually equivalent while the `plan-review` workflow step is running.
+
+                                  FNXC:TaskCardOptionalGateBadge 2026-07-21-22:30:
+                                  Same badge contract for Code Review / Browser Verification in In-review.
                                   */
-                                  <span className="list-status-badge list-status-badge--reviewing pulsing">
-                                    {t("listView.reviewing", "Reviewing")}
+                                  <span
+                                    className="list-status-badge list-status-badge--reviewing pulsing"
+                                    data-testid={`list-${optionalGateBadge.testId}-${task.id}`}
+                                    data-optional-gate={optionalGateBadge.workflowStepId}
+                                    title={
+                                      optionalGateBadge.workflowStepId === "plan-review" || optionalGateBadge.workflowStepId === "plan-replan"
+                                        ? t("tasks.planReviewingTitle", "Plan Review in progress")
+                                        : t("tasks.optionalGateRunningTitle", "{{name}} in progress", { name: optionalGateBadge.name })
+                                    }
+                                  >
+                                    {optionalGateBadge.workflowStepId === "plan-review" || optionalGateBadge.workflowStepId === "plan-replan"
+                                      ? t("listView.planReviewBadge", "Plan Review")
+                                      : optionalGateBadge.label}
                                   </span>
                                 )}
                               </div>
 
                               <div className="list-card-row">
-                                <div className="list-card-title">{task.title || task.description}</div>
+                                <div className="list-card-title">{getTaskTitleDisplay(task).text}</div>
                               </div>
+
+                              <ExternalBlockNotice task={task} variant="list" onOpenChatWithPrefill={onOpenChatWithPrefill} onRetryTask={onRetryTask} addToast={addToast} />
+                              <PlanApprovalNotice task={task} variant="list" projectId={projectId} addToast={addToast} isPlanningLane={isPlanningLaneForTask(task)} />
 
                               {(hasDependencies || hasProgress) && (
                                 <div className="list-card-row list-card-meta">
@@ -2793,6 +2563,7 @@ export function ListView({
                 </Fragment>
               );
             })}
+            <div aria-hidden="true" className="list-virtual-spacer" style={{ height: virtualList.bottomSpacerHeight }} />
           </div>
         ) : (
           <table className="list-table">
@@ -2840,19 +2611,26 @@ export function ListView({
               </tr>
             </thead>
             <tbody>
+              <tr aria-hidden="true" className="list-virtual-spacer-row">
+                <td colSpan={visibleColumns.size + (bulkEditEnabled ? 1 : 0)} style={{ height: virtualList.topSpacerHeight }} />
+              </tr>
               {listColumns.map((columnDef) => {
                 const column = columnDef.id;
                 // When column filter is active, only show the selected column
                 if (selectedColumn && column !== selectedColumn) return null;
                 
-                // Skip done and archived column sections when hideDoneTasks is enabled (unless it's the selected column)
-                if (hideDoneTasks && (columnDef.flags.complete || columnDef.flags.archived) && !selectedColumn) return null;
+                // Skip completed column sections when hideDoneTasks is enabled (unless it's the selected column)
+                if (hideDoneTasks && (columnDef.flags.complete) && !selectedColumn) return null;
 
                 const columnTasks = groupedTasks[column];
                 const isEmpty = columnTasks.length === 0;
 
                 // When text filtering, hide empty sections entirely
                 if (searchQuery && isEmpty) return null;
+
+                // FNXC:ListViewWindowing 2026-07-26-11:34: header count stays the FULL group size; only the rendered slice is windowed.
+                const sectionWindow = listSectionWindows[column] ?? { tasks: columnTasks, hiddenCount: 0 };
+                const windowedTasks = sectionWindow.tasks;
 
                 const isCollapsed = collapsedSections.has(column);
 
@@ -2885,37 +2663,61 @@ export function ListView({
                             </td>
                           </tr>
                         ) : (
-                          columnTasks.map((task) => {
-                            const isDoneColumn = isCompleteColumn(task.column);
+                          windowedTasks.map((task) => {
+                            const isDoneColumn = isTaskCompleteColumn(task);
                             const visualStatus = isDoneColumn ? "done" : task.status;
                             const isFailed = !isDoneColumn && task.status === "failed" && !hasPendingAutomaticRecovery(task, lastFetchTimeMs);
                             const isPaused = !isDoneColumn && task.paused === true;
-                            const isStuckState = isTaskStuck(task, taskStuckTimeoutMs, lastFetchTimeMs);
-                            const isAgentActive = isTaskAgentActive(task, { globalPaused, isStuck: isStuckState });
+                            const isAgentActive = isTaskAgentActive(task, { globalPaused, columnFlags: getTaskColumnFlags(task) });
                             const isReviewBudgetExhausted = isReviewBudgetExhaustedApproval(task);
-                            const isTransientPlannerActive = task.column === "triage"
+                            const isTransientPlannerActive = isIntakeColumnForTask(task)
                               && !visualStatus
                               && Boolean(task.recentAgentActivityAt)
                               && isAgentActive;
-                            const showStatusBadge = (Boolean(visualStatus) || isTransientPlannerActive)
-                              && !shouldSuppressPlanningStatusBadge({ status: visualStatus, column: task.column });
-                            const planReviewRunning = isPlanReviewRunning(task);
-                            const isDragging = draggingTaskId === task.id;
+                            const isLivePlanning = isTaskPlanningActive(task, { globalPaused });
+                            /*
+                          FNXC:WorkflowLifecycleColumns 2026-07-30-01:10 (corrected): pass the resolved flags so the
+                          badge's review-lane gate is not the literal — but through `getTaskColumnFlags(task)`, NOT
+                          `columnFlagsById`. "This list already owns columnFlagsById" was the original reasoning and
+                          it is the trap: that map is a UNION across workflows keyed by column id, so for a task whose
+                          own workflow does not declare this column it hands back a NEIGHBOUR workflow's traits and
+                          the badge claims a role the card's board never gave it. The accessor degrades to absent
+                          flags instead. Enforced by column-role-degraded-flags.test.ts, which caught this.
+                          */
+                          const optionalGateBadge = getRunningOptionalGateBadge(task, getTaskColumnFlags(task));
+                            const showOptionalGateBadge = Boolean(optionalGateBadge) && isAgentActive;
+                            const suppressPlanningStatusBadge = showOptionalGateBadge && isNonPlanningOptionalGateBadge(optionalGateBadge);
+                            const isPlanningStatusBadge = !isReviewBudgetExhausted
+                              && (isLivePlanning || isTransientPlannerActive || visualStatus === "planning");
+                            const wipLifecycleBadgeLabel = !isPaused
+                              && !isReviewBudgetExhausted
+                              && !showOptionalGateBadge
+                              ? getTaskWipLifecycleBadgeLabel(visualStatus, t, {
+                                isWipColumn: isWipColumnRole(getTaskColumnFlags(task), task.column),
+                                lifecycleLabel: getTaskColumnDisplayLabel(task),
+                              })
+                              : null;
+                            const showStatusBadge = ((hasTaskStatusBadge(visualStatus) && visualStatus !== "queued")
+                              || isTransientPlannerActive
+                              || Boolean(wipLifecycleBadgeLabel))
+                              && !(suppressPlanningStatusBadge && isPlanningStatusBadge);
+                            // FNXC:TaskStatusBadge 2026-07-26-14:05: the step-name override yields to the
+                            // gate badge — see the grouped-card render path above.
+                            const statusBadgeLabel = isReviewBudgetExhausted
+                              ? t("tasks.reviewBudgetExhausted", "Review budget exhausted")
+                              : isLivePlanning || isTransientPlannerActive
+                                ? t("tasks.statusPlanning", "Planning")
+                                : wipLifecycleBadgeLabel
+                                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null });
 
                             return (
                               <tr
                                 key={task.id}
-                                className={`list-row${isFailed ? " failed" : ""}${isPaused ? " paused" : ""}${
-                                  isStuckState ? " stuck" : ""
-                                }${isAgentActive ? " agent-active" : ""}${
-                                  isDragging ? " dragging" : ""
-                                }${selectedTaskId === task.id ? " list-row--selected" : ""}`}
+                                ref={virtualList.measureRow(task.id)}
+                                className={`list-row${isFailed ? " failed" : ""}${isPaused ? " paused" : ""}${isAgentActive ? " agent-active" : ""}${selectedTaskId === task.id ? " list-row--selected" : ""}`}
                                 onClick={() => handleRowClick(task)}
                                 onContextMenu={(event) => handleListContextMenu(event, task)}
                                 onKeyDown={(event) => handleListKeyDown(event, task)}
-                                draggable={!isPaused}
-                                onDragStart={(e) => handleDragStart(e, task)}
-                                onDragEnd={handleDragEnd}
                                 data-id={task.id}
                                 tabIndex={0}
                                 aria-haspopup="menu"
@@ -2930,7 +2732,6 @@ export function ListView({
                                         toggleTaskSelection(task.id);
                                       }}
                                       onClick={(e) => e.stopPropagation()}
-                                      disabled={isArchivedColumn(task.column)}
                                       aria-label={t("listView.selectTask", "Select {{taskId}}", { taskId: task.id })}
                                     />
                                   </td>
@@ -2950,19 +2751,17 @@ export function ListView({
                                             <span className="visually-hidden">{t("listView.fastMode", "Fast mode")}</span>
                                           </span>
                                         )}
-                                        <span className="list-title-text">{task.title || task.description}</span>
+                                        <span className="list-title-text">{getTaskTitleDisplay(task).text}</span>
                                       </div>
                                     </div>
                                   </td>
                                 )}
                                 {visibleColumns.has("status") && (
                                   <td className="list-cell">
+                                    <ExternalBlockNotice task={task} variant="list" onOpenChatWithPrefill={onOpenChatWithPrefill} onRetryTask={onRetryTask} addToast={addToast} />
+                                    <PlanApprovalNotice task={task} variant="list" projectId={projectId} addToast={addToast} isPlanningLane={isPlanningLaneForTask(task)} />
                                     {isPaused && task.pausedByAgentId ? (
                                       <span className="list-status-badge paused">{t("listView.pausedByAgent", "paused by agent")}</span>
-                                    ) : isStuckState ? (
-                                      <span className="list-status-badge stuck">
-                                        {t("listView.stuck", "Stuck")}
-                                      </span>
                                     ) : showStatusBadge ? (
                                       <span
                                         className={`list-status-badge list-status-badge--${task.column}${isReviewBudgetExhausted ? " list-status-badge--review-budget-exhausted" : ""}${isFailed ? " failed" : ""}${
@@ -2972,22 +2771,35 @@ export function ListView({
                                         aria-label={isTransientPlannerActive ? t("tasks.statusPlanning", "Planning") : undefined}
                                         data-testid={isReviewBudgetExhausted ? `list-review-budget-exhausted-${task.id}` : undefined}
                                       >
-                                        {isReviewBudgetExhausted
-                                          ? t("tasks.reviewBudgetExhausted", "Review budget exhausted")
-                                          : isTransientPlannerActive
-                                            ? t("tasks.statusPlanning", "Planning")
-                                            : getTaskStatusLabel(visualStatus ?? "", t, getRunningWorkflowStepLabel(task))}
+                                        {statusBadgeLabel}
                                       </span>
-                                    ) : (
+                                    ) : showOptionalGateBadge ? null : (
                                       <span className="list-status-badge">-</span>
                                     )}
-                                    {planReviewRunning && isAgentActive && (
+                                    {isTaskReverted(task.sourceMetadata) && (isCompleteColumnRole(getTaskColumnFlags(task), task.column)) && (
+                                      <span className="list-status-badge list-status-badge--reverted" title={t("tasks.revertedBadgeTitle", "This task's changes were reverted")} aria-label={t("tasks.revertedBadgeTitle", "This task's changes were reverted")}>{t("tasks.revertedBadge", "Reverted")}</span>
+                                    )}
+                                    {showOptionalGateBadge && optionalGateBadge && (
                                       /*
                                       FNXC:TaskCardPlanReviewBadge 2026-07-11-12:11:
                                       Ungrouped ListView table rows must render the same Reviewing badge from the shared predicate; this second status render path is easy to miss and must stay in parity with grouped rows.
+
+                                      FNXC:TaskCardOptionalGateBadge 2026-07-21-22:30:
+                                      Same badge contract for Code Review / Browser Verification in In-review.
                                       */
-                                      <span className="list-status-badge list-status-badge--reviewing pulsing">
-                                        {t("listView.reviewing", "Reviewing")}
+                                      <span
+                                        className="list-status-badge list-status-badge--reviewing pulsing"
+                                        data-testid={`list-${optionalGateBadge.testId}-${task.id}`}
+                                        data-optional-gate={optionalGateBadge.workflowStepId}
+                                        title={
+                                          optionalGateBadge.workflowStepId === "plan-review" || optionalGateBadge.workflowStepId === "plan-replan"
+                                            ? t("tasks.planReviewingTitle", "Plan Review in progress")
+                                            : t("tasks.optionalGateRunningTitle", "{{name}} in progress", { name: optionalGateBadge.name })
+                                        }
+                                      >
+                                        {optionalGateBadge.workflowStepId === "plan-review" || optionalGateBadge.workflowStepId === "plan-replan"
+                                          ? t("listView.planReviewBadge", "Plan Review")
+                                          : optionalGateBadge.label}
                                       </span>
                                     )}
                                   </td>
@@ -3022,7 +2834,7 @@ export function ListView({
                                 {visibleColumns.has("progress") && (
                                   <td className="list-cell list-cell-progress">
                                     {(() => {
-                                      const taskProgress = getTaskProgress(task);
+                                      const taskProgress = getTaskProgress(task, getTaskColumnFlags(task));
                                       if (!taskProgress.hasProgress) return "-";
                                       return (
                                         <div className="list-progress">
@@ -3050,67 +2862,23 @@ export function ListView({
                   </Fragment>
                 );
               })}
+              <tr aria-hidden="true" className="list-virtual-spacer-row">
+                <td colSpan={visibleColumns.size + (bulkEditEnabled ? 1 : 0)} style={{ height: virtualList.bottomSpacerHeight }} />
+              </tr>
             </tbody>
           </table>
         )}
-          </div>
-          {!useSinglePaneList && (
-            <>
-              <div
-                className="list-split-resize-handle"
-                data-testid="list-split-resize-handle"
-                onPointerDown={handleSplitResizeStart}
-                onKeyDown={handleSplitResizeKeyDown}
-                role="separator"
-                tabIndex={0}
-                aria-orientation="vertical"
-                aria-label={t("listView.resizeSidebar", "Resize task list sidebar")}
-                aria-valuemin={LIST_SIDEBAR_MIN_WIDTH}
-                aria-valuemax={Math.round(
-                  getSidebarMaxWidth(
-                    splitLayoutRef.current?.clientWidth ??
-                      (sidebarWidth / LIST_SIDEBAR_MAX_RATIO + LIST_SIDEBAR_KEYBOARD_STEP)
-                  )
-                )}
-                aria-valuenow={Math.round(sidebarWidth)}
-              />
-              <div className="list-split-detail" data-testid="list-split-detail">
-                {!selectedTaskSnapshot ? (
-                  <div className="list-split-detail-empty">
-                    <p>{t("listView.selectTaskPrompt", "Select a task to view details")}</p>
-                  </div>
-                ) : (
-                  <div className="list-split-detail-content" data-testid="list-split-detail-content">
-                    <TaskDetailContent
-                      task={selectedTaskSnapshot}
-                      projectId={projectId}
-                      tasks={tasks}
-                      embedded
-                      onRequestClose={closeEmbeddedTaskDetail}
-                      onOpenDetail={handleEmbeddedOpenDetail}
-                      onMoveTask={onMoveTask}
-                      onDeleteTask={onDeleteTask}
-                      onMergeTask={onMergeTask}
-                      onRetryTask={onRetryTask}
-                      onResetTask={onResetTask}
-                      onDuplicateTask={onDuplicateTask}
-                      onPopOut={onPopOut ? () => onPopOut(selectedTaskSnapshot) : undefined}
-                      onTaskUpdated={(updatedTask) => {
-                        setSelectedTaskSnapshot((previous) => {
-                          if (!previous || previous.id !== updatedTask.id) return previous;
-                          return { ...previous, ...updatedTask };
-                        });
-                      }}
-                      addToast={addToast}
-                      prAuthAvailable={prAuthAvailable}
-                      autoMergeEnabled={autoMerge}
-                      taskDetailChatFirst={taskDetailChatFirst}
-                    />
-                  </div>
-                )}
-              </div>
-            </>
-          )}
+          {(currentTasksHasMore || currentTasksPaginationError) ? (
+            <div className="list-pagination-footer" ref={currentTasksHasMore ? autoPagination.sentinelRef : undefined} role="status" aria-live="polite" data-testid="list-auto-pagination-sentinel">
+              {currentTasksLoadingMore ? t("column.loadMoreCompletedLoading", "Loading…") : null}
+              {currentTasksPaginationError ? (
+                <div className="list-pagination-error">
+                  <span>{t("column.paginationError", "Older tasks could not be loaded.")}</span>
+                  <button type="button" className="btn btn-sm" onClick={() => void onRetryCurrentTasks?.()}>{t("common.retry", "Retry")}</button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

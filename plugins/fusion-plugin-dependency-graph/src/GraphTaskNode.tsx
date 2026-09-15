@@ -1,8 +1,8 @@
 import type { CSSProperties, ComponentProps, HTMLAttributes } from "react";
+import type { TraitFlags } from "@fusion/core";
 import type { GraphPosition } from "./types.js";
 import { useNodeDrag } from "./hooks/useNodeDrag.js";
 import { TaskCard } from "@fusion/dashboard/app/components/TaskCard";
-import { isTaskStuck } from "@fusion/dashboard/app/utils/taskStuck";
 import "./GraphTaskNode.css";
 import "./GraphHighlight.css";
 import "./styles/drag.css";
@@ -17,19 +17,29 @@ type TaskCardBridgeProps = Pick<
   | "addToast"
   | "globalPaused"
   | "onUpdateTask"
-  | "onArchiveTask"
-  | "onUnarchiveTask"
   | "onDeleteTask"
   | "onRetryTask"
   | "onOpenDetailWithTab"
-  | "taskStuckTimeoutMs"
   | "onOpenMission"
   | "onMoveTask"
   | "lastFetchTimeMs"
-  | "workflowStepNameLookup"
 >;
 
 export interface GraphTaskNodeProps extends TaskCardBridgeProps, Pick<HTMLAttributes<HTMLDivElement>, "onMouseEnter" | "onMouseLeave" | "onClick"> {
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-07-31-15:30:
+  This card's OWN resolved column traits, threaded from the host's plugin view context.
+
+  Defect closed here, from this component having no access to the board's vocabulary
+  (a second consumer, isTaskStuck, was deleted with the stuck-tag removal):
+    - The `TaskCard` rendered below is a THIRD producer of unflagged cards, after the two #3025 fixed.
+      It bypasses `renderTaskCard` entirely by importing the component directly, so a host-side fix
+      could not reach it; every role helper inside it read the legacy ids.
+
+  Optional, and absent means legacy: the host omits the map for remote rows and off-board columns, and
+  the degraded answer there is the documented literal rather than "this board has no such lane".
+  */
+  taskColumnFlags?: Partial<TraitFlags>;
   style?: CSSProperties;
   position: GraphPosition;
   scale: number;
@@ -52,6 +62,7 @@ function getStatusLabel(status?: string): string {
 }
 
 export function GraphTaskNode({
+  taskColumnFlags,
   style,
   position,
   scale,
@@ -66,18 +77,47 @@ export function GraphTaskNode({
   onNodeDragEnd,
   ...taskCardProps
 }: GraphTaskNodeProps) {
-  const { task, globalPaused, taskStuckTimeoutMs, lastFetchTimeMs, onOpenDetail } = taskCardProps;
+  const { task, globalPaused, onOpenDetail } = taskCardProps;
   const isFailed = task.status === "failed";
   const isPaused = task.paused === true;
-  const isStuck = isTaskStuck(task, taskStuckTimeoutMs, lastFetchTimeMs);
-  const isAwaitingApproval = task.column === "triage" && task.status === "awaiting-approval";
+  // FNXC:StuckTagRemoval 2026-08-17-22:30: stuck-task tagging was removed from the dashboard; graph nodes no longer derive or suppress on a stuck state.
+  /*
+  FNXC:PluginLifecycleColumns 2026-07-30-03:40 (U11 #2515 audit):
+  Keyed on `column === "triage"`, this went permanently FALSE for default-lineage
+  cards once U11 merged Todo into Planning and dropped the `triage` id — an
+  awaiting-approval card sits in `todo` now. The node then stopped showing the
+  awaiting-approval state AND fell through to `isActive`, rendering a card that is
+  blocked on a human as if it were running.
+
+  The column condition is DELETED rather than converted, because it was always
+  redundant: `awaiting-approval` is written only by the plan-approval gate and the
+  replan-cap park, both of which act on a card in the planning lane, so the status
+  alone is the signal. Deleting it is also the only option that needs no resolution —
+  this is a synchronous React render, where an IR lookup is not available.
+  */
+  /*
+  FNXC:PluginLifecycleColumns 2026-07-31-11:50 (PR #2644 review, greptile P1):
+  A STALE APPROVAL STATUS MUST NOT HIDE A RUNNING CARD. Dropping the column condition made the
+  awaiting-approval signal status-only, which is right for a planning-lane card — but `awaiting-approval`
+  is DURABLE, so a card that carries it into an execution lane was rendered as not-active: no active
+  styling, no execution-status indicator, no current-step metadata, while it was plainly running.
+
+  So the suppression now yields to an execution SIGNAL rather than to a column name. If the card shows
+  execution activity, it is active and the stale approval status is residue; if it does not, the approval
+  state is the truth. That ordering needs no IR lookup, which matters here — this is a synchronous React
+  render.
+
+  The `in-progress` literal is pre-existing and NOT on the triage bar; converting it needs the board's
+  column traits, which this component is not given. Left with this note rather than half-converted.
+  */
+  const hasExecutionSignal = task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string);
+  const isAwaitingApproval = task.status === "awaiting-approval" && !hasExecutionSignal;
   const isActive =
     !globalPaused &&
     !isFailed &&
     !isPaused &&
-    !isStuck &&
     !isAwaitingApproval &&
-    (task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string));
+    hasExecutionSignal;
 
   const hasValidCurrentStep =
     typeof task.currentStep === "number" &&
@@ -124,7 +164,7 @@ export function GraphTaskNode({
           <span className="graph-task-active-indicator-text">{getStatusLabel(task.status)}</span>
         </div>
       ) : null}
-      <TaskCard {...taskCardProps} onOpenDetail={() => {}} disableDrag={true} />
+      <TaskCard {...taskCardProps} taskColumnFlags={taskColumnFlags} onOpenDetail={() => {}} />
     </div>
   );
 }

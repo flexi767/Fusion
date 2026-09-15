@@ -37,6 +37,7 @@ import {
   setHostExtensionPaths,
   createFusionAuthStorage,
   createFusionModelRegistry,
+  refreshFusionModelRegistry,
 } from "@fusion/engine";
 import { setHostTaskStore, clearHostTaskStores } from "../extension.js";
 import {
@@ -77,9 +78,10 @@ import {
 import { resolveSelfExtension } from "./self-extension.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getPackageManagerAgentDir } from "./auth-paths.js";
+import { createProjectScopedPackageManagerFactory } from "./skills-package-manager.js";
 import { resolveProject } from "../project-context.js";
 import { startMigrationHoldingServer } from "./migration-holding-server.js";
-import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled } from "../plugins/bundled-plugin-install.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
@@ -360,15 +362,22 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
   const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
-  const engineManager = new ProjectEngineManager(sharedCentralCore, {
+  const engineManager: ProjectEngineManager = new ProjectEngineManager(sharedCentralCore, {
     onMigrationProgress: (event) => migrationHoldingServer?.setMigrationProgress(event),
     cliPackageVersion,
     getMergeStrategy,
-    processPullRequestMerge: (s, wd, taskId, pool) =>
-      processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool),
+    processPullRequestMerge: (s, wd, taskId, signal) =>
+      processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, signal),
     createGroupPr: createGroupPrCallback(githubClient),
     syncGroupPr: syncGroupPrCallback(githubClient),
-    prNodeGithubOps: createPrNodeGithubOps(githubClient),
+    /*
+    FNXC:PrMergeAutoMerge 2026-08-09-10:59:
+    Each daemon engine supplies its own TaskStore to this factory. Never infer
+    the project from a task ID because IDs are only project-scoped.
+    */
+    createPrNodeGithubOps: (taskStore) => createPrNodeGithubOps(githubClient, {
+      isNativeAutoMergeEnabled: async () => (await taskStore.getSettings()).githubNativeAutoMerge === true,
+    }),
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
@@ -564,6 +573,24 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     console.warn(`[plugins] Failed to auto-install bundled Grok CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
   }
 
+  /*
+   * FNXC:CursorCli 2026-08-16-04:05:
+   * FN-9093: daemon executors/reviewers/mergers resolve `cursor-cli` through the fail-fast runtime route,
+   * but nothing registered fusion-plugin-cursor-runtime (the provider Enable action only sets `useCursorCli`),
+   * so Cursor sessions failed with the missing-runtime error. Mirror the FN-7761 Grok eager bootstrap so the
+   * Cursor runtime is loaded before agent sessions are created.
+   */
+  try {
+    const installStatus = await ensureBundledCursorRuntimePluginInstalled(pluginStore, pluginLoader);
+    if (installStatus === "installed") {
+      console.log("[plugins] Installed bundled Cursor CLI runtime plugin");
+    } else if (installStatus === "missing-bundle") {
+      console.warn("[plugins] Bundled Cursor CLI runtime plugin was not found in this build");
+    }
+  } catch (err) {
+    console.warn(`[plugins] Failed to auto-install bundled Cursor CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
+  }
+
   // Auto-load all enabled plugins so runtime UI (NewAgentDialog, AgentDetailView)
   // can discover installed runtimes like Hermes and OpenClaw.
   try {
@@ -705,7 +732,13 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     extensionsResult.runtime.pendingProviderRegistrations = [];
     mergeBuiltInZaiProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
     mergeBuiltInGrokProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
-    await modelRegistry.refresh();
+    /*
+    FNXC:ModelRegistry 2026-07-21-17:15:
+    Bound post-extension refresh so a hung remote catalog cannot leave daemon stuck before listen.
+    */
+    await refreshFusionModelRegistry(modelRegistry, {
+      log: (message) => console.log(`[extensions] ${message}`),
+    });
 
     try {
       const globalSettings = await store.getGlobalSettingsStore().getSettings();
@@ -722,7 +755,9 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     const message = error instanceof Error ? error.message : String(error);
     console.log(`[extensions] Failed to discover extensions: ${message}`);
     createExtensionRuntime();
-    await modelRegistry.refresh();
+    await refreshFusionModelRegistry(modelRegistry, {
+      log: (message) => console.log(`[extensions] ${message}`),
+    });
   }
 
   void syncStartupModels({
@@ -813,6 +848,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     ? createSkillsAdapter({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dashboard's resolve() uses a looser onMissing signature than pi's DefaultPackageManager
         packageManager: packageManager as any,
+        getPackageManager: createProjectScopedPackageManagerFactory(getPackageManagerAgentDir()),
         getSettingsPath: (rootDir: string) => getProjectSettingsPath(rootDir),
         /*
          * FNXC:PluginSkills 2026-07-10-00:00:

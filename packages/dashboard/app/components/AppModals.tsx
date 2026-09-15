@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useRef, useState, lazy, Suspense } from "react";
+import { useTranslation } from "react-i18next";
 import type { ProjectInfo, RevertTaskOptions, RevertTaskResult } from "../api";
 import type { ColorTheme, Column, MergeResult, Task, TaskCreateInput, ThemeMode, GithubIssueAction } from "@fusion/core";
 import type { UseProjectActionsResult } from "../hooks/useProjectActions";
+import { mergeTaskSnapshot } from "../hooks/useTasks";
 import type { ModalManager } from "../hooks/useModalManager";
+import type { NavEntry } from "../hooks/useNavigationHistory";
 import type { UseTaskHandlersResult } from "../hooks/useTaskHandlers";
+import type { ChatMessageLayout } from "../hooks/useAppSettings";
 import type { Toast, ToastType } from "../hooks/useToast";
 import { ModalErrorBoundary } from "./ErrorBoundary";
-import { TaskDetailModal } from "./TaskDetailModal";
+import { AppModalTaskDetailHost } from "./TaskDetailHostBoundaries";
+import type { BlockerFanoutColumnFlags } from "../hooks/useBlockerFanout";
 import { GitHubImportModal } from "./GitHubImportModal";
-import { SubtaskBreakdownModal } from "./SubtaskBreakdownModal";
 import { ScriptsModal } from "./ScriptsModal";
 import { FileBrowserModal } from "./FileBrowserModal";
 import { UsageIndicator } from "./UsageIndicator";
@@ -21,10 +25,42 @@ import { ModelOnboardingModal } from "./ModelOnboardingModal";
 import { ToastContainer } from "./ToastContainer";
 import { GroupTaskModal } from "./GroupTaskModal";
 import { useNavigationHistoryContext } from "../hooks/useNavigationHistory";
+import { AlphaMobileDrawer } from "./AlphaMobileDrawer";
 
 const SetupWizardModal = lazy(() => import("./SetupWizardModal").then((m) => ({ default: m.SetupWizardModal })));
 const SettingsModal = lazy(() => import("./SettingsModal").then((m) => ({ default: m.SettingsModal })));
 const WorkflowNodeEditor = lazy(() => import("./WorkflowNodeEditor").then((m) => ({ default: m.WorkflowNodeEditor })));
+
+interface AlphaUsageDrawerProps {
+  open: boolean;
+  title: string;
+  onClose: () => void;
+  projectId?: string;
+}
+
+/*
+FNXC:AlphaMobileDrawer 2026-09-10-23:59:
+Usage browser checks must mount AppModals' production bridge rather than duplicate its shell flags. This exported bridge remains the single Alpha usage composition while the ordinary popover path stays owned by AppModals.
+*/
+export function AlphaUsageDrawer({ open, title, onClose, projectId }: AlphaUsageDrawerProps) {
+  return (
+    <AlphaMobileDrawer
+      open={open}
+      title={title}
+      onClose={onClose}
+      testId="alpha-mobile-drawer-usage"
+      contentOwnsHeader
+      contentOwnsScroll
+    >
+      <UsageIndicator
+        isOpen={open}
+        onClose={onClose}
+        projectId={projectId}
+        presentation="embedded"
+      />
+    </AlphaMobileDrawer>
+  );
+}
 
 function prefetchSettingsModal() {
   const idle: (cb: () => void, opts?: { timeout?: number }) => number =
@@ -41,7 +77,12 @@ function prefetchSettingsModal() {
 
 interface AppModalsProps {
   projectId?: string;
+  /** Applies the shared drawer presentation only inside the Alpha mobile project shell. */
+  alphaMobileDrawer?: boolean;
   tasks: Task[];
+  /* Per-task lifecycle traits, forwarded to Task Detail's blocker fan-out. */
+  columnFlagsByTaskId?: ReadonlyMap<string, BlockerFanoutColumnFlags>;
+  globalPaused?: boolean;
   projects: ProjectInfo[];
   currentProject: ProjectInfo | null;
   addToast: (message: string, type?: ToastType) => void;
@@ -49,12 +90,13 @@ interface AppModalsProps {
   removeToast: (id: number) => void;
   modalManager: ModalManager;
   projectActions: Pick<UseProjectActionsResult, "handleAddProject" | "handleSetupComplete" | "handleModelOnboardingComplete">;
-  taskHandlers: Pick<UseTaskHandlersResult, "handleModalCreate" | "handlePlanningTaskCreated" | "handlePlanningTasksCreated" | "handleSubtaskTasksCreated" | "handleGitHubImport">;
-  onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
+  taskHandlers: Pick<UseTaskHandlersResult, "handleModalCreate" | "handlePlanningTaskCreated" | "handlePlanningTasksCreated" | "handleGitHubImport">;
+  /** App-owned ingestion seam for a successful detail refinement. */
+  onRefinementCreated?: (task: Task) => void;
+  onPlanningMode?: (initialPlan: string, workflowId?: string | null, sourceIssue?: { provider: "github"; repository: string; issueNumber: number; url: string; title?: string }) => void;
   onOpenChatWithPrefill?: (prefillText: string) => void;
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   taskOperations: {
-    moveTask: (taskId: string, column: Column, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
+    moveTask: (taskId: string, column: Column, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
     deleteTask: (taskId: string, options?: {
       removeDependencyReferences?: boolean;
       removeLineageReferences?: boolean;
@@ -62,14 +104,15 @@ interface AppModalsProps {
       allowResurrection?: boolean;
     }) => Promise<Task>;
     mergeTask: (taskId: string) => Promise<MergeResult>;
-    archiveTask: (taskId: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-    /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside archiveTask; never mutates the source task's column. */
     revertTask?: (taskId: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
     retryTask: (taskId: string) => Promise<Task>;
+    pauseTask: (taskId: string) => Promise<Task>;
+    unpauseTask: (taskId: string) => Promise<Task>;
     /* FNXC:ReviewLaneBypass 2026-07-09-00:00 (FN-7720): operator-only review-lane bypass, threaded to TaskDetailModal only. */
     bypassReview?: (taskId: string, reason: string) => Promise<Task>;
-    resetTask: (taskId: string) => Promise<Task>;
-    duplicateTask: (taskId: string) => Promise<Task>;
+
+    resetTask: (taskId: string, options?: { description?: string }) => Promise<Task>;
+    duplicateTask: (taskId: string, options?: { workflowId?: string }) => Promise<Task>;
   };
   deepLink: {
     handleDetailClose: () => void;
@@ -77,7 +120,12 @@ interface AppModalsProps {
   settings: {
     prAuthAvailable: boolean;
     autoMerge: boolean;
+    openTasksInRightSidebar: boolean;
+    openMobileTasksInPopup: boolean;
+    taskPopupsBoardListOnly: boolean;
+    showCostBadgeOnCards: boolean;
     taskDetailChatFirst: boolean;
+    chatMessageLayout: ChatMessageLayout;
     themeMode: ThemeMode;
     colorTheme: ColorTheme;
     dashboardFontScalePct: number;
@@ -88,6 +136,12 @@ interface AppModalsProps {
     setDashboardFontScalePct: (scalePct: number) => void;
     setShadcnCustomColors: (colors: Record<string, string>) => void;
     setQuickChatButtonModeImmediate: (mode: "floating" | "footer" | "off") => void;
+    setChatMessageLayoutImmediate: (layout: ChatMessageLayout) => void;
+    setOpenTasksInRightSidebarImmediate: (enabled: boolean) => void;
+    setOpenMobileTasksInPopupImmediate: (enabled: boolean) => void;
+    setTaskPopupsBoardListOnlyImmediate: (enabled: boolean) => void;
+    setShowCostBadgeOnCardsImmediate: (enabled: boolean) => void;
+    setTaskDetailChatFirstImmediate: (enabled: boolean) => void;
     setMobileNavPrimaryItemsImmediate: (items: string[]) => void;
   };
   /** Optional override for the settings modal close handler. When provided, this is called instead of modalManager.closeSettings. */
@@ -100,9 +154,48 @@ interface AppModalsProps {
   agentOnboardingEnabled?: boolean;
 }
 
+export interface AppFilesModalProps {
+  modalManager: ModalManager;
+  projectId?: string;
+  onClose: () => void;
+}
+
+/*
+FNXC:FileBrowser 2026-09-13-08:50:
+App conserve une seule chaîne d’ouverture pour Files : une sélection précise publie son chemin dans le gestionnaire de modales avant qu’AppModals rende la vue directe, tandis qu’une ouverture générale garde un initialFile nul. Le dock compact et son hôte développé doivent appeler cette même frontière afin qu’aucun des deux ne puisse contourner l’état de production.
+*/
+export function openAppFileInBrowser(
+  modalManager: Pick<ModalManager, "openFiles" | "closeFiles">,
+  pushNav: (entry: NavEntry) => void,
+  path: string,
+  opts?: { workspace?: string; line?: number; col?: number },
+) {
+  modalManager.openFiles(opts?.workspace, path);
+  pushNav({ type: "modal", close: modalManager.closeFiles });
+}
+
+/** Production Files bridge shared by AppModals and its dock-to-modal integration tests. */
+export function AppFilesModal({ modalManager, projectId, onClose }: AppFilesModalProps) {
+  if (!modalManager.filesOpen) return null;
+  return (
+    <FileBrowserModal
+      initialWorkspace={modalManager.fileBrowserWorkspace}
+      initialFile={modalManager.fileBrowserInitialFile}
+      isOpen={true}
+      onClose={onClose}
+      onWorkspaceChange={modalManager.setFileWorkspace}
+      projectId={projectId}
+      onSendSelectionToTask={modalManager.openNewTaskWithDescription}
+    />
+  );
+}
+
 export function AppModals({
   projectId,
+  alphaMobileDrawer = false,
   tasks,
+  columnFlagsByTaskId,
+  globalPaused = false,
   projects,
   currentProject,
   addToast,
@@ -111,9 +204,9 @@ export function AppModals({
   modalManager,
   projectActions,
   taskHandlers,
+  onRefinementCreated,
   onPlanningMode,
   onOpenChatWithPrefill,
-  onSubtaskBreakdown,
   taskOperations,
   deepLink,
   settings,
@@ -122,26 +215,14 @@ export function AppModals({
   onOpenApprovals,
   agentOnboardingEnabled = false,
 }: AppModalsProps) {
+  const { t } = useTranslation("app");
   const { pushNav, removeNav } = useNavigationHistoryContext();
   const [firstCreatedTask, setFirstCreatedTask] = useState<Task | null>(null);
   const detailNavCloseRef = useRef<(() => void) | null>(null);
   const detailTask = modalManager.detailTask
     ? (() => {
         const liveTask = tasks.find((task) => task.id === modalManager.detailTask?.id);
-        if (!liveTask) {
-          return modalManager.detailTask;
-        }
-
-        if ("prompt" in modalManager.detailTask) {
-          return {
-            ...modalManager.detailTask,
-            ...liveTask,
-            prompt: modalManager.detailTask.prompt,
-            log: modalManager.detailTask.log,
-          };
-        }
-
-        return liveTask;
+        return liveTask ? mergeTaskSnapshot(modalManager.detailTask, liveTask) : modalManager.detailTask;
       })()
     : null;
 
@@ -155,17 +236,6 @@ export function AppModals({
   FNXC:TaskDetailSwipeBack 2026-06-29-14:20:
   Mobile swipe-back (`popstate`) for modal task detail must step back through nested task-detail opens before dismissing the modal. The latest pushed callback restores the previous task/tab/origin snapshot when one exists, and explicit close falls back to the original first-open callback (`modalManager.closeDetailTask`) so programmatic closes still consume the matching history entry.
   */
-  const closeDetailFromHistory = useCallback(() => {
-    modalManager.closeDetailTask();
-    deepLink.handleDetailClose();
-    detailNavCloseRef.current = null;
-  }, [deepLink, modalManager]);
-
-  const closeDetailWithNav = useCallback(() => {
-    removeNav(detailNavCloseRef.current ?? modalManager.closeDetailTask);
-    closeDetailFromHistory();
-  }, [closeDetailFromHistory, modalManager, removeNav]);
-
   const closeGroupWithNav = useCallback(() => {
     removeNav(modalManager.closeGroupModal);
     modalManager.closeGroupModal();
@@ -180,11 +250,6 @@ export function AppModals({
     removeNav(modalManager.closeGitHubImport);
     modalManager.closeGitHubImport();
   }, [modalManager.closeGitHubImport, removeNav]);
-
-  const closeSubtaskWithNav = useCallback(() => {
-    removeNav(modalManager.closeSubtask);
-    modalManager.closeSubtask();
-  }, [modalManager.closeSubtask, removeNav]);
 
   const closeScriptsWithNav = useCallback(() => {
     removeNav(modalManager.closeScripts);
@@ -236,8 +301,8 @@ export function AppModals({
     modalManager.closeSetupWizard();
   }, [modalManager.closeSetupWizard, removeNav]);
 
-  const handleOpenNewTask = useCallback(() => {
-    modalManager.openNewTask();
+  const handleOpenNewTask = useCallback((workflowId?: string | null) => {
+    modalManager.openNewTask(workflowId);
   }, [modalManager]);
 
   const handleOpenGitHubImport = useCallback(() => {
@@ -280,11 +345,6 @@ export function AppModals({
     [deepLink, modalManager, pushNav],
   );
 
-  const openGroupModalWithNav = useCallback((groupId: string) => {
-    modalManager.openGroupModal(groupId);
-    pushNav({ type: "modal", close: modalManager.closeGroupModal });
-  }, [modalManager, pushNav]);
-
   const handleOnboardingViewTask = useCallback((task: Task) => {
     setFirstCreatedTask(null);
     modalManager.closeModelOnboarding();
@@ -316,23 +376,33 @@ export function AppModals({
     <>
       {detailTask && (
         <ModalErrorBoundary>
-          <TaskDetailModal
+          <AppModalTaskDetailHost
             task={detailTask}
+            alphaMobileDrawer={alphaMobileDrawer}
             projectId={projectId}
             tasks={tasks}
-            onClose={closeDetailWithNav}
+            columnFlagsByTaskId={columnFlagsByTaskId}
+            globalPaused={globalPaused}
+            onRemoveNavigation={() => removeNav(detailNavCloseRef.current ?? modalManager.closeDetailTask)}
+            onCloseDetail={modalManager.closeDetailTask}
+            onCleanupDeepLink={deepLink.handleDetailClose}
+            onClosed={() => { detailNavCloseRef.current = null; }}
             onOpenDetail={openDetailTaskWithNav}
             mobileHeaderMode={modalManager.detailTaskOrigin === "list-mobile" ? "back" : "close"}
-            onMoveTask={taskOperations.moveTask}
+            /* FNXC:TaskRevert 2026-08-01-20:27: Modal detail must offer the same revision draft recovery as every reverted-task host. */
+            onReviseTask={(task) => modalManager.openNewTaskWithDescription(task.description)}
             onDeleteTask={taskOperations.deleteTask}
             onMergeTask={taskOperations.mergeTask}
-            onArchiveTask={taskOperations.archiveTask}
             onRevertTask={taskOperations.revertTask}
             onRetryTask={taskOperations.retryTask}
+            onOpenChatWithPrefill={onOpenChatWithPrefill}
+            onPauseTask={taskOperations.pauseTask}
+            onUnpauseTask={taskOperations.unpauseTask}
             onBypassReview={taskOperations.bypassReview}
             onResetTask={taskOperations.resetTask}
             onDuplicateTask={taskOperations.duplicateTask}
             onTaskUpdated={modalManager.updateDetailTask}
+            onRefinementCreated={onRefinementCreated}
             addToast={addToast}
             prAuthAvailable={settings.prAuthAvailable}
             autoMergeEnabled={settings.autoMerge}
@@ -379,6 +449,18 @@ export function AppModals({
               onDashboardFontScaleChange={settings.setDashboardFontScalePct}
               onShadcnCustomColorsChange={settings.setShadcnCustomColors}
               onQuickChatButtonModeChange={settings.setQuickChatButtonModeImmediate}
+              chatMessageLayout={settings.chatMessageLayout}
+              onChatMessageLayoutChange={settings.setChatMessageLayoutImmediate}
+              openTasksInRightSidebar={settings.openTasksInRightSidebar}
+              onOpenTasksInRightSidebarChange={settings.setOpenTasksInRightSidebarImmediate}
+              openMobileTasksInPopup={settings.openMobileTasksInPopup}
+              onOpenMobileTasksInPopupChange={settings.setOpenMobileTasksInPopupImmediate}
+              taskPopupsBoardListOnly={settings.taskPopupsBoardListOnly}
+              onTaskPopupsBoardListOnlyChange={settings.setTaskPopupsBoardListOnlyImmediate}
+              showCostBadgeOnCards={settings.showCostBadgeOnCards}
+              onShowCostBadgeOnCardsChange={settings.setShowCostBadgeOnCardsImmediate}
+              taskDetailChatFirst={settings.taskDetailChatFirst}
+              onTaskDetailChatFirstChange={settings.setTaskDetailChatFirstImmediate}
               onMobileNavPrimaryItemsChange={settings.setMobileNavPrimaryItemsImmediate}
               onReopenOnboarding={onReopenOnboarding}
               onOpenApprovals={onOpenApprovals}
@@ -391,7 +473,17 @@ export function AppModals({
         </ModalErrorBoundary>
       )}
 
+      {/*
+      FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+      Key the always-mounted GitHub Import modal by project. Its persist effect depends on
+      projectId, so a project swap (close + new projectId in one render) re-fired it with the
+      OLD project's provider/labels/repo selections and wrote them under the NEW project's
+      kb-dashboard-github-import-state key. Keying remounts instead; unmount writes nothing,
+      so each project's last persisted import state stays under its own key. The embedded
+      Import Tasks view already unmounts on navigation and was never affected.
+      */}
       <GitHubImportModal
+        key={projectId ?? "no-project"}
         isOpen={modalManager.githubImportOpen}
         onClose={closeGitHubImportWithNav}
         onImport={taskHandlers.handleGitHubImport}
@@ -401,18 +493,6 @@ export function AppModals({
         projectId={projectId}
       />
 
-      <ModalErrorBoundary>
-        <SubtaskBreakdownModal
-          isOpen={modalManager.isSubtaskOpen}
-          onClose={closeSubtaskWithNav}
-          initialDescription={modalManager.subtaskInitialDescription ?? ""}
-          onTasksCreated={taskHandlers.handleSubtaskTasksCreated}
-          projectId={projectId}
-          workflowId={modalManager.subtaskWorkflowId}
-          resumeSessionId={modalManager.subtaskResumeSessionId}
-          onOpenGroupModal={openGroupModalWithNav}
-        />
-      </ModalErrorBoundary>
 
       <ScriptsModal
         isOpen={modalManager.scriptsOpen}
@@ -422,24 +502,31 @@ export function AppModals({
         projectId={projectId}
       />
 
-      {modalManager.filesOpen && (
-        <FileBrowserModal
-          initialWorkspace={modalManager.fileBrowserWorkspace}
-          initialFile={modalManager.fileBrowserInitialFile}
-          isOpen={true}
-          onClose={closeFilesWithNav}
-          onWorkspaceChange={modalManager.setFileWorkspace}
+      <AppFilesModal
+        modalManager={modalManager}
+        projectId={projectId}
+        onClose={closeFilesWithNav}
+      />
+
+      {/*
+      FNXC:AlphaMobileDrawer 2026-09-10-16:56:
+      Usage opened from Alpha mobile reuses its embedded content inside the shared bottom-edge drawer above the trigger pill. The modal manager remains the single open/close owner, while standard mobile and desktop preserve the existing overlay or anchored popover.
+      */}
+      {alphaMobileDrawer ? (
+        <AlphaUsageDrawer
+          open={modalManager.usageOpen}
+          title={t("nav.usage", "Usage")}
+          onClose={closeUsageWithNav}
           projectId={projectId}
-          onSendSelectionToTask={modalManager.openNewTaskWithDescription}
+        />
+      ) : (
+        <UsageIndicator
+          isOpen={modalManager.usageOpen}
+          onClose={closeUsageWithNav}
+          projectId={projectId}
+          anchorRect={modalManager.usageAnchorRect}
         />
       )}
-
-      <UsageIndicator
-        isOpen={modalManager.usageOpen}
-        onClose={closeUsageWithNav}
-        projectId={projectId}
-        anchorRect={modalManager.usageAnchorRect}
-      />
 
       {modalManager.schedulesOpen && (
         <ScheduledTasksModal
@@ -455,12 +542,12 @@ export function AppModals({
           onClose={closeNewTaskWithNav}
           tasks={tasks}
           onCreateTask={handleModalCreateWithOnboardingTracking}
+          onMoveTask={(taskId, column) => taskOperations.moveTask(taskId, column as Column)}
           addToast={addToast}
           projectId={projectId}
           initialDescription={modalManager.newTaskInitialDescription ?? ""}
           initialWorkflowId={modalManager.newTaskInitialWorkflowId}
           onPlanningMode={onPlanningMode}
-          onSubtaskBreakdown={onSubtaskBreakdown}
         />
       </ModalErrorBoundary>
 

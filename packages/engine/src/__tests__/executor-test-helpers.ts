@@ -1,7 +1,37 @@
 import { vi } from "vitest";
 import type { Mock } from "vitest";
-import { installTaskWorktreeIdentityGuard } from "../worktree-hooks.js";
-import type * as ReviewerModule from "../reviewer.js";
+import { DEFAULT_MAX_POST_REVIEW_FIXES, type Task } from "@fusion/core";
+import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
+import type * as ReviewerModule from "../execution/reviewer.js";
+
+/*
+FNXC:EngineTests 2026-08-15-01:20:
+Graph dispatch made the agent store MANDATORY: admitWorkflowPrincipalBeforeNode (FN-8764/FN-8821,
+2026-08-07..09) fails closed with `workflow-principal-routing-unavailable:no-agent-store:<role>`
+before any model session is created, so a bare `new TaskExecutor(store, root)` never reaches
+createFnAgent and every fn_task_done/customTools capture stays undefined. Hundreds of legacy
+executor suites construct the executor bare; rather than edit each construction site, fill the
+missing agentStore at the ONE seam every such test goes through — the TaskExecutor constructor —
+with the same createWorkflowRoutingAgentStore fixture the migrated suites pass explicitly.
+An options bag that mentions `agentStore` at all (including an explicit `agentStore: undefined`)
+always wins, so suites asserting the fail-closed no-agent-store park keep that behavior by
+opting out explicitly. Mirrors the withSessionDefaults precedent below: supply only what a
+test omitted, never override what it controls.
+*/
+vi.mock("../executor.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown> & {
+    TaskExecutor: new (store: unknown, rootDir: string, options?: Record<string, unknown>) => unknown;
+  };
+  class DefaultRoutedTaskExecutor extends actual.TaskExecutor {
+    constructor(store: any, rootDir: string, options: Record<string, unknown> = {}) {
+      const filled = "agentStore" in options
+        ? options
+        : { ...options, agentStore: createWorkflowRoutingAgentStore(store).agentStore };
+      super(store, rootDir, filled);
+    }
+  }
+  return { ...actual, TaskExecutor: DefaultRoutedTaskExecutor };
+});
 
 // Mock external dependencies
 vi.mock("../pi.js", () => ({
@@ -29,7 +59,7 @@ vi.mock("../pi.js", () => ({
  * FNXC:WorkflowReviewers 2026-07-07-08:40:
  * Commit 3167dbc83 wired `proseSignalsClearApproval` + `extractJsonObjectCandidates` from reviewer.js into the workflow-step verdict parser (parseWorkflowStepVerdict). A mock that returns only `reviewStep` makes every executeWorkflowStep verdict parse throw `[vitest] No "extractJsonObjectCandidates" export`. Surface the real exports via importOriginal and stub only `reviewStep` (the agent-invoking seam these tests avoid); the verdict-parsing helpers then run for real.
  */
-vi.mock("../reviewer.js", async (importOriginal) => {
+vi.mock("../execution/reviewer.js", async (importOriginal) => {
   const actual = (await importOriginal()) as ReviewerModule;
   return { ...actual, reviewStep: vi.fn() };
 });
@@ -37,7 +67,14 @@ vi.mock("../logger.js", () => {
   const probe = process.env.FUSION_TEST_LOG_PROBE === "1"
     ? (...a: unknown[]) => console.error("[probe]", ...a)
     : undefined;
+  /*
+  FNXC:EngineTests 2026-07-26-09:50:
+  Executor construction now emits debug-only dispatch bookkeeping. The rescued
+  fn_task_done invariant suite imports this logger mock, so preserve its full
+  logger contract when it re-enters the default test suite.
+  */
   const createMockLogger = () => ({
+    debug: vi.fn(probe),
     log: vi.fn(probe),
     warn: vi.fn(probe),
     error: vi.fn(probe),
@@ -55,6 +92,7 @@ vi.mock("../logger.js", () => {
     ipcLog: createMockLogger(),
     projectManagerLog: createMockLogger(),
     hybridExecutorLog: createMockLogger(),
+    piLog: createMockLogger(),
     formatError: (err: unknown) => {
       if (err instanceof Error) {
         const message = err.message || err.name || "Error";
@@ -115,9 +153,11 @@ function withSessionDefaults(session: any, options?: { systemPrompt?: unknown })
   return session;
 }
 
-vi.mock("../agent-session-helpers.js", async () => {
+vi.mock("../agents/agent-session-helpers.js", async () => {
+  const actual = await vi.importActual<typeof import("../agents/agent-session-helpers.js")>("../agents/agent-session-helpers.js");
   const { createFnAgent } = await import("../pi.js");
   return {
+    ...actual,
     createResolvedAgentSession: async (options: any) => {
       const result = await createFnAgent(options);
       return {
@@ -149,15 +189,26 @@ vi.mock("../agent-session-helpers.js", async () => {
       ?? (typeof settings?.defaultThinkingLevelOverride === "string" ? settings.defaultThinkingLevelOverride : undefined)
       ?? (typeof settings?.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined),
     resolveValidatorThinkingLevel: (taskThinkingLevel: string | undefined, settings: Record<string, unknown> | undefined) =>
-      (typeof settings?.validatorThinkingLevel === "string" ? settings.validatorThinkingLevel : undefined)
-      ?? taskThinkingLevel
+      taskThinkingLevel
+      ?? (typeof settings?.validatorThinkingLevel === "string" ? settings.validatorThinkingLevel : undefined)
+      ?? (typeof settings?.validatorGlobalThinkingLevel === "string" ? settings.validatorGlobalThinkingLevel : undefined)
+      ?? (typeof (settings?.selectedWorkflowModelLanes as Record<string, unknown> | undefined)?.validatorThinkingLevel === "string"
+        ? (settings?.selectedWorkflowModelLanes as Record<string, unknown>).validatorThinkingLevel as string
+        : undefined)
       ?? (typeof settings?.defaultThinkingLevelOverride === "string" ? settings.defaultThinkingLevelOverride : undefined)
       ?? (typeof settings?.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined),
     resolveValidatorFallbackThinkingLevel: (taskThinkingLevel: string | undefined, settings: Record<string, unknown> | undefined) =>
       (typeof settings?.validatorFallbackThinkingLevel === "string" ? settings.validatorFallbackThinkingLevel : undefined)
       ?? (typeof settings?.fallbackThinkingLevel === "string" ? settings.fallbackThinkingLevel : undefined)
-      ?? (typeof settings?.validatorThinkingLevel === "string" ? settings.validatorThinkingLevel : undefined)
+      ?? (typeof (settings?.selectedWorkflowModelLanes as Record<string, unknown> | undefined)?.validatorFallbackThinkingLevel === "string"
+        ? (settings?.selectedWorkflowModelLanes as Record<string, unknown>).validatorFallbackThinkingLevel as string
+        : undefined)
       ?? taskThinkingLevel
+      ?? (typeof settings?.validatorThinkingLevel === "string" ? settings.validatorThinkingLevel : undefined)
+      ?? (typeof settings?.validatorGlobalThinkingLevel === "string" ? settings.validatorGlobalThinkingLevel : undefined)
+      ?? (typeof (settings?.selectedWorkflowModelLanes as Record<string, unknown> | undefined)?.validatorThinkingLevel === "string"
+        ? (settings?.selectedWorkflowModelLanes as Record<string, unknown>).validatorThinkingLevel as string
+        : undefined)
       ?? (typeof settings?.defaultThinkingLevelOverride === "string" ? settings.defaultThinkingLevelOverride : undefined)
       ?? (typeof settings?.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined),
     resolveExecutorSessionModel: (
@@ -189,35 +240,53 @@ vi.mock("../agent-session-helpers.js", async () => {
       }
       return { provider: undefined, modelId: undefined };
     },
+
   };
 });
-vi.mock("../worktree-names.js", async () => {
-  const actual = await vi.importActual<typeof import("../worktree-names.js")>("../worktree-names.js");
-  return {
-    ...actual,
-    generateWorktreeName: vi.fn().mockReturnValue("swift-falcon"),
-  };
-});
-vi.mock("../worktree-pool.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../worktree-pool.js")>();
-  const backend = await vi.importActual<typeof import("../worktree-backend.js")>("../worktree-backend.js");
+vi.mock("../worktree/worktree-pool.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../worktree/worktree-pool.js")>();
+  const backend = await vi.importActual<typeof import("../worktree/worktree-backend.js")>("../worktree/worktree-backend.js");
   return {
     ...actual,
     ActiveSessionWorktreeRemovalError: backend.ActiveSessionWorktreeRemovalError,
     RemovalReason: backend.RemovalReason,
     removeWorktree: vi.fn(actual.removeWorktree),
     classifyTaskWorktree: vi.fn().mockResolvedValue({ ok: true }),
+    /*
+    FNXC:ExecutorTests 2026-09-02-19:43:
+    Shared executor fixtures model FN-001's already-acquired pinned checkout. The acquisition boundary
+    now requires a non-empty registered branch probe in addition to classification, so provide matching
+    evidence rather than letting every session-oriented test fail before it opens an agent session.
+    */
+    getRegisteredWorktreeBranches: vi.fn().mockResolvedValue([{
+      worktreePath: "/tmp/test/.fusion/worktrees/fn-001",
+      branch: "fusion/fn-001",
+    }]),
     describeRegisteredWorktrees: vi.fn().mockResolvedValue({ rawOutput: "", canonicalized: [] }),
     isUsableTaskWorktree: vi.fn().mockResolvedValue(true),
   };
 });
-vi.mock("../worktree-hooks.js", () => ({
+vi.mock("../worktree/worktree-hooks.js", () => ({
   installTaskWorktreeIdentityGuard: vi.fn().mockResolvedValue(undefined),
   IDENTITY_GUARD_BYPASS_ENV: "FUSION_MERGER_BYPASS_IDENTITY_GUARD",
 }));
 
-vi.mock("../worktree-stale-lock.js", async () => {
-  const actual = await vi.importActual<typeof import("../worktree-stale-lock.js")>("../worktree-stale-lock.js");
+/*
+FNXC:EngineTests 2026-08-09-12:02:
+Executor harnesses model already-acquired worktrees, not git reconciliation. Graph-owned execution
+now refreshes a reused worktree before step-execute; keep that external git seam safely up-to-date so
+resume and stale-assistant lifecycle tests reach their implementation session instead of failing before it.
+*/
+vi.mock("../worktree-base-refresh.js", () => ({
+  refreshReusedWorktreeBase: vi.fn().mockResolvedValue({ kind: "up-to-date", executionSafe: true }),
+}));
+vi.mock("../worktree/secrets-env-writer.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../worktree/secrets-env-writer.js")>()),
+  reconcileSecretsEnvFingerprint: vi.fn().mockResolvedValue({ executionSafe: true, outcome: "up-to-date" }),
+}));
+
+vi.mock("../worktree/worktree-stale-lock.js", async () => {
+  const actual = await vi.importActual<typeof import("../worktree/worktree-stale-lock.js")>("../worktree/worktree-stale-lock.js");
   return {
     ...actual,
     parseIndexLockPath: vi.fn(actual.parseIndexLockPath),
@@ -226,8 +295,8 @@ vi.mock("../worktree-stale-lock.js", async () => {
   };
 });
 
-vi.mock("../worktree-stale-registration.js", async () => {
-  const actual = await vi.importActual<typeof import("../worktree-stale-registration.js")>("../worktree-stale-registration.js");
+vi.mock("../worktree/worktree-stale-registration.js", async () => {
+  const actual = await vi.importActual<typeof import("../worktree/worktree-stale-registration.js")>("../worktree/worktree-stale-registration.js");
   return {
     ...actual,
     parseStaleRegistrationPath: vi.fn(actual.parseStaleRegistrationPath),
@@ -317,6 +386,7 @@ vi.mock("node:fs", () => ({
   existsSync: vi.fn().mockReturnValue(true),
   realpathSync: vi.fn((path: string) => path),
   lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isDirectory: () => true })),
+  statSync: vi.fn(() => ({ isDirectory: () => true })),
 }));
 
 export const mockExecuteAll: Mock<() => Promise<unknown[]>> = vi.fn().mockResolvedValue([]);
@@ -324,7 +394,7 @@ export const mockTerminateAllSessions: Mock<() => Promise<void>> = vi.fn().mockR
 export const mockCleanup: Mock<() => Promise<void>> = vi.fn().mockResolvedValue(undefined);
 export const mockSteerActiveSessions: Mock<(message: string) => Promise<void>> = vi.fn().mockResolvedValue(undefined);
 
-vi.mock("../step-session-executor.js", () => ({
+vi.mock("../execution/step-session-executor.js", () => ({
   StepSessionExecutor: vi.fn().mockImplementation(function () {
     return {
       executeAll: mockExecuteAll,
@@ -343,12 +413,20 @@ vi.mock("../step-session-executor.js", () => ({
     const end = nextHeading === -1 ? prompt.length : nextHeading;
     return prompt.slice(start, end).trim();
   },
+  buildFastLanePrompt: (task: { id: string; description?: string; attachments?: Array<{ originalName: string }> }, _rootDir?: string, _settings?: unknown, worktreePath?: string) => [
+    `## Task: ${task.id}`,
+    "## Original Request",
+    task.description ?? "",
+    ...(task.attachments?.map((attachment) => attachment.originalName) ?? []),
+    `Work only inside ${worktreePath ?? "the assigned task worktree"}.`,
+    `fix(${task.id}): <short summary>`,
+  ].join("\n"),
 }));
 
-vi.mock("../rate-limit-retry.js", () => ({
+vi.mock("../errors/rate-limit-retry.js", () => ({
   withRateLimitRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
-vi.mock("../worktree-db-hydrate.js", () => ({
+vi.mock("../worktree/worktree-db-hydrate.js", () => ({
   hydrateWorktreeDb: vi.fn().mockResolvedValue({
     tasksCopied: 0,
     documentsCopied: 0,
@@ -356,8 +434,8 @@ vi.mock("../worktree-db-hydrate.js", () => ({
     degraded: false,
   }),
 }));
-vi.mock("../verification-utils.js", async () => {
-  const actual = await vi.importActual<typeof import("../verification-utils.js")>("../verification-utils.js");
+vi.mock("../execution/verification-utils.js", async () => {
+  const actual = await vi.importActual<typeof import("../execution/verification-utils.js")>("../execution/verification-utils.js");
   return {
     ...actual,
     runVerificationCommand: vi.fn(),
@@ -386,22 +464,20 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
 
 import { createFnAgent } from "../pi.js";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { generateWorktreeName } from "../worktree-names.js";
 import { findWorktreeUser } from "../merger.js";
-import { StepSessionExecutor } from "../step-session-executor.js";
-import { withRateLimitRetry } from "../rate-limit-retry.js";
+import { StepSessionExecutor } from "../execution/step-session-executor.js";
+import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
 import { exec, execSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
-import { hydrateWorktreeDb } from "../worktree-db-hydrate.js";
-import { classifyTaskWorktree, describeRegisteredWorktrees, isUsableTaskWorktree } from "../worktree-pool.js";
-import { classifyStaleLock, tryRemoveStaleLock } from "../worktree-stale-lock.js";
-import { parseStaleRegistrationPath, recoverStaleRegistration } from "../worktree-stale-registration.js";
-import { activeSessionRegistry, executingTaskLock } from "../active-session-registry.js";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { hydrateWorktreeDb } from "../worktree/worktree-db-hydrate.js";
+import { classifyTaskWorktree, describeRegisteredWorktrees, isUsableTaskWorktree } from "../worktree/worktree-pool.js";
+import { classifyStaleLock, tryRemoveStaleLock } from "../worktree/worktree-stale-lock.js";
+import { parseStaleRegistrationPath, recoverStaleRegistration } from "../worktree/worktree-stale-registration.js";
+import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
 import { TaskExecutor } from "../executor.js";
 
 export const mockedCreateFnAgent = vi.mocked(createFnAgent);
 export const mockedSessionManager = vi.mocked(SessionManager);
-export const mockedGenerateWorktreeName = vi.mocked(generateWorktreeName);
 export const mockedFindWorktreeUser = vi.mocked(findWorktreeUser);
 export const mockedStepSessionExecutor = vi.mocked(StepSessionExecutor);
 export const mockedWithRateLimitRetry = vi.mocked(withRateLimitRetry);
@@ -409,6 +485,7 @@ export const mockedExec = vi.mocked(exec);
 export const mockedExecSync = vi.mocked(execSync);
 export const mockedExistsSync = vi.mocked(existsSync);
 export const mockedRealpathSync = vi.mocked(realpathSync);
+export const mockedStatSync = vi.mocked(statSync);
 export const mockedHydrateWorktreeDb = vi.mocked(hydrateWorktreeDb);
 export const mockedClassifyTaskWorktree = vi.mocked(classifyTaskWorktree);
 export const mockedDescribeRegisteredWorktrees = vi.mocked(describeRegisteredWorktrees);
@@ -461,6 +538,16 @@ const withLegacyWorkflowFeatureDefaults = (settings: Record<string, unknown>) =>
   },
 });
 
+const LEGACY_MOCK_SETTINGS_DEFAULTS = {
+  maxConcurrent: 2,
+  maxWorktrees: 4,
+  pollIntervalMs: 15000,
+  groupOverlappingFiles: false,
+  autoMerge: false,
+  maxPostReviewFixes: DEFAULT_MAX_POST_REVIEW_FIXES,
+  worktreeInitCommand: undefined,
+};
+
 const createLegacySettingsMock = (initialSettings: Record<string, unknown>) => {
   const mock = vi.fn().mockResolvedValue(withLegacyWorkflowFeatureDefaults(initialSettings));
   const mockResolvedValue = mock.mockResolvedValue.bind(mock);
@@ -468,6 +555,19 @@ const createLegacySettingsMock = (initialSettings: Record<string, unknown>) => {
     mockResolvedValue(withLegacyWorkflowFeatureDefaults(settings))) as typeof mock.mockResolvedValue;
   return mock;
 };
+
+/*
+FNXC:EngineTests 2026-09-09-07:19:
+The legacy mockResolvedValue override intentionally replaces its settings object because existing
+callers use minimal settings fixtures to model incomplete configuration. Tests that need one setting
+while retaining the standard executor defaults must opt into this overlay helper instead.
+*/
+export function setMockSettings(
+  store: { getSettings: ReturnType<typeof createLegacySettingsMock> },
+  patch: Record<string, unknown>,
+): void {
+  store.getSettings.mockResolvedValue({ ...LEGACY_MOCK_SETTINGS_DEFAULTS, ...patch });
+}
 
 export function createMockStore() {
   const listeners = new Map<string, EventListener[]>();
@@ -486,6 +586,13 @@ export function createMockStore() {
   `getTask`/`updateTask` implementations replace these outright and are unaffected.
   */
   const patches = new Map<string, Record<string, unknown>>();
+  /*
+  FNXC:EngineTests 2026-08-21-08:34:
+  The shared executor store fake must preserve TaskStore's per-task atomic merge contract. Queue merge
+  calls and re-read after an async callback so sibling merges and simulated external task updates cannot
+  be overwritten by a stale workspaceWorktrees snapshot.
+  */
+  const workspaceMergeTails = new Map<string, Promise<void>>();
   const applyPatch = (id: string, patch: Record<string, unknown> | undefined) => {
     if (!patch || typeof patch !== "object") return;
     patches.set(id, { ...(patches.get(id) ?? {}), ...patch });
@@ -605,6 +712,67 @@ export function createMockStore() {
       applyPatch(id, patch);
       return { ...(patches.get(id) ?? {}), id };
     }),
+    /*
+    FNXC:EngineTests 2026-09-04-03:21:
+    The shared executor store fake must model TaskStore's atomic reducer so terminal graph-failure
+    persistence can test its live-row fence without falling into production backoff retries.
+    */
+    updateTaskAtomic: vi.fn(async (
+      id: string,
+      updater: (current: Task) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>,
+    ) => {
+      const current = await store.getTask(id) as Task;
+      const patch = await updater(current);
+      applyPatch(id, patch ?? undefined);
+      return store.getTask(id);
+    }),
+    mergeWorkspaceWorktreeEntry: vi.fn((
+      id: string,
+      repoRelPath: string,
+      patch: Partial<NonNullable<Task["workspaceWorktrees"]>[string]>
+        | ((current: Task) => Promise<Partial<NonNullable<Task["workspaceWorktrees"]>[string]>>),
+      options?: {
+        requireExistingEntry?: boolean;
+        clearSingularWorktree?: boolean;
+        validateBeforePersist?: (current: Task) => Promise<void>;
+      },
+    ) => {
+      const operation = (workspaceMergeTails.get(id) ?? Promise.resolve()).then(async () => {
+        const callbackTask = await store.getTask(id) as Task;
+        const callbackExisting = callbackTask.workspaceWorktrees?.[repoRelPath];
+        if (options?.requireExistingEntry && !callbackExisting) return callbackTask;
+        const resolvedPatch = typeof patch === "function" ? await patch(callbackTask) : patch;
+        const current = await store.getTask(id) as Task;
+        const workspaceWorktrees = current.workspaceWorktrees ?? {};
+        const existing = workspaceWorktrees[repoRelPath];
+        if (options?.requireExistingEntry && !existing) return current;
+        await options?.validateBeforePersist?.(current);
+        applyPatch(id, {
+          workspaceWorktrees: {
+            ...workspaceWorktrees,
+            [repoRelPath]: { ...existing, ...resolvedPatch },
+          },
+          ...(options?.clearSingularWorktree
+            ? {
+                worktree: null,
+                branch: null,
+                branchWriteOrigin: "engine",
+                executionStartBranch: null,
+                baseCommitSha: null,
+              }
+            : {}),
+        });
+        return store.getTask(id);
+      });
+      workspaceMergeTails.set(id, operation.then(() => undefined, () => undefined));
+      return operation;
+    }),
+    updateWorkspaceReviewState: vi.fn(async (id: string, _revision: number, reviewRemediation: unknown) => {
+      const current = await store.getTask(id);
+      const repositoryScope = { ...(current.repositoryScope ?? {}), reviewRemediation };
+      applyPatch(id, { repositoryScope });
+      return { task: { ...current, repositoryScope }, updated: true };
+    }),
     recordActivity: vi.fn().mockResolvedValue({}),
     moveTask: makeWriteThroughMoveTask(),
     handoffToReview: vi.fn().mockImplementation(async (id: string) => store.moveTask(id, "in-review")),
@@ -622,18 +790,18 @@ export function createMockStore() {
       updatedAt: new Date().toISOString(),
     })),
     logEntry: vi.fn().mockResolvedValue(undefined),
+    transitionQueuedEpisode: vi.fn(async (id: string, transition: { signature: string; blockedBy: string | null; overlapBlockedBy: string | null; action: string; outcome?: string }) => {
+      const prior = patches.get(id) ?? {};
+      const appended = !(prior.status === "queued" && prior.blockedBy === transition.blockedBy && prior.overlapBlockedBy === transition.overlapBlockedBy && prior.queuedLogEpisodeSignature === transition.signature);
+      await store.updateTask(id, { status: "queued", blockedBy: transition.blockedBy, overlapBlockedBy: transition.overlapBlockedBy, queuedLogEpisodeSignature: transition.signature });
+      if (appended) await store.logEntry(id, transition.action, transition.outcome);
+      return { appended, task: { id, ...patches.get(id) } };
+    }),
     addTaskComment: vi.fn().mockResolvedValue(undefined),
     parseStepsFromPrompt: vi.fn().mockResolvedValue([]),
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
     updateSettings: vi.fn().mockResolvedValue({}),
-    getSettings: createLegacySettingsMock({
-      maxConcurrent: 2,
-      maxWorktrees: 4,
-      pollIntervalMs: 15000,
-      groupOverlappingFiles: false,
-      autoMerge: false,
-      worktreeInitCommand: undefined,
-    }),
+    getSettings: createLegacySettingsMock(LEGACY_MOCK_SETTINGS_DEFAULTS),
     /*
     FNXC:EngineTests 2026-07-19-14:20 (U10b):
     Write-through step state, for the same reason `updateTask` became write-through (U5g).
@@ -651,6 +819,15 @@ export function createMockStore() {
       applyPatch(id, { steps });
       return { ...current, steps };
     }),
+    // FNXC:EngineTests 2026-07-22-10:30: Mirror the production atomic-start surface while retaining this helper's write-through projection behavior.
+    startStep: vi.fn(async (id: string, stepIndex: number, options?: { source?: "graph" }) => {
+      const task = await store.updateStep(id, stepIndex, "in-progress", options);
+      return {
+        task,
+        accepted: task.steps?.[stepIndex]?.status === "in-progress",
+        disposition: task.steps?.[stepIndex]?.status === "in-progress" ? "started" as const : "blocked" as const,
+      };
+    }),
     getWorkflowStep: vi.fn().mockResolvedValue(undefined),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     setPluginWorkflowStepTemplates: vi.fn(),
@@ -659,6 +836,7 @@ export function createMockStore() {
       listGoals: vi.fn().mockReturnValue([]),
     }),
     getFusionDir: vi.fn().mockReturnValue("/tmp/test/.fusion"),
+    getRootDir: vi.fn().mockReturnValue("/tmp/test"),
     clearStaleExecutionStartBranchReferences: vi.fn().mockReturnValue([]),
     // FNXC:EngineTestDrift 2026-07-11-22:40:
     // FN-7750 / Runfusion#1980 made isLiveSharedBranchGroupMemberIntegration
@@ -730,6 +908,89 @@ FNXC:TaskVerificationRequest 2026-07-19-04:30 (merged with U5f 2026-07-19-06:00)
 }
 
 /*
+FNXC:EngineTests 2026-08-09-05:51:
+Graph-owned coding workflows route planning, execution, and review nodes by role before opening an
+implementation session. The durable fixture advertises all three graph lanes so todo/planning tests
+cannot suspend at triage before their executor assertion; ephemeral-gate coverage still opts into a
+task-executor-managed runtime identity for its policy check.
+*/
+export function createWorkflowRoutingAgentStore(
+  store: Pick<any, "getTask" | "updateTask">,
+  options: { ephemeral?: boolean } = {},
+) {
+  const leases = new Map<string, string>();
+  const agent = {
+    id: "workflow-test-executor",
+    name: "Workflow Test Executor",
+    role: "executor",
+    roles: ["triage", "executor", "reviewer"],
+    state: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    runtimeConfig: {},
+    ...(options.ephemeral ? { metadata: { managedBy: "task-executor" } } : {}),
+  };
+  // Role-pool admission deliberately accepts durable agents only. For an ephemeral session-identity
+  // test, advertise a durable routing record and resolve its same-ID runtime identity as ephemeral.
+  const routingAgent = options.ephemeral ? { ...agent, metadata: undefined } : agent;
+  const countAgentLeases = (agentId: string) => [...leases.values()].filter((holder) => holder === agentId).length;
+  const agentStore = {
+    workflowProjectId: "executor-worktree-test-project",
+    listAgents: vi.fn(async () => [routingAgent]),
+    getAgent: vi.fn(async (agentId: string) => agentId === agent.id ? agent : null),
+    acquireWorkflowSessionCapacity: vi.fn(async (input: {
+      agentId: string;
+      attemptId: string;
+      maxProjectSessions?: number;
+      maxAgentSessions?: number;
+    }) => {
+      const existing = leases.get(input.attemptId);
+      if (existing) return existing === input.agentId ? "acquired" : "agent-capacity";
+      if (input.maxProjectSessions !== undefined && leases.size >= input.maxProjectSessions) return "project-capacity";
+      if (input.maxAgentSessions !== undefined && countAgentLeases(input.agentId) >= input.maxAgentSessions) return "agent-capacity";
+      leases.set(input.attemptId, input.agentId);
+      return "acquired";
+    }),
+    renewWorkflowSessionCapacity: vi.fn(async (attemptId: string) => leases.has(attemptId)),
+    releaseWorkflowSessionCapacity: vi.fn(async (attemptId: string) => {
+      leases.delete(attemptId);
+    }),
+    checkoutTask: vi.fn(async (
+      agentId: string,
+      taskId: string,
+      leaseContext?: { nodeId?: string; runId?: string; leaseEpoch?: number; renewedAt?: string },
+    ) => {
+      const task = await store.getTask(taskId);
+      if (!task) throw new Error(`Task ${taskId} not found`);
+      const renewedAt = leaseContext?.renewedAt ?? new Date().toISOString();
+      await store.updateTask(taskId, {
+        checkedOutBy: agentId,
+        checkedOutAt: task.checkedOutBy === agentId ? task.checkedOutAt ?? renewedAt : renewedAt,
+        checkoutNodeId: leaseContext?.nodeId ?? task.checkoutNodeId ?? null,
+        checkoutRunId: leaseContext?.runId ?? task.checkoutRunId ?? null,
+        checkoutLeaseRenewedAt: renewedAt,
+        checkoutLeaseEpoch: leaseContext?.leaseEpoch ?? task.checkoutLeaseEpoch ?? 0,
+      });
+      return await store.getTask(taskId);
+    }),
+  };
+  return {
+    agent,
+    agentStore,
+    leases,
+    reset() {
+      leases.clear();
+      agentStore.listAgents.mockClear();
+      agentStore.getAgent.mockClear();
+      agentStore.acquireWorkflowSessionCapacity.mockClear();
+      agentStore.renewWorkflowSessionCapacity.mockClear();
+      agentStore.releaseWorkflowSessionCapacity.mockClear();
+      agentStore.checkoutTask.mockClear();
+    },
+  };
+}
+
+/*
 FNXC:ExecutorTests 2026-07-19-09:40:
 Under graph ownership mockedCreateFnAgent fires once per graph session (e.g. Plan
 Review, then implementation), so a bare `customTools.find(...)` assignment on a
@@ -745,10 +1006,33 @@ export function captureNamedTool<T extends { name: string }>(
   return customTools?.find((tool) => tool.name === name) ?? previous;
 }
 
+/*
+FNXC:EngineTests 2026-08-09-05:51:
+Graph runs can open review and implementation sessions in either order and can retry implementation.
+`fn_task_done` belongs only to implementation sessions, so select the first positive match rather
+than relying on call order or excluding review prompts. Throwing on no match turns an unwired routing
+agent store into an immediate harness failure instead of a vacuous empty tool/prompt capture.
+*/
+export function implementationSessionCalls<T extends { customTools?: Array<{ name?: string }> }>(calls: T[]): T[] {
+  return calls.filter((call) => call.customTools?.some((tool) => tool.name === "fn_task_done"));
+}
+
+export function selectImplementationSessionCall<T extends { customTools?: Array<{ name?: string }> }>(calls: T[]): T {
+  const call = implementationSessionCalls(calls)[0];
+  if (!call) {
+    throw new Error(
+      "No implementation session was opened (fn_task_done missing); graph routing likely suspended because the TaskExecutor has no agentStore.",
+    );
+  }
+  return call;
+}
+
 export function resetExecutorMocks() {
   vi.clearAllMocks();
   mockedExec.mockReset();
   mockedExecSync.mockReset();
+  mockedStatSync.mockReset();
+  mockedStatSync.mockReturnValue({ isDirectory: () => true } as ReturnType<typeof statSync>);
   mockedIsUsableTaskWorktree.mockResolvedValue(true);
   mockedClassifyTaskWorktree.mockImplementation(async (rootDir: string, worktreePath: string) => {
     const usable = await mockedIsUsableTaskWorktree(rootDir, worktreePath);

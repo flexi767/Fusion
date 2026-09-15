@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { McpSecretReader } from "@fusion/core";
-import { resolveMcpServersForRuntime } from "../mcp-resolution.js";
+import { resolveMcpServersForRuntime } from "../mcp/mcp-resolution.js";
 
 function secrets(values: Record<string, string>): McpSecretReader {
   return {
@@ -63,8 +63,28 @@ describe("resolveMcpServersForRuntime", () => {
     ]);
   });
 
+  it("uses only provider-filtered plugin contributions before materialization", async () => {
+    const result = await resolveMcpServersForRuntime({
+      globalSettings: { mcpServers: { enabled: true } }, projectSettings: { mcpServers: { enabled: true } },
+      pluginServers: [
+        { pluginId: "enabled-plugin", server: { name: "navigator", transport: "stdio", command: "navigator", env: { TOKEN: { secretRef: "token", scope: "project" } } } },
+      ], secrets: secrets({ token: "SECRET_VALUE" }),
+    });
+    expect(result).toEqual({ servers: [{ name: "navigator", transport: "stdio", command: "navigator", env: { TOKEN: "SECRET_VALUE" } }], errors: [] });
+  });
+
+  it("uses the store scoped provider rather than requiring raw loader output", async () => {
+    const { resolveMcpServersForStore } = await import("../mcp/mcp-resolution.js");
+    const result = await resolveMcpServersForStore({
+      async getSettingsByScope() { return { global: { mcpServers: { enabled: true } }, project: { mcpServers: { enabled: true } } }; },
+      async getSecretsStore() { return secrets({}); },
+      async getProjectScopedPluginMcpServers() { return [{ pluginId: "enabled", server: { name: "scoped", transport: "stdio" as const, command: "scoped" } }]; },
+    });
+    expect(result.servers).toEqual([{ name: "scoped", transport: "stdio", command: "scoped" }]);
+  });
+
   it("resolves through the TaskStore-compatible settings split seam", async () => {
-    const { resolveMcpServersForStore } = await import("../mcp-resolution.js");
+    const { resolveMcpServersForStore } = await import("../mcp/mcp-resolution.js");
     const result = await resolveMcpServersForStore({
       async getSettingsByScope() {
         return {
@@ -84,7 +104,7 @@ describe("resolveMcpServersForRuntime", () => {
   });
 
   it("treats a missing settings seam as a genuine empty configuration", async () => {
-    const { resolveMcpServersForStore } = await import("../mcp-resolution.js");
+    const { resolveMcpServersForStore } = await import("../mcp/mcp-resolution.js");
     await expect(resolveMcpServersForStore({})).resolves.toEqual({ servers: [], errors: [] });
   });
 

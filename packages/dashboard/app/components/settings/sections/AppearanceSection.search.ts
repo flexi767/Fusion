@@ -8,6 +8,21 @@
 import type { SettingsSearchEntry } from "../search/types";
 
 export const appearanceSearchEntries: SettingsSearchEntry[] = [
+  /*
+   * FNXC:SettingsSearch 2026-08-19-14:19:
+   * Every rendered descriptor must have one co-located searchable entry. Keep
+   * the project-scoped conversation layout metadata identical to AppearanceSection
+   * so label, help, and field-key queries all reach the existing control.
+   */
+  {
+    sectionId: "appearance",
+    key: "chatMessageLayout",
+    labelKey: "settings.appearance.chatMessageLayout",
+    labelFallback: "Conversation layout",
+    helpKey: "settings.appearance.chatMessageLayoutHelp",
+    helpFallback:
+      "Choose Bubbles or Full width for normal Chat, Quick Chat, dock Chat, task Activity, and Planner Chat. Project-scoped; default: Bubbles.",
+  },
   {
     sectionId: "appearance",
     key: "openTasksInRightSidebar",
@@ -25,7 +40,7 @@ export const appearanceSearchEntries: SettingsSearchEntry[] = [
     labelFallback: "Open tasks as popups",
     helpKey: "settings.appearance.openMobileTasksInPopupHelp",
     helpFallback:
-      "When enabled, ordinary board task-card, List row/card, and right-dock Tasks-list clicks open the existing movable task popup so the board or list remains visible. Deep-tab and other task opens keep their current behavior. Default: disabled.",
+      "When enabled, ordinary board task-card and List row/card clicks open the existing movable task popup so the board or list remains visible. Deep-tab and other task opens keep their current behavior. Default: disabled.",
     /*
     FNXC:SettingsSearch 2026-07-15-17:35:
     "mobile" is indexed as a keyword rather than left to the copy: the stored key is `openMobileTasksInPopup` and the setting was mobile-only until FN-7945 made it all-viewport, so operators and older docs still call it the mobile popup setting even though the label no longer says it.

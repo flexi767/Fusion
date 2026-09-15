@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MissionInterviewModal } from "../MissionInterviewModal";
+import { readAppFile } from "../../test/cssFixture";
 
-const missionInterviewCss = readFileSync("app/components/MissionInterviewModal.css", "utf8");
+const missionInterviewCss = readAppFile("components/MissionInterviewModal.css");
 
 const mockStartMissionInterview = vi.fn();
 const mockRespondToMissionInterview = vi.fn();
@@ -347,18 +348,41 @@ describe("MissionInterviewModal", () => {
       expect(streamHandlers).toBeDefined();
     });
 
+    const trace = "**Ensuring Docker build includes dev dependencies for tests**\n\nDocker tests need development dependencies.\n\n**Planning deployment commit structure**\n\nDeployment commits remain independently reviewable.";
     act(() => {
-      streamHandlers.onThinking?.("Analyzing mission goals...");
+      streamHandlers.onThinking?.(trace);
     });
 
-    expect(await screen.findByText("Analyzing mission goals...")).toBeInTheDocument();
+    const output = await screen.findByText("Deployment commits remain independently reviewable.");
+    const container = output.closest(".planning-thinking-output")!;
+    const sections = container.querySelectorAll<HTMLElement>("[data-testid='thinking-trace-section']");
+    expect(sections).toHaveLength(2);
+    expect([...sections].every((section) => section.open)).toBe(true);
+    const first = sections[0];
+    act(() => streamHandlers.onThinking?.("\n\n**Editing README content**\n\nREADME edits remain visible in their own section."));
+    expect(container.querySelectorAll("[data-testid='thinking-trace-section']")).toHaveLength(3);
+    expect(container.querySelector("[data-testid='thinking-trace-section']")).toBe(first);
 
     act(() => {
       streamHandlers.onConnectionStateChange?.("reconnecting");
     });
 
     expect(screen.getByText("Reconnecting…")).toBeInTheDocument();
-    expect(screen.getByText("Analyzing mission goals...")).toBeInTheDocument();
+    expect(screen.getByText("Deployment commits remain independently reviewable.")).toBeInTheDocument();
+  });
+
+  it("keeps titles-only mission interview thinking visible with a raw trace escape hatch", async () => {
+    renderModal();
+    fireEvent.change(screen.getByLabelText("What do you want to build?"), { target: { value: "Build a mission planning workflow" } });
+    fireEvent.click(screen.getByText("Start Interview"));
+    await waitFor(() => expect(streamHandlers).toBeDefined());
+    act(() => streamHandlers.onThinking?.("**One**\n\n**Two**\n\n**Three**"));
+    await waitFor(() => expect(screen.getByTestId("thinking-trace-raw-toggle")).toBeInTheDocument());
+    const container = document.querySelector<HTMLElement>(".planning-thinking-output")!;
+    expect(container.querySelectorAll("[data-testid='thinking-trace-section']")).toHaveLength(0);
+    expect(container.querySelectorAll(".thinking-trace-section-empty")).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("thinking-trace-raw-toggle"));
+    expect(screen.getByTestId("thinking-trace-raw")).toHaveTextContent("**One**");
   });
 
   it("recovers a generating mission interview after a transient Stream error", async () => {
@@ -998,5 +1022,23 @@ describe("MissionInterviewModal", () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(textarea).toHaveValue("New mission idea");
+  });
+
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  Missions is keyed by project, so a project switch unmounts this modal mid-composition.
+  The unmount must persist an un-started goal under the instance's OWN project id — before
+  the keyed remount, the surviving instance saved it under the NEW project's
+  kb-mission-last-goal key on close.
+  */
+  it("saves an un-started goal draft under its own project id on unmount", () => {
+    const { unmount } = renderModal({ projectId: "proj_a" });
+
+    const textarea = screen.getByLabelText("What do you want to build?");
+    fireEvent.change(textarea, { target: { value: "Goal from project A" } });
+
+    unmount();
+
+    expect(mockSaveMissionGoal).toHaveBeenCalledWith("Goal from project A", "proj_a");
   });
 });

@@ -7,12 +7,16 @@ import { request } from "../../test-request.js";
 import { registerConfigMcpPiSettingsRoutes } from "../register-config-mcp-pi-settings-routes.js";
 import type { ApiRoutesContext } from "../types.js";
 
-function createApp(settings = { maxConcurrent: 6, maxTriageConcurrent: 3, maxWorktrees: 2 }) {
+function createApp(
+  settings = { maxConcurrent: 6, maxWorktrees: 2 },
+  pluginServers: Array<{ pluginId: string; server: unknown }> = [],
+) {
   const app = express();
   app.use(express.json());
   const store = {
     getRootDir: () => "/workspace",
     getSettingsFast: async () => settings,
+    getProjectScopedPluginMcpServers: async () => pluginServers,
   };
   const context = {
     router: app,
@@ -35,14 +39,54 @@ describe("registerConfigMcpPiSettingsRoutes", () => {
     const response = await request(createApp(), "GET", "/config");
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ maxConcurrent: 6, maxTriageConcurrent: 3, maxWorktrees: 2, rootDir: "/workspace" });
+    expect(response.body).toEqual({
+      maxConcurrent: 6,
+      maxWorktrees: 2,
+      worktreeLimitEnabled: true,
+      rootDir: "/workspace",
+    });
   });
 
-  it("uses option and fixed defaults for missing scheduler settings", async () => {
+  it("uses shipped resolver defaults for missing scheduler settings", async () => {
     const response = await request(createApp({}), "GET", "/config");
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ maxConcurrent: 9, maxTriageConcurrent: 2, maxWorktrees: 4, rootDir: "/workspace" });
+    expect(response.body).toEqual({
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+      worktreeLimitEnabled: true,
+      rootDir: "/workspace",
+    });
+  });
+
+  it("reports the resolver defaults when the authoritative settings read fails", async () => {
+    const app = express();
+    const store = { getRootDir: () => "/workspace", getSettingsFast: async () => { throw new Error("unavailable"); } };
+    registerConfigMcpPiSettingsRoutes({ router: app, getProjectContext: async () => ({ store }), rethrowAsApiError(error: unknown): never { throw error; } } as unknown as ApiRoutesContext);
+
+    const response = await request(app, "GET", "/config");
+    expect(response.body).toMatchObject({ maxConcurrent: 2, maxWorktrees: 4, worktreeLimitEnabled: true });
+  });
+
+  it("lists only provider-filtered valid project plugin MCP contributions", async () => {
+    const response = await request(createApp(undefined, [
+      { pluginId: "enabled", server: { name: "navigator", transport: "stdio", command: "roslyn" } },
+      { pluginId: "malformed", server: null },
+    ]), "GET", "/mcp/plugin-servers?projectId=project-a");
+
+    expect(response.status).toBe(200);
+    /*
+    FNXC:MemoryMcp 2026-08-15-05:10:
+    The route now also reports whether Fusion's built-in memory MCP entry resolves on this host
+    (a Node filesystem probe, deliberately outside the SPA bundle). Its value is environment-
+    dependent, so pin its presence and type while keeping the server list exact.
+    */
+    expect(response.body).toEqual({
+      servers: [
+        { pluginId: "enabled", server: { name: "navigator", transport: "stdio", command: "roslyn" } },
+      ],
+      fusionMemoryMcpAvailable: expect.any(Boolean),
+    });
   });
 
   it("rejects malformed MCP validation bodies", async () => {

@@ -12,17 +12,16 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  FileText,
   Gauge,
   Lightbulb,
   LayoutGrid,
-  List,
   Mail,
   MessageSquare,
-  Plus,
+  PanelsTopLeft,
   Search,
   Settings,
   Sparkles,
+  StickyNote,
   Target,
   Workflow,
   Zap,
@@ -33,6 +32,8 @@ import type { TaskView } from "../hooks/useViewState";
 import { buildPluginTaskViewId } from "../plugins/pluginViewRegistry";
 import { getPluginDashboardViewNavIcon } from "./pluginNavIcon";
 import { GithubIcon } from "./GithubIcon";
+import { getDashboardViewLabel } from "../../src/shared/dashboard-views";
+import { buildDashboardNavigationEntries } from "./dashboardNavigationEntries";
 
 export interface LeftSidebarExperimentalFeatures {
   insights?: boolean;
@@ -41,6 +42,7 @@ export interface LeftSidebarExperimentalFeatures {
   researchView?: boolean;
   evalsView?: boolean;
   ideationView?: boolean;
+  whiteboardView?: boolean;
   goalsView?: boolean;
 }
 
@@ -52,7 +54,10 @@ interface SidebarNavEntry {
   icon: ComponentType<LucideProps>;
   testId: string;
   badge?: number;
+  badgeLabel?: string;
+  alpha?: boolean;
   dot?: "pending" | "online";
+  dotLabel?: string;
   onSelect: () => void;
 }
 
@@ -104,9 +109,8 @@ function persistCollapsed(collapsed: boolean): void {
 export interface LeftSidebarNavProps {
   view: TaskView;
   onChangeView: (view: TaskView) => void;
-  onNewTask?: () => void;
+  onNewTask?: (workflowId?: string | null) => void;
   onOpenSettings?: () => void;
-  todosEnabled?: boolean;
   mailboxUnreadCount?: number;
   mailboxPendingApprovalCount?: number;
   chatHasUnreadResponse?: boolean;
@@ -237,8 +241,6 @@ export function LeftSidebarNav({
     persistSidebarWidth(nextWidth);
   }, [isCollapsed, sidebarWidth]);
 
-  const newTaskLabel = t("nav.newTask", "New Task");
-
   /*
   FNXC:Navigation 2026-06-22-12:00:
   All plugin dashboard views are flattened into a single sorted pool. Placement no longer splits the sidebar into primary/secondary sections; the sidebar is now ONE explicitly-ordered list (FN navigation reorder). The dependency-graph and compound-engineering plugin views are hoisted into fixed positions (graph after List, compound after Goals), so they must be excluded from the trailing "remaining plugin views" append to avoid duplication.
@@ -282,7 +284,7 @@ export function LeftSidebarNav({
 
   /*
   FNXC:Navigation 2026-06-22-12:00:
-  Single explicit sidebar order (top to bottom): board, list, graph, agents, chat, mailbox, planning, missions, goals, compound, automation, import, workflows, insight, research, ideation, command-center, documents (Artifacts), skills, memory, evals, then any remaining plugin views in their sorted order.
+  Single explicit sidebar order (top to bottom): dashboard, board, list, History, graph, planning, missions, agents, chat, mailbox, recommendations, skills, memory, Artifacts, goals, automation, import, workflows, insight, research, ideation, evals, then any remaining plugin views in their sorted order.
 
   Dev Server is intentionally absent: it moved to the right dock. Secrets and Todos remain omitted (they live in the right dock / mobile More-sheet / Header overflow).
 
@@ -296,7 +298,7 @@ export function LeftSidebarNav({
     */
     {
       id: "command-center",
-      label: t("nav.commandCenter", "Dashboard"),
+      label: t("nav.commandCenter", getDashboardViewLabel("command-center")),
       view: "command-center",
       isActive: view === "command-center",
       icon: Gauge,
@@ -305,22 +307,18 @@ export function LeftSidebarNav({
     },
     {
       id: "board",
-      label: t("nav.board", "Board"),
+      label: t("nav.board", getDashboardViewLabel("board")),
       view: "board",
       isActive: view === "board",
       icon: LayoutGrid,
       testId: "sidebar-nav-board",
       onSelect: () => onChangeView("board"),
     },
-    {
-      id: "list",
-      label: t("nav.list", "List"),
-      view: "list",
-      isActive: view === "list",
-      icon: List,
-      testId: "sidebar-nav-list",
-      onSelect: () => onChangeView("list"),
-    },
+    /*
+    FNXC:ListInRightDock 2026-09-14-04:42:
+    FN-382: List is a right-dock tool on every non-mobile host, so this rail no longer offers it as a page. The phone
+    navigation keeps both of its List producers.
+    */
     ...(graphPluginEntry ? [mapPluginEntry(graphPluginEntry)] : []),
     /*
     FNXC:Navigation 2026-06-23-01:30:
@@ -328,7 +326,7 @@ export function LeftSidebarNav({
     */
     {
       id: "planning",
-      label: t("nav.planning", "Planning"),
+      label: t("nav.planning", getDashboardViewLabel("planning")),
       view: "planning",
       isActive: view === "planning",
       icon: Lightbulb,
@@ -339,7 +337,7 @@ export function LeftSidebarNav({
     },
     {
       id: "missions",
-      label: t("nav.missions", "Missions"),
+      label: t("nav.missions", getDashboardViewLabel("missions")),
       view: "missions",
       isActive: view === "missions",
       icon: Target,
@@ -350,7 +348,7 @@ export function LeftSidebarNav({
       ? [
           {
             id: "agents",
-            label: t("nav.agents", "Agents"),
+            label: t("nav.agents", getDashboardViewLabel("agents")),
             view: "agents" as TaskView,
             isActive: view === "agents",
             icon: Bot,
@@ -361,7 +359,7 @@ export function LeftSidebarNav({
       : []),
     {
       id: "chat",
-      label: t("nav.chat", "Chat"),
+      label: t("nav.chat", getDashboardViewLabel("chat")),
       view: "chat",
       isActive: view === "chat",
       icon: MessageSquare,
@@ -371,7 +369,7 @@ export function LeftSidebarNav({
     },
     {
       id: "mailbox",
-      label: t("nav.mailbox", "Mailbox"),
+      label: t("nav.mailbox", getDashboardViewLabel("mailbox")),
       view: "mailbox",
       isActive: view === "mailbox",
       icon: Mail,
@@ -380,31 +378,26 @@ export function LeftSidebarNav({
       dot: view !== "mailbox" && mailboxPendingApprovalCount > 0 ? "pending" : view !== "mailbox" && mailboxUnreadCount > 0 ? "online" : undefined,
       onSelect: () => onChangeView("mailbox"),
     },
-    /*
-    FNXC:Navigation 2026-06-22-00:50:
-    Skills and Memory sit directly after Mailbox (still flag-gated by showSkillsTab / memoryView).
-    */
     ...(showSkillsTab
-      ? [{ id: "skills", label: t("header.skillsView", "Skills"), view: "skills" as TaskView, isActive: view === "skills", icon: Zap, testId: "sidebar-nav-skills", onSelect: () => onChangeView("skills") }]
+      ? [{ id: "skills", label: t("header.skillsView", getDashboardViewLabel("skills")), view: "skills" as TaskView, isActive: view === "skills", icon: Zap, testId: "sidebar-nav-skills", onSelect: () => onChangeView("skills") }]
       : []),
     ...(experimentalFeatures?.memoryView
-      ? [{ id: "memory", label: t("header.memoryView", "Memory"), view: "memory" as TaskView, isActive: view === "memory", icon: Brain, testId: "sidebar-nav-memory", onSelect: () => onChangeView("memory") }]
+      ? [{ id: "memory", label: t("header.memoryView", getDashboardViewLabel("memory")), view: "memory" as TaskView, isActive: view === "memory", icon: Brain, testId: "sidebar-nav-memory", onSelect: () => onChangeView("memory") }]
       : []),
     {
-      id: "documents",
-      /*
-      FNXC:Navigation 2026-06-21-18:25:
-      FN-6890 renames the top-level Documents label to Artifacts while preserving the documents view id and sidebar-nav-documents test id.
-      */
-      label: t("nav.documents", "Artifacts"),
-      view: "documents",
-      isActive: view === "documents",
-      icon: FileText,
-      testId: "sidebar-nav-documents",
-      onSelect: () => onChangeView("documents"),
+      id: "notes",
+      label: t("nav.notes", getDashboardViewLabel("notes")),
+      view: "notes",
+      isActive: view === "notes",
+      icon: StickyNote,
+      testId: "sidebar-nav-notes",
+      onSelect: () => onChangeView("notes"),
     },
+    ...(experimentalFeatures?.whiteboardView
+      ? [{ id: "whiteboard", label: t("nav.whiteboard", getDashboardViewLabel("whiteboard")), view: "whiteboard" as TaskView, isActive: view === "whiteboard", icon: PanelsTopLeft, testId: "sidebar-nav-whiteboard", alpha: true, onSelect: () => onChangeView("whiteboard") }]
+      : []),
     ...(experimentalFeatures?.goalsView
-      ? [{ id: "goals", label: t("header.goalsView", "Goals"), view: "goalsView" as TaskView, isActive: view === "goalsView", icon: Target, testId: "sidebar-nav-goals", onSelect: () => onChangeView("goalsView") }]
+      ? [{ id: "goals", label: t("header.goalsView", getDashboardViewLabel("goalsView")), view: "goalsView" as TaskView, isActive: view === "goalsView", icon: Target, testId: "sidebar-nav-goals", onSelect: () => onChangeView("goalsView") }]
       : []),
     /*
     FNXC:Navigation 2026-06-22-00:00 (reordered 2026-06-23-01:45):
@@ -412,7 +405,7 @@ export function LeftSidebarNav({
     */
     {
       id: "automations",
-      label: t("nav.automations", "Automations"),
+      label: t("nav.automations", getDashboardViewLabel("automations")),
       view: "automations" as TaskView,
       isActive: view === "automations",
       icon: Clock,
@@ -421,7 +414,7 @@ export function LeftSidebarNav({
     },
     {
       id: "import-tasks",
-      label: t("nav.importTasks", "Import Tasks"),
+      label: t("nav.importTasks", getDashboardViewLabel("import-tasks")),
       view: "import-tasks" as TaskView,
       isActive: view === "import-tasks",
       icon: GithubIcon,
@@ -431,7 +424,7 @@ export function LeftSidebarNav({
     ...(compoundPluginEntry ? [mapPluginEntry(compoundPluginEntry)] : []),
     {
       id: "workflows",
-      label: t("nav.workflows", "Workflows"),
+      label: t("nav.workflows", getDashboardViewLabel("workflows")),
       view: "workflows" as TaskView,
       isActive: view === "workflows",
       icon: Workflow,
@@ -439,19 +432,31 @@ export function LeftSidebarNav({
       onSelect: () => onChangeView("workflows"),
     },
     ...(experimentalFeatures?.insights
-      ? [{ id: "insights", label: t("header.insightsView", "Insights"), view: "insights" as TaskView, isActive: view === "insights", icon: Sparkles, testId: "sidebar-nav-insights", onSelect: () => onChangeView("insights") }]
+      ? [{ id: "insights", label: t("header.insightsView", getDashboardViewLabel("insights")), view: "insights" as TaskView, isActive: view === "insights", icon: Sparkles, testId: "sidebar-nav-insights", onSelect: () => onChangeView("insights") }]
       : []),
     ...(experimentalFeatures?.researchView
-      ? [{ id: "research", label: t("header.researchView", "Research"), view: "research" as TaskView, isActive: view === "research", icon: Search, testId: "sidebar-nav-research", onSelect: () => onChangeView("research") }]
+      ? [{ id: "research", label: t("header.researchView", getDashboardViewLabel("research")), view: "research" as TaskView, isActive: view === "research", icon: Search, testId: "sidebar-nav-research", onSelect: () => onChangeView("research") }]
       : []),
     ...(experimentalFeatures?.ideationView
-      ? [{ id: "ideation", label: t("nav.ideation", "Ideation"), view: "ideation" as TaskView, isActive: view === "ideation", icon: Lightbulb, testId: "sidebar-nav-ideation", onSelect: () => onChangeView("ideation") }]
+      ? [{ id: "ideation", label: t("nav.ideation", getDashboardViewLabel("ideation")), view: "ideation" as TaskView, isActive: view === "ideation", icon: Lightbulb, testId: "sidebar-nav-ideation", onSelect: () => onChangeView("ideation") }]
       : []),
     ...(experimentalFeatures?.evalsView
-      ? [{ id: "evals", label: t("header.evalsView", "Evals"), view: "evals" as TaskView, isActive: view === "evals", icon: Target, testId: "sidebar-nav-evals", onSelect: () => onChangeView("evals") }]
+      ? [{ id: "evals", label: t("header.evalsView", getDashboardViewLabel("evals")), view: "evals" as TaskView, isActive: view === "evals", icon: Target, testId: "sidebar-nav-evals", onSelect: () => onChangeView("evals") }]
       : []),
     ...remainingPluginViews.map(mapPluginEntry),
   ];
+
+  const sharedRegistry = buildDashboardNavigationEntries({
+    view,
+    onChangeView,
+    onNewTask: onNewTask ? () => onNewTask() : undefined,
+    onOpenSettings,
+    pluginDashboardViews,
+    showAgents: showAgentsTab,
+    showSkills: showSkillsTab,
+    flags: { memory: experimentalFeatures?.memoryView, whiteboard: experimentalFeatures?.whiteboardView, goals: experimentalFeatures?.goalsView, insights: experimentalFeatures?.insights, research: experimentalFeatures?.researchView, ideation: experimentalFeatures?.ideationView, evals: experimentalFeatures?.evalsView },
+  });
+  const sharedKinds = new Map(sharedRegistry.map((entry) => [entry.view ?? entry.id, entry.kind]));
 
   const renderEntry = (entry: SidebarNavEntry) => {
     const Icon = entry.icon;
@@ -466,6 +471,7 @@ export function LeftSidebarNav({
         aria-current={isActive && entry.view ? "page" : undefined}
         title={entry.label}
         data-testid={entry.testId}
+        data-navigation-kind={sharedKinds.get(entry.view ?? entry.id)}
         onClick={() => {
           if (entry.view) setOptimisticView(entry.view);
           entry.onSelect();
@@ -473,10 +479,17 @@ export function LeftSidebarNav({
       >
         <span className="left-sidebar-nav__icon-wrap">
           <Icon size={16} />
-          {entry.dot ? <span className={`status-dot status-dot--${entry.dot} left-sidebar-nav__dot`} aria-hidden="true" /> : null}
+          {entry.dot ? (
+            <span
+              className={`status-dot status-dot--${entry.dot} left-sidebar-nav__dot`}
+              aria-hidden={entry.dotLabel ? undefined : "true"}
+              aria-label={entry.dotLabel}
+            />
+          ) : null}
         </span>
         <span className="left-sidebar-nav__label">{entry.label}</span>
-        {entry.badge ? <span className="btn-badge left-sidebar-nav__badge">{formatCount(entry.badge)}</span> : null}
+        {entry.badge ? <span className="btn-badge left-sidebar-nav__badge" aria-label={entry.badgeLabel}>{formatCount(entry.badge)}</span> : null}
+        {entry.alpha ? <span className="btn-badge left-sidebar-nav__badge">{t("common.alpha", "Alpha")}</span> : null}
       </button>
     );
   };
@@ -493,23 +506,7 @@ export function LeftSidebarNav({
       </nav>
 
       <div className="left-sidebar-nav__footer">
-        {/*
-        FNXC:Navigation 2026-06-23-02:30:
-        New Task now lives in the footer, directly ABOVE Collapse (and Settings), per user request — the primary create action sits with the other persistent footer affordances instead of at the top of the rail.
-        */}
-        {onNewTask ? (
-          <button
-            type="button"
-            className="btn left-sidebar-nav__item left-sidebar-nav__new-task"
-            aria-label={newTaskLabel}
-            title={newTaskLabel}
-            data-testid="sidebar-nav-new-task"
-            onClick={onNewTask}
-          >
-            <Plus size={16} />
-            <span className="left-sidebar-nav__label">{newTaskLabel}</span>
-          </button>
-        ) : null}
+        {/* FNXC:StandardizedViewActions 2026-09-13-21:43: New Task is header-owned; the navigation footer contains navigation chrome only and must never expose a duplicate creation mutation. */}
         {/*
         FNXC:Navigation 2026-06-21-00:00:
         The sidebar collapse affordance belongs in the footer immediately above Settings, using the same row-item visual language. Expanded mode shows the Collapse label, while rail mode relies on the shared label-hiding rule so the button remains icon-only like Settings.
@@ -529,14 +526,14 @@ export function LeftSidebarNav({
         <button
           type="button"
           className="btn left-sidebar-nav__item left-sidebar-nav__settings"
-          aria-label={t("header.settings", "Settings")}
-          title={t("header.settings", "Settings")}
+          aria-label={t("header.settings", getDashboardViewLabel("settings"))}
+          title={t("header.settings", getDashboardViewLabel("settings"))}
           data-testid="sidebar-nav-settings"
           /* FNXC:Navigation 2026-06-22-12:00: Wrap so React's MouseEvent is not forwarded as onOpenSettings' settingsInitialSection arg. */
           onClick={() => onOpenSettings?.()}
         >
           <Settings size={16} />
-          <span className="left-sidebar-nav__label">{t("header.settings", "Settings")}</span>
+          <span className="left-sidebar-nav__label">{t("header.settings", getDashboardViewLabel("settings"))}</span>
         </button>
       </div>
 

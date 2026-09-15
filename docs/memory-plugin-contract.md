@@ -179,6 +179,53 @@ export class MemoryBackendError extends Error {
 | `QmdMemoryBackend` | `qmd` | Delegates read/write to file backend; schedules qmd refresh; uses qmd search first, local layered search fallback |
 | `ReadOnlyMemoryBackend` | `readonly` | Read-only; `write()` throws `MemoryBackendError("READ_ONLY", ...)`; `search()` returns empty |
 
+#### 3.3.1 Stash vector/semantic search (RUFU-126)
+
+`StashMemoryBackend` supports an **opt-in vector (semantic) recall path** for
+multi-word queries, layered in front of the RUFU-121 keyword path. Decision
+provenance D1–D5: `docs/research/stash-vector-search-evaluation.md`.
+
+**Endpoint contract.** `GET /api/v1/me/sessions/events/semantic-search` with
+`q=<raw trimmed query, capped at 200 chars>` (NOT RUFU-121-normalized — the
+embedder tokenizes on its own) and `limit=<same 1..20 clamp as the keyword
+path>`. Response: the standard `HistoryEventListResponse` envelope
+(`{ events: [...], has_more }`); each event carries `id`, `session_id`,
+`content`/`snippet`, and a `rank` (cosine similarity, 0..1) from Stash.
+
+**Flag (default off).** Per-project `stashVectorSearch` boolean, schema-only
+(no UI row, consistent with `stashUrl`/`stashApiKey`), default `false`. Threaded
+through `resolveMemoryBackend` into the materialized backend; the shared
+registry default instance always stays off. Default-off = zero behavior
+change until an operator enables it.
+
+**Multi-word-only rule (D2).** The vector attempt runs only when the flag is
+on AND the trimmed raw query has ≥2 whitespace-separated tokens. Single-word
+queries stay keyword-only (exact-token FTS is the best single-token baseline).
+
+**Fallback + negative-cache semantics.** On ANY vector failure — network
+error/timeout, non-2xx, malformed body, or an empty vector result list —
+`search()` falls through to the RUFU-121 keyword path **byte-identical**
+(normalized `q`, legacy empty-query URL, limit cap, fail-closed `[]`). A
+per-process negative capability cache (baseUrl-keyed, TTL 1h, test seam
+`__resetVectorCapabilityCacheForTests`) suppresses further vector attempts
+only after *definitive* no-vector responses — 404 (unpatched server), 405,
+501, 503 (embedder unconfigured); 422/500 and network errors are never
+cached, so the vector path retries on the next call.
+
+**Score-scale caveat (D5).** Vector `score` = response `rank` (cosine
+similarity, 0..1; missing/non-finite → 1.0); the keyword path keeps
+positional scores (2.0 first hit, 1.0 thereafter). The two scales differ —
+client-side min-score filters must treat score scales per-backend.
+
+**Upstream dependency.** The endpoint ships in a local Stash branch
+(`fusion-rufu-126-sessions-semantic-search`, plus `sentence-transformers` in
+requirements and a history-event embedding backfill task) — **not yet merged
+or deployed**. Against an unpatched server the vector path 404s and falls
+back transparently (once negatively cached per process). Operator rollout
+steps (image rebuild with the embedder, backfill, verification, flag
+enablement) are checklist form in
+`docs/research/stash-vector-search-evaluation.md`.
+
 ### 3.4 Registry Contract (Function-Based)
 
 ```ts
@@ -341,3 +388,13 @@ If backend contract behavior changes in source, update these docs in the same ch
 ---
 
 *Last updated: 2026-04-19*
+
+## Recall layer
+
+The project-scoped recall store records durable `decision`, `preference`, and `solution` entries with content, tags, source provenance (`taskId`, `agentId`, `sessionId`, and origin), timestamps, and optional knowledge-graph node ids. `appendRecall` normalizes content (trim/lowercase/whitespace collapse/trailing punctuation removal) and rejects an exact normalized hash or Jaccard token similarity of at least `0.9` among the 200 most-recent same-kind records. That candidate window is intentionally bounded: an older exact twin is not visible to the in-memory classifier.
+
+Writes hold a transaction advisory lock keyed by `(project, kind)` across candidate lookup and insert, which serializes the read-then-write near-duplicate decision without contending unrelated kinds or projects. The named `(project_id, kind, content_hash)` constraint is only an exact-hash backstop: `ON CONFLICT DO NOTHING` keeps the transaction usable for its in-transaction re-read when an exact twin is outside the bounded window (or a bypassing importer races the write). A raising unique insert would abort the transaction, and the constraint cannot catch near duplicates.
+
+`searchRecall` uses deterministic keyword scoring and one shared `clampRecallSearchLimit` (default 10, maximum 50) for keyword, vector, degradation, and list paths. A caller may supply a per-call `RecallVectorSearchProvider` to rank—never fetch, write, or filter—the already project-scoped, kind/tag-filtered candidate set. There is no provider registry, setting, default implementation, or embedding dependency. `mode: "vector"` is returned only for a successful provider result containing a resolvable candidate; missing, throwing, empty, or unknown-only providers degrade to keyword mode while `capabilities.vector` remains true when a provider was supplied. Provider limits are advisory: the store discards unknown ids, keeps each duplicate id's highest score, ranks, then applies the same clamped limit after ranking.
+
+Prompt builders may append a `### Recalled Context` section capped at 800 UTF-8 bytes; the budget includes its separator, heading, lines, and trailing newline, and never truncates pre-existing instructions. This task adds no MCP/tool surface, automatic capture, consolidation, agent pre-steering, or knowledge-graph integration; those remain later work.

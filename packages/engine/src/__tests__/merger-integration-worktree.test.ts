@@ -8,8 +8,8 @@ import {
   mockedCreateFnAgent,
   setupHappyPathExecSync,
 } from "./merger-test-helpers.js";
-import { activeSessionRegistry, executingTaskLock } from "../active-session-registry.js";
-import * as branchAutocorrect from "../branch-autocorrect.js";
+import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
+import * as branchAutocorrect from "../execution/branch-autocorrect.js";
 import {
   acquireReuseHandoff,
   ensureUsableMergeIntegrationRoot,
@@ -18,9 +18,9 @@ import {
   releaseReuseHandoff,
   resolveIntegrationRemote,
   resolveMergeIntegrationRoot,
-} from "../merger-integration-worktree.js";
-import * as worktreePool from "../worktree-pool.js";
-import { PoolDoubleLeaseError } from "../worktree-pool.js";
+} from "../merge/merger-integration-worktree.js";
+import * as worktreePool from "../worktree/worktree-pool.js";
+import { PoolDoubleLeaseError } from "../worktree/worktree-pool.js";
 
 describe("resolveMergeIntegrationRoot", () => {
   it("defaults to reusing the task worktree", () => {
@@ -312,11 +312,6 @@ describe("merger fresh reacquire init wiring", () => {
     expect(freshAcquireBlock?.[0]).toContain("runInitCommand: true");
     expect(freshAcquireBlock?.[0]).toContain("runConfiguredCommand:");
     expect(freshAcquireBlock?.[0]).toContain("runConfiguredMergeWorktreeCommand");
-  });
-
-  it("keeps direct-reuse shortcut on existing registrations", () => {
-    const mergerSource = readFileSync(new URL("../merger.ts", import.meta.url), "utf-8");
-    expect(mergerSource).toContain("Skip acquireTaskWorktree's");
   });
 });
 

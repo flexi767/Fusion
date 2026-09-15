@@ -1,11 +1,13 @@
+import { ViewHeader } from "./ViewHeader";
 import "./GroupTaskModal.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CheckCircle2, CircleDashed, ExternalLink, Loader2, X } from "lucide-react";
+import { CheckCircle2, CircleDashed, ExternalLink, Loader2 } from "lucide-react";
 import { apiAbandonBranchGroup, apiGetBranchGroup, apiPromoteBranchGroup, type BranchGroupSummary } from "../api";
 import { subscribeSse } from "../sse-bus";
 import { BRANCH_GROUP_REFRESH_TASK_EVENTS, shouldRefreshBranchGroupForTaskEvent } from "../utils/branchGroupSse";
 
+import { FloatingWindow } from "./FloatingWindow";
 interface GroupTaskModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -102,14 +104,16 @@ export function GroupTaskModal({ isOpen, onClose, groupId, projectId, onOpenMemb
   if (!isOpen || !groupId) return null;
 
   return (
-    <div className="modal-overlay open" onClick={onClose}>
-      <div className="modal modal-lg group-task-modal" role="dialog" aria-modal="true" aria-label={t("groupTask.ariaLabel", "Branch group details")} onClick={(event) => event.stopPropagation()}>
-        <div className="modal-header">
-          <h2>{t("groupTask.title", "Branch Group {{id}}", { id: groupId })}</h2>
-          <button type="button" className="modal-close" onClick={onClose} aria-label={t("actions.closeModal", "Close modal")}>
-            <X />
-          </button>
-        </div>
+    /* FNXC:ModalTouchGeometry 2026-07-26-13:15: Shared FloatingWindow owns this modal's touch drag, resize, clamping, and persistence while phone and short viewports retain their sheet behavior. */
+    <FloatingWindow windowKey="group-task" title={t("groupTask.title", "Branch Group")} ariaLabel={t("groupTask.ariaLabel", "Branch group details")} onClose={onClose} hideHeader dragHandleSelector=".modal-header" className="floating-window--group-task" defaultSize={{ width: 720, height: 560 }} minSize={{ width: 360, height: 280 }} persistGeometryKey="floating-window:group-task" suspendGeometryPersistenceOnMobile suspendGeometryPersistenceOnShortViewport closeOnOutsidePointerDown>
+      <div className="modal modal-lg group-task-modal">
+        {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: Shared dialog chrome; `.modal-header` stays for the drag handle selector. */}
+        <ViewHeader
+          className="modal-header"
+          title={t("groupTask.title", "Branch Group {{id}}", { id: groupId })}
+          onClose={onClose}
+          closeButtonProps={{ "aria-label": t("actions.closeModal", "Close modal") }}
+        />
         <div className="modal-body group-task-modal-body">
           {loading && (
             <div className="card group-task-modal-state"><Loader2 className="spin" /> {t("groupTask.loading", "Loading branch group…")}</div>
@@ -186,6 +190,6 @@ export function GroupTaskModal({ isOpen, onClose, groupId, projectId, onOpenMemb
           )}
         </div>
       </div>
-    </div>
+    </FloatingWindow>
   );
 }

@@ -2,28 +2,27 @@
 /* eslint-disable -eslint/no-unused-vars */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import "./executor-test-helpers.js";
-import { AgentSemaphore } from "../concurrency.js";
+import { AgentSemaphore } from "../concurrency/concurrency.js";
 import { detectReviewHandoffIntent, determineRevisionResetStart } from "../executor.js";
 import { TaskExecutor, buildExecutionPrompt } from "../executor.js";
 import { createFnAgent } from "../pi.js";
-import { reviewStep as mockedReviewStepFn } from "../reviewer.js";
+import { reviewStep as mockedReviewStepFn } from "../execution/reviewer.js";
 import { execSync } from "node:child_process";
 import { findWorktreeUser, aiMergeTask } from "../merger.js";
-import { WorktreePool } from "../worktree-pool.js";
-import { generateWorktreeName, slugify } from "../worktree-names.js";
-import type { Task, TaskDetail } from "@fusion/core";
+import { isEphemeralAgent, type Task, type TaskDetail } from "@fusion/core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { StepSessionExecutor } from "../step-session-executor.js";
+import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import { executorLog } from "../logger.js";
-import { withRateLimitRetry } from "../rate-limit-retry.js";
-import { MAX_RECOVERY_RETRIES } from "../recovery-policy.js";
-import { executingTaskLock } from "../active-session-registry.js";
-import { runVerificationCommand as mockedRunVerificationCommand } from "../verification-utils.js";
+import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
+import { MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
+import { executingTaskLock } from "../agents/active-session-registry.js";
+import { runVerificationCommand as mockedRunVerificationCommand } from "../execution/verification-utils.js";
 import {
   createMockStore,
+  createWorkflowRoutingAgentStore,
+  implementationSessionCalls,
   mockedCreateFnAgent,
   mockedSessionManager,
-  mockedGenerateWorktreeName,
   mockedFindWorktreeUser,
   mockedStepSessionExecutor,
   mockedWithRateLimitRetry,
@@ -34,9 +33,149 @@ import {
   mockCleanup,
   mockSteerActiveSessions,
   resetExecutorMocks,
+  selectImplementationSessionCall,
 } from "./executor-test-helpers.js";
 
 const mockedReviewStep = vi.mocked(mockedReviewStepFn);
+
+/* FNXC:EngineTests 2026-08-09-05:51: Graph-owned execution fails closed before session creation when a test omits agentStore, so every executor harness must route through the durable fixture unless a test explicitly overrides it. */
+function createRoutingExecutor(store: any, rootDir: string, options: any = {}) {
+  const { ephemeral, ...executorOptions } = options;
+  return new TaskExecutor(store, rootDir, {
+    agentStore: createWorkflowRoutingAgentStore(store, { ephemeral }).agentStore,
+    ...executorOptions,
+  });
+}
+
+/*
+FNXC:EngineTests 2026-08-09-05:51:
+A graph-owned executor cannot reach its implementation session without a routing agent store; before
+this guard, that suspend left behavioral captures empty. Keep both fixture identities explicit so
+policy tests exercise ephemeral gating while ordinary graph harnesses retain durable role-pool routing.
+*/
+/*
+FNXC:EngineTests 2026-08-09-12:02:
+An unwired agent store suspends graph-owned runs at step-execute before any implementation session
+opens. These guards cover durable and ephemeral routes plus step-list shapes so uniform session mocks
+cannot silently reduce lifecycle assertions to review-node captures.
+*/
+describe("workflow routing harness guards", () => {
+  it("offers explicit durable and ephemeral executor identities", () => {
+    const store = createMockStore();
+    expect(isEphemeralAgent(createWorkflowRoutingAgentStore(store).agent)).toBe(false);
+    expect(isEphemeralAgent(createWorkflowRoutingAgentStore(store, { ephemeral: true }).agent)).toBe(true);
+  });
+
+  it.each([
+    { ephemeral: false, steps: [] },
+    { ephemeral: false, steps: [{ name: "Implement", status: "pending" }] },
+    { ephemeral: true, steps: [] },
+    { ephemeral: true, steps: [{ name: "Implement", status: "pending" }] },
+  ])("opens an implementation session for $ephemeral principals with $steps step state", async ({ ephemeral, steps }) => {
+    resetExecutorMocks();
+    mockedCreateFnAgent.mockImplementation((async (options: any) => {
+      const taskDone = (options.customTools ?? []).find((tool: any) => tool.name === "fn_task_done");
+      return {
+        session: {
+          prompt: vi.fn().mockImplementation(async () => taskDone?.execute("guard", { summary: "done" })),
+          dispose: vi.fn(),
+        },
+      } as any;
+    }) as any);
+    const store = createMockStore();
+    const task = {
+      id: `FN-GUARD-${ephemeral}-${steps.length}`,
+      title: "Graph routing guard",
+      description: "Ensure graph routing reaches implementation",
+      column: "in-progress",
+      dependencies: [],
+      steps,
+      currentStep: 0,
+      log: [],
+      prompt: "# test\n## Steps\n### Step 0: Implement\n- [ ] work",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    store.getTask.mockResolvedValue(task as any);
+
+    await createRoutingExecutor(store, "/tmp/test", { ephemeral }).execute(task as any);
+
+    expect(implementationSessionCalls(
+      mockedCreateFnAgent.mock.calls.map(([options]) => options as { customTools?: Array<{ name?: string }> }),
+    )).toHaveLength(1);
+  });
+
+  it("fails loudly when graph routing has no agent store instead of accepting a non-implementation capture", async () => {
+    resetExecutorMocks();
+    const store = createMockStore();
+    const task = {
+      id: "FN-GUARD-NO-STORE",
+      title: "Missing routing guard",
+      description: "No agent store must suspend",
+      column: "in-progress",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      prompt: "# test",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    store.getTask.mockResolvedValue(task as any);
+
+    // Explicit `agentStore: undefined` opts out of the harness's default routing agent store
+    // (executor-test-helpers fills it for bare constructions) so the fail-closed park stays testable.
+    await new TaskExecutor(store, "/tmp/test", { agentStore: undefined }).execute(task as any);
+
+    expect(() => selectImplementationSessionCall(
+      mockedCreateFnAgent.mock.calls.map(([options]) => options as { customTools?: Array<{ name?: string }> }),
+    )).toThrow(/No implementation session was opened/);
+    expect(store.logEntry.mock.calls.some(
+      ([id, action]: [string, string]) => id === task.id && action.includes("workflow-principal-routing-unavailable:no-agent-store:executor"),
+    )).toBe(true);
+  });
+
+  /*
+  FNXC:EngineTests 2026-08-09-12:31:
+  A partially routed graph can open planning or review sessions before executor admission fails.
+  Lifecycle capture must reject that realistic non-implementation-only run rather than treating a
+  review-node call as evidence that the implementation session was exercised.
+  */
+  it("rejects a realistic review-only graph capture when no executor principal is available", async () => {
+    resetExecutorMocks();
+    const store = createMockStore();
+    const routing = createWorkflowRoutingAgentStore(store);
+    routing.agentStore.listAgents.mockResolvedValue([{
+      ...routing.agent,
+      role: "reviewer",
+      roles: ["triage", "reviewer"],
+    }]);
+    const task = {
+      id: "FN-GUARD-REVIEW-ONLY",
+      title: "Review-only routing guard",
+      description: "A missing executor must not produce a valid lifecycle capture",
+      column: "todo",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      prompt: "# test\n## Steps\n### Step 0: Implement\n- [ ] work",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    store.getTask.mockResolvedValue(task as any);
+
+    await new TaskExecutor(store, "/tmp/test", { agentStore: routing.agentStore }).execute(task as any);
+
+    expect(mockedCreateFnAgent).toHaveBeenCalled();
+    expect(implementationSessionCalls(
+      mockedCreateFnAgent.mock.calls.map(([options]) => options as { customTools?: Array<{ name?: string }> }),
+    )).toHaveLength(0);
+    expect(() => selectImplementationSessionCall(
+      mockedCreateFnAgent.mock.calls.map(([options]) => options as { customTools?: Array<{ name?: string }> }),
+    )).toThrow(/No implementation session was opened/);
+  });
+});
 
 describe("Workflow Steps Execution", () => {
   beforeEach(() => {
@@ -53,8 +192,8 @@ describe("Workflow Steps Execution", () => {
    * assertions measuring the retry contract instead of the graph's node count.
    */
   function implementationSessionCount(): number {
-    return mockedCreateFnAgent.mock.calls.filter((call: any[]) =>
-      ((call[0]?.customTools as any[]) || []).some((tool: any) => tool.name === "fn_task_done"),
+    return implementationSessionCalls(
+      mockedCreateFnAgent.mock.calls.map(([options]) => options as { customTools?: Array<{ name?: string }> }),
     ).length;
   }
 
@@ -136,7 +275,7 @@ describe("Workflow Steps Execution", () => {
       };
     }) as any);
 
-    const executor = new TaskExecutor(store, "/tmp/test", {});
+    const executor = createRoutingExecutor(store, "/tmp/test", {});
     await executor.execute(task as any);
 
     /*
@@ -179,7 +318,7 @@ describe("Workflow Steps Execution", () => {
 
     const onComplete = vi.fn();
     const onError = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onComplete, onError });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onComplete, onError });
 
     await executor.execute({
       id: "FN-001",
@@ -250,7 +389,7 @@ describe("Workflow Steps Execution", () => {
     } as any);
 
     const onError = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onError });
 
     await executor.execute({
       id: "FN-001",
@@ -328,22 +467,25 @@ describe("Workflow Steps Execution", () => {
     }) as any);
 
     const onError = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onError });
     const markGraphExecuteSelfRequeued = vi.spyOn(executor as any, "markGraphExecuteSelfRequeued");
     (executor as any).activeWorktrees.set("FN-ASSISTANT-STALE", new Set([task.worktree]));
 
     await executor.execute(task as any);
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-ASSISTANT-STALE", {
-      sessionFile: null,
-      recoveryRetryCount: 1,
-      nextRecoveryAt: expect.any(String),
-    });
-    expect(store.updateTask).toHaveBeenCalledWith("FN-ASSISTANT-STALE", {
-      sessionFile: null,
-      status: null,
-      error: null,
-    });
+    const retryRecoveryWrite = store.updateTask.mock.calls.find(
+      ([id, patch, runContext]) => id === "FN-ASSISTANT-STALE"
+        && patch?.sessionFile === null
+        && patch?.recoveryRetryCount === 1
+        && typeof patch?.nextRecoveryAt === "string"
+        && runContext === undefined,
+    );
+    expect(retryRecoveryWrite).toHaveLength(2);
+    expect(retryRecoveryWrite?.[2]).toBeUndefined();
+    expect(store.updateTask.mock.calls).toContainEqual([
+      "FN-ASSISTANT-STALE",
+      { sessionFile: null, status: null, error: null },
+    ]);
     expect(store.moveTask).toHaveBeenCalledWith("FN-ASSISTANT-STALE", "todo", { preserveResumeState: true });
     expect(markGraphExecuteSelfRequeued).toHaveBeenCalledWith("FN-ASSISTANT-STALE");
     expect(executingTaskLock.has("FN-ASSISTANT-STALE")).toBe(false);
@@ -389,16 +531,26 @@ describe("Workflow Steps Execution", () => {
       };
     }) as any);
     const onError = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onError });
 
     await executor.execute(task as any);
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-ASSISTANT-STALE-EXHAUSTED", {
-      status: "failed",
-      error: "Cannot continue from message role: assistant",
-      recoveryRetryCount: null,
-      nextRecoveryAt: null,
-    });
+    /*
+    FNXC:EngineTests 2026-08-09-12:02:
+    Graph-owned stale-assistant recovery reaches the existing classifier once reused-worktree
+    reconciliation is mocked safe. Assert the absent run context is observably undefined and the
+    two-argument store write retains its exact arity, distinguishing it from the graph wrapper path.
+    */
+    const exhaustedRecoveryWrite = store.updateTask.mock.calls.find(
+      ([id, patch, runContext]) => id === "FN-ASSISTANT-STALE-EXHAUSTED"
+        && patch?.status === "failed"
+        && patch?.error === "Cannot continue from message role: assistant"
+        && patch?.recoveryRetryCount === null
+        && patch?.nextRecoveryAt === null
+        && runContext === undefined,
+    );
+    expect(exhaustedRecoveryWrite).toHaveLength(2);
+    expect(exhaustedRecoveryWrite?.[2]).toBeUndefined();
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-ASSISTANT-STALE-EXHAUSTED", "todo", expect.anything());
     expect(onError).toHaveBeenCalledOnce();
   });
@@ -433,17 +585,28 @@ describe("Workflow Steps Execution", () => {
       };
       store.getTask.mockResolvedValue(baseTask as any);
 
-      mockedCreateFnAgent.mockResolvedValue({
+      /*
+      FNXC:EngineTests 2026-07-23-21:40:
+      The graph's `parse` node re-derives the step list from PROMPT.md and writes every step
+      back as `pending`, so an `in-progress` step on the fixture literal no longer survives to
+      `detectPendingReviewBlock`. The pending-review shape can only arise from the
+      implementation session itself: the agent starts the step, requests review, and exits
+      without fn_task_done. Simulate that by having the session mark the parsed step
+      `in-progress` (the review-request log line is already on the row).
+      */
+      mockedCreateFnAgent.mockImplementation(async () => ({
         session: {
-          prompt: vi.fn().mockResolvedValue(undefined),
+          prompt: vi.fn(async () => {
+            store._setRow("FN-5436-B", { steps: [{ name: "Implement", status: "in-progress" }] });
+          }),
           dispose: vi.fn(),
           on: vi.fn(),
           sessionManager: { getLeafId: vi.fn().mockReturnValue("leaf-1") },
           state: {},
         },
-      } as any);
+      }) as any);
 
-      const executor = new TaskExecutor(store, "/tmp/test", {});
+      const executor = createRoutingExecutor(store, "/tmp/test", {});
       await executor.execute(baseTask as any);
 
       // FNXC:EngineTests 2026-07-19-10:55 (U10b): the pending-review block must skip the retry
@@ -460,7 +623,24 @@ describe("Workflow Steps Execution", () => {
         undefined,
         expect.objectContaining({ agentId: "executor" }),
       );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-5436-B", "in-review");
+      /*
+      FNXC:WorkflowExecutionOwnership 2026-07-29-19:10 (U8 / R4):
+      FN-5436's invariant is unchanged — a pending-review block still parks the card in review,
+      never `failed`. What changed is the OWNER. The executor no longer hands off inline; the
+      graph routes the ending to its `review-pending-handoff` node, which moves the card with
+      workflow provenance. So this asserts the same outcome plus proof of who produced it, which
+      is strictly stronger than the old two-argument `moveTask(id, "in-review")` — that shape
+      could not distinguish a graph-owned park from an out-of-band one, and telling those apart
+      is the entire point of the unit.
+      */
+      expect(store.moveTask).toHaveBeenCalledWith(
+        "FN-5436-B",
+        "in-review",
+        expect.objectContaining({
+          workflowMoveSource: "workflow-graph",
+          workflowMoveMetadata: expect.objectContaining({ nodeId: "review-pending-handoff" }),
+        }),
+      );
     });
 
     it("keeps existing retry loop when no pending review block is present", async () => {
@@ -490,7 +670,7 @@ describe("Workflow Steps Execution", () => {
         },
       } as any);
 
-      const executor = new TaskExecutor(store, "/tmp/test", {});
+      const executor = createRoutingExecutor(store, "/tmp/test", {});
       await executor.execute(baseTask as any);
 
       // FNXC:EngineTests 2026-07-19-10:55 (U10b): no pending-review block means the full retry
@@ -549,7 +729,7 @@ describe("Workflow Steps Execution", () => {
 
       const onComplete = vi.fn();
       const onError = vi.fn();
-      const executor = new TaskExecutor(store, "/tmp/test", { onComplete, onError });
+      const executor = createRoutingExecutor(store, "/tmp/test", { onComplete, onError });
       await executor.execute(baseTask as any);
 
       // FNXC:EngineTests 2026-07-19-10:55 (U10b): implicit done is accepted without a retry, so the
@@ -606,7 +786,7 @@ describe("Workflow Steps Execution", () => {
     createAgentWithTaskDone();
 
     const onComplete = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onComplete });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onComplete });
 
     await executor.execute({
       id: "FN-001",
@@ -644,8 +824,8 @@ describe("Workflow Steps Execution", () => {
     // workflow-step Promise.race used a frozen 360 s setTimeout, and the
     // rejection from the mock prompt never reached the catch block in time.
     // The behavior we actually need to lock down is:
-    //   1. sendTaskBackForFix re-opens the actionable implementation step plus
-    //      any trailing verification/delivery step, not just a trivial last step.
+    //   1. sendTaskBackForFix re-opens exactly the workflow-selected trailing step;
+    //      it must not infer additional work from step titles.
     //   2. The rerun bounce uses preserveResumeState so step progress and
     //      the worktree survive the in-progress → todo hop.
     //   3. PROMPT.md gains the Workflow Step Failure section with the
@@ -689,15 +869,14 @@ describe("Workflow Steps Execution", () => {
     };
     store.getTask.mockImplementation(async () => mutableTask);
 
-    store.updateStep.mockImplementation(async (_taskId: string, stepIndex: number, status: string) => {
-      if (mutableTask.steps[stepIndex]) {
-        mutableTask.steps[stepIndex].status = status as any;
-      }
-      return {};
+    (store as any).updateTaskAtomic = vi.fn(async (_taskId: string, mutate: (current: any) => Partial<typeof mutableTask> | null) => {
+      const patch = mutate(mutableTask);
+      if (patch) Object.assign(mutableTask, patch);
+      return mutableTask as any;
     });
 
     const onError = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onError });
 
     // Stub injectWorkflowStepFailureInstructions: PROMPT.md write is verified
     // by separate tests; here we just need sendTaskBackForFix to proceed past
@@ -748,39 +927,45 @@ describe("Workflow Steps Execution", () => {
       "Workflow step failed",
     );
 
-    // (1) failure comment + the implementation-bearing step is re-opened with the trailing delivery step.
-    // Before FN-7162, reopenLastStepForRevision returned only [1] here, so a
-    // Code Review / Browser Verification REVISE could re-run Documentation &
-    // Delivery against unchanged implementation work and loop until budget exhaustion.
+    // (1) failure comment + only the policy-selected trailing step receives a replay occurrence.
+    // FN-180 removed title-based suffix selection because it was a second replay
+    // authority that scheduled unrelated completed checklist work after review.
     expect(store.addTaskComment).toHaveBeenCalledWith(
       "FN-001",
       expect.stringContaining("Workflow step failed"),
       "agent",
     );
-    const reopenedStepIndexes = store.updateStep.mock.calls
-      .filter((call: any[]) => call[0] === "FN-001" && call[2] === "pending")
-      .map((call: any[]) => call[1]);
-    expect(reopenedStepIndexes).toEqual([0, 1]);
+    expect(mutableTask.steps.map((step) => [step.name, step.status])).toEqual([
+      ["Implementation", "done"],
+      ["Documentation & Delivery", "done"],
+      ["Documentation & Delivery", "pending"],
+    ]);
+    expect(mutableTask.currentStep).toBe(2);
 
-    // FNXC:ExecutorMoveTask 2026-07-07-08:38: Await the captured rerun-bounce promise instead of flushing a fixed number of microtasks. 3167dbc83 inserted clearTerminalStepFailuresForRetry (an extra awaited hop) between the todo and in-progress moves inside performWorkflowRerunBounce, so a fixed microtask count no longer deterministically drains the bounce to the final in-progress moveTask. Awaiting the promise is exact and survives future awaited hops; the bounce still performs the todo→in-progress hop (executor.ts:3650 then 3674).
+    // Await the exact production bounce rather than relying on timer/microtask flushing.
     await bouncePromise;
 
-    // (2) bounce uses preserveResumeState so step progress + worktree survive
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", expect.objectContaining({ preserveResumeState: true, preserveWorktree: true }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-001", "in-review");
+    // (2) remediation already in WIP stays in WIP; no sideways reset move can discard progress.
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(mutableTask.column).toBe("in-progress");
     expect(onError).not.toHaveBeenCalled();
 
     // (3) PROMPT.md injection was invoked with the failure context. The
     // actual file write is covered by other tests; here we just need to
     // confirm sendTaskBackForFix forwards the right step name and feedback.
-    // Last arg is MAX_WORKFLOW_STEP_RETRIES (private const, currently 3) so
-    // the injected PROMPT.md note shows "3/3 (0 remaining)".
+    // FNXC:EngineTests 2026-07-23-21:40 (FN-8503): the retry arg is now a
+    // structured `{ attempt, max? }` presentation (max omitted = unbounded
+    // Code Review budget). A hard-failure exhaustion passes the bounded
+    // MAX_WORKFLOW_STEP_RETRIES budget (currently 3), so the injected
+    // PROMPT.md note shows "3/3 (0 remaining)".
+    // FNXC:ReviewSeverityGate 2026-08-10-17:33: a trailing `findings` arg now carries structured
+    // review findings into the injection; a prompt-mode hard failure has none, so it is `undefined`.
     expect(injectSpy).toHaveBeenCalledWith(
-      mutableTask,
+      expect.objectContaining({ id: mutableTask.id }),
       feedback,
       stepName,
-      expect.any(Number),
+      { attempt: 3, max: 3 },
+      undefined,
     );
 
     // The scheduleWorkflowRerun stub above never registers the 15 s
@@ -789,7 +974,7 @@ describe("Workflow Steps Execution", () => {
     injectSpy.mockRestore();
   });
 
-  it("keeps post-verdict reopening bounded across all-done, mixed, and single-step states", async () => {
+  it("keeps post-verdict replay bounded across all-done, mixed, and single-step states", async () => {
     const cases = [
       {
         id: "all-done-terminal",
@@ -797,8 +982,7 @@ describe("Workflow Steps Execution", () => {
           { name: "Implementation", status: "done" as const },
           { name: "Documentation & Delivery", status: "done" as const },
         ],
-        expectedIndexes: [0, 1],
-        expectedCurrent: 0,
+        expectedIndex: 2,
       },
       {
         id: "mixed-terminal-pending",
@@ -806,14 +990,12 @@ describe("Workflow Steps Execution", () => {
           { name: "Implementation", status: "done" as const },
           { name: "Documentation & Delivery", status: "pending" as const },
         ],
-        expectedIndexes: [0],
-        expectedCurrent: 0,
+        expectedIndex: null,
       },
       {
         id: "single-step",
         steps: [{ name: "Implementation", status: "done" as const }],
-        expectedIndexes: [0],
-        expectedCurrent: 0,
+        expectedIndex: 1,
       },
     ];
 
@@ -831,28 +1013,34 @@ describe("Workflow Steps Execution", () => {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      store.updateStep.mockImplementation(async (_taskId: string, stepIndex: number, status: string) => {
-        mutableTask.steps[stepIndex]!.status = status as any;
-        return {};
+      const originalLength = mutableTask.steps.length;
+      (store as any).updateTaskAtomic = vi.fn(async (_taskId: string, mutate: (current: any) => Partial<typeof mutableTask> | null) => {
+        const patch = mutate(mutableTask);
+        if (patch) Object.assign(mutableTask, patch);
+        return mutableTask as any;
       });
 
-      const executor = new TaskExecutor(store, "/tmp/test");
-      const reopened = await (executor as unknown as {
+      const executor = createRoutingExecutor(store, "/tmp/test");
+      const replayed = await (executor as unknown as {
         reopenLastStepForRevision: (
           taskId: string,
           task: typeof mutableTask,
         ) => Promise<{ index: number; name: string; indexes: number[] } | null>;
       }).reopenLastStepForRevision(mutableTask.id, mutableTask);
 
-      expect(reopened?.indexes).toEqual(testCase.expectedIndexes);
-      expect(reopened?.index).toBe(testCase.expectedCurrent);
-      expect(store.updateStep.mock.calls.map((call: any[]) => call[1])).toEqual(testCase.expectedIndexes);
-      expect(store.updateTask).toHaveBeenCalledWith(mutableTask.id, { currentStep: testCase.expectedCurrent });
-      expect(mutableTask.steps.some((step) => step.status === "pending")).toBe(true);
+      if (testCase.expectedIndex === null) {
+        expect(replayed).toBeNull();
+        expect(mutableTask.steps).toHaveLength(originalLength);
+      } else {
+        expect(replayed).toMatchObject({ index: testCase.expectedIndex, indexes: [testCase.expectedIndex] });
+        expect(mutableTask.currentStep).toBe(testCase.expectedIndex);
+        expect(mutableTask.steps).toHaveLength(originalLength + 1);
+        expect(mutableTask.steps.at(-1)?.status).toBe("pending");
+      }
     }
   });
 
-  it("reopens terminal verification and delivery suffix with the implementation step", async () => {
+  it("does not infer verification or delivery suffixes from step names", async () => {
     const store = createMockStore();
     const mutableTask = {
       id: "FN-7162-SUFFIX",
@@ -870,12 +1058,13 @@ describe("Workflow Steps Execution", () => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    store.updateStep.mockImplementation(async (_taskId: string, stepIndex: number, status: string) => {
-      mutableTask.steps[stepIndex]!.status = status as any;
-      return {};
+    (store as any).updateTaskAtomic = vi.fn(async (_taskId: string, mutate: (current: any) => Partial<typeof mutableTask> | null) => {
+      const patch = mutate(mutableTask);
+      if (patch) Object.assign(mutableTask, patch);
+      return mutableTask as any;
     });
 
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const reopened = await (executor as unknown as {
       reopenLastStepForRevision: (
         taskId: string,
@@ -883,9 +1072,14 @@ describe("Workflow Steps Execution", () => {
       ) => Promise<{ index: number; name: string; indexes: number[] } | null>;
     }).reopenLastStepForRevision(mutableTask.id, mutableTask);
 
-    expect(reopened).toEqual({ index: 0, name: "Implementation", indexes: [0, 1, 2] });
-    expect(store.updateStep.mock.calls.map((call: any[]) => call[1])).toEqual([0, 1, 2]);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-7162-SUFFIX", { currentStep: 0 });
+    expect(reopened).toEqual({ index: 3, name: "Documentation & Delivery", indexes: [3] });
+    expect(mutableTask.steps.map((step) => [step.name, step.status])).toEqual([
+      ["Implementation", "done"],
+      ["Testing & Verification", "done"],
+      ["Documentation & Delivery", "done"],
+      ["Documentation & Delivery", "pending"],
+    ]);
+    expect(mutableTask.currentStep).toBe(3);
   });
 
   // FNXC:WorkflowOptionalStepFix 2026-06-27-13:30:
@@ -913,9 +1107,12 @@ describe("Workflow Steps Execution", () => {
       dependencies: [] as string[],
       steps: [
         { name: "Step 0", status: "done" as const },
-        // Last step reopened by reopenLastStepForRevision — this is the step
-        // the merge gate blocks on until the executor re-runs.
-        { name: "Documentation & Delivery", status: "pending" as const },
+        // A review-to-WIP handoff carries named pending remediation.
+        {
+          name: "Fix: Documentation & Delivery",
+          status: "pending" as const,
+          remediation: { wave: 1, gate: "Code Review" as const, gateStepId: "code-review", detail: "Apply requested documentation fix" },
+        },
       ],
       currentStep: 1,
       log: [] as any[],
@@ -927,7 +1124,7 @@ describe("Workflow Steps Execution", () => {
     store.getTask.mockImplementation(async () => mutableTask);
 
     const onError = vi.fn();
-    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const executor = createRoutingExecutor(store, "/tmp/test", { onError });
 
     const outcome = await (executor as unknown as {
       performWorkflowRerunBounce: (
@@ -939,13 +1136,14 @@ describe("Workflow Steps Execution", () => {
 
     // The bounce succeeds instead of throwing "cannot bounce to in-progress".
     expect(outcome).toBe("bounced");
-    // in-review → todo (preserving step progress + worktree) → in-progress, so
-    // the reopened step is re-executed rather than left stranded.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-7122", "todo", {
+    // Review remediation returns directly to WIP; Planning is never an intermediate stop.
+    expect(store.moveTask).toHaveBeenCalledTimes(1);
+    expect(store.moveTask).toHaveBeenCalledWith("FN-7122", "in-progress", {
       preserveResumeState: true,
       preserveWorktree: true,
+      workflowMoveSource: "workflow-remediation",
+      lifecycleReason: "code-review-revise-remediation",
     });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-7122", "in-progress");
     expect(onError).not.toHaveBeenCalled();
   });
 
@@ -982,7 +1180,7 @@ describe("Real-time steering injection", () => {
   it("initializes seenSteeringIds with existing comments at session start", async () => {
     const store = createMockStore();
     const steerFn = vi.fn().mockResolvedValue(undefined);
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const existingComment = {
       id: "1234567890-abc123",
       text: "Existing comment",
@@ -999,7 +1197,7 @@ describe("Real-time steering injection", () => {
   it("injects new steering comments via session.steer() on task:updated", async () => {
     const store = createMockStore();
     const steerFn = vi.fn().mockResolvedValue(undefined);
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     setLegacyActiveSession(executor, steerFn);
     const newComment = {
       id: "9876543210-def456",
@@ -1022,7 +1220,7 @@ describe("Real-time steering injection", () => {
 
   it("injects new steering comments via active StepSessionExecutor on task:updated", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const seenIds = new Set<string>();
     const updateSteeringComments = vi.fn();
     const steerActiveSessions = vi.fn().mockImplementation(async () => {
@@ -1073,14 +1271,14 @@ describe("Real-time steering injection", () => {
 
   it("queues step-session steering comments for the next prompt when no step session is active", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const newComment = {
       id: "step-session-queued-comment",
       text: "Please apply this in the next step prompt",
       createdAt: new Date().toISOString(),
       author: "user" as const,
     };
-    const { StepSessionExecutor: ActualStepSessionExecutor } = await vi.importActual<typeof import("../step-session-executor.js")>("../step-session-executor.js");
+    const { StepSessionExecutor: ActualStepSessionExecutor } = await vi.importActual<typeof import("../execution/step-session-executor.js")>("../execution/step-session-executor.js");
     const stepExecutor = new ActualStepSessionExecutor({
       taskDetail: makeSteeringTask() as any,
       worktreePath: "/tmp/test",
@@ -1109,7 +1307,7 @@ describe("Real-time steering injection", () => {
 
   it("injects new steering comments via active workflow step session on task:updated", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const steer = vi.fn().mockResolvedValue(undefined);
     const newComment = {
       id: "workflow-step-comment",
@@ -1147,7 +1345,7 @@ describe("Real-time steering injection", () => {
 
   it("marks new comments seen before injecting and logs once across simultaneous surfaces", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const newComment = {
       id: "shared-surface-comment",
       text: "Please reach every live surface once",
@@ -1193,7 +1391,7 @@ describe("Real-time steering injection", () => {
 
   it("does not re-inject an already seen active StepSessionExecutor steering comment", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const steerActiveSessions = vi.fn().mockResolvedValue(undefined);
     const comment = {
       id: "step-session-seen-comment",
@@ -1225,7 +1423,7 @@ describe("Real-time steering injection", () => {
   it("does not re-inject already seen steering comments", async () => {
     const store = createMockStore();
     const steerFn = vi.fn().mockResolvedValue(undefined);
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const comment = {
       id: "1111111111-aaa111",
       text: "Original comment",
@@ -1242,7 +1440,7 @@ describe("Real-time steering injection", () => {
   it("marks comment as seen even if steer() throws", async () => {
     const store = createMockStore();
     const steerFn = vi.fn().mockRejectedValue(new Error("Session disconnected"));
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const comment = {
       id: "2222222222-bbb222",
       text: "Comment that fails",
@@ -1259,7 +1457,7 @@ describe("Real-time steering injection", () => {
 
   it("does not inject or log when active surfaces receive empty or undefined steering comments", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const legacySteer = vi.fn().mockResolvedValue(undefined);
     const stepSteerActiveSessions = vi.fn().mockResolvedValue(1);
     const workflowSteer = vi.fn().mockResolvedValue(undefined);
@@ -1288,7 +1486,7 @@ describe("Real-time steering injection", () => {
 
   it("does not inject steering comments for tasks without an active injection target", async () => {
     const store = createMockStore();
-    new TaskExecutor(store, "/tmp/test");
+    createRoutingExecutor(store, "/tmp/test");
 
     await (store as any)._triggerAsync("task:updated", {
       ...makeSteeringTask([{
@@ -1310,7 +1508,7 @@ describe("Real-time steering injection", () => {
   it("handles multiple new steering comments in a single task:updated", async () => {
     const store = createMockStore();
     const steerFn = vi.fn().mockResolvedValue(undefined);
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     setLegacyActiveSession(executor, steerFn, new Set(["existing-comment"]));
 
     await (store as any)._triggerAsync("task:updated", makeSteeringTask([
@@ -1341,7 +1539,7 @@ describe("Real-time steering injection", () => {
     const store = createMockStore();
     store.getSettings.mockResolvedValue({ reviewHandoffPolicy: "comment-triggered" } as any);
     const steerFn = vi.fn().mockResolvedValue(undefined);
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store, "/tmp/test");
     const { session, state } = setLegacyActiveSession(executor, steerFn);
     const executeReviewHandoff = vi.fn().mockResolvedValue(undefined);
     (executor as any).executeReviewHandoff = executeReviewHandoff;
@@ -1405,7 +1603,7 @@ describe("TaskExecutor loop recovery", () => {
       autoMerge: false,
     });
 
-    const executor = new TaskExecutor(store, "/tmp/test-root");
+    const executor = createRoutingExecutor(store, "/tmp/test-root");
 
     // Directly inject an active session (avoids full execute() chain)
     (executor as any).activeSessions.set("FN-001", {
@@ -1427,7 +1625,6 @@ describe("TaskExecutor loop recovery", () => {
       inactivityMs: 0,
       activitySinceProgress: 100,
       ignoredStepUpdateCount: 0,
-      shouldRequeue: true,
     });
 
     expect(result).toBe(true);
@@ -1441,7 +1638,7 @@ describe("TaskExecutor loop recovery", () => {
 
   it("handleLoopDetected returns false when no active session", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test-root");
+    const executor = createRoutingExecutor(store, "/tmp/test-root");
 
     // No session active (activeSessions is empty)
     const result = await executor.handleLoopDetected({
@@ -1451,7 +1648,6 @@ describe("TaskExecutor loop recovery", () => {
       inactivityMs: 0,
       activitySinceProgress: 100,
       ignoredStepUpdateCount: 0,
-      shouldRequeue: true,
     });
 
     expect(result).toBe(false);
@@ -1469,7 +1665,6 @@ describe("TaskExecutor loop recovery", () => {
       inactivityMs: 0,
       activitySinceProgress: 100,
       ignoredStepUpdateCount: 0,
-      shouldRequeue: true,
     });
     expect(result1).toBe(true);
 
@@ -1481,7 +1676,6 @@ describe("TaskExecutor loop recovery", () => {
       inactivityMs: 0,
       activitySinceProgress: 200,
       ignoredStepUpdateCount: 0,
-      shouldRequeue: true,
     });
     expect(result2).toBe(false);
   });
@@ -1497,7 +1691,6 @@ describe("TaskExecutor loop recovery", () => {
       inactivityMs: 0,
       activitySinceProgress: 100,
       ignoredStepUpdateCount: 0,
-      shouldRequeue: true,
     });
 
     expect(result).toBe(false);
@@ -1515,7 +1708,6 @@ describe("TaskExecutor loop recovery", () => {
       inactivityMs: 0,
       activitySinceProgress: 100,
       ignoredStepUpdateCount: 0,
-      shouldRequeue: true,
     });
 
     await vi.advanceTimersByTimeAsync(60000);

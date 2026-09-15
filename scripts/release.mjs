@@ -11,25 +11,23 @@
 //     `release` for stable), up to date with origin
 //   - at least one pending changeset in .changeset/
 //   - `npm login` already completed (publish uses the active npm token)
-//   - real releases require a live operator to type the authorization phrase
-//     ("authorized") at an interactive prompt; they cannot run non-interactively.
-//     Dry-runs skip this because they make no file/git/npm changes
+//   - real releases always prompt y/N before mutation (no --yes skip)
+//     Dry-runs make no file/git/npm changes
 //
 // Usage:
-//   pnpm release                  # interactive: review changesets, accept or override version, type the authorization phrase, then confirm before mutation
-//   pnpm release --yes            # accept the proposed version, skip the y/N confirmation prompt, but STILL require the typed authorization phrase before mutation
-//   pnpm release --dry-run        # preview only; non-interactive by default; no authorization or file/git/npm changes
+//   pnpm release                  # interactive: review changesets, accept or override version, then confirm before mutation
+//   pnpm release --dry-run        # preview only; non-interactive by default; no file/git/npm changes
 //   pnpm release --dry-run --interactive
 //                                 # preview only, but exercise the version prompt override
 //   pnpm release --channel beta   # beta release from `main`: enters changesets pre-mode,
 //                                 # versions X.Y.Z-beta.N, publishes npm dist-tag `beta`,
-//                                 # GitHub prerelease; skips Homebrew tap + X draft
+//                                 # GitHub prerelease; prints a tester-facing X draft; skips Homebrew tap
 //   pnpm release --channel stable # stable release from the `release` branch:
 //                                 # exits pre-mode if present, publishes dist-tag `latest`,
 //                                 # GitHub release marked latest, bumps Homebrew tap
 //
 //   Without --channel, the script prompts for the channel; the default answer
-//   (and the silent default for --yes / non-interactive dry-runs) is BETA.
+//   (and the silent default for non-interactive dry-runs) is BETA.
 
 import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, statSync, existsSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
@@ -38,21 +36,29 @@ import { tmpdir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 
-import {
-  evaluateReleaseAuthorization,
-  isReleaseAuthorizationPhrase,
-  RELEASE_AUTHORIZATION_PHRASE,
-} from "./lib/release-authorization-gate.mjs";
 import { extractVersionNotes, replaceVersionSection } from "./lib/extract-version-notes.mjs";
 import { parseChangesetFile } from "./lib/changeset-schema.mjs";
 import { distillReleaseNotes } from "./lib/distill-release-notes.mjs";
 import { shouldPromptForVersion } from "./lib/release-prompt-gate.mjs";
+import { selectChannelChangesets } from "./lib/channel-changeset-scope.mjs";
+import {
+  evaluateBetaCycleAnchor,
+  isVersionAheadOfStable,
+  latestStableVersionFromTags,
+  setPackageJsonVersions,
+} from "./lib/release-version-anchor.mjs";
 import {
   archivePointerLine,
   CHANGELOG_ARCHIVE_CUTOFF,
   CHANGELOG_ARCHIVE_FILE,
   partitionVersionsByCutoff,
 } from "./lib/changelog-archive.mjs";
+import {
+  buildRootChangelogLines,
+  collectDistilledBodies,
+  normalizeChangelogLines,
+  parseChangelog,
+} from "./lib/changelog-sync.mjs";
 
 const argv = process.argv.slice(2);
 const args = new Set(argv);
@@ -61,15 +67,25 @@ const args = new Set(argv);
  * `--dry-run` must not read stdin in the default agent-shell path; `--interactive` is the explicit maintainer override for prompt coverage while preserving real-release prompts.
  */
 const DRY_RUN = args.has("--dry-run");
-const AUTO_YES = args.has("--yes") || args.has("-y");
 const INTERACTIVE = args.has("--interactive");
+/*
+ * FNXC:ReleaseScript 2026-08-03-02:57:
+ * `--yes` / `-y` is removed. Real releases must confirm interactively; agents must not release
+ * (AGENTS.md → Releasing). Fail closed if the old flag is passed so muscle-memory does not skip
+ * the proceed prompt by accident.
+ */
+if (args.has("--yes") || args.has("-y")) {
+  console.error("✗ `--yes` / `-y` was removed from `pnpm release`. Run interactively and confirm with y.");
+  process.exit(1);
+}
 
 /*
  * FNXC:UpdateChannels 2026-07-19-13:20:
  * Two release tracks (see docs/plans/2026-07-19-001-beta-stable-release-tracks-plan.md):
  * - `--channel beta` runs on `main`, uses changesets pre-mode (auto `pre enter beta`),
  *   publishes to the npm `beta` dist-tag, tags vX.Y.Z-beta.N, and creates a GitHub
- *   PRERELEASE. Homebrew tap and the X draft are stable-only and skipped.
+ *   PRERELEASE. Homebrew tap is stable-only; the X draft is printed for both
+ *   channels (betas get tester-facing copy).
  * - `--channel stable` runs on the long-lived `release` branch, exits
  *   pre-mode if `.changeset/pre.json` was merged in from main, publishes to `latest`,
  *   marks the GitHub Release latest, and bumps the Homebrew tap. After a stable
@@ -90,11 +106,11 @@ if (CHANNEL !== null && CHANNEL !== "stable" && CHANNEL !== "beta") {
  * default is BETA: day-to-day releases are betas cut from main, while stable
  * promotions are deliberate (release branch) and must be chosen explicitly
  * (answer "stable" or pass --channel stable). The prompt obeys the same gate
- * as the version prompt (shouldPromptForVersion): non-interactive dry-runs and
- * --yes runs never read stdin and silently default to beta.
+ * as the version prompt (shouldPromptForVersion): non-interactive dry-runs
+ * never read stdin and silently default to beta.
  */
 if (CHANNEL === null) {
-  if (shouldPromptForVersion({ dryRun: DRY_RUN, autoYes: AUTO_YES, interactive: INTERACTIVE })) {
+  if (shouldPromptForVersion({ dryRun: DRY_RUN, interactive: INTERACTIVE })) {
     while (true) {
       const answer = (await ask("Release channel — beta or stable? [beta]: ")).toLowerCase();
       if (answer === "" || answer === "beta" || answer === "b") {
@@ -158,6 +174,12 @@ function run(cmd, { capture = false, allowFail = false, cwd } = {}) {
  *
  * FNXC:ReleaseChangelog 2026-07-13-22:55:
  * Cutoff is CHANGELOG_ARCHIVE_CUTOFF (currently 0.60.0) from scripts/lib/changelog-archive.mjs.
+ *
+ * FNXC:ReleaseChangelog 2026-07-21-20:22:
+ * Preserve already-distilled version bodies from the existing root CHANGELOG.md
+ * (and archive) when regenerating. Distillation only rewrites the current
+ * version; without this, every prior release loses its Highlights/New/Fixed
+ * summary on the next release sync and falls back to the raw package aggregate.
  */
 function syncRootChangelog() {
   const pkgsDir = "packages";
@@ -191,12 +213,22 @@ function syncRootChangelog() {
     }
   }
 
+  // Prefer already-distilled bodies so historical releases keep their summary.
+  const existingCurrent = existsSync("CHANGELOG.md")
+    ? readFileSync("CHANGELOG.md", "utf8")
+    : "";
+  const existingArchive = existsSync(CHANGELOG_ARCHIVE_FILE)
+    ? readFileSync(CHANGELOG_ARCHIVE_FILE, "utf8")
+    : "";
+  const preservedBodies = collectDistilledBodies([existingCurrent, existingArchive]);
+
   const { current, archived } = partitionVersionsByCutoff(versionOrder);
   const currentLines = buildRootChangelogLines({
     title: "# Fusion changelog",
     banner: "User-facing release notes aggregated across all packages. This file is auto-synced from each `packages/*/CHANGELOG.md` by `scripts/release.mjs` — do not edit by hand.",
     parsed,
     versionOrder: current,
+    preservedBodies,
   });
 
   if (archived.length > 0) {
@@ -208,60 +240,11 @@ function syncRootChangelog() {
     banner: `Archived release notes before ${CHANGELOG_ARCHIVE_CUTOFF}. This file is auto-synced from each \`packages/*/CHANGELOG.md\` by \`scripts/release.mjs\` — do not edit by hand.`,
     parsed,
     versionOrder: archived,
+    preservedBodies,
   });
 
   writeFileSync("CHANGELOG.md", normalizeChangelogLines(currentLines));
   writeFileSync(CHANGELOG_ARCHIVE_FILE, normalizeChangelogLines(archiveLines));
-}
-
-function buildRootChangelogLines({ title, banner, parsed, versionOrder }) {
-  const lines = [title, "", banner, ""];
-
-  for (const version of versionOrder) {
-    lines.push(`## ${version}`, "");
-    // Sort packages alphabetically within a version for deterministic output.
-    const pkgsForVersion = parsed
-      .filter((p) => p.versions.has(version))
-      .sort((a, b) => a.pkgName.localeCompare(b.pkgName));
-    for (const p of pkgsForVersion) {
-      const body = p.versions.get(version).trim();
-      if (!body) continue;
-      lines.push(`### ${p.pkgName}`, "");
-      // Bump heading levels by one so package sub-sections nest cleanly.
-      const bumped = body.replace(/^(#{1,5}) /gm, (_m, hashes) => `${hashes}# `);
-      lines.push(bumped, "");
-    }
-  }
-
-  return lines;
-}
-
-function normalizeChangelogLines(lines) {
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
-}
-
-/**
- * Parse a changeset-format CHANGELOG into { versions, order }.
- * Splits on top-level `## ` headings; the version key is the heading text
- * verbatim (e.g. "0.2.5", or "0.4.0 (pre-release, unpublished)").
- */
-function parseChangelog(raw) {
-  const versions = new Map();
-  const order = [];
-  // Strip out the first-line title and any horizontal rules so they don't
-  // pollute the first version section.
-  const stripped = raw.replace(/^# [^\n]*\n?/, "").replace(/^---\s*$/gm, "");
-  const sections = stripped.split(/^## /m).slice(1); // drop pre-first-version preamble
-  for (const section of sections) {
-    const nl = section.indexOf("\n");
-    const key = (nl === -1 ? section : section.slice(0, nl)).trim();
-    const body = nl === -1 ? "" : section.slice(nl + 1).trim();
-    if (!versions.has(key)) {
-      versions.set(key, body);
-      order.push(key);
-    }
-  }
-  return { versions, order };
 }
 
 /** Compare two semver-ish version strings ("0.2.5", "0.4.0 (pre-release)"). */
@@ -281,7 +264,6 @@ function parseVersionKey(key) {
 }
 
 async function confirm(prompt) {
-  if (AUTO_YES) return true;
   const rl = createInterface({ input: stdin, output: stdout });
   const answer = (await rl.question(`${prompt} [y/N] `)).trim().toLowerCase();
   rl.close();
@@ -402,6 +384,51 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/*
+ * FNXC:UpdateChannels 2026-07-24-09:40:
+ * Requirement: after a stable release ships, the NEXT beta must be based on the
+ * stable version that just shipped — never a beta below it. v0.73.0 exposed the
+ * gap: the stable was cut on `release` while `main` stayed in the 0.72.0-based
+ * pre-mode cycle, so the next beta would have been v0.73.0-beta.7 (older than
+ * the published v0.73.0) and `pnpm dev` on main still reported the last beta.
+ * The helpers below let the beta path detect that stale cycle and rebase it
+ * onto the shipped stable, and let the stable path prove main picked the
+ * version up (see the automatic back-merge after promotion).
+ */
+
+/** Highest published STABLE version from local `v*` git tags (prereleases excluded). */
+function latestStableTagVersion() {
+  const out = run("git tag --list 'v*'", { capture: true, allowFail: true }).stdout;
+  return latestStableVersionFromTags(out);
+}
+
+/** Package names in the changesets "fixed" group — they all share one version. */
+function readFixedGroupPackageNames() {
+  try {
+    const config = JSON.parse(readFileSync(join(".changeset", "config.json"), "utf8"));
+    return (config.fixed || []).flat();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Point every fixed-group package.json at `version` (plus the workspace root).
+ * Used to re-anchor a stale beta cycle on the shipped stable before
+ * `changeset pre enter`, which snapshots these versions into pre.json's
+ * `initialVersions` and derives every X.Y.Z-beta.N from them.
+ *
+ * Returns the list of rewritten paths so a dry-run can restore them.
+ */
+function rewriteFixedGroupVersions(version) {
+  const paths = ["package.json"];
+  for (const name of readFixedGroupPackageNames()) {
+    const dir = findPackageDir(name);
+    if (dir) paths.push(join(dir, "package.json"));
+  }
+  return setPackageJsonVersions(paths, version);
+}
+
 /**
  * Pack @runfusion/fusion and runfusion.ai, install them into a clean temp dir
  * with plain `npm` (mimicking the `npx runfusion.ai` install path), and invoke
@@ -455,6 +482,7 @@ function runReleaseSmoke() {
         name: "fusion-smoke-test",
         version: "0.0.0",
         private: true,
+        type: "module",
         overrides: { "@runfusion/fusion": `file:${fusionTarballPath}` },
       },
       null,
@@ -490,6 +518,49 @@ function runReleaseSmoke() {
     cleanupSmoke(smokeDir);
     fail(
       `Packed bin failed to start (exit ${invoke.status}):\n--- stdout ---\n${invoke.stdout}\n--- stderr ---\n${invoke.stderr}`,
+    );
+  }
+
+  // Issue #3320: a fast local release build emitted the plugin-sdk runtime but
+  // omitted the declaration targeted by exports["./plugin-sdk"]. Exercise the
+  // published boundary with TypeScript so a missing declaration entrypoint
+  // blocks release instead of shipping an unusable SDK contract.
+  const consumerPath = join(installDir, "plugin-sdk-consumer.ts");
+  const consumerTsconfigPath = join(installDir, "plugin-sdk-consumer.tsconfig.json");
+  writeFileSync(
+    consumerPath,
+    'import { definePlugin } from "@runfusion/fusion/plugin-sdk";\nvoid definePlugin;\n',
+  );
+  writeFileSync(
+    consumerTsconfigPath,
+    JSON.stringify(
+      {
+        compilerOptions: {
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          noEmit: true,
+          // The public contract here is subpath resolution. Existing SDK
+          // declarations can reference optional database types, so checking
+          // their internals would conflate that separate compatibility issue
+          // with a missing declaration entrypoint.
+          skipLibCheck: true,
+          strict: true,
+        },
+        files: [consumerPath],
+      },
+      null,
+      2,
+    ),
+  );
+  const typecheck = spawnSync(
+    "pnpm",
+    ["exec", "tsc", "--project", consumerTsconfigPath],
+    { cwd: repoRoot, stdio: "pipe", encoding: "utf8", timeout: 120_000 },
+  );
+  if (typecheck.status !== 0) {
+    cleanupSmoke(smokeDir);
+    fail(
+      `Packed plugin SDK failed consumer typecheck${typecheck.error ? `: ${typecheck.error.message}` : ""}${typecheck.signal ? ` (signal ${typecheck.signal})` : ""}:\n--- stdout ---\n${typecheck.stdout}\n--- stderr ---\n${typecheck.stderr}`,
     );
   }
 
@@ -622,7 +693,7 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
     promoteTarget = "HEAD";
   }
 
-  if (shouldPromptForVersion({ dryRun: DRY_RUN, autoYes: AUTO_YES, interactive: INTERACTIVE })) {
+  if (shouldPromptForVersion({ dryRun: DRY_RUN, interactive: INTERACTIVE })) {
     const answer = await ask(`Promote which commit/tag to 'release'? [${promoteTarget}]: `);
     if (answer !== "") promoteTarget = answer;
   } else {
@@ -672,11 +743,10 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
   info("Installing dependencies in the promotion worktree (fresh checkout)…");
   run("pnpm install --prefer-offline", { cwd: promoteDir });
 
-  info("Re-running the release inside the promotion worktree (authorization prompts continue there)…");
+  info("Re-running the release inside the promotion worktree (interactive prompts continue there)…");
   const passThroughArgs = [
     join("scripts", "release.mjs"),
     "--channel", "stable",
-    ...(AUTO_YES ? ["--yes"] : []),
     ...(INTERACTIVE ? ["--interactive"] : []),
   ];
   const child = spawnSync(process.execPath, passThroughArgs, {
@@ -693,7 +763,36 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
     } else {
       ok("Promotion worktree removed.");
     }
-    info("Reminder: back-merge 'release' into 'main' from this checkout (commands were printed above).");
+    /*
+     * FNXC:UpdateChannels 2026-07-24-09:40:
+     * Requirement: once a stable ships, the local dev checkout must report the
+     * stable version, and the next beta must be based on it. A printed reminder
+     * was not enough — v0.73.0 shipped while `main` stayed at 0.73.0-beta.6
+     * (dashboard/`pnpm dev` kept showing the beta, and the next beta would have
+     * numbered beneath the stable). The parent (still on `main`) now performs
+     * the back-merge itself. Fail-soft: a conflicting merge is aborted and the
+     * manual commands are printed, since the resolution needs a human.
+     */
+    info("Back-merging the release branch into 'main' so the dev checkout carries the stable version…");
+    const backMerge = run(
+      `git merge ${RELEASE_BRANCH} -m "chore(release): back-merge from ${RELEASE_BRANCH}"`,
+      { capture: true, allowFail: true },
+    );
+    if (backMerge.status !== 0) {
+      run("git merge --abort", { capture: true, allowFail: true });
+      warn(
+        "Back-merge conflicted and was aborted — resolve it by hand:\n" +
+        `    git merge ${RELEASE_BRANCH}\n` +
+        "    # keep the release branch's package.json versions and its deleted .changeset/*.md\n" +
+        "    # (keep a changeset only if it was re-edited on main for an UNRELEASED fix)\n" +
+        "    git commit && git push origin main",
+      );
+    } else {
+      const mainVersion = JSON.parse(readFileSync("packages/cli/package.json", "utf8")).version;
+      ok(`'main' back-merged; local dev version is now v${mainVersion}.`);
+      const pushed = run("git push origin main", { capture: true, allowFail: true });
+      if (pushed.status !== 0) warn("Could not push 'main'; push the back-merge manually: git push origin main");
+    }
   } else {
     warn(`Stable release in the promotion worktree exited with status ${child.status ?? "unknown"}.`);
     warn(`Worktree kept for inspection: ${promoteDir}`);
@@ -744,9 +843,39 @@ if (remoteBranchExists) {
  * Dry-runs revert whichever pre-mode mutation they made before exiting.
  */
 let preModeMutation = "none"; // "entered" | "exited" | "none"
+let rebasedVersionPaths = [];
 const preJsonExists = () => existsSync(PRE_JSON_PATH) && JSON.parse(readFileSync(PRE_JSON_PATH, "utf8")).mode === "pre";
+const LATEST_STABLE_VERSION = latestStableTagVersion();
 if (IS_BETA) {
-  if (!preJsonExists()) {
+  /*
+   * FNXC:UpdateChannels 2026-07-24-09:40:
+   * A beta cycle is anchored at pre.json's `initialVersions` (snapshotted by
+   * `pre enter`). If a stable shipped since that snapshot, the anchor is stale
+   * and every further beta would number BELOW the published stable. Re-anchor:
+   * exit the stale cycle, set the fixed group to the shipped stable, re-enter.
+   * The pending changesets are untouched, so the bump type still decides
+   * whether the next beta is a patch or minor of that stable.
+   */
+  const preState = preJsonExists() ? JSON.parse(readFileSync(PRE_JSON_PATH, "utf8")) : null;
+  const cycleBase =
+    preState?.initialVersions?.["@runfusion/fusion"] ??
+    JSON.parse(readFileSync("packages/cli/package.json", "utf8")).version;
+  const { stale: staleCycle, anchor } = evaluateBetaCycleAnchor({
+    cycleBase,
+    latestStable: LATEST_STABLE_VERSION,
+  });
+
+  if (staleCycle) {
+    warn(
+      `Beta cycle is anchored at ${cycleBase}, but stable v${LATEST_STABLE_VERSION} has shipped. ` +
+      `Re-anchoring the beta track on v${anchor}.`,
+    );
+    if (preState) run("pnpm changeset pre exit");
+    rebasedVersionPaths = rewriteFixedGroupVersions(anchor);
+    run("pnpm changeset pre enter beta");
+    preModeMutation = "entered";
+    ok(`Beta cycle re-anchored on v${anchor} (${rebasedVersionPaths.length} package.json rewritten).`);
+  } else if (!preState) {
     info("Entering changesets pre-mode (beta)…");
     run("pnpm changeset pre enter beta");
     preModeMutation = "entered";
@@ -769,14 +898,52 @@ function revertDryRunPreModeMutation() {
   } else if (preModeMutation === "exited") {
     run(`git checkout -- ${PRE_JSON_PATH}`);
   }
+  // A re-anchored cycle also rewrote tracked package.json versions; restore them.
+  for (const path of rebasedVersionPaths) {
+    run(`git checkout -- ${path}`, { allowFail: true });
+  }
 }
 
 const changesetSummaries = readChangesetSummaries();
 if (changesetSummaries.length === 0) {
   fail("No pending changesets in .changeset/. Run `pnpm changeset` first.");
 }
-ok(`${changesetSummaries.length} pending changeset(s):`);
-for (const cs of changesetSummaries) {
+
+/*
+ * FNXC:Changelog 2026-07-23-10:40:
+ * Scope release notes to the channel. Pre-mode preserves every consumed
+ * changeset .md on disk, so on beta.N the directory holds the WHOLE cycle —
+ * feeding all of it to distillation made every beta's notes an aggregate of
+ * everything since the last stable (v0.73.0-beta.4 shipped the full cycle
+ * instead of its own fixes). Betas distill only changesets NOT yet recorded
+ * in pre.json's `changesets` array (i.e. new since the previous beta).
+ * Stable keeps the full set on purpose: its notes are the rollup of every
+ * change across all betas in the cycle.
+ */
+const preReleasedNames = IS_BETA && preJsonExists()
+  ? (JSON.parse(readFileSync(PRE_JSON_PATH, "utf8")).changesets ?? [])
+  : [];
+const { selected: noteChangesets, alreadyReleased } = selectChannelChangesets(
+  CHANNEL,
+  changesetSummaries,
+  preReleasedNames,
+);
+if (IS_BETA && noteChangesets.length === 0) {
+  fail(
+    `All ${changesetSummaries.length} pending changeset(s) were already released in a prior beta of this cycle. ` +
+    "Nothing new to release — land a changeset first, or run `pnpm release --channel stable` to promote.",
+  );
+}
+if (IS_BETA && alreadyReleased.length > 0) {
+  info(`${alreadyReleased.length} changeset(s) already released in earlier betas of this cycle (kept for the stable rollup; excluded from this beta's notes).`);
+}
+// pre.json survives `pre exit` (mode flips to "exit"); its presence on the
+// stable channel means this release promotes a beta cycle.
+if (!IS_BETA && existsSync(PRE_JSON_PATH)) {
+  info(`Stable notes will roll up all ${changesetSummaries.length} changeset(s) accumulated across the beta cycle.`);
+}
+ok(`${noteChangesets.length} changeset(s) new in this ${CHANNEL} release:`);
+for (const cs of noteChangesets) {
   console.log(`    ${color(33, `[${cs.bump}]`)} ${cs.summary}  ${color(90, `(${cs.file})`)}`);
 }
 
@@ -790,8 +957,25 @@ console.log(`  Proposed version: ${color(32, proposedVersion)}`);
 console.log(`  Bumped packages : ${releases.map((r) => r.name).join(", ")}`);
 console.log("");
 
+/*
+ * FNXC:UpdateChannels 2026-07-24-09:40:
+ * Backstop for the re-anchoring above: a release must never number at or below
+ * the newest published stable, in either channel. This catches hand-edited
+ * pre.json, a resolved-the-wrong-way back-merge, and an operator typing a stale
+ * version at the override prompt.
+ */
+if (!isVersionAheadOfStable(proposedVersion, LATEST_STABLE_VERSION)) {
+  fail(
+    `Proposed ${CHANNEL} version v${proposedVersion} is not newer than the published stable v${LATEST_STABLE_VERSION}.\n` +
+    (IS_BETA
+      ? `  'main' is behind the stable release. Back-merge first:\n` +
+        `    git merge ${RELEASE_BRANCH} -m "chore(release): back-merge v${LATEST_STABLE_VERSION} from ${RELEASE_BRANCH}"`
+      : `  The '${RELEASE_BRANCH}' branch is behind the v${LATEST_STABLE_VERSION} tag.`),
+  );
+}
+
 let chosenVersion = proposedVersion;
-if (shouldPromptForVersion({ dryRun: DRY_RUN, autoYes: AUTO_YES, interactive: INTERACTIVE })) {
+if (shouldPromptForVersion({ dryRun: DRY_RUN, interactive: INTERACTIVE })) {
   while (true) {
     const answer = await ask(`Release version [${proposedVersion}]: `);
     if (answer === "") break;
@@ -805,6 +989,9 @@ if (shouldPromptForVersion({ dryRun: DRY_RUN, autoYes: AUTO_YES, interactive: IN
 }
 
 if (chosenVersion !== proposedVersion) {
+  if (!isVersionAheadOfStable(chosenVersion, LATEST_STABLE_VERSION)) {
+    fail(`Overridden version v${chosenVersion} is not newer than the published stable v${LATEST_STABLE_VERSION}.`);
+  }
   warn(`Overriding changeset-proposed version: ${proposedVersion} → ${chosenVersion}`);
 }
 
@@ -817,12 +1004,12 @@ if (DRY_RUN) {
    * deterministic if no model is reachable) so operators can review the post
    * without authorizing a real publish.
    */
-  const dryEntries = changesetSummaries.map(({ file }) => {
+  const dryEntries = noteChangesets.map(({ file }) => {
     const raw = readFileSync(join(".changeset", file), "utf8");
     return parseChangesetFile(raw).parsed;
   }).filter(Boolean);
-  info("Distilling release notes with Claude (sonnet; soft fallback if unavailable)…");
-  const dryDistilled = await distillReleaseNotes(dryEntries, chosenVersion);
+  info("Distilling release notes with Claude (opus; soft fallback if unavailable)…");
+  const dryDistilled = await distillReleaseNotes(dryEntries, chosenVersion, { channel: CHANNEL });
   console.log("");
   console.log(color(36, "─── Draft post for X (preview) ───"));
   console.log(dryDistilled.tweet);
@@ -835,30 +1022,11 @@ if (DRY_RUN) {
 }
 
 /*
- * FNXC:ReleaseScript 2026-07-08-11:20:
- * FN-6469 showed `main`-branch preflight is bypassable by cloning a clean `main`. A real release now requires a live human to type the authorization phrase at an interactive prompt before any version bump, publish, push, tag, GitHub Release, or Homebrew tap mutation can begin. This replaces the removed `FUSION_RELEASE_AUTHORIZED` env signal, which was self-grantable and leaked into non-interactive shells. `--yes` does not bypass this prompt; a non-interactive shell is blocked outright. Dry-run exits above so agents can still inspect release plans without authorization.
+ * FNXC:ReleaseScript 2026-08-03-02:56:
+ * The typed "authorized" phrase is removed. Real releases always require the operator y/N
+ * confirmation below (no --yes skip). Dry-run exits above so agents can still inspect release
+ * plans. Agents must not run real releases (AGENTS.md → Releasing).
  */
-const releaseAuthorization = evaluateReleaseAuthorization({
-  dryRun: DRY_RUN,
-  stdinIsTTY: process.stdin.isTTY === true,
-});
-if (releaseAuthorization.mode === "blocked") {
-  fail(
-    `${releaseAuthorization.reason ?? "Release is not authorized."}\n` +
-    "Releases are not agent-initiable and cannot run non-interactively.",
-  );
-}
-if (releaseAuthorization.mode === "requires-confirmation") {
-  const typed = await ask(
-    `Type "${RELEASE_AUTHORIZATION_PHRASE}" to authorize this real release (build, publish, tag): `,
-  );
-  if (!isReleaseAuthorizationPhrase(typed)) {
-    fail(
-      `Authorization phrase not entered ("${RELEASE_AUTHORIZATION_PHRASE}" required); aborted before version bump, publish, push, or tag.`,
-    );
-  }
-}
-
 if (!(await confirm(`Proceed with ${CHANNEL} release v${chosenVersion} (build, publish to npm tag '${NPM_DIST_TAG}', tag)?`))) {
   warn("Aborted by user.");
   process.exit(0);
@@ -871,8 +1039,13 @@ if (!(await confirm(`Proceed with ${CHANNEL} release v${chosenVersion} (build, p
  * Capture and parse structured changeset entries BEFORE `changeset version`
  * runs — versioning consumes and deletes the .changeset/*.md files.
  * The captured entries feed the post-version distillation step.
+ *
+ * FNXC:Changelog 2026-07-23-10:40:
+ * `noteChangesets` is channel-scoped (see selection above): a beta captures
+ * only changesets new since the previous beta; a stable capture is the full
+ * cross-beta rollup.
  */
-const capturedEntries = changesetSummaries.map(({ file }) => {
+const capturedEntries = noteChangesets.map(({ file }) => {
   const raw = readFileSync(join(".changeset", file), "utf8");
   return parseChangesetFile(raw).parsed;
 }).filter(Boolean);
@@ -907,13 +1080,13 @@ ok("Root CHANGELOG.md updated.");
  * notes, and an engagement-oriented X draft ≤280 chars. Soft deterministic
  * fallback only if Claude is unreachable so release never blocks.
  */
-info("Distilling release notes with Claude (sonnet; soft fallback if unavailable)…");
+info("Distilling release notes with Claude (opus; soft fallback if unavailable)…");
 const {
   notes: distilledNotes,
   source: distillSource,
   highlights: releaseHighlights,
   tweet: releaseTweet,
-} = await distillReleaseNotes(capturedEntries, version);
+} = await distillReleaseNotes(capturedEntries, version, { channel: CHANNEL });
 const changelogBeforeDistill = readFileSync("CHANGELOG.md", "utf8");
 const changelogAfterDistill = replaceVersionSection(changelogBeforeDistill, version, distilledNotes);
 if (changelogAfterDistill !== changelogBeforeDistill) {
@@ -926,7 +1099,7 @@ if (changelogAfterDistill !== changelogBeforeDistill) {
 // --- Build ----------------------------------------------------------------
 
 info("Building all packages…");
-run("pnpm build");
+run("pnpm build:full");
 
 // --- Commit ---------------------------------------------------------------
 
@@ -1038,7 +1211,7 @@ if (githubReleaseStatus === "created") {
  */
 if (!IS_BETA) {
   console.log("");
-  info("Next step — back-merge the release branch into main:");
+  info("Next step — back-merge the release branch into main (the promoting checkout does this automatically; run it by hand only if that merge conflicted or you released outside a promotion):");
   console.log(`    git checkout main && git pull origin main`);
   console.log(`    git merge ${RELEASE_BRANCH} -m "chore(release): back-merge v${version} from ${RELEASE_BRANCH}"`);
   console.log(`    git push origin main`);
@@ -1049,13 +1222,13 @@ if (!IS_BETA) {
  * FNXC:ReleaseScript 2026-07-13-15:25:
  * After a successful publish/tag, print the LLM-authored X draft (≤280 chars)
  * produced during distillation so the operator can copy-paste to X.
- * FNXC:UpdateChannels 2026-07-19-13:20: stable-only — betas are not announced.
+ * FNXC:Changelog 2026-07-24-11:05: BOTH channels get a draft now (it was
+ * stable-only). Betas ship to testers who opt in, and that audience only hears
+ * about a prerelease if it is posted; the beta draft is written as a call for
+ * testers carrying `fn update --channel beta`, never as a GA announcement.
  */
-if (!IS_BETA) {
-  console.log("");
-  console.log(color(36, "─── Draft post for X (copy-paste) ───"));
-  console.log(releaseTweet);
-  console.log(color(90, `(${releaseTweet.length}/280 chars; source: ${distillSource})`));
-  console.log(color(36, "─────────────────────────────────────"));
-}
-
+console.log("");
+console.log(color(36, `─── Draft post for X (${CHANNEL}, copy-paste) ───`));
+console.log(releaseTweet);
+console.log(color(90, `(${releaseTweet.length}/280 chars; source: ${distillSource})`));
+console.log(color(36, "──────────────────────────────────────────────"));

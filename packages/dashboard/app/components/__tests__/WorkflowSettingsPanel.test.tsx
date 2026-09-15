@@ -167,6 +167,14 @@ describe("WorkflowSettingsPanel — Definitions tab", () => {
 });
 
 describe("WorkflowSettingsPanel — Values tab", () => {
+  it("renders Memory consolidation enabled in Oversight with its default and override", async () => {
+    mockFetchValues.mockResolvedValue(payload({ effective: { memoryConsolidationEnabled: false } }));
+    render(<Host readOnly initial={[{ id: "memoryConsolidationEnabled", name: "Memory consolidation enabled", type: "boolean", default: true }]} />);
+    await waitFor(() => expect(mockFetchValues).toHaveBeenCalled());
+    expect(within(screen.getByTestId("wf-settings-group-oversight")).getByText("Planner Oversight")).toBeInTheDocument();
+    expect(screen.getByLabelText("Memory consolidation enabled")).not.toBeChecked();
+  });
+
   const decls: WorkflowSettingDefinition[] = [
     { id: "timeout-ms", name: "Timeout", type: "number", default: 1000 },
     { id: "new-sessions", name: "New sessions", type: "boolean", default: false },
@@ -214,7 +222,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     expect(screen.getByLabelText("Plan Review revision cap")).toBeInTheDocument();
     expect(screen.getByText(/Leave empty for unbounded automatic Plan Review\/spec revision/i)).toBeInTheDocument();
     expect(screen.getByLabelText("Code Review revision cap")).toBeInTheDocument();
-    expect(screen.getByText(/Leave empty for unbounded automatic Code Review remediation/i)).toBeInTheDocument();
+    expect(screen.getByText(/Leave empty to use this workflow's authored Code Review default/i)).toBeInTheDocument();
   });
 
   // FNXC:PlannerOversight 2026-07-04-00:00: the Values tab is the project/global default
@@ -251,58 +259,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     expect(optionValues).toEqual(expect.arrayContaining(["off", "observe", "steer", "autonomous"]));
   });
 
-  it("renders and saves the automatic large-task splitting workflow toggle once", async () => {
-    const triageToggle: WorkflowSettingDefinition[] = [
-      {
-        id: "triageProactiveSubtaskSplittingEnabled",
-        name: "Triage proactive subtask splitting",
-        type: "boolean",
-        default: true,
-      },
-    ];
-    mockFetchValues.mockResolvedValueOnce(
-      payload({ effective: { triageProactiveSubtaskSplittingEnabled: true } }),
-    );
-    mockUpdateValues
-      .mockResolvedValueOnce(
-        payload({
-          stored: { triageProactiveSubtaskSplittingEnabled: false },
-          effective: { triageProactiveSubtaskSplittingEnabled: false },
-        }),
-      )
-      .mockResolvedValueOnce(
-        payload({ effective: { triageProactiveSubtaskSplittingEnabled: true } }),
-      );
 
-    render(<Host initial={triageToggle} readOnly />);
-
-    const controls = await screen.findAllByLabelText("Automatic large-task splitting");
-    expect(controls).toHaveLength(1);
-    const toggle = controls[0] as HTMLInputElement;
-    expect(toggle.checked).toBe(true);
-    expect(screen.getByText(/Default enabled/i)).toBeInTheDocument();
-    expect(screen.getByText(/breakIntoSubtasks: true/i)).toBeInTheDocument();
-    expect(screen.queryByTestId("wf-settings-customized-triageProactiveSubtaskSplittingEnabled")).not.toBeInTheDocument();
-
-    fireEvent.click(toggle);
-    fireEvent.click(screen.getByTestId("wf-settings-save-values"));
-    await waitFor(() => expect(mockUpdateValues).toHaveBeenCalledWith(
-      "wf-1",
-      { triageProactiveSubtaskSplittingEnabled: false },
-      "proj-1",
-    ));
-    expect(screen.getByTestId("wf-settings-customized-triageProactiveSubtaskSplittingEnabled")).toBeInTheDocument();
-
-    const row = screen.getByTestId("wf-settings-value-triageProactiveSubtaskSplittingEnabled");
-    const clearButton = within(row).getByRole("button", { name: "Reset to default" });
-    fireEvent.click(clearButton);
-    fireEvent.click(screen.getByTestId("wf-settings-save-values"));
-    await waitFor(() => expect(mockUpdateValues).toHaveBeenLastCalledWith(
-      "wf-1",
-      { triageProactiveSubtaskSplittingEnabled: null },
-      "proj-1",
-    ));
-  });
 
   it("batches three field edits into exactly ONE patch on Save values", async () => {
     mockFetchValues.mockResolvedValue(payload({ effective: { "timeout-ms": 1000, "new-sessions": false } }));
@@ -537,7 +494,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     await waitFor(() => expect(mockFetchValues).toHaveBeenCalledWith("wf-1", "proj-1"));
     expect(screen.getByTestId("wf-settings-tab-values")).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText(/Leave empty for unbounded automatic Plan Review\/spec revision/i)).toBeInTheDocument();
-    expect(screen.getByText(/Leave empty for unbounded automatic Code Review remediation/i)).toBeInTheDocument();
+    expect(screen.getByText(/Leave empty to use this workflow's authored Code Review default/i)).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Plan Review revision cap"), { target: { value: "2" } });
     fireEvent.change(screen.getByLabelText("Code Review revision cap"), { target: { value: "0" } });
@@ -705,7 +662,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     await waitFor(() => expect(mockUpdateValues).toHaveBeenCalledTimes(1));
     expect(mockUpdateValues).toHaveBeenCalledWith(
       "wf-1",
-      { planningProvider: "anthropic", planningModelId: "claude-sonnet" },
+      { planningProvider: "anthropic", planningModelId: "claude-sonnet", planningCredentialInstanceId: null },
       "proj-1",
     );
   });
@@ -759,6 +716,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
       validatorFallbackProvider: null,
       validatorFallbackModelId: null,
       validatorFallbackThinkingLevel: null,
+      validatorFallbackCredentialInstanceId: null,
     }, "proj-1");
   });
 
@@ -788,7 +746,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     await waitFor(() => expect(mockUpdateValues).toHaveBeenCalledTimes(1));
     expect(mockUpdateValues).toHaveBeenCalledWith(
       "wf-1",
-      { planningProvider: null, planningModelId: null },
+      { planningProvider: null, planningModelId: null, planningCredentialInstanceId: null },
       "proj-1",
     );
   });
@@ -830,7 +788,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     expect(mockUpdateValues).toHaveBeenNthCalledWith(
       2,
       "wf-1",
-      { planningProvider: "anthropic", planningModelId: "claude-sonnet" },
+      { planningProvider: "anthropic", planningModelId: "claude-sonnet", planningCredentialInstanceId: null },
       "proj-1",
     );
   });
@@ -871,7 +829,7 @@ describe("WorkflowSettingsPanel — Values tab", () => {
     expect(within(row).getByLabelText("Plan/Triage Model")).toHaveTextContent("Claude Sonnet");
     expect(mockUpdateValues).toHaveBeenCalledWith(
       "wf-1",
-      { planningProvider: "anthropic", planningModelId: "claude-sonnet" },
+      { planningProvider: "anthropic", planningModelId: "claude-sonnet", planningCredentialInstanceId: null },
       "proj-1",
     );
   });

@@ -7,8 +7,9 @@ import { createInsightsRouter } from "../insights-routes.js";
 import { createEvalsRouter } from "../evals-routes.js";
 import { createResearchRouter } from "../research-routes.js";
 import { createExperimentRouter } from "../experiment-routes.js";
-import { createTodoRouter } from "../todo-routes.js";
 import { createGoalsRouter } from "../goals-routes.js";
+import { createNotesRouter } from "../notes-routes.js";
+import { createWhiteboardRouter } from "../whiteboard-routes.js";
 import { createRoadmapCompatibilityRouter } from "../roadmap-routes.js";
 import { createDevServerRouter } from "../dev-server-routes.js";
 import type { AiSessionStore } from "../ai-session-store.js";
@@ -52,8 +53,9 @@ export function registerIntegratedRouters({
   router.use("/evals", createEvalsRouter(store, options));
   router.use("/research", createResearchRouter(store, options));
   router.use("/experiments", createExperimentRouter(store));
-  router.use("/todos", createTodoRouter(store, options));
   router.use("/goals", createGoalsRouter(store, options));
+  router.use("/notes", createNotesRouter(store, options));
+  router.use("/whiteboards", createWhiteboardRouter(store, options));
   router.use("/roadmaps", createRoadmapCompatibilityRouter(store));
   router.use("/stash-recovery", createStashRecoveryRouter(store));
   // T7: resolve the per-project working directory so the group-PR helpers (which

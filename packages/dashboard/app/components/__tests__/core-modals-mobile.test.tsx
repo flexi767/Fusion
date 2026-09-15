@@ -1,6 +1,4 @@
-import fs from "node:fs";
-import { loadAllAppCss } from "../../test/cssFixture";
-import path from "node:path";
+import { loadAllAppCss, loadAllAppCssBaseOnly } from "../../test/cssFixture";
 import { describe, expect, it } from "vitest";
 
 
@@ -31,6 +29,35 @@ function getMainMobileBlock(css: string): string {
   const block = getMediaBlocks(css, /@media[^{]*\(max-width:\s*768px\)[^{]*\{/g);
   expect(block).toContain(".modal-overlay");
   expect(block).toContain(".detail-tabs");
+  return block;
+}
+
+/*
+FNXC:ModalTouchGeometry 2026-07-30-19:20:
+FloatingWindow's phone breakpoint is NOT the 768px one `getMainMobileBlock` aggregates.
+
+It is `(max-width: 767.98px), (max-height: 480px)` — the project's documented mobile query, whose
+`max-height` clause catches landscape phones that exceed 768px wide. Reusing the 768px helper here
+silently returns styles.css's block, which contains none of these selectors; the anti-vacuity
+assertion in the caller is what caught that during authoring.
+*/
+function getFloatingWindowMobileBlock(css: string): string {
+  const block = getMediaBlocks(css, /@media[^{]*\(max-width:\s*767\.98px\)[^{]*\{/g);
+  expect(block).toContain(".floating-window");
+  return block;
+}
+
+/*
+FNXC:GitManager 2026-08-09-07:48:
+FN-8702 moved the Git Manager phone sheet to the documented <768px boundary so a 768px tablet keeps
+its geometry. Asserting those rules against the 768px aggregate can only fail; keep that helper for
+the shared .gm-modal sizing rule that remains in styles.css, and require stable Git Manager selectors
+here so a renamed or removed phone query fails loudly instead of producing an empty aggregate.
+*/
+function getGitManagerMobileBlock(css: string): string {
+  const block = getMediaBlocks(css, /@media[^{]*\(max-width:\s*767\.98px\)[^{]*\{/g);
+  expect(block).toContain(".gm-layout {");
+  expect(block).toContain(".gm-panel {");
   return block;
 }
 
@@ -67,35 +94,57 @@ function getLastRuleBlock(css: string, selector: string): string {
   return block!;
 }
 
-function extractVhHeight(rule: string): number {
-  const heightMatch = rule.match(/height:\s*(\d+)vh;/);
-  expect(heightMatch).toBeTruthy();
-  return Number(heightMatch![1]);
-}
-
 describe("core modals mobile css coverage", () => {
-  it("TaskDetailModal: keeps desktop, tablet, mobile, and embedded height invariants", () => {
+  /*
+  FNXC:ModalTouchGeometry 2026-07-30-19:05:
+  TASK DETAIL NO LONGER SIZES ITSELF — the invariant moved layers, it did not disappear.
+
+  This case pinned `.modal.task-detail-modal` at `height: 85vh` (desktop), `92vh` (tablet) and
+  `100dvh` (mobile), with `resize: both` / `resize: none`. FN-8619 migrated Task Detail onto
+  `FloatingWindow`, so the panel is now `width: 100%; height: 100%` and fills a host sized by
+  geometry. The desktop and tablet `vh` heights are `defaultSize` in TSX, not CSS, so asserting them
+  against a stylesheet can only ever fail.
+
+  The MOBILE invariant is the one that still matters and is still CSS, so it is asserted at its new
+  home: `.floating-window--task-detail` inside FloatingWindow.css's mobile block takes over the
+  viewport and hides the resize handle. That is the same guarantee the old `100dvh` / `resize: none`
+  assertions made — a phone gets a full-screen sheet, not a draggable window.
+
+  Deliberately NOT re-pinning the desktop/tablet numbers via `defaultSize`: those are ordinary
+  layout defaults a designer may retune, and a test that fails on a 640→680 width change is noise.
+  The full-screen-on-mobile rule is a real contract; 85vh on a desktop is a preference.
+
+  Note the media query is `(max-width: 767.98px), (max-height: 480px)` — landscape phones exceed
+  768px wide, so the height clause is load-bearing and asserted with it.
+  */
+  it("TaskDetailModal: takes over the viewport on mobile instead of sizing itself", () => {
     const css = loadAllAppCss();
     const tabletBlock = getTabletBlock(css);
-    const mobileBlock = getMainMobileBlock(css);
 
+    /* The panel defers sizing to its FloatingWindow host. */
     const baseRule = getFirstRuleBlock(css, ".modal.task-detail-modal");
-    expect(baseRule).toContain("height: 85vh;");
-    expect(baseRule).toContain("max-height: calc(100dvh - var(--overlay-padding-top, 10vh) - 16px);");
-    expect(baseRule).toContain("resize: both;");
+    expect(baseRule).toContain("width: 100%;");
+    expect(baseRule).toContain("height: 100%;");
 
-    const tabletRule = getLastRuleBlock(tabletBlock, ".modal.task-detail-modal");
-    expect(tabletRule).toContain("height: 92vh;");
-    expect(extractVhHeight(tabletRule)).toBeGreaterThan(extractVhHeight(baseRule));
-    expect(tabletRule).toContain("width: 98vw;");
-    expect(tabletRule).toContain("max-width: 98vw;");
-    expect(tabletBlock).toContain("--overlay-padding-top: 6vh;");
-    expect(tabletRule).toContain("max-height: calc(100dvh - var(--overlay-padding-top, 6vh) - var(--space-md));");
+    /* ANTI-VACUITY: prove the mobile block was found and really is the phone breakpoint,
+       so a renamed/removed query fails loudly instead of matching an empty string. */
+    const floatingMobileBlock = getFloatingWindowMobileBlock(css);
+    expect(floatingMobileBlock).toContain("max-height: 480px");
+    expect(floatingMobileBlock).toContain(".floating-window--task-detail");
 
-    const mobileRule = getLastRuleBlock(mobileBlock, ".modal.task-detail-modal");
-    expect(mobileRule).toContain("height: 100dvh;");
-    expect(mobileRule).toContain("max-height: 100dvh;");
-    expect(mobileRule).toContain("resize: none;");
+    const mobileRule = getLastRuleBlock(floatingMobileBlock, ".floating-window--task-detail");
+    /*
+    MATCHED AT DECLARATION BOUNDARIES, not by substring. `toContain("height: 100dvh")` is satisfied
+    by the `max-height: 100dvh` line, so it stays green even if `height` itself is changed — caught
+    by mutation: rewriting `height` to `90dvh` left the old assertions passing. Anchoring on `{`/`;`
+    forces each declaration to be checked on its own.
+    */
+    expect(mobileRule).toMatch(/[{;]\s*height:\s*100dvh/);
+    expect(mobileRule).toMatch(/[{;]\s*max-height:\s*100dvh/);
+    expect(mobileRule).toMatch(/[{;]\s*width:\s*100vw/);
+    expect(mobileRule).toMatch(/[{;]\s*max-width:\s*100vw/);
+    /* The resize affordance must be gone on touch, not merely inert. */
+    expect(floatingMobileBlock).toContain(".floating-window--task-detail .floating-window__resize-handle");
 
     const embeddedRule = getRuleBlocks(css, ".task-detail-content--embedded")
       .find((rule) => rule.includes("height: 100%;"));
@@ -233,9 +282,9 @@ describe("core modals mobile css coverage", () => {
     expect(actionsRule![0]).toContain("margin-left: auto;");
   });
 
-  it("GitManagerModal: 768px mobile block includes stacked layout rules", () => {
+  it("GitManagerModal: <768px phone block includes stacked layout rules", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
 
     expect(mobileBlock).toContain(".gm-layout {");
     expect(mobileBlock).toContain("flex-direction: column;");
@@ -245,7 +294,7 @@ describe("core modals mobile css coverage", () => {
 
   it("GitManagerModal: mobile section toolbar opts back into horizontal touch scrolling", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
 
     const sidebarRules = getRuleBlocks(mobileBlock, ".gm-sidebar");
     expect(sidebarRules.length).toBeGreaterThan(0);
@@ -301,7 +350,7 @@ describe("core modals mobile css coverage", () => {
 
   it("GitManagerModal: workspace repo selector does not consume the mobile tab strip", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
     const embeddedBlock = getEmbeddedGitManagerBlock(css);
 
     const standaloneWrapRules = getRuleBlocks(mobileBlock, ".gm-repo-selector-wrap");
@@ -326,7 +375,7 @@ describe("core modals mobile css coverage", () => {
 
   it("GitManagerModal: nav items keep a token-sized touch target on mobile", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
 
     expect(mobileBlock).toContain(".gm-nav-item {");
     expect(mobileBlock).toContain("min-height: calc(var(--space-xl) + var(--space-sm));");
@@ -334,7 +383,7 @@ describe("core modals mobile css coverage", () => {
 
   it("GitManagerModal: panel allows content scrolling on mobile", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
 
     expect(mobileBlock).toContain(".gm-panel {");
     expect(mobileBlock).toContain("overflow-y: auto;");
@@ -342,7 +391,7 @@ describe("core modals mobile css coverage", () => {
 
   it("GitManagerModal: mobile fullscreen block includes explicit overlay class and keyboard viewport rule", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
 
     expect(mobileBlock).toContain(".modal-overlay.git-manager-modal-overlay,");
     // FNXC:GitManager 2026-06-22-09:30: The mobile viewport-takeover (and its keyboard rule)
@@ -360,7 +409,7 @@ describe("core modals mobile css coverage", () => {
 
   it("GitManagerModal: changes rows/actions wrap without widening viewport on mobile", () => {
     const css = loadAllAppCss();
-    const mobileBlock = getMainMobileBlock(css);
+    const mobileBlock = getGitManagerMobileBlock(css);
 
     const actionsRule = mobileBlock.match(/\.gm-file-section-actions\s*\{[^}]+\}/s);
     expect(actionsRule).not.toBeNull();
@@ -421,13 +470,9 @@ describe("core modals mobile css coverage", () => {
     const css = loadAllAppCss();
     const mobileBlock = getMainMobileBlock(css);
 
-    // Verify dropdown menu selectors are in mobile block (selectors share the same line)
-    expect(mobileBlock).toContain(".detail-actions-menu,");
-    expect(mobileBlock).toContain(".detail-move-menu {");
-
-    // Extract the dropdown menu rule block and verify constraints
+    // Extract the retained Actions dropdown rule and verify constraints.
     const menuBlockMatch = mobileBlock.match(
-      /\.detail-actions-menu,\s*\.detail-move-menu\s*\{[^}]+\}/s,
+      /\.detail-actions-menu\s*\{[^}]+\}/s,
     );
     expect(menuBlockMatch).not.toBeNull();
     const menuBlock = menuBlockMatch![0];
@@ -449,13 +494,12 @@ describe("core modals mobile css coverage", () => {
     expect(backControlMatch![0]).toContain("min-width: calc(var(--space-2xl) + var(--space-xs))");
   });
 
-  it("TaskDetailModal: footer dropdown menus anchor toward available horizontal space", () => {
+  it("TaskDetailModal: Actions dropdown anchors toward available horizontal space", () => {
     const css = loadAllAppCss();
 
-    const actionsMenuAnchorMatch = css.match(/^\.detail-actions-menu\s*\{\s*left: 0;\s*\}/m);
-    const moveMenuAnchorMatch = css.match(/^\.detail-move-menu\s*\{\s*right: 0;\s*\}/m);
+    const actionsMenuAnchorMatch = css.match(/^\.detail-actions-menu\s*\{[\s\S]*?left: 0;/m);
     expect(actionsMenuAnchorMatch).not.toBeNull();
-    expect(moveMenuAnchorMatch).not.toBeNull();
+    expect(css).not.toContain(".detail-move-");
   });
 
   it("TaskForm / TaskEditModal: description textarea capped at 200px height with scroll on mobile", () => {
@@ -522,6 +566,23 @@ describe("core modals mobile css coverage", () => {
     );
     expect(actionButtonMatch).not.toBeNull();
     expect(actionButtonMatch![0]).toContain("min-height: 36px");
+    expect(actionButtonMatch![0]).toContain("flex: 0 1 auto");
+    expect(actionButtonMatch![0]).not.toContain("flex: 1 1 auto");
+    expect(actionButtonMatch![0]).not.toMatch(/flex-grow:\s*(?!0\b)\d/);
+
+    const baseCss = loadAllAppCssBaseOnly();
+    const iconOnlyRule = baseCss.match(
+      /\.task-form-description-actions \.task-form-inline-icon-btn\s*\{[^}]+\}/,
+    );
+    expect(iconOnlyRule).not.toBeNull();
+    expect(iconOnlyRule![0]).toContain("flex: 0 0 auto");
+    expect(iconOnlyRule![0]).toMatch(/min-width:\s*36px/);
+
+    const baseActionsRule = [...baseCss.matchAll(/\.task-form-description-actions\s*\{[^}]+\}/g)]
+      .map((match) => match[0])
+      .find((rule) => rule.includes("width: fit-content"));
+    expect(baseActionsRule).toBeDefined();
+    expect(baseActionsRule).toContain("width: fit-content");
 
     const quickFieldsTriggerMatch = mobileBlock.match(
       /\.new-task-quick-fields \.dep-trigger\s*\{[^}]+\}/,

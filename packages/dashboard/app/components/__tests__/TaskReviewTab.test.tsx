@@ -1127,6 +1127,105 @@ describe("TaskReviewTab", () => {
     expect(onRequestCreatePr).toHaveBeenCalledTimes(1);
   });
 
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-07:35 (fleet phase — evidence for the review-lane conversion):
+  Three of this tab's questions were `task.column === "in-review"`: the Create-PR button, the
+  "frozen on entry to review" auto-merge hint, and PR-feedback addressing. On a board whose review lane is
+  renamed, all three silently took their non-review branch — the button was absent and the hint claimed
+  the effective auto-merge value was NOT frozen when it was.
+
+  `columnFlags` is optional and every case above omits it, so they all keep asserting the legacy-id
+  behaviour — which is why none of them could catch this. These two supply it.
+
+  REVERT CHECK, measured (both run): restoring `task.column === "in-review"` on the Create-PR guard makes
+  the renamed case fail (`Unable to find an element by: [data-testid="task-review-create-pr"]`), and
+  restoring it on the hint makes the frozen-hint case fail — it renders the unfrozen wording.
+  */
+  const REVIEW_FLAGS = { mergeBlocker: true } as const;
+
+  it("shows create PR action on a RENAMED review lane", async () => {
+    const onRequestCreatePr = vi.fn();
+    const task = makeTask({ column: "checking" as never, prInfo: undefined });
+    apiMocks.fetchTaskReview.mockResolvedValue({ reviewState: task.reviewState, automationStatus: null, emptyMessage: null });
+
+    await renderWithAct(
+      <TaskReviewTab
+        task={task}
+        addToast={vi.fn()}
+        prAuthAvailable
+        onRequestCreatePr={onRequestCreatePr}
+        columnFlags={REVIEW_FLAGS as never}
+      />,
+    );
+
+    await screen.findByRole("button", { name: "Refresh" });
+    fireEvent.click(screen.getByTestId("task-review-create-pr"));
+    expect(onRequestCreatePr).toHaveBeenCalledTimes(1);
+  });
+
+  it("says the effective auto-merge value is frozen on a RENAMED review lane", async () => {
+    const task = makeTask({ column: "checking" as never, prInfo: undefined });
+    apiMocks.fetchTaskReview.mockResolvedValue({ reviewState: task.reviewState, automationStatus: null, emptyMessage: null });
+
+    await renderWithAct(
+      <TaskReviewTab task={task} addToast={vi.fn()} columnFlags={REVIEW_FLAGS as never} />,
+    );
+
+    await screen.findByRole("button", { name: "Refresh" });
+    expect(screen.getByTestId("task-review-auto-merge-effective-hint").textContent)
+      .toContain("frozen on entry to review");
+  });
+
+  it("offers Address PR Feedback on a RENAMED lane with no loaded review items (#2744 review)", async () => {
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-11:15 (#2744 review — greptile P1):
+    The half-conversion this pins: the tab's own lane check was converted while
+    `canStartPrFeedbackAddressing` in utils/prFeedback.ts still compared ids. With NO loaded display
+    items the action depends entirely on that helper, so on a renamed lane it stayed hidden even though
+    the card had actionable PR feedback.
+
+    Empty `items` is the point of the case — with items present the `displayItems.length > 0` arm masks
+    the helper and the bug is invisible.
+
+    REVERT CHECK, measured: restoring the id pair in `canStartPrFeedbackAddressing` fails this with
+    `Unable to find an element by: [data-testid="task-review-address-pr-feedback"]`.
+    */
+    const task = makeTask({
+      column: "checking" as never,
+      // `lastReviewDecision` is the field `hasActionablePrFeedback` reads (not `reviewDecision`).
+      prInfo: { number: 7, url: "https://github.com/o/r/pull/7", state: "open", lastReviewDecision: "CHANGES_REQUESTED" } as never,
+    });
+    // `isPrMode` requires the review SOURCE to be pull-request; with items empty the action then depends
+    // entirely on canStartPrFeedbackAddressing, which is the helper under test.
+    apiMocks.fetchTaskReview.mockResolvedValue({ reviewState: { source: "pull-request", items: [], addressing: [] }, automationStatus: null, emptyMessage: null });
+
+    await renderWithAct(
+      <TaskReviewTab task={task} addToast={vi.fn()} columnFlags={REVIEW_FLAGS as never} onTaskUpdated={vi.fn()} />,
+    );
+
+    await screen.findByRole("button", { name: "Refresh" });
+    expect(screen.queryByTestId("task-review-address-pr-feedback")).toBeInTheDocument();
+  });
+
+  it("still hides create PR action on a non-review lane of that same renamed board", async () => {
+    // Non-vacuous: the widened test must not treat every column as review.
+    const task = makeTask({ column: "building" as never, prInfo: undefined });
+    apiMocks.fetchTaskReview.mockResolvedValue({ reviewState: task.reviewState, automationStatus: null, emptyMessage: null });
+
+    await renderWithAct(
+      <TaskReviewTab
+        task={task}
+        addToast={vi.fn()}
+        prAuthAvailable
+        onRequestCreatePr={vi.fn()}
+        columnFlags={{ countsTowardWip: true } as never}
+      />,
+    );
+
+    await screen.findByRole("button", { name: "Refresh" });
+    expect(screen.queryByTestId("task-review-create-pr")).toBeNull();
+  });
+
   it("hides create PR action outside in-review column", async () => {
     const task = makeTask({ column: "todo", prInfo: undefined });
     apiMocks.fetchTaskReview.mockResolvedValue({ reviewState: task.reviewState, automationStatus: null, emptyMessage: null });
@@ -1175,6 +1274,54 @@ describe("TaskReviewTab", () => {
 
     await screen.findByRole("button", { name: "Refresh" });
     expect(screen.queryByTestId("task-review-create-pr")).toBeNull();
+  });
+
+  it("renders resolved findings as audit rows without revision checkboxes on desktop and mobile", async () => {
+    const task = makeTask();
+    const items = [
+      { id: "c1", summary: "Earlier cleanup", body: "Earlier finding", resolution: "superseded" as const },
+      { id: "c2", summary: "Earlier error", body: "Earlier finding", resolution: "superseded" as const },
+      { id: "c3", summary: "Earlier timeout", body: "Earlier finding", resolution: "superseded" as const },
+      { id: "r1", summary: "Receipt one", body: "Fixed: explicit catch", resolution: "resolved-in-review" as const },
+      { id: "r2", summary: "Receipt two", body: "Fixed: timeout budget", resolution: "resolved-in-review" as const },
+      { id: "u1", summary: "Adjudicated dispute", body: "The reviewer maintained this objection", resolution: "dispute-upheld" as const },
+      { id: "o1", summary: "Open finding", body: "The only actionable item" },
+    ];
+    apiMocks.fetchTaskReview.mockResolvedValue({
+      reviewState: { source: "reviewer-agent", summary: { verdict: "REVISE", reviewType: "code", summary: "Needs fixes" }, items, addressing: [] },
+      automationStatus: null,
+      emptyMessage: null,
+    });
+    apiMocks.reviseTaskReviewItems.mockResolvedValue({ task: makeTask(), reviewState: { source: "reviewer-agent", items: [], addressing: [] } });
+
+    const renderAt = async (mobile: boolean) => {
+      Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        value: vi.fn().mockReturnValue({ matches: mobile, addEventListener: vi.fn(), removeEventListener: vi.fn() }),
+      });
+      return renderWithAct(<TaskReviewTab task={task} addToast={vi.fn()} />);
+    };
+
+    const desktop = await renderAt(false);
+    expect(await screen.findAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.getAllByText("Fixed in review")).toHaveLength(2);
+    expect(screen.getAllByText("Superseded")).toHaveLength(3);
+    expect(screen.getByText("Dispute upheld")).toBeInTheDocument();
+    expect(screen.queryAllByLabelText(/Earlier cleanup|Receipt one|Adjudicated dispute/)).toHaveLength(0);
+    expect(document.querySelectorAll(".task-review-tab__item-selection")).toHaveLength(1);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("checkbox"));
+      fireEvent.click(screen.getByRole("button", { name: "Request revision" }));
+    });
+    expect(apiMocks.reviseTaskReviewItems).toHaveBeenCalledWith(task.id, [expect.objectContaining({ id: "o1" })], undefined);
+    desktop.unmount();
+
+    apiMocks.reviseTaskReviewItems.mockClear();
+    const mobile = await renderAt(true);
+    expect(await screen.findAllByRole("checkbox")).toHaveLength(1);
+    expect(document.querySelectorAll("[data-review-resolution]")).toHaveLength(6);
+    expect(document.querySelectorAll(".task-review-tab__item-selection")).toHaveLength(1);
+    mobile.unmount();
   });
 
   it("submits reviewer-agent selections through same revision action", async () => {

@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
-import { reviewStep as mockedReviewStepFn } from "../reviewer.js";
+import { reviewStep as mockedReviewStepFn } from "../execution/reviewer.js";
 import {
   createMockStore,
+  createWorkflowRoutingAgentStore,
   mockedCreateFnAgent,
   mockedExecSync,
   mockedExistsSync,
@@ -11,6 +12,18 @@ import {
 } from "./executor-test-helpers.js";
 
 const mockedReviewStep = vi.mocked(mockedReviewStepFn);
+
+/*
+FNXC:EngineTests 2026-08-09-11:30:
+The graph resolves an executor principal before reaching tool or step-numbering behavior. Route
+these focused fixtures through the shared durable agent so their assertions reach the owned seam.
+*/
+function createRoutingExecutor(store: any) {
+  return new TaskExecutor(store, "/tmp/test", {
+    agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+  });
+}
+
 
 describe("executor tool step numbering is 0-based", () => {
   beforeEach(() => {
@@ -61,7 +74,7 @@ describe("executor tool step numbering is 0-based", () => {
       } as any;
     });
 
-    const executor = new TaskExecutor(store, "/tmp/test");
+    const executor = createRoutingExecutor(store);
     await executor.execute({
       id: "FN-6607-T",
       title: "Zero based steps",
@@ -102,7 +115,7 @@ describe("executor tool step numbering is 0-based", () => {
       updatedAt: new Date().toISOString(),
     } as any);
 
-    const executor = new TaskExecutor(store as any, "/tmp/test");
+    const executor = createRoutingExecutor(store);
     await (executor as any).recoverApprovedStepsOnResume("FN-6607-R");
 
     expect(store.updateStep).toHaveBeenCalledWith("FN-6607-R", 1, "done");
@@ -142,7 +155,7 @@ describe("executor tool step numbering is 0-based", () => {
       return "";
     });
 
-    const executor = new TaskExecutor(store as any, "/tmp/test");
+    const executor = createRoutingExecutor(store);
     await (executor as any).reconcileStepsFromGitHistory("FN-7273", detail, "/tmp/wt");
 
     expect(store.updateStep).not.toHaveBeenCalled();
@@ -190,7 +203,7 @@ describe("executor tool step numbering is 0-based", () => {
       return "";
     });
 
-    const executor = new TaskExecutor(store as any, "/tmp/test");
+    const executor = createRoutingExecutor(store);
     await (executor as any).reconcileStepsFromGitHistory("FN-7273", detail, "/tmp/wt");
 
     expect(store.updateStep).toHaveBeenCalledWith("FN-7273", 2, "done");
@@ -247,18 +260,34 @@ describe("executor tool step numbering is 0-based", () => {
     store.getTaskDocument.mockImplementation(async (_taskId: string, key: string) =>
       key === "PROMPT.md" ? { content: task.prompt } : undefined,
     );
-    mockedCreateFnAgent.mockResolvedValue({
+    /*
+    FNXC:EngineTests 2026-07-23-21:40:
+    The graph's `parse` node writes every re-derived step back as `pending`, so the fixture's
+    seeded `in-progress` step no longer survives to `detectPendingReviewBlock`. The
+    pending-review shape can only arise from the implementation session itself: the agent
+    starts Step 0, requests review, and exits without fn_task_done. Simulate that by having
+    the session mark Step 0 `in-progress` (the 0-based review-request log line stays the
+    discriminator this test exists for).
+    */
+    mockedCreateFnAgent.mockImplementation(async () => ({
       session: {
-        prompt: vi.fn().mockResolvedValue(undefined),
+        prompt: vi.fn(async () => {
+          store._setRow("FN-6607-P", {
+            steps: [
+              { name: "Preflight", status: "in-progress" },
+              { name: "First", status: "pending" },
+            ],
+          });
+        }),
         dispose: vi.fn(),
         subscribe: vi.fn(),
         on: vi.fn(),
         sessionManager: { getLeafId: vi.fn().mockReturnValue("leaf-1") },
         state: {},
       },
-    } as any);
+    }) as any);
 
-    const executor = new TaskExecutor(store as any, "/tmp/test");
+    const executor = createRoutingExecutor(store);
     await executor.execute(task);
 
     expect(store.logEntry).toHaveBeenCalledWith(
@@ -267,6 +296,30 @@ describe("executor tool step numbering is 0-based", () => {
       undefined,
       expect.objectContaining({ agentId: "executor" }),
     );
-    expect(store.moveTask).toHaveBeenCalledWith("FN-6607-P", "in-review");
+    /*
+    FNXC:ReviewHandoff 2026-07-30-11:00 (#2646 review — greptile P2):
+    ISOLATE the handoff call instead of matching any of them. This flow records TWO
+    moveTask calls, so `toHaveBeenCalledWith(id, "in-review", expect.anything())` is
+    satisfied by the workflow-boundary move even if the review handoff itself regresses —
+    the review was right, and it is the same objection I had already raised against my own
+    first attempt without then fixing it properly.
+
+    The handoff call is identifiable by its own provenance marker
+    (`workflowMoveMetadata.reason === "workflow-review-handoff"`, set at
+    workflow-node-handlers.ts's `review-handoff` seam), so select THAT call and assert its
+    target column. Now a regression has nowhere to hide: drop the handoff and no such call
+    exists; retarget it and the column assertion fails.
+
+    Attribution verified by mutation, which the previous version could not manage —
+    changing the seam's `reason` and changing its target column each fail this test.
+    */
+    const handoffCalls = (store.moveTask as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) =>
+        (call[2] as { workflowMoveMetadata?: { reason?: string } } | undefined)
+          ?.workflowMoveMetadata?.reason === "workflow-review-handoff",
+    );
+    expect(handoffCalls).toHaveLength(1);
+    expect(handoffCalls[0]?.[0]).toBe("FN-6607-P");
+    expect(handoffCalls[0]?.[1]).toBe("in-review");
   });
 });

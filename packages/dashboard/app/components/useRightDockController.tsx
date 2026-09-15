@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { ColumnId, GithubIssueAction, MergeResult, Task, TaskDetail, WorkflowStep } from "@fusion/core";
-import { isNearDuplicateCanonicalInactive } from "../../../core/src/near-duplicate-canonical";
+import type { GithubIssueAction, MergeResult, ProjectNoteSummary, Task, TaskDetail, WorkflowStep } from "@fusion/core";
+import { isNearDuplicateCanonicalInactive } from "../../../core/src/duplicates/near-duplicate-canonical";
 import type { ToastType } from "../hooks/useToast";
+import type { UseNotesController } from "../hooks/useNotes";
+import type { ChatSessionInfo } from "../hooks/useChat";
 import type { DetailTaskTab } from "../hooks/useModalManager";
 import { fetchTaskDetail } from "../api";
 import type { RevertTaskOptions, RevertTaskResult } from "../api";
-import { getScopedItem } from "../utils/projectStorage";
-import { DOCK_FILES_CURRENT_KEY } from "./DockFilesView";
 import { TaskCard } from "./TaskCard";
-import { TaskDetailContent } from "./TaskDetailModal";
-import { RightDock, persistRightDockOpen, persistRightDockPinned, readStoredRightDockOpen, readStoredRightDockPinned } from "./RightDock";
+import { RightDockTaskDetailHost } from "./TaskDetailHostBoundaries";
+import { mergeTaskSnapshot } from "../hooks/useTasks";
+import { RightDock, persistRightDockOpen, persistRightDockPinned, persistRightDockViewSelection, readStoredRightDockOpen, readStoredRightDockPinned, readStoredRightDockView } from "./RightDock";
 import { RightDockExpandModal } from "./RightDockExpandModal";
 import type { OverflowViewKey, OverflowViewRenderProps, OverflowViewVisibilityOptions } from "./overflowViewRegistry";
 
@@ -21,23 +22,34 @@ export interface RightDockControllerInput {
   researchReadinessVersion: number;
   goalAnchorId?: string;
   tasks: Array<Task | TaskDetail>;
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-04:00 (batch-dashboard-app — the dock-wide fix):
+  Per-task column traits for every view the dock hosts. DevServerView and plugin task cards consume
+  this shared index rather than falling back to legacy column ids. Reuse the map App already builds
+  for the footer; no new resolution.
+  */
+  columnFlagsByTaskId?: ReadonlyMap<string, { complete?: boolean; countsTowardWip?: boolean; mergeBlocker?: boolean; humanReview?: boolean; intake?: boolean; hold?: boolean }>;
   workflowSteps: WorkflowStep[];
   subscribePluginEvents: (pluginId: string, onEvent: (event: { event: string; payload: unknown }) => void) => () => void;
   openDetailTask: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
-  openTaskPopup: (task: Task | TaskDetail) => void;
-  openMobileTasksInPopup: boolean;
+  onOpenSessionInNewWindow?: (session: ChatSessionInfo) => void;
+  openChatWindows?: ReadonlyMap<string, "open" | "minimized">;
+  notesController?: UseNotesController;
+  onOpenNote?: (note: ProjectNoteSummary) => void;
+  registerNotesGuard?: (guard: () => boolean | Promise<boolean>, onAccepted?: () => void) => () => void;
   openFileInBrowser: (path: string, opts?: { workspace?: string; line?: number; col?: number }) => void;
-  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
+  onUpdateTask?: (id: string, updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean; githubTracking?: { enabled?: boolean } }) => Promise<Task>;
   onDeleteTask: (id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; githubIssueAction?: GithubIssueAction; allowResurrection?: boolean }) => Promise<Task>;
-  onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside onArchiveTask; never mutates the source task's column. */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   onMergeTask: (id: string) => Promise<MergeResult>;
   onRetryTask?: (id: string) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
+  onPauseTask?: (id: string) => Promise<Task>;
+  onUnpauseTask?: (id: string) => Promise<Task>;
   /* FNXC:ReviewLaneBypass 2026-07-09-00:00 (FN-7720): threaded through so the right-dock host renders the same TaskDetailContent bypass affordance as the full modal/floating hosts. */
   onBypassReview?: (id: string, reason: string) => Promise<Task>;
-  onResetTask?: (id: string) => Promise<Task>;
-  onDuplicateTask?: (id: string) => Promise<Task>;
+  onResetTask?: (id: string, options?: { description?: string }) => Promise<Task>;
+  onDuplicateTask?: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   onTaskUpdated?: (task: Task) => void;
   openSettings: (section?: string) => void;
   onOpenUsage?: (anchorRect?: DOMRect | null) => void;
@@ -53,6 +65,8 @@ export interface RightDockControllerInput {
   autoMerge: boolean;
   taskDetailChatFirst: boolean;
   visibilityOptions: OverflowViewVisibilityOptions;
+  /** FN-382: the owner-supplied List surface rendered as a dock tool on non-mobile hosts. */
+  renderListView?: () => ReactNode;
   footerVisible: boolean;
 }
 
@@ -65,6 +79,8 @@ export interface RightDockController {
   modal: ReactNode;
   openTaskInDock: (task: Task | TaskDetail) => void;
   closeDockTask: () => void;
+  /** FN-382: select a dock tool from outside the dock (non-mobile List navigation). */
+  selectView: (key: OverflowViewKey) => void;
 }
 
 /*
@@ -82,35 +98,42 @@ export function useRightDockController(input: RightDockControllerInput): RightDo
   */
   const [pinned, setPinned] = useState(readStoredRightDockPinned);
   const [expandedView, setExpandedView] = useState<OverflowViewKey | null>(null);
-  const [dockTaskSnapshot, setDockTaskSnapshot] = useState<Task | TaskDetail | null>(null);
+  /*
+  FNXC:ListInRightDock 2026-09-14-04:42:
+  FN-382: the selected tool lives here so an outside caller (non-mobile List navigation) can open one. Persistence
+  keeps the dock storage key and its Files fallback unchanged.
+  */
+  const [selectedKey, setSelectedKey] = useState<OverflowViewKey>(() => readStoredRightDockView(input.visibilityOptions));
+  const selectView = useCallback((key: OverflowViewKey) => {
+    setSelectedKey(key);
+    persistRightDockViewSelection(key);
+  }, []);
+  const [dockTaskSnapshot, setDockTaskSnapshot] = useState<{
+    projectId: string | undefined;
+    task: Task | TaskDetail;
+  } | null>(null);
 
   const closeDockTask = useCallback(() => {
     setDockTaskSnapshot(null);
   }, []);
 
   const openTaskInDock = useCallback((task: Task | TaskDetail) => {
-    setDockTaskSnapshot(task);
+    setDockTaskSnapshot({ projectId: input.projectId, task });
     setOpen(true);
     persistRightDockOpen(true);
-  }, []);
-
-  /*
-  FNXC:RightDockTaskPopup 2026-07-03-00:00:
-  Ordinary task opens from the right-dock Tasks list must honor the task-popup setting before creating an embedded dock-detail snapshot. Keep `openTaskInDock` intact for setting-off routing, board right-sidebar routing, and the Tasks-tab back/list detail lifecycle.
-  */
-  const openTaskFromDockList = useCallback((task: Task | TaskDetail) => {
-    if (input.openMobileTasksInPopup === true) {
-      input.openTaskPopup(task);
-      return;
-    }
-
-    openTaskInDock(task);
-  }, [input, openTaskInDock]);
+  }, [input.projectId]);
 
   const resolvedDockTask = useMemo(() => {
-    if (!dockTaskSnapshot) return null;
-    return input.tasks.find((candidate) => candidate.id === dockTaskSnapshot.id) ?? dockTaskSnapshot;
-  }, [dockTaskSnapshot, input.tasks]);
+    /*
+    FNXC:RightDockTaskDetail 2026-09-12-02:18:
+    A project-switch render happens before the cleanup effect commits. Fence the transient snapshot by
+    its capture-time project identity so Task Detail cannot mount or run effects against the next project.
+    */
+    if (!dockTaskSnapshot || dockTaskSnapshot.projectId !== input.projectId) return null;
+    const snapshotTask = dockTaskSnapshot.task;
+    const liveTask = input.tasks.find((candidate) => candidate.id === snapshotTask.id);
+    return liveTask ? mergeTaskSnapshot(snapshotTask, liveTask) : snapshotTask;
+  }, [dockTaskSnapshot, input.projectId, input.tasks]);
 
   const toggle = useCallback(() => {
     setOpen((current) => {
@@ -134,21 +157,6 @@ export function useRightDockController(input: RightDockControllerInput): RightDo
   Popping a view out CLOSES the right dock but KEEPS the floating modal open. The modal is independent of dock open state (see expandedView note above), so collapsing the dock on pop-out gives the user the full-width app behind the movable, non-blocking modal. Clearing the pop-out (viewKey null) leaves the dock as-is.
   */
   const handleExpand = useCallback((viewKey: OverflowViewKey | null) => {
-    /*
-    FNXC:RightDockFiles 2026-06-23-23:38:
-    If Files is showing an individual file, Expand should open the existing FileBrowserModal at that file instead of the generic right-dock expanded panel. The file modal is the shared movable/resizable file surface and keeps its transparent, non-blurring FloatingWindow backdrop; an empty Files view still expands to the two-pane browser.
-    */
-    if (viewKey === "files") {
-      const currentFile = getScopedItem(DOCK_FILES_CURRENT_KEY, input.projectId);
-      if (currentFile) {
-        input.openFileInBrowser(currentFile, { workspace: "project" });
-        setOpen(false);
-        persistRightDockOpen(false);
-        setExpandedView(null);
-        return;
-      }
-    }
-
     setExpandedView(viewKey);
     if (viewKey) {
       setOpen(false);
@@ -157,35 +165,51 @@ export function useRightDockController(input: RightDockControllerInput): RightDo
   }, [input]);
 
   useEffect(() => {
-    if (!input.active) {
-      setExpandedView(null);
-      setDockTaskSnapshot(null);
-    }
-  }, [input.active]);
+    /*
+    FNXC:RightDockTaskDetail 2026-09-12-02:04:
+    Temporary task detail is project-scoped even when the dock remains active across a direct project switch. Clear both transient surfaces whenever project identity changes so an equal task id in the next project cannot merge with or display the previous project's snapshot.
+    */
+    setExpandedView(null);
+    setDockTaskSnapshot(null);
+  }, [input.active, input.projectId]);
 
   const renderTaskCard = useCallback((task: Task | TaskDetail) => (
     <TaskCard
       task={task}
+      /* Plugin- and dock-rendered cards resolved NO traits before this, so every role helper inside
+         the card fell back to the legacy id. The map is already in scope for the canonical lookup
+         below — the card itself was simply never given it. */
+      taskColumnFlags={input.columnFlagsByTaskId?.get(task.id)}
       projectId={input.projectId}
       onOpenDetail={(value: Task | TaskDetail) => input.openDetailTask(value)}
+      onOpenChatWithPrefill={input.onOpenChatWithPrefill}
       onDeleteTask={input.onDeleteTask}
+      onUpdateTask={input.onUpdateTask}
       addToast={input.addToast}
-      disableDrag={true}
       prAuthAvailable={input.prAuthAvailable}
       autoMergeEnabled={input.autoMerge}
       nearDuplicateCanonicalInactive={typeof task.sourceMetadata?.nearDuplicateOf === "string"
-        ? isNearDuplicateCanonicalInactive(input.tasks.find((candidate) => candidate.id === task.sourceMetadata?.nearDuplicateOf))
+        ? (() => {
+          /* FNXC:WorkflowResolvedColumns 2026-07-30-23:30: the canonical's own flags, from the map
+             this controller already threads to every dock view. */
+          const canonical = input.tasks.find((candidate) => candidate.id === task.sourceMetadata?.nearDuplicateOf);
+          return isNearDuplicateCanonicalInactive(canonical, canonical ? input.columnFlagsByTaskId?.get(canonical.id) : undefined);
+        })()
         : undefined}
     />
   ), [input]);
 
   const renderProps = useMemo<OverflowViewRenderProps>(() => ({
     projectId: input.projectId,
+    hostMode: input.visibilityOptions.hostMode ?? "standard",
+    experimentalFeatures: input.visibilityOptions.experimentalFeatures,
     addToast: input.addToast,
     settingsLoaded: input.settingsLoaded,
     readinessVersion: input.researchReadinessVersion,
     anchorGoalId: input.goalAnchorId,
     tasks: input.tasks,
+    columnFlagsByTaskId: input.columnFlagsByTaskId,
+    onUpdateTask: input.onUpdateTask,
     workflowSteps: input.workflowSteps,
     pluginContext: {
       projectId: input.projectId,
@@ -203,18 +227,27 @@ export function useRightDockController(input: RightDockControllerInput): RightDo
     onOpenGitHubImport: input.onOpenGitHubImport,
     onOpenGitManager: input.onOpenGitManager,
     onOpenSchedules: input.onOpenSchedules,
+    renderListView: input.renderListView,
     onOpenTaskDetail: (taskId: string) => {
       void fetchTaskDetail(taskId, input.projectId)
         .then((task) => input.openDetailTask(task as TaskDetail))
         .catch((error) => input.addToast(error instanceof Error ? error.message : "Failed to open task detail", "error"));
     },
     /*
-    FNXC:RightDockTasks 2026-06-28-17:05:
-    DockTaskList rows must open through the controller's ordinary right-dock task route, not TaskCard's canonical full task modal. Thread one controller-level handler into registry render props so both compact and expanded Tasks lists share popup-setting routing and setting-off dock-detail behavior.
+    FNXC:TaskRevert 2026-08-01-20:06:
+    Dock resolution uses the same New Task prefill owner as every other surface.
+    Keeping this callback in registry props lets compact and expanded dock hosts revise
+    the exact source description without introducing a second draft state.
     */
-    onOpenTaskInDock: openTaskFromDockList,
+    onReviseTask: (task: Task | TaskDetail) => input.onSendSelectionToTask(task.description),
     onDeleteTask: input.onDeleteTask,
+    onOpenChatWithPrefill: input.onOpenChatWithPrefill,
     onOpenDetail: input.openDetailTask,
+    onOpenSessionInNewWindow: input.onOpenSessionInNewWindow,
+    openChatWindows: input.openChatWindows,
+    notesController: input.notesController,
+    onOpenNote: input.onOpenNote,
+    registerNotesGuard: input.registerNotesGuard,
     onSendSelectionToTask: input.onSendSelectionToTask,
     onCreateTaskFromInsight: input.onCreateTaskFromInsight,
     onNavigateToMission: input.onNavigateToMission,
@@ -223,30 +256,33 @@ export function useRightDockController(input: RightDockControllerInput): RightDo
     renderTaskCard,
     subscribePluginEvents: input.subscribePluginEvents,
     openFile: input.openFileInBrowser,
-  }), [input, openTaskFromDockList, renderTaskCard]);
+  }), [input, renderTaskCard]);
 
   const dockTaskContent = resolvedDockTask ? (
     /*
     FNXC:OpenTasksInRightSidebar 2026-06-28-00:00:
     Board-routed right-sidebar task detail reuses the embedded TaskDetailContent surface so task actions, dependency links, and pop-out semantics stay aligned with the full-panel and list split-detail hosts. The controller resolves a live task row by id and falls back to the clicked snapshot so revalidation never blanks the dock.
     */
-    <TaskDetailContent
+    <RightDockTaskDetailHost
       task={resolvedDockTask}
       projectId={input.projectId}
       tasks={input.tasks as Task[]}
-      embedded
-      onRequestClose={closeDockTask}
-      onOpenDetail={(value) => input.openDetailTask(value, "chat")}
-      onMoveTask={input.onMoveTask}
+      onCloseDock={closeDockTask}
+      onOpenDetail={(value, initialTab) => input.openDetailTask(value, initialTab ?? "chat")}
+      /* FNXC:TaskRevert 2026-08-01-20:27: Right-dock task detail uses the shared New Task draft recovery for reverted tasks. */
+      onReviseTask={(task) => input.onSendSelectionToTask(task.description)}
       onDeleteTask={input.onDeleteTask}
-      onArchiveTask={input.onArchiveTask}
       onRevertTask={input.onRevertTask}
       onMergeTask={input.onMergeTask}
       onRetryTask={input.onRetryTask}
+      onOpenChatWithPrefill={input.onOpenChatWithPrefill}
+      onPauseTask={input.onPauseTask}
+      onUnpauseTask={input.onUnpauseTask}
       onBypassReview={input.onBypassReview}
       onResetTask={input.onResetTask}
       onDuplicateTask={input.onDuplicateTask}
       onTaskUpdated={input.onTaskUpdated}
+      onRefinementCreated={input.onTaskCreated}
       addToast={input.addToast}
       prAuthAvailable={input.prAuthAvailable}
       autoMergeEnabled={input.autoMerge}
@@ -261,7 +297,8 @@ export function useRightDockController(input: RightDockControllerInput): RightDo
     togglePin,
     openTaskInDock,
     closeDockTask,
-    dock: input.active ? <RightDock open={open} renderProps={renderProps} visibilityOptions={input.visibilityOptions} footerVisible={input.footerVisible} pinned={pinned} onTogglePin={togglePin} onExpand={handleExpand} dockTask={resolvedDockTask} dockTaskContent={dockTaskContent} onCloseDockTask={closeDockTask} /> : null,
+    selectView,
+    dock: input.active ? <RightDock selectedKey={selectedKey} onSelectKey={selectView} open={open} renderProps={renderProps} visibilityOptions={input.visibilityOptions} footerVisible={input.footerVisible} pinned={pinned} onTogglePin={togglePin} onExpand={handleExpand} dockTask={resolvedDockTask} dockTaskContent={dockTaskContent} onCloseDockTask={closeDockTask} /> : null,
     modal: input.active ? <RightDockExpandModal viewKey={expandedView} renderProps={renderProps} visibilityOptions={input.visibilityOptions} onClose={() => setExpandedView(null)} /> : null,
   };
 }

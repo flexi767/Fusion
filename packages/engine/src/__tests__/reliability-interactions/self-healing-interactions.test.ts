@@ -37,7 +37,6 @@ function makeStore(tasks: Map<string, Task>): TaskStore & EventEmitter {
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
     getCompletionHandoffAcceptedMarker: vi.fn().mockReturnValue(null),
     walCheckpoint: vi.fn(() => ({ busy: 0, log: 0, checkpointed: 0 })),
-    archiveTaskAndCleanup: vi.fn(async () => ({})),
     clearStaleExecutionStartBranchReferences: vi.fn(() => []),
     updateSettings: vi.fn(async () => ({})),
     mergeTask: vi.fn(async () => undefined),
@@ -81,7 +80,7 @@ describe("reliability interactions: self-healing", () => {
     "Refusing to start coding agent in missing worktree: /tmp/wt",
     "Refusing to start coding agent in incomplete worktree: /tmp/wt",
     "Refusing to start coding agent in unregistered git worktree: /tmp/wt",
-  ])("recoverMissingWorktreeReviewFailures rebounds no-progress review tasks for '%s'", async (error) => {
+  ])("recoverMissingWorktreeReviewFailures contains no-progress review tasks for '%s'", async (error) => {
     const taskId = "WT";
     const tasks = new Map<string, Task>([[
       taskId,
@@ -102,7 +101,7 @@ describe("reliability interactions: self-healing", () => {
     const recovered = await mgr.recoverMissingWorktreeReviewFailures();
 
     expect(recovered).toBe(1);
-    expect(tasks.get(taskId)?.column).toBe("todo");
+    expect(tasks.get(taskId)?.column).toBe("in-review");
     expect(tasks.get(taskId)?.worktree ?? null).toBeNull();
     expect(tasks.get(taskId)?.branch ?? null).toBeNull();
     expect(store.logEntry).toHaveBeenCalledWith(
@@ -119,7 +118,9 @@ describe("reliability interactions: self-healing", () => {
     await fx.writeAndCommit("src/sh.txt", "z\n", "feat: sh");
     await fx.checkout("main");
     await fx.writeAndCommit("src/sh.txt", "z\n", "feat: landed");
-    await fx.store.updateTask(fx.task.id, { branch: "fusion/fn-4361-sh", status: "failed", mergeRetries: 3, column: "in-review" } as any);
+    /* FNXC:BranchNaming 2026-08-23-02:10: a branch write is a provenance boundary
+       (updateTaskUnlockedImpl); without an explicit origin this threw before the scenario ran. */
+    await fx.store.updateTask(fx.task.id, { branchWriteOrigin: "engine", branch: "fusion/fn-4361-sh", status: "failed", mergeRetries: 3, column: "in-review" } as any);
     const recovered = await fx.selfHeal.recoverAlreadyMergedReviewTasks();
     expect(recovered).toBeGreaterThanOrEqual(0);
   });

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Column, Task, TaskDetail } from "@fusion/core";
 import {
@@ -15,7 +15,6 @@ import { TaskDetailContent, TaskDetailModal } from "../TaskDetailModal";
 setupTaskDetailModalHooks();
 
 const sharedProps = {
-  onMoveTask: noopMove,
   onDeleteTask: noopDelete,
   onMergeTask: noopMerge,
   onOpenDetail: noopOpenDetail,
@@ -28,7 +27,7 @@ function renderDetail({
   embedded = false,
 }: {
   task: Task | TaskDetail;
-  initialTab?: "definition" | "documents" | "stats" | "workflow" | "logs" | "retries" | "pr" | "summary" | "terminal";
+  initialTab?: "definition" | "documents" | "stats" | "workflow" | "logs" | "history" | "retries" | "pr" | "summary" | "terminal";
   embedded?: boolean;
 }) {
   if (embedded) {
@@ -60,7 +59,7 @@ function rerenderDetail(
     embedded = false,
   }: {
     task: Task | TaskDetail;
-    initialTab?: "definition" | "documents" | "stats" | "workflow" | "logs" | "retries" | "pr" | "summary" | "terminal";
+    initialTab?: "definition" | "documents" | "stats" | "workflow" | "logs" | "history" | "retries" | "pr" | "summary" | "terminal";
     embedded?: boolean;
   },
 ) {
@@ -167,6 +166,20 @@ describe("TaskDetailModal tab persistence", () => {
     expectActivitySegment("Feed");
   });
 
+  it("maps legacy History to Summary while Logs still maps to Feed", () => {
+    const task = makeTask({ column: "todo", prompt: "# Full task" });
+    const view = renderDetail({ task, initialTab: "history", embedded: true });
+
+    expect(screen.getByRole("button", { name: "Summary" })).toHaveClass("detail-tab-active");
+    expect(screen.getByTestId("task-history-tab")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "History" })).not.toBeInTheDocument();
+
+    rerenderDetail(view.rerender, { task, initialTab: "logs", embedded: true });
+    expect(screen.getByRole("button", { name: "Activity" })).toHaveClass("detail-tab-active");
+    expectActivitySegment("Feed");
+    expect(screen.queryByTestId("task-history-tab")).not.toBeInTheDocument();
+  });
+
   it("does not collapse expanded retries on a column-only update", () => {
     const task = makeTask({
       column: "in-progress",
@@ -194,7 +207,7 @@ describe("TaskDetailModal tab persistence", () => {
     expectActivitySegment("Feed");
 
     rerenderDetail(view.rerender, { task, initialTab: "retries" });
-    expect(screen.getByRole("button", { name: "Plan" })).toHaveClass("detail-tab-active");
+    expect(screen.getByRole("button", { name: "Details" })).toHaveClass("detail-tab-active");
     expect(screen.getByRole("button", { name: "Collapse retries details" })).toHaveAttribute("aria-expanded", "true");
   });
 
@@ -208,14 +221,14 @@ describe("TaskDetailModal tab persistence", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Plan" })).toHaveClass("detail-tab-active"));
   });
 
-  it("keeps the Summary guard when a task leaves done", async () => {
+  it("keeps Summary selected when a task leaves done", async () => {
     const task = makeTask({ column: "done", prompt: "# Full task" });
     const view = renderDetail({ task, initialTab: "summary" });
 
     expect(screen.getByRole("button", { name: "Summary" })).toHaveClass("detail-tab-active");
     rerenderDetail(view.rerender, { task: { ...task, column: "in-review" }, initialTab: "summary" });
 
-    await waitFor(() => expect(screen.getByRole("button", { name: "Plan" })).toHaveClass("detail-tab-active"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Summary" })).toHaveClass("detail-tab-active"));
   });
 
   it("keeps the Terminal guard when the mocked CLI session disappears", async () => {
@@ -232,8 +245,16 @@ describe("TaskDetailModal tab persistence", () => {
       const view = renderDetail({ task });
 
       await waitFor(() => expect(screen.getByRole("button", { name: "Session" })).toBeInTheDocument());
+      /*
+      FNXC:TaskDetailTabs 2026-07-24-00:00:
+      Settle pending CLI-session fetch commits and click a freshly-queried node: clicking
+      right after the tab appears raced the cliSession hydration re-render on loaded CI
+      shards (full-suite run 30070825088), dispatching on a detached node so the tab never
+      activated. Same detached-node class d7752931b fixed for PlanningModeModal Proceed.
+      */
+      await act(async () => {});
       fireEvent.click(screen.getByRole("button", { name: "Session" }));
-      expect(screen.getByRole("button", { name: "Session" })).toHaveClass("detail-tab-active");
+      await waitFor(() => expect(screen.getByRole("button", { name: "Session" })).toHaveClass("detail-tab-active"));
 
       rerenderDetail(view.rerender, { task: makeTask({ id: "FN-NO-SESSION", column: "in-progress", prompt: "# Full task" }) });
       await waitFor(() => expect(screen.getByRole("button", { name: "Plan" })).toHaveClass("detail-tab-active"));

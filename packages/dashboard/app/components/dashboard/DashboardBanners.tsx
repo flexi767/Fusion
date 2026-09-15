@@ -3,7 +3,7 @@ FNXC:DashboardBanners 2026-06-24-00:00:
 DashboardBanners is the conditional banner cluster rendered above the dashboard-project-shell, extracted verbatim from AppInner's main return JSX. It is a pure render of the same gated banners (every condition, prop, FNXC comment, and the TaskIdIntegrityBanner setDashboardHealth updater preserved byte-for-byte); the banner components are imported directly from their siblings.
 */
 import type { DashboardBannersProps } from "./types";
-import type { DashboardHealthResponse } from "../../api/health";
+import type { DashboardHealthResponse } from "../../api/client/health";
 import type { SectionId } from "../SettingsModal";
 import { TestModeBanner } from "../TestModeBanner";
 import { MigrationInProgressBanner } from "../MigrationInProgressBanner";
@@ -85,7 +85,7 @@ export function DashboardBanners({
 }: DashboardBannersProps) {
   /* FNXC:DashboardBanners 2026-06-26-00:00: The Open Mailbox approval banner is gated by an approval:<id> candidate from a real ApprovalRequest. The count floor remains only for the approval-SSE/count-refresh race and must not fabricate a mailbox request for task awaiting-approval states. */
   const showMailboxApprovalBanner = isMailboxApprovalCandidate(approvalBannerCandidate);
-  /* FNXC:AuthRecovery 2026-06-29-00:00: Daemon-auth token recovery owns unauthorized remediation while its blocking dialog is open. Suppress engine remediation banners in parallel so operators fix the token once without seeing stale engine restart/start controls or live-region shells. */
+  /* FNXC:AuthRecovery 2026-09-10-21:28: Daemon-auth token recovery owns unauthorized remediation while its blocking full-screen page is open. Suppress engine remediation banners in parallel so operators fix the token once without seeing stale engine restart/start controls or live-region shells. */
   const showEngineRemediationBanners = !authTokenRecoveryOpen;
 
 

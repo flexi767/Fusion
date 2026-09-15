@@ -1,6 +1,7 @@
+import { ViewHeader } from "./ViewHeader";
 import "./SetupWizardModal.css";
 import { lazy, Suspense, useState, useCallback, useMemo, useRef, useEffect, type KeyboardEvent } from "react";
-import { X, Loader2, CheckCircle, ChevronRight, Sparkles } from "lucide-react";
+import { Loader2, CheckCircle, ChevronRight, Sparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AgentOnboardingSummary, ProjectInfo, ProjectCreateInput } from "../api";
 import { createAgent, registerProject, detectWorkspace, fetchAuthStatus } from "../api";
@@ -8,6 +9,7 @@ import { useConfirm } from "../hooks/useConfirm";
 import { openExternalUrl } from "../utils/open-external";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { suggestProjectName } from "../utils/projectDetection";
+import { FloatingWindow } from "./FloatingWindow";
 
 /*
 FNXC:TaskPrefix 2026-06-24-19:00:
@@ -231,56 +233,33 @@ export function SetupWizardModal({
     };
 
     /*
-    FNXC:ProjectSetup 2026-07-18-04:30:
-    Registering a project on a host without git previously failed AFTER submission with a raw
-    spawn error. Probe git up front and warn with an explicit choice: open the git downloads,
-    or create the project anyway without a git repo (skipGitInit). Clone mode cannot proceed
-    without git, so its dialog only offers the install link. The probe is best-effort — if the
-    status call itself fails, registration proceeds and server-side errors still surface.
+    FNXC:ProjectSetup 2026-08-19-12:44:
+    Registration is fail-closed when Git is unavailable. Every setup mode uses the same
+    install/download plus cancel/retry contract; no bypass can register a project that
+    cannot create task worktrees. The server remains authoritative when the probe itself
+    is unavailable, so a transient status endpoint failure does not create a second policy.
     */
-    let skipGitInit = false;
     try {
       const { gitCli } = await fetchAuthStatus();
       if (gitCli && !gitCli.available) {
-        if (state.manualMode === "clone") {
-          const choice = await confirmWithChoice({
-            title: t("setup.gitMissingTitle", "Git is not installed"),
-            message: t(
-              "setup.gitMissingCloneMessage",
-              "Cloning a repository requires Git on the Fusion host, and Git was not found. Install Git, then try again — Fusion picks it up without a restart.",
-            ),
-            confirmLabel: t("setup.gitMissingOpenDownloads", "Open Git downloads"),
-            cancelLabel: t("setup.cancel", "Cancel"),
-            alwaysAsk: true,
-          });
-          if (choice === "primary") openExternalUrl(gitCli.installUrl ?? "https://git-scm.com/downloads");
-          abortRegistration();
-          return;
-        }
         const choice = await confirmWithChoice({
           title: t("setup.gitMissingTitle", "Git is not installed"),
           message: t(
             "setup.gitMissingMessage",
-            "Git was not found on the Fusion host. Fusion projects normally live in a git repository so agents can branch, commit, and merge work. You can install Git first (Fusion picks it up without a restart), or create the project anyway without a git repository.",
+            "Git was not found on the Fusion host. Install Git, then try again — Fusion projects need Git so agents can create task worktrees.",
           ),
-          confirmLabel: t("setup.gitMissingCreateAnyway", "Create anyway without Git"),
-          tertiaryLabel: t("setup.gitMissingOpenDownloads", "Open Git downloads"),
+          confirmLabel: t("setup.gitMissingOpenDownloads", "Open Git downloads"),
           cancelLabel: t("setup.cancel", "Cancel"),
           alwaysAsk: true,
         });
-        if (choice === "tertiary") {
+        if (choice === "primary") {
           openExternalUrl(gitCli.installUrl ?? "https://git-scm.com/downloads");
-          abortRegistration();
-          return;
         }
-        if (choice !== "primary") {
-          abortRegistration();
-          return;
-        }
-        skipGitInit = true;
+        abortRegistration();
+        return;
       }
     } catch {
-      // Probe failure must not block registration.
+      // The registration route still performs the authoritative readiness check.
     }
 
     try {
@@ -293,7 +272,6 @@ export function SetupWizardModal({
         cloneUrl: state.manualMode === "clone" ? trimmedCloneUrl : undefined,
         workspaceMode: state.manualMode === "existing" ? state.workspaceMode : false,
         taskPrefix: state.manualTaskPrefix.trim() || undefined,
-        skipGitInit: skipGitInit || undefined,
       };
 
       const result = await registerProject(input);
@@ -449,12 +427,34 @@ export function SetupWizardModal({
   const modalClassName = `modal setup-wizard-modal${state.step === "agent" ? " setup-wizard-modal--agent" : ""}`;
 
   return (
-    <div className="modal-overlay open setup-wizard-overlay" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+    <FloatingWindow
+      windowKey="setup-wizard" modal
+      title={t("setup.welcomeToFusion", "Welcome to Fusion")}
+      ariaLabelledBy="wizard-title"
+      onClose={() => {}}
+      hideHeader
+      dragHandleSelector=".setup-wizard-modal .setup-wizard-header"
+      className="floating-window--setup-wizard"
+      defaultSize={{ width: 760, height: 680 }}
+      minSize={{ width: 480, height: 360 }}
+      persistGeometryKey="floating-window:setup-wizard"
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+    >
+      {/* FNXC:ModalTouchGeometry 2026-07-26-16:22: The first-run wizard remains blocking, while its reflowable steps use shared tablet geometry and suspend it for sheet viewports. */}
       <div className={modalClassName}>
-        {/* Header */}
-        <div className="setup-wizard-header">
-          <div className="setup-wizard-heading">
-            <div className="setup-wizard-brand" aria-label={t("setup.brandName", "Fusion")}>
+        {/*
+        FNXC:StandardizedViewLayout 2026-09-13-22:40:
+        FN-379 remediation: the first-run wizard shares the canonical header. Its brand block and onboarding
+        eyebrow stay rich title content, and the dialog keeps labelling itself from the step title span.
+        */}
+        <ViewHeader
+          className="setup-wizard-header"
+          onClose={state.step !== "complete" && state.step !== "agent" ? handleClose : undefined}
+          closeButtonProps={{ "aria-label": t("setup.closeWizard", "Close wizard") }}
+          title={(
+          <span className="setup-wizard-heading">
+            <span className="setup-wizard-brand" aria-label={t("setup.brandName", "Fusion")}>
               <svg
                 className="setup-wizard-brand-logo"
                 width={28}
@@ -477,7 +477,7 @@ export function SetupWizardModal({
                 />
               </svg>
               <span className="setup-wizard-brand-name">{t("setup.brandName", "Fusion")}</span>
-            </div>
+            </span>
             {/*
               FNXC:SetupWizard 2026-07-10-11:05:
               First-run review: opening project registration from the 5-step onboarding wizard (its
@@ -492,24 +492,16 @@ export function SetupWizardModal({
                 {t("setup.projectStepContext", "Step 3 of 5 — Project · Fusion setup")}
               </span>
             )}
-            <h2 id="wizard-title" className="setup-wizard-title">
+            <span id="wizard-title" className="setup-wizard-title">
               {state.step === "manual" && (includeAgentStep
                 ? t("setup.welcomeToFusion", "Welcome to Fusion")
                 : t("setup.titleSetUpProject", "Set Up Your Project"))}
               {state.step === "agent" && t("setup.firstAgentTitle", "Create your first agent")}
               {state.step === "complete" && t("setup.setupCompleteTitle", "Setup Complete!")}
-            </h2>
-          </div>
-          {state.step !== "complete" && state.step !== "agent" && (
-            <button
-              className="modal-close"
-              onClick={handleClose}
-              aria-label={t("setup.closeWizard", "Close wizard")}
-            >
-              <X size={20} />
-            </button>
+            </span>
+          </span>
           )}
-        </div>
+        />
 
         {/* Content */}
         <div className="setup-wizard-content">
@@ -1000,6 +992,6 @@ export function SetupWizardModal({
           </Suspense>
         </ErrorBoundary>
       )}
-    </div>
+    </FloatingWindow>
   );
 }

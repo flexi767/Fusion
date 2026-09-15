@@ -23,6 +23,8 @@ import type { PluginSetupStatusResponse, RegistryPluginEntry } from "../api";
 import type { ToastType } from "../hooks/useToast";
 import { useConfirm } from "../hooks/useConfirm";
 import { subscribeSse } from "../sse-bus";
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewHeader } from "./ViewHeader";
 
 /** Normalized plugin lifecycle payload from SSE plugin:lifecycle events */
 interface PluginLifecyclePayload {
@@ -42,6 +44,8 @@ interface PluginLifecyclePayload {
 interface PluginManagerProps {
   addToast: (message: string, type?: ToastType) => void;
   projectId?: string;
+  /** Lets a mounted Settings owner refresh installed-only runtime navigation. */
+  onPluginsChanged?: () => void;
 }
 
 interface BuiltinPlugin {
@@ -264,7 +268,7 @@ function renderPluginError(plugin: PluginInstallation, className = "plugin-error
   );
 }
 
-export function PluginManager({ addToast, projectId }: PluginManagerProps) {
+export function PluginManager({ addToast, projectId, onPluginsChanged }: PluginManagerProps) {
   const { t } = useTranslation("app");
   const [plugins, setPlugins] = useState<PluginInstallation[]>([]);
   const [loading, setLoading] = useState(true);
@@ -287,25 +291,27 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
   const [builtinSetupStatusById, setBuiltinSetupStatusById] = useState<Record<string, PluginSetupStatusResponse>>({});
   const [loadingBuiltinSetupId, setLoadingBuiltinSetupId] = useState<string | null>(null);
   const [installingBuiltinSetupId, setInstallingBuiltinSetupId] = useState<string | null>(null);
-  /*
-   * FNXC:PluginManager 2026-07-07-00:00:
-   * FN-7629 — built-in runtime plugins (Hermes/Paperclip/OpenClaw/Droid) must expose a durable
-   * enable/disable control even when no plugin_installs row exists yet ("activated-without-record").
-   * Track in-flight toggles separately from install/setup so the toggle-switch can show a busy
-   * state without blocking the Install/Manage button.
-   */
-  const [togglingBuiltinRuntimeId, setTogglingBuiltinRuntimeId] = useState<string | null>(null);
   const { confirm } = useConfirm();
 
-  const loadPlugins = useCallback(async () => {
+  const loadPlugins = useCallback(async (background = false, mutationResponse?: PluginInstallation) => {
     try {
-      setLoading(true);
+      if (!background) setLoading(true);
       const data = await fetchPlugins(projectId);
-      setPlugins(data);
+      /*
+      FNXC:PluginEnablementScope 2026-07-21-16:30:
+      A successful project-scoped toggle response is authoritative for its immediate confirmation
+      refresh. Preserve it when that refresh returns a stale or host-scoped list so a completed
+      enable/disable request cannot flip the switch back until a later explicit refresh or SSE event.
+      */
+      setPlugins(mutationResponse
+        ? data.some((entry) => entry.id === mutationResponse.id)
+          ? data.map((entry) => entry.id === mutationResponse.id ? mutationResponse : entry)
+          : [...data, mutationResponse]
+        : data);
     } catch (err) {
       addToast(t("plugins.loadFailed", "Failed to load plugins: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     } finally {
-      setLoading(false);
+      if (!background) setLoading(false);
     }
   }, [projectId, addToast]);
 
@@ -496,6 +502,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
       setInstallPath("");
       setInstallAiScanOnLoad(false);
       await loadPlugins();
+      onPluginsChanged?.();
     } catch (err) {
       addToast(t("plugins.installFailed", "Failed to install plugin: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     } finally {
@@ -514,6 +521,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
       await installPlugin({ path: plugin.path }, projectId);
       addToast(t("plugins.builtinInstalledGlobally", "{{name}} installed globally", { name: plugin.name }), "success");
       await loadPlugins();
+      onPluginsChanged?.();
     } catch (err) {
       addToast(t("plugins.builtinInstallFailed", "Failed to install {{name}}: {{error}}", { name: plugin.name, error: err instanceof Error ? err.message : String(err) }), "error");
     } finally {
@@ -532,6 +540,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
       await installPlugin({ path: entry.path }, projectId);
       addToast(t("plugins.registryInstalled", "{{name}} installed and enabled", { name: entry.name }), "success");
       await loadPlugins();
+      onPluginsChanged?.();
       await loadRegistry(registrySearchQuery, registryCategory);
     } catch (err) {
       addToast(t("plugins.registryInstallFailed", "Failed to install {{name}}: {{error}}", { name: entry.name, error: err instanceof Error ? err.message : String(err) }), "error");
@@ -563,6 +572,13 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
   const handleEnable = async (plugin: PluginInstallation) => {
     try {
       const enabledPlugin = await enablePlugin(plugin.id, projectId);
+      /*
+      FNXC:PluginEnablementScope 2026-07-21-12:00:
+      Apply the project-scoped enable response before the background list refresh. This keeps the
+      switch truthful even when lifecycle SSE races the refresh; SSE filtering below rejects
+      events attributed to another project instead of overwriting this project’s enabled state.
+      */
+      setPlugins((previous) => previous.map((entry) => entry.id === enabledPlugin.id ? enabledPlugin : entry));
       if (enabledPlugin.state === "error") {
         addToast(t("plugins.enableFailed", "Failed to enable {{name}}: {{error}}", { name: plugin.name, error: enabledPlugin.error ?? t("plugins.unknownError", "unknown error") }), "error");
         await loadPlugins();
@@ -570,7 +586,10 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
       }
 
       addToast(t("plugins.enabledForProject", "{{name}} enabled for this project", { name: plugin.name }), "success");
-      await loadPlugins();
+      // FNXC:PluginEnablementScope 2026-07-21-16:30: Preserve this authoritative
+      // response if the single confirmation refresh races a stale scoped-list read.
+      await loadPlugins(true, enabledPlugin);
+      onPluginsChanged?.();
     } catch (err) {
       addToast(t("plugins.enablePluginFailed", "Failed to enable plugin: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     }
@@ -578,53 +597,26 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
 
   const handleDisable = async (plugin: PluginInstallation) => {
     try {
-      await disablePlugin(plugin.id, projectId);
+      const disabledPlugin = await disablePlugin(plugin.id, projectId);
+      setPlugins((previous) => previous.map((entry) => entry.id === disabledPlugin.id ? disabledPlugin : entry));
       addToast(t("plugins.disabledForProject", "{{name}} disabled for this project", { name: plugin.name }), "success");
-      await loadPlugins();
+      await loadPlugins(true, disabledPlugin);
+      onPluginsChanged?.();
     } catch (err) {
       addToast(t("plugins.disablePluginFailed", "Failed to disable plugin: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     }
   };
 
   /*
-   * FNXC:PluginManager 2026-07-07-00:00:
-   * FN-7629 — durable built-in runtime disable path. A built-in runtime
-   * (Hermes/Paperclip/OpenClaw/Droid) that has never been explicitly installed
-   * has no plugin_installs row, so enablePlugin/disablePlugin (which both call
-   * getPlugin -> ENOENT) cannot persist a decision for it. When the user wants
-   * to disable such a runtime, first register it via the existing install path
-   * (mirrors the CLI's ensureBundledPluginInstalled lazy-install) so a
-   * plugin_installs row + project state exists, then disable it immediately so
-   * the decision is durable: loadAllPlugins() only loads plugins where
-   * enabled=true, so a disabled runtime is never re-activated on restart.
-   * Already-installed runtimes just toggle through the normal enable/disable
-   * handlers, same as the installed-plugin list row.
+   * FNXC:PluginManager 2026-07-22-20:41:
+   * FN-8521 keeps installation and project-scoped enablement as separate actions: only a
+   * PluginInstallation can reach this toggle, so toggling can never register a missing package.
    */
-  const handleToggleBuiltinRuntime = async (builtinPlugin: BuiltinPlugin, installedPlugin?: PluginInstallation) => {
-    if (installedPlugin) {
-      if (installedPlugin.enabled) {
-        await handleDisable(installedPlugin);
-      } else {
-        await handleEnable(installedPlugin);
-      }
-      return;
-    }
-
-    if (!builtinPlugin.path) {
-      addToast(t("plugins.builtinNoPackage", "{{name}} is built in and does not have an installable package yet", { name: builtinPlugin.name }), "warning");
-      return;
-    }
-
-    try {
-      setTogglingBuiltinRuntimeId(builtinPlugin.id);
-      const registered = await installPlugin({ path: builtinPlugin.path }, projectId);
-      await disablePlugin(registered.id, projectId);
-      addToast(t("plugins.disabledForProject", "{{name}} disabled for this project", { name: builtinPlugin.name }), "success");
-      await loadPlugins();
-    } catch (err) {
-      addToast(t("plugins.disablePluginFailed", "Failed to disable plugin: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
-    } finally {
-      setTogglingBuiltinRuntimeId(null);
+  const handleToggleBuiltinRuntime = async (installedPlugin: PluginInstallation) => {
+    if (installedPlugin.enabled) {
+      await handleDisable(installedPlugin);
+    } else {
+      await handleEnable(installedPlugin);
     }
   };
 
@@ -655,6 +647,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
       await uninstallPlugin(plugin.id, projectId);
       addToast(t("plugins.uninstalledGlobally", "{{name}} uninstalled globally", { name: plugin.name }), "success");
       await loadPlugins();
+      onPluginsChanged?.();
       setSelectedPlugin(null);
     } catch (err) {
       addToast(t("plugins.uninstallFailed", "Failed to uninstall plugin: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
@@ -709,20 +702,22 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
   if (selectedPlugin) {
     return (
       <div className="plugin-manager-detail" data-testid="plugin-manager-detail">
-        <div className="plugin-manager-detail-header">
-          <button className="btn-icon" onClick={() => setSelectedPlugin(null)} aria-label={t("plugins.backToList", "Back to plugin list")}>
-            <X size={16} />
-          </button>
-          <div className="plugin-detail-title">
-            <div className="plugin-detail-title-copy">
-              <h4 className="plugin-detail-name">{selectedPlugin.name}</h4>
-              {renderPluginError(selectedPlugin, "plugin-error-text plugin-error-text--detail")}
-            </div>
-            <span className="plugin-state-badge" style={{ color: STATE_COLORS[selectedPlugin.state] || STATE_COLORS.installed }}>
-              {selectedPlugin.state}
+        <ViewHeader
+          className="plugin-manager-detail-header"
+          icon={Package}
+          title={(
+            <span className="plugin-detail-title">
+              <span className="plugin-detail-title-copy">
+                <span className="plugin-detail-name">{selectedPlugin.name}</span>
+                {renderPluginError(selectedPlugin, "plugin-error-text plugin-error-text--detail")}
+              </span>
+              <span className="plugin-state-badge" style={{ color: STATE_COLORS[selectedPlugin.state] || STATE_COLORS.installed }}>
+                {selectedPlugin.state}
+              </span>
             </span>
-          </div>
-        </div>
+          )}
+          backAction={{ label: t("plugins.backToList", "Back to plugin list"), onClick: () => setSelectedPlugin(null) }}
+        />
 
         <div className="plugin-detail-content">
           <div className="plugin-detail-card">
@@ -1139,16 +1134,8 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
           const setupReady = isInstalled && setupStatus?.hasSetup && pluginSetupState === "installed";
           const setupCheckInFlight = loadingBuiltinSetupId === builtinPlugin.id;
           const metadataOnly = !builtinPlugin.path;
-          /*
-           * FNXC:PluginManager 2026-07-07-00:00:
-           * FN-7629 — runtime built-ins (Hermes/Paperclip/OpenClaw/Droid) must always expose an
-           * interactive enable/disable control, independent of install status, and must never
-           * dead-end at the static "Built-in metadata only" label. Non-runtime built-ins (e.g.
-           * Agent Browser) keep the existing metadata-only/install/manage affordances unchanged.
-           */
           const isRuntimeBuiltin = builtinPlugin.category === "runtime";
-          const runtimeEnabled = installedPlugin ? installedPlugin.enabled : true;
-          const isTogglingRuntime = togglingBuiltinRuntimeId === builtinPlugin.id;
+          const runtimeEnabled = installedPlugin?.enabled;
 
           return (
             <div key={builtinPlugin.id} className="plugin-builtins-item">
@@ -1159,7 +1146,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
                 <span className={`plugin-builtins-status ${isInstalled ? "plugin-builtins-status--installed" : "plugin-builtins-status--available"}`}>
                   {isInstalled ? t("plugins.statusInstalled", "Installed") : metadataOnly ? t("plugins.statusBuiltIn", "Built in") : t("plugins.statusNotInstalled", "Not installed")}
                 </span>
-                {isRuntimeBuiltin && !runtimeEnabled && (
+                {isRuntimeBuiltin && runtimeEnabled === false && (
                   <span className="plugin-builtins-setup-status plugin-builtins-setup-status--warning">{t("plugins.builtinDisabled", "Disabled")}</span>
                 )}
                 {requiresSetupAction && (
@@ -1177,14 +1164,13 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
                 <span className="plugin-builtins-description-text">{builtinPlugin.description}</span>
               </div>
               <div className="plugin-builtins-actions">
-                {isRuntimeBuiltin && (
+                {isRuntimeBuiltin && installedPlugin && (
                   <label className="toggle-switch">
                     <input
                       type="checkbox"
-                      checked={runtimeEnabled}
-                      onChange={() => void handleToggleBuiltinRuntime(builtinPlugin, installedPlugin)}
-                      disabled={isTogglingRuntime}
-                      aria-label={runtimeEnabled
+                      checked={installedPlugin.enabled}
+                      onChange={() => void handleToggleBuiltinRuntime(installedPlugin)}
+                      aria-label={installedPlugin.enabled
                         ? t("plugins.disablePlugin", "Disable {{name}}", { name: builtinPlugin.name })
                         : t("plugins.enablePlugin", "Enable {{name}}", { name: builtinPlugin.name })}
                     />
@@ -1249,18 +1235,18 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
   // Plugin list view
   return (
     <div className="plugin-manager" data-testid="plugin-manager">
-      <div className="plugin-manager-header">
-        <span className="plugin-manager-header-title">{t("plugins.installedPlugins", "Installed Plugins")}</span>
-        <div className="plugin-manager-actions">
-          <button className="btn btn-sm" onClick={loadPlugins} title={t("plugins.refresh", "Refresh")} aria-label={t("plugins.refreshPluginList", "Refresh plugin list")}>
-            <RefreshCw size={14} className={loading ? "spin" : ""} />
-            {t("plugins.refresh", "Refresh")}
-          </button>
-          <button className="btn btn-primary btn-sm" onClick={() => setShowInstall(true)}>
-            <Plus size={14} /> {t("plugins.install", "Install")}
-          </button>
-        </div>
-      </div>
+      {/* FNXC:StandardizedViewLayout 2026-09-13-21:43: Plugin list/detail navigation and installation now use the same header actions and tactile return as every Settings collection without changing install or save controllers. */}
+      <ViewHeader
+        className="plugin-manager-header"
+        icon={Package}
+        title={t("plugins.installedPlugins", "Installed Plugins")}
+        actions={(
+          <>
+            <ViewActionButton icon={RefreshCw} label={t("plugins.refresh", "Refresh")} onClick={() => void loadPlugins()} title={t("plugins.refresh", "Refresh")} aria-label={t("plugins.refreshPluginList", "Refresh plugin list")} />
+            <ViewActionButton kind="create" label={t("plugins.install", "Install")} onClick={() => setShowInstall(true)} />
+          </>
+        )}
+      />
 
       {showInstall && (
         <div className="plugin-install-form">

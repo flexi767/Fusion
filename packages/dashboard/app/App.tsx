@@ -4,11 +4,21 @@ import {
   type Task,
   type TaskDetail,
   type WorkflowStep,
+  WHITEBOARD_VIEW_FLAG,
+  isExperimentalFeatureEnabled,
 } from "@fusion/core";
 import { Header, useViewportMode } from "./components/Header";
-import { TaskDetailContent } from "./components/TaskDetailModal";
-import { FloatingWindow } from "./components/FloatingWindow";
-import { AppModals } from "./components/AppModals";
+import { AlphaProvider } from "./context/AlphaContext";
+import { ViewLayoutProvider } from "./context/ViewLayoutContext";
+import {
+  AppTaskPopoutWindows,
+  useAppMainPanelTaskDetailState,
+  useAppPoppedOutTaskState,
+} from "./components/TaskDetailHostBoundaries";
+import { AlphaPlanningDrawer, AlphaProjectsDrawer } from "./components/AlphaMobileDrawer";
+import { PoppedOutChatWindows, QuickChatWindow } from "./components/PoppedOutChatWindows";
+import { PoppedOutNoteWindows } from "./components/PoppedOutNoteWindows";
+import { AppModals, openAppFileInBrowser } from "./components/AppModals";
 import { DashboardLoader, type DashboardLoaderStage } from "./components/DashboardLoader";
 import { TopProgressBar } from "./components/TopProgressBar";
 import { ExecutorStatusBar } from "./components/ExecutorStatusBar";
@@ -22,13 +32,18 @@ import {
 import type { SectionId } from "./components/SettingsModal";
 import { MobileNavBar } from "./components/MobileNavBar";
 import { LeftSidebarNav } from "./components/LeftSidebarNav";
-import { useRightDockController } from "./components/useRightDockController";
+import { AlphaDesktopActionBar } from "./components/AlphaDesktopActionBar";
+import { buildDashboardNavigationEntries } from "./components/dashboardNavigationEntries";
+import { useRightDockController, type RightDockControllerInput } from "./components/useRightDockController";
 import { QuickChatFAB } from "./components/QuickChatFAB";
 import { ToastContainer } from "./components/ToastContainer";
+import { ProjectOverview } from "./components/ProjectOverview";
 import { useBackgroundSessions } from "./hooks/useBackgroundSessions";
-import { useGitHubStarPromptShown, markGitHubStarPromptShown } from "./hooks/useGitHubStarPrompt";
+import { useGitHubStarPromptState, markGitHubStarPromptShown, refreshGitHubStarPromptDismissal } from "./hooks/useGitHubStarPrompt";
 import { useSessionBannersHidden } from "./hooks/useSessionBannerPref";
 import { useTasks } from "./hooks/useTasks";
+import { useBoardWorkflows } from "./hooks/useBoardWorkflows";
+import type { ExecutorColumnFlags } from "./hooks/useExecutorStats";
 import { useProjects } from "./hooks/useProjects";
 import { useAgents } from "./hooks/useAgents";
 import { useNodes } from "./hooks/useNodes";
@@ -42,11 +57,13 @@ import { useModalManager, type DetailTaskOrigin, type DetailTaskTab } from "./ho
 import { useAppSettings } from "./hooks/useAppSettings";
 import { useDashboardKeyboardShortcuts } from "./hooks/useDashboardKeyboardShortcuts";
 import { ModalDismissPreferenceProvider } from "./hooks/useOverlayDismiss";
+import { QuickAddSubmitOnEnterProvider } from "./hooks/useQuickAddSubmitOnEnter";
 import { useDeepLink } from "./hooks/useDeepLink";
 import { useFavorites } from "./hooks/useFavorites";
 import { useAuthOnboarding } from "./hooks/useAuthOnboarding";
 import { useMobileKeyboard } from "./hooks/useMobileKeyboard";
-import { isIOS, useMobileKeyboardViewportLock, useMobileViewportRestoreReset } from "./hooks/useMobileScrollLock";
+import { useKeyboardFocusPending } from "./hooks/useKeyboardFocusPending";
+import { useMobileKeyboardViewportLock, useMobileViewportRestoreReset } from "./hooks/useMobileScrollLock";
 import { computeMobileBarKeyboardFlags } from "./utils/mobileBarKeyboardFlags";
 import { recordActivity } from "./utils/activity-trace";
 import { closeViewShortcut, retainViewNavRevert } from "./utils/dashboardShortcutToggles";
@@ -59,6 +76,8 @@ import { usePluginDashboardViews } from "./hooks/usePluginDashboardViews";
 import { isPluginViewId, isPluginViewRegistered } from "./plugins/pluginViewRegistry";
 import { registerBundledPluginViews } from "./plugins/registerBundledPluginViews";
 import { useProjectActions } from "./hooks/useProjectActions";
+import { useAlphaDesktopViewWindows } from "./hooks/useAlphaDesktopViewWindows";
+import { useNotes } from "./hooks/useNotes";
 import { useTaskHandlers } from "./hooks/useTaskHandlers";
 import { useRemoteNodeData } from "./hooks/useRemoteNodeData";
 import { useRemoteNodeEvents } from "./hooks/useRemoteNodeEvents";
@@ -68,20 +87,23 @@ import { FileBrowserProvider } from "./context/FileBrowserContext";
 import { ShellProvider } from "./context/ShellContext";
 import { RetryWarningProvider } from "./context/RetryWarningContext";
 import { CostBadgeProvider } from "./context/CostBadgeContext";
+import { ChatMessageLayoutProvider } from "./context/ChatMessageLayoutContext";
+import { ChatSubmitOnEnterProvider } from "./context/ChatSubmitOnEnterContext";
 import { ShellHostProvider, useShellHostContext } from "./context/ShellHostContext";
 import { useShellConnection } from "./hooks/useShellConnection";
 import { useStashOrphanCount } from "./hooks/useStashOrphanCount";
 import { useChatUnreadBadge } from "./hooks/useChatUnreadBadge";
 import { useMailboxUnread } from "./hooks/useMailboxUnread";
 import { useApprovalBanner } from "./hooks/useApprovalBanner";
-import { useBranchTaskFilters } from "./hooks/useBranchTaskFilters";
 import { useDashboardHealth } from "./hooks/useDashboardHealth";
 import { useAuthTokenRecovery } from "./hooks/useAuthTokenRecovery";
 import { useScopedDismissFlag } from "./hooks/useScopedDismissFlag";
 import { useCapacityRiskBanner } from "./hooks/useCapacityRiskBanner";
-import { useMainPanelTaskDetail } from "./hooks/useMainPanelTaskDetail";
 import { useBoardScrollRestore } from "./hooks/useBoardScrollRestore";
-import { usePoppedOutTasks, type PoppedOutTaskEntry } from "./hooks/usePoppedOutTasks";
+import type { PoppedOutTaskEntry } from "./hooks/usePoppedOutTasks";
+import { usePoppedOutChats, type PoppedOutChatEntry } from "./hooks/usePoppedOutChats";
+import { usePoppedOutNotes } from "./hooks/usePoppedOutNotes";
+import { shouldCloseQuickChatOnOutsideClick, useChatVisibilityToggle } from "./hooks/useChatVisibilityToggle";
 import { NativeShellOnboardingModal } from "./components/NativeShellOnboardingModal";
 import { NativeShellConnectionManager } from "./components/NativeShellConnectionManager";
 import { ShellConnectionStatus } from "./components/ShellConnectionStatus";
@@ -99,7 +121,7 @@ import {
   executeCliSessionBannerAction,
 } from "./utils/appLifecycle";
 // Re-export the unit-tested lifecycle helpers so existing `from "./App"` /
-// `from "../../App"` imports keep resolving after the bodies moved to utils.
+// `from "./App"` imports keep resolving after the bodies moved to utils.
 export {
   didEnterAwaitingApproval,
   didEnterDone,
@@ -111,11 +133,16 @@ export {
   executeCliSessionBannerAction,
 } from "./utils/appLifecycle";
 import { subscribeSse } from "./sse-bus";
-import { AuthTokenRecoveryDialog } from "./components/AuthTokenRecoveryDialog";
-import { MainContent } from "./components/dashboard/MainContent";
+import { AuthTokenRecoveryPage } from "./components/AuthTokenRecoveryPage";
+import {
+  AppMainPanelTaskDetailComposition,
+  MainContentListView,
+  type AppMainPanelTaskDetailMainContentProps,
+} from "./components/dashboard/MainContent";
+import { PlanningKeepAlive } from "./components/dashboard/PlanningKeepAlive";
 import { NATIVE_STRUCTURE_OPEN_EVENT, type NativeStructureOpenEventDetail } from "./components/nativeStructureNavigation";
 import { DashboardBanners } from "./components/dashboard/DashboardBanners";
-import type { DashboardBannersProps, MainContentProps } from "./components/dashboard/types";
+import type { DashboardBannersProps } from "./components/dashboard/types";
 import type { GraphWorkflowSelection } from "./components/GraphWorkflowSwitcherSlot";
 
 // ChatView's CSS is imported eagerly so the styles bundle into the main
@@ -123,24 +150,28 @@ import type { GraphWorkflowSelection } from "./components/GraphWorkflowSwitcherS
 // link asynchronously, producing a brief flash of unstyled chat UI on
 // first render.
 import "./components/ChatView.css";
+import { useChatMailReportRouting } from "./components/chatReportHandoff";
 
 const IS_TEST_ENV = import.meta.env.MODE === "test";
 export const TASK_DETAIL_FLOATING_GEOMETRY_KEY = "floating-window:task-detail";
 
 const AgentsView = lazy(() => import("./components/AgentsView").then((m) => ({ default: m.AgentsView })));
-const DocumentsView = lazy(() => import("./components/DocumentsView").then((m) => ({ default: m.DocumentsView })));
+const NotesView = lazy(() => import("./components/NotesView").then((m) => ({ default: m.NotesView })));
+/* FNXC:WhiteboardAlpha 2026-09-10-05:42: Keep every Whiteboard-owned module behind this destination-only boundary; unlike ordinary lazy views it is intentionally excluded from idle prefetch. */
+const WhiteboardView = lazy(() => import("./components/WhiteboardView").then((m) => ({ default: m.WhiteboardView })));
 const InsightsView = lazy(() => import("./components/InsightsView").then((m) => ({ default: m.InsightsView })));
 const ResearchView = lazy(() => import("./components/ResearchView").then((m) => ({ default: m.ResearchView })));
 const EvalsView = lazy(() => import("./components/EvalsView").then((m) => ({ default: m.EvalsView })));
 const ChatView = lazy(() => import("./components/ChatView").then((m) => ({ default: m.ChatView })));
 
 const SkillsView = lazy(() => import("./components/SkillsView").then((m) => ({ default: m.SkillsView })));
+const SnippetsView = lazy(() => import("./components/SnippetsView").then((m) => ({ default: m.SnippetsView })));
 const MemoryView = lazy(() => import("./components/MemoryView").then((m) => ({ default: m.MemoryView })));
 const SecretsView = lazy(() => import("./components/SecretsView").then((m) => ({ default: m.SecretsView })));
 const CommandCenter = lazy(() => import("./components/command-center/CommandCenter").then((m) => ({ default: m.CommandCenter })));
 const DevServerView = lazy(() => import("./components/DevServerView").then((m) => ({ default: m.DevServerView })));
-const TodoView = lazy(() => import("./components/TodoView").then((m) => ({ default: m.TodoView })));
 const GoalsView = lazy(() => import("./components/GoalsView").then((m) => ({ default: m.GoalsView })));
+const PatchnodeView = lazy(() => import("./components/PatchnodeView").then((m) => ({ default: m.PatchnodeView })));
 const PullRequestView = lazy(() => import("./components/PullRequestView").then((m) => ({ default: m.PullRequestView })));
 /*
 FNXC:Navigation 2026-06-22-00:00:
@@ -172,24 +203,63 @@ function prefetchLazyViews() {
     ((cb: () => void) => setTimeout(cb, 200));
   idle(() => {
     void import("./components/AgentsView");
-    void import("./components/DocumentsView");
+    void import("./components/NotesView");
     void import("./components/InsightsView");
     void import("./components/ResearchView");
     void import("./components/EvalsView");
     void import("./components/ChatView");
 
     void import("./components/SkillsView");
+    void import("./components/SnippetsView");
     void import("./components/MemoryView");
     void import("./components/SecretsView");
     void import("./components/command-center/CommandCenter");
     void import("./components/DevServerView");
-    void import("./components/TodoView");
     void import("./components/GoalsView");
+    void import("./components/PatchnodeView");
     void import("./components/PullRequestView");
   });
 }
 
 registerBundledPluginViews();
+
+/*
+FNXC:ViewportChrome 2026-08-23-18:14:
+App-level keyboard state follows Fusion's viewport-mode classification rather than useMobileKeyboard's <=768px heuristic. Landscape phones render the nav in mobile mode; this production seam keeps that path executable in tests.
+*/
+export function useMobileBarKeyboardState({
+  isMobile,
+  anyModalOpen,
+  overlayOpen,
+}: {
+  isMobile: boolean;
+  anyModalOpen: boolean;
+  overlayOpen: boolean;
+}) {
+  const keyboardMetrics = useMobileKeyboard({ enabled: isMobile, allowNonMobileViewport: isMobile });
+  const keyboardFocusPending = useKeyboardFocusPending(isMobile) || false;
+  const navigationViewport = keyboardMetrics.navigationViewport ?? {
+    active: keyboardMetrics.keyboardOpen,
+    keyboardOverlap: keyboardMetrics.keyboardOverlap,
+    viewportHeight: keyboardMetrics.viewportHeight,
+    viewportOffsetTop: keyboardMetrics.viewportOffsetTop,
+  };
+  return {
+    ...keyboardMetrics,
+    keyboardOverlap: navigationViewport.keyboardOverlap,
+    viewportHeight: navigationViewport.viewportHeight,
+    viewportOffsetTop: navigationViewport.viewportOffsetTop,
+    keyboardFocusPending,
+    ...computeMobileBarKeyboardFlags({
+      isMobile,
+      keyboardOpen: keyboardMetrics.keyboardOpen,
+      keyboardFocusPending,
+      navigationViewportActive: navigationViewport.active,
+      anyModalOpen,
+      overlayOpen,
+    }),
+  };
+}
 
 export function shouldOpenBoardTaskInDock(openTasksInRightSidebar: boolean, rightDockActive: boolean, initialTab?: DetailTaskTab): boolean {
   return !initialTab && openTasksInRightSidebar && rightDockActive;
@@ -204,7 +274,7 @@ export function getBoardTaskOpenRoute(options: {
   rightDockActive: boolean;
   initialTab?: DetailTaskTab;
 }): BoardTaskOpenRoute {
-  if (!options.initialTab && options.openMobileTasksInPopup) {
+  if (options.openMobileTasksInPopup) {
     return "popup";
   }
   if (shouldOpenBoardTaskInDock(options.openTasksInRightSidebar, options.rightDockActive, options.initialTab)) {
@@ -215,6 +285,8 @@ export function getBoardTaskOpenRoute(options: {
 
 export interface DashboardShortcutPopupState {
   poppedOutTaskEntries: Array<Pick<PoppedOutTaskEntry, "task" | "originTaskView">>;
+  poppedOutChatEntries: Array<Pick<PoppedOutChatEntry, "projectId" | "session" | "minimized">>;
+  poppedOutNoteEntries?: Array<{ projectId: string; note: { id: string } }>;
   quickChatOpen: boolean;
   terminalOpen: boolean;
   modalClosers: Array<[boolean, () => void]>;
@@ -222,6 +294,8 @@ export interface DashboardShortcutPopupState {
 
 export interface DashboardShortcutPopupHandlers {
   closePoppedOutTask: (taskId: string, originTaskView?: TaskView) => void;
+  closePoppedOutChat: (projectId: string, sessionId: string) => void;
+  closePoppedOutNote?: (projectId: string, noteId: string) => void;
   closeQuickChat: () => void;
   closeTerminal: () => void;
 }
@@ -244,8 +318,96 @@ export function taskPopupIdentityKey(taskId: string, originTaskView?: TaskView):
 }
 
 /*
+FNXC:AlphaDesktopRightDock 2026-09-12-04:56:
+App reste l’unique propriétaire des fenêtres lancées depuis les listes Chat et Notes du dock Alpha. Cette frontière lie l’identité du projet courant aux ouvertures, déduplique via les hooks de fenêtres existants et projette seulement les conversations du projet courant vers les badges ouvert/minimisé; elle est partagée par le shell réel et sa régression d’intégration.
+*/
+export function useAppAlphaDesktopRightDockWindows(projectId?: string) {
+  const chats = usePoppedOutChats();
+  const notes = usePoppedOutNotes();
+  const openSessionInNewWindow = useCallback((session: import("./hooks/useChat").ChatSessionInfo) => {
+    if (projectId) chats.popOut(projectId, session);
+  }, [chats.popOut, projectId]);
+  const openNoteInWindow = useCallback((note: import("@fusion/core").ProjectNoteSummary) => {
+    if (projectId) notes.popOut(projectId, note);
+  }, [notes.popOut, projectId]);
+  const openChatWindows = useMemo(() => {
+    const states = new Map<string, "open" | "minimized">();
+    if (!projectId) return states;
+    for (const entry of chats.entries) {
+      if (entry.projectId === projectId) states.set(entry.session.id, entry.minimized ? "minimized" : "open");
+    }
+    return states;
+  }, [chats.entries, projectId]);
+
+  return { chats, notes, openSessionInNewWindow, openNoteInWindow, openChatWindows };
+}
+
+export interface AppAlphaDesktopRightDockCompositionInput {
+  projectId?: string;
+  owner: ReturnType<typeof useAppAlphaDesktopRightDockWindows>;
+  controllerInput: Omit<RightDockControllerInput,
+    | "projectId"
+    | "onOpenSessionInNewWindow"
+    | "openChatWindows"
+    | "onOpenNote"
+  >;
+  chatWindowProps: Omit<import("./components/PoppedOutChatWindows").PoppedOutChatWindowsProps,
+    | "entries"
+    | "projectId"
+    | "onClose"
+    | "onOpenSessionInNewWindow"
+  >;
+  noteWindowProps: Omit<import("./components/PoppedOutNoteWindows").PoppedOutNoteWindowsProps,
+    | "entries"
+    | "projectId"
+    | "onClose"
+  >;
+}
+
+/*
+FNXC:AlphaDesktopRightDock 2026-09-12-05:14:
+Le shell App et la régression d’intégration doivent appeler la même frontière de composition. Elle câble elle-même les callbacks Chat/Notes dans le vrai contrôleur du dock et produit les fenêtres correspondantes, afin qu’une omission dans ce chemin de production fasse échouer le test au lieu de rester masquée par un harness qui réassemble les pièces.
+*/
+export function useAppAlphaDesktopRightDockComposition({
+  projectId,
+  owner,
+  controllerInput,
+  chatWindowProps,
+  noteWindowProps,
+}: AppAlphaDesktopRightDockCompositionInput) {
+  const rightDock = useRightDockController({
+    ...controllerInput,
+    projectId,
+    onOpenSessionInNewWindow: owner.openSessionInNewWindow,
+    openChatWindows: owner.openChatWindows,
+    onOpenNote: owner.openNoteInWindow,
+  });
+  const windows = projectId ? (
+    <>
+      <PoppedOutNoteWindows
+        {...noteWindowProps}
+        entries={owner.notes.entries}
+        projectId={projectId}
+        onClose={owner.notes.close}
+      />
+      <PoppedOutChatWindows
+        {...chatWindowProps}
+        entries={owner.chats.entries}
+        projectId={projectId}
+        onClose={owner.chats.close}
+        onOpenSessionInNewWindow={owner.openSessionInNewWindow}
+      />
+    </>
+  ) : null;
+  return { rightDock, windows };
+}
+
+/*
 FNXC:DashboardShortcuts 2026-07-04-12:02:
 The App-level Escape close order is factored into a pure helper so regression tests can prove the real dashboard shell ordering without rendering every lazy dashboard surface. The helper must close exactly one surface and return false when no popup is open so component-local Escape handlers remain authoritative.
+
+FNXC:DashboardShortcuts 2026-09-02-05:24:
+Escape must never dismiss a chat window the operator cannot see, mirroring the existing visible-only rule for task pop-outs while preserving the surrounding close order.
 */
 export function closeTopmostDashboardPopupForShortcut(
   state: DashboardShortcutPopupState,
@@ -254,6 +416,16 @@ export function closeTopmostDashboardPopupForShortcut(
   const lastPoppedOutTask = state.poppedOutTaskEntries[state.poppedOutTaskEntries.length - 1];
   if (lastPoppedOutTask) {
     handlers.closePoppedOutTask(lastPoppedOutTask.task.id, lastPoppedOutTask.originTaskView);
+    return true;
+  }
+  const lastPoppedOutNote = state.poppedOutNoteEntries?.at(-1);
+  if (lastPoppedOutNote && handlers.closePoppedOutNote) {
+    handlers.closePoppedOutNote(lastPoppedOutNote.projectId, lastPoppedOutNote.note.id);
+    return true;
+  }
+  const lastPoppedOutChat = [...state.poppedOutChatEntries].reverse().find((entry) => !entry.minimized);
+  if (lastPoppedOutChat) {
+    handlers.closePoppedOutChat(lastPoppedOutChat.projectId, lastPoppedOutChat.session.id);
     return true;
   }
   if (state.quickChatOpen) {
@@ -288,7 +460,7 @@ function AppInner() {
   // Project management hooks - MUST be called before any conditional logic
   const { projects, loading: projectsLoading, error: projectsError, refresh: refreshProjects } = useProjects();
   const hasEverLoadedProjectsRef = useRef(projects.length > 0);
-  const { nodes } = useNodes();
+  const { nodes, loading: nodesLoading } = useNodes();
 
   useEffect(() => {
     if (projects.length > 0) {
@@ -301,6 +473,8 @@ function AppInner() {
 
   // Current project with node-aware persistence
   const { currentProject, setCurrentProject, clearCurrentProject, loading: currentProjectLoading } = useCurrentProject(projects, { nodeId: currentNodeId, projectsLoading });
+  /* FNXC:AlphaDesktopWindows 2026-09-11-19:35: App owns one Notes controller across page/window presentation changes so a dirty draft and conflict cannot be reset by responsive chrome changes. */
+  const notesController = useNotes(currentProject?.id);
 
   const {
     hasAiProvider,
@@ -321,30 +495,14 @@ function AppInner() {
     dismiss: dismissUpdateBanner,
   } = useUpdateCheck();
   
-  // Sync node context with useNodes() results:
-  // - Resolve saved node ID to full NodeConfig when nodes list loads
-  // - Fall back to local if selected node is missing or deleted
+  // Resolve a persisted node identity once its current list response arrives.
+  // Destructive missing-node fallback is intentionally deferred until the
+  // project-scoped Notes guard exists below.
   useEffect(() => {
-    // If we have a saved node ID but no currentNode yet (initial hydration),
-    // resolve it from the nodes list
-    if (currentNodeId && !currentNode && nodes.length > 0) {
-      const foundNode = nodes.find((n) => n.id === currentNodeId);
-      if (foundNode) {
-        setCurrentNode(foundNode);
-        return;
-      }
-    }
-    
-    // If we have a currentNode but the saved ID no longer exists in nodes list,
-    // fall back to local view
-    if (currentNodeId && nodes.length > 0) {
-      const nodeExists = nodes.some((n) => n.id === currentNodeId);
-      if (!nodeExists) {
-        // Selected node was deleted or unregistered - fall back to local
-        clearCurrentNode();
-      }
-    }
-  }, [currentNodeId, currentNode, nodes, setCurrentNode, clearCurrentNode]);
+    if (!currentNodeId || currentNode || nodesLoading) return;
+    const foundNode = nodes.find((node) => node.id === currentNodeId);
+    if (foundNode) setCurrentNode(foundNode);
+  }, [currentNodeId, currentNode, nodes, nodesLoading, setCurrentNode]);
   
   // Search query state - must be defined before useTasks
   const [searchQuery, setSearchQuery] = useState("");
@@ -358,7 +516,23 @@ function AppInner() {
       const params = new URLSearchParams();
       if (currentProject?.id) params.set("projectId", currentProject.id);
       const query = params.size > 0 ? `?${params.toString()}` : "";
+      /*
+      FNXC:PluginEvents 2026-07-26-16:46:
+      Resync contract (see SseSubscription in sse-bus.ts). This subscription is a pure relay: it parses
+      `plugin:custom`, filters by pluginId, and hands the payload to the plugin view's callback. It
+      holds no state of its own, so there is nothing here to refetch — and the host cannot synthesize a
+      refetch for the plugin either, because `plugin:custom` payloads are opaque and no generic
+      "current plugin state" endpoint exists. Adding a refetch here would only add a request to the
+      visible-edge burst without correcting anything, so this takes the documented replaySafe opt-out.
+      RESIDUAL RISK, stated deliberately: a plugin view that accumulates state purely from these events
+      still diverges across a hidden-suspend gap. The fix belongs in the plugin surface, which must
+      resync when its own view remounts or through its own authoritative fetch; the relay cannot do it.
+      */
       return subscribeSse(`/api/events${query}`, {
+        replaySafe: {
+          reason:
+            "relay-only: no host state; plugin:custom payloads are opaque so the host has no authoritative refetch, plugin views own their resync",
+        },
         events: {
           "plugin:custom": (event: MessageEvent) => {
             try {
@@ -411,7 +585,7 @@ function AppInner() {
   const isMobile = viewportMode === "mobile";
 
   // Navigation history for browser back button (desktop + mobile).
-  const { pushNav, replaceCurrent, removeNav } = useNavigationHistory({ enabled: true });
+  const { pushNav, replaceCurrent, removeNav, promoteNav } = useNavigationHistory({ enabled: true });
   const viewNavRevertRef = useRef(new Map<TaskView, (() => void)[]>());
 
   // View state must be defined before useTasks since useTasks depends on taskView for SSE gating
@@ -460,7 +634,8 @@ function AppInner() {
   FNXC:DashboardShortcuts 2026-07-16-00:00:
   FN-8069 makes Settings and Command Center shortcuts true toggles. Retain the exact view-revert callback pushed to navigation history so a shortcut can remove that identity-matched entry and restore the captured prior view for shortcut and Header/MobileNavBar opens alike; the callback deletes itself for shortcut close and Browser Back paths (Runfusion/Fusion#2118).
   */
-  const handleTaskViewChange = useCallback((newView: TaskView) => {
+  const alphaPilotRouterRef = useRef<(view: TaskView) => boolean>(() => false);
+  const commitTaskViewChange = useCallback((newView: TaskView) => {
     if (newView === "missions") {
       setMissionResumeSessionId(undefined);
       setMissionTargetId(undefined);
@@ -481,6 +656,19 @@ function AppInner() {
       pushNav({ type: "view", revert });
     }
   }, [handleChangeTaskView, taskView, pushNav]);
+  /*
+  FNXC:ListInRightDock 2026-09-14-04:42:
+  FN-382: on every non-mobile host List is a dock tool, not a page. An explicit request for it — sidebar, footer,
+  header toggle, a stored view or a `?view=list` deep link — selects the dock tool and opens the dock, leaving the
+  current destination on screen and writing no navigation entry. Phone hosts are untouched: they keep the dedicated
+  route, both nav producers and the drawer. When the dock is unavailable (no project shell, feature off) the ordinary
+  route still answers, so the destination can never become unreachable.
+  */
+  const listDockRouteRef = useRef<((newView: TaskView) => boolean) | null>(null);
+  const handleTaskViewChange = useCallback((newView: TaskView) => {
+    if (listDockRouteRef.current?.(newView)) return;
+    if (!alphaPilotRouterRef.current(newView)) commitTaskViewChange(newView);
+  }, [commitTaskViewChange]);
 
   /*
   FNXC:NativeStructureEmbed 2026-07-19-19:30:
@@ -521,13 +709,93 @@ function AppInner() {
   // FNXC:DashboardLiveUpdates 2026-06-26-01:08:
   // SSE remains enabled only for board/list views to free connection slots for mission detail fetches. The false→true missed-event catch-up lives inside useTasks so App keeps the routing gate only and cannot double-fetch on task-view re-entry.
   const taskSseEnabled = taskView === "board" || taskView === "list";
-  const { tasks, isStale, createTask, moveTask, pauseTask, unpauseTask, deleteTask, mergeTask, retryTask, bypassReview, resetTask, updateTask, duplicateTask, archiveTask, unarchiveTask, revertTask, archiveAllDone, loadArchivedTasks, loadMoreArchivedTasks, archivedHasMore, archivedLoadingMore, ingestCreatedTasks, lastFetchTimeMs } = useTasks(
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-03:50:
+  HOISTED above `useTasks` so its planner-activity stamp can be a role question.
+
+  The board-workflow payload is the only per-task trait source on this screen, and it depends on
+  `projectId` alone — nothing about tasks — so reading it first is safe. `useTasks` previously gated
+  that stamp on the literal `{triage, todo}` pair, which matches nothing on a renamed board, so the
+  planning border and pulsing badge never appeared while the planner was working the card.
+
+  REMOTE NODES GET NO FLAGS, deliberately: their rows belong to another store, so local
+  board-workflow metadata must never be applied to their ids — the same rule the footer index below
+  already follows. They keep the legacy fallback.
+  */
+  const { boardWorkflows: footerBoardWorkflows } = useBoardWorkflows({ projectId: currentProject?.id });
+  const resolveTaskWorkflowId = useCallback((task: Task) => {
+    if (isRemote || !footerBoardWorkflows) return undefined;
+    return footerBoardWorkflows.taskWorkflowIds[task.id] ?? footerBoardWorkflows.defaultWorkflowId;
+  }, [footerBoardWorkflows, isRemote]);
+
+  const resolveTaskColumnFlagsForActivity = useCallback((task: Task) => {
+    if (!footerBoardWorkflows) return undefined;
+    const workflowId = resolveTaskWorkflowId(task);
+    return footerBoardWorkflows.workflows
+      .find((workflow) => workflow.id === workflowId)
+      ?.columns.find((column) => column.id === task.column)?.flags;
+  }, [footerBoardWorkflows, resolveTaskWorkflowId]);
+
+  const { tasks, isStale, createTask, moveTask, pauseTask, unpauseTask, deleteTask, mergeTask, retryTask, bypassReview, resetTask, updateTask, duplicateTask, revertTask, loadMoreCurrentTasks, retryCurrentTasksPagination, currentTasksTotal, currentTasksHasMore, currentTasksLoadingMore, currentTasksPaginationError, currentTasksProgressKey, loadMoreCompletedTasks, retryCompletedTasksPagination, completedSortMode, changeCompletedSortMode, completedCounts, completedHasMore, completedLoadingMore, completedPaginationError, completedProgressKey, ingestCreatedTasks, lastFetchTimeMs } = useTasks(
     {
       ...(currentProject ? { projectId: currentProject.id } : {}),
       searchQuery: searchQuery || undefined,
       sseEnabled: taskSseEnabled,
+      resolveColumnFlags: resolveTaskColumnFlagsForActivity,
+      resolveWorkflowId: resolveTaskWorkflowId,
     }
   );
+  const remoteTaskRequestIdentity = isRemote
+    ? `${currentNodeId ?? ""}\u0000${currentProject?.id ?? ""}`
+    : null;
+  const remoteTaskSourceRef = useRef<{
+    identity: string | null;
+    readiness: "ready" | "awaiting-load" | "loading";
+  }>({
+    identity: remoteTaskRequestIdentity,
+    readiness: "ready",
+  });
+  const remoteTaskSource = remoteTaskSourceRef.current;
+  if (remoteTaskSource.identity !== remoteTaskRequestIdentity) {
+    remoteTaskSource.identity = remoteTaskRequestIdentity;
+    remoteTaskSource.readiness = isRemote ? "awaiting-load" : "ready";
+  }
+  if (isRemote && remoteData.loading) {
+    remoteTaskSource.readiness = "loading";
+  } else if (isRemote && !remoteData.error && remoteTaskSource.readiness === "loading") {
+    remoteTaskSource.readiness = "ready";
+  }
+  /*
+  FNXC:TaskSearchSource 2026-09-10-01:08:
+  Remote task rows are authoritative even when the result is empty. A node or project change must first cross the remote hook's loading cycle, so rows retained from the preceding source can never leak into Board, List, the dock, or task-number suggestions.
+  */
+  const boardSourceTasks = !isRemote
+    ? tasks
+    : remoteTaskSource.readiness === "ready" && !remoteData.error
+      ? remoteData.tasks
+      : [];
+  const footerTasks = boardSourceTasks;
+  const footerColumnFlagsByTaskId = useMemo(() => {
+    const index = new Map<string, ExecutorColumnFlags>();
+    // FNXC:ConcurrencyIndicators 2026-08-04-10:00: remote tasks belong to a
+    // different store, so local board-workflow metadata must never be applied to
+    // their ids. Until the remote node supplies its own traits, use only the
+    // documented literal fallback rather than fabricate custom lifecycle state.
+    if (isRemote || !footerBoardWorkflows) return index;
+    const workflowsById = new Map(footerBoardWorkflows.workflows.map((workflow) => [workflow.id, workflow]));
+    // Build traits for the exact local rows supplied to the footer.
+    for (const task of footerTasks) {
+      const workflow = workflowsById.get(footerBoardWorkflows.taskWorkflowIds[task.id] ?? footerBoardWorkflows.defaultWorkflowId);
+      const flags = workflow?.columns.find((column) => column.id === task.column)?.flags;
+      if (flags) index.set(task.id, flags);
+    }
+    return index;
+  }, [footerBoardWorkflows, footerTasks, isRemote]);
+  /*
+  FNXC:ConcurrencyIndicators 2026-08-03-12:00:
+  FN-8453 threads board workflow traits into the footer so custom intake,
+  complete, WIP, and merge columns share the same live-agent predicate as the engine.
+  */
 
   /*
   FNXC:Navigation 2026-06-22-00:00:
@@ -536,48 +804,47 @@ function AppInner() {
   FNXC:TaskDetail 2026-06-23-00:41:
   Board task-card secondary actions can deep-link into the inline main-panel task detail. Files-changed must land on the embedded Changes tab instead of reopening the task in the modal path.
   */
-  const { task: mainPanelDetailTask, initialTab: mainPanelDetailInitialTab, setTask: setMainPanelDetailTask, setInitialTab: setMainPanelDetailInitialTab } = useMainPanelTaskDetail();
   const { capture: captureCurrentBoardScrollSnapshot, requestRestore } = useBoardScrollRestore(taskView);
-  const mainPanelDetailNavRevertRef = useRef<(() => void) | null>(null);
+  const mainPanelTaskDetail = useAppMainPanelTaskDetailState({
+    taskView,
+    changeTaskView: handleChangeTaskView,
+    captureBoardScroll: captureCurrentBoardScrollSnapshot,
+    requestBoardScrollRestore: requestRestore,
+    pushNav,
+    removeNav,
+  });
+  const {
+    task: mainPanelDetailTask,
+    open: openTaskDetailInMainPanel,
+    close: closeTaskDetailMainPanel,
+  } = mainPanelTaskDetail;
   /*
   FNXC:FloatingWindow 2026-07-15-15:20:
   FN-8016 identifies a popped-out task detail by task id plus origin view. The same task can therefore coexist in separate view-scoped FloatingWindows while re-opening it on one view refreshes only that entry.
   */
-  const { entries: poppedOutTaskEntries, popOut: popOutTaskDetail, close: closePoppedOutTask } = usePoppedOutTasks();
-  const popupNavCloseRef = useRef(new Map<string, () => void>());
+  const poppedOutTasks = useAppPoppedOutTaskState({ taskView, isMobile, pushNav, removeNav });
+  const {
+    entries: poppedOutTaskEntries,
+    open: popOutTaskDetailForCurrentView,
+    close: closePoppedOutTaskWithNav,
+    closeAll: closeAllPoppedOutTasks,
+    clearNavigation: clearPoppedOutTaskNavigation,
+  } = poppedOutTasks;
+  const appRightDockWindows = useAppAlphaDesktopRightDockWindows(currentProject?.id);
+  const {
+    entries: poppedOutChatEntries,
+    close: closePoppedOutChat,
+    closeAll: closeAllPoppedOutChats,
+    minimizeAll: minimizeAllPoppedOutChats,
+    restoreAll: restoreAllPoppedOutChats,
+  } = appRightDockWindows.chats;
+  const {
+    entries: poppedOutNoteEntries,
+    close: closePoppedOutNote,
+    closeAll: closeAllPoppedOutNotes,
+  } = appRightDockWindows.notes;
+  const { openSessionInNewWindow } = appRightDockWindows;
 
-  /*
-  FNXC:TaskDetailSwipeBack 2026-07-15-10:32:
-  Mobile task popups keep Board or List visible, but they are still task-detail
-  surfaces. Give each newly opened popup its own navigation callback so browser,
-  iOS swipe, and Android Back dismiss only that popup rather than leaving the
-  Fusion stack empty and allowing Back to skip past the originating task view.
-  */
-  const closePoppedOutTaskWithNav = useCallback((taskId: string, originTaskView?: TaskView) => {
-    const identityKey = taskPopupIdentityKey(taskId, originTaskView);
-    const closeFromHistory = popupNavCloseRef.current.get(identityKey);
-    if (closeFromHistory) {
-      popupNavCloseRef.current.delete(identityKey);
-      removeNav(closeFromHistory);
-    }
-    closePoppedOutTask(taskId, originTaskView);
-  }, [closePoppedOutTask, removeNav]);
-
-  const popOutTaskDetailForCurrentView = useCallback((task: Task | TaskDetail) => {
-    const identityKey = taskPopupIdentityKey(task.id, taskView);
-    const alreadyOpen = poppedOutTaskEntries.some((entry) => entry.task.id === task.id && entry.originTaskView === taskView);
-    if (isMobile && !alreadyOpen) {
-      const closeFromHistory = () => {
-        popupNavCloseRef.current.delete(identityKey);
-        closePoppedOutTask(task.id, taskView);
-      };
-      popupNavCloseRef.current.set(identityKey, closeFromHistory);
-      pushNav({ type: "modal", close: closeFromHistory });
-    }
-    popOutTaskDetail(task, taskView);
-  }, [isMobile, poppedOutTaskEntries, popOutTaskDetail, pushNav, closePoppedOutTask, taskView]);
-
-  const boardSourceTasks = isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks;
   const [graphWorkflowSelection, setGraphWorkflowSelection] = useState<GraphWorkflowSelection | null>(null);
 
   const [researchReadinessVersion, setResearchReadinessVersion] = useState(0);
@@ -624,6 +891,17 @@ function AppInner() {
   }, [initialLoadComplete]);
 
   const [quickChatOpen, setQuickChatOpen] = useState(false);
+  const {
+    action: chatVisibilityToggleAction,
+    toggle: toggleChatVisibility,
+    reset: resetChatVisibilityToggle,
+  } = useChatVisibilityToggle({
+    quickChatOpen,
+    setQuickChatOpen,
+    poppedOutChatEntries,
+    minimizeAllPoppedOutChats,
+    restoreAllPoppedOutChats,
+  });
   const [chatComposerPrefill, setChatComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
   const [quickChatEverOpenedProjectId, setQuickChatEverOpenedProjectId] = useState<string | null>(null);
   const quickChatProjectIdRef = useRef<string | undefined>(undefined);
@@ -634,18 +912,42 @@ function AppInner() {
   across close/reopen so ChatView retains its selected session, transcript, and scroll position.
   Reset the latch when the project changes so a hidden ChatView cannot leak one project's state
   into another project; the FloatingWindow key supplies the matching React identity boundary.
+
+  FNXC:MainViewKeepAlive 2026-08-30-19:05:
+  Hidden Quick Chat now receives the same active gate as retained main Chat. Visibility alone is
+  insufficient because automatic read acknowledgements must stop until the operator reveals it.
   */
   useEffect(() => {
     const projectId = currentProject?.id;
     if (quickChatProjectIdRef.current !== projectId) {
       quickChatProjectIdRef.current = projectId;
+      resetChatVisibilityToggle();
       setQuickChatEverOpenedProjectId(quickChatOpen && projectId ? projectId : null);
       return;
     }
     if (quickChatOpen && projectId) {
       setQuickChatEverOpenedProjectId(projectId);
     }
-  }, [currentProject?.id, quickChatOpen]);
+  }, [currentProject?.id, quickChatOpen, resetChatVisibilityToggle]);
+
+  /*
+  FNXC:PlanningKeepAlive 2026-07-22-12:30:
+  Planning Mode mounts only after its first open for the current project, then stays mounted-but-hidden across sidebar navigation so the interview survives round-trips (FN remount-churn fix R5). This mirrors Quick Chat's quickChatEverOpenedProjectId latch above: reset on project change so one project's kept-alive interview can never leak into another; the PlanningKeepAlive key supplies the matching React identity boundary.
+  */
+  const [planningEverOpenedProjectId, setPlanningEverOpenedProjectId] = useState<string | null>(null);
+  const planningLatchProjectIdRef = useRef<string | undefined>(undefined);
+  const planningViewActive = taskView === "planning";
+  useEffect(() => {
+    const projectId = currentProject?.id;
+    if (planningLatchProjectIdRef.current !== projectId) {
+      planningLatchProjectIdRef.current = projectId;
+      setPlanningEverOpenedProjectId(planningViewActive && projectId ? projectId : null);
+      return;
+    }
+    if (planningViewActive && projectId) {
+      setPlanningEverOpenedProjectId(projectId);
+    }
+  }, [currentProject?.id, planningViewActive]);
 
   /*
   FNXC:GitHubImportChat 2026-07-30-12:00:
@@ -657,7 +959,18 @@ function AppInner() {
     setQuickChatOpen(true);
   }, []);
 
-  const { keyboardOpen } = useMobileKeyboard({ enabled: isMobile });
+  const {
+    footerHidden,
+    navKeyboardOpen,
+    footerKeyboardOpen,
+    keyboardOverlap,
+    viewportHeight,
+    viewportOffsetTop,
+  } = useMobileBarKeyboardState({
+    isMobile,
+    anyModalOpen: modalManager.anyModalOpen,
+    overlayOpen: isMobile && quickChatOpen,
+  });
   // Keyboard visibility controls both MobileNavBar rendering and whether
   // the project content reserves bottom padding for the mobile nav bar.
   // When a modal is open, modal-local inputs can trigger the keyboard without
@@ -672,16 +985,10 @@ function AppInner() {
   // keyboard with no empty gap. This supersedes the earlier Android gate
   // (FN-5707), which kept the footer visible and left a ~80px dead band
   // where the off-screen nav bar's padding remained reserved.
-  // `footerKeyboardOpen` (the footer `bottom: 0` collapse class) stays
-  // iOS-only: it only matters when the footer is still rendered (e.g. over
-  // a modal), where Android's resizes-content already stacks it correctly.
-  const { footerHidden, navKeyboardOpen, footerKeyboardOpen } = computeMobileBarKeyboardFlags({
-    isMobile,
-    keyboardOpen,
-    anyModalOpen: modalManager.anyModalOpen,
-    overlayOpen: isMobile && quickChatOpen,
-    isIOS: isIOS(),
-  });
+  // `footerKeyboardOpen` uses only the immediate focus/keyboard trigger. A
+  // footer that remains rendered over a modal must also drop its bottom
+  // reservation on both platforms to avoid a dead band; unlike the pill, it
+  // must not inherit the visual viewport's keyboard-dismissal tail.
   const mobileKeyboardOpen = footerHidden;
   const mobileNavKeyboardOpen = navKeyboardOpen;
   // App-level scroll lock for inline editing (TaskCard inline edit, etc.):
@@ -694,33 +1001,52 @@ function AppInner() {
   useMobileViewportRestoreReset(isMobile);
 
   // App-level mailbox/chat unread state (used for header/mobile nav badges)
-  const { mailboxUnreadCount, mailboxPendingApprovalCount, setMailboxUnreadCount } = useMailboxUnread(currentProject?.id);
+  const {
+    mailboxUnreadCount,
+    mailboxPendingApprovalCount,
+    setMailboxUnreadCount,
+  } = useMailboxUnread(currentProject?.id);
   const { chatHasUnreadResponse } = useChatUnreadBadge(currentProject?.id, { taskView, quickChatOpen });
   const { stashOrphanCount } = useStashOrphanCount(currentProject?.id);
   const [showGitHubStarPrompt, setShowGitHubStarPrompt] = useState(false);
-  const gitHubStarPromptShown = useGitHubStarPromptShown();
-  const handleStarPrompt = useCallback(() => setShowGitHubStarPrompt(true), []);
+  /*
+  FNXC:GithubStarAsk 2026-08-23-23:35:
+  The banner gate hides the ask while the durable answer is unknown, but the done-transition TRIGGER
+  below reads the durable answer alone. That transition is one-shot: gating it on the unknown state
+  would drop it for good, so a fresh browser profile would never show the ask even when nobody had
+  dismissed it.
+  */
+  const { dismissed: gitHubStarPromptDismissed, resolved: gitHubStarPromptResolved } = useGitHubStarPromptState();
+  const gitHubStarPromptShown = gitHubStarPromptDismissed || !gitHubStarPromptResolved;
+  /*
+  FNXC:GithubStarAsk 2026-08-23-23:43:
+  Every trigger that would SHOW the ask re-reads the durable answer first — both of them route through
+  here: a task first reaching done, and onboarding completing. The mount-time lookup can be stale by
+  then (first-run setup routinely has this tab open while the operator answers `fn onboard` in a
+  terminal), and showing an ask the operator already dismissed elsewhere is the exact duplicate the
+  shared record exists to prevent.
+  */
+  const handleStarPrompt = useCallback(() => {
+    void refreshGitHubStarPromptDismissal().then((alreadyAnswered) => {
+      if (!alreadyAnswered) setShowGitHubStarPrompt(true);
+    });
+  }, []);
   const { candidate: approvalBannerCandidate, dismissApproval } = useApprovalBanner({
     tasks,
     currentProjectId: currentProject?.id,
-    gitHubStarPromptShown,
+    gitHubStarPromptShown: gitHubStarPromptDismissed,
     onStarPrompt: handleStarPrompt,
   });
-
-  const {
-    branchFilter,
-    baseBranchFilter,
-    branchOptions,
-    baseBranchOptions,
-    filteredBoardTasks,
-    onBranchFilterChange: handleBranchFilterChange,
-    onBaseBranchFilterChange: handleBaseBranchFilterChange,
-  } = useBranchTaskFilters({ boardSourceTasks, currentProjectId: currentProject?.id });
 
   const [retryingProjects, setRetryingProjects] = useState(false);
   const [missionResumeSessionId, setMissionResumeSessionId] = useState<string | undefined>(undefined);
   const [missionTargetId, setMissionTargetId] = useState<string | undefined>(undefined);
   const [goalAnchorId, setGoalAnchorId] = useState<string | undefined>(undefined);
+  /*
+  FNXC:CommandCenterAgentActivity 2026-08-10-01:54:
+  Agent activity raises a focused-agent anchor through App's existing view router rather than changing routing itself. The request id mirrors goalAnchorId but preserves repeated activation of one agent.
+  */
+  const [agentAnchor, setAgentAnchor] = useState<{ agentId: string; requestId: number } | undefined>(undefined);
   const [selectedPrId, setSelectedPrId] = useState<string | undefined>(() => {
     if (typeof window === "undefined") return undefined;
     const v = new URL(window.location.href).searchParams.get("pr");
@@ -733,6 +1059,11 @@ function AppInner() {
       setGoalAnchorId(undefined);
     }
   }, [goalAnchorId, taskView]);
+  useEffect(() => {
+    if (taskView !== "agents" && agentAnchor !== undefined) {
+      setAgentAnchor(undefined);
+    }
+  }, [agentAnchor, taskView]);
   useEffect(() => {
     if (taskView !== "pull-requests" && selectedPrId !== undefined) {
       setSelectedPrId(undefined);
@@ -751,13 +1082,13 @@ function AppInner() {
   // Settings state
   const {
     maxConcurrent,
+    maxWorktrees,
     autoMerge,
     mergeStrategy,
     planAutoApproveEnabled,
     showWorktreeGrouping,
     globalPaused,
     isTestMode,
-    taskStuckTimeoutMs,
     staleHighFanoutBlockerAgeThresholdMs,
     capacityRiskBannerEnabled,
     capacityRiskTodoThreshold,
@@ -767,11 +1098,13 @@ function AppInner() {
     showCostBadgeOnCards,
     modelPricingOverrides,
     taskDetailChatFirst,
+    chatMessageLayout,
     quickChatButtonMode,
-    mobileNavPrimaryItems,
     quickChatCloseOnOutsideClick,
     dashboardKeyboardShortcuts,
     dismissModalsOnOutsideClick,
+    quickAddSubmitOnEnter,
+    chatSubmitOnEnter,
     skipConfirmationDialogs,
     maxTotalRetriesBeforeFail,
     prAuthAvailable,
@@ -780,14 +1113,21 @@ function AppInner() {
     insightsEnabled,
     memoryEnabled,
     devServerEnabled,
-    todosEnabled,
     goalsEnabled,
     setQuickChatButtonModeImmediate,
+    setChatMessageLayoutImmediate,
+    setOpenTasksInRightSidebarImmediate,
+    setOpenMobileTasksInPopupImmediate,
+    setTaskPopupsBoardListOnlyImmediate,
+    setShowCostBadgeOnCardsImmediate,
+    setTaskDetailChatFirstImmediate,
     setMobileNavPrimaryItemsImmediate,
     toggleAutoMerge,
     togglePlanAutoApprove,
     refresh: refreshAppSettings,
   } = useAppSettings(currentProject?.id);
+  const [alphaMenuOpen, setAlphaMenuOpen] = useState(false);
+  const [alphaProjectsDrawerOpen, setAlphaProjectsDrawerOpen] = useState(false);
 
   const taskPopupsVisibleOnCurrentView = useCallback((originTaskView?: TaskView) => isTaskPopupVisibleForView({
     taskPopupsBoardListOnly,
@@ -796,7 +1136,10 @@ function AppInner() {
   }), [taskPopupsBoardListOnly, taskView]);
   /*
   FNXC:TaskPopupViewGating 2026-07-15-15:20:
-  FN-8016 defaults popup rendering to the originating view for every dashboard surface. Entries without an origin are legacy snapshots and intentionally remain globally visible; navigating away unmounts scoped FloatingWindow shells without deleting their state.
+  FN-8016 defaults popup rendering to the originating view for every dashboard surface. Entries without an origin are legacy snapshots and intentionally remain globally visible.
+
+  FNXC:TaskPopupViewGating 2026-07-22-13:15:
+  FN remount-churn fix R7: this memo no longer drives the render list (all entries render; off-view windows hide via FloatingWindow `hidden`). It remains the "currently visible" set consumed by the Escape/back-navigation shortcut handler below, which must only dismiss windows the user can actually see.
   */
   const visiblePoppedOutTaskEntries = useMemo(
     () => poppedOutTaskEntries.filter((entry) => taskPopupsVisibleOnCurrentView(entry.originTaskView)),
@@ -839,8 +1182,28 @@ function AppInner() {
   const researchEnabled = experimentalFeatures.researchView === true;
   const evalsEnabled = experimentalFeatures.evalsView === true;
   const ideationEnabled = experimentalFeatures.ideationView === true;
-  /* FNXC:QuickAddSubtaskFlag 2026-06-21-00:00: Missing or false `subtaskBreakdown` settings must hide the AI Subtask quick-add handoff across List, Board, and New Task Modal surfaces; only an explicit true wires the callback. */
-  const subtaskBreakdownEnabled = experimentalFeatures.subtaskBreakdown === true;
+  const whiteboardEnabled = isExperimentalFeatureEnabled({ experimentalFeatures }, WHITEBOARD_VIEW_FLAG);
+  /* FNXC:OfficialDashboardDesign 2026-09-13-00:38: The former Alpha shell is Fusion's unconditional dashboard design; historical alphaUpdates settings never participate in production composition. */
+  const alphaMobileDrawerActive = isMobile && viewMode === "project" && Boolean(currentProject);
+
+  /*
+  FNXC:AlphaMobileDrawer 2026-09-10-04:41:
+  Alpha mobile has one task-detail owner. Clear legacy pop-outs when the presentation boundary activates; every new Board, List, dock, plugin, and pop-out request is routed to the shared main-content drawer below instead of creating a second detail subscription.
+  */
+  useEffect(() => {
+    if (!alphaMobileDrawerActive || poppedOutTaskEntries.length === 0) return;
+    clearPoppedOutTaskNavigation();
+    closeAllPoppedOutTasks();
+  }, [alphaMobileDrawerActive, clearPoppedOutTaskNavigation, closeAllPoppedOutTasks, poppedOutTaskEntries.length]);
+
+  useEffect(() => {
+    if (!alphaMobileDrawerActive) {
+      delete document.documentElement.dataset.alphaMobileDrawers;
+      return;
+    }
+    document.documentElement.dataset.alphaMobileDrawers = "true";
+    return () => { delete document.documentElement.dataset.alphaMobileDrawers; };
+  }, [alphaMobileDrawerActive, currentProject?.id]);
   /*
   FNXC:Navigation 2026-06-19-00:00:
   Experimental left sidebar navigation replaces the Header view shortcuts with a persistent sidebar on non-mobile project screens, while mobile continues to use the bottom navigation bar as the only primary navigation surface.
@@ -851,9 +1214,87 @@ function AppInner() {
   const leftSidebarNavEnabled = experimentalFeatures.leftSidebarNav !== false;
   /* FNXC:Navigation 2026-06-22-18:00: The right dock panel is no longer experimental or user-toggleable; tablet/desktop project screens always support it regardless of any stale persisted `rightDock` setting. */
   const rightDockEnabled = true;
-  const executorFooterVisible = viewMode === "project" && !!currentProject;
-  const rightDockActive = rightDockEnabled && !isMobile && executorFooterVisible;
-  const sidebarActive = leftSidebarNavEnabled && !isMobile && executorFooterVisible;
+  const projectShellPresent = viewMode === "project" && !!currentProject;
+  const alphaDesktopNavigationActive = viewportMode === "desktop" && projectShellPresent;
+  /*
+  FNXC:AlphaDesktopNavigation 2026-09-13-02:40:
+  Tablet and desktop share the wide Alpha footer, while alphaDesktopNavigationActive remains desktop-only and continues to own sidebar removal, pilot routing, windows, and guards. Mobile keeps its pill, and tablet keeps its compact Header, sidebar, standard right dock, and page routing; only the footer owner broadens here.
+  */
+  const alphaWideFooterActive = viewportMode !== "mobile" && projectShellPresent;
+  const executorFooterVisible = projectShellPresent && !alphaWideFooterActive && viewportMode !== "mobile";
+  const shellFooterVisible = executorFooterVisible || alphaWideFooterActive;
+  const mobileNavVisible = projectShellPresent;
+  /*
+  FNXC:AlphaMobileDrawer 2026-09-10-17:16:
+  An Alpha shared drawer is the foreground layer, not a replacement for its navigation trigger. Keep the pill mounted behind Usage and modal-owned Task Detail while ordinary blocking modals continue to suppress mobile navigation.
+  */
+  const alphaSharedModalDrawerOpen = alphaMobileDrawerActive && Boolean(modalManager.usageOpen || modalManager.detailTask);
+  /*
+  FNXC:AlphaUpdates 2026-09-11-15:01:
+  App remains the sole owner of the Alpha popover's accessible open state while MobileNavBar owns both its trailing pill trigger and canonical menu surface. Any shell boundary that removes the pill closes this transient menu; the legacy More drawer remains MobileNavBar-owned.
+
+  FNXC:MobilePillKeyboard 2026-09-13-10:32:
+  Keyboard transitions are no longer shell boundaries because the official pill remains mounted throughout them. Moving focus from a field into the opened menu closes the keyboard, so that metric change must update geometry without immediately dismissing the App-owned popover.
+  */
+  useEffect(() => {
+    setAlphaMenuOpen(false);
+  }, [currentProject?.id, isMobile, modalManager.anyModalOpen, viewMode]);
+  const rightDockActive = rightDockEnabled && !isMobile && projectShellPresent;
+  const sidebarActive = leftSidebarNavEnabled && !isMobile && projectShellPresent && !alphaDesktopNavigationActive;
+  const alphaDesktopWindows = useAlphaDesktopViewWindows({
+    enabled: alphaDesktopNavigationActive,
+    projectId: currentProject?.id,
+    navigation: { pushNav, removeNav, promoteNav },
+    showBoard: () => { if (taskView !== "board") handleChangeTaskView("board"); },
+    showNotesPage: () => handleChangeTaskView("notes"),
+    notesDirty: notesController.dirty,
+  });
+  const missingNodeFallbackGenerationRef = useRef(0);
+  const latestNodeScopeRef = useRef({ currentNodeId, nodes, nodesLoading });
+  latestNodeScopeRef.current = { currentNodeId, nodes, nodesLoading };
+  const nodeListIdentity = nodes.map((node) => node.id).join("\u0000");
+  const currentNodeMissing = Boolean(currentNodeId && !nodesLoading && !nodes.some((node) => node.id === currentNodeId));
+  useEffect(() => {
+    const generation = ++missingNodeFallbackGenerationRef.current;
+    if (!currentNodeId || !currentNodeMissing) return;
+    const missingNodeId = currentNodeId;
+
+    /*
+    FNXC:AlphaDesktopWindows 2026-09-11-20:29:
+    A node disappearing from an authoritative list is a project-scope exit, not a harmless local fallback. The pilot owner resolves the dirty-Notes verdict first, then runs this freshness fence before it discards the draft or closes any window, so a node that reappears while confirmation is open leaves the complete prior scope intact.
+    */
+    void alphaDesktopWindows.requestCloseAll(() => {
+      const latest = latestNodeScopeRef.current;
+      return generation === missingNodeFallbackGenerationRef.current
+        && !latest.nodesLoading
+        && latest.currentNodeId === missingNodeId
+        && !latest.nodes.some((node) => node.id === missingNodeId);
+    }).then((accepted) => {
+      if (accepted) clearCurrentNode();
+    });
+
+    return () => {
+      if (missingNodeFallbackGenerationRef.current === generation) {
+        missingNodeFallbackGenerationRef.current += 1;
+      }
+    };
+  }, [alphaDesktopWindows.requestCloseAll, clearCurrentNode, currentNodeId, currentNodeMissing, nodeListIdentity]);
+  alphaPilotRouterRef.current = (target) => {
+    if (!alphaDesktopNavigationActive) return false;
+    if (target === "patchnode") {
+      alphaDesktopWindows.open(target);
+      return true;
+    }
+    if (alphaDesktopWindows.windows.length === 0) return false;
+    void alphaDesktopWindows.requestCloseAll().then((accepted) => {
+      if (accepted) commitTaskViewChange(target);
+    });
+    return true;
+  };
+  useEffect(() => {
+    if (!alphaDesktopNavigationActive || taskView !== "patchnode") return;
+    alphaDesktopWindows.open(taskView);
+  }, [alphaDesktopNavigationActive, alphaDesktopWindows.open, taskView]);
   const agentOnboardingEnabled = experimentalFeatures.agentOnboarding === true;
   const agentsEnabled = true;
 
@@ -902,7 +1343,7 @@ function AppInner() {
       handleChangeTaskView("board");
     }
     /*
-    FNXC:Navigation 2026-08-01-00:00:
+    FNXC:Navigation 2026-07-30-00:00:
     FN-8352 promotes Ideation to a default-off experimental top-level view.
     Redirect persisted and deep-linked disabled views to Board so MainContent
     never leaves users on a blank unavailable surface.
@@ -910,13 +1351,13 @@ function AppInner() {
     if (taskView === "ideation" && !ideationEnabled) {
       handleChangeTaskView("board");
     }
+    if (taskView === "whiteboard" && !whiteboardEnabled) {
+      handleChangeTaskView("board");
+    }
     if (taskView === "goalsView" && !goalsEnabled) {
       handleChangeTaskView("board");
     }
-    if (taskView === "todos" && !todosEnabled) {
-      handleChangeTaskView("board");
-    }
-  }, [taskView, settingsLoaded, skillsEnabled, insightsEnabled, handleChangeTaskView, agentsEnabled, memoryEnabled, devServerEnabled, researchEnabled, evalsEnabled, ideationEnabled, goalsEnabled, todosEnabled, graphPluginTaskView]);
+  }, [taskView, settingsLoaded, skillsEnabled, insightsEnabled, handleChangeTaskView, agentsEnabled, memoryEnabled, devServerEnabled, researchEnabled, evalsEnabled, ideationEnabled, whiteboardEnabled, goalsEnabled, graphPluginTaskView]);
 
   const {
     availableModels,
@@ -933,6 +1374,18 @@ function AppInner() {
     openModelOnboarding: modalManager.openModelOnboarding,
     openSettings: modalManager.openSettings,
   });
+
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  Project-scoped task-detail surfaces are not all owned by modalManager: depending on
+  settings, tasks open as popped-out FloatingWindows, in the main panel (task-detail view),
+  or in the right dock, and Quick Chat is an App-level floating window. A project swap must
+  dismiss ALL of them, so useProjectActions receives this composite via a ref — the pieces
+  it closes (main-panel detail, right dock) are constructed later in this component, and
+  the ref keeps the callback stable while always invoking the latest wiring.
+  */
+  const closeProjectScopedUiRef = useRef<() => void>(() => {});
+  const closeProjectScopedUi = useCallback(() => closeProjectScopedUiRef.current(), []);
 
   const {
     handleSelectProject,
@@ -960,7 +1413,27 @@ function AppInner() {
     openSetupWizard: modalManager.openSetupWizard,
     closeSetupWizard: modalManager.closeSetupWizard,
     closeModelOnboarding: modalManager.closeModelOnboarding,
+    closeProjectScopedModals: closeProjectScopedUi,
+    requestCloseProjectScopedUi: alphaDesktopWindows.requestCloseAll,
+    // FNXC:GithubStarAsk 2026-08-19-03:59: finishing onboarding is the first moment we ask for a GitHub star.
+    onOnboardingCompleted: handleStarPrompt,
   });
+
+  /*
+  FNXC:AlphaMobileDrawer 2026-09-10-05:38:
+  Projects opened from the Alpha mobile pill must remain project-scoped so Board stays mounted behind the shared drawer. Selecting another project closes the drawer before the normal project transition; every non-Alpha entry retains the overview route that clears the current project.
+  */
+  const openProjectsFromMobileNav = useCallback(() => {
+    if (alphaMobileDrawerActive) {
+      setAlphaProjectsDrawerOpen(true);
+      return;
+    }
+    handleViewAllProjects();
+  }, [alphaMobileDrawerActive, handleViewAllProjects]);
+
+  useEffect(() => {
+    if (!alphaMobileDrawerActive) setAlphaProjectsDrawerOpen(false);
+  }, [alphaMobileDrawerActive, currentProject?.id]);
 
   const { handleDetailClose } = useDeepLink({
     projectId: currentProject?.id,
@@ -1000,14 +1473,12 @@ function AppInner() {
     handleModalCreate,
     handlePlanningTaskCreated,
     handlePlanningTasksCreated,
-    handleSubtaskTasksCreated,
     handleGitHubImport,
   } = useTaskHandlers({
     createTask,
     ingestCreatedTasks,
     onPlanningTaskCreated: modalManager.onPlanningTaskCreated,
     onPlanningTasksCreated: modalManager.onPlanningTasksCreated,
-    onSubtaskTasksCreated: modalManager.onSubtaskTasksCreated,
     addToast,
   });
 
@@ -1053,70 +1524,25 @@ function AppInner() {
   }, [modalManager, pushNav]);
 
   /*
-  FNXC:Navigation 2026-06-22-00:00:
-  Board card clicks open task detail as a full main-content view that replaces the board (design: "Full main panel (replaces board)"), instead of the TaskDetailModal overlay. We store a snapshot of the clicked task and navigate to the registered `task-detail` view; renderMainContent renders TaskDetailContent embedded with a Back-to-board button. Only the Board uses this handler — list-view split-detail, right-dock cards, and other openDetail callers keep the modal behavior.
-
-  FNXC:TaskDetailBack 2026-06-25-00:00:
-  Browser and Android Back must close the currently viewed full-panel task detail before leaving the prior dashboard view. The history entry owns an idempotent revert callback that clears stale snapshot state for board/list origins or restores the previous task snapshot for nested task-detail links, and explicit Back-to-board consumes that same entry without pushing a contradictory view entry during popstate.
+  FNXC:TaskPopupDeepTabs 2026-07-21-00:00:
+  FN-8478 makes every board TaskCard deep-tab action, including files changed, honor Open tasks as popups. Route once to the popup with its requested tab so a click never opens both a FloatingWindow and a main-panel/modal detail surface.
   */
-  const openTaskDetailInMainPanel = useCallback((task: Task | TaskDetail, initialTab?: DetailTaskTab) => {
-    const previousView = taskView;
-    const previousDetailTask = mainPanelDetailTask;
-    const previousDetailTab = mainPanelDetailInitialTab;
-
-    if (previousView === "task-detail" && previousDetailTask?.id === task.id && previousDetailTab === initialTab) {
-      setMainPanelDetailTask(task);
+  const handleOpenDetailWithTab = useCallback((task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => {
+    if (alphaMobileDrawerActive) {
+      openTaskDetailInMainPanel(task, initialTab);
       return;
     }
-
-    if (previousView !== "task-detail") {
-      captureCurrentBoardScrollSnapshot();
+    if (openMobileTasksInPopup) {
+      popOutTaskDetailForCurrentView(task, initialTab);
+      return;
     }
-
-    const revertMainPanelDetail = () => {
-      if (previousView === "task-detail" && previousDetailTask) {
-        setMainPanelDetailTask(previousDetailTask);
-        setMainPanelDetailInitialTab(previousDetailTab);
-        handleChangeTaskView("task-detail");
-        mainPanelDetailNavRevertRef.current = null;
-        return;
-      }
-
-      requestRestore();
-      setMainPanelDetailTask(null);
-      setMainPanelDetailInitialTab("chat");
-      handleChangeTaskView(previousView);
-      mainPanelDetailNavRevertRef.current = null;
-    };
-
-    setMainPanelDetailTask(task);
-    setMainPanelDetailInitialTab(initialTab);
-    handleChangeTaskView("task-detail");
-    mainPanelDetailNavRevertRef.current = revertMainPanelDetail;
-    pushNav({ type: "view", revert: revertMainPanelDetail });
-  }, [captureCurrentBoardScrollSnapshot, handleChangeTaskView, mainPanelDetailInitialTab, mainPanelDetailTask, pushNav, requestRestore, taskView]);
-
-  // FNXC:Navigation 2026-06-22-00:00: Leaving task-detail clears the snapshot so a stale task never lingers if the view is reopened empty.
-  const closeTaskDetailMainPanel = useCallback(() => {
-    const revert = mainPanelDetailNavRevertRef.current;
-    if (revert) {
-      removeNav(revert);
-      mainPanelDetailNavRevertRef.current = null;
-    }
-    requestRestore();
-    setMainPanelDetailTask(null);
-    setMainPanelDetailInitialTab("chat");
-    handleChangeTaskView("board");
-  }, [handleChangeTaskView, removeNav, requestRestore]);
-
-  const handleOpenDetailWithTab = useCallback((task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => {
     if (initialTab === "changes") {
       openTaskDetailInMainPanel(task, "changes");
       return;
     }
     modalManager.openDetailTask(task, initialTab);
     pushNav({ type: "modal", close: modalManager.closeDetailTask });
-  }, [modalManager, openTaskDetailInMainPanel, pushNav]);
+  }, [alphaMobileDrawerActive, modalManager, openMobileTasksInPopup, openTaskDetailInMainPanel, popOutTaskDetailForCurrentView, pushNav]);
 
   /*
   FNXC:Settings 2026-06-22-00:00:
@@ -1135,8 +1561,8 @@ function AppInner() {
     handleTaskViewChange("command-center");
   }, [handleTaskViewChange]);
 
-  const openNewTaskWithNav = useCallback(() => {
-    modalManager.openNewTask();
+  const openNewTaskWithNav = useCallback((workflowId?: string | null) => {
+    modalManager.openNewTask(workflowId);
     pushNav({ type: "modal", close: modalManager.closeNewTask });
   }, [modalManager, pushNav]);
 
@@ -1159,8 +1585,8 @@ function AppInner() {
     handleTaskViewChange("planning");
   }, [handleTaskViewChange, modalManager]);
 
-  const openPlanningWithInitialPlanWithNav = useCallback((initialPlan: string, workflowId?: string | null) => {
-    modalManager.openPlanningWithInitialPlan(initialPlan, workflowId);
+  const openPlanningWithInitialPlanWithNav = useCallback((initialPlan: string, workflowId?: string | null, sourceIssue?: { provider: "github"; repository: string; issueNumber: number; url: string; title?: string }) => {
+    modalManager.openPlanningWithInitialPlan(initialPlan, workflowId, sourceIssue);
     handleTaskViewChange("planning");
   }, [handleTaskViewChange, modalManager]);
 
@@ -1169,10 +1595,6 @@ function AppInner() {
     handleTaskViewChange("planning");
   }, [handleTaskViewChange, modalManager]);
 
-  const openSubtaskBreakdownWithNav = useCallback((description: string, workflowId?: string | null) => {
-    modalManager.openSubtaskBreakdown(description, workflowId);
-    pushNav({ type: "modal", close: modalManager.closeSubtask });
-  }, [modalManager, pushNav]);
 
   const openGroupModalWithNav = useCallback((groupId: string) => {
     modalManager.openGroupModal(groupId);
@@ -1188,6 +1610,16 @@ function AppInner() {
     removeNav(modalManager.closeTerminal);
     modalManager.closeTerminal();
   }, [modalManager, removeNav]);
+
+  /*
+  FNXC:AlphaDesktopWindows 2026-09-11-20:21:
+  App's Escape authority can close Task Detail before the later-mounted modal host receives the key. Consume the exact navigation callback first and perform the same detail/deep-link cleanup so no phantom modal entry remains above History or Notes.
+  */
+  const closeDetailTaskWithNav = useCallback(() => {
+    removeNav(modalManager.closeDetailTask);
+    modalManager.closeDetailTask();
+    handleDetailClose();
+  }, [handleDetailClose, modalManager, removeNav]);
 
   const toggleTerminalWithNav = useCallback(() => {
     if (!modalManager.terminalOpen) {
@@ -1206,9 +1638,11 @@ function AppInner() {
     FNXC:DashboardShortcuts 2026-07-04-12:02:
     Popped-out tasks are the most recent floating work surface and must close before Quick Chat. This preserves the topmost-popup invariant when a task popout overlays chat, then falls back to Terminal and modal-manager surfaces one layer per Escape.
     */
-    return closeTopmostDashboardPopupForShortcut(
+    const closedHigherPrioritySurface = closeTopmostDashboardPopupForShortcut(
       {
         poppedOutTaskEntries: visiblePoppedOutTaskEntries,
+        poppedOutChatEntries,
+        poppedOutNoteEntries,
         quickChatOpen,
         terminalOpen: modalManager.terminalOpen,
         modalClosers: [
@@ -1222,9 +1656,8 @@ function AppInner() {
           [modalManager.schedulesOpen, modalManager.closeSchedules],
           [modalManager.githubImportOpen, modalManager.closeGitHubImport],
           [modalManager.settingsOpen, modalManager.closeSettings],
-          [Boolean(modalManager.detailTask), modalManager.closeDetailTask],
+          [Boolean(modalManager.detailTask), closeDetailTaskWithNav],
           [Boolean(modalManager.groupModalGroupId), modalManager.closeGroupModal],
-          [modalManager.isSubtaskOpen, modalManager.closeSubtask],
           [modalManager.isPlanningOpen, modalManager.closePlanning],
           [modalManager.newTaskModalOpen, modalManager.closeNewTask],
           [modalManager.setupWizardOpen, modalManager.closeSetupWizard],
@@ -1233,11 +1666,22 @@ function AppInner() {
       },
       {
         closePoppedOutTask: closePoppedOutTaskWithNav,
+        closePoppedOutChat,
+        closePoppedOutNote: (projectId, noteId) => { void alphaDesktopWindows.requestGuardedClose(`note:${projectId}:${noteId}`); },
         closeQuickChat: () => setQuickChatOpen(false),
         closeTerminal: closeTerminalWithNav,
       },
     );
-  }, [closePoppedOutTaskWithNav, closeTerminalWithNav, modalManager, quickChatOpen, visiblePoppedOutTaskEntries]);
+    if (closedHigherPrioritySurface) return true;
+    const pilotTopmost = alphaDesktopWindows.topmost;
+    if (!pilotTopmost) return false;
+    /*
+    FNXC:AlphaDesktopWindows 2026-09-11-20:06:
+    Non-modal pilot windows still participate in App's single-surface Escape authority. Existing task/chat/modal owners retain their higher-priority close order; otherwise Escape requests closure of only the topmost pilot and honors the Notes discard guard before touching anything underneath.
+    */
+    void alphaDesktopWindows.requestClose(pilotTopmost);
+    return true;
+  }, [alphaDesktopWindows.requestClose, alphaDesktopWindows.requestGuardedClose, alphaDesktopWindows.topmost, closeDetailTaskWithNav, closePoppedOutChat, closePoppedOutTaskWithNav, closeTerminalWithNav, modalManager, poppedOutChatEntries, poppedOutNoteEntries, quickChatOpen, visiblePoppedOutTaskEntries]);
 
   const openFilesWithNav = useCallback((workspace?: string, initialFile?: string | null) => {
     modalManager.openFiles(workspace, initialFile);
@@ -1259,7 +1703,7 @@ function AppInner() {
   */
   useDashboardKeyboardShortcuts({
     shortcuts: dashboardKeyboardShortcuts,
-    toggleQuickChat: () => setQuickChatOpen((open) => !open),
+    toggleQuickChat: toggleChatVisibility,
     toggleTerminal: toggleTerminalWithNav,
     closeTopmostPopup: closeTopmostPopupForShortcut,
     toggleFiles: () => modalManager.filesOpen ? closeFilesWithNav() : openFilesWithNav(),
@@ -1269,8 +1713,7 @@ function AppInner() {
   });
 
   const openFileInBrowser = useCallback((path: string, opts?: { workspace?: string; line?: number; col?: number }) => {
-    modalManager.openFiles(opts?.workspace, path);
-    pushNav({ type: "modal", close: modalManager.closeFiles });
+    openAppFileInBrowser(modalManager, pushNav, path, opts);
   }, [modalManager, pushNav]);
 
   const openActivityLogWithNav = useCallback(() => {
@@ -1349,8 +1792,6 @@ function AppInner() {
       */
       modalManager.openPlanningWithSession(session.id);
       handleChangeTaskView("planning");
-    } else if (session.type === "subtask") {
-      modalManager.openSubtaskWithSession(session.id);
     } else if (session.type === "mission_interview") {
       setMissionTargetId(undefined);
       setMissionResumeSessionId(session.id);
@@ -1386,8 +1827,22 @@ function AppInner() {
         moveTask,
         openAuthenticationSettings: () => openSettingsWithNav("authentication" as SectionId),
         addToast,
+        /*
+        FNXC:WorkflowLifecycleColumns 2026-08-01-02:10:
+        Resolve Cancel's destination from the card's OWN workflow. Without this the banner moved to a
+        hardcoded `"todo"`, which `moves.ts` REJECTS on a board that does not declare it — the button
+        threw instead of cancelling. Wired here rather than left optional: an unsupplied parameter is
+        the inert shape this program has already found five times.
+        */
+        resolveCancelColumn: (taskId: string) => {
+          if (!footerBoardWorkflows) return undefined;
+          const workflow = footerBoardWorkflows.workflows.find(
+            (candidate) => candidate.id === (footerBoardWorkflows.taskWorkflowIds[taskId] ?? footerBoardWorkflows.defaultWorkflowId),
+          );
+          return workflow?.columns.find((column) => column.flags?.hold === true)?.id;
+        },
       }),
-    [addToast, currentProject?.id, modalManager, moveTask, retryTask],
+    [addToast, currentProject?.id, footerBoardWorkflows, modalManager, moveTask, retryTask],
   );
 
   const [shellOnboardingComplete, setShellOnboardingComplete] = useState(false);
@@ -1451,16 +1906,77 @@ function AppInner() {
 
   // Props for the extracted <MainContent> switch (see components/dashboard/MainContent.tsx).
   // Every value is passed by its App name; the switch renders the same subtrees as before.
-  const rightDock = useRightDockController({ active: rightDockActive, projectId: currentProject?.id, addToast, settingsLoaded, researchReadinessVersion, goalAnchorId, tasks: isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks, workflowSteps, subscribePluginEvents, openDetailTask, openTaskPopup: popOutTaskDetailForCurrentView, openMobileTasksInPopup, openFileInBrowser, onMoveTask: moveTask, onDeleteTask: deleteTask, onArchiveTask: archiveTask, onRevertTask: revertTask, onMergeTask: mergeTask, onRetryTask: retryTask, onBypassReview: bypassReview, onResetTask: resetTask, onDuplicateTask: duplicateTask, onTaskUpdated: (task: Task) => ingestCreatedTasks([task]), openSettings: (section?: string) => openSettingsWithNav(section as SectionId), onOpenUsage: openUsageWithNav, onOpenActivityLog: openActivityLogWithNav, onOpenGitHubImport: openGitHubImportWithNav, onOpenGitManager: openGitManagerWithNav, onOpenSchedules: openSchedulesWithNav, onSendSelectionToTask: modalManager.openNewTaskWithDescription, onCreateTaskFromInsight: handleInsightTaskCreate, onNavigateToMission: handleOpenMission, onTaskCreated: (task: Task) => ingestCreatedTasks([task]), prAuthAvailable, autoMerge, taskDetailChatFirst, visibilityOptions: { experimentalFeatures: { insights: insightsEnabled, memoryView: memoryEnabled, devServerView: devServerEnabled, researchView: researchEnabled, evalsView: evalsEnabled, goalsView: goalsEnabled }, showSkillsTab: skillsEnabled, todosEnabled, pluginDashboardViews }, footerVisible: executorFooterVisible });
+  const notesDirtyRef = useRef(notesController.dirty);
+  notesDirtyRef.current = notesController.dirty;
+  const alphaDesktopNavigationActiveRef = useRef(alphaDesktopNavigationActive);
+  alphaDesktopNavigationActiveRef.current = alphaDesktopNavigationActive;
+  const registerAlphaDesktopNotesGuard = useCallback((guard: () => boolean | Promise<boolean>, onAccepted?: () => void) => {
+    /*
+    FNXC:AlphaDesktopRightDock 2026-09-11-22:51:
+    The compact dock may retain its mounted content after a responsive transition, but it must never overwrite the standard Notes page guard. Keep its last Alpha-desktop guard sticky only while Alpha desktop owns Notes; the standard page installs its own live closure after the handoff.
+    */
+    if (!alphaDesktopNavigationActiveRef.current) return () => {};
+    alphaDesktopWindows.registerGuard(
+      "notes",
+      () => !notesDirtyRef.current || guard(),
+      () => { if (notesDirtyRef.current) onAccepted?.(); },
+    );
+    return () => {};
+  }, [alphaDesktopWindows.registerGuard]);
+  const registerStandardNotesGuard = useCallback((guard: () => boolean | Promise<boolean>, onAccepted?: () => void) => {
+    if (alphaDesktopNavigationActiveRef.current) return () => {};
+    return alphaDesktopWindows.registerGuard(
+      "notes",
+      () => !notesDirtyRef.current || guard(),
+      () => { if (notesDirtyRef.current) onAccepted?.(); },
+    );
+  }, [alphaDesktopWindows.registerGuard]);
+  /*
+  FNXC:ListInRightDock 2026-09-14-03:31:
+  FN-382: the dock renders the SAME List surface as the route, so it needs the main-content wiring that is assembled
+  further down this render. A ref keeps the callback identity stable for the memoized dock render props while always
+  reading the current props, and the dock body renders later in the same pass, so it never sees a stale snapshot.
+  */
+  const mainContentPropsRef = useRef<AppMainPanelTaskDetailMainContentProps | null>(null);
+  const renderDockListView = useCallback(
+    () => (mainContentPropsRef.current ? <MainContentListView {...mainContentPropsRef.current} listHost="dock" /> : null),
+    [],
+  );
+
+  const { rightDock, windows: alphaDesktopRightDockWindows } = useAppAlphaDesktopRightDockComposition({
+    projectId: currentProject?.id,
+    owner: appRightDockWindows,
+    controllerInput: { active: rightDockActive, addToast, columnFlagsByTaskId: footerColumnFlagsByTaskId, settingsLoaded, researchReadinessVersion, goalAnchorId, tasks: boardSourceTasks, workflowSteps, subscribePluginEvents, openDetailTask: alphaMobileDrawerActive ? openTaskDetailInMainPanel : openDetailTask, notesController, registerNotesGuard: registerAlphaDesktopNotesGuard, openFileInBrowser, onUpdateTask: updateTask, onDeleteTask: deleteTask, onRevertTask: revertTask, onMergeTask: mergeTask, onRetryTask: retryTask, onOpenChatWithPrefill: openChatWithPrefill, onPauseTask: pauseTask, onUnpauseTask: unpauseTask, onBypassReview: bypassReview, onResetTask: resetTask, onDuplicateTask: duplicateTask, onTaskUpdated: (task: Task) => ingestCreatedTasks([task]), openSettings: (section?: string) => openSettingsWithNav(section as SectionId), onOpenUsage: openUsageWithNav, onOpenActivityLog: openActivityLogWithNav, onOpenGitHubImport: openGitHubImportWithNav, onOpenGitManager: openGitManagerWithNav, onOpenSchedules: openSchedulesWithNav, onSendSelectionToTask: modalManager.openNewTaskWithDescription, onCreateTaskFromInsight: handleInsightTaskCreate, onNavigateToMission: handleOpenMission, onTaskCreated: (task: Task) => ingestCreatedTasks([task]), prAuthAvailable, autoMerge, taskDetailChatFirst, renderListView: isMobile ? undefined : renderDockListView, visibilityOptions: { hostMode: alphaDesktopNavigationActive ? "alpha-desktop" : "standard", experimentalFeatures: { insights: insightsEnabled, memoryView: memoryEnabled, devServerView: devServerEnabled, researchView: researchEnabled, evalsView: evalsEnabled, goalsView: goalsEnabled }, showSkillsTab: skillsEnabled, pluginDashboardViews, listViewAvailable: !isMobile }, footerVisible: shellFooterVisible },
+    chatWindowProps: { addToast, experimentalFeatures },
+    noteWindowProps: {
+      addToast,
+      onChanged: () => void notesController.loadList(notesController.search),
+      registerGuard: (projectId, noteId, guard, onAccepted) => alphaDesktopWindows.registerGuard(`note:${projectId}:${noteId}`, guard, () => {
+        onAccepted?.();
+        closePoppedOutNote(projectId, noteId);
+      }),
+    },
+  });
+
+  listDockRouteRef.current = (newView: TaskView) => {
+    if (newView !== "list" || isMobile || !rightDockActive) return false;
+    rightDock.selectView("list");
+    if (!rightDock.open) rightDock.toggle();
+    return true;
+  };
 
   /*
   FNXC:OpenTasksInRightSidebar 2026-06-28-00:00:
   Board card clicks are the only task-open path governed by openTasksInRightSidebar. When the project setting is enabled and the tablet/desktop right dock is active, the board keeps its current view and asks the dock controller to render task detail; otherwise the existing full main-panel replacement remains the fallback, including mobile and hidden-footer states.
 
-  FNXC:MobileTaskPopups 2026-07-01-12:00:
-  Board-card clicks on every viewport may opt into the existing task pop-out path, but only for ordinary task opens with no deep initial tab. The route is intentionally ordered as all-viewport popup, then tablet/desktop right dock, then main-panel fallback so the popup setting keeps the board visible when requested while deep-tab opens and non-board handlers keep their existing behavior.
+  FNXC:MobileTaskPopups 2026-07-21-00:00:
+  FN-8478 makes board TaskCard deep-tab opens use the all-viewport popup route when enabled, preserving the requested tab. Popup routing remains first so neither dock nor main-panel detail can double-open behind the FloatingWindow.
   */
   const openBoardTaskDetail = useCallback((task: Task | TaskDetail, initialTab?: DetailTaskTab) => {
+    if (alphaMobileDrawerActive) {
+      openTaskDetailInMainPanel(task, initialTab);
+      return;
+    }
     const route = getBoardTaskOpenRoute({
       isMobile,
       openMobileTasksInPopup,
@@ -1470,7 +1986,7 @@ function AppInner() {
     });
 
     if (route === "popup") {
-      popOutTaskDetailForCurrentView(task);
+      popOutTaskDetailForCurrentView(task, initialTab);
       return;
     }
 
@@ -1480,7 +1996,7 @@ function AppInner() {
     }
 
     openTaskDetailInMainPanel(task, initialTab);
-  }, [isMobile, openMobileTasksInPopup, openTaskDetailInMainPanel, openTasksInRightSidebar, popOutTaskDetailForCurrentView, rightDock, rightDockActive]);
+  }, [alphaMobileDrawerActive, isMobile, openMobileTasksInPopup, openTaskDetailInMainPanel, openTasksInRightSidebar, popOutTaskDetailForCurrentView, rightDock, rightDockActive]);
 
   useEffect(() => {
     if (!openTasksInRightSidebar) {
@@ -1488,7 +2004,33 @@ function AppInner() {
     }
   }, [openTasksInRightSidebar, rightDock]);
 
-  const mainContentProps: MainContentProps = {
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  The composite project-switch reset. Beyond modalManager's project-scoped modals, dismiss
+  every task-detail surface the open-task routing can target (popped-out FloatingWindows,
+  main-panel task-detail view, right-dock task) and close the Quick Chat floating window —
+  all of these showed the previous project's content over the new project. Assigned each
+  render so the ref-stable callback handed to useProjectActions always sees current state.
+  */
+  closeProjectScopedUiRef.current = () => {
+    modalManager.closeProjectScopedModals();
+    closeAllPoppedOutTasks();
+    closeAllPoppedOutChats();
+    closeAllPoppedOutNotes();
+    resetChatVisibilityToggle();
+    if (mainPanelDetailTask) {
+      closeTaskDetailMainPanel();
+    }
+    rightDock.closeDockTask();
+    setQuickChatOpen(false);
+  };
+
+  const { mailComposerPrefill, onSendAsReport: handleSendChatMessageAsReport } = useChatMailReportRouting(
+    () => handleChangeTaskView("mailbox"),
+    () => setQuickChatOpen(false),
+  );
+
+  const mainContentProps: AppMainPanelTaskDetailMainContentProps = {
     showBackendConnectionErrorPage,
     projectsError,
     t,
@@ -1496,6 +2038,7 @@ function AppInner() {
     handleRetryProjects,
     shellApi,
     taskView,
+    pluginDashboardViews,
     modalManager,
     handleChangeTaskView,
     refreshAppSettings,
@@ -1511,6 +2054,12 @@ function AppInner() {
     setShadcnCustomColors,
     resolvedThemeMode,
     setQuickChatButtonModeImmediate,
+    setChatMessageLayoutImmediate,
+    setOpenTasksInRightSidebarImmediate,
+    setOpenMobileTasksInPopupImmediate,
+    setTaskPopupsBoardListOnlyImmediate,
+    setShowCostBadgeOnCardsImmediate,
+    setTaskDetailChatFirstImmediate,
     setMobileNavPrimaryItemsImmediate,
     reopenOnboardingWithNav,
     viewMode,
@@ -1526,9 +2075,8 @@ function AppInner() {
     graphWorkflowSelection,
     setGraphWorkflowSelection,
     isRemote,
-    remoteData,
-    tasks,
-    bgPlanningSessions,
+    remoteData: { ...remoteData, tasks: boardSourceTasks },
+    tasks: boardSourceTasks,
     workflowSteps,
     subscribePluginEvents,
     openDetailTask,
@@ -1538,12 +2086,19 @@ function AppInner() {
     mergeStrategy,
     planAutoApproveEnabled,
     settingsLoaded,
+    openTasksInRightSidebar,
     openMobileTasksInPopup,
+    taskPopupsBoardListOnly,
+    showCostBadgeOnCards,
     taskDetailChatFirst,
+    chatMessageLayout,
     skillsEnabled,
     experimentalFeatures,
     setQuickChatOpen,
+    onOpenSessionInNewWindow: openSessionInNewWindow,
     chatComposerPrefill,
+    mailComposerPrefill,
+    onSendAsReport: handleSendChatMessageAsReport,
     onOpenChatWithPrefill: openChatWithPrefill,
     setMailboxUnreadCount,
     setMissionTargetId,
@@ -1554,10 +2109,12 @@ function AppInner() {
     milestoneSliceResumeSessionId,
     setGoalAnchorId,
     goalAnchorId,
+    agentAnchor,
+    setAgentAnchor,
     agentsEnabled,
     agentOnboardingEnabled,
     handleOpenTaskLogs,
-    popOutTaskDetail: popOutTaskDetailForCurrentView,
+    popOutTaskDetail: alphaMobileDrawerActive ? openTaskDetailInMainPanel : popOutTaskDetailForCurrentView,
     selectedPrId,
     insightsEnabled,
     handleInsightTaskCreate,
@@ -1566,45 +2123,49 @@ function AppInner() {
     researchReadinessVersion,
     evalsEnabled,
     ideationEnabled,
+    whiteboardEnabled,
     memoryEnabled,
     goalsEnabled,
     handleOpenMission,
-    todosEnabled,
     openPlanningWithInitialPlanWithNav,
     ingestCreatedTasks,
     nodesEnabled,
     openWorkflowEditorWithNav,
-    handlePlanningTaskCreated,
-    handlePlanningTasksCreated,
     handleGitHubImport,
     devServerEnabled,
-    mainPanelDetailTask,
-    filteredBoardTasks,
+    filteredBoardTasks: boardSourceTasks,
     maxConcurrent,
+    maxWorktrees,
     showWorktreeGrouping,
     moveTask,
     pauseTask,
     openBoardTaskDetail,
-    openTaskDetailInMainPanel,
     openGroupModalWithNav,
     handleBoardQuickCreate,
     openNewTaskWithNav,
-    subtaskBreakdownEnabled,
-    openSubtaskBreakdownWithNav,
     toggleAutoMerge,
     togglePlanAutoApprove,
     globalPaused,
     updateTask,
     retryTask,
-    archiveTask,
-    unarchiveTask,
     revertTask,
     deleteTask,
-    archiveAllDone,
-    loadArchivedTasks,
-    loadMoreArchivedTasks,
-    archivedHasMore,
-    archivedLoadingMore,
+    loadMoreCurrentTasks,
+    currentTasksTotal,
+    currentTasksHasMore,
+    currentTasksLoadingMore,
+    currentTasksPaginationError,
+    currentTasksProgressKey,
+    retryCurrentTasksPagination,
+    loadMoreCompletedTasks,
+    completedCounts,
+    completedHasMore,
+    completedLoadingMore,
+    completedPaginationError,
+    completedProgressKey,
+    retryCompletedTasksPagination,
+    completedSortMode,
+    changeCompletedSortMode,
     searchQuery,
     availableModels,
     favoriteProviders,
@@ -1612,42 +2173,46 @@ function AppInner() {
     handleOpenDetailWithTab,
     handleToggleFavorite,
     handleToggleModelFavorite,
-    taskStuckTimeoutMs,
     staleHighFanoutBlockerAgeThresholdMs,
     lastFetchTimeMs,
     openCreateWorkflowWithNav,
     sidebarActive,
+    notesController,
+    registerNotesGuard: registerStandardNotesGuard,
     isMobile,
-    mainPanelDetailInitialTab,
-    closeTaskDetailMainPanel,
-    setMainPanelDetailTask,
     mergeTask,
-    resetTask,
+        resetTask,
     duplicateTask,
     unpauseTask,
     capacityRiskBannerEnabled,
     capacityRiskDismissed,
     capacityRiskSignal,
     handleDismissCapacityRisk,
+    // FNXC:WorkflowLifecycleColumns 2026-07-30-12:15: reuse the footer's per-task column traits
+    // so main-content views resolve lifecycle roles instead of matching column names.
+    columnFlagsByTaskId: footerColumnFlagsByTaskId,
     AgentsView,
     ChatView,
     CommandCenter,
     DevServerView,
-    DocumentsView,
+    NotesView,
+    WhiteboardView,
     EvalsView,
     GoalsView,
+    PatchnodeView,
     InsightsView,
     MemoryView,
     PullRequestView,
     ResearchView,
     SecretsView,
     SkillsView,
-    TodoView,
+    SnippetsView,
     _AutomationsView,
     _ImportTasksView,
     _SettingsView,
     _WorkflowEditorView,
   };
+  mainContentPropsRef.current = mainContentProps;
 
   const showOnboardingResumeCard = !modalManager.modelOnboardingOpen && isOnboardingResumable();
   const showPostOnboardingRecommendations =
@@ -1705,14 +2270,46 @@ function AppInner() {
     markGitHubStarPromptShown,
     setShowGitHubStarPrompt,
   };
+  const alphaDesktopNavigationEntries = buildDashboardNavigationEntries({
+    view: taskView,
+    onChangeView: async (target) => {
+      if (!await alphaDesktopWindows.requestCloseAll()) return false;
+      commitTaskViewChange(target);
+      return true;
+    },
+    onNewTask: () => openNewTaskWithNav(),
+    onOpenSettings: async () => {
+      if (!await alphaDesktopWindows.requestCloseAll()) return false;
+      modalManager.setSettingsSection(undefined);
+      commitTaskViewChange("settings");
+      return true;
+    },
+    pluginDashboardViews,
+    showAgents: agentsEnabled,
+    showSkills: skillsEnabled,
+    flags: { memory: memoryEnabled, whiteboard: whiteboardEnabled, goals: goalsEnabled, insights: insightsEnabled, research: researchEnabled, ideation: ideationEnabled, evals: evalsEnabled },
+    mailboxUnreadCount,
+    mailboxPendingApprovalCount,
+    chatHasUnreadResponse,
+    planningNeedsInput,
+  });
+  const alphaDesktopActiveNavigationId = alphaDesktopWindows.topmost ?? taskView;
   return (
+    <AlphaProvider>
+    <ViewLayoutProvider projectId={currentProject?.id}>
     <ConfirmDialogProvider skipConfirmations={skipConfirmationDialogs}>
+      <ChatMessageLayoutProvider value={chatMessageLayout}>
+      <ChatSubmitOnEnterProvider value={chatSubmitOnEnter}>
       <ModalDismissPreferenceProvider enabled={dismissModalsOnOutsideClick}>
-      <NavigationHistoryProvider value={{ pushNav, replaceCurrent, removeNav }}>
+        <QuickAddSubmitOnEnterProvider enabled={quickAddSubmitOnEnter}>
+      <NavigationHistoryProvider value={{ pushNav, replaceCurrent, removeNav, promoteNav }}>
         <FileBrowserProvider openFile={openFileInBrowser}>
           <RetryWarningProvider value={maxTotalRetriesBeforeFail * RETRY_WARNING_RATIO}>
             <CostBadgeProvider value={{ enabled: showCostBadgeOnCards, pricingOverrides: modelPricingOverrides }}>
-        {isFirstEverBoot ? (
+        {/* FNXC:AuthTokenRecovery 2026-09-10-21:28: A latched daemon-auth failure must win the first render over both the first-boot loader and the dashboard shell, leaving one blocking full-screen recovery page. */}
+        {authTokenRecoveryOpen ? (
+          <AuthTokenRecoveryPage open />
+        ) : isFirstEverBoot ? (
           <>
             <DashboardLoader stage={loadingStage} />
             <ToastContainer toasts={toasts} onRemove={removeToast} />
@@ -1736,38 +2333,42 @@ function AppInner() {
         onOpenWorkflowEditor={openWorkflowEditorWithNav}
         onOpenFiles={openFilesWithNav}
         filesOpen={modalManager.filesOpen}
-        todosEnabled={todosEnabled}
         view={taskView}
         onChangeView={viewMode === "project" && currentProject ? handleTaskViewChange : undefined}
+        onNewTask={viewMode === "project" && currentProject ? openNewTaskWithNav : undefined}
         showSkillsTab={skillsEnabled}
         showAgentsTab={agentsEnabled}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
-        branchFilter={branchFilter}
-        baseBranchFilter={baseBranchFilter}
-        branchOptions={branchOptions}
-        baseBranchOptions={baseBranchOptions}
-        onBranchFilterChange={handleBranchFilterChange}
-        onBaseBranchFilterChange={handleBaseBranchFilterChange}
+        taskSearchTasks={boardSourceTasks}
+        onSelectSearchTask={(task) => {
+          const selected = boardSourceTasks.find((candidate) => candidate.id.toLocaleLowerCase() === task.id.toLocaleLowerCase());
+          if (selected) openDetailTask(selected);
+        }}
         projects={effectiveProjects}
         currentProject={currentProject}
         onSelectProject={handleSelectProject}
         onViewAllProjects={handleViewAllProjects}
         projectId={currentProject?.id}
         mobileNavEnabled={isMobile}
-        leftSidebarNavActive={sidebarActive}
+        leftSidebarNavActive={sidebarActive || alphaDesktopNavigationActive}
         rightDockAvailable={rightDockActive}
         rightDockOpen={rightDock.open}
         onToggleRightDock={rightDock.toggle}
         // Node switching props
         availableNodes={nodes}
         currentNode={currentNode}
-        onSelectNode={(node) => {
-          if (node === null) {
-            clearCurrentNode();
-          } else {
-            setCurrentNode(node);
-          }
+        onSelectNode={async (node) => {
+          const targetNodeId = node?.id ?? null;
+          if (targetNodeId === currentNodeId) return true;
+          /*
+          FNXC:AlphaDesktopWindows 2026-09-11-20:06:
+          Node changes replace the project scope just like project selection does. The shared pilot-window guard must accept before NodeContext mutates, otherwise a dirty Notes controller can reset before its discard decision; refusal also keeps the selector open for a retry.
+          */
+          if (!await alphaDesktopWindows.requestCloseAll()) return false;
+          if (node === null) clearCurrentNode();
+          else setCurrentNode(node);
+          return true;
         }}
         isRemote={isRemote}
         experimentalFeatures={{
@@ -1778,6 +2379,7 @@ function AppInner() {
           researchView: researchEnabled,
           evalsView: evalsEnabled,
           ideationView: ideationEnabled,
+          whiteboardView: whiteboardEnabled,
           goalsView: goalsEnabled,
           leftSidebarNav: leftSidebarNavEnabled,
           rightDock: rightDockEnabled,
@@ -1801,7 +2403,6 @@ function AppInner() {
             onChangeView={handleTaskViewChange}
             onNewTask={openNewTaskWithNav}
             onOpenSettings={openSettingsWithNav}
-            todosEnabled={todosEnabled}
             mailboxUnreadCount={mailboxUnreadCount}
             mailboxPendingApprovalCount={mailboxPendingApprovalCount}
             chatHasUnreadResponse={chatHasUnreadResponse}
@@ -1813,6 +2414,7 @@ function AppInner() {
               researchView: researchEnabled,
               evalsView: evalsEnabled,
               ideationView: ideationEnabled,
+              whiteboardView: whiteboardEnabled,
               goalsView: goalsEnabled,
             }}
             pluginDashboardViews={pluginDashboardViews}
@@ -1822,33 +2424,125 @@ function AppInner() {
             currentProject={currentProject}
             onSelectProject={handleSelectProject}
             onViewAllProjects={handleViewAllProjects}
-            footerVisible={executorFooterVisible}
+            footerVisible={shellFooterVisible}
           />
         )}
         <div
-          className={`project-content${executorFooterVisible && (!isMobile || !mobileKeyboardOpen) ? " project-content--with-footer" : ""}${isMobile && !mobileKeyboardOpen ? " project-content--with-mobile-nav" : ""}`}
+          className={`project-content${shellFooterVisible && (!isMobile || !mobileKeyboardOpen) ? " project-content--with-footer" : ""}${isMobile && mobileNavVisible && !(modalManager.anyModalOpen || quickChatOpen) ? " project-content--with-alpha-nav" : ""}`}
         >
-          <MainContent {...mainContentProps} />
+          <AppMainPanelTaskDetailComposition
+            state={mainPanelTaskDetail}
+            mainContentProps={mainContentProps}
+          />
+          {alphaMobileDrawerActive && currentProject && (
+            <AlphaProjectsDrawer
+              open={alphaProjectsDrawerOpen}
+              title={t("nav.projects", "Projects")}
+              onClose={() => setAlphaProjectsDrawerOpen(false)}
+            >
+              <ProjectOverview
+                projects={projects}
+                loading={projectsLoading}
+                onSelectProject={(project) => {
+                  setAlphaProjectsDrawerOpen(false);
+                  handleSelectProject(project);
+                }}
+                onAddProject={handleAddProject}
+                onPauseProject={handlePauseProject}
+                onResumeProject={handleResumeProject}
+                onRemoveProject={handleRemoveProject}
+                nodes={nodes}
+              />
+            </AlphaProjectsDrawer>
+          )}
+          {/*
+          FNXC:PlanningKeepAlive 2026-07-22-12:30:
+          Kept-alive Planning Mode renders as a sibling of the MainContent switch inside .project-content (which is position:relative for the hidden out-of-flow overlay state). Keyed by project id + planningEntryGeneration so project switches and payload-carrying planning entry points remount with fresh-open semantics while plain navigation restores the live instance.
+          */}
+          {viewMode === "project" && currentProject && planningEverOpenedProjectId === currentProject.id && (
+            isMobile ? (
+              <AlphaPlanningDrawer
+                open={planningViewActive && !modalManager.detailTask}
+                title={t("nav.planning", "Planning")}
+                onClose={() => {
+                  modalManager.closePlanning();
+                  handleTaskViewChange("board");
+                }}
+              >
+                <PlanningKeepAlive
+                  key={`${currentProject.id}:${modalManager.planningEntryGeneration}`}
+                  active={planningViewActive}
+                  projectId={currentProject.id}
+                  tasks={tasks}
+                  bgPlanningSessions={bgPlanningSessions}
+                  modalManager={modalManager}
+                  handleChangeTaskView={handleTaskViewChange}
+                  handlePlanningTaskCreated={handlePlanningTaskCreated}
+                  handlePlanningTasksCreated={handlePlanningTasksCreated}
+                  openBoardTaskDetail={openBoardTaskDetail}
+                  openWorkflowEditorWithNav={openWorkflowEditorWithNav}
+                />
+              </AlphaPlanningDrawer>
+            ) : (
+              <PlanningKeepAlive
+                key={`${currentProject.id}:${modalManager.planningEntryGeneration}`}
+                active={planningViewActive}
+                projectId={currentProject.id}
+                tasks={tasks}
+                bgPlanningSessions={bgPlanningSessions}
+                modalManager={modalManager}
+                handleChangeTaskView={handleTaskViewChange}
+                handlePlanningTaskCreated={handlePlanningTaskCreated}
+                handlePlanningTasksCreated={handlePlanningTasksCreated}
+                openBoardTaskDetail={openBoardTaskDetail}
+                openWorkflowEditorWithNav={openWorkflowEditorWithNav}
+              />
+            )
+          )}
         </div>
         {rightDock.dock}
       </div>
-      {currentProject && (
+      {alphaWideFooterActive ? <AlphaDesktopActionBar entries={alphaDesktopNavigationEntries} activeId={alphaDesktopActiveNavigationId} tasks={footerTasks} projectId={currentProject?.id} columnFlagsByTaskId={footerColumnFlagsByTaskId} onToggleTerminal={toggleTerminalWithNav} /> : null}
+      {alphaDesktopNavigationActive ? alphaDesktopWindows.windows.filter((entry) => entry.id === "patchnode").map((entry) => (
+        <Suspense fallback={null} key={entry.id}>
+          <PatchnodeView
+            projectId={currentProject?.id}
+            onOpenTaskDetail={async (taskId) => {
+              const task = await fetchTaskDetail(taskId, currentProject?.id);
+              /* FNXC:AlphaDesktopWindows 2026-09-11-20:06: History delegates to the canonical nav-aware Task Detail opener so Browser Back and Escape close the detail layer before either pilot window. */
+              openDetailTask(task);
+            }}
+            floating={{ onClose: () => { void alphaDesktopWindows.requestClose("patchnode"); }, onActivate: () => alphaDesktopWindows.activate("patchnode"), raiseToFrontSignal: entry.raiseToFrontSignal }}
+          />
+        </Suspense>
+      )) : null}
+      {/*
+      FNXC:Terminal 2026-07-26-11:40:
+      Mount the terminal ONLY while it is open. It used to be mounted for the whole session (visibility driven purely by `isOpen`), so a closed terminal still ran `useTerminalSessions` + `useTerminal`: a live PTY WebSocket, its heartbeat interval, and — because xterm is torn down on close, leaving no `onData` subscriber — an UNBOUNDED client-side buffer of every byte the shell emitted while the user was elsewhere. Background timers/sockets are a primary tab-discard signal on iOS Safari and Chrome Android, and the growing buffer is the memory pressure that triggers the discard; together they are why returning to the dashboard after a few minutes costs a full white-splash reload.
+      This does NOT regress the "persist across tab switches" requirement: `terminalOpen` survives view switches, so switching views keeps the modal mounted and its buffer intact. Only an explicit close unmounts. Terminal tabs are server-side PTY sessions restored on reopen, with scrollback replayed by the server on reconnect.
+
+      FNXC:Terminal 2026-07-26-14:10 (CORRECTION — the paragraph above originally ended "close already disposed xterm and its scrollback, so nothing is lost that closing did not already discard"; that was FALSE and must not be reasserted):
+      Closing DID dispose xterm, but the WebSocket stayed open with zero `onData` subscribers, so `useTerminal`'s `initialBufferRef.current.data` accumulated EVERY byte emitted while closed and `onData()` replayed the whole array verbatim when xterm re-initialized on reopen. Reopen was therefore lossless for arbitrarily long closed-terminal output. It no longer is: unmounting closes the socket, and reopen now starts from the server's replay — `MAX_SCROLLBACK_SIZE = 50000` CHARACTERS in `packages/dashboard/src/terminal-service.ts` (~600-800 typical lines), not lines and not unbounded.
+      Keeping the component mounted is nonetheless the WRONG repair, because the property it preserved was itself the defect: that buffer has no cap and is never drained while closed, so a long-running command (a watch build, `tail -f`) left in a closed terminal grows the heap without bound for as long as the app is open — strictly worse than losing scrollback, and precisely the memory pressure that gets the tab discarded. There is no in-component way to keep both properties: the buffer lives inside `useTerminal`, which cannot outlive the mount.
+      The real ceiling is the server ring, and the correct place to recover the lost history is to raise `MAX_SCROLLBACK_SIZE` (the repo's own CLI-agent session ring is 512 KiB by comparison) or to bound-and-persist the client buffer outside the component. Both are outside this change's file scope; this comment records the deliberate, known trade so it is not rediscovered as a mystery.
+      */}
+      {currentProject && modalManager.terminalOpen && (
         <TerminalModal
           isOpen={modalManager.terminalOpen}
           onClose={closeTerminalWithNav}
           initialCommand={modalManager.terminalInitialCommand}
           initialCommandGeneration={modalManager.terminalInitialCommandGeneration}
           projectId={currentProject.id}
-          footerVisible={executorFooterVisible}
+          footerVisible={shellFooterVisible}
         />
       )}
       </div>
       {rightDock.modal}
       {executorFooterVisible && currentProject && (
         <ExecutorStatusBar
-          tasks={isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks}
+          tasks={footerTasks}
           projectId={currentProject.id}
-          taskStuckTimeoutMs={taskStuckTimeoutMs}
+          columnFlagsByTaskId={footerColumnFlagsByTaskId}
           staleHighFanoutBlockerAgeThresholdMs={staleHighFanoutBlockerAgeThresholdMs}
           lastFetchTimeMs={lastFetchTimeMs}
           currentProjectPath={currentProject.path}
@@ -1857,18 +2551,22 @@ function AppInner() {
           hideWhenKeyboardOpen={mobileKeyboardOpen}
           onToggleTerminal={toggleTerminalWithNav}
           quickChatButtonMode={quickChatButtonMode}
-          onOpenQuickChat={() => setQuickChatOpen(true)}
+          onToggleQuickChat={toggleChatVisibility}
+          quickChatToggleAction={chatVisibilityToggleAction}
           onOpenScripts={openScriptsWithNav}
           onRunScript={runScriptWithNav}
         />
       )}
       <MobileNavBar
         view={taskView}
-        onChangeView={viewMode === "project" && currentProject ? handleTaskViewChange : () => {}}
-        footerVisible={viewMode === "project" && !!currentProject}
-        modalOpen={modalManager.anyModalOpen}
+        onChangeView={mobileNavVisible ? handleTaskViewChange : () => {}}
+        footerVisible={executorFooterVisible}
+        hidden={!mobileNavVisible}
+        modalOpen={modalManager.anyModalOpen && !alphaSharedModalDrawerOpen}
         keyboardOpen={mobileNavKeyboardOpen}
-        mobileNavPrimaryItems={mobileNavPrimaryItems}
+        keyboardMetrics={{ keyboardOverlap, viewportHeight, viewportOffsetTop }}
+        alphaMenuOpen={alphaMenuOpen}
+        onAlphaMenuOpenChange={setAlphaMenuOpen}
         onOpenSettings={openSettingsWithNav}
         onOpenActivityLog={openActivityLogWithNav}
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
@@ -1888,7 +2586,7 @@ function AppInner() {
         activePlanningSessionCount={bgPlanningSessions.length}
         planningNeedsInput={planningNeedsInput}
         onOpenUsage={() => openUsageWithNav(null)}
-        onViewAllProjects={handleViewAllProjects}
+        onViewAllProjects={openProjectsFromMobileNav}
         onRunScript={runScriptWithNav}
         projectId={currentProject?.id}
         showSkillsTab={skillsEnabled}
@@ -1897,10 +2595,10 @@ function AppInner() {
           memoryView: memoryEnabled,
           devServer: devServerEnabled,
           devServerView: devServerEnabled,
-          todoView: todosEnabled,
           researchView: researchEnabled,
           evalsView: evalsEnabled,
           ideationView: ideationEnabled,
+          whiteboardView: whiteboardEnabled,
           goalsView: goalsEnabled,
         }}
         pluginDashboardViews={pluginDashboardViews}
@@ -1914,14 +2612,14 @@ function AppInner() {
         }
       />
       {/*
-      FNXC:ChatModal 2026-06-22-13:24:
-      Quick Chat is replaced by the full ChatView in a movable/resizable FloatingWindow. The launcher icon is only the minimized entry point: clicking it opens the Chat modal, and the modal's minimize button closes the window back into that icon. Main Chat can also pop out into this same full Chat modal.
+      FNXC:ChatModal 2026-08-20-05:25:
+      FN-068 keeps Quick Chat's launcher as the only minimized entry point. Its floating Chat header exposes Close for dismissal and Open in Chat view for navigation, so no redundant minimize control can compete with Close. Main Chat can also pop out into this same full Chat modal.
 
       FNXC:ChatModal 2026-06-22-14:57:
       Reopening Quick Chat from the FAB restores the last floating Chat window geometry through FloatingWindow's persisted/clamped geometry key. The modal's maximize button routes to the full Chat view and closes the floating modal without clearing ChatView's shared session selection state.
 
       FNXC:ChatModal 2026-06-27-00:00:
-      Quick Chat is a transient utility window, so it opts into FloatingWindow's outside-click dismissal in addition to minimize, close, and maximize controls. Task pop-outs intentionally do not opt in because they are persistent workspace windows that should survive page clicks.
+      Quick Chat is a transient utility window, so it opts into FloatingWindow's outside-click dismissal in addition to close and Open in Chat view controls. Task pop-outs intentionally do not opt in because they are persistent workspace windows that should survive page clicks.
 
       FNXC:ChatModal 2026-06-28-00:00:
       Outside-click dismissal is now governed by the project-scoped quickChatCloseOnOutsideClick setting, default-on to preserve FN-7152 behavior. Other FloatingWindow callers still do not pass closeOnOutsidePointerDown, so task pop-outs and utility windows remain persistent.
@@ -1930,55 +2628,33 @@ function AppInner() {
         <QuickChatFAB
           showFAB={quickChatButtonMode === "floating"}
           open={quickChatOpen}
-          onOpenChange={setQuickChatOpen}
+          onToggle={toggleChatVisibility}
+          toggleAction={chatVisibilityToggleAction}
         />
       )}
       {currentProject && quickChatEverOpenedProjectId === currentProject.id && (
-        <FloatingWindow
+        <QuickChatWindow
           key={currentProject.id}
-          windowKey="chat-modal"
+          projectId={currentProject.id}
           hidden={!quickChatOpen}
-          title="Chat"
+          closeOnOutsidePointerDown={shouldCloseQuickChatOnOutsideClick({
+            quickChatCloseOnOutsideClick,
+            poppedOutChatEntries,
+          })}
+          addToast={addToast}
+          experimentalFeatures={experimentalFeatures}
+          initialComposerDraft={chatComposerPrefill?.text}
+          initialComposerDraftNonce={chatComposerPrefill?.nonce}
+          onSendAsReport={handleSendChatMessageAsReport}
+          onOpenSessionInNewWindow={openSessionInNewWindow}
+          onMaximize={() => {
+            handleTaskViewChange("chat");
+            setQuickChatOpen(false);
+          }}
           onClose={() => setQuickChatOpen(false)}
-          closeOnOutsidePointerDown={quickChatCloseOnOutsideClick}
-          hideHeader
-          dragHandleSelector=".chat-view--floating .view-header"
-          className="floating-window--chat"
-          layer="task-detail"
-          /*
-          FNXC:ChatModal 2026-07-17-15:55:
-          Quick Chat and task-detail popups must share the task popup interaction stack: either
-          overlapping surface claims the front on pointer/focus. Other utility FloatingWindows keep
-          their higher utility band, so this scoped opt-in cannot change Terminal, Files, or New Task.
-          */
-          /* FNXC:ModalGeometryPersistence 2026-07-15-19:30: Chat is a full-screen sheet at ≤768px, so preserve its desktop location and size instead of restoring or overwriting them there. */
-          suspendGeometryPersistenceOnMobile
-          persistGeometryKey="kb-dashboard-chat-floating-window"
-          defaultSize={{ width: 980, height: 680 }}
-          /*
-          FNXC:ChatModal 2026-06-23-22:14:
-          The full Chat pop-out must be resizable into a very narrow desktop utility window. ChatView already switches to its mobile one-pane layout at narrow widths, so allow the FloatingWindow to shrink below the old two-pane desktop minimum while preserving enough width for composer controls.
-          */
-          minSize={{ width: 300, height: 420 }}
-        >
-          <Suspense fallback={null}>
-            <ChatView
-              addToast={addToast}
-              projectId={currentProject.id}
-              experimentalFeatures={experimentalFeatures}
-              floating
-              initialComposerDraft={chatComposerPrefill?.text}
-              initialComposerDraftNonce={chatComposerPrefill?.nonce}
-              onMaximize={() => {
-                handleTaskViewChange("chat");
-                setQuickChatOpen(false);
-              }}
-              onMinimize={() => setQuickChatOpen(false)}
-              onClose={() => setQuickChatOpen(false)}
-            />
-          </Suspense>
-        </FloatingWindow>
+        />
       )}
+      {alphaDesktopRightDockWindows}
       {/*
       FNXC:FloatingWindow 2026-06-22-20:45:
       One movable, resizable, non-blocking FloatingWindow per popped-out task. Each hosts the same embedded TaskDetailContent List/Board use, wired to the same App task handlers. Live row preferred by id; falls back to the snapshot. Terminal/destructive actions and the window close button both remove the entry. Multiple entries → multiple coexisting windows; FloatingWindow's per-window z-counter handles focus-to-front so the clicked one comes on top.
@@ -1994,52 +2670,43 @@ function AppInner() {
       moves either overlapping surface above the other. Other utility windows retain their separate,
       higher utility band and cannot be reordered by task-popup interaction.
 
-      FNXC:TaskPopupViewGating 2026-07-15-15:20:
-      Rendering uses only the active view's scoped entries; state keeps hidden snapshots so returning remounts them with shared geometry. Each FloatingWindow key includes its origin so identical task ids never collide across views.
+      FNXC:TaskPopupViewGating 2026-07-22-13:15:
+      FN remount-churn fix R7 supersedes the FN-8016 remount behavior: ALL popped-out entries render, and off-origin-view windows are hidden via FloatingWindow's hidden contract (visibility-based, aria-hidden, effects suspended) instead of being filtered out of the render array. Returning to the origin view is an instant reveal of the live window — the embedded task detail, including an open terminal WebSocket, stays mounted. The `isTaskPopupVisibleForView` predicate and per-origin-view addressability are unchanged; `visiblePoppedOutTaskEntries` still feeds the Escape/nav-shortcut consumer. While hidden, `active={false}` closes the detail's SSE/EventSource channels (R8). Each FloatingWindow key includes its origin so identical task ids never collide across views.
       */}
-      {visiblePoppedOutTaskEntries.map(({ task: snapshot, originTaskView }) => {
-        const liveTask = tasks.find((candidate) => candidate.id === snapshot.id) ?? snapshot;
-        const popupKey = taskPopupIdentityKey(snapshot.id, originTaskView);
-        const close = () => closePoppedOutTaskWithNav(snapshot.id, originTaskView);
-        return (
-          <FloatingWindow
-            key={popupKey}
-            windowKey={`task-detail-${snapshot.id}-${originTaskView ?? "global"}`}
-            title={liveTask.id}
-            onClose={close}
-            hideHeader
-            dragHandleSelector=".task-detail-content--embedded > .modal-header"
-            className="floating-window--task-detail"
-            /* FNXC:ModalGeometryPersistence 2026-07-15-19:30: Task pop-outs are full-screen sheets at ≤768px; preserve the shared desktop geometry record for their next movable reopen. */
-            suspendGeometryPersistenceOnMobile
-            persistGeometryKey={TASK_DETAIL_FLOATING_GEOMETRY_KEY}
-            layer="task-detail"
-          >
-            <TaskDetailContent
-              task={liveTask}
-              projectId={currentProject?.id}
-              tasks={tasks}
-              embedded
-              onOpenDetail={popOutTaskDetailForCurrentView}
-              onMoveTask={moveTask}
-              onDeleteTask={deleteTask}
-              onMergeTask={mergeTask}
-              onRetryTask={retryTask}
-              onBypassReview={bypassReview}
-              onResetTask={resetTask}
-              onDuplicateTask={duplicateTask}
-              onRequestClose={close}
-              addToast={addToast}
-              prAuthAvailable={prAuthAvailable}
-              autoMergeEnabled={autoMerge}
-              taskDetailChatFirst={taskDetailChatFirst}
-            />
-          </FloatingWindow>
-        );
-      })}
+      <AppTaskPopoutWindows
+        entries={poppedOutTaskEntries}
+        liveTasks={tasks}
+        isVisible={taskPopupsVisibleOnCurrentView}
+        onCloseTask={closePoppedOutTaskWithNav}
+        persistGeometryKey={TASK_DETAIL_FLOATING_GEOMETRY_KEY}
+        windowProps={{
+          projectId: currentProject?.id,
+          tasks,
+          globalPaused,
+          onOpenDetail: popOutTaskDetailForCurrentView,
+          /* FNXC:TaskRevert 2026-08-01-20:27: Popped-out detail preserves Delete-or-Revise recovery for reverted tasks. */
+          onReviseTask: (task) => modalManager.openNewTaskWithDescription(task.description),
+          onDeleteTask: deleteTask,
+          onMergeTask: mergeTask,
+          onRetryTask: retryTask,
+          onPauseTask: pauseTask,
+          onUnpauseTask: unpauseTask,
+          onBypassReview: bypassReview,
+          onResetTask: resetTask,
+          onDuplicateTask: duplicateTask,
+          onRefinementCreated: (task) => ingestCreatedTasks([task]),
+          addToast,
+          prAuthAvailable,
+          autoMergeEnabled: autoMerge,
+          taskDetailChatFirst,
+        }}
+      />
       <AppModals
         projectId={currentProject?.id}
+        alphaMobileDrawer={alphaMobileDrawerActive}
         tasks={tasks}
+        columnFlagsByTaskId={footerColumnFlagsByTaskId}
+        globalPaused={globalPaused}
         projects={projects}
         currentProject={currentProject}
         addToast={addToast}
@@ -2051,21 +2718,19 @@ function AppInner() {
           handleModalCreate,
           handlePlanningTaskCreated,
           handlePlanningTasksCreated,
-          handleSubtaskTasksCreated,
           handleGitHubImport,
         }}
+        onRefinementCreated={(task) => ingestCreatedTasks([task])}
         onPlanningMode={openPlanningWithInitialPlanWithNav}
         onOpenChatWithPrefill={openChatWithPrefill}
-        onSubtaskBreakdown={subtaskBreakdownEnabled ? openSubtaskBreakdownWithNav : undefined}
-        taskOperations={{ moveTask, deleteTask, mergeTask, archiveTask, revertTask, retryTask, bypassReview, resetTask, duplicateTask }}
+        taskOperations={{ moveTask, deleteTask, mergeTask, revertTask, retryTask, pauseTask, unpauseTask, bypassReview, resetTask, duplicateTask }}
         deepLink={{ handleDetailClose }}
-        settings={{ prAuthAvailable, autoMerge, taskDetailChatFirst, themeMode, colorTheme, dashboardFontScalePct, shadcnCustomColors, resolvedThemeMode, setThemeMode, setColorTheme, setDashboardFontScalePct, setShadcnCustomColors, setQuickChatButtonModeImmediate, setMobileNavPrimaryItemsImmediate }}
+        settings={{ prAuthAvailable, autoMerge, openTasksInRightSidebar, openMobileTasksInPopup, taskPopupsBoardListOnly, showCostBadgeOnCards, taskDetailChatFirst, chatMessageLayout, themeMode, colorTheme, dashboardFontScalePct, shadcnCustomColors, resolvedThemeMode, setThemeMode, setColorTheme, setDashboardFontScalePct, setShadcnCustomColors, setQuickChatButtonModeImmediate, setChatMessageLayoutImmediate, setOpenTasksInRightSidebarImmediate, setOpenMobileTasksInPopupImmediate, setTaskPopupsBoardListOnlyImmediate, setShowCostBadgeOnCardsImmediate, setTaskDetailChatFirstImmediate, setMobileNavPrimaryItemsImmediate }}
         onSettingsClose={handleSettingsCloseWithNav}
         onReopenOnboarding={reopenOnboardingWithNav}
         onOpenApprovals={(_approvalId) => handleTaskViewChange("mailbox")}
         agentOnboardingEnabled={agentOnboardingEnabled}
       />
-      <AuthTokenRecoveryDialog open={authTokenRecoveryOpen} />
             {shellApi && (
               <>
                 <NativeShellOnboardingModal
@@ -2088,8 +2753,13 @@ function AppInner() {
           </RetryWarningProvider>
         </FileBrowserProvider>
       </NavigationHistoryProvider>
+        </QuickAddSubmitOnEnterProvider>
       </ModalDismissPreferenceProvider>
+      </ChatSubmitOnEnterProvider>
+      </ChatMessageLayoutProvider>
     </ConfirmDialogProvider>
+    </ViewLayoutProvider>
+    </AlphaProvider>
   );
 }
 

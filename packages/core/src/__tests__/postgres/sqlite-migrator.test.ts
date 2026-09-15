@@ -28,19 +28,24 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
-import { execSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { DatabaseSync } from "../../sqlite-adapter.js";
+import { DatabaseSync } from "../../db/sqlite-adapter.js";
 import {
   formatMigrationProgress,
   migrateLegacyProjectPluginRows,
   migrateSqliteToPostgres,
+  projectPluginSqliteMigrationKey,
+  recordSqliteMigrationComplete,
   toSnakeCase,
   type MigrationProgressEvent,
 } from "../../postgres/sqlite-migrator.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
+import {
+  createBaselinedPgTestDatabase,
+  createEmptyPgTestDatabase,
+} from "../../__test-utils__/pg-test-harness.js";
 
 const PG_TEST_URL_BASE =
   process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
@@ -78,25 +83,13 @@ describe("SQLite migration CLI progress", () => {
   });
 });
 
-/**
- * FNXC:PostgresMigration 2026-06-24-09:05:
- * Create a uniquely-named fresh PostgreSQL database. Mirrors the
- * schema-applier test harness.
- */
-function uniqueDbName(): string {
-  return `fusion_migrate_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 /*
-FNXC:PgTestAuthFix 2026-07-14-00:00:
-The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+FNXC:PostgresMigration 2026-08-15-03:52:
+Database naming/creation/drop now lives in the shared pg-test-harness
+(createBaselinedPgTestDatabase); the former inline psql adminExec (see
+FNXC:PgTestAuthFix 2026-07-14-00:00) is gone with it, which also removes this
+file's only execSync shellout.
 */
-function adminExec(statement: string): void {
-  execSync(
-    `psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
-    { stdio: "pipe", env: process.env },
-  );
-}
 
 /** A subset of the tasks table schema (the columns the migration tests touch). */
 const TASKS_SQLITE_DDL = `
@@ -438,24 +431,28 @@ interface TestCtx {
   sqlConn: ReturnType<typeof postgres>;
   db: ReturnType<typeof drizzle>;
   fusionDir: string;
+  dropDb: () => Promise<void>;
 }
 
+/*
+FNXC:PostgresMigration 2026-08-15-03:52:
+Slow-test fix: the per-test target used to be an EMPTY database, so every test
+paid the migrator's full internal applySchemaBaseline DDL run (~3s). Clone the
+target from the harness's run-shared golden template instead — that template IS
+the applySchemaBaseline end-state (schema + version markers), so the migrator's
+idempotent baseline call degrades to a marker-check no-op while every assertion,
+including the explicit applySchemaBaseline() calls below, sees the identical
+target state.
+*/
 async function setupCtx(): Promise<TestCtx> {
   const fusionDir = mkdtempSync(join(tmpdir(), "fusion-migrate-"));
   buildPopulatedSqliteProject(fusionDir);
   buildPopulatedSqliteArchive(fusionDir);
 
-  const dbName = uniqueDbName();
-  try {
-    adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch {
-    // ignore
-  }
-  adminExec(`CREATE DATABASE "${dbName}"`);
-  const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
-  const sqlConn = postgres(testUrl, { max: 3, prepare: false, onnotice: () => {} });
+  const baselined = await createBaselinedPgTestDatabase("fusion_migrate_test");
+  const sqlConn = postgres(baselined.testUrl, { max: 3, prepare: false, onnotice: () => {} });
   const db = drizzle(sqlConn);
-  return { dbName, sqlConn, db, fusionDir };
+  return { dbName: baselined.dbName, sqlConn, db, fusionDir, dropDb: baselined.drop };
 }
 
 async function teardownCtx(ctx: TestCtx | null): Promise<void> {
@@ -466,7 +463,7 @@ async function teardownCtx(ctx: TestCtx | null): Promise<void> {
     // best-effort
   }
   try {
-    adminExec(`DROP DATABASE IF EXISTS "${ctx.dbName}"`);
+    await ctx.dropDb();
   } catch {
     // best-effort
   }
@@ -1132,12 +1129,10 @@ pgDescribe("SQLite-to-PostgreSQL migrator", () => {
     try {
       legacy.exec(`
         CREATE TABLE centralSettings (id INTEGER PRIMARY KEY, defaultProjectId TEXT, updatedAt TEXT NOT NULL);
-        CREATE TABLE globalConcurrency (id INTEGER PRIMARY KEY, globalMaxConcurrent INTEGER, currentlyActive INTEGER, queuedCount INTEGER, updatedAt TEXT);
         CREATE TABLE plugin_installs (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, path TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL);
         CREATE TABLE project_plugin_states (projectPath TEXT NOT NULL, pluginId TEXT NOT NULL, enabled INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY (projectPath, pluginId));
       `);
       legacy.prepare(`INSERT INTO centralSettings VALUES (?, ?, ?)`).run(1, "project-default", "2026-06-01");
-      legacy.prepare(`INSERT INTO globalConcurrency VALUES (?, ?, ?, ?, ?)`).run(1, 10, 0, 0, "2026-06-02");
       legacy.prepare(`INSERT INTO plugin_installs VALUES (?, ?, ?, ?, ?, ?)`).run("plugin-a", "A", "1.0.0", "/a", "2026-06-01", "2026-06-01");
       legacy.prepare(`INSERT INTO plugin_installs VALUES (?, ?, ?, ?, ?, ?)`).run("plugin-b", "B", "1.0.0", "/b", "2026-06-01", "2026-06-01");
       const insertState = legacy.prepare(`INSERT INTO project_plugin_states VALUES (?, ?, ?, ?, ?, ?, ?)`);
@@ -1150,17 +1145,26 @@ pgDescribe("SQLite-to-PostgreSQL migrator", () => {
     const report = await migrateTest(ctx!.db, [
       { sqlitePath, pgSchema: "central" as const },
     ]);
-    for (const table of ["central_settings", "global_concurrency", "project_plugin_states"]) {
+    /*
+    FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
+    `global_concurrency` leaves this list with the table itself (migration 0037).
+    A legacy SQLite `globalConcurrency` table now has no destination and is simply
+    not migrated, which is the intent: its cap is deleted and its
+    currently_active/queued_count counters were never written by production code.
+    */
+    for (const table of ["central_settings", "project_plugin_states"]) {
       expect(report.tables).toContainEqual(expect.objectContaining({ table, verified: true }));
     }
     const settings = await ctx!.db.execute(sql`
       SELECT default_project_id, updated_at FROM central.central_settings WHERE id = 1
     `) as unknown as Array<{ default_project_id: string; updated_at: string }>;
     expect(settings).toEqual([{ default_project_id: "project-default", updated_at: "2026-06-01" }]);
-    const concurrency = await ctx!.db.execute(sql`
-      SELECT global_max_concurrent, updated_at FROM central.global_concurrency WHERE id = 1
-    `) as unknown as Array<{ global_max_concurrent: number; updated_at: string }>;
-    expect(concurrency).toEqual([{ global_max_concurrent: 10, updated_at: "2026-06-02" }]);
+    // The dropped table must be GONE, not merely unread — a lingering table with
+    // plausible counters invites a future reader to trust it.
+    const remaining = await ctx!.db.execute(sql`
+      SELECT to_regclass('central.global_concurrency') AS present
+    `) as unknown as Array<{ present: string | null }>;
+    expect(remaining[0]?.present ?? null).toBeNull();
   });
 
   /*
@@ -1296,6 +1300,19 @@ pgDescribe("SQLite-to-PostgreSQL migrator", () => {
       WHERE install.id = 'shared-plugin' AND state.project_path = ${projectA}
     `)) as unknown as Array<{ name: string; enabled: number }>;
     expect(preserved).toEqual([{ name: "Shared from B", enabled: 1 }]);
+  });
+
+  it("does not probe a retained plugin SQLite path after its marker completes", async () => {
+    await applySchemaBaseline(ctx!.db);
+    const projectPath = join(ctx!.fusionDir, "project-complete");
+    await recordSqliteMigrationComplete(
+      ctx!.db,
+      projectPluginSqliteMigrationKey(projectPath),
+    );
+
+    // A directory is not a SQLite database and would throw if the bridge opened it.
+    await expect(migrateLegacyProjectPluginRows(ctx!.db, ctx!.fusionDir, projectPath))
+      .resolves.toBeUndefined();
   });
 
   it("treats missing SQLite files and databases without plugins as a no-op", async () => {
@@ -1854,8 +1871,18 @@ pgDescribe("SQLite-to-PostgreSQL migrator", () => {
 
   // VAL-MIGRATE-005 — dry-run reports without writing
   it("dry-run reports the plan without modifying PostgreSQL", async () => {
+    /*
+    FNXC:PostgresMigration 2026-08-15-03:52:
+    This test's contract is a PRISTINE external target (no schemas, no marker
+    table), so it cannot use the shared golden-template ctx.db whose baseline is
+    pre-applied — it provisions its own empty database.
+    */
+    const empty = await createEmptyPgTestDatabase("fusion_migrate_pristine");
+    const emptyConn = postgres(empty.testUrl, { max: 3, prepare: false, onnotice: () => {} });
+    const emptyDb = drizzle(emptyConn);
+    try {
     const report = await migrateTest(
-      ctx!.db,
+      emptyDb,
       [{ sqlitePath: join(ctx!.fusionDir, "fusion.db"), pgSchema: "project" as const }],
       { dryRun: true },
     );
@@ -1870,7 +1897,7 @@ pgDescribe("SQLite-to-PostgreSQL migrator", () => {
     FNXC:PostgresMigration 2026-07-14-23:47:
     VAL-MIGRATE-005 applies to catalog state as well as copied rows. A preview against a pristine external target must leave no schemas, tables, or migration marker behind after it reports the plan.
     */
-    const catalog = (await ctx!.db.execute(sql`
+    const catalog = (await emptyDb.execute(sql`
       SELECT
         to_regnamespace('project')::text AS project_schema,
         to_regclass('project.tasks')::text AS tasks_table,
@@ -1891,6 +1918,10 @@ pgDescribe("SQLite-to-PostgreSQL migrator", () => {
 
     // No sequences should have been bumped in dry-run.
     expect(report.sequenceBumps).toHaveLength(0);
+    } finally {
+      await emptyConn.end({ timeout: 5 }).catch(() => {});
+      await empty.drop().catch(() => {});
+    }
   });
 
   // VAL-SEARCH-002 (search_vector population) — generated column auto-populates

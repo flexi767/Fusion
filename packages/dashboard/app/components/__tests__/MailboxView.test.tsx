@@ -1,14 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { useEffect, type ReactNode } from "react";
 import { loadAllAppCss } from "../../test/cssFixture";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MailboxView } from "../MailboxView";
+import { useMailboxUnread } from "../../hooks/useMailboxUnread";
 import { NavigationHistoryProvider, useNavigationHistory, type UseNavigationHistoryResult } from "../../hooks/useNavigationHistory";
 import * as apiModule from "../../api";
 import * as viewportModule from "../../hooks/useViewportMode";
 import * as mobileKeyboardModule from "../../hooks/useMobileKeyboard";
 import * as sseBusModule from "../../sse-bus";
-import type { Agent } from "../../api";
+import type { Agent, InboxResponse, UnreadCountResponse } from "../../api";
 import type { Message } from "@fusion/core";
 
 // Mock the API module
@@ -28,6 +30,7 @@ vi.mock("../../api", () => ({
   fetchApprovalDetail: vi.fn(),
   decideApproval: vi.fn(),
   artifactMediaUrlWithToken: vi.fn((id: string, projectId?: string) => `/api/artifacts/${id}/media${projectId ? `?projectId=${projectId}&` : "?"}fn_token=daemon-token`),
+  artifactMediaUrl: vi.fn(),
   fetchNativeStructurePreview: vi.fn(),
 }));
 
@@ -39,12 +42,24 @@ vi.mock("../../hooks/useViewportMode", () => {
     MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
     getViewportMode: () => useViewportMode(),
     isMobileViewport: () => useViewportMode() === "mobile",
+    isTabletTouchViewport: (mode?: string) => mode === "tablet",
     useViewportMode,
   };
 });
 
 vi.mock("../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: vi.fn(),
+}));
+
+/*
+FNXC:StructuralMail 2026-08-09-10:50:
+Report-mode prefill opens the existing drafting panel by default. Keep mailbox integration tests focused
+on the real host-to-composer handoff rather than the panel's separately tested chat session.
+*/
+vi.mock("../ComposeChatPanel", () => ({ ComposeChatPanel: () => null }));
+vi.mock("../ArtifactImageViewer", () => ({
+  ArtifactImage: ({ title }: { title: string }) => <img alt={title} src="blob:secure-preview" />,
+  ArtifactImageViewer: () => null,
 }));
 
 const sseSubscriptions: Array<Record<string, () => void>> = [];
@@ -58,13 +73,15 @@ vi.mock("../../sse-bus", () => ({
 // Mock lucide-react icons
 vi.mock("lucide-react", () => ({
   X: () => <span data-testid="icon-x">X</span>,
+  ChevronLeft: () => <span data-testid="icon-chevron-left">Back</span>,
   Mail: () => <span data-testid="icon-mail">Mail</span>,
-  Send: () => <span data-testid="icon-send">Send</span>,
-  Inbox: () => <span data-testid="icon-inbox">Inbox</span>,
-  Bot: () => <span data-testid="icon-bot">Bot</span>,
+  Send: () => <svg data-testid="icon-send" />,
+  Inbox: () => <svg data-testid="icon-inbox" />,
+  Bot: () => <svg data-testid="icon-bot" />,
   Trash2: () => <span data-testid="icon-trash">Trash</span>,
+  Archive: () => <span data-testid="icon-archive">Archive</span>,
   Check: () => <span data-testid="icon-check">Check</span>,
-  CheckCheck: () => <span data-testid="icon-checkcheck">CheckCheck</span>,
+  CheckCheck: () => <svg data-testid="icon-checkcheck" />,
   Loader2: ({ className }: { className?: string }) => (
     <span data-testid="icon-loader" className={className}>Loader</span>
   ),
@@ -188,6 +205,33 @@ function makeOutboxResponse(messages: Message[]) {
   return { messages, total: messages.length };
 }
 
+function categoryUnreadResponse(message: number, recommendation: number, artifact: number) {
+  return {
+    unreadCount: message + recommendation + artifact,
+    categoryUnreadCounts: { message, recommendation, artifact },
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function MailboxUnreadHarness({ projectId }: { projectId: string }) {
+  const unread = useMailboxUnread(projectId);
+  return (
+    <>
+      <output data-testid="mailbox-harness-message-count">{unread.mailboxUnreadCount}</output>
+      <MailboxView
+        {...defaultProps}
+        projectId={projectId}
+        onUnreadCountChange={unread.setMailboxUnreadCount}
+      />
+    </>
+  );
+}
+
 function HistoryHarness({ children, historyRef }: { children: ReactNode; historyRef?: { current: UseNavigationHistoryResult | null } }) {
   const history = useNavigationHistory({ enabled: true });
   useEffect(() => {
@@ -233,6 +277,27 @@ describe("MailboxView", () => {
     expect(screen.getByTestId("mailbox-tabs")).toBeDefined();
   });
 
+  it.each(["desktop", "mobile"] as const)("opens a %s report composer from a fresh chat handoff without leaking it after close", async (viewport) => {
+    const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
+    mockUseViewportMode.mockReturnValue(viewport);
+    mockFetchInbox.mockResolvedValue(makeInboxResponse([], 0));
+    mockFetchOutbox.mockResolvedValue(makeOutboxResponse([]));
+    const prefill = { body: "Assistant report body", title: "Assistant report", nonce: 10 };
+    const { rerender } = render(<MailboxView {...defaultProps} composePrefill={prefill} />);
+
+    expect(await screen.findByTestId("report-title")).toHaveValue("Assistant report");
+    expect(screen.getByTestId("message-composer-content")).toHaveValue("Assistant report body");
+    expect(screen.getByTestId("message-composer-send")).toBeDisabled();
+
+    await user.click(screen.getByTestId("mailbox-back-to-list"));
+    expect(screen.queryByTestId("report-title")).not.toBeInTheDocument();
+    rerender(<MailboxView {...defaultProps} composePrefill={prefill} />);
+    expect(screen.queryByTestId("report-title")).not.toBeInTheDocument();
+
+    rerender(<MailboxView {...defaultProps} composePrefill={{ ...prefill, nonce: 11 }} />);
+    expect(await screen.findByTestId("report-title")).toHaveValue("Assistant report");
+  });
+
   it("shows the Mailbox title with unread count badge", async () => {
     mockFetchInbox.mockResolvedValue({
       messages: [mockMessage],
@@ -245,6 +310,59 @@ describe("MailboxView", () => {
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-unread-badge")).toBeDefined();
     });
+  });
+
+  it("keeps the new project's Inbox rows and badges when the prior requests resolve late", async () => {
+    const projectAInbox = deferred<InboxResponse>();
+    const projectBInbox = deferred<InboxResponse>();
+    const projectBMessage = { ...mockMessage, id: "msg-project-b", content: "Project B completion" };
+    const projectACounts = deferred<UnreadCountResponse>();
+    const projectBCounts = deferred<UnreadCountResponse>();
+    mockFetchInbox.mockImplementation((_options, projectId) => (
+      projectId === "proj-a" ? projectAInbox.promise : projectBInbox.promise
+    ));
+    mockFetchUnreadCount.mockImplementation((projectId) => (
+      projectId === "proj-a" ? projectACounts.promise : projectBCounts.promise
+    ));
+
+    const rendered = render(<MailboxUnreadHarness projectId="proj-a" />);
+    await waitFor(() => {
+      expect(mockFetchInbox).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 50 }),
+        "proj-a",
+      );
+    });
+
+    rendered.rerender(<MailboxUnreadHarness projectId="proj-b" />);
+    await waitFor(() => {
+      expect(mockFetchInbox).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 50 }),
+        "proj-b",
+      );
+    });
+
+    await act(async () => {
+      projectBCounts.resolve(categoryUnreadResponse(4, 5, 5));
+      projectBInbox.resolve({
+        ...makeInboxResponse([projectBMessage], 5),
+        categoryUnreadCounts: { message: 5, recommendation: 5, artifact: 5 },
+      });
+      await Promise.all([projectBCounts.promise, projectBInbox.promise]);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-harness-message-count")).toHaveTextContent("5");
+      expect(screen.getByText("Project B completion")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      projectACounts.resolve(categoryUnreadResponse(1, 1, 1));
+      projectAInbox.resolve(makeInboxResponse([mockMessage], 1));
+      await Promise.all([projectACounts.promise, projectAInbox.promise]);
+    });
+
+    expect(screen.getByTestId("mailbox-harness-message-count")).toHaveTextContent("5");
+    expect(screen.getByText("Project B completion")).toBeInTheDocument();
+    expect(screen.queryByText(mockMessage.content)).not.toBeInTheDocument();
   });
 
   it("preserves composed inbox timestamp buckets", async () => {
@@ -502,6 +620,55 @@ describe("MailboxView", () => {
     await waitFor(() => {
       expect(mockDecideApproval).toHaveBeenCalledWith("apr-1", { decision: "deny", comment: undefined }, undefined);
     });
+  });
+
+  it("surfaces the safe server decision error on the desktop approval controls", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "secrets_access", actionSummary: "Read secret", agentId: "user", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "secrets_access", actionSummary: "Read secret", agentId: "user", createdAt: now, updatedAt: now, requester: { actorId: "user", actorType: "user", actorName: "User" }, requestedAt: now, targetAction: { category: "secrets_access", action: "read", summary: "Read secret", resourceType: "secret", resourceId: "secret" }, history: [] });
+    mockDecideApproval.mockRejectedValue(new Error("An approval request cannot be decided by its own requester"));
+    const addToast = vi.fn();
+
+    render(<MailboxView {...defaultProps} addToast={addToast} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-approve")); });
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith("An approval request cannot be decided by its own requester", "error"));
+  });
+
+  it("surfaces the safe server denial error on the mobile approval controls", async () => {
+    const now = new Date().toISOString();
+    mockUseViewportMode.mockReturnValue("mobile");
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "secrets_access", actionSummary: "Read secret", agentId: "user", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "secrets_access", actionSummary: "Read secret", agentId: "user", createdAt: now, updatedAt: now, requester: { actorId: "user", actorType: "user", actorName: "User" }, requestedAt: now, targetAction: { category: "secrets_access", action: "read", summary: "Read secret", resourceType: "secret", resourceId: "secret" }, history: [] });
+    mockDecideApproval.mockRejectedValue(new Error("An approval request cannot be decided by its own requester"));
+    const addToast = vi.fn();
+
+    render(<MailboxView {...defaultProps} addToast={addToast} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-deny")); });
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith("An approval request cannot be decided by its own requester", "error"));
+  });
+
+  it("uses the generic decision error only for unknown rejections", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "secrets_access", actionSummary: "Read secret", agentId: "agent-1", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "secrets_access", actionSummary: "Read secret", agentId: "agent-1", createdAt: now, updatedAt: now, requester: { actorId: "agent-1", actorType: "agent", actorName: "Agent" }, requestedAt: now, targetAction: { category: "secrets_access", action: "read", summary: "Read secret", resourceType: "secret", resourceId: "secret" }, history: [] });
+    mockDecideApproval.mockRejectedValue("unknown failure");
+    const addToast = vi.fn();
+
+    render(<MailboxView {...defaultProps} addToast={addToast} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.getByTestId("mailbox-approval-deny")); });
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith("Failed to submit decision", "error"));
   });
 
   it("disables decision buttons while submission is pending", async () => {
@@ -832,6 +999,30 @@ describe("MailboxView", () => {
     });
   });
 
+  it("opens markdown task links from the selected mail detail in the existing desktop tab", async () => {
+    const taskMessage: Message = {
+      ...mockMessage,
+      id: "msg-markdown-task-link",
+      content: "See [FN-1234](/?project=project-1&task=FN-1234) and [external](https://example.com).",
+    };
+    const onOpenTask = vi.fn();
+    const user = userEvent.setup();
+    mockFetchInbox.mockResolvedValue(makeInboxResponse([taskMessage], 1));
+    mockFetchConversation.mockResolvedValue([taskMessage]);
+    mockMarkMessageRead.mockResolvedValue({ ...taskMessage, read: true });
+
+    render(<MailboxView {...defaultProps} onOpenTask={onOpenTask} />);
+    await user.click(await screen.findByTestId("mailbox-item-msg-markdown-task-link"));
+
+    const detail = await screen.findByTestId("mailbox-message-body");
+    const taskLink = within(detail).getByTestId("mailbox-task-link");
+    expect(taskLink).not.toHaveAttribute("target", "_blank");
+    await user.click(taskLink);
+    expect(onOpenTask).toHaveBeenCalledTimes(1);
+    expect(onOpenTask).toHaveBeenCalledWith("FN-1234");
+    expect(within(detail).getByRole("link", { name: "external" })).toHaveAttribute("target", "_blank");
+  });
+
   it("opens task-only and planning-clarification related work from mailbox detail", async () => {
     const taskMessage: Message = {
       ...mockMessage,
@@ -863,7 +1054,7 @@ describe("MailboxView", () => {
     expect(onOpenPlanningSession).toHaveBeenCalledWith("planning-8428");
   });
 
-  it("renders an inline artifact attachment in the single-message detail path", async () => {
+  it("renders an archived artifact attachment in the single-message detail path", async () => {
     const artifactMessage: Message = {
       ...mockMessage,
       metadata: {
@@ -874,13 +1065,16 @@ describe("MailboxView", () => {
         taskId: "FN-1234",
       },
     };
-    const onOpenTask = vi.fn();
-    mockFetchInbox.mockResolvedValue(makeInboxResponse([artifactMessage], 1));
+    mockFetchInbox.mockImplementation(async (filter) => filter?.archived
+      ? makeInboxResponse([artifactMessage], 0)
+      : makeInboxResponse([], 0));
+    mockFetchOutbox.mockResolvedValue(makeOutboxResponse([]));
+    mockFetchAllAgentMailbox.mockResolvedValue({ messages: [], total: 0, unreadCount: 0 });
     mockFetchConversation.mockResolvedValue([artifactMessage]);
-    mockMarkMessageRead.mockResolvedValue({ ...artifactMessage, read: true });
 
-    render(<MailboxView {...defaultProps} projectId="project-a" onOpenTask={onOpenTask} />);
+    render(<MailboxView {...defaultProps} projectId="project-a" />);
 
+    fireEvent.click(await screen.findByTestId("mailbox-tab-archived"));
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
     });
@@ -892,17 +1086,11 @@ describe("MailboxView", () => {
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-message-body")).toHaveTextContent(artifactMessage.content);
       expect(screen.getByTestId("mailbox-artifact-attachment")).toBeInTheDocument();
-      expect(screen.getByRole("img", { name: "Mailbox Screenshot" })).toHaveAttribute("src", "/api/artifacts/art-mailbox-image/media?projectId=project-a&fn_token=daemon-token");
-      expect(screen.getByRole("link", { name: "Open artifact: Mailbox Screenshot" })).toHaveAttribute("href", "/api/artifacts/art-mailbox-image/media?projectId=project-a&fn_token=daemon-token");
-      expect(screen.getByTestId("mailbox-view-task")).toBeInTheDocument();
-      expect(screen.queryByTestId("mailbox-artifact-view-task")).toBeNull();
+      expect(screen.getByRole("img", { name: "Mailbox Screenshot" })).toHaveAttribute("src", "blob:secure-preview");
     });
-
-    fireEvent.click(screen.getByTestId("mailbox-view-task"));
-    expect(onOpenTask).toHaveBeenCalledWith("FN-1234");
   });
 
-  it("does not render a View task affordance for artifact messages without task metadata", async () => {
+  it("does not render a View task affordance for archived artifact messages without task metadata", async () => {
     const artifactMessage: Message = {
       ...mockMessage,
       metadata: {
@@ -911,12 +1099,16 @@ describe("MailboxView", () => {
         title: "Mailbox Screenshot",
       },
     };
-    mockFetchInbox.mockResolvedValue(makeInboxResponse([artifactMessage], 1));
+    mockFetchInbox.mockImplementation(async (filter) => filter?.archived
+      ? makeInboxResponse([artifactMessage], 0)
+      : makeInboxResponse([], 0));
+    mockFetchOutbox.mockResolvedValue(makeOutboxResponse([]));
+    mockFetchAllAgentMailbox.mockResolvedValue({ messages: [], total: 0, unreadCount: 0 });
     mockFetchConversation.mockResolvedValue([artifactMessage]);
-    mockMarkMessageRead.mockResolvedValue({ ...artifactMessage, read: true });
 
     render(<MailboxView {...defaultProps} onOpenTask={vi.fn()} />);
 
+    fireEvent.click(await screen.findByTestId("mailbox-tab-archived"));
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
     });
@@ -989,7 +1181,7 @@ describe("MailboxView", () => {
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-conversation")).toBeInTheDocument();
       expect(screen.getByTestId("mailbox-artifact-attachment")).toBeInTheDocument();
-      expect(screen.getByRole("img", { name: "Thread Image" })).toHaveAttribute("src", "/api/artifacts/art-thread-image/media?fn_token=daemon-token");
+      expect(screen.getByRole("img", { name: "Thread Image" })).toHaveAttribute("src", "blob:secure-preview");
       expect(screen.getByTestId("mailbox-view-task")).toBeInTheDocument();
       expect(screen.queryByTestId("mailbox-artifact-view-task")).toBeNull();
     });
@@ -1116,7 +1308,10 @@ describe("MailboxView", () => {
 
   it.each([
     ["the in-pane Back button", async () => fireEvent.click(screen.getByTestId("mailbox-back-to-list"))],
-    ["delete", async () => fireEvent.click(screen.getByTestId("mailbox-delete"))],
+    ["delete", async () => {
+      fireEvent.click(screen.getByTestId("mailbox-delete"));
+      fireEvent.click(screen.getByTestId("mailbox-delete-confirm"));
+    }],
     ["an agent tab switch", async () => fireEvent.click(screen.getByTestId("mailbox-tab-outbox"))],
   ])("consumes the message entry before %s", async (_label, close) => {
     mockUseViewportMode.mockReturnValue("mobile");
@@ -1168,7 +1363,7 @@ describe("MailboxView", () => {
       await screen.findByTestId("mailbox-message-detail");
       fireEvent.click(screen.getByTestId("mailbox-reply"));
       await screen.findByTestId("message-composer");
-      fireEvent.click(screen.getByTestId("message-composer-cancel"));
+      fireEvent.click(screen.getByTestId("mailbox-back-to-list"));
       await waitFor(() => expect(screen.queryByTestId("message-composer")).toBeNull());
 
       act(() => {
@@ -1472,7 +1667,11 @@ describe("MailboxView", () => {
     await act(async () => {
       fireEvent.click(deleteButton);
     });
+    expect(mockDeleteMessage).not.toHaveBeenCalled();
 
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("mailbox-delete-confirm"));
+    });
     await waitFor(() => {
       expect(mockDeleteMessage).toHaveBeenCalledWith("msg-001", undefined);
     });
@@ -1901,8 +2100,10 @@ describe("MailboxView", () => {
         fireEvent.click(screen.getByTestId("mailbox-tab-agents"));
       });
 
+      // Compose exists once, in the owning header; the Agents tab no longer paints its own copy.
+      expect(screen.queryByTestId("mailbox-compose-btn")).toBeNull();
       await act(async () => {
-        fireEvent.click(screen.getByTestId("mailbox-compose-btn"));
+        fireEvent.click(screen.getByTestId("mailbox-header-compose"));
       });
 
       await waitFor(() => {
@@ -1964,15 +2165,19 @@ describe("MailboxView", () => {
         expect(mockFetchAgentMailbox).toHaveBeenCalledWith("agent-001", undefined);
       });
 
-      // Sub-tabs should be visible
+      // Sub-tabs should be visible, and they are scope controls owned by the header.
       await waitFor(() => {
         expect(screen.getByTestId("mailbox-agent-subtabs")).toBeDefined();
         expect(screen.getByTestId("mailbox-agent-subtab-inbox")).toBeDefined();
         expect(screen.getByTestId("mailbox-agent-subtab-outbox")).toBeDefined();
       });
 
-      const agentsComposeButton = screen.getByTestId("mailbox-compose-btn");
-      expect(agentsComposeButton).toHaveClass("btn", "btn-sm", "btn-secondary", "mailbox-compose-btn");
+      const header = document.querySelector(".view-header");
+      expect(header?.contains(screen.getByTestId("mailbox-agent-subtabs"))).toBe(true);
+      expect(header?.contains(screen.getByTestId("mailbox-agent-select"))).toBe(true);
+      // One compose control only, and it is the shared header action.
+      expect(screen.queryByTestId("mailbox-compose-btn")).toBeNull();
+      expect(header?.contains(screen.getByTestId("mailbox-header-compose"))).toBe(true);
     });
 
     it("shows agent sender names in agent inbox rows", async () => {
@@ -2291,38 +2496,24 @@ describe("MailboxView", () => {
       const afterRight = Number(handle.getAttribute("aria-valuenow"));
       expect(afterRight).toBeGreaterThanOrEqual(afterLeft);
 
-      // FNXC:Mailbox 2026-06-22-18:05: Home clamps to MAILBOX_SIDEBAR_MIN_WIDTH (locked at 180); End clamps to the container max ratio.
       fireEvent.keyDown(handle, { key: "Home" });
-      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(180);
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(220);
 
       fireEvent.keyDown(handle, { key: "End" });
-      expect(Number(handle.getAttribute("aria-valuenow"))).toBeGreaterThanOrEqual(180);
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(560);
     });
 
-    it("persists and restores scoped mailbox sidebar width", async () => {
+    it("uses the shared standalone sidebar authority outside the app provider", async () => {
       mockUseViewportMode.mockReturnValue("desktop");
       mockFetchInbox.mockResolvedValue(makeInboxResponse([mockMessage], 1));
 
-      const projectId = "proj-persist";
-      const storageKey = `kb:${projectId}:kb-dashboard-mailbox-sidebar-width`;
-      window.localStorage.setItem(storageKey, "360");
-
-      const { unmount } = render(<MailboxView {...defaultProps} projectId={projectId} />);
+      render(<MailboxView {...defaultProps} projectId="proj-persist" />);
 
       const handle = await screen.findByTestId("mailbox-split-resize-handle");
-      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(360);
-
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(300);
       fireEvent.keyDown(handle, { key: "ArrowRight" });
-      await waitFor(() => {
-        const savedWidth = Number(window.localStorage.getItem(storageKey));
-        expect(savedWidth).toBeGreaterThan(360);
-      });
-
-      unmount();
-      render(<MailboxView {...defaultProps} projectId={projectId} />);
-      const remountedHandle = await screen.findByTestId("mailbox-split-resize-handle");
-      const persistedWidth = Number(window.localStorage.getItem(storageKey));
-      expect(Number(remountedHandle.getAttribute("aria-valuenow"))).toBe(Math.round(persistedWidth));
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(316);
+      expect(window.localStorage.getItem("kb:proj-persist:kb-dashboard-view-sidebar-width")).toBeNull();
     });
   });
 
@@ -2360,6 +2551,28 @@ describe("MailboxView", () => {
 
       // The runtime class, not a height or pointer media proxy, is the only FN-8407 gate.
       expect(css).not.toMatch(/@media\s*\([^)]*(?:max-height:\s*480px|pointer:\s*coarse)[^)]*\)\s*\{[\s\S]*?\.mailbox-view--mobile/);
+    });
+
+    it("keeps mailbox tab icons and badges from shrinking in the mobile flex track", async () => {
+      mockUseViewportMode.mockReturnValue("mobile");
+      mockFetchInbox.mockResolvedValue(makeInboxResponse([], 16));
+      mockFetchApprovals.mockResolvedValue({ requests: [], total: 0, pendingCount: 16 });
+
+      const style = document.createElement("style");
+      style.textContent = loadAllAppCss();
+      document.head.append(style);
+      try {
+        render(<MailboxView {...defaultProps} />);
+        fireEvent.click(screen.getByTestId("mailbox-tab-approvals"));
+        await screen.findByTestId("mailbox-approvals-pending-badge");
+
+        for (const tab of ["inbox", "outbox", "agents", "approvals"]) {
+          expect(getComputedStyle(screen.getByTestId(`mailbox-tab-${tab}`).querySelector("svg")!).flexShrink).toBe("0");
+        }
+        expect(getComputedStyle(screen.getByTestId("mailbox-approvals-pending-badge")).flexShrink).toBe("0");
+      } finally {
+        style.remove();
+      }
     });
 
     it("keeps system and agent message actions on the mobile detail row", async () => {

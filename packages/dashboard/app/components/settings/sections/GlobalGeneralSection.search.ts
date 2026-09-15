@@ -33,13 +33,52 @@ export const globalGeneralSearchEntries: SettingsSearchEntry[] = [
   },
   {
     sectionId: "global-general",
+    key: "quickAddSubmitOnEnter",
+    labelKey: "settings.globalGeneral.quickAddSubmitOnEnter",
+    labelFallback: " Press Enter to save a task in Quick Add ",
+    helpKey: "settings.globalGeneral.quickAddSubmitOnEnterHint",
+    helpFallback: " Default: enabled. When disabled, Enter inserts a newline and Cmd/Ctrl+Enter saves. ",
+    keywords: ["enter", "keyboard", "quick add", "newline", "submit"],
+  },
+  {
+    sectionId: "global-general",
+    key: "chatSubmitOnEnter",
+    labelKey: "settings.globalGeneral.chatSubmitOnEnter",
+    labelFallback: " Enter key behavior in conversations ",
+    helpKey: "settings.globalGeneral.chatSubmitOnEnterHint",
+    helpFallback:
+      " Default: automatic — Enter inserts a newline on touch devices with an on-screen keyboard, and sends on desktop. Shift+Enter never sends, even with Cmd/Ctrl held; it inserts a newline except in Chat while an autocomplete menu is open, where the files/tasks, agents and skills menus consume it instead. Cmd/Ctrl+Enter without Shift sends regardless of this setting and of the device. While an autocomplete menu is open it takes priority and consumes both Enter and Cmd/Ctrl+Enter; press Escape to close it. In the task chat, an in-progress IME composition takes priority over all of these. The Send button stays available whenever the draft is not empty. ",
+    keywords: ["enter", "newline", "mobile", "keyboard", "chat", "send", "shift"],
+  },
+  {
+    sectionId: "global-general",
     key: "persistAgentToolOutput",
     labelKey: "settings.globalGeneral.saveToolOutputInAgentLogs",
     labelFallback: " Save tool output in agent logs ",
     helpKey: "settings.globalGeneral.whenDisabledToolRowsAreStillLoggedBut",
     helpFallback:
-      " When disabled, tool rows are still logged but detailed tool payloads are omitted. Very large tool payloads may still be clipped even when this stays enabled. Default: disabled. ",
-    keywords: ["persist", "transcript", "disk usage"],
+      " When disabled, tool rows are still logged but detailed tool payloads are omitted. Very large tool payloads may still be clipped even when this stays enabled. Default: enabled. ",
+    keywords: ["persist", "transcript", "disk usage", "tool arguments", "tool results"],
+  },
+  {
+    sectionId: "global-general",
+    key: "agentToolOutputMaxChars",
+    labelKey: "settings.globalGeneral.agentToolOutputLimit",
+    labelFallback: " Agent tool-output limit ",
+    helpKey: "settings.globalGeneral.agentToolOutputLimitHint",
+    helpFallback:
+      " Maximum characters returned from each engine-injected tool result. When unset, inherits the 16,000-character engine default. Leave empty to use the default. ",
+    keywords: ["tokens", "context", "truncate", "tool output", "agent"],
+  },
+  {
+    sectionId: "global-general",
+    key: "agentToolOutputMaxCharsNoLimit",
+    labelKey: "settings.globalGeneral.noLimitOnAgentToolOutput",
+    labelFallback: " No limit on agent tool output ",
+    helpKey: "settings.globalGeneral.noLimitOnAgentToolOutputHint",
+    helpFallback:
+      " Disable the shared tool-output clamp. A single tool result can consume the agent context window. Default: disabled; when unset, the budget inherits the 16,000-character engine default. ",
+    keywords: ["unlimited", "tokens", "context", "truncate", "tool output"],
   },
   {
     sectionId: "global-general",
@@ -76,12 +115,20 @@ export const globalGeneralSearchEntries: SettingsSearchEntry[] = [
   },
   {
     sectionId: "global-general",
-    key: "autoReloadOnVersionChange",
-    labelKey: "settings.globalGeneral.autoReloadDashboardOnVersionChange",
-    labelFallback: " Auto-reload dashboard on version change ",
-    helpKey: "settings.globalGeneral.whenEnabledDefaultTheDashboardAutomaticallyReloadsWhen",
-    helpFallback:
-      " When enabled (default), the dashboard automatically reloads when it detects a new build version — either from server rebuilds or service worker updates. Disable this to stay on the current version until you manually refresh. Default: enabled. ",
-    keywords: ["refresh", "service worker", "hot reload"],
+    key: "autoUpdateEnabled",
+    labelKey: "settings.globalGeneral.autoUpdateEnabled",
+    labelFallback: " Automatically install updates ",
+    helpKey: "settings.globalGeneral.autoUpdateEnabledHelp",
+    helpFallback: " Installs updates from the selected release channel during the background update check. Unset: disabled. ",
+    keywords: ["auto update", "automatic update", "install", "unattended"],
+  },
+  {
+    sectionId: "global-general",
+    key: "autoRestartAfterUpdate",
+    labelKey: "settings.globalGeneral.autoRestartAfterUpdate",
+    labelFallback: " Automatically restart after an update ",
+    helpKey: "settings.globalGeneral.autoRestartAfterUpdateHelp",
+    helpFallback: " After a dashboard update installs, requests a supervised restart. Unset: disabled. ",
+    keywords: ["auto update", "automatic restart", "restart", "supervisor"],
   },
 ];

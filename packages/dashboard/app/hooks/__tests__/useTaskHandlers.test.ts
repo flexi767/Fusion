@@ -26,7 +26,6 @@ function createOptions(overrides: Partial<Parameters<typeof useTaskHandlers>[0]>
     ingestCreatedTasks: vi.fn(),
     onPlanningTaskCreated: vi.fn(),
     onPlanningTasksCreated: vi.fn(),
-    onSubtaskTasksCreated: vi.fn(),
     addToast: vi.fn(),
     ...overrides,
   };
@@ -57,7 +56,7 @@ describe("useTaskHandlers", () => {
   it("handleBoardQuickCreate forwards an explicit workflowId without forcing a column", async () => {
     const options = createOptions();
     const { result } = renderHook(() => useTaskHandlers(options));
-    const input: TaskCreateInput = { description: "Do work", workflowId: "builtin:coding-ideas" };
+    const input: TaskCreateInput = { description: "Do work", workflowId: "builtin:coding-ideas-v2" };
 
     await act(async () => {
       await result.current.handleBoardQuickCreate(input);
@@ -65,7 +64,7 @@ describe("useTaskHandlers", () => {
 
     expect(options.createTask).toHaveBeenCalledWith({
       description: "Do work",
-      workflowId: "builtin:coding-ideas",
+      workflowId: "builtin:coding-ideas-v2",
       source: { sourceType: "dashboard_ui" },
     });
   });
@@ -105,18 +104,6 @@ describe("useTaskHandlers", () => {
 
     expect(options.ingestCreatedTasks).toHaveBeenCalledWith([CREATED_TASK]);
     expect(options.onPlanningTasksCreated).toHaveBeenCalledWith([CREATED_TASK], options.addToast);
-  });
-
-  it("handleSubtaskTasksCreated delegates with addToast", () => {
-    const options = createOptions();
-    const { result } = renderHook(() => useTaskHandlers(options));
-
-    act(() => {
-      result.current.handleSubtaskTasksCreated([CREATED_TASK]);
-    });
-
-    expect(options.ingestCreatedTasks).toHaveBeenCalledWith([CREATED_TASK]);
-    expect(options.onSubtaskTasksCreated).toHaveBeenCalledWith([CREATED_TASK], options.addToast);
   });
 
   it("handleGitHubImport shows success toast with task ID", () => {

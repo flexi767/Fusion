@@ -9,17 +9,28 @@ vi.mock("../pi.js", () => ({
   }),
 }));
 
-vi.mock("../agent-session-helpers.js", () => ({
+vi.mock("../agents/agent-session-helpers.js", () => ({
   createResolvedAgentSession: vi.fn(),
   extractRuntimeHint: vi.fn().mockReturnValue(undefined),
   resolveValidatorSessionModel: vi.fn().mockReturnValue({
     provider: "mock-provider",
     modelId: "mock-model",
   }),
+  // FN-7794 fallback-swap resolver called unconditionally on the validator hot path; mirror
+  // production's validatorFallback -> fallback -> validator -> task precedence (see executor-test-helpers.ts).
+  resolveValidatorFallbackThinkingLevel: vi.fn(
+    (taskThinkingLevel: string | undefined, settings: Record<string, unknown> | undefined) =>
+      (typeof settings?.validatorFallbackThinkingLevel === "string" ? settings.validatorFallbackThinkingLevel : undefined)
+      ?? (typeof settings?.fallbackThinkingLevel === "string" ? settings.fallbackThinkingLevel : undefined)
+      ?? (typeof settings?.validatorThinkingLevel === "string" ? settings.validatorThinkingLevel : undefined)
+      ?? taskThinkingLevel
+      ?? (typeof settings?.defaultThinkingLevelOverride === "string" ? settings.defaultThinkingLevelOverride : undefined)
+      ?? (typeof settings?.defaultThinkingLevel === "string" ? settings.defaultThinkingLevel : undefined),
+  ),
 }));
 
-import { reviewStep } from "../reviewer.js";
-import { createResolvedAgentSession } from "../agent-session-helpers.js";
+import { reviewStep } from "../execution/reviewer.js";
+import { createResolvedAgentSession } from "../agents/agent-session-helpers.js";
 
 const mockedCreateResolvedAgentSession = vi.mocked(createResolvedAgentSession);
 
@@ -77,7 +88,7 @@ describe("FN-4068 baseline — plan review UNAVAILABLE", () => {
 
   it("retries on the same model with stricter verdict instruction when fallback model is not configured", async () => {
     const first = buildSession("No parseable verdict here.");
-    const second = buildSession("### Verdict: APPROVE\n### Summary\nRecovered.");
+    const second = buildSession("### Verdict: APPROVE\n### Summary\nRecovered.\n{\"verdict\":\"APPROVE\",\"notes\":\"Recovered with structured output.\"}");
     mockedCreateResolvedAgentSession
       .mockResolvedValueOnce(first)
       .mockResolvedValueOnce(second);
@@ -96,7 +107,7 @@ describe("FN-4068 baseline — plan review UNAVAILABLE", () => {
     expect(result.verdict).toBe("APPROVE");
     expect(mockedCreateResolvedAgentSession).toHaveBeenCalledTimes(2);
     expect(second.session.prompt).toHaveBeenCalledWith(
-      expect.stringContaining('Respond with exactly one of: APPROVE | REVISE | RETHINK on a line starting with "Verdict:"'),
+      expect.stringContaining("End your response with exactly one trailing JSON object"),
     );
   });
 });

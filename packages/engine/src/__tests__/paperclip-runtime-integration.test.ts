@@ -1,15 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { AgentRuntime } from "../agent-runtime.js";
-import { resolveRuntime } from "../runtime-resolution.js";
-import { createResolvedAgentSession } from "../agent-session-helpers.js";
-import type { PluginRunner } from "../plugin-runner.js";
+import type { AgentRuntime } from "../agents/agent-runtime.js";
+import { resolveRuntime } from "../execution/runtime-resolution.js";
+import { createResolvedAgentSession } from "../agents/agent-session-helpers.js";
+import type { PluginRunner } from "../plugins/plugin-runner.js";
 import type { PluginRuntimeRegistration } from "@fusion/core";
 
 const mockCreateFnAgent = vi.hoisted(() => vi.fn());
 
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn(() => ({
-    log: vi.fn(),
+    log: vi.fn(), debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   })),

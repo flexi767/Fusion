@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import type { AgentCapability, PlanningQuestion, TaskStore } from "@fusion/core";
+import type { AgentCapability, PlanningQuestion, TaskStore, ThinkingLevel } from "@fusion/core";
 import { resolvePrompt, type PromptOverrideMap } from "@fusion/core";
 import { buildSessionSkillContextSync, createFnAgent as engineCreateFnAgent, resolveMcpServersForStore } from "@fusion/engine";
 import { SessionEventBuffer, type SessionBufferedEvent } from "./sse-buffer.js";
@@ -9,7 +9,7 @@ export interface AgentOnboardingSummary {
   name: string;
   role: AgentCapability | "custom";
   instructionsText: string;
-  thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel: ThinkingLevel;
   maxTurns: number;
   title?: string;
   icon?: string;
@@ -42,7 +42,7 @@ export interface ExistingAgentOnboardingConfig {
   reportsTo?: string;
   skills?: string[];
   model?: string;
-  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel?: ThinkingLevel;
   maxTurns?: number;
   runtimeHint?: string;
   heartbeatIntervalMs?: number;
@@ -99,7 +99,7 @@ When ready, return a final summary JSON in this exact format:
 
 Rules:
 - role must be one of triage|executor|reviewer|merger|scheduler|engineer|custom
-- thinkingLevel must be off|minimal|low|medium|high
+- thinkingLevel must be one of off|minimal|low|medium|high|xhigh|max; model-bound controls may narrow this list from registry metadata
 - maxTurns must be a positive integer
 - Use instructionsText for starter operating guidance/playbook content; do not create a separate playbook field
 - Prefer structuring instructionsText with these markdown sections when drafting: ## Description, ## Expertise, ## Priorities, ## Boundaries, ## Communication, ## Collaboration & Escalation
@@ -537,7 +537,30 @@ export async function respondToAgentOnboarding(
 ): Promise<AgentOnboardingRespondResult> {
   const session = sessions.get(sessionId);
   if (!session) throw new SessionNotFoundError(`Agent onboarding session ${sessionId} not found or expired`);
-  if (!session.currentQuestion) throw new InvalidSessionStateError("No active question in session");
+  if (!session.currentQuestion) {
+    /*
+    FNXC:PlanningQuestionRegeneration 2026-07-23-22:20:
+    A completed onboarding (summary present) still rejects late submissions, but a live session
+    with no active question (e.g. cleared by a failed generation) must not dead-end with
+    "No active question in session". Mirror Planning Mode: reprompt the agent to continue and
+    ask the next onboarding question, carrying the submitted input along as context. No history
+    entry is recorded because there is no question to pair the response with.
+    */
+    if (session.summary) throw new InvalidSessionStateError("No active question in session");
+    const operatorInput = Object.entries(responses)
+      .filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`);
+    await continueConversation(session, [
+      "The onboarding interview currently has no active question; continue instead of treating this as an error.",
+      "Ask the next best onboarding question, following the established response contract.",
+      ...(operatorInput.length
+        ? ["The operator submitted this input while no question was active; honor it as context:", operatorInput.join("\n")]
+        : []),
+    ].join("\n\n"));
+    if (session.summary) return { type: "complete", data: session.summary };
+    if (session.currentQuestion) return { type: "question", data: session.currentQuestion };
+    throw new InvalidSessionStateError("AI agent did not return a question or summary");
+  }
   const answeredQuestion = session.currentQuestion;
   session.history.push({ question: answeredQuestion, response: responses });
   /*

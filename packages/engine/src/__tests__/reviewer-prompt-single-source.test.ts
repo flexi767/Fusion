@@ -22,12 +22,12 @@ vi.mock("../pi.js", () => ({
   }),
 }));
 
-import { reviewStep } from "../reviewer.js";
+import { reviewStep } from "../execution/reviewer.js";
 import { createFnAgent } from "../pi.js";
 
 const mockedCreateFnAgent = vi.mocked(createFnAgent);
 
-function createMockSession(reviewText = "### Verdict: APPROVE\n### Summary\nLooks good.") {
+function createMockSession(reviewText = "### Verdict: APPROVE\n### Summary\nLooks good.\n{\"verdict\":\"APPROVE\",\"notes\":\"Reviewed the prompt source.\"}") {
   return {
     session: {
       prompt: vi.fn().mockResolvedValue(undefined),
@@ -75,7 +75,7 @@ beforeEach(() => {
 describe("reviewer prompt single source", () => {
   it("does not reintroduce an engine reviewer policy constant", () => {
     const reviewerSource = readFileSync(
-      resolve(fileURLToPath(new URL("..", import.meta.url)), "reviewer.ts"),
+      resolve(fileURLToPath(new URL("..", import.meta.url)), "execution/reviewer.ts"),
       "utf8",
     );
 

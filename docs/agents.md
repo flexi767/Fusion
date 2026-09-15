@@ -37,16 +37,27 @@ fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>] [--
 - On a direct-message reply, agents must pass `reply_to_message_id` and either set `to_id` to the exact `[from: type:id]` value reported by `fn_read_messages` (including `cli`) or omit it to use the safe parent-sender default. Parent-derived routing is allowed only when the parent was addressed to the replying agent; an explicit `to_id` remains available for intentional forwarding.
 - The default conversation ID is `cli-chat:cli:<agent-id>`; use `--conversation-id <id>` to name or share a different mailbox thread.
 - One-shot replies have a deadline independent of `--poll-ms`; polling sleeps are capped at the remaining deadline. The interactive REPL maintains one pending deadline per outbound message, reports and clears an unanswered request, then continues to receive later replies.
-- Dashboard-created agent chat sessions request the target agent's declared `metadata.skills` plus enabled plugin-contributed skills, forwarding both requested skill names and resolved plugin body directories so skills such as `ce-debug` are available in chat when the contributing plugin is enabled for the requesting project. Model-only QuickChat sessions request enabled plugin skills, and room responder sessions request the responder agent's skills.
-- Agent-acting session lanes share the same skill-injection contract as executor sessions: executor, merger, triage, reviewer, heartbeat, step-session, dashboard chat/room responders, CLI agent execution, planning, mission interview, milestone/slice interview, agent-onboarding interview, workflow design, memory dreams/insight extraction, and scheduled cron automation all request agent/fallback skills plus enabled plugin-contributed skills when a plugin runner is available. Utility-only lanes that only summarize/extract/generate JSON (title/PR summaries, memory compaction, subtask breakdown, text refinement, agent generation, PR metadata generation, evaluator/research synthesis, and similar one-shot helpers) intentionally stay exempt to avoid loading skills where no agent-style tool loop can use them.
-- In dashboard model-loop chat (main chat, QuickChat, and room responders), typing `/skill:{name}` requests that skill for the current AI session and strips the slash token from the prompt sent to the model. Slash and catalog-style names such as `/skill:review/pr`, `/skill:review/pr/SKILL.md`, and `source::skills/review/pr/SKILL.md` resolve to the matching discovered bare skill token across chat and agent session lanes. The requested skill is still subject to the normal enabled/disabled execution-skill filters; CLI-agent-backed PTY chat keeps raw terminal input semantics and does not interpret this command.
-- Dashboard chat and planning sessions with a scoped task store expose `fn_task_document_write`, `fn_task_document_read`, and `fn_task_logs_read`; because neither lane has an ambient task, each tool requires an explicit `task_id`. `fn_task_logs_read` pages the persisted full agent log for failure analysis.
+- Enabling a skill in project settings makes it automatically available to **all** agent sessions, including default agents with no `metadata.skills`; project `+`/`-` patterns remain the sole enablement authority. Enabled plugin skills and their body directories follow the same contract.
+- `metadata.skills` is an additive forced-reading list, not an allow-list: resolved forced skills are required reading before work begins while every other enabled skill remains available on demand. A forced skill that is disabled by `-` settings or cannot be discovered is diagnosed rather than silently re-enabled or named in the prompt. Heartbeats receive their waking agent's forced skills and all enabled project/plugin skills, but have no `fusion` role fallback.
+- In dashboard model-loop chat (main chat, QuickChat, and room responders), typing `/skill:{name}` ensures that skill is present for the current AI session and strips the slash token from the prompt. Slash and catalog-style names resolve to the matching discovered skill token and remain subject to project enable/disable settings; CLI-agent-backed PTY chat keeps raw terminal input semantics.
+- Dashboard chat and planning sessions with a scoped task store expose `fn_task_document_write`, `fn_task_document_read`, and `fn_task_logs_read`; because neither lane has an ambient task, each tool requires an explicit `task_id`. Document writers may pass `expected_revision` and/or `expected_content_hash` after a read for safe cross-task CAS publication; stale writes return typed conflict state and are never auto-retried. `fn_task_logs_read` previews tool detail per row by default; pass `detail: "full"` to lift that row preview while its whole response remains bounded.
+- Direct dashboard model-loop chat additionally exposes the read-only `fn_chat_conversation_read` and `fn_chat_conversation_search` tools. Both require an explicit `conversation_id` and refuse unknown or cross-project sessions with the same non-disclosing error. Reads return at most 100 messages, truncate each message at 1,500 characters, and cap the response at 12,000 characters; searches return at most 25 matches with 200-character excerpts from a scan of the latest 400 messages. These tools are not registered for Rooms, explicitly mentioned-agent responders, planning, or CLI-agent-backed chat.
 - Dashboard chat and room responders share a safe coordination/productivity toolset across pi and Grok CLI runtimes: board reads, task creation, delegation, agent listing/configuration, web fetch, and goal/memory/research retrieval. Destructive agent-lifecycle tools and memory append remain excluded because chat has no action-gate context.
 - Agent workflow-routing tools follow an intent boundary: agents may select or change a task workflow only when the user explicitly requested that workflow or when the agent created the task. Executors must not call `fn_workflow_select` to reroute the task they are executing unless the task instructions or a user steering comment explicitly asks for the workflow change. Lanes without an ambient task, including dashboard chat/planning and published/pi extension calls outside a task, must pass an explicit `task_id`; task-bound executor paths may default to the current task.
 - Executor, heartbeat, and dashboard chat sessions expose artifact registry tools so agents can publish and inspect multi-type deliverables without relying on the dashboard gallery. Planning sessions intentionally exclude artifact tools until they can thread the existing `MessageStore` dependency.
-- Permanent/custom heartbeat agents and the published/pi extension receive the broad coordination and work-discovery tool surface instead of a narrowly curated subset: read-only task discovery (`fn_task_list`, `fn_task_show`, `fn_task_search`) for work discovery and duplicate avoidance, workflow discovery and authoring (`fn_workflow_list`, `fn_workflow_get`, `fn_workflow_validate`, `fn_workflow_create`, `fn_workflow_update`, `fn_workflow_delete`, `fn_workflow_settings`, `fn_trait_list`), governed research (`fn_research_run`, `fn_research_list`, `fn_research_get`, `fn_research_cancel`), structured clarification (`fn_ask_question`), artifact, memory, messaging, goal, evaluation, identity, and delegation tools. Task-scoped heartbeat sessions also expose current-task workflow selection and promotion (`fn_workflow_select`, `fn_task_promote`); no-task heartbeats omit those because they have no ambient task, while no-task extension/chat/planning lanes expose `fn_workflow_select` but require explicit `task_id`. Workflow creation, updates, settings writes, deletion, and selection remain permission-gated task/agent mutations even when the tools are exposed in the lane. Prompt-injectable lanes strip workflow approval-bypass flags during `fn_workflow_create`/`fn_workflow_update`; executor-owner paths are the only authoring path that may preserve those flags. Executor-only worktree/workspace tools such as `fn_run_verification` and `fn_acquire_repo_worktree` remain out of the ambient heartbeat lane until that lane owns the required worktree/workspace context. The task read tools are store-backed, text-only, and action-gate-recognized as read-only; dangerous actions are controlled at invocation time by each agent's `AgentPermissionPolicy` through the action gate (allow / require approval / block), not by withholding governed tools from the session.
+- Permanent/custom heartbeat agents and the published/pi extension receive the broad coordination and work-discovery tool surface instead of a narrowly curated subset: read-only task discovery (`fn_task_list`, `fn_task_show`, `fn_task_search`) for work discovery and duplicate avoidance, workflow discovery and authoring (`fn_workflow_list`, `fn_workflow_get`, `fn_workflow_validate`, `fn_workflow_create`, `fn_workflow_update`, `fn_workflow_delete`, `fn_workflow_settings`, `fn_trait_list`), governed research (`fn_research_run`, `fn_research_list`, `fn_research_get`, `fn_research_cancel`), structured clarification (`fn_ask_question`), artifact, memory, messaging, goal, evaluation, identity, and delegation tools. Task-scoped heartbeat sessions also expose current-task workflow selection and promotion (`fn_workflow_select`, `fn_task_promote`); no-task heartbeats omit those because they have no ambient task, while no-task extension/chat/planning lanes expose `fn_workflow_select` but require explicit `task_id`. Workflow creation, updates, settings writes, deletion, and selection remain permission-gated task/agent mutations even when the tools are exposed in the lane. Prompt-injectable lanes strip workflow approval-bypass flags during `fn_workflow_create`/`fn_workflow_update`; executor-owner paths are the only authoring path that may preserve those flags. Executor-only worktree and verification tools such as `fn_run_verification` remain out of the ambient heartbeat lane until that lane owns the required task context. The task read tools are store-backed, text-only, and action-gate-recognized as read-only; dangerous actions are controlled at invocation time by each agent's `AgentPermissionPolicy` through the action gate (allow / require approval / block), not by withholding governed tools from the session.
 - `agent.taskId` is an active-execution linkage, not durable ownership. It may legitimately point at a `todo`/`triage` task only while the agent has live run or executor-active proof; task-move sync and self-healing clear stale parked, terminal, or unresolved links otherwise. `fn_list_agents` and `fn_agent_show` therefore include column context in the human-readable `Current Task` line, such as `(triage)`, `(in-progress)`, `(not active — done)`, or `(unresolved)`, so coordinators can distinguish transient planning ownership from drift.
 - `fn_agent_show` prints `Last Error`, `Pause Reason`, and compact `Error Recovery` counter details when present. `fn_list_agents` prints the same diagnostics only for agents currently in `error` or `paused`, keeping healthy rows compact while making durable-agent recovery state inspectable without direct DB/log access.
+
+### Tool output budget
+
+Every engine-injected tool result has a **16,000-character** budget across the concatenated `text` values of all of its text content blocks. This is a per-result total, not a per-block limit; non-text blocks, `details`, and error status remain intact.
+
+When a result overflows, Fusion reserves the canonical marker (`[Tool output truncated to fit the context budget; narrow your query or use limit/offset for more.]`) inside that budget. Text is allocated deterministically in document order: complete earlier text blocks are retained while room remains, the first block that no longer fits receives the retained prefix and marker, and later text blocks become empty strings. Results already ending in that exact marker are not marked again, making the clamp idempotent; pre-existing markers from other tool-specific clamps remain ordinary counted text.
+
+Operators configure this shared budget with the global or project `agentToolOutputMaxChars` setting. An unset, `null`, or invalid value uses the 16,000-character default; a positive integer sets a custom cap; and the explicit `0` sentinel means **no limit**, so Fusion skips this shared clamp entirely. No limit can let one tool result consume the agent context window; it does not disable existing tool-local clamps such as task-list text, web-fetch bytes, or workflow-script output.
+
+`TOOL_OUTPUT_BUDGET_OVERRIDES` may set a named tool to a different **finite positive integer** budget, either larger or smaller, and still wins over a custom shared cap. The unlimited option exists only at the operator-setting level: overrides cannot use a sentinel, `Infinity`, zero, or negative budget. A missing override uses the resolved shared budget, and invalid overrides throw in development/test or fall back to that budget in production. Pi applies the clamp as its outermost tool wrapper, while non-pi plugin runtimes apply it once in their custom-tool wrapper.
 
 ### Artifact registry tools
 
@@ -83,6 +94,12 @@ printf "deploy report" | fn chat agent-abc123 --once --non-interactive
 
 > Replies require a running engine for the same project (for example `fn` dashboard or `fn serve`).
 
+## Mission lineage and task creation
+
+`fn_task_create` and `fn_delegate_task` use two distinct controls. A session executing a board task, including the durable Workflow Executor, implementation/retry, both workflow-step lanes, verification-fix, and spawned-child sessions, cannot create or delegate tasks. It records optional out-of-scope findings as `fn_task_done` completion recommendations, implements in-scope needs directly, and uses the honest blocked exit only for real external blockers. In an autonomous no-task heartbeat, the caller must provide approved `mission_lineage` (mission, slice, and feature); a rejection states that approved mission lineage is required, and no permission grant overrides it. In interactive/user-supervised non-execution sessions, lineage is optional and `task_agent_mutation` category rules and exact-tool overrides decide whether creation is allowed, requires approval, or is blocked.
+
+A valid active lineage can bootstrap the first task for a hand-authored `defined` feature. The feature is linked to that exact task and promoted to `triaged`; later autonomous scheduler work still requires a `triaged` or `in-progress` feature.
+
 ## Agent configuration updates from agents
 
 The `fn_agent_update` extension tool lets chat/extension callers update existing non-ephemeral agents in place instead of deleting and recreating them. It accepts `agent_id` plus any editable subset of:
@@ -103,6 +120,12 @@ The legacy `fn_agent_set_instructions` extension tool remains available for back
 - `instructions_path` — optional markdown file path; pass an explicit empty string to clear `instructionsPath`.
 
 At least one instruction field must be provided. The legacy tool uses the same direct/indirect-report authorization model for agent callers and persists changes through `AgentStore.updateAgent`, so instruction edits are captured as normal agent config revisions.
+
+### Manager evaluation tools
+
+`fn_agent_read_evaluations` lets a manager read a named direct or indirect report's rating summary, commented ratings, reflection history, latest reflection, and performance summary. `fn_agent_evaluation_followup` records a 1–5 coaching rating for that same scoped report; the report reads the rating through its existing self-improvement loop. Agent callers may not target themselves, peers, ancestors, or unrelated agents. CLI/user calls without `ctx.agentId` are privileged operator calls and may read or record a follow-up for any durable agent. The follow-up remains subject to the normal agent action policy gate.
+
+These tools complement, but do not replace, the existing self-only `fn_read_evaluations`: an agent's self-improvement cycle still reads only its own data. Use `fn_task_create` or `fn_delegate_task` to route implementation work discovered from feedback.
 
 ## Agent Field Parity Matrix
 
@@ -139,7 +162,7 @@ Every first-class editable agent field has a defined create/edit/import/template
 | `reportsTo` | `reportsTo` | — |
 | `instructionBody` | `instructionsText` | — |
 | `memory` | `memory` | — |
-| `skills` | `metadata.skills` | — |
+| `skills` | `metadata.skills` | — (additive forced skills; cannot re-enable a project `-`-disabled skill) |
 
 ## Permission Policy Presets (Permanent and Ephemeral Agents)
 
@@ -175,7 +198,7 @@ Exact tool overrides are stored as `toolRules: { [toolName]: disposition }` on e
 The engine classifies tool calls by behavior (not namespace alone):
 
 - `file_write_delete`: built-in `write` / `edit`, plus direct filesystem attach helpers like `fn_task_attach`; low-risk coordination/registration writes such as `fn_task_document_write` and `fn_artifact_register` are handled by the coordination-exempt/read-only allow-lists below rather than this category
-- `command_execution`: built-in `bash` when not classified as mutating git, plus fn tools that run bounded subprocess/worktree acquisition flows such as `fn_run_verification` and `fn_acquire_repo_worktree`
+- `command_execution`: built-in `bash` when not classified as mutating git, plus fn tools that run bounded subprocess flows such as `fn_run_verification`
 - `git_write`: mutating git shell commands run via `bash`
 - `network_api`: external/network-facing tools (for example `fn_research_run`, `fn_research_cancel`, `fn_web_fetch`, `worktrunk_install`; `fn_research_retry` is permanent-agent network-classified and remains action-gate read-only/exception behavior)
 - `task_agent_mutation`: task/agent/workflow mutation tools (for example `fn_update_agent_config`, `fn_task_pause`, `fn_spawn_agent`, `fn_task_create`, `fn_task_update`, `fn_task_promote`, `fn_task_refine`, and workflow mutators such as `fn_workflow_create`, `fn_workflow_update`, `fn_workflow_delete`, `fn_workflow_settings`, `fn_workflow_select`; action-gate-only task coordination tools like `fn_delegate_task`, `fn_task_import_github`, and `fn_task_import_github_issue` use this category in action-gate evaluation)
@@ -248,6 +271,12 @@ Separation of concerns:
 - `permissionPolicy` determines how sensitive runtime actions are gated (`allow`, `block`, `require-approval`) once the capability path is in play. `require-approval` creates an approval request with the permanent or ephemeral actor identity, pauses the associated task safely, and resumes through the existing approval lifecycle.
 - Dashboard persona presets (`packages/dashboard/app/components/agent-presets/`) are UI templates for identity/behavior and are **not** the source of truth for permission-policy enforcement.
 
+### Task wedge operator notifications
+
+When a task is terminally blocked (for example, by a merge gate, exhausted execution retries, or a completion blocker), Fusion posts a system message to the dashboard mailbox and sends a `task-wedged` notification through configured providers. Self-healing declines alert only when their proof shows no live session, no recent activity, and no intentional pause or auto-merge-off hold. Before delivery, Fusion revalidates the live row: progressing (including `reviewing`), paused, auto-merge-off, deleted, archived, and complete-lane rows do not alert. The message identifies the task, bounded reason/gate when known, and a recovery action. The active/resolved episode is persisted with the task, so it is sent once per active reason across service restarts; retrying or otherwise restoring progress clears the episode, so a later recurrence is visible again.
+
+For an unclassified generic `terminal-failed` park, Fusion first uses a small durable automatic-recovery budget rather than immediately paging an operator. While retries are owed, all failure-alert channels are withheld. Budget exhaustion produces one confirmed terminal-failure escalation; turning automatic recovery off emits a reason-tagged drain alert without discarding remaining retries, so turning it back on resumes recovery. An operator Retry starts a fresh budget; success, archive, and deletion clear it automatically. Agent-initiated retry intentionally does not mint a fresh budget. A spent budget can also expire after its age bound only when a later foreign row write proves the episode moved on.
+
 ### CLI agent permission prompts and notifications
 
 CLI-agent adapters keep their own autonomy posture and tool-permission handling separate from permanent-agent `permissionPolicy`. When an adapter reports a permission/input prompt (`PermissionRequest`, `Notification`, or a conservative approval-prompt heuristic), the CLI session moves to `waitingOnInput`; the dashboard shows the session banner, and Fusion dispatches the `cli-agent-awaiting-input` notification event through enabled ntfy/webhook providers. Repeated waiting events for the same CLI session are de-duplicated before provider delivery, while the in-app banner continues to reflect the live session state.
@@ -266,11 +295,10 @@ These fields are managed by the engine and cannot be directly edited:
 
 ### Stale Task Link Sanitization
 
-The `taskId` field is suppressed in API responses when the linked task is in a terminal state (`done` or `archived`). This prevents stale "working on" UI indicators in the Agents dashboard for agents whose task has already completed.
+The `taskId` field is suppressed in API responses when the linked task reaches its workflow's Complete column or is soft-deleted. This prevents stale "working on" UI indicators for agents whose assignment is no longer active.
 
-**Terminal task statuses:**
-- `done` — Task completed successfully
-- `archived` — Task archived
+**Terminal task state:**
+- Any column carrying the workflow `complete` trait (`done` in the built-in fallback)
 
 **Affected API endpoints:**
 - `GET /api/agents` — `taskId` is omitted from agents with terminal linked tasks
@@ -346,14 +374,13 @@ Executor precedence for task runs:
 
 If the assigned agent runtime model is missing or incomplete, Fusion continues to automatic provider/model resolution without mixing partial runtime fields into the selected pair.
 
-### Durable-agent heartbeat model precedence and unavailable-provider behavior
+### Permanent role-agent identity, chat, and heartbeat model inheritance
 
-Heartbeat sessions for durable agents resolve models with the same fresh-settings-first rule:
+For permanent role agents, the Agents page, Agent Detail, Chat session creation, direct chat, room responders, and model-less heartbeats share one identity resolution chain. Explicit session or room thinking wins, then an agent's explicit thinking, then its role lane, project default override, and global default. A complete per-agent runtime model (`runtimeConfig.model` or `modelProvider` + `modelId`) wins for agent-bound interactive sessions and heartbeats; incomplete pairs are ignored.
 
-1. Execution-lane settings fallback (`executionProvider`/`executionModelId` → `executionGlobalProvider`/`executionGlobalModelId` → project/global defaults)
-2. Agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) only when both provider and model ID are present and no execution/default pair is configured
+Built-in workflow roles select their own lanes: Planner uses planning, Reviewer uses validator, Merger uses merger, and Executor/other permanent agents use execution. Thus an unset role lane inherits `defaultProviderOverride`/`defaultModelIdOverride` before global defaults. The Agent Detail picker labels an empty stored model as **Inherit project/role default**; saving inherit leaves the agent row empty rather than materialising the selected project model.
 
-Heartbeat no longer passes a stale runtime model ahead of a saved execution lane or project default override.
+Model-less durable-agent heartbeats use the same role-lane chain. Calling the low-level heartbeat resolver without role context deliberately retains its historical execution-lane behavior for compatibility. Task execution remains settings-first as described above and is not changed by identity inheritance.
 
 Task-scoped heartbeat runs for durable agents execute inside the task's git worktree (same as ephemeral task execution), while no-task heartbeat runs continue to execute from the project root.
 Heartbeat and executor system prompts share the same active-goal context injector (`buildGoalContextSection`), so both lanes receive identical goal preambles when active goals exist.
@@ -404,7 +431,7 @@ The Task Detail Activity → Raw Logs model header prefers runtime provenance ma
 
 - `Executor using model: <provider>/<modelId>`
 - `Reviewer using model: <provider>/<modelId>`
-- `Triage using model: <provider>/<modelId>`
+- `Planning using model: <provider>/<modelId>` (legacy `Triage using model: <provider>/<modelId>` rows remain parseable)
 
 When the lane resolves a thinking level, the same row appends ` (thinking effort: <level>)`, for example `Executor using model: openai/gpt-4o (thinking effort: high)`. Dashboard parsers ignore parenthesized diagnostics for provider icons/effective-model headers while Raw Logs and Activity rows keep the full text visible.
 
@@ -459,7 +486,7 @@ The **Token Usage** panel in Agents view is derived from each agent's persisted 
 
 Fusion exposes cache-hit metrics across logs, API, and CLI:
 
-- **Structured logs:** `token-cache-metrics` channel emits per-persist records with `taskId`, `agentId`, `role`, `inputTokens`, `cachedTokens`, `cacheWriteTokens`, and computed `hitRatio`.
+- **Structured logs:** `token-cache-metrics` channel emits per-persist records with `taskId`, `agentId`, `role`, `inputTokens`, `cachedTokens`, `cacheWriteTokens`, and computed `hitRatio`. Emission is `debug`-gated (`FUSION_DEBUG=token-cache-metrics` or `FUSION_DEBUG=1`); it is off in the default TUI log pane.
 - **Agent API:** `GET /api/agents/:id/token-usage` returns `last24h`, `last7d`, and `allTime` window summaries for permanent agents.
 - **CLI rollup:** run `pnpm fn:cache-stats` (or `pnpm fn:cache-stats --json`) for project-wide role totals plus per-permanent-agent cache-hit summaries.
 
@@ -673,7 +700,7 @@ Operators can disable this per agent in **Agent Detail → Settings → Heartbea
 
 When `selfImproveEnabled !== false`, heartbeat runs periodically enter a self-improvement phase once `selfImproveIntervalMs` has elapsed since `lastSelfImproveAt` (or first run with available ratings). During that phase the agent is prompted to:
 
-1. Call `fn_read_evaluations` to inspect ratings/reflections
+1. Call the self-only `fn_read_evaluations` to inspect its own ratings/reflections (managers use `fn_agent_read_evaluations` for scoped report visibility and `fn_agent_evaluation_followup` for coaching)
 2. Identify recurring quality issues and trends
 3. Call `fn_update_identity` to adjust its own `soul`, `instructionsText`, or `memory`
 4. Record concise improvement decisions
@@ -926,11 +953,21 @@ Messaging is available in dashboard mailbox UI and CLI. In dashboard Mailbox →
 
 Agent-backed dashboard chat sessions (including plugin-runtime agents such as Hermes/OpenClaw/Paperclip) also expose mailbox tools (`fn_send_message`, `fn_read_messages`) when a `MessageStore` is wired for that project. Model-only chats without an attached agent do not expose these tools.
 
+Mail has an optional structural metadata contract: `mailKind` distinguishes ordinary messages, reports, and approvals; reports carry a small serializable title/section writeup, while `approvalRequestId` is a reference to live approval state rather than a copied snapshot. `fn_send_message` can send reports with `mail_kind: "report"` and `report`; use Chat for quick back-and-forth. Approval items are engine-emitted only.
+
 ### Dashboard Chat workspace tools
 
-Dashboard Chat, Chat Room responders, and task-detail Planner Chat run at the interactive project checkout with coding workspace tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Use them for user-directed file changes and shell investigation. When a durable agent is bound, its permanent-agent permission policy still governs file writes/deletes and command execution; unbound model Chat has no durable-principal policy gate. Chat must keep the checkout branch sticky: inspect Git freely, but do not use `git checkout` or `git switch` unless the operator explicitly requests it.
+Dashboard Chat, Chat Room responders, and task-aware task-detail Chat run at the interactive project checkout with coding workspace tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Use them for user-directed file changes and shell investigation. When a durable agent is bound, its permanent-agent permission policy still governs file writes/deletes and command execution; unbound model Chat has no durable-principal policy gate. Chat must keep the checkout branch sticky: inspect Git freely, but do not use `git checkout` or `git switch` unless the operator explicitly requests it.
 
-Task-detail Planner Chat is included because it is a `task-planner:<taskId>` ChatManager session. This does not change the readonly planning/mission interview lanes or WhatsApp plugin chat. Chat verification remains limited to its existing allowlisted profiles rather than accepting arbitrary shell commands.
+Task-detail Chat is included because it is a `task-planner:<taskId>` ChatManager session, not because it is the workflow planner lane. The session keeps the server-built task definition, dependencies, activity, metrics, steering, and refinement context and retains the existing task-scoped tool and SSE task-identity contract. Its model target follows the project Direct Chat default, and the Chat UI exposes model/thinking selectors while keeping targeting model-only; it never impersonates a configured durable Direct Chat agent. This does not change the readonly planning/mission interview lanes or WhatsApp plugin chat. Chat verification remains limited to its existing allowlisted profiles rather than accepting arbitrary shell commands.
+
+### Planning dependency-install tool
+
+Planning and re-planning sessions may receive `fn_install_worktree_dependencies` when a task worktree has unresolved or unrecognised dependency evidence. Its `install` action asks Fusion to execute the supplied command in the selected task worktree; only an engine-observed exit code `0` is recorded as installed. Its `none` action requires a reason and records that a detected unknown evidence file has no install step. The tool is planning-session-only: it is command-execution governed, absent from readonly sessions, and never registered for executor, reviewer, or merger sessions. Plan Review verifies the durable record rather than trusting planner prose or a shell invocation outside the tool.
+
+### Worktree session file boundary
+
+Pi sessions started in an isolated task worktree reject filesystem paths outside that worktree. The established project-memory and task-attachment exceptions remain unchanged. The standard user Agent Skills root at `~/.agents/skills` is readable from worktree sessions. Separately, when Fusion advertises skill bodies through `AgentOptions.additionalSkillPaths` (including enabled plugin skill roots), it allows only `read`, `glob`, and `grep` to access those exact normalized roots. `write`, `edit`, and Bash working directories remain worktree-bound for skill roots; these are not general `~/.agents` or `~/.fusion/plugins` exceptions.
 
 ```bash
 fn message inbox
@@ -944,6 +981,16 @@ fn agent mailbox AGENT-001
 ## Permanent agent playbooks
 
 Worked manager/IC/message/blocked/no-task scenarios live in [Permanent Agent Heartbeat Playbooks](./agents-playbooks.md). Prefer those examples over re-deriving tick behavior from engine source.
+
+## Built-in workflow owner identities
+
+At startup, Fusion provisions one provenance-marked durable owner for each built-in workflow role: **Workflow Planner** (`triage`), **Workflow Executor**, **Workflow Reviewer**, and **Workflow Merger**. Each receives role-specific inline `instructionsText` and `soul` values. Those persisted fields are the runtime authority used when the engine builds an agent prompt.
+
+Fusion also creates a managed setup mirror under each owner’s agent directory: `AGENTS.md` mirrors the default instruction text and `soul.md` mirrors the default soul. The files are intentionally not assigned to `instructionsPath`, so the same default identity is not composed twice at runtime. They are safe operator editing starting points, not an additional runtime source.
+
+Provisioning is idempotent and non-destructive. A trimmed non-empty inline instruction, `instructionsPath`, external bundle, non-canonical managed bundle, non-empty soul, or non-empty managed mirror is operator-owned and is preserved. Sparse canonical owners receive only missing default fields/files; an incomplete default bundle is repaired without overwriting non-empty files. Files are materialized after the database transaction commits, so a filesystem failure is retryable on the next startup without duplicating owners.
+
+If legacy data contains several provenance-marked owners for a supported role, Fusion retains the earliest valid `createdAt` row (then lexicographically smallest ID as a tie-breaker). It removes only the built-in provenance keys from the other rows, preserving them as ordinary durable agents with their names, roles, identity, policies, settings, metadata, and files intact. Agents with missing or unsupported provenance roles, and same-role agents without built-in provenance, are never adopted or changed by this repair.
 
 ## Heartbeat Prompt Composition and Autonomous Run Behavior
 
@@ -971,7 +1018,7 @@ Heartbeat runs are composed from multiple prompt layers so each wake has full id
 
 This structure ensures every run re-anchors on identity, wake reason, and current context before taking action.
 
-**Heartbeat skill policy:** heartbeat sessions load the waking agent’s `metadata.skills` plus enabled plugin skills. There is **no** role fallback to the published `fusion` operator skill on the heartbeat lane.
+**Heartbeat skill policy:** heartbeat sessions automatically receive every project-enabled and enabled-plugin skill. The waking agent’s `metadata.skills` are additive forced-reading requests: only skills that resolve and remain enabled are instructed before work starts; disabled or missing requests are reported. There is **no** role fallback to the published `fusion` operator skill on the heartbeat lane.
 
 **Default HEARTBEAT.md seed:** `ensureDefaultHeartbeatProcedureFile` is create-if-missing only. Operator edits to an existing per-agent procedure file are preserved; upgrade without force does not overwrite content.
 
@@ -1680,6 +1727,12 @@ Seven coordination tools support spawning, provisioning, discovery, delegation, 
 - `delegate_task` — Create + assign task to a specific agent. Implementation tasks require executor-role target unless `override: true`. Cannot target ephemeral agents (use `spawn_agent`).
 - `get_agent_config` / `update_agent_config` — Read/write soul, instructions, heartbeat interval/timeout, max concurrent runs, message response mode. **Authorization**: caller can only act on agents where `target.reportsTo === caller.id`. Cannot operate on ephemeral agents.
 
+## Workspace repository scope tools
+
+Workspace tasks acquire every repository configured in `.fusion/workspace.json` when the task starts. Agents and operators do not select individual repositories or request additional checkouts. Planning proposes the repository scope, and the blocking Plan Review gate confirms a valid `## Repository Scope` plus its dependency assessment before execution proceeds.
+
+For workspace tasks, `fn_task_file_scope_add` must use qualified paths such as `repo-a/src/file.ts`. A relative entry is only unambiguous when the task has one configured repository; never use an unqualified path to imply every workspace repository.
+
 ## Checkout leasing
 
 - 409 Conflict = ownership contention. Response: `{ error, currentHolder, taskId }`. **Never auto-retry 409.**
@@ -1692,3 +1745,23 @@ Per-agent overrides via `runtimeConfig`:
 - **Heartbeat**: `heartbeatIntervalMs`, `heartbeatTimeoutMs`, `maxConcurrentRuns`. Triggered by timer, task assignment, or on-demand (`POST /api/agents/:id/runs`).
 - **Budgets**: per-agent token budget tracking; `HeartbeatMonitor.executeHeartbeat()` skips when `isOverBudget` or `isOverThreshold` (timer triggers). Hard caps pause the agent.
 - **Performance ratings**: 1–5 scale with trend analysis, injected into system prompts.
+
+## Memory Keeper (FN-8932)
+
+Each project provisions a durable **Memory Keeper** custom agent for deterministic memory upkeep. It is heartbeat-disabled by default, so consolidation is opt-in: enable its heartbeat from Agent Detail when you want the hourly schedule to run. Task auto-claim remains disabled, and the one-hour heartbeat interval is preconfigured for that later opt-in, so it cannot claim board work or make product decisions. Provisioning identifies the owner by its provenance marker, not its display name: if an operator already owns `Memory Keeper`, Fusion creates `Memory Keeper (built-in)` instead; if both names are occupied, startup continues without a memory agent rather than renaming/adopting the operator agent or failing initialization. Later startups preserve an operator's explicit heartbeat choice in either direction.
+
+When enabled, a heartbeat refreshes the knowledge graph incrementally, appends deterministic FNXC rationale decisions through recall deduplication, then merges rationale/file node identifiers into each resulting recall record. Cross-references only grow: the per-record PostgreSQL advisory lock reads, unions, and writes in one transaction, and equal unions perform no update. Pruning is intentionally out of scope. A fingerprint-stable graph, duplicate recall results, and equal cross-reference unions yield a no-write tick; an in-process `(agentId, projectId)` guard skips re-entry. The guard is defense-in-depth for manual callers and does not fence another process or CLI graph build.
+
+Graph files are atomically replaced **per file**, not as an atomic three-file set. Concurrent builders can leave a transient mismatched set, but the manifest is written last and strict consistency validation reports `inconsistent-artifact` and triggers a full rebuild on the next load. This accepted residual risk can create temporary committable-tree artifact noise; `graphRecoveryReason` makes repeated recovery visible. The adapter alone imports graph filesystem/configuration APIs; the tick and material transformer may use only graph types and pure ID helpers so they remain fixture-testable. Missing data-layer/project/root-directory or invalid graph-directory environments are successful skips, while runtime failures use the existing shared heartbeat recovery budget.
+
+The workflow-native `memoryConsolidationEnabled` setting defaults to `true` and is resolved from the project default workflow for no-task heartbeats. Disabling it stops the tick without deleting the agent or memory. The tick makes no LLM calls.
+
+## Workflow role principals
+
+Permanent agents carry one or more normalized role tags: `triage`, `executor`, `reviewer`, `merger`, `scheduler`, `engineer`, and `custom`. Upgrades preserve legacy singular roles, and every project receives four distinct heartbeat-disabled built-ins for planning, execution, review, and merge. Heartbeat enablement and `maxConcurrentRuns` are independent from `runtimeConfig.maxWorkflowSessions`.
+
+Workflow routing never changes `assignedAgentId`. An explicit task owner runs classified stages regardless of its tags, except for an exact reviewer-node override. Otherwise a column binding is considered, then an available role-tag pool is selected by fewest active workflow sessions, oldest creation time, and ID. A named unavailable principal holds work rather than falling back.
+
+### Memory-first steering and consolidation history
+
+Agent instruction assembly uses the resolved `agentMemoryInclusionMode` across triage, execution, review, heartbeat, and chat lanes. `full` asks agents to query memory before re-reading raw sources, `index` keeps that direction terse, and `off` omits it. Operators can inspect the built-in Memory Keeper's compact consolidation audit history in **Agent Detail → Agent Memory**; it shows only completion outcomes and existing audit counts/reasons, never memory content.

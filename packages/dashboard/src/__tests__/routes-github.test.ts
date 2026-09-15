@@ -18,15 +18,33 @@ import {
 import { GitHubClient } from "../github.js";
 import * as resolveDiffBaseModule from "../routes/resolve-diff-base.js";
 import { githubRateLimiter } from "../github-poll.js";
-import type { TaskStore, TaskAttachment, Routine, RoutineCreateInput, RoutineUpdateInput, RoutineExecutionResult, ChatSession, ChatMessage } from "@fusion/core";
-import type { TaskDetail } from "@fusion/core";
+import {
+  MAX_TASK_MESSAGE_LENGTH,
+  PLAN_REVIEW_GROUP_ID,
+  TransitionRejectionError,
+  type Task,
+  type TaskStore,
+  type TaskAttachment,
+  type Routine,
+  type RoutineCreateInput,
+  type RoutineUpdateInput,
+  type RoutineExecutionResult,
+  type ChatSession,
+  type ChatMessage,
+  type TaskDetail,
+  type WorkflowIr,
+  type WorkflowWorkItem,
+} from "@fusion/core";
+import { Scheduler } from "../../../engine/src/scheduler.js";
+import { WorkflowGraphTaskRunner } from "../../../engine/src/workflows/workflow-graph-task-runner.js";
+import { createExecutorColumnBoundaryHooks } from "../../../engine/src/workflow-column-boundary-hooks.js";
+import { isUnplannedForExecution } from "../../../engine/src/execution/hold-release.js";
+import { drainDuePlanningContinuations } from "../../../engine/src/runtimes/in-process-runtime.js";
 import type { AuthStorageLike, ModelRegistryLike } from "../routes.js";
 import { __resetBatchImportRateLimiter, __setCreateFnAgentForRefine } from "../routes.js";
 import * as agentGenerationModule from "../agent-generation.js";
 import { __resetPlanningState, __setCreateFnAgent, planningStreamManager } from "../planning.js";
 import * as planningModule from "../planning.js";
-import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
-import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
@@ -143,9 +161,11 @@ vi.mock("@fusion/core", async (importOriginal) => {
   });
 });
 
-vi.mock("@fusion/engine", async () => {
+vi.mock("@fusion/engine", async (importOriginal) => {
   const { createEngineMock } = await import("../test/mockCoreEngine.js");
+  const actual = await importOriginal<typeof import("@fusion/engine")>();
   return createEngineMock({
+  resumeApprovedPlanReviewHandoff: vi.fn(actual.resumeApprovedPlanReviewHandoff),
   createFnAgent: vi.fn(async (options?: { onText?: (delta: string) => void }) => ({
     session: {
       state: {
@@ -189,7 +209,7 @@ vi.mock("@fusion/engine", async () => {
 });
 
 import { AgentStore, Database, RoutineStore, isGhAvailable, isGhAuthenticated } from "@fusion/core";
-import { createFnAgent } from "@fusion/engine";
+import { createFnAgent, resumeApprovedPlanReviewHandoff } from "@fusion/engine";
 
 const mockIsGhAvailable = vi.mocked(isGhAvailable);
 const mockIsGhAuthenticated = vi.mocked(isGhAuthenticated);
@@ -212,10 +232,22 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     createTask: vi.fn(),
     moveTask: vi.fn(),
     updateTask: vi.fn(),
+    withPlanningLifecycleLock: vi.fn(async (_id, fn) => await fn()),
+    // FNXC:SpecLockApproval 2026-08-15-05:10: approve-plan now locks the approved PROMPT.md and publishes a drift report inside the planning fence; mock both seams so route contracts stay isolated from spec-lock persistence.
+    lockCurrentPlanWhilePlanningLocked: vi.fn().mockResolvedValue(undefined),
+    reconcileSpecDriftWhilePlanningLocked: vi.fn().mockResolvedValue(undefined),
+    /*
+    FNXC:PlanApprovalDispatch 2026-08-15-05:10:
+    The engine mock's resumeApprovedPlanReviewHandoff defaults to the REAL implementation, which
+    seeds a runnable Plan Review continuation through these store writers after approval. Provide
+    the empty/no-op continuation surface so route unit tests exercise the genuine handoff instead
+    of exploding with "store.listWorkflowWorkItemsForTask is not a function".
+    */
+    listWorkflowWorkItemsForTask: vi.fn().mockResolvedValue([]),
+    seedStrandedPlanReviewContinuation: vi.fn(async () => ({ seeded: true, workItemId: "mock-plan-review-continuation" })),
+    replaceActiveTaskWorkflowContinuation: vi.fn(async (input: Record<string, unknown>) => ({ ...input, id: "mock-plan-review-continuation" })),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({}),
     updateSettings: vi.fn(),
@@ -251,6 +283,16 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     removePrInfoByNumber: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    /*
+    FNXC:PluginMcpServers 2026-07-23-23:40:
+    FN-8491 (3cd023fa4) made resolveProjectContext bind a project-scoped plugin
+    MCP provider on every getProjectContext call. A store that already exposes
+    getProjectScopedPluginMcpServers is treated as runtime-owned and skips the
+    binder (which would otherwise call getPluginStore()); declare it here so the
+    route contracts under test stay isolated from plugin-loader bootstrapping.
+    Same alignment as remote-access-routes.test.ts (d7752931b).
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -1825,7 +1867,6 @@ describe("projectId store scoping regressions", () => {
   beforeEach(() => {
     __resetBatchImportRateLimiter();
     __resetPlanningState();
-    __resetSubtaskBreakdownState();
     mockIsGhAuthenticated.mockReturnValue(true);
 
     defaultStore = createMockStore({
@@ -1974,6 +2015,15 @@ describe("projectId store scoping regressions", () => {
       initialPlan: "Scoped initial plan",
       history: [],
       thinkingOutput: "",
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
+      summary: {
+        title: "Scoped planned task",
+        description: "Create task in scoped project",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: [],
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     } as any);
@@ -1985,6 +2035,17 @@ describe("projectId store scoping regressions", () => {
       keyDeliverables: [],
     });
     vi.spyOn(planningModule, "cleanupSession").mockImplementation(() => {});
+    /*
+    FNXC:PlanningMode 2026-07-23-23:55:
+    FN-8442 (36b318096) routes create-task through durable create-claim plumbing
+    (getDurablePlanningSession + updatePlanningCreateClaim). Those functions call the
+    REAL module-internal getSession (a namespace spy cannot intercept intra-module
+    calls), so the spied session above is invisible to them and they throw
+    SessionNotFoundError. This test's contract is scoped-store routing of createTask,
+    not claim persistence, so stub the claim plumbing to inert no-ops here.
+    */
+    vi.spyOn(planningModule, "getDurablePlanningSession").mockResolvedValue(undefined);
+    vi.spyOn(planningModule, "updatePlanningCreateClaim").mockResolvedValue(undefined);
 
     (scopedStore.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FAKE_TASK_DETAIL,
@@ -2005,94 +2066,7 @@ describe("projectId store scoping regressions", () => {
     expect(defaultStore.createTask).not.toHaveBeenCalled();
   });
 
-  it("routes planning create-tasks mutations to scoped store when projectId is provided", async () => {
-    vi.spyOn(planningModule, "getSession").mockReturnValue({
-      id: "plan-session-2",
-      initialPlan: "Scoped multi task plan",
-      history: [],
-      summary: {
-        title: "Plan",
-        description: "Plan description",
-        suggestedSize: "M",
-        suggestedDependencies: [],
-        keyDeliverables: ["Deliverable 1", "Deliverable 2"],
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    } as any);
-    vi.spyOn(planningModule, "formatInterviewQA").mockReturnValue("Q: Scope\nA: Medium");
-    vi.spyOn(planningModule, "cleanupSession").mockImplementation(() => {});
 
-    (scopedStore.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-6", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-7", column: "triage" });
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/planning/create-tasks",
-      JSON.stringify({
-        planningSessionId: "plan-session-2",
-        projectId,
-        subtasks: [
-          { id: "subtask-1", title: "First scoped task", description: "First", suggestedSize: "S", dependsOn: [] },
-          { id: "subtask-2", title: "Second scoped task", description: "Second", suggestedSize: "M", dependsOn: ["subtask-1"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(scopedStore.createTask).toHaveBeenCalledTimes(2);
-    expect(defaultStore.createTask).not.toHaveBeenCalled();
-  });
-
-  it("routes subtask create-tasks mutations to scoped store when projectId is provided", async () => {
-    vi.spyOn(subtaskBreakdownModule, "getSubtaskSession").mockReturnValue({
-      sessionId: "subtask-session-1",
-      initialDescription: "Break down scoped work",
-      subtasks: [],
-      status: "complete",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      thinkingOutput: "",
-    } as any);
-    vi.spyOn(subtaskBreakdownModule, "cleanupSubtaskSession").mockImplementation(() => {});
-
-    (scopedStore.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-8", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-9", column: "triage" });
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: "subtask-session-1",
-        projectId,
-        parentTaskId: "FN-PARENT",
-        subtasks: [
-          { tempId: "temp-1", title: "Scoped subtask one", description: "One", size: "S", dependsOn: [] },
-          { tempId: "temp-2", title: "Scoped subtask two", description: "Two", size: "M", dependsOn: ["temp-1"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(scopedStore.getTask).toHaveBeenCalledWith("FN-PARENT");
-    expect(defaultStore.getTask).not.toHaveBeenCalled();
-    expect(scopedStore.createTask).toHaveBeenCalledTimes(2);
-    expect(defaultStore.createTask).not.toHaveBeenCalled();
-    expect(scopedStore.deleteTask).toHaveBeenCalledWith("FN-PARENT", expect.objectContaining({
-      auditContext: expect.objectContaining({
-        agentId: "system",
-        runId: expect.stringMatching(/^synthetic-planning-delete-FN-PARENT-/),
-        sessionId: "subtask-session-1",
-      }),
-    }));
-    expect(defaultStore.deleteTask).not.toHaveBeenCalled();
-  });
 });
 
 // --- Spec Revision route tests ---
@@ -2116,9 +2090,9 @@ describe("POST /tasks/:id/spec/revise", () => {
     return app;
   }
 
-  it("requests spec revision and moves task from todo to triage", async () => {
+  it("requests spec revision in place from the todo planning column", async () => {
     const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-revise-"));
     const taskDir = join(tempRoot, ".fusion", "tasks", "FN-001");
     mkdirSync(taskDir, { recursive: true });
@@ -2144,7 +2118,11 @@ describe("POST /tasks/:id/spec/revise", () => {
         "AI spec revision requested",
         "Please add more details about error handling"
       );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage");
+      /*
+      FNXC:PlanApproval 2026-08-28-11:39:
+      A card already in the workflow's planning column is reset in place, not moved. The fixture's `todo` column contains the planning node, so respecify must leave it there for triage's hold-column needs-replan rediscovery.
+      */
+      expect(store.moveTask).not.toHaveBeenCalled();
       expect(existsSync(join(taskDir, "PROMPT.md"))).toBe(false);
       expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
     } finally {
@@ -2154,7 +2132,7 @@ describe("POST /tasks/:id/spec/revise", () => {
 
   it("requests spec revision and moves task from in-progress to triage", async () => {
     const inProgressTask = { ...FAKE_TASK_DETAIL, column: "in-progress" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(inProgressTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2169,12 +2147,12 @@ describe("POST /tasks/:id/spec/revise", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
   });
 
   it("allows spec revision for task already in triage", async () => {
-    const triageTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
-    const updatedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "needs-replan" as const };
+    const triageTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
+    const updatedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "needs-replan" as const };
     const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-revise-triage-"));
     const taskDir = join(tempRoot, ".fusion", "tasks", "FN-001");
     mkdirSync(taskDir, { recursive: true });
@@ -2211,7 +2189,7 @@ describe("POST /tasks/:id/spec/revise", () => {
 
   it("allows spec revision when task is in in-review (in-review can transition to triage)", async () => {
     const inReviewTask = { ...FAKE_TASK_DETAIL, column: "in-review" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(inReviewTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2225,13 +2203,13 @@ describe("POST /tasks/:id/spec/revise", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
   });
 
   it("allows spec revision when task is in done (done can transition to triage)", async () => {
     const doneTask = { ...FAKE_TASK_DETAIL, column: "done" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(doneTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2245,7 +2223,7 @@ describe("POST /tasks/:id/spec/revise", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
   });
 
   it("returns 400 when feedback is missing", async () => {
@@ -2274,18 +2252,67 @@ describe("POST /tasks/:id/spec/revise", () => {
     expect(res.body.error).toContain("feedback is required");
   });
 
-  it("returns 400 when feedback exceeds 2000 characters", async () => {
-    const longFeedback = "a".repeat(2001);
+  it("rejects whitespace-only spec-revision feedback before reading or mutating the task", async () => {
     const res = await REQUEST(
       buildApp(),
       "POST",
       "/api/tasks/KB-001/spec/revise",
-      JSON.stringify({ feedback: longFeedback }),
-      { "Content-Type": "application/json" }
+      JSON.stringify({ feedback: " \t\n " }),
+      { "Content-Type": "application/json" },
     );
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toContain("feedback must be between 1 and 2000");
+    expect(res.body).toEqual({ error: `feedback must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
+    expect(store.getTask).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts long spec-revision feedback through the shared cap and rejects the next character", async () => {
+    const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
+    const updatedTask = { ...todoTask, status: "needs-replan" as const };
+    const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-revise-length-"));
+    const longFeedback = "a".repeat(2001);
+    const boundaryFeedback = "a".repeat(MAX_TASK_MESSAGE_LENGTH);
+    const rejectedFeedback = "a".repeat(MAX_TASK_MESSAGE_LENGTH + 1);
+
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
+    (store.getRootDir as ReturnType<typeof vi.fn>).mockReturnValue(tempRoot);
+
+    try {
+      const longResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/spec/revise",
+        JSON.stringify({ feedback: longFeedback }),
+        { "Content-Type": "application/json" },
+      );
+      const boundaryResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/spec/revise",
+        JSON.stringify({ feedback: boundaryFeedback }),
+        { "Content-Type": "application/json" },
+      );
+      const rejectedResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/spec/revise",
+        JSON.stringify({ feedback: rejectedFeedback }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(longResponse.status).toBe(200);
+      expect(boundaryResponse.status).toBe(200);
+      expect(store.logEntry).toHaveBeenCalledWith("FN-001", "AI spec revision requested", longFeedback);
+      expect(store.logEntry).toHaveBeenCalledWith("FN-001", "AI spec revision requested", boundaryFeedback);
+      expect(rejectedResponse.status).toBe(400);
+      expect(rejectedResponse.body).toEqual({ error: `feedback must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("returns 404 when task not found", async () => {
@@ -2306,7 +2333,7 @@ describe("POST /tasks/:id/spec/revise", () => {
 
   it("queues multiple revision requests as multiple log entries", async () => {
     const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(todoTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2360,7 +2387,7 @@ describe("POST /tasks/:id/spec/rebuild", () => {
 
   it("rebuilds spec and moves task from todo to triage", async () => {
     const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-rebuild-"));
     const taskDir = join(tempRoot, ".fusion", "tasks", "FN-001");
     mkdirSync(taskDir, { recursive: true });
@@ -2379,7 +2406,12 @@ describe("POST /tasks/:id/spec/rebuild", () => {
         "FN-001",
         "Specification rebuild requested by user"
       );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage", { moveSource: "user", recoveryRehome: true });
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-08-03-01:40: the resolved rebuild target for the default lineage IS
+      `todo` (no `triage` since #2515), and the route only moves when `task.column !== replanColumn` — so a card
+      already in `todo` is rebuilt IN PLACE. Two stale things in one assertion: the column, and the move itself.
+      */
+      expect(store.moveTask).not.toHaveBeenCalled();
       expect((store as unknown as { clearWorkflowRunStepInstancesAsync: ReturnType<typeof vi.fn> }).clearWorkflowRunStepInstancesAsync).toHaveBeenCalledWith("FN-001");
       expect(existsSync(join(taskDir, "PROMPT.md"))).toBe(false);
       expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
@@ -2390,7 +2422,7 @@ describe("POST /tasks/:id/spec/rebuild", () => {
 
   it("rebuilds spec and moves task from in-progress to triage", async () => {
     const inProgressTask = { ...FAKE_TASK_DETAIL, column: "in-progress" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(inProgressTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2399,14 +2431,14 @@ describe("POST /tasks/:id/spec/rebuild", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/spec/rebuild");
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage", { moveSource: "user", recoveryRehome: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "user", recoveryRehome: true });
     expect((store as unknown as { clearWorkflowRunStepInstancesAsync: ReturnType<typeof vi.fn> }).clearWorkflowRunStepInstancesAsync).toHaveBeenCalledWith("FN-001");
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
   });
 
   it("rebuilds spec and moves task from done to triage", async () => {
     const doneTask = { ...FAKE_TASK_DETAIL, column: "done" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(doneTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2415,13 +2447,13 @@ describe("POST /tasks/:id/spec/rebuild", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/spec/rebuild");
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage", { moveSource: "user", recoveryRehome: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "user", recoveryRehome: true });
     expect((store as unknown as { clearWorkflowRunStepInstancesAsync: ReturnType<typeof vi.fn> }).clearWorkflowRunStepInstancesAsync).toHaveBeenCalledWith("FN-001");
   });
 
   it("allows rebuild for task already in triage", async () => {
-    const triageTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
-    const updatedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "needs-replan" as const };
+    const triageTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
+    const updatedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "needs-replan" as const };
     const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-rebuild-triage-"));
     const taskDir = join(tempRoot, ".fusion", "tasks", "FN-001");
     mkdirSync(taskDir, { recursive: true });
@@ -2453,7 +2485,7 @@ describe("POST /tasks/:id/spec/rebuild", () => {
 
   it("allows spec rebuild when task is in in-review (in-review can transition to triage)", async () => {
     const inReviewTask = { ...FAKE_TASK_DETAIL, column: "in-review" as const };
-    const movedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const };
+    const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(inReviewTask);
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2461,7 +2493,7 @@ describe("POST /tasks/:id/spec/rebuild", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/spec/rebuild");
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage", { moveSource: "user", recoveryRehome: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "user", recoveryRehome: true });
     expect((store as unknown as { clearWorkflowRunStepInstancesAsync: ReturnType<typeof vi.fn> }).clearWorkflowRunStepInstancesAsync).toHaveBeenCalledWith("FN-001");
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
   });
@@ -2496,6 +2528,10 @@ describe("POST /tasks/:id/spec/rebuild", () => {
       const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/spec/rebuild");
 
       expect(res.status).toBe(200);
+      /* This workflow declares NEITHER `triage` NOR `todo` (only `publish`), so the route's documented last
+         resort applies and the target stays the legacy `triage` — recovery-rehomed because a plain move would
+         reject an undeclared target. My blanket `triage` -> `todo` sweep over this file had broken exactly this
+         case, which is the one that proves the fallback still exists. */
       expect(store.moveTask).toHaveBeenCalledWith("FN-001", "triage", { moveSource: "user", recoveryRehome: true });
       expect((store as unknown as { clearWorkflowRunStepInstancesAsync: ReturnType<typeof vi.fn> }).clearWorkflowRunStepInstancesAsync).toHaveBeenCalledWith("FN-001");
       expect(existsSync(join(taskDir, "PROMPT.md"))).toBe(false);
@@ -2537,29 +2573,6 @@ describe("POST /tasks/:id/spec/rebuild", () => {
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
   });
 
-  it("rejects legacy and semantic archived tasks before rebuilding", async () => {
-    const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-rebuild-archived-"));
-    const taskDir = join(tempRoot, ".fusion", "tasks", "FN-001");
-    mkdirSync(taskDir, { recursive: true });
-    writeFileSync(join(taskDir, "PROMPT.md"), "# retained spec\n");
-    const archivedTask = { ...FAKE_TASK_DETAIL, column: "cold-storage" as any };
-    selectWorkflow([{ id: "cold-storage", traits: [{ trait: "archived" }] }]);
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(archivedTask);
-    (store.getRootDir as ReturnType<typeof vi.fn>).mockReturnValue(tempRoot);
-
-    try {
-      const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/spec/rebuild");
-
-      expect(res.status).toBe(400);
-      expect(res.body.error).toContain("not available for archived tasks");
-      expect(store.moveTask).not.toHaveBeenCalled();
-      expect(store.updateTask).not.toHaveBeenCalled();
-      expect(existsSync(join(taskDir, "PROMPT.md"))).toBe(true);
-    } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
-    }
-  });
-
   it("returns 404 when task not found", async () => {
     const error = new Error("Task not found") as Error & { code?: string };
     error.code = "ENOENT";
@@ -2575,15 +2588,30 @@ describe("POST /tasks/:id/spec/rebuild", () => {
 
 describe("POST /tasks/:id/approve-plan", () => {
   let store: TaskStore;
+  let approvalRoot: string;
 
   beforeEach(() => {
+    /*
+    FNXC:SpecLockApproval 2026-08-15-05:10:
+    Approval is a release boundary — an unreadable PROMPT.md is now a 409 (the route refuses to
+    approve without creating the immutable spec lock). The mock root must therefore carry a real
+    on-disk PROMPT.md for the fixture task, matching production where an awaiting-approval card
+    always has its spec materialized.
+    */
+    approvalRoot = mkdtempSync(join(tmpdir(), "kb-dashboard-approve-plan-root-"));
+    mkdirSync(join(approvalRoot, ".fusion", "tasks", "FN-001"), { recursive: true });
+    writeFileSync(join(approvalRoot, ".fusion", "tasks", "FN-001", "PROMPT.md"), "# Task: FN-001\n\nPlan body.\n");
     store = createMockStore({
       getTask: vi.fn(),
       moveTask: vi.fn(),
       updateTask: vi.fn(),
       logEntry: vi.fn().mockResolvedValue(undefined),
-      getRootDir: vi.fn().mockReturnValue("/fake/root"),
+      getRootDir: vi.fn().mockReturnValue(approvalRoot),
     });
+  });
+
+  afterEach(() => {
+    rmSync(approvalRoot, { recursive: true, force: true });
   });
 
   function buildApp() {
@@ -2593,8 +2621,146 @@ describe("POST /tasks/:id/approve-plan", () => {
     return app;
   }
 
+  it("drives one real approval through Plan Review capacity and scheduler dispatch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fusion-plan-approval-dispatch-"));
+    const ir: WorkflowIr = {
+      version: "v2", id: "custom:approved-plan-dispatch", name: "approved-plan-dispatch",
+      columns: [
+        { id: "todo", name: "Todo", traits: [{ trait: "intake" }, { trait: "hold", config: { release: "capacity" } }] },
+        { id: "in-progress", name: "In progress", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+      ],
+      nodes: [
+        { id: "start", kind: "start", column: "todo" },
+        { id: PLAN_REVIEW_GROUP_ID, kind: "optional-group", column: "todo", config: { name: "Plan Review", defaultOn: true, template: { nodes: [{ id: "review", kind: "prompt", config: { prompt: "Review the plan" } }], edges: [] } } },
+        { id: "execute", kind: "prompt", column: "in-progress", config: {} },
+        { id: "end", kind: "end", column: "in-progress" },
+      ],
+      edges: [
+        { from: "start", to: PLAN_REVIEW_GROUP_ID },
+        { from: PLAN_REVIEW_GROUP_ID, to: "execute", condition: "success" },
+        { from: "execute", to: "end", condition: "success" },
+      ],
+    } as WorkflowIr;
+    const task = {
+      ...FAKE_TASK_DETAIL, id: "FN-8792-repro", column: "todo" as const, status: "awaiting-approval" as const,
+      enabledWorkflowSteps: [PLAN_REVIEW_GROUP_ID], assignedAgentId: "executor-1",
+    } as Task;
+    const items: WorkflowWorkItem[] = [];
+    const logs: string[] = [];
+    const scheduled = vi.fn();
+    const capacityError = () => new TransitionRejectionError(
+      { code: "capacity-exhausted", messageKey: "transition.rejected.capacityExhausted", retryable: true },
+      "Column 'in-progress' is at capacity (1/1)",
+    );
+    const integrationStore = createMockStore({
+      getRootDir: vi.fn(() => root),
+      getTasksDir: vi.fn(() => join(root, ".fusion", "tasks")),
+      getTask: vi.fn(async () => task), listTasks: vi.fn(async () => [task]),
+      getSettings: vi.fn(async () => ({ maxConcurrent: 1, maxWorktrees: 1, pollIntervalMs: 60_000 })),
+      updateSettings: vi.fn(async () => undefined),
+      updateTask: vi.fn(async (_id, patch) => Object.assign(task, patch)),
+      moveTask: vi.fn(async (_id, column: string) => {
+        if (column === "in-progress") throw capacityError();
+        task.column = column as Task["column"];
+        return task;
+      }),
+      moveTaskIf: vi.fn(async (_id, column, predicate) => {
+        if (!await predicate(task)) return { task, moved: false };
+        task.column = column;
+        return { task, moved: true };
+      }),
+      logEntry: vi.fn(async (_id, action: string) => { logs.push(action); }),
+      parseFileScopeFromPrompt: vi.fn(async () => []),
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: ir.id!, stepIds: [PLAN_REVIEW_GROUP_ID] })),
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: ir.id!, stepIds: [PLAN_REVIEW_GROUP_ID] })),
+      getWorkflowDefinition: vi.fn(async () => ({ id: ir.id, ir })),
+      listWorkflowWorkItemsForTask: vi.fn(async () => items),
+      seedStrandedPlanReviewContinuation: vi.fn(async (input) => {
+        const item = { ...input, id: "plan-review-1" } as WorkflowWorkItem;
+        items.push(item);
+        return { seeded: true, workItemId: item.id };
+      }),
+      replaceActiveTaskWorkflowContinuation: vi.fn(async (input) => {
+        for (const item of items) if (["runnable", "retrying", "running", "held"].includes(item.state)) item.state = "cancelled";
+        const item = { ...input, id: "capacity-1" } as WorkflowWorkItem;
+        items.push(item);
+        return item;
+      }),
+      getCompletionHandoffAcceptedMarker: vi.fn(async () => null),
+      recordRunAuditEvent: vi.fn(async () => undefined),
+      renewSymbolLocks: vi.fn(async () => ({ renewed: [], lost: [] })),
+      transitionQueuedEpisode: vi.fn(async () => ({ appended: false, task })),
+      on: vi.fn(), off: vi.fn(),
+    });
+    mkdirSync(join(root, ".fusion", "tasks", task.id), { recursive: true });
+    writeFileSync(join(root, ".fusion", "tasks", task.id, "PROMPT.md"), "# Task\nA real approved plan\n");
+
+    try {
+      await expect(isUnplannedForExecution(integrationStore, task, ir)).resolves.toBe(true);
+      const res = await REQUEST((() => {
+        const app = express(); app.use(express.json()); app.use("/api", createApiRoutes(integrationStore)); return app;
+      })(), "POST", `/api/tasks/${task.id}/approve-plan`);
+      expect(res.status).toBe(200);
+      expect(items).toContainEqual(expect.objectContaining({ nodeId: PLAN_REVIEW_GROUP_ID, state: "runnable", waitReason: "planning" }));
+      await expect(isUnplannedForExecution(integrationStore, task, ir)).resolves.toBe(true);
+
+      const runner = new WorkflowGraphTaskRunner({
+        store: integrationStore,
+        seams: { planning: async () => undefined, execute: async () => undefined, review: async () => undefined, merge: async () => undefined, schedule: async () => undefined },
+        runCustomNode: async () => ({ outcome: "success" }),
+        columnBoundaryHooks: createExecutorColumnBoundaryHooks({ store: integrationStore, task }),
+      });
+      const reviewRuns = vi.fn(async () => {
+        items[0].state = "running";
+        return runner.run(task as TaskDetail, {}, PLAN_REVIEW_GROUP_ID);
+      });
+      await drainDuePlanningContinuations({
+        listDue: async () => items.filter((item) => item.state === "runnable" && item.waitReason === "planning"),
+        getTask: async () => task, cancelOrphan: async () => undefined, defer: async () => undefined,
+        dispatch: async () => {
+          await expect(reviewRuns()).resolves.toMatchObject({
+            disposition: "suspended",
+            suspension: { reason: "capacity" },
+          });
+        },
+        nowMs: () => Date.parse("2026-08-05T02:13:00.000Z"), warn: () => undefined,
+      });
+      expect(reviewRuns).toHaveBeenCalledOnce();
+      expect(items).toContainEqual(expect.objectContaining({ state: "held", waitReason: "capacity", sourceColumn: "todo" }));
+      await expect(isUnplannedForExecution(integrationStore, task, ir)).resolves.toBe(false);
+
+      const scheduler = new Scheduler(integrationStore, { onSchedule: scheduled });
+      (scheduler as unknown as { running: boolean }).running = true;
+      await scheduler.schedule();
+      expect(scheduled).toHaveBeenCalledWith(expect.objectContaining({ id: task.id, column: "in-progress" }));
+      expect(logs).not.toContain("Execution dispatch refused — task is still unplanned");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes Plan Review through the public engine handoff after approval", async () => {
+    const awaitingTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "awaiting-approval" as const };
+    const approvedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: undefined };
+    const publicHandoff = vi.mocked(resumeApprovedPlanReviewHandoff);
+    publicHandoff.mockClear();
+    publicHandoff.mockResolvedValue({ resumed: true, reason: "seeded", workItemId: "review-continuation" });
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingTask);
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(approvedTask);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(approvedTask);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/approve-plan");
+
+    expect(res.status).toBe(200);
+    expect(publicHandoff).toHaveBeenCalledWith(
+      store,
+      expect.objectContaining({ id: "FN-001", column: "todo", status: undefined }),
+      expect.any(Object),
+    );
+  });
+
   it("approves plan and moves task from triage to todo", async () => {
-    const awaitingTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "awaiting-approval" as const };
+    const awaitingTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "awaiting-approval" as const };
     const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingTask);
@@ -2606,24 +2772,37 @@ describe("POST /tasks/:id/approve-plan", () => {
     expect(res.status).toBe(200);
     expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Plan approved by user");
     expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
-    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: undefined });
+    /*
+    FNXC:SpecLockApproval 2026-08-15-05:10:
+    A readable PROMPT.md is now mandatory at approval (unreadable is a 409), so the persisted
+    patch always carries the real fingerprint hash of the approved on-disk plan — never null.
+    */
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
+      status: null,
+      approvedPlanFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     expect(res.body.column).toBe("todo");
     expect(res.body.status).toBeUndefined();
   });
 
-  it("returns 400 when task is not in triage column", async () => {
-    const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "awaiting-approval" as const };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(todoTask);
+  it("returns 400 when the task is not at the workflow's intake column", async () => {
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-08-03-01:50 (red on main): the guard is "is the card at the workflow's
+    INTAKE column", and on the default lineage intake IS `todo` — so a `todo` fixture is now the VALID case and
+    proves nothing. The rejection needs a column that is genuinely not intake.
+    */
+    const nonIntakeTask = { ...FAKE_TASK_DETAIL, column: "in-progress" as const, status: "awaiting-approval" as const };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(nonIntakeTask);
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/approve-plan");
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toContain("triage");
+    expect(res.body.error).toContain("todo");
     expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("returns 400 when task does not have awaiting-approval status", async () => {
-    const triageTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "planning" as const };
+    const triageTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "planning" as const };
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(triageTask);
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/approve-plan");
@@ -2659,7 +2838,7 @@ describe("POST /tasks/:id/approve-plan", () => {
   it("approves a task carrying the legacy release-authorization hold", async () => {
     const releaseHoldTask = {
       ...FAKE_TASK_DETAIL,
-      column: "triage" as const,
+      column: "todo" as const,
       status: "awaiting-approval" as const,
       awaitingApprovalReason: "release-authorization" as const,
     };
@@ -2679,7 +2858,7 @@ describe("POST /tasks/:id/approve-plan", () => {
   it("still approves a manual-approval hold with awaitingApprovalReason unset", async () => {
     const awaitingTask = {
       ...FAKE_TASK_DETAIL,
-      column: "triage" as const,
+      column: "todo" as const,
       status: "awaiting-approval" as const,
       awaitingApprovalReason: undefined,
     };
@@ -2713,7 +2892,7 @@ describe("POST /tasks/:id/approve-plan", () => {
         logEntry: vi.fn().mockResolvedValue(undefined),
         getRootDir: vi.fn().mockReturnValue(root),
       });
-      const awaitingTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "awaiting-approval" as const };
+      const awaitingTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "awaiting-approval" as const };
       const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
       (localStore.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingTask);
       (localStore.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
@@ -2728,7 +2907,7 @@ describe("POST /tasks/:id/approve-plan", () => {
       expect(res.status).toBe(200);
       expect(localStore.updateTask).toHaveBeenCalledWith(
         "FN-001",
-        expect.objectContaining({ status: undefined, approvedPlanFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) }),
+        expect.objectContaining({ status: null, approvedPlanFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) }),
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -2756,8 +2935,8 @@ describe("POST /tasks/:id/reject-plan", () => {
   }
 
   it("rejects plan and clears status for regeneration", async () => {
-    const awaitingTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "awaiting-approval" as const };
-    const updatedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: undefined };
+    const awaitingTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "awaiting-approval" as const };
+    const updatedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: undefined };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
@@ -2768,23 +2947,30 @@ describe("POST /tasks/:id/reject-plan", () => {
     expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Plan rejected by user", "Specification will be regenerated");
     // FN-7569: reject-plan clears any previously-recorded approval fingerprint so a
     // regenerated plan is always treated as new and requires fresh manual approval.
-    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: undefined, approvedPlanFingerprint: null });
-    expect(res.body.column).toBe("triage");
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: null, approvedPlanFingerprint: null });
+    /* The rejected card stays where it was — the workflow's intake column, `todo` on the default lineage since
+       #2515 removed `triage`. Reject clears status for regeneration; it does not move the card. */
+    expect(res.body.column).toBe("todo");
   });
 
-  it("returns 400 when task is not in triage column", async () => {
-    const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "awaiting-approval" as const };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(todoTask);
+  it("returns 400 when the task is not at the workflow's intake column", async () => {
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-08-03-01:50 (red on main): the guard is "is the card at the workflow's
+    INTAKE column", and on the default lineage intake IS `todo` — so a `todo` fixture is now the VALID case and
+    proves nothing. The rejection needs a column that is genuinely not intake.
+    */
+    const nonIntakeTask = { ...FAKE_TASK_DETAIL, column: "in-progress" as const, status: "awaiting-approval" as const };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(nonIntakeTask);
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/reject-plan");
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toContain("triage");
+    expect(res.body.error).toContain("todo");
     expect(store.updateTask).not.toHaveBeenCalled();
   });
 
   it("returns 400 when task does not have awaiting-approval status", async () => {
-    const triageTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "planning" as const };
+    const triageTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: "planning" as const };
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(triageTask);
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/reject-plan");
@@ -2819,18 +3005,18 @@ describe("POST /tasks/:id/reject-plan", () => {
   it("rejects a task carrying the legacy release-authorization hold", async () => {
     const releaseHoldTask = {
       ...FAKE_TASK_DETAIL,
-      column: "triage" as const,
+      column: "todo" as const,
       status: "awaiting-approval" as const,
       awaitingApprovalReason: "release-authorization" as const,
     };
-    const updatedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: undefined };
+    const updatedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: undefined };
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(releaseHoldTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/reject-plan");
 
     expect(res.status).toBe(200);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: undefined, approvedPlanFingerprint: null });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: null, approvedPlanFingerprint: null });
   });
 
   // Passthrough: an ordinary manual-approval hold (no awaitingApprovalReason)
@@ -2838,11 +3024,11 @@ describe("POST /tasks/:id/reject-plan", () => {
   it("still rejects a manual-approval hold with awaitingApprovalReason unset", async () => {
     const awaitingTask = {
       ...FAKE_TASK_DETAIL,
-      column: "triage" as const,
+      column: "todo" as const,
       status: "awaiting-approval" as const,
       awaitingApprovalReason: undefined,
     };
-    const updatedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: undefined };
+    const updatedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: undefined };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
@@ -2850,7 +3036,7 @@ describe("POST /tasks/:id/reject-plan", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/reject-plan");
 
     expect(res.status).toBe(200);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: undefined, approvedPlanFingerprint: null });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: null, approvedPlanFingerprint: null });
   });
 
   /*
@@ -2861,11 +3047,11 @@ describe("POST /tasks/:id/reject-plan", () => {
   it("clears an existing approvedPlanFingerprint on reject", async () => {
     const awaitingTask = {
       ...FAKE_TASK_DETAIL,
-      column: "triage" as const,
+      column: "todo" as const,
       status: "awaiting-approval" as const,
       approvedPlanFingerprint: "deadbeef",
     };
-    const updatedTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: undefined, approvedPlanFingerprint: undefined };
+    const updatedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const, status: undefined, approvedPlanFingerprint: undefined };
 
     (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
@@ -2873,7 +3059,7 @@ describe("POST /tasks/:id/reject-plan", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/reject-plan");
 
     expect(res.status).toBe(200);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: undefined, approvedPlanFingerprint: null });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: null, approvedPlanFingerprint: null });
   });
 });
 
@@ -3010,6 +3196,96 @@ describe("GET /tasks/:id/diff", () => {
       // The diff should be schema-compatible even if it returns empty
       expect(Array.isArray(res.body.files)).toBe(true);
       expect(res.body.stats).toHaveProperty("filesChanged");
+    });
+
+    it("scopes both done diff endpoints to an attributed commit after a remote rebase", async () => {
+      const root = mkdtempSync(join(tmpdir(), "kb-dashboard-rebase-attribution-"));
+      try {
+        execFileSync("git", ["init", "--initial-branch=main", root], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.email", "kb-tests@example.com"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.name", "KB Tests"], { stdio: "pipe" });
+        writeFileSync(join(root, "base.ts"), "export const base = true;\n");
+        execFileSync("git", ["-C", root, "add", "base.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "base"], { stdio: "pipe" });
+        const rebaseBaseSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+
+        writeFileSync(join(root, "foreign.ts"), "export const remote = true;\n");
+        execFileSync("git", ["-C", root, "add", "foreign.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "remote work"], { stdio: "pipe" });
+        writeFileSync(join(root, "task.ts"), "export const task = true;\n");
+        execFileSync("git", ["-C", root, "add", "task.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "fix(FN-014): task execution change"], { stdio: "pipe" });
+        const commitSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+
+        const localStore = createMockStore({ getRootDir: vi.fn().mockReturnValue(root) });
+        (localStore.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+          ...FAKE_TASK_DETAIL,
+          id: "FN-014",
+          column: "done",
+          modifiedFiles: ["task.ts"],
+          mergeDetails: { commitSha, rebaseBaseSha, filesChanged: 2 },
+        });
+        const app = express();
+        app.use(express.json());
+        app.use("/api", createApiRoutes(localStore));
+
+        const diffResponse = await GET(app, "/api/tasks/FN-014/diff");
+        expect(diffResponse.status).toBe(200);
+        expect(diffResponse.body.files.map((file: { path: string }) => file.path)).toEqual(["task.ts"]);
+        expect(diffResponse.body.files[0].patch).toContain("task = true");
+        expect(diffResponse.body.files.map((file: { path: string }) => file.path)).not.toContain("foreign.ts");
+        expect(diffResponse.body.stats.filesChanged).toBe(1);
+
+        const fileDiffsResponse = await GET(app, "/api/tasks/FN-014/file-diffs");
+        expect(fileDiffsResponse.status).toBe(200);
+        expect(fileDiffsResponse.body.map((file: { path: string }) => file.path)).toEqual(["task.ts"]);
+        expect(fileDiffsResponse.body[0].diff).toContain("task = true");
+        expect(fileDiffsResponse.body.map((file: { path: string }) => file.path)).not.toContain("foreign.ts");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("returns no files for a foreign-only rebase when execution evidence is empty", async () => {
+      const root = mkdtempSync(join(tmpdir(), "kb-dashboard-rebase-unproven-"));
+      try {
+        execFileSync("git", ["init", "--initial-branch=main", root], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.email", "kb-tests@example.com"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.name", "KB Tests"], { stdio: "pipe" });
+        writeFileSync(join(root, "base.ts"), "export const base = true;\n");
+        execFileSync("git", ["-C", root, "add", "base.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "base"], { stdio: "pipe" });
+        const rebaseBaseSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+        writeFileSync(join(root, "foreign.ts"), "export const remote = true;\n");
+        execFileSync("git", ["-C", root, "add", "foreign.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "remote work"], { stdio: "pipe" });
+        writeFileSync(join(root, "unproven.ts"), "export const task = true;\n");
+        execFileSync("git", ["-C", root, "add", "unproven.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "local task work"], { stdio: "pipe" });
+        const commitSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+
+        const localStore = createMockStore({ getRootDir: vi.fn().mockReturnValue(root) });
+        (localStore.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+          ...FAKE_TASK_DETAIL,
+          id: "FN-014",
+          column: "done",
+          modifiedFiles: [],
+          mergeDetails: { commitSha, rebaseBaseSha, filesChanged: 2 },
+        });
+        const app = express();
+        app.use(express.json());
+        app.use("/api", createApiRoutes(localStore));
+
+        const diffResponse = await GET(app, "/api/tasks/FN-014/diff");
+        expect(diffResponse.status).toBe(200);
+        expect(diffResponse.body).toEqual({ files: [], stats: { filesChanged: 0, additions: 0, deletions: 0 } });
+
+        const fileDiffsResponse = await GET(app, "/api/tasks/FN-014/file-diffs");
+        expect(fileDiffsResponse.status).toBe(200);
+        expect(fileDiffsResponse.body).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 
@@ -3453,6 +3729,15 @@ describe("PR conflict refresh + reclaim routes", () => {
     return app;
   }
 
+  const readyMergeStatus = (prInfo: Record<string, unknown>) => ({
+    prInfo: { ...prInfo, headOid: "checked-head", mergeable: "clean" },
+    mergeable: "clean",
+    reviewDecision: "APPROVED",
+    checks: [],
+    mergeReady: true,
+    blockingReasons: [],
+  });
+
   it("create-PR on a task with an existing PR appends instead of overwriting", async () => {
     process.env.GITHUB_REPOSITORY = "owner/repo";
     const existingPr = {
@@ -3796,6 +4081,219 @@ describe("PR conflict refresh + reclaim routes", () => {
     expect(res.body.all).toHaveLength(2);
     expect(res.body.primary.prInfo.number).toBe(res.body.prInfo.number);
     expect(res.body.mergeReady).toBe(res.body.primary.mergeReady);
+  });
+
+  it("blocks the merge before dispatch when the pre-flight status is not merge-ready", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/939", number: 939, status: "open" as const, title: "PR939", headBranch: "fusion/fn-939", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-939", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr");
+    vi.spyOn(GitHubClient.prototype, "getPrMergeStatus").mockResolvedValue({
+      prInfo: { ...prInfo, headOid: "checked-head", mergeable: "blocked" },
+      mergeable: "blocked",
+      reviewDecision: null,
+      checks: [],
+      mergeReady: false,
+      blockingReasons: ["required checks not successful: ci (pending)"],
+    } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("required checks not successful: ci (pending)");
+    expect(mergePrSpy).not.toHaveBeenCalled();
+    expect(store.updatePrInfo).not.toHaveBeenCalled();
+  });
+
+  it("blocks the merge when the checked PR has no head commit id", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/938", number: 938, status: "open" as const, title: "PR938", headBranch: "fusion/fn-938", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-938", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr");
+    vi.spyOn(GitHubClient.prototype, "getPrMergeStatus").mockResolvedValue({
+      prInfo: { ...prInfo, mergeable: "clean" },
+      mergeable: "clean",
+      reviewDecision: "APPROVED",
+      checks: [],
+      mergeReady: true,
+      blockingReasons: [],
+    } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/head commit ID/);
+    expect(mergePrSpy).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a pre-flight status failure without attempting the merge", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/937", number: 937, status: "open" as const, title: "PR937", headBranch: "fusion/fn-937", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-937", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr");
+    vi.spyOn(GitHubClient.prototype, "getPrMergeStatus").mockRejectedValue(new Error("GitHub unavailable"));
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe("GitHub unavailable");
+    expect(mergePrSpy).not.toHaveBeenCalled();
+    expect(store.applyPrMergedTransition).not.toHaveBeenCalled();
+  });
+
+  it("returns a refreshed branch-protection diagnosis for an ambiguous merge failure", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/940", number: 940, status: "open" as const, title: "PR940", headBranch: "fusion/fn-940", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-940", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr").mockRejectedValue(new Error("Pull request is not mergeable"));
+    const getPrMergeStatusSpy = vi.spyOn(GitHubClient.prototype, "getPrMergeStatus")
+      .mockResolvedValueOnce(readyMergeStatus(prInfo) as never)
+      .mockResolvedValueOnce({
+        prInfo: { ...prInfo, mergeable: "blocked" },
+        mergeable: "blocked",
+        reviewDecision: "REVIEW_REQUIRED",
+        checks: [],
+        mergeReady: false,
+        blockingReasons: [],
+      } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details.githubError.code).toBe("merge-blocked-by-policy");
+    expect(res.body.error).toContain("review approval is required");
+    expect(res.body.error).not.toMatch(/conflict/i);
+    expect(store.updatePrInfo).toHaveBeenCalledWith(task.id, expect.objectContaining({
+      mergeable: "blocked",
+      lastMergeError: expect.stringContaining("review approval is required"),
+    }));
+    expect(store.applyPrMergedTransition).not.toHaveBeenCalled();
+    expect(mergePrSpy).toHaveBeenCalledTimes(1);
+    expect(getPrMergeStatusSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns required-check blockers from the refreshed merge status", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/941", number: 941, status: "open" as const, title: "PR941", headBranch: "fusion/fn-941", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-941", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr").mockRejectedValue(new Error("Pull request is not mergeable"));
+    const getPrMergeStatusSpy = vi.spyOn(GitHubClient.prototype, "getPrMergeStatus")
+      .mockResolvedValueOnce(readyMergeStatus(prInfo) as never)
+      .mockResolvedValueOnce({
+        prInfo: { ...prInfo, mergeable: "blocked" },
+        mergeable: "blocked",
+        reviewDecision: null,
+        checks: [],
+        mergeReady: false,
+        blockingReasons: ["required checks not successful: ci (pending)"],
+      } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details.githubError).toMatchObject({ code: "merge-blocked-by-policy" });
+    expect(res.body.error).toContain("required checks not successful: ci (pending)");
+    expect(res.body.error).not.toMatch(/conflict/i);
+    expect(mergePrSpy).toHaveBeenCalledTimes(1);
+    expect(getPrMergeStatusSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the conflict diagnosis for a refreshed conflicting PR", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/942", number: 942, status: "open" as const, title: "PR942", headBranch: "fusion/fn-942", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-942", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr").mockRejectedValue(new Error("Pull request is not mergeable"));
+    const getPrMergeStatusSpy = vi.spyOn(GitHubClient.prototype, "getPrMergeStatus")
+      .mockResolvedValueOnce(readyMergeStatus(prInfo) as never)
+      .mockResolvedValueOnce({
+        prInfo: { ...prInfo, mergeable: "conflicting" },
+        mergeable: "conflicting",
+        reviewDecision: null,
+        checks: [],
+        mergeReady: false,
+        blockingReasons: ["PR mergeability is conflicting"],
+      } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details.githubError.code).toBe("merge-conflict");
+    expect(res.body.error).toMatch(/conflicts/i);
+    expect(mergePrSpy).toHaveBeenCalledTimes(1);
+    expect(getPrMergeStatusSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an ambiguous merge failure generic when its refresh has no merge state", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/942", number: 942, status: "open" as const, title: "PR942", headBranch: "fusion/fn-942", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-942", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr").mockRejectedValue(new Error("Pull request is not mergeable"));
+    const getPrMergeStatusSpy = vi.spyOn(GitHubClient.prototype, "getPrMergeStatus")
+      .mockResolvedValueOnce(readyMergeStatus(prInfo) as never)
+      .mockResolvedValueOnce({
+        prInfo,
+        mergeable: undefined,
+        reviewDecision: null,
+        checks: [],
+        mergeReady: false,
+        blockingReasons: [],
+      } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(502);
+    expect(res.body.details.githubError.code).toBe("unknown");
+    expect(res.body.error).toBe("Pull request is not mergeable");
+    expect(res.body.error).not.toMatch(/conflict/i);
+    expect(mergePrSpy).toHaveBeenCalledTimes(1);
+    expect(getPrMergeStatusSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles a PR merged after the merge command failure exactly once", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/943", number: 943, status: "open" as const, title: "PR943", headBranch: "fusion/fn-943", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-943", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr").mockRejectedValue(new Error("merge command timed out"));
+    const getPrMergeStatusSpy = vi.spyOn(GitHubClient.prototype, "getPrMergeStatus")
+      .mockResolvedValueOnce(readyMergeStatus(prInfo) as never)
+      .mockResolvedValueOnce({
+        prInfo: { ...prInfo, status: "merged" },
+        mergeable: "clean",
+        reviewDecision: "APPROVED",
+        checks: [],
+        mergeReady: true,
+        blockingReasons: [],
+      } as never);
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.prInfo.status).toBe("merged");
+    expect(store.applyPrMergedTransition).toHaveBeenCalledTimes(1);
+    expect(store.updatePrInfo).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: "merged", lastMergeError: undefined }));
+    expect(mergePrSpy).toHaveBeenCalledTimes(1);
+    expect(getPrMergeStatusSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the original merge failure when status refresh fails", async () => {
+    const prInfo = { url: "https://github.com/owner/repo/pull/944", number: 944, status: "open" as const, title: "PR944", headBranch: "fusion/fn-944", baseBranch: "main", commentCount: 0 };
+    const task = { ...FAKE_TASK_DETAIL, id: "FN-944", prInfo, prInfos: [prInfo] };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+    const mergePrSpy = vi.spyOn(GitHubClient.prototype, "mergePr").mockRejectedValue(new Error("merge command failed"));
+    const getPrMergeStatusSpy = vi.spyOn(GitHubClient.prototype, "getPrMergeStatus")
+      .mockResolvedValueOnce(readyMergeStatus(prInfo) as never)
+      .mockRejectedValueOnce(new Error("GitHub unavailable"));
+
+    const res = await REQUEST(buildApp(), "POST", `/api/tasks/${task.id}/pr/merge`, JSON.stringify({}), { "content-type": "application/json" });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe("merge command failed");
+    expect(store.updatePrInfo).toHaveBeenCalledWith(task.id, expect.objectContaining({
+      lastMergeError: "merge command failed",
+    }));
+    expect(store.applyPrMergedTransition).not.toHaveBeenCalled();
+    expect(mergePrSpy).toHaveBeenCalledTimes(1);
+    expect(getPrMergeStatusSpy).toHaveBeenCalledTimes(2);
   });
 
   it("unlink removes targeted PR without closing github PR", async () => {

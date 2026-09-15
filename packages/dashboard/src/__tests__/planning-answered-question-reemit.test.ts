@@ -9,6 +9,11 @@ auto-retry opens one), and the client's question handler reset the bounded auto-
 an unbounded loop. Invariant under test: currentQuestion is only set while the session is
 genuinely awaiting user input — cleared on answer accept, on retry, and never restored from
 non-awaiting_input persisted rows.
+
+FNXC:PlanningMode 2026-08-06-23:18:
+An awaiting-input row is the one valid restored-question surface. Its legacy model payload
+must cross the same normalization boundary as a live response, preserving four alternatives
+and one Other choice instead of trusting persisted options.
 */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +30,10 @@ vi.mock("@fusion/engine", () => ({
     skillSource: "role-fallback" as const,
   }),
   createFnAgent: vi.fn(),
+  // FNXC:PlanningRuntimeResolution 2026-07-24-16:20: planning builds sessions through the
+  // shared runtime-resolving seam; these suites drive it via __setCreateFnAgent, so the
+  // engine export only needs to exist on the mock factory.
+  createResolvedAgentSession: vi.fn(),
   createWorkflowAuthoringTools: () => [],
   createChatTaskDocumentTools: () => [],
   createChatTaskLogsReadTool: () => ({}),
@@ -35,6 +44,7 @@ import {
   __resetPlanningState,
   __setCreateFnAgent,
   createSessionWithAgent,
+  GenerationInProgressError,
   getSession,
   planningStreamManager,
   retrySession,
@@ -42,7 +52,39 @@ import {
   submitResponse,
 } from "../planning.js";
 
+/*
+FNXC:PlanningTurnAdmission 2026-07-24-01:25:
+PR #2417 gave every planning generation entry point a synchronous single-turn reservation
+that is held for the FULL span of the turn — including persistence work after
+session.currentQuestion is emitted. The mock agent's microtask-based firstQuestionEmitted
+signal therefore fires while the initial turn still holds the reservation, so an immediate
+submitResponse/retrySession is (correctly) rejected with GenerationInProgressError.
+Admission rejections are side-effect free by contract (the admission guards run before any
+session mutation), so polling until admission succeeds is safe and deterministic.
+*/
+async function onceAdmitted<T>(attempt: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (err instanceof GenerationInProgressError && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 const MOCK_TASK_STORE = {
+  /*
+  FNXC:PlanningMode 2026-07-24-01:25:
+  FN-8538 (3f976e3dc) gave Planning Mode a dedicated collaborative prompt:
+  resolvePlanningModeSystemPrompt now reads store.getSettings() on every planning
+  agent creation, so the mock store must expose it.
+  */
+  getSettings: vi.fn(async () => ({})),
   listTasks: vi.fn(async () => []),
   getTask: vi.fn(async () => {
     throw new Error("not found");
@@ -195,7 +237,7 @@ describe("answered planning questions are never re-emittable", () => {
     const sessionId = await startSessionAtFirstQuestion(agent);
 
     const hungEntered = agent.hungTurnEntered;
-    const submitPromise = submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE);
+    const submitPromise = onceAdmitted(() => submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE));
     submitPromise.catch(() => {});
     await hungEntered;
 
@@ -207,8 +249,8 @@ describe("answered planning questions are never re-emittable", () => {
 
     agent.releaseHungTurn(questionPayload(Q2));
     const result = await submitPromise;
-    expect(result).toEqual({ type: "question", data: Q2 });
-    expect((await getSession(sessionId))?.currentQuestion).toEqual(Q2);
+    expect(result).toMatchObject({ type: "question", data: { id: Q2.id, question: Q2.question } });
+    expect((await getSession(sessionId))?.currentQuestion).toMatchObject({ id: Q2.id, question: Q2.question });
   });
 
   it("keeps currentQuestion cleared when generation fails, while preserving the legacy 200 respond contract", async () => {
@@ -218,11 +260,11 @@ describe("answered planning questions are never re-emittable", () => {
     ]);
     const sessionId = await startSessionAtFirstQuestion(agent);
 
-    const result = await submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE);
+    const result = await onceAdmitted(() => submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE));
 
     // The modal ignores this body and lets the SSE error event drive recovery;
     // it must stay a resolved response, not a thrown InvalidSessionStateError.
-    expect(result).toEqual({ type: "question", data: Q1 });
+    expect(result).toMatchObject({ type: "question", data: { id: Q1.id, question: Q1.question } });
 
     const session = await getSession(sessionId);
     expect(session?.error).toMatch(/provider exploded/);
@@ -236,14 +278,14 @@ describe("answered planning questions are never re-emittable", () => {
       { kind: "hang" },
     ]);
     const sessionId = await startSessionAtFirstQuestion(agent);
-    await submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE);
+    await onceAdmitted(() => submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE));
 
     // Simulate a row persisted by a pre-fix build where the answered question lingered.
     const session = await getSession(sessionId);
     session!.currentQuestion = Q1;
 
     const hungEntered = agent.hungTurnEntered;
-    const retryPromise = retrySession(sessionId, "/tmp/project", undefined, MOCK_TASK_STORE);
+    const retryPromise = onceAdmitted(() => retrySession(sessionId, "/tmp/project", undefined, MOCK_TASK_STORE));
     retryPromise.catch(() => {});
     await hungEntered;
 
@@ -251,38 +293,11 @@ describe("answered planning questions are never re-emittable", () => {
 
     agent.releaseHungTurn(questionPayload(Q2));
     await retryPromise;
-    expect((await getSession(sessionId))?.currentQuestion).toEqual(Q2);
+    expect((await getSession(sessionId))?.currentQuestion).toMatchObject({ id: Q2.id, question: Q2.question });
   });
 
-  it("clears the deepening checkpoint question while a deepening turn generates", async () => {
-    const agent = setupAgent([
-      { kind: "respond", payload: questionPayload(Q1) },
-      { kind: "respond", payload: COMPLETE_PAYLOAD },
-      { kind: "hang" },
-    ]);
-    const sessionId = await startSessionAtFirstQuestion(agent);
+  /* FNXC:PlanningMode 2026-07-19-01:45: deepen checkpoint reemit case removed with FN-8341. */
 
-    const checkpointResult = await submitResponse(sessionId, { q1: "ship auth first" }, "/tmp/project", undefined, MOCK_TASK_STORE);
-    expect(checkpointResult.type).toBe("question");
-    expect((checkpointResult as { data: { id: string } }).data.id).toBe(PLANNING_DEEPEN_CHECKPOINT_ID);
-
-    const hungEntered = agent.hungTurnEntered;
-    const submitPromise = submitResponse(
-      sessionId,
-      { [PLANNING_DEEPEN_CHECKPOINT_ID]: [], _other: "explore security hardening" },
-      "/tmp/project",
-      undefined,
-      MOCK_TASK_STORE,
-    );
-    submitPromise.catch(() => {});
-    await hungEntered;
-
-    expect((await getSession(sessionId))?.currentQuestion).toBeUndefined();
-
-    agent.releaseHungTurn(questionPayload(Q2));
-    const result = await submitPromise;
-    expect(result).toEqual({ type: "question", data: Q2 });
-  });
 
   it("does not restore currentQuestion from persisted rows that are not awaiting input", async () => {
     const baseRow: Omit<AiSessionRow, "id" | "status"> = {
@@ -312,6 +327,10 @@ describe("answered planning questions are never re-emittable", () => {
 
     expect((await getSession("restored-error"))?.currentQuestion).toBeUndefined();
     expect((await getSession("restored-generating"))?.currentQuestion).toBeUndefined();
-    expect((await getSession("restored-awaiting"))?.currentQuestion).toEqual(Q1);
+    const restoredQuestion = (await getSession("restored-awaiting"))?.currentQuestion;
+    expect(restoredQuestion).toMatchObject({ id: Q1.id, question: Q1.question, type: "single_select" });
+    expect(restoredQuestion?.options).toHaveLength(5);
+    expect(restoredQuestion?.options?.filter((option) => !option.isOther)).toHaveLength(4);
+    expect(restoredQuestion?.options?.filter((option) => option.isOther)).toHaveLength(1);
   });
 });

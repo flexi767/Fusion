@@ -1,18 +1,36 @@
-import type { Task, TaskStore } from "@fusion/core";
+import type { Task, TaskStore, WorkflowIr } from "@fusion/core";
+import { completeColumnsForTask } from "./task-lifecycle-lanes.js";
 import { resolveGitLabClient, resolveGitLabTarget, safeLogGitLabEntry } from "./gitlab-lifecycle.js";
 
 export const GITLAB_RECONCILE_SCAN_LIMIT = 200;
 
 type BackfillResult = { scanned: number; filled: number; skipped: number; errors: number; hasMore: boolean };
 
-function hasDoneColumn(task: Pick<Task, "column">): boolean {
-  return task.column === "done";
+/*
+FNXC:WorkflowResolvedColumns 2026-07-30-03:25 (batch-core):
+Candidacy is now resolved from each task's OWN workflow. Keyed on `done`, this backfill found nothing
+on a renamed board and reported a clean scan — `scanned: N, filled: 0` reads as "nothing to do", so
+the failure was indistinguishable from success.
+
+Two-stage on purpose: the CHEAP provider and closedAt tests run first and reject almost everything,
+so the workflow read only happens for tasks that could actually be candidates. It also shares one IR
+cache across the scan, making it one read per distinct workflow rather than per task.
+
+`completeColumnsForTask` is the sole terminal criterion. The live store scan excludes soft-deleted
+and historical-sentinel rows.
+*/
+function isGitLabSourceCandidate(task: Task): boolean {
+  return task.sourceIssue?.provider === "gitlab" && !task.sourceIssue.closedAt;
 }
 
-function isGitLabBackfillCandidate(task: Task): boolean {
-  return hasDoneColumn(task)
-    && task.sourceIssue?.provider === "gitlab"
-    && !task.sourceIssue.closedAt;
+async function filterGitLabBackfillCandidates(store: TaskStore, tasks: readonly Task[]): Promise<Task[]> {
+  const irCache = new Map<string, WorkflowIr>();
+  const candidates: Task[] = [];
+  for (const task of tasks) {
+    if (!isGitLabSourceCandidate(task)) continue;
+    if ((await completeColumnsForTask(store, task.id, irCache)).has(task.column)) candidates.push(task);
+  }
+  return candidates;
 }
 
 function normalizeProviderTimestamp(value: string | undefined): string | undefined {
@@ -27,7 +45,7 @@ function normalizeProviderTimestamp(value: string | undefined): string | undefin
  * GitLab closed-at backfill is an explicit operator action for local analytics accuracy. It reads real GitLab issue/MR terminal timestamps only, skips already-filled rows, and never fabricates timestamps from local task state or provider `updated_at` values.
  *
  * FNXC:CommandCenterGitLab 2026-07-02-00:00:
- * Archived tasks live in archiveDb, so this active-task backfill intentionally excludes them instead of calling updateTask/logEntry on read-only archive rows.
+ * This active-task backfill excludes soft-deleted and historical-sentinel rows instead of mutating read-only history.
  */
 export class GitLabSourceIssueReconciler {
   async backfillSourceIssueClosedAt(
@@ -37,7 +55,7 @@ export class GitLabSourceIssueReconciler {
     const offset = Math.max(0, options?.offset ?? 0);
     const limit = Math.max(0, options?.limit ?? GITLAB_RECONCILE_SCAN_LIMIT);
     const listedTasks = await store.listTasks({ slim: false, includeArchived: false } as Parameters<TaskStore["listTasks"]>[0]);
-    const matchingTasks = (Array.isArray(listedTasks) ? listedTasks : []).filter(isGitLabBackfillCandidate);
+    const matchingTasks = await filterGitLabBackfillCandidates(store, Array.isArray(listedTasks) ? listedTasks : []);
     const tasks = matchingTasks.slice(offset, offset + limit);
     const hasMore = offset + limit < matchingTasks.length;
 

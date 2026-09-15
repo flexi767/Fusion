@@ -14,12 +14,23 @@ Both forges' import routes call the same helper, so the helper + its policies ar
 */
 
 vi.mock("@fusion/core", () => ({
+  /*
+  FNXC:DashboardTestMocks 2026-08-03-04:10 (whole-file red on main — a mock factory missing one export):
+  `createLogger` is stubbed because a `vi.mock("@fusion/core", …)` factory REPLACES the module: any export the
+  module under test (or anything it transitively imports) reaches for and the factory omits throws
+  `No "createLogger" export is defined`, which fails the ENTIRE file rather than one case.
+
+  That makes this class systemic rather than local: every PR that adds a `createLogger` call to a module inside
+  this import graph reddens every suite whose factory predates it, and the failure names the mock rather than the
+  change that caused it. Four whole-file reds on main came from two missing exports (this and `execFile`).
+  */
+  createLogger: () => ({ log: () => undefined, debug: () => undefined, warn: () => undefined, error: () => undefined }),
   isGhAvailable: () => false,
   isGhAuthenticated: () => false,
   runGhAsync: vi.fn(async () => ""),
 }));
 
-const { extractIssueImageUrls, importIssueImageAttachments, githubImagePolicy, gitlabImagePolicy } =
+const { containsIssueImageMarkup, extractIssueImageUrls, importIssueImageAttachments, importIssueImagesFromUrls, githubImagePolicy, gitlabImagePolicy } =
   await import("../issue-image-attachments.js");
 
 const PNG = Buffer.from("89504e470d0a1a0a", "hex");
@@ -336,5 +347,36 @@ describe("importIssueImageAttachments", () => {
     const result = await importIssueImageAttachments(store as never, "FN-1", "plain text issue", GH);
     expect(result).toEqual({ attached: 0, failed: 0 });
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("re-resolves persisted URLs before downloading them", async () => {
+    const result = await importIssueImagesFromUrls(
+      store as never,
+      "FN-1",
+      ["https://169.254.169.254/x.png"],
+      GH,
+    );
+    expect(result).toEqual({ attached: 0, failed: 1 });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("downloads a policy-allowed persisted URL", async () => {
+    await expect(importIssueImagesFromUrls(
+      store as never,
+      "FN-1",
+      ["https://github.com/user-attachments/assets/abc-123"],
+      GH,
+    )).resolves.toEqual({ attached: 1, failed: 0 });
+    expect(store.addAttachment).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a containment-only image-bearing predicate", () => {
+    const markdown = "![shot](https://github.com/user-attachments/assets/abc-123)";
+    const html = '<img src="https://github.com/user-attachments/assets/abc-123">';
+    expect(containsIssueImageMarkup(markdown)).toBe(true);
+    expect(containsIssueImageMarkup(html)).toBe(true);
+    expect(containsIssueImageMarkup("prose only")).toBe(false);
+    expect(containsIssueImageMarkup("![foreign](https://example.com/a.png)")).toBe(true);
+    expect(extractIssueImageUrls([markdown, html], GH)).toHaveLength(1);
   });
 });

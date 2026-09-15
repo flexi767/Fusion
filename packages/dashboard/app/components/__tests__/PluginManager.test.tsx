@@ -902,8 +902,17 @@ describe("PluginManager", () => {
     await screen.findAllByText("WhatsApp Chat");
     await userEvent.click(screen.getByTitle("Settings"));
 
-    expect(await screen.findByTestId("whatsapp-pairing-instructions")).toBeTruthy();
-    expect(screen.getAllByText("Allowed WhatsApp Senders")).toHaveLength(2);
+    /*
+    FNXC:WhatsAppPairing 2026-08-23-21:00:
+    FN-013 localized the pairing instructions, so the allow-list field name is now interpolated into
+    one sentence rather than rendered as its own exact-text node: the instructions must still name
+    the field, and the settings form still carries exactly one label for it.
+    */
+    const instructions = await screen.findByTestId("whatsapp-pairing-instructions");
+    expect(instructions).toHaveTextContent("Allowed WhatsApp Senders");
+    expect(screen.getAllByText("Allowed WhatsApp Senders")).toHaveLength(1);
+    expect(instructions.compareDocumentPosition(screen.getByText("Allowed WhatsApp Senders")))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 
   it("shows plugin detail view when settings button is clicked", async () => {
@@ -1209,22 +1218,33 @@ describe("PluginManager", () => {
       });
     });
 
-    it("handles plugin uninstalled SSE event", async () => {
-      vi.mocked(fetchPlugins).mockResolvedValueOnce(mockPlugins);
+    it("removes a runtime toggle after its uninstalled lifecycle event", async () => {
+      const hermesRuntime: PluginInstallation = {
+        id: "fusion-plugin-hermes-runtime",
+        name: "Hermes Runtime",
+        version: "1.0.0",
+        state: "started",
+        enabled: true,
+        path: "./plugins/fusion-plugin-hermes-runtime",
+        settings: {},
+        settingsSchema: {},
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      vi.mocked(fetchPlugins).mockResolvedValueOnce([hermesRuntime]);
 
       render(<PluginManager addToast={addToast} />);
 
-      await waitFor(() => {
-        expect(screen.getByText("Test Plugin A")).toBeTruthy();
-      });
+      const installedCard = await waitFor(() => getBuiltInPluginCard("Hermes Runtime"));
+      expect(within(installedCard).getByRole("checkbox", { name: "Disable Hermes Runtime" })).toBeChecked();
 
       const eventSourceInstance = (globalThis as any).__testEventSourceInstance;
       const eventHandler = eventSourceInstance?.handlers?.["plugin:lifecycle"];
-      
+
       act(() => {
         eventHandler({
           data: JSON.stringify({
-            pluginId: "plugin-a",
+            pluginId: hermesRuntime.id,
             transition: "uninstalled",
             sourceEvent: "plugin:unregistered",
             timestamp: new Date().toISOString(),
@@ -1237,7 +1257,10 @@ describe("PluginManager", () => {
       });
 
       await waitFor(() => {
-        expect(screen.queryByText("Test Plugin A")).toBeNull();
+        const card = getBuiltInPluginCard("Hermes Runtime");
+        expect(within(card).getByRole("button", { name: "Install Hermes Runtime" })).toBeVisible();
+        expect(within(card).queryByRole("checkbox")).not.toBeInTheDocument();
+        expect(card.querySelector("label.toggle-switch")).toBeNull();
       });
     });
 
@@ -1707,7 +1730,7 @@ describe("PluginManager", () => {
       const settingsButtons = screen.getAllByTitle("Settings");
       await userEvent.click(settingsButtons[0]);
 
-      const pluginTitle = await screen.findByRole("heading", { name: "Test Plugin A", level: 4 });
+      const pluginTitle = await screen.findByRole("heading", { name: /Test Plugin A/, level: 2 });
       const settingsHeading = screen.getByRole("heading", { name: "Settings", level: 5 });
 
       expect(pluginTitle).toBeTruthy();

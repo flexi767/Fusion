@@ -1,6 +1,7 @@
 import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Settings, TaskStore } from "@fusion/core";
+import { resolveProjectDefaultModel, resolveTaskPrHeadBranch } from "@fusion/core";
 import { createResolvedAgentSession, resolveMcpServersForStore, type PluginRunner } from "@fusion/engine";
 import { runGitCommand } from "./routes/resolve-diff-base.js";
 
@@ -52,21 +53,20 @@ export interface ResolvePrConflictsResult {
   message: string;
 }
 
-function getHeadBranch(taskId: string): string {
-  return `fusion/${taskId.toLowerCase()}`;
-}
-
+/*
+FNXC:LaneModelResolution 2026-07-24-17:40:
+Delegate to the shared core resolver instead of hand-rolling the override→default chain.
+The local copy drifted in two ways: it never applied `applyTestModeOverrides`, so a project
+with `testMode: true` could still issue a real provider call from PR conflict resolution, and
+it returned the two halves independently, so a settings row with only one half set propagated
+a half-set pair — which the runtime treats as unset and silently replaces with its own
+built-in Anthropic default. `resolveProjectDefaultModel` handles both.
+*/
 function getDefaultSessionModel(settings: Settings): { provider: string | undefined; modelId: string | undefined } {
-  if (settings.defaultProviderOverride && settings.defaultModelIdOverride) {
-    return {
-      provider: settings.defaultProviderOverride,
-      modelId: settings.defaultModelIdOverride,
-    };
-  }
-  return {
-    provider: settings.defaultProvider,
-    modelId: settings.defaultModelId,
-  };
+  const resolved = resolveProjectDefaultModel(settings);
+  return resolved.provider && resolved.modelId
+    ? { provider: resolved.provider, modelId: resolved.modelId }
+    : { provider: undefined, modelId: undefined };
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -219,7 +219,13 @@ async function runResolutionAgent(params: {
 export async function resolvePrConflicts(input: ResolvePrConflictsInput): Promise<ResolvePrConflictsResult> {
   const { taskId, baseRef, rootDir, store } = input;
   const task = await store.getTask(taskId);
-  const branchName = getHeadBranch(taskId);
+  /*
+  FNXC:WorkspacePrHead 2026-08-20-03:38:
+  Conflict resolution checks out the same persisted branch PR creation exposes.
+  A workspace task may intentionally reuse an operator branch, so deriving
+  fusion/<task-id> here would resolve conflicts on the wrong ref.
+  */
+  const branchName = resolveTaskPrHeadBranch(task);
   const reusableWorktree = await resolveUsableWorktree(task.worktree, branchName);
   const tempWorktreePath = join(rootDir, ".fusion", "worktrees", `conflict-${taskId.toLowerCase()}`);
   const cwd = reusableWorktree ?? tempWorktreePath;

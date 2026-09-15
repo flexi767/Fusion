@@ -42,24 +42,39 @@ describe("board-mobile-overscroll-containment (FN-6378)", () => {
     expect(boardBlock).not.toContain("scroll-snap-type: x mandatory");
   });
 
-  it("base .board contains horizontal overscroll for shared and tablet board scrollers", () => {
+  /*
+  FNXC:BoardNavigation 2026-07-24-10:05:
+  Desktop must never snap: the base scrollers keep overscroll containment but declare
+  `scroll-snap-type: none`, so wheel/trackpad panning is free of the browser's snap settle
+  animation. Snapping is asserted only inside the phone-tier media blocks above/below.
+  */
+  it("base .board contains horizontal overscroll and does not snap on desktop", () => {
     const boardBlock = extractRuleBlock(baseCss, ".board");
 
     expect(boardBlock).toContain("overflow-x: auto");
     expect(boardBlock).toContain("overscroll-behavior-x: contain");
-    expect(boardBlock).toContain("scroll-snap-type: x proximity");
-    expect(boardBlock).not.toContain("scroll-snap-type: x mandatory");
+    expect(boardBlock).toContain("scroll-snap-type: none");
+    expect(boardBlock).not.toContain("scroll-snap-type: x");
   });
 
-  it("workflow columns and multi-lane column strips contain horizontal overscroll", () => {
+  it("live workflow Board columns contain horizontal overscroll and do not snap on desktop", () => {
     const workflowColumnsBlock = extractRuleBlock(baseCss, ".board.board-workflow-columns");
-    const laneColumnsBlock = extractRuleBlock(baseCss, ".lane-columns");
 
-    for (const block of [workflowColumnsBlock, laneColumnsBlock]) {
-      expect(block).toContain("overflow-x: auto");
-      expect(block).toContain("overscroll-behavior-x: contain");
-      expect(block).toContain("scroll-snap-type: x proximity");
-      expect(block).not.toContain("scroll-snap-type: x mandatory");
-    }
+    expect(workflowColumnsBlock).toContain("overflow-x: auto");
+    expect(workflowColumnsBlock).toContain("overscroll-behavior-x: contain");
+    expect(workflowColumnsBlock).toContain("scroll-snap-type: none");
+    expect(workflowColumnsBlock).not.toContain("scroll-snap-type: x");
+  });
+
+  it("does not ship the retired lane selector in base or phone CSS", () => {
+    expect(baseCss).not.toMatch(/\.lane-columns\b/);
+    expect(mobileCss).not.toMatch(/\.lane-columns\b/);
+  });
+
+  it("phone tier re-enables proximity snapping for the live workflow Board", () => {
+    const workflowColumnsBlock = extractRuleBlock(mobileCss, ".board.board-workflow-columns");
+
+    expect(workflowColumnsBlock).toContain("scroll-snap-type: x proximity");
+    expect(workflowColumnsBlock).not.toContain("scroll-snap-type: x mandatory");
   });
 });

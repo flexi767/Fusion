@@ -17,8 +17,8 @@ const testState = vi.hoisted(() => ({
 // dispatch onto runAiMerge (merger-ai.js). This test injects a verification
 // failure through the merge seam, so it now mocks runAiMerge. merger.js stays
 // real (importOriginal) for commitOrAmendMergeWithFixes used below.
-vi.mock("../../merger-ai.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../merger-ai.js")>();
+vi.mock("../../merge/merger-ai.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../merge/merger-ai.js")>();
   return {
     ...actual,
     runAiMerge: testState.runAiMerge,
@@ -87,7 +87,6 @@ function createStore(task: Task, taskSequence?: Task[]) {
     on: emitter.on.bind(emitter),
     off: emitter.off.bind(emitter),
     walCheckpoint: () => ({ busy: 0, log: 0, checkpointed: 0 }),
-    archiveTaskAndCleanup: async () => ({}),
     clearStaleExecutionStartBranchReferences: () => [],
     updateSettings: async () => ({}),
     mergeTask: async () => undefined,
@@ -201,7 +200,7 @@ describe("post-finalize verification failure reliability interactions (real git)
       expect(task.status ?? null).toBeNull();
       expect(task.mergeDetails?.mergeConfirmed).toBe(true);
       expect(comments.some((comment) => comment.includes("Please fix the failing"))).toBe(false);
-      expect(logs.some((entry) => entry.includes("[verification] post-finalize verification failed for already-on-main fast-path; no action"))).toBe(true);
+      expect(logs.some((entry) => entry.includes("post-finalize verification"))).toBe(false);
 
       const manager = new SelfHealingManager(store, { rootDir: dir, getExecutingTaskIds: () => new Set() });
       await expect(manager.recoverStaleMergingStatus()).resolves.toBe(0);

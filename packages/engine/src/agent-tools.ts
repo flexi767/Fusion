@@ -13,35 +13,58 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import * as fusionCore from "@fusion/core";
-import type { AgentState, AgentCapability, AgentUpdateInput, AgentLogEntry, Artifact, ArtifactCreateInput, ArtifactWithTask, Task, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus, WorkflowIrNode } from "@fusion/core";
+import type { AgentState, AgentCapability, AgentUpdateInput, AgentLogEntry, Artifact, ArtifactCreateInput, ArtifactWithTask, Task, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus, WorkflowIrNode, IdeationCandidate, MissionWithHierarchy, DbTransaction } from "@fusion/core";
 import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon, parseWorkflowIr, WorkflowIrError, assertColumnTraitsValid, ColumnTraitValidationError } from "@fusion/core";
-import { promoteHeldTask } from "./hold-release.js";
+import { promoteHeldTask } from "./execution/hold-release.js";
 import { computeCrossParentDiagnosticClaim, computeCrossParentDiagnosticClaimId, computeParentIntentClaimId, DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, evaluateImplementationTaskBind, extractAgentProvisioningRequest, findSameAgentDuplicates, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, reconcileDeterministicDuplicate, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTaskGithubTracking, runDeterministicDuplicateGuard, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh } from "@fusion/core";
-import { ResearchOrchestrator } from "./research-orchestrator.js";
+import { ResearchOrchestrator } from "./research/research-orchestrator.js";
 import { ResearchProviderRegistry } from "./research/provider-registry.js";
-import { ResearchStepRunner } from "./research-step-runner.js";
+import { ResearchStepRunner } from "./research/research-step-runner.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@earendil-works/pi-ai";
-import type { AgentReflectionService } from "./agent-reflection.js";
+import type { AgentReflectionService } from "./agents/agent-reflection.js";
 import { createLogger } from "./logger.js";
-import { fetchWebContent, WebFetchError } from "./web-fetch.js";
-import type { RunAuditor } from "./run-audit.js";
-import { computeApprovalDedupeKey } from "./agent-action-gate.js";
+// FNXC:PlanArtifactPersistence 2026-07-26-03:55: PROMPT.md is filesystem-only; mirror plan writes into the DB.
+import { mirrorPlanToProjectDb } from "./plan-artifact-writeback.js";
+import { fetchWebContent, WebFetchError } from "./util/web-fetch.js";
+import type { RunAuditor } from "./util/run-audit.js";
+import { computeApprovalDedupeKey } from "./agents/agent-action-gate.js";
 import { MessageDeliveryAutoRecoveryHandler } from "./auto-recovery-handlers/message-delivery.js";
-import { emitGoalRetrievalAudit } from "./goal-anchoring-audit.js";
-import { recordRetry } from "./retry-burned-logger.js";
-import { acquireWorkspaceRepoWorktree, WorkspaceRepoAcquireBusyError } from "./worktree-acquisition.js";
-import { validateCodeNodeSources } from "./code-node-runner.js";
+import { emitGoalRetrievalAudit } from "./goals/goal-anchoring-audit.js";
+import { recordRetry } from "./errors/retry-burned-logger.js";
+import {
+  DEPENDENCY_INSTALL_COMMAND_TIMEOUT_MS,
+  recordPlannerDependencyResolution,
+  type DependencyCommandResult,
+  type DependencyCommandRunner,
+} from "./worktree/worktree-dependency-install.js";
+import { validateCodeNodeSources } from "./execution/code-node-runner.js";
+import { resolveFeatureRepairTargets } from "./missions/mission-feature-sync.js";
+import { reconcileMissionState } from "./missions/mission-state-reconcile.js";
 
 // ── Tool parameter schemas (canonical definitions) ────────────────────────
 
 const TASK_CREATE_PRIORITY_VALUES = ["low", "normal", "high", "urgent"] as const;
 
-const missionLineageParams = Type.Object({
-  mission_id: Type.String({ description: "Approved mission ID for this implementation task" }),
-  slice_id: Type.String({ description: "Approved slice ID under the mission" }),
-  feature_id: Type.String({ description: "Approved feature ID under the slice" }),
-});
+/*
+FNXC:MissionAdmission 2026-07-22-13:07:
+Chat/user-directed freeform intake may omit mission_lineage (same as board Quick Entry).
+Autonomous heartbeat surfaces pass requireMissionLineage and hard-require an approved chain.
+When supplied, the full Feature → Slice → Milestone → Mission chain is always validated.
+*/
+const missionLineageParams = Type.Object(
+  {
+    mission_id: Type.String({ description: "Approved mission ID for this implementation task" }),
+    slice_id: Type.String({ description: "Approved slice ID under the mission" }),
+    feature_id: Type.String({ description: "Approved feature ID under the slice" }),
+  },
+  {
+    description:
+      "Optional approved Feature → Slice → Mission linkage. Omit for freeform intake (chat/board). " +
+      "Required only on autonomous heartbeat patrol creates. When omitted on a follow-up, may inherit " +
+      "from a mission-linked parent task. When supplied, the full active chain is validated.",
+  },
+);
 
 export const taskCreateParams = Type.Object({
   description: Type.String({ description: "What needs to be done" }),
@@ -77,10 +100,18 @@ const agentLogTypeParams = Type.Union([
   Type.Literal("tool_error"),
 ], { description: "Only return entries of this agent-log type." });
 
+const agentLogDetailModeParams = Type.Union([
+  Type.Literal("preview"),
+  Type.Literal("full"),
+], {
+  description: "Tool-detail mode. Preview (default) bounds each detail row; full lifts that row preview while the whole response remains bounded.",
+});
+
 export const taskLogsReadParams = Type.Object({
   limit: Type.Optional(Type.Number({ description: "Maximum matching entries to return (default 100)." })),
   offset: Type.Optional(Type.Number({ description: "Number of matching entries to skip from the newest entry (default 0)." })),
   type: Type.Optional(agentLogTypeParams),
+  detail: Type.Optional(agentLogDetailModeParams),
 });
 
 export const chatTaskLogsReadParams = Type.Object({
@@ -88,6 +119,7 @@ export const chatTaskLogsReadParams = Type.Object({
   limit: Type.Optional(Type.Number({ description: "Maximum matching entries to return (default 100)." })),
   offset: Type.Optional(Type.Number({ description: "Number of matching entries to skip from the newest entry (default 0)." })),
   type: Type.Optional(agentLogTypeParams),
+  detail: Type.Optional(agentLogDetailModeParams),
 });
 
 export const taskListParams = Type.Object({});
@@ -98,18 +130,24 @@ export const taskShowParams = Type.Object({
 
 export const taskSearchParams = Type.Object({
   query: Type.String({ minLength: 1, description: "Search query" }),
-  includeDone: Type.Optional(Type.Boolean({ description: "Include done tasks (default true)" })),
-  includeArchived: Type.Optional(Type.Boolean({ description: "Include archived tasks (default true)" })),
+  includeDone: Type.Optional(Type.Boolean({ description: "Include done tasks (default false)" })),
   limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50, description: "Max results (default 20, max 50)" })),
 });
 
-export const acquireRepoWorktreeParams = Type.Object({
-  repo: Type.String({
-    description:
-      "Relative path of the sub-repo within the workspace to acquire a worktree in " +
-      "(e.g. 'wolf-server'). Must be one of the repos listed in the workspace. " +
-      "If already acquired, returns the existing worktree path immediately.",
+export const historyReadParams = Type.Object({
+  query: Type.Optional(Type.String({ description: "Search task IDs, titles, and completion summaries" })),
+  from: Type.Optional(Type.String({ description: "First UTC day, YYYY-MM-DD (inclusive)" })),
+  to: Type.Optional(Type.String({ description: "Last UTC day, YYYY-MM-DD (inclusive)" })),
+  limit: Type.Optional(Type.Number({ minimum: 1, description: "Max entries (default 20, max 50)" })),
+});
+
+export const installWorktreeDependenciesParams = Type.Object({
+  action: Type.Union([Type.Literal("install"), Type.Literal("none")], {
+    description: "Run an engine-observed dependency install, or record a reasoned absence of an install step.",
   }),
+  command: Type.Optional(Type.String({ minLength: 1, description: "Required for action=install; command executed by Fusion in the task worktree." })),
+  reason: Type.Optional(Type.String({ minLength: 1, description: "Required for action=none; why this dependency evidence needs no install step." })),
+  repository: Type.Optional(Type.String({ minLength: 1, description: "Workspace-relative repository path when this task has multiple configured repositories." })),
 });
 
 export const taskDocumentWriteParams = Type.Object({
@@ -118,6 +156,8 @@ export const taskDocumentWriteParams = Type.Object({
   }),
   content: Type.String({ description: "Document content to store" }),
   author: Type.Optional(Type.String({ description: "Who is writing (default: 'agent')" })),
+  expected_revision: Type.Optional(Type.Integer({ minimum: 0, description: "CAS precondition: 0 requires absence; a positive value must match the current revision." })),
+  expected_content_hash: Type.Optional(Type.String({ pattern: "^sha256:[0-9a-f]{64}$", description: "CAS precondition: current exact-content SHA-256 (`sha256:<64 lowercase hex>`) must match." })),
 });
 
 export const taskDocumentReadParams = Type.Object({
@@ -150,6 +190,8 @@ export const chatTaskDocumentWriteParams = Type.Object({
   }),
   content: Type.String({ description: "Document content to store" }),
   author: Type.Optional(Type.String({ description: "Who is writing (default: 'agent')" })),
+  expected_revision: Type.Optional(Type.Integer({ minimum: 0, description: "CAS precondition: 0 requires absence; a positive value must match the current revision." })),
+  expected_content_hash: Type.Optional(Type.String({ pattern: "^sha256:[0-9a-f]{64}$", description: "CAS precondition: current exact-content SHA-256 (`sha256:<64 lowercase hex>`) must match." })),
 });
 
 export const chatTaskDocumentReadParams = Type.Object({
@@ -235,6 +277,58 @@ export const taskPromoteParams = Type.Object({
   task_id: Type.Optional(
     Type.String({ description: "Held task to promote. Defaults to the current task." }),
   ),
+});
+
+export const taskDeleteParams = Type.Object({
+  id: Type.String({ description: "Task ID to delete (e.g. FN-001)" }),
+  allowResurrection: Type.Optional(Type.Boolean({ description: "When true, mark this tombstone as explicitly reusable for future recreation." })),
+  removeLineageReferences: Type.Optional(Type.Boolean({ description: "When true, clear incoming lineage-parent references before deleting." })),
+});
+
+export const taskRetryParams = Type.Object({
+  id: Type.String({ description: "Task ID to retry (e.g. FN-001)." }),
+});
+
+export const taskPauseParams = Type.Object({
+  id: Type.String({ description: "Task ID (e.g. FN-001)" }),
+});
+
+export const taskUnpauseParams = Type.Object({
+  id: Type.String({ description: "Task ID (e.g. FN-001)" }),
+});
+
+export const taskDuplicateParams = Type.Object({
+  id: Type.String({ description: "Source task ID to duplicate (e.g. FN-001)" }),
+});
+
+export const taskMergeParams = Type.Object({
+  task_id: Type.String({ description: "The task ID to merge into the current task." }),
+});
+
+export const taskAddDepParams = Type.Object({
+  task_id: Type.String({ description: "The ID of the task to depend on (e.g. \"KB-001\")" }),
+  confirm: Type.Optional(Type.Boolean({ description: "Set to true to confirm adding the dependency. Required because adding a dependency to an in-progress task will stop execution and discard current work." })),
+});
+
+export const STEP_STATUSES = ["pending", "in-progress", "done", "skipped"] as const;
+
+export const taskUpdateParams = Type.Object({
+  step: Type.Optional(Type.Number({ description: "Step number (0-indexed; matches the `### Step N:` numbers in PROMPT.md — Step 0 is Preflight). Omit when updating only custom_fields/dependencies." })),
+  status: Type.Optional(Type.Union(
+    STEP_STATUSES.map((s) => Type.Literal(s)),
+    { description: "New status: pending, in-progress, done, or skipped. Required when step is set." },
+  )),
+  summary: Type.Optional(Type.String({ description: "2-4 plain-language sentences describing what THIS step actually delivered (files/behavior changed, verification run). Required when status is 'done'. Shown to the operator in the task History tab." })),
+  dependencies: Type.Optional(Type.Array(Type.String(), {
+    description: "Optional task dependency array. Replaces existing dependencies. Pass ['FN-001', 'FN-002'] to set dependencies. Pass [] to clear all dependencies. Omit parameter to preserve existing dependencies.",
+  })),
+  custom_fields: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+    description:
+      "Optional patch of workflow-defined custom field values, keyed by field id. " +
+      "Values are validated against the task's workflow field schema (type/enum membership); " +
+      "pass null for a field to clear it. Rejected writes return the offending field id and reason. " +
+      "Only fields declared by the task's workflow may be written.",
+  })),
 });
 
 export const workflowCreateParams = Type.Object({
@@ -391,6 +485,11 @@ export const delegateTaskParams = Type.Object({
         "Omit to inherit the project default workflow. Use fn_workflow_list to discover valid IDs.",
     }),
   ),
+  /*
+  FNXC:MissionAdmission 2026-07-22-13:07:
+  Same freeform-vs-autonomous contract as fn_task_create: optional for user-directed
+  delegation; required when the tool factory is registered with requireMissionLineage.
+  */
   mission_lineage: Type.Optional(missionLineageParams),
   override: Type.Optional(Type.Boolean({ description: "Set true to bypass executor-role assignment policy" })),
 });
@@ -459,6 +558,13 @@ export const sendMessageParams = Type.Object({
   reply_to_message_id: Type.Optional(
     Type.String({ description: "Optional ID of the message you are replying to. Parent-based recipient inference is allowed only when that message was addressed to you." }),
   ),
+  mail_kind: Type.Optional(Type.Union([
+    Type.Literal("message"), Type.Literal("report"), Type.Literal("approval"),
+  ], { description: "Structural mail kind. Use report for a composed writeup; approval is engine-managed." })),
+  report: Type.Optional(Type.Object({
+    title: Type.String({ description: "Report title" }),
+    sections: Type.Array(Type.Object({ heading: Type.String(), body: Type.String() }), { description: "Non-empty report sections" }),
+  }, { description: "Structured report payload for mail" })),
 });
 
 export const readMessagesParams = Type.Object({
@@ -494,6 +600,13 @@ export const askQuestionParams = Type.Object({
       multiSelect: Type.Optional(Type.Boolean({
         description: "Set true when the user may choose multiple options. Prefer type='multi_select' for clarity.",
       })),
+      /*
+       * FNXC:ChatAskQuestion 2026-09-09-02:42:
+       * An agent must be able to append a non-blocking free-text field to a structured form without forcing the user to type filler.
+       */
+      optional: Type.Optional(Type.Boolean({
+        description: "Set true when the user may leave this question unanswered; the card can be submitted without it. Defaults to false (required).",
+      })),
       type: Type.Optional(Type.Union([
         Type.Literal("text"),
         Type.Literal("single_select"),
@@ -509,6 +622,7 @@ export const askQuestionParams = Type.Object({
 
 export const memorySearchParams = Type.Object({
   query: Type.String({ description: "Search terms for durable project memory. Use focused keywords, not a full prompt." }),
+  topic: Type.Optional(Type.String({ description: "RUFU-068: optional read-time focus/topic. When set, scopes the project recall to a working topic (a within-project read filter). 'all', empty, or '*' clears to whole-project scope. The Stash backend pushes this as a &topic= query param for SQL-enforced filtering; never post-filter in-memory." })),
   limit: Type.Optional(Type.Number({ description: "Maximum snippets to return (default: 5, max: 20)" })),
 });
 
@@ -579,6 +693,11 @@ type AgentMemoryContext = {
 
 type MemoryToolOptions = {
   agentMemory?: AgentMemoryContext;
+  // FNXC:MemoryFocusEngine 2026-08-13-15:57: optional per-conversation memory
+  // focus/topic from the enclosing session (chat_sessions.memory_focus). When set,
+  // fn_memory_search scopes the project recall to this topic via
+  // resolveMemorySearchTopic → searchProjectMemory (a within-project read filter).
+  focus?: string;
 };
 
 type MemorySearchHit = {
@@ -936,6 +1055,57 @@ async function getAgentMemoryWindow(rootDir: string, agentMemory: AgentMemoryCon
 
 // ── Tool factory functions ────────────────────────────────────────────────
 
+/**
+ * FNXC:EphemeralAgentTaskCreation 2026-07-26-06:20:
+ * When the project policy is `deny`, an ephemeral/runtime task-worker must not merely
+ * be REFUSED at execute time — `fn_task_create` must not be registered for that session
+ * at all, so the model never sees the tool in its tool list.
+ *
+ * Incident: an executing agent under a `deny` project fired five parallel `fn_task_create`
+ * calls, reported them as timed out, retried them sequentially, and left ten tasks on a
+ * board whose operator had switched follow-up creation off. An execute-time-only refusal
+ * still invites the model to plan around the tool, burn turns retrying it, and — on any
+ * lane where `callerIsEphemeral` fails to reach the factory — create the tasks anyway.
+ * Suppressing registration makes the operator's Deny structural instead of advisory.
+ *
+ * `upon_validation` keeps the tool registered: that policy routes a proposal to the
+ * operator mailbox and is a supported agent action, not a prohibition.
+ */
+export function isAgentTaskCreateToolAvailable(
+  settings: Pick<Settings, "ephemeralAgentTaskCreationPolicy" | "ephemeralAgentsCanCreateTasks"> | undefined | null,
+  callerIsEphemeral: boolean | undefined,
+  lane: "task-execution" | "agent-session" = "agent-session",
+): boolean {
+  if (lane === "task-execution") return false;
+  if (!callerIsEphemeral) return true;
+  return fusionCore.resolveEphemeralTaskCreationPolicy(settings ?? {}) !== "deny";
+}
+
+/**
+ * FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+ * `fn_delegate_task` creates a task through the same `createAgentTask` primitive as
+ * `fn_task_create`, so the follow-up-task policy must govern both or it governs neither.
+ * Code review of the first Deny fix found the gap: the tool validated only that the TARGET
+ * agent is non-ephemeral and never checked the CALLER, so under Deny an ephemeral worker
+ * could enumerate agents and delegate unlimited tasks to any permanent one — reproducing the
+ * ten-duplicate incident through a sibling tool name.
+ *
+ * Delegation is withheld under BOTH non-allow policies, which is stricter than the
+ * `fn_task_create` rule. `upon_validation` means "an operator approves before work is filed";
+ * delegation has no proposal channel of its own, so honoring it as an allow would launder a
+ * create past the very validation the operator asked for. Under `upon_validation` the agent
+ * still has the sanctioned path: `fn_task_create` remains registered and mails a proposal.
+ */
+export function isAgentDelegateTaskToolAvailable(
+  settings: Pick<Settings, "ephemeralAgentTaskCreationPolicy" | "ephemeralAgentsCanCreateTasks"> | undefined | null,
+  callerIsEphemeral: boolean | undefined,
+  lane: "task-execution" | "agent-session" = "agent-session",
+): boolean {
+  if (lane === "task-execution") return false;
+  if (!callerIsEphemeral) return true;
+  return fusionCore.resolveEphemeralTaskCreationPolicy(settings ?? {}) === "allow";
+}
+
 type AgentTaskCreationOptions = {
   rootDir?: string;
   bypassDuplicateCheck?: boolean;
@@ -956,26 +1126,35 @@ type MissionLineageReference = {
   missionId: string;
   sliceId: string;
   featureId: string;
+  /** Defined features are admitted only to atomically claim their first task. */
+  bootstrapDefinedFeature?: boolean;
 };
 
 /**
  * FNXC:MissionAdmission 2026-07-30-00:00:
- * FN-8307 requires every autonomous implementation create/delegate operation to
+ * FN-8307 requires autonomous implementation create/delegate (heartbeat patrol) to
  * prove an active Feature → Slice → Milestone → Mission chain before persistence.
  * Decision A records that proof on the new task without calling linkFeatureToTask:
  * a feature's scalar taskId remains owned by its source task and cannot be stolen
  * by a follow-up task.
+ *
+ * FNXC:MissionAdmission 2026-07-22-13:07:
+ * User-directed freeform intake (chat, board-equivalent agent creates) must remain
+ * allowed without mission_lineage. Only surfaces that pass `required: true` (idle
+ * heartbeat with requireMissionLineage) hard-fail on a missing lineage. When a
+ * lineage is supplied on any surface, the full approved chain is still validated.
+ * Missing lineage with inheritance disabled returns null so callers omit mission fields.
  */
 async function resolveApprovedMissionLineage(
   store: TaskStore,
   requested: { mission_id: string; slice_id: string; feature_id: string } | undefined,
   sourceTaskId: string | undefined,
-): Promise<MissionLineageReference | { error: string }> {
+  options?: { required?: boolean },
+): Promise<MissionLineageReference | null | { error: string }> {
   const missionStore = store.getMissionStore?.();
-  if (!missionStore) return { error: "Mission lineage is unavailable; no task was created." };
 
   let requestedLineage = requested;
-  if (!requestedLineage && sourceTaskId) {
+  if (!requestedLineage && sourceTaskId && missionStore) {
     const sourceFeature = await missionStore.getFeatureByTaskId(sourceTaskId);
     if (sourceFeature) {
       const sourceSlice = await missionStore.getSlice(sourceFeature.sliceId);
@@ -989,7 +1168,13 @@ async function resolveApprovedMissionLineage(
       }
     }
   }
-  if (!requestedLineage) return { error: "Approved mission_lineage is required; no task was created." };
+  if (!requestedLineage) {
+    if (options?.required) {
+      return { error: "Approved mission_lineage is required; no task was created." };
+    }
+    return null;
+  }
+  if (!missionStore) return { error: "Mission lineage is unavailable; no task was created." };
 
   const [feature, slice, mission] = await Promise.all([
     missionStore.getFeature(requestedLineage.feature_id),
@@ -1004,14 +1189,136 @@ async function resolveApprovedMissionLineage(
   const approval = fusionCore.evaluateMissionLineageApproval({
     feature, slice, milestone, mission, task: {}, planApprovalRequired: false,
   });
-  if (!approval.approved) return { error: `Mission lineage is not approved (${approval.reason}); no task was created.` };
+  /*
+  FNXC:MissionAdmission 2026-07-23-12:00:
+  A hand-authored defined Feature has no first task to link, so scheduler-only
+  approval would dead-end task creation. Admit it solely as a bootstrap claim;
+  symbol-lock admission remains triaged/in-progress in the core predicate.
+  */
+  if (!approval.approved) {
+    if (approval.reason === "feature-not-implementable" && feature.status === "defined" && !feature.taskId) {
+      return { missionId: mission.id, sliceId: slice.id, featureId: feature.id, bootstrapDefinedFeature: true };
+    }
+    return { error: `Mission lineage is not approved (${approval.reason}); no task was created.` };
+  }
   return { missionId: mission.id, sliceId: slice.id, featureId: feature.id };
+}
+
+type DefinedFeatureBootstrapStore = {
+  claimDefinedFeatureTaskInTransaction: (tx: DbTransaction, input: { featureId: string; taskId: string; missionId: string; sliceId: string }) => Promise<unknown>;
+  claimDefinedFeatureTask: (input: { featureId: string; taskId: string; missionId: string; sliceId: string }) => Promise<unknown>;
+  deleteDefinedFeatureBootstrapDuplicate: (input: { featureId: string; taskId: string; duplicateTaskId: string }) => Promise<void>;
+};
+
+type AgentTaskInputWithBootstrap = TaskCreateInput & {
+  afterTaskInsert?: (tx: DbTransaction, task: Task) => Promise<void>;
+  validateDuplicateCanonical?: (task: Task) => Promise<void>;
+  skipSameAgentDuplicateIntake?: boolean;
+  preflightSameAgentDuplicate?: boolean;
+  reconcileCreatedDuplicate?: (duplicate: Task, created: Task) => Promise<void>;
+};
+
+function definedFeatureBootstrapInput(store: TaskStore, lineage: MissionLineageReference | null): Pick<AgentTaskInputWithBootstrap, "afterTaskInsert" | "validateDuplicateCanonical" | "skipSameAgentDuplicateIntake" | "preflightSameAgentDuplicate" | "reconcileCreatedDuplicate"> {
+  if (!lineage?.bootstrapDefinedFeature) return {};
+  const missionStore = store.getMissionStore() as Partial<DefinedFeatureBootstrapStore>;
+  if (!missionStore.claimDefinedFeatureTaskInTransaction || !missionStore.claimDefinedFeatureTask || !missionStore.deleteDefinedFeatureBootstrapDuplicate) {
+    throw new Error("Defined-feature bootstrap requires the PostgreSQL mission store; no task was created.");
+  }
+  const claim = (taskId: string) => ({ featureId: lineage.featureId, taskId, missionId: lineage.missionId, sliceId: lineage.sliceId });
+  return {
+    /*
+    FNXC:MissionAdmission 2026-07-23-15:30:
+    The first defined-feature task and feature promotion are one PostgreSQL
+    transaction. Do not replace this hook with create-then-link compensation:
+    a failed claim must roll back the task row before any task is observable.
+    */
+    afterTaskInsert: async (tx, task) => { await missionStore.claimDefinedFeatureTaskInTransaction!(tx, claim(task.id)); },
+    validateDuplicateCanonical: async (task) => { await missionStore.claimDefinedFeatureTask!(claim(task.id)); },
+    /*
+    FNXC:MissionAdmission 2026-07-23-20:00:
+    The ordinary same-agent intake runs after task-row commit and could delete
+    feature.taskId. Suppress only that path; deterministic reconciliation below
+    retains the claimed task and atomically soft-deletes a late competing duplicate.
+    */
+    skipSameAgentDuplicateIntake: true,
+    preflightSameAgentDuplicate: true,
+    reconcileCreatedDuplicate: async (duplicate, created) => {
+      await missionStore.deleteDefinedFeatureBootstrapDuplicate!({
+        featureId: lineage.featureId,
+        taskId: created.id,
+        duplicateTaskId: duplicate.id,
+      });
+    },
+  };
 }
 
 /*
 FNXC:AgentRouting 2026-07-29-00:00:
 FN-8207 requires deterministic-duplicate canonical tasks to honor an explicit delegate's owner and todo-column request. Carry both mutations in the engine task-creation seam so every canonical return path is truthful without changing the shared core duplicate-guard API.
 */
+async function findDefinedFeatureBootstrapDuplicate(
+  store: TaskStore,
+  input: TaskCreateInput,
+  sourceAgentId: string | undefined,
+  sourceParentTaskId: string | undefined,
+): Promise<Task | undefined> {
+  if (!sourceAgentId && !sourceParentTaskId) return undefined;
+  const candidates = await store.listTasks({ slim: true, includeArchived: false, includeDeleted: true });
+  const byId = new Map(candidates.map((task) => [task.id, task]));
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-10:05 (batch-engine tail):
+  Resolve terminal columns ahead of the synchronous `flatMap`, which cannot await. The query excludes
+  historical snapshots but includes soft-deleted rows so the explicit `deletedAt` guard below preserves
+  the no-resurrection boundary without treating deleted work as a canonical duplicate.
+  */
+  const isTerminalCandidate = await resolveTerminalColumnsForTasks(store, candidates);
+  const matches = findSameAgentDuplicates({
+    title: input.title,
+    description: input.description,
+    sourceParentTaskId,
+  }, candidates.flatMap((task) => {
+    const createdAt = Date.parse(task.createdAt);
+    /*
+    FNXC:MissionAdmission 2026-07-23-21:10:
+    Defined-feature retry preflight follows the normal duplicate guard's live
+    task boundary. Completed or soft-deleted siblings cannot become bootstrap
+    canonicals because `claimDefinedFeatureTask` accepts only live work.
+    */
+    if (Number.isNaN(createdAt) || task.deletedAt || isTerminalCandidate(task)) return [];
+    return [{
+      id: task.id,
+      title: task.title ?? "",
+      description: task.description,
+      column: task.column,
+      createdAt,
+      sourceAgentId: task.sourceAgentId ?? null,
+      sourceParentTaskId: task.sourceParentTaskId ?? null,
+    }];
+  }), { sourceAgentId: sourceAgentId ?? null });
+  return matches[0] ? byId.get(matches[0].id) : undefined;
+}
+
+async function resolveDelegationReadyColumn(
+  store: TaskStore,
+  workflowId?: string,
+): Promise<string> {
+  /*
+  FNXC:AgentDelegation 2026-08-01-23:36:
+  Delegation promises immediate heartbeat eligibility, so it targets the workflow's hold/ready lane,
+  not a manual intake lane. Resolve the selected workflow's trait-defined hold column first, then its
+  entry column; the legacy `todo` fallback preserves delegation when workflow resolution is degraded.
+  */
+  try {
+    const selectedWorkflowId = workflowId ?? (await store.getDefaultWorkflowId()) ?? fusionCore.DEFAULT_WORKFLOW_ID;
+    const ir = await fusionCore.resolveWorkflowIrById(store, selectedWorkflowId);
+    return fusionCore.columnsWithFlag(ir, "hold")[0]
+      ?? fusionCore.resolveEntryColumnId(ir)
+      ?? "todo";
+  } catch {
+    return "todo";
+  }
+}
+
 async function carryCanonicalTaskRouting(
   store: TaskStore,
   canonical: Task,
@@ -1030,11 +1337,46 @@ async function carryCanonicalTaskRouting(
   return task;
 }
 
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-30-23:05 (batch-engine — the agent tools listed finished cards as active):
+`fn_task_list` describes itself as listing active tasks, and `fn_task_search` offers `includeDone: false`. Both filtered with `task.column !== "done"`, so on a board whose Complete lane
+is renamed a FINISHED card came back as active — to an AGENT, which then reasons and acts on it as
+outstanding work. `includeArchived: false` is handled by the query, but "done" was only ever a TS predicate.
+
+MEMBERSHIP over every Complete column, unioned with the legacy Done fallback: `resolveWorkflowIrForTask`
+returns the BUILT-IN IR for a missing or corrupt workflow rather than throwing, so without the union a
+degraded renamed board would resolve a terminal set that excludes its own terminal lane and the filter
+would go inert.
+
+ONE CACHE per call, so a list spanning three workflows reads three IRs rather than one per task.
+*/
+export async function resolveTerminalColumnsForTasks(
+  store: TaskStore,
+  tasks: readonly Task[],
+): Promise<(task: Task) => boolean> {
+  const cache = new Map<string, Awaited<ReturnType<typeof fusionCore.resolveWorkflowIrForTask>>>();
+  const terminalByTaskId = new Map<string, ReadonlySet<string>>();
+  for (const task of tasks) {
+    if (terminalByTaskId.has(task.id)) continue;
+    const columns = new Set<string>(["done"]);
+    try {
+      const ir = await fusionCore.resolveWorkflowIrForTask(store, task.id, cache);
+      if (ir) {
+        for (const id of fusionCore.columnsWithFlag(ir, "complete")) columns.add(id);
+      }
+    } catch { /* degraded: Done only */ }
+    terminalByTaskId.set(task.id, columns);
+  }
+  return (task: Task) => terminalByTaskId.get(task.id)?.has(task.column) === true;
+}
+
 export async function createAgentTask(
   store: TaskStore,
   input: TaskCreateInput,
   options?: AgentTaskCreationOptions,
 ): Promise<{ task: Awaited<ReturnType<TaskStore["createTask"]>>; wasDuplicate: boolean }> {
+  const validateDuplicateCanonical = (input as AgentTaskInputWithBootstrap).validateDuplicateCanonical;
   const settings = typeof (store as { getSettings?: unknown }).getSettings === "function"
     ? await store.getSettings()
     : {} as Settings;
@@ -1070,6 +1412,7 @@ export async function createAgentTask(
 
   try {
     if (guard.action === "duplicate" && guard.existing) {
+      await validateDuplicateCanonical?.(guard.existing);
       return {
         task: await carryCanonicalTaskRouting(store, guard.existing, input),
         wasDuplicate: true,
@@ -1080,11 +1423,19 @@ export async function createAgentTask(
       try {
         const acknowledged = new Set(options?.acknowledgedDuplicates ?? []);
         const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
-        const candidates = (await store.searchTasks(crossParentDiagnosticClaim.searchTerm, {
+        const searched = await store.searchTasks(crossParentDiagnosticClaim.searchTerm, {
           slim: true,
           includeArchived: false,
-        }))
-          .filter((candidate) => candidate.column !== "done" && candidate.column !== "archived")
+        });
+        /*
+        FNXC:WorkflowResolvedColumns 2026-07-30-10:05 (batch-engine tail):
+        On a renamed complete lane a FINISHED diagnostic card passed this filter, so the dedup guard
+        adopted it as canonical and returned `wasDuplicate: true` — silently absorbing new diagnostic
+        work into a task nobody is working on. Same shape as the eval-followup dedup defect.
+        */
+        const isTerminalCandidate = await resolveTerminalColumnsForTasks(store, searched);
+        const candidates = searched
+          .filter((candidate) => !isTerminalCandidate(candidate))
           .filter((candidate) => Date.parse(candidate.createdAt) >= cutoffMs)
           .filter((candidate) => !acknowledged.has(candidate.id))
           .filter((candidate) => computeCrossParentDiagnosticClaimId({
@@ -1094,6 +1445,7 @@ export async function createAgentTask(
           .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
         const canonical = candidates[0];
         if (canonical) {
+          await validateDuplicateCanonical?.(canonical);
           return { task: await carryCanonicalTaskRouting(store, canonical, input), wasDuplicate: true };
         }
       } catch (error) {
@@ -1109,11 +1461,12 @@ export async function createAgentTask(
       try {
         const acknowledged = new Set(options?.acknowledgedDuplicates ?? []);
         const candidates = await store.findRecentTasksBySourceParentTaskId(sourceParentTaskId);
+        const isTerminalCandidate = await resolveTerminalColumnsForTasks(store, candidates);
         const matches = findSameAgentDuplicates({
           title: input.title,
           description: input.description,
           sourceParentTaskId,
-        }, candidates.map((candidate) => ({
+        }, candidates.filter((candidate) => !isTerminalCandidate(candidate)).map((candidate) => ({
           id: candidate.id,
           title: candidate.title ?? "",
           description: candidate.description,
@@ -1125,6 +1478,7 @@ export async function createAgentTask(
         const match = matches.find((candidate) => !acknowledged.has(candidate.id));
         const canonical = match ? candidates.find((candidate) => candidate.id === match.id) : undefined;
         if (canonical) {
+          await validateDuplicateCanonical?.(canonical);
           return { task: await carryCanonicalTaskRouting(store, canonical, input), wasDuplicate: true };
         }
       } catch (error) {
@@ -1133,6 +1487,21 @@ export async function createAgentTask(
           error: error instanceof Error ? error.message : String(error),
         });
         throw new Error(`Unable to verify parent-scoped task uniqueness for ${sourceParentTaskId}`, { cause: error });
+      }
+    }
+
+    /*
+    FNXC:MissionAdmission 2026-07-23-20:00:
+    Probe same-agent duplicates before a defined Feature is claimed. The generic
+    intake probe happens after commit and can archive feature.taskId; an existing
+    canonical must already belong to this feature or creation fails with no new
+    task, rather than silently repurposing unrelated work.
+    */
+    if ((input as AgentTaskInputWithBootstrap).preflightSameAgentDuplicate && validateDuplicateCanonical) {
+      const duplicate = await findDefinedFeatureBootstrapDuplicate(store, input, sourceAgentId, sourceParentTaskId);
+      if (duplicate) {
+        await validateDuplicateCanonical(duplicate);
+        return { task: await carryCanonicalTaskRouting(store, duplicate, input), wasDuplicate: true };
       }
     }
 
@@ -1165,7 +1534,12 @@ export async function createAgentTask(
           ? undefined
           : computeParentIntentClaimId({ title: input.title, description: input.description, sourceParentTaskId }) ?? undefined
       ),
-      summarize: !input.title?.trim() ? true : undefined,
+      /*
+      FNXC:TitleSummarization 2026-08-19-13:43:
+      Agent-created tasks use the same project-scoped automatic title policy as every other
+      create gateway. Do not inject summarize:true for untitled tasks; that flag is reserved for
+      an explicit caller request.
+      */
       source: nextSource,
       githubTracking: shouldPrefillGithubTrackingEnabled
         ? {
@@ -1184,21 +1558,35 @@ export async function createAgentTask(
       onProposalClaimConflict: () => { proposalClaimConflict = true; },
     });
 
+    const reconcileCreatedDuplicate = (input as AgentTaskInputWithBootstrap).reconcileCreatedDuplicate;
     const reconcile = await reconcileDeterministicDuplicate(store, {
       createdTask,
       fingerprint: guard.fingerprint,
       sourceParentTaskId,
       logger: log,
+      onDuplicate: reconcileCreatedDuplicate
+        ? async (duplicate) => {
+          await reconcileCreatedDuplicate(duplicate, createdTask);
+          return "keep-created";
+        }
+        : undefined,
     });
 
-    return {
-      task: proposalClaimConflict
-        ? await carryCanonicalTaskRouting(store, createdTask, input)
-        : reconcile.outcome === "archived"
-        ? await carryCanonicalTaskRouting(store, reconcile.canonical, input)
-        : reconcile.canonical,
-      wasDuplicate: proposalClaimConflict || reconcile.outcome === "archived",
-    };
+    const wasDuplicate = proposalClaimConflict || reconcile.outcome === "removed" || reconcile.outcome === "kept-duplicate";
+    const canonical = proposalClaimConflict
+      ? await carryCanonicalTaskRouting(store, createdTask, input)
+      : reconcile.outcome === "removed"
+      ? await carryCanonicalTaskRouting(store, reconcile.canonical, input)
+      : reconcile.canonical;
+    /*
+    FNXC:MissionAdmission 2026-07-23-17:20:
+    A proposal-claim race and post-create reconciliation both select an existing
+    canonical after createTask returns. Revalidate that canonical before reporting
+    duplicate success so a defined feature cannot remain unlinked or claim an
+    archived/unrelated loser.
+    */
+    if (wasDuplicate) await validateDuplicateCanonical?.(canonical);
+    return { task: canonical, wasDuplicate };
   } finally {
     guard.releaseLock();
   }
@@ -1220,7 +1608,8 @@ export function createTaskCreateTool(
     name: "fn_task_create",
     label: "Create Task",
     description:
-      "Create a new task for out-of-scope work discovered during execution. " +
+      "Create a new task for out-of-scope work discovered during execution, or freeform " +
+      "intake from chat. " +
       "The task enters the selected-or-default workflow's intake/planning column " +
       "where it will be specified by the AI (a custom workflow with a non-triage " +
       "intake column, e.g. Inbox, lands the card there instead and it stays inert " +
@@ -1230,7 +1619,9 @@ export function createTaskCreateTool(
       "Optionally set dependencies (e.g., the new task depends on the current one, " +
       "or the current task should wait for the new one). " +
       "Optionally pass workflow_id to select a workflow at creation time; use " +
-      "fn_workflow_list to discover valid IDs.",
+      "fn_workflow_list to discover valid IDs. " +
+      "mission_lineage is optional for freeform intake; pass it only when linking to an " +
+      "approved Feature → Slice → Mission (required on autonomous heartbeat patrol).",
     parameters: taskCreateParams,
     execute: async (_id: string, params: Static<typeof taskCreateParams>) => {
       try {
@@ -1262,12 +1653,19 @@ export function createTaskCreateTool(
           }
         }
         const workflowId = params.workflow_id?.trim() || undefined;
+        /*
+        FNXC:MissionAdmission 2026-07-22-13:07:
+        Freeform chat/user-directed creates omit mission_lineage and must succeed.
+        Only requireMissionLineage (idle heartbeat patrol) hard-requires an approved chain.
+        Supplied lineage is always validated; parent inheritance still applies when not required.
+        */
         const lineage = await resolveApprovedMissionLineage(
           store,
           params.mission_lineage,
           options?.requireMissionLineage ? undefined : options?.sourceTaskId ?? provenance?.sourceParentTaskId,
+          { required: options?.requireMissionLineage === true },
         );
-        if ("error" in lineage) {
+        if (lineage && "error" in lineage) {
           return { content: [{ type: "text" as const, text: `ERROR: ${lineage.error}` }], details: { rule: "mission-lineage-required" }, isError: true };
         }
         /*
@@ -1287,15 +1685,15 @@ export function createTaskCreateTool(
           dependencies: params.dependencies,
           priority: params.priority,
           ...(workflowId ? { workflowId } : {}),
-          missionId: lineage.missionId,
-          sliceId: lineage.sliceId,
+          ...(lineage ? { missionId: lineage.missionId, sliceId: lineage.sliceId } : {}),
+          ...definedFeatureBootstrapInput(store, lineage),
           source: {
             sourceType: provenance?.sourceType ?? "api",
             sourceAgentId: provenance?.sourceAgentId,
             sourceRunId: provenance?.sourceRunId,
             sourceParentTaskId: provenance?.sourceParentTaskId ?? options?.sourceTaskId,
             // Decision A: lineage metadata is deliberately distinct from feature.taskId.
-            sourceMetadata: { missionLineage: lineage },
+            ...(lineage ? { sourceMetadata: { missionLineage: lineage } } : {}),
           },
         }, options);
         const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";
@@ -1365,6 +1763,22 @@ function formatTaskReadLines(lines: string[], emptyStateText: string): string {
   return text.trim().length > 0 ? text : emptyStateText;
 }
 
+/*
+FNXC:ToolOutputBudget 2026-08-03-06:41:
+FN-8614 requires high-volume read tools to preserve their identifying headers while
+providing a useful source-level stop before the universal per-result wrapper runs.
+The hint names the narrowing surface instead of silently tail-cutting an agent's context.
+*/
+const SEMANTIC_TOOL_READ_MAX_CHARS = 12_000;
+/** Maximum persisted tool-detail characters shown per row in normal agent log reads. */
+export const AGENT_LOG_READ_DETAIL_PREVIEW_MAX = 600;
+
+function trimSemanticToolRead(text: string, hint: string): string {
+  if (text.length <= SEMANTIC_TOOL_READ_MAX_CHARS) return text;
+  const marker = `\n\n[Output truncated; ${hint}]`;
+  return text.slice(0, Math.max(0, SEMANTIC_TOOL_READ_MAX_CHARS - marker.length)) + marker;
+}
+
 function formatTaskSummaryLine(task: { id: string; column: string; title?: string | null; description: string; dependencies: string[] }): string {
   const desc = task.title || task.description.slice(0, 80) || "(no description)";
   const deps = task.dependencies.length ? ` [deps: ${task.dependencies.join(", ")}]` : "";
@@ -1383,12 +1797,13 @@ export function createTaskListTool(store: TaskStore): ToolDefinition {
     name: "fn_task_list",
     label: "List Tasks",
     description:
-      "List active tasks that aren't done or archived. Returns ID, description, column, " +
+      "List active tasks that have not reached their workflow's Complete column. Returns ID, description, column, " +
       "and dependencies for each. Use to discover work and check for duplicates.",
     parameters: taskListParams,
     execute: async () => {
       const tasks = await store.listTasks({ slim: true, includeArchived: false });
-      const active = tasks.filter((task) => task.column !== "done");
+      const isTerminal = await resolveTerminalColumnsForTasks(store, tasks);
+      const active = tasks.filter((task) => !isTerminal(task));
       const lines = active.map(formatTaskSummaryLine);
       return {
         content: [{ type: "text" as const, text: formatTaskReadLines(lines, "No active tasks.") }],
@@ -1403,8 +1818,8 @@ export function createTaskSearchTool(store: TaskStore): ToolDefinition {
     name: "fn_task_search",
     label: "Search Tasks",
     description:
-      "Keyword search across tasks, including done and archived tasks by default. " +
-      "Use for duplicate detection and work discovery before filing new tasks.",
+      "Keyword search across active tasks by default. " +
+      "Done history is opt-in and must not be used for duplicate detection.",
     parameters: taskSearchParams,
     execute: async (_id: string, params: Static<typeof taskSearchParams>) => {
       const query = params.query.trim();
@@ -1417,11 +1832,12 @@ export function createTaskSearchTool(store: TaskStore): ToolDefinition {
       const limit = Math.min(50, Math.max(1, Math.floor(params.limit ?? 20)));
       const results = await store.searchTasks(query, {
         slim: true,
-        includeArchived: params.includeArchived ?? true,
+        includeArchived: false,
         limit,
       });
-      const includeDone = params.includeDone ?? true;
-      const filtered = includeDone ? results : results.filter((task) => task.column !== "done");
+      const includeDone = params.includeDone ?? false;
+      const isTerminalResult = includeDone ? undefined : await resolveTerminalColumnsForTasks(store, results);
+      const filtered = includeDone ? results : results.filter((task) => !isTerminalResult!(task));
       const lines = filtered.map(formatTaskSummaryLine);
       const text = formatTaskReadLines(
         lines.length > 0 ? [`Search results for "${query}" (${filtered.length}):`, ...lines] : [],
@@ -1430,6 +1846,53 @@ export function createTaskSearchTool(store: TaskStore): ToolDefinition {
       return {
         content: [{ type: "text" as const, text }],
         details: { count: filtered.length },
+      };
+    },
+  };
+}
+
+/*
+FNXC:PatchnodeChat 2026-08-28-12:16:
+Chat reads the same permanent, per-delivery ledger as the dashboard and never looks task rows up, so later-deleted deliveries remain answerable.
+
+FNXC:HistoryChat 2026-09-04-09:35:
+FN-293 completes the agent-facing rename by exposing only `fn_history_read`, without a compatibility alias.
+The HTTP route, PostgreSQL table, view id, i18n keys, and `@fusion/core` types and methods intentionally retain their stable `patchnode` identifiers.
+*/
+export function createHistoryReadTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_history_read",
+    label: "Read History",
+    description: "Read the permanent daily history of completed and reverted task deliveries.",
+    parameters: historyReadParams,
+    execute: async (_id: string, params: Static<typeof historyReadParams>) => {
+      const limit = Math.min(50, Math.max(1, Math.floor(params.limit ?? 20)));
+      const result = await store.listPatchnodeEntries({
+        ...(params.query?.trim() ? { query: params.query.trim() } : {}),
+        ...(params.from ? { from: params.from } : {}),
+        ...(params.to ? { to: params.to } : {}),
+        limit,
+      });
+      const days = fusionCore.groupPatchnodeEntriesByDay(result.entries);
+      if (days.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No History entries matched." }],
+          details: { dayCount: 0, entryCount: 0 },
+        };
+      }
+      const lines = days.flatMap((day) => [
+        `## ${day.day}`,
+        ...day.entries.map((entry) => {
+          const cancelled = entry.kind === "reverted" ? "CANCELLED — " : "";
+          const reverted = entry.kind === "completed" && entry.revertedAt
+            ? ` (reverted ${entry.revertedAt.slice(0, 10)})`
+            : "";
+          return `${cancelled}${entry.taskId} — ${entry.title}: ${entry.body}${reverted}`;
+        }),
+      ]);
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: { dayCount: days.length, entryCount: result.entries.length },
       };
     },
   };
@@ -1459,7 +1922,13 @@ export function createTaskShowTool(store: TaskStore): ToolDefinition {
           task.prompt || "(not yet specified)",
         ].filter((part): part is string => typeof part === "string");
         return {
-          content: [{ type: "text" as const, text: parts.join("\n") || `Task ${params.id} has no details.` }],
+          content: [{
+            type: "text" as const,
+            text: trimSemanticToolRead(
+              parts.join("\n") || `Task ${params.id} has no details.`,
+              "use fn_task_document_read or a focused task query for more",
+            ),
+          }],
           details: { taskId: task.id },
         };
       } catch {
@@ -1492,18 +1961,7 @@ export function createTaskLogTool(store: TaskStore, taskId: string): ToolDefinit
       "Use for significant events — not every small step.",
     parameters: taskLogParams,
     execute: async (_id: string, params: Static<typeof taskLogParams>) => {
-      try {
-        await store.logEntry(taskId, params.message, params.outcome);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } catch (err: any) {
-        if (typeof err?.message === "string" && err.message.toLowerCase().includes("archived")) {
-          return {
-            content: [{ type: "text" as const, text: "ERROR: Cannot log to archived task — this task is read-only" }],
-            details: {},
-          };
-        }
-        throw err;
-      }
+      await store.logEntry(taskId, params.message, params.outcome);
 
       return {
         content: [{ type: "text" as const, text: `Logged: ${params.message}` }],
@@ -1530,18 +1988,7 @@ export function createTaskLogToolWithContext(store: TaskStore, taskId: string, r
       "Use for significant events — not every small step.",
     parameters: taskLogParams,
     execute: async (_id: string, params: Static<typeof taskLogParams>) => {
-      try {
-        await store.logEntry(taskId, params.message, params.outcome, runContext);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } catch (err: any) {
-        if (typeof err?.message === "string" && err.message.toLowerCase().includes("archived")) {
-          return {
-            content: [{ type: "text" as const, text: "ERROR: Cannot log to archived task — this task is read-only" }],
-            details: {},
-          };
-        }
-        throw err;
-      }
+      await store.logEntry(taskId, params.message, params.outcome, runContext);
 
       return {
         content: [{ type: "text" as const, text: `Logged: ${params.message}` }],
@@ -1568,20 +2015,67 @@ export function normalizeAgentLogPaging(rawLimit?: unknown, rawOffset?: unknown,
 FNXC:TaskLogsRead 2026-07-16-00:00:
 Issue #2149 requires failure analysis to preserve each persisted log row's chronology. AgentLogEntry has no persisted stream/run boundary, so adjacent text or thinking rows cannot safely be re-glued here: they may be distinct responses from the same agent. The dashboard can group its live render entries using its hidden tool-boundary metadata; this store-only reader must render every persisted row separately.
 */
-export function renderAgentLogEntries(entries: AgentLogEntry[]): string {
-  return entries.map((entry) => formatAgentLogBlock(entry, entry.text)).join("\n\n");
+export interface RenderAgentLogEntriesOptions {
+  /** Maximum tool-detail characters per entry; omit to retain the legacy unbounded renderer. */
+  detailPreviewMax?: number;
 }
 
-function formatAgentLogBlock(entry: AgentLogEntry, text: string): string {
+function buildAgentLogDetailPreview(detail: string, maximum: number | undefined): string {
+  if (maximum === undefined || detail.length <= maximum) return detail;
+
+  let kept = maximum;
+  let marker = "";
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    const omitted = detail.length - kept;
+    marker = `\n[Detail preview truncated: ${omitted} characters omitted. Use detail: "full" with a smaller limit, offset, or type filter to retrieve the complete payload.]`;
+    const nextKept = Math.max(0, maximum - marker.length);
+    if (nextKept === kept) break;
+    kept = nextKept;
+  }
+  return `${detail.slice(0, kept)}${marker}`;
+}
+
+export function renderAgentLogEntries(entries: AgentLogEntry[], options?: RenderAgentLogEntriesOptions): string {
+  return entries.map((entry) => formatAgentLogBlock(entry, entry.text, options?.detailPreviewMax)).join("\n\n");
+}
+
+function formatAgentLogBlock(entry: AgentLogEntry, text: string, detailPreviewMax?: number): string {
   const agent = entry.agent ? ` (${entry.agent})` : "";
-  const detail = entry.detail !== undefined ? `\nDetail:\n${entry.detail}` : "";
+  const detail = entry.detail !== undefined
+    ? `\nDetail:\n${buildAgentLogDetailPreview(entry.detail, detailPreviewMax)}`
+    : "";
   return `[${entry.timestamp}] ${entry.type}${agent}\n${text}${detail}`;
+}
+
+export type AgentLogReadDetailMode = "preview" | "full";
+
+export interface TaskAgentLogReadTextOptions {
+  total: number;
+  limit: number;
+  offset: number;
+  type?: AgentLogEntry["type"];
+  detail?: AgentLogReadDetailMode;
+}
+
+/*
+FNXC:TaskLogsRead 2026-08-29-05:00:
+FN-253 makes tool detail default-persisted, so all three fn_task_logs_read registrations share this
+builder. Preview mode bounds each row before the existing 12,000-character response budget; full mode
+is the explicit retrieval escape hatch while the same whole-response narrowing hint remains intact.
+*/
+export function buildTaskAgentLogReadText(entries: AgentLogEntry[], options: TaskAgentLogReadTextOptions): string {
+  const filter = options.type ? `, type=${options.type}` : "";
+  const header = `Agent log: ${entries.length}/${options.total} entries (limit=${options.limit}, offset=${options.offset}${filter})`;
+  const rendered = entries.length > 0
+    ? `${header}\n\n${renderAgentLogEntries(entries, options.detail === "full" ? undefined : { detailPreviewMax: AGENT_LOG_READ_DETAIL_PREVIEW_MAX })}`
+    : `${header}\n\n(no matching log entries)`;
+  return trimSemanticToolRead(rendered, "use a smaller limit, offset, or type filter for more");
 }
 
 async function readTaskAgentLogs(
   store: TaskStore,
   taskId: string,
-  params: { limit?: unknown; offset?: unknown; type?: AgentLogEntry["type"] },
+  params: { limit?: unknown; offset?: unknown; type?: AgentLogEntry["type"]; detail?: AgentLogReadDetailMode },
 ) {
   const { limit, offset } = normalizeAgentLogPaging(params.limit, params.offset);
   try {
@@ -1589,9 +2083,16 @@ async function readTaskAgentLogs(
       store.getAgentLogs(taskId, { limit, offset, type: params.type }),
       store.getAgentLogCount(taskId, { type: params.type }),
     ]);
-    const filter = params.type ? `, type=${params.type}` : "";
-    const header = `Agent log: ${entries.length}/${total} entries (limit=${limit}, offset=${offset}${filter})`;
-    return { content: [{ type: "text" as const, text: entries.length > 0 ? `${header}\n\n${renderAgentLogEntries(entries)}` : `${header}\n\n(no matching log entries)` }], details: { taskId, total, limit, offset, type: params.type } };
+    return {
+      content: [{ type: "text" as const, text: buildTaskAgentLogReadText(entries, {
+        total,
+        limit,
+        offset,
+        type: params.type,
+        detail: params.detail,
+      }) }],
+      details: { taskId, total, limit, offset, type: params.type },
+    };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } catch (err: any) {
     return { content: [{ type: "text" as const, text: `ERROR: Failed to read agent log for task ${taskId}: ${err.message}` }], details: {} };
@@ -1606,7 +2107,7 @@ export function createTaskLogsReadTool(store: TaskStore, taskId: string): ToolDe
   return {
     name: "fn_task_logs_read",
     label: "Read Agent Logs",
-    description: "Read this task's persisted agent log with pagination and optional type filtering. Default page size is 100.",
+    description: "Read this task's persisted agent log with pagination and optional type filtering. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response stays bounded. Default page size is 100.",
     parameters: taskLogsReadParams,
     execute: async (_id: string, params: Static<typeof taskLogsReadParams>) => readTaskAgentLogs(store, taskId, params),
   };
@@ -1620,9 +2121,35 @@ export function createChatTaskLogsReadTool(store: TaskStore): ToolDefinition {
   return {
     name: "fn_task_logs_read",
     label: "Read Agent Logs",
-    description: "Read a task's persisted agent log with pagination and optional type filtering. Requires task_id; default page size is 100.",
+    description: "Read a task's persisted agent log with pagination and optional type filtering. Requires task_id. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response stays bounded. Default page size is 100.",
     parameters: chatTaskLogsReadParams,
     execute: async (_id: string, params: Static<typeof chatTaskLogsReadParams>) => readTaskAgentLogs(store, params.task_id, params),
+  };
+}
+
+/*
+FNXC:TaskDocumentCAS 2026-07-20-11:06:
+Task-bound and explicit cross-task publishers share one read-then-CAS contract. They forward optional snake_case expectations without inventing defaults, return revision/hash on success, and expose stale state as a typed error result. Agents must re-read and explicitly rebase; the tool never retries or converts a conflict into success text.
+*/
+function taskDocumentWriteResult(document: TaskDocument) {
+  return {
+    content: [{ type: "text" as const, text: `Saved document "${document.key}" (revision ${document.revision}, ${document.contentHash}).` }],
+    details: { key: document.key, revision: document.revision, contentHash: document.contentHash },
+  };
+}
+
+function taskDocumentWriteError(error: unknown, key: string, taskId?: string) {
+  if (error instanceof fusionCore.TaskDocumentPreconditionFailedError) {
+    return {
+      content: [{ type: "text" as const, text: `ERROR: Document "${key}" changed; re-read it and explicitly rebase before writing.` }],
+      details: { ...error.toDetails() },
+      isError: true,
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    content: [{ type: "text" as const, text: `ERROR: Failed to save document "${key}"${taskId ? ` for task ${taskId}` : ""}: ${message}` }],
+    details: {},
   };
 }
 
@@ -1638,34 +2165,22 @@ export function createTaskDocumentWriteTool(store: TaskStore, taskId: string): T
     name: "fn_task_document_write",
     label: "Write Document",
     description:
-      "Save a named document for this task (for example plan, notes, or research). " +
-      "Each write creates a new revision so you can update documents over time.",
+      "Save a named document for this task. Read first, then pass expected_revision and/or expected_content_hash for safe CAS publication; stale writes fail and require an explicit rebase.",
     parameters: taskDocumentWriteParams,
     execute: async (_id: string, params: Static<typeof taskDocumentWriteParams>) => {
       const input: TaskDocumentCreateInput = {
         key: params.key,
         content: params.content,
         author: params.author || "agent",
+        ...(params.expected_revision !== undefined ? { expectedRevision: params.expected_revision } : {}),
+        ...(params.expected_content_hash !== undefined ? { expectedContentHash: params.expected_content_hash } : {}),
       };
 
       try {
         const document: TaskDocument = await store.upsertTaskDocument(taskId, input);
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Saved document "${document.key}" (revision ${document.revision}).`,
-          }],
-          details: {},
-        };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } catch (err: any) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `ERROR: Failed to save document "${params.key}": ${err.message}`,
-          }],
-          details: {},
-        };
+        return taskDocumentWriteResult(document);
+      } catch (error: unknown) {
+        return taskDocumentWriteError(error, params.key);
       }
     },
   };
@@ -1689,21 +2204,228 @@ export function createTaskDocumentReadTool(store: TaskStore, taskId: string): To
   };
 }
 
+/*
+FNXC:WorktreeDependencies 2026-08-29-06:59:
+Planner dependency resolutions are durable only when Fusion itself observed the command result. The
+planning-only tool below runs in the pinned task worktree through the sandbox-routed command seam;
+planner prose or a shell claim cannot mark an install as successful. A reasoned `none` is limited to
+unrecognised evidence, while Plan Review remains the bounded blocker for unresolved readiness.
+*/
+export function createInstallWorktreeDependenciesTool(
+  store: TaskStore,
+  taskId: string,
+  options: {
+    rootDir: string;
+    runConfiguredCommand: DependencyCommandRunner;
+    getSettings: () => Promise<Settings>;
+    runContext?: RunMutationContext;
+    taskEnv?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+  },
+): ToolDefinition {
+  const errorResult = (message: string) => ({
+    content: [{ type: "text" as const, text: `ERROR: ${message}` }],
+    details: {},
+    isError: true,
+  });
+  const tail = (value: string, max = 2_000) => value.length <= max ? value : `…${value.slice(-max)}`;
+
+  return {
+    name: "fn_install_worktree_dependencies",
+    label: "Install Worktree Dependencies",
+    description:
+      "Run a planner-selected dependency install through Fusion, or record a reasoned no-install decision. " +
+      "Plan Review will continue to request revision until dependency readiness is durable.",
+    parameters: installWorktreeDependenciesParams,
+    execute: async (_id: string, params: Static<typeof installWorktreeDependenciesParams>) => {
+      const task = await store.getTask(taskId);
+      if (!task) return errorResult(`Task ${taskId} no longer exists.`);
+      const workspaceRepos = (await fusionCore.loadWorkspaceConfig(options.rootDir))?.repos ?? [];
+      const requestedRepository = params.repository?.trim();
+      let worktreePath: string | undefined;
+      let repositoryLabel: string | undefined;
+      if (workspaceRepos.length > 0) {
+        if (workspaceRepos.length > 1 && !requestedRepository) {
+          return errorResult("repository is required for a workspace with multiple configured repositories.");
+        }
+        if (workspaceRepos.length === 1 && requestedRepository && requestedRepository !== workspaceRepos[0]) {
+          return errorResult(`Unknown workspace repository: ${requestedRepository}`);
+        }
+        const repository = requestedRepository ?? workspaceRepos[0]!;
+        if (!workspaceRepos.includes(repository)) return errorResult(`Unknown workspace repository: ${repository}`);
+        worktreePath = task.workspaceWorktrees?.[repository]?.worktreePath;
+        repositoryLabel = repository;
+      } else {
+        if (requestedRepository) return errorResult("repository is only valid for a configured workspace task.");
+        worktreePath = task.worktree;
+      }
+      if (!worktreePath || !existsSync(worktreePath)) {
+        return errorResult(`No acquired task worktree is available${repositoryLabel ? ` for ${repositoryLabel}` : ""}.`);
+      }
+
+      const settings = await options.getSettings();
+      if (params.action === "none") {
+        const reason = params.reason?.trim();
+        if (!reason) return errorResult("reason is required for action=none.");
+        const readiness = recordPlannerDependencyResolution({
+          worktreePath,
+          action: "none",
+          reason,
+          settings,
+        });
+        await store.logEntry(
+          taskId,
+          `Planner recorded no dependency install step${repositoryLabel ? ` [${repositoryLabel}]` : ""}`,
+          reason,
+          options.runContext,
+        );
+        return {
+          content: [{ type: "text" as const, text: `Recorded no-install resolution${repositoryLabel ? ` for ${repositoryLabel}` : ""}. Readiness: ${readiness.readiness}.` }],
+          details: { readiness: readiness.readiness },
+        };
+      }
+
+      const command = params.command?.trim();
+      if (!command) return errorResult("command is required for action=install.");
+      let result: DependencyCommandResult;
+      try {
+        result = await options.runConfiguredCommand(
+          command,
+          worktreePath,
+          DEPENDENCY_INSTALL_COMMAND_TIMEOUT_MS,
+          options.taskEnv ?? process.env,
+        );
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        result = {
+          stdout: "",
+          stderr: "",
+          exitCode: null,
+          signal: null,
+          bufferExceeded: false,
+          timedOut: false,
+          spawnError: error instanceof Error ? error : new Error(String(error)),
+        };
+      }
+      const readiness = recordPlannerDependencyResolution({
+        worktreePath,
+        action: "install",
+        command,
+        result,
+        settings,
+      });
+      const succeeded = !result.spawnError && !result.timedOut && result.exitCode === 0;
+      const output = tail([result.stdout ?? "", result.stderr ?? "", typeof result.spawnError === "string" ? result.spawnError : result.spawnError?.message ?? ""]
+        .filter(Boolean)
+        .join("\n"));
+      await store.logEntry(
+        taskId,
+        `Planner dependency install${repositoryLabel ? ` [${repositoryLabel}]` : ""} ${succeeded ? "completed" : "failed"}`,
+        output || `Exit code: ${result.exitCode ?? "unknown"}`,
+        options.runContext,
+      );
+      return {
+        content: [{
+          type: "text" as const,
+          text: `${succeeded ? "Dependency install completed" : "Dependency install failed"}${repositoryLabel ? ` for ${repositoryLabel}` : ""}. Exit code: ${result.exitCode ?? "unknown"}. Readiness: ${readiness.readiness}.${output ? `\n${output}` : ""}`,
+        }],
+        details: { exitCode: result.exitCode, readiness: readiness.readiness },
+        ...(succeeded ? {} : { isError: true }),
+      };
+    },
+  };
+}
+
 /**
  * FNXC:WorkflowReviewers 2026-07-01-13:22:
  * Plan Review inline fixes must be able to rewrite the task's authoritative PROMPT.md, but that pre-execution reviewer should not need general source-file write tools. Route the write through TaskStore so existing PROMPT.md validation, task directory placement, and task.json sync remain the single persistence path.
  */
-export function createTaskPromptWriteTool(store: TaskStore, taskId: string, runContext?: RunMutationContext): ToolDefinition {
+export function createTaskPromptWriteTool(
+  store: TaskStore,
+  taskId: string,
+  runContext?: RunMutationContext,
+  canPersist?: () => boolean,
+): ToolDefinition {
   return {
     name: "fn_task_prompt_write",
     label: "Write PROMPT.md",
     description:
-      "Replace this task's PROMPT.md with revised plan/spec content. " +
-      "Use only during Plan Review/spec repair; provide the complete final PROMPT.md content.",
+      "Create or replace this task's PROMPT.md with complete plan/spec content. " +
+      "Use during fresh triage planning, replanning, or Plan Review repair; provide the complete final PROMPT.md content.",
     parameters: taskPromptWriteParams,
     execute: async (_id: string, params: Static<typeof taskPromptWriteParams>) => {
+      /*
+      FNXC:RepositoryScope 2026-08-21-00:58:
+      updateTask's authoritative prompt path owns the planning lifecycle lock. Do not wrap this
+      tool in that non-reentrant lock: prompt publication would wait on itself before scope
+      confirmation could run, so the validated prompt-then-scope compensation remains sequential.
+      */
       try {
-        await store.updateTask(taskId, { prompt: params.content }, runContext);
+        /*
+        FNXC:TaskReset 2026-08-22-04:49:
+        A triage attempt captured before Reset can outlive the route's non-reentrant planning lock.
+        Check its generation immediately before the authoritative write so a stale planner cannot
+        recreate PROMPT.md after Reset publishes the description-only state.
+        */
+        if (canPersist && !canPersist()) {
+          throw new Error(`Planning for ${taskId} was reset before PROMPT.md could be persisted`);
+        }
+        // Workspace membership is derived from workspace.json at task start; PROMPT.md is plan-only.
+        const promptUpdate = { prompt: params.content };
+        if (canPersist) {
+          /*
+          FNXC:TaskReset 2026-08-22-18:07:
+          Reset serializes its publication with the non-reentrant planning lifecycle lock. A
+          generation check before `updateTask` is insufficient because that writer can queue behind
+          Reset and recreate PROMPT.md after reset commits. Check and write under the same lock,
+          using the lock-held TaskStore variants so this tool never re-enters the advisory lock.
+          */
+          await store.withPlanningLifecycleLock(taskId, async () => {
+            if (!canPersist()) {
+              throw new Error(`Planning for ${taskId} was reset before PROMPT.md could be persisted`);
+            }
+            const updated = await store.withTaskLock(taskId, () => store.updateTaskUnlocked(taskId, promptUpdate, runContext));
+            if (store.isBackendMode()) {
+              await store.reconcileSpecDriftWhilePlanningLocked(updated).catch((error: unknown) => {
+                log.warn(`[spec-lock] deferred drift reconciliation for ${updated.id}: ${error instanceof Error ? error.message : String(error)}`);
+              });
+            }
+            /* FNXC:TaskReset 2026-08-22-18:15: Reset clears agent-authored plan documents under this lifecycle lock. */
+            await mirrorPlanToProjectDb(store, taskId, params.content, {
+              author: runContext?.agentId ?? "agent",
+            });
+          });
+        } else {
+          await store.updateTask(taskId, promptUpdate, runContext);
+        }
+        /*
+        FNXC:PlanArtifactPersistence 2026-08-22-03:37:
+        FN-094 repointed this fail-closed check at updateTask's task-row return value after adding
+        workspace-scope publication. The row has no prompt column, so it can never verify PROMPT.md.
+        Re-read through getTask after the write because it hydrates the filesystem-backed artifact;
+        missing, unreadable, or changed content must still reject publication.
+        */
+        let persisted: Awaited<ReturnType<TaskStore["getTask"]>>;
+        try {
+          persisted = await store.getTask(taskId);
+        } catch {
+          throw new Error("authoritative PROMPT.md read-back did not match the requested content; persistence could not be verified");
+        }
+        if (persisted?.prompt !== params.content) {
+          throw new Error("authoritative PROMPT.md read-back did not match the requested content; persistence could not be verified");
+        }
+        /*
+        FNXC:PlanArtifactPersistence 2026-07-26-03:55:
+        `updateTask({ prompt })` writes the project-root PROMPT.md and task.json, but `project.tasks` has
+        no `prompt` column — the spec would live only as a file in the project checkout. Reset-fenced
+        planners mirror it inside the serialized prompt publication above, preventing Reset from clearing
+        the document and then observing a stale mirror recreated after its transaction commits.
+        */
+        if (!canPersist) {
+          await mirrorPlanToProjectDb(store, taskId, params.content, {
+            author: runContext?.agentId ?? "agent",
+          });
+        }
         return {
           content: [{ type: "text" as const, text: `Updated PROMPT.md for ${taskId}.` }],
           details: {},
@@ -1806,34 +2528,22 @@ export function createChatTaskDocumentTools(store: TaskStore): ToolDefinition[] 
       name: "fn_task_document_write",
       label: "Write Document",
       description:
-        "Save a named document for a task (for example plan, notes, or research). " +
-        "Each write creates a new revision so you can update documents over time. Requires task_id.",
+        "Save a named document for an explicit task. Read first, then pass expected_revision and/or expected_content_hash for safe CAS publication; stale writes fail and require an explicit rebase. Requires task_id.",
       parameters: chatTaskDocumentWriteParams,
       execute: async (_id: string, params: Static<typeof chatTaskDocumentWriteParams>) => {
         const input: TaskDocumentCreateInput = {
           key: params.key,
           content: params.content,
           author: params.author || "agent",
+          ...(params.expected_revision !== undefined ? { expectedRevision: params.expected_revision } : {}),
+          ...(params.expected_content_hash !== undefined ? { expectedContentHash: params.expected_content_hash } : {}),
         };
 
         try {
           const document: TaskDocument = await store.upsertTaskDocument(params.task_id, input);
-          return {
-            content: [{
-              type: "text" as const,
-              text: `Saved document "${document.key}" (revision ${document.revision}).`,
-            }],
-            details: {},
-          };
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        } catch (err: any) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: `ERROR: Failed to save document "${params.key}" for task ${params.task_id}: ${err.message}`,
-            }],
-            details: {},
-          };
+          return taskDocumentWriteResult(document);
+        } catch (error: unknown) {
+          return taskDocumentWriteError(error, params.key, params.task_id);
         }
       },
     },
@@ -2003,7 +2713,6 @@ async function registerArtifactForAgent(
     };
 
     const artifact: Artifact = await store.registerArtifact(input);
-    void notifyArtifactRegistered(messageStore, artifact, authorId);
     return {
       content: [{
         type: "text" as const,
@@ -2281,35 +2990,6 @@ function hasImageSignature(data: Buffer, mimeType: string): boolean {
   return false;
 }
 
-async function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifact: Artifact, authorId: string): Promise<void> {
-  if (!messageStore) return;
-
-  /*
-  FNXC:ArtifactRegistry 2026-07-12-00:00:
-  Artifact-registration mailbox notifications remain best-effort and keep their stable content string, but metadata now carries mimeType so dashboard mailbox surfaces can render document/other artifact affordances from metadata without an extra artifact fetch.
-  */
-  try {
-    await messageStore.sendMessage({
-      fromType: "system",
-      toType: "user",
-      toId: DASHBOARD_USER_ID,
-      type: "system",
-      content: `New ${artifact.type} artifact registered: ${artifact.title}`,
-      metadata: {
-        artifactId: artifact.id,
-        artifactType: artifact.type,
-        title: artifact.title,
-        mimeType: artifact.mimeType,
-        authorId,
-        taskId: artifact.taskId,
-      },
-    });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } catch (err: any) {
-    log.warn(`Failed to send best-effort artifact registration notification for ${artifact.id}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
 async function listArtifactsForAgent(store: TaskStore, params: Static<typeof artifactListParams>) {
   try {
     const artifacts: ArtifactWithTask[] = await store.listArtifacts({
@@ -2377,7 +3057,10 @@ async function viewArtifactForAgent(store: TaskStore, id: string) {
     if (artifact.content) lines.push("", artifact.content);
 
     return {
-      content: [{ type: "text" as const, text: lines.join("\n") }],
+      content: [{
+        type: "text" as const,
+        text: trimSemanticToolRead(lines.join("\n"), "use artifact metadata or a more focused artifact read for more"),
+      }],
       details: { artifactId: artifact.id },
     };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2406,11 +3089,13 @@ async function readTaskDocuments(store: TaskStore, taskId: string, key?: string)
       return {
         content: [{
           type: "text" as const,
-          text:
+          text: trimSemanticToolRead(
             `Document: ${document.key}\n` +
-            `Revision: ${document.revision}\n` +
-            `Updated: ${document.updatedAt}\n\n` +
-            document.content,
+              `Revision: ${document.revision}\n` +
+              `Updated: ${document.updatedAt}\n\n` +
+              document.content,
+            "read a narrower document or use its revision metadata before requesting more",
+          ),
         }],
         details: {},
       };
@@ -2586,6 +3271,30 @@ export function createWorkflowSelectTool(store: TaskStore, currentTaskId: string
         };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } catch (err: any) {
+        /*
+        FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — PR #2512 review):
+        TRANSLATE the switch re-home failure so the agent gets an actionable, retryable
+        result instead of an opaque message. `selectionCommitted` is the field that
+        matters: false means nothing was written and the task is intact (destination
+        column full, caught before any commit) so the agent can make room and retry;
+        true means the selection committed and the re-home then lost a race, so the
+        task is INCONSISTENT and the agent must not treat the switch as done.
+        */
+        if (err?.name === "WorkflowSwitchRehomeFailedError") {
+          return {
+            content: [{ type: "text" as const, text: `ERROR: ${err.message}` }],
+            details: {
+              code: "workflow-switch-rehome-failed",
+              taskId: err.taskId,
+              workflowId: err.workflowId,
+              fromColumn: err.fromColumn,
+              intendedColumn: err.intendedColumn,
+              selectionCommitted: err.committed === true,
+              ...(err.reason !== undefined ? { reason: err.reason } : {}),
+            },
+            isError: true,
+          };
+        }
         return {
           content: [{ type: "text" as const, text: `ERROR: Failed to select workflow: ${err?.message ?? err}` }],
           details: {},
@@ -2600,6 +3309,11 @@ export function createWorkflowSelectTool(store: TaskStore, currentTaskId: string
  * Create a `fn_task_promote` tool that manually releases a held task out of its
  * hold column — the agent-native equivalent of the dashboard's "promote" action.
  * Defaults to the current task. Wraps {@link promoteHeldTask}.
+ *
+ * FNXC:WorkflowScheduling 2026-08-29-00:24:
+ * FN-245 removes the agent-native plan-gate override. The tool exposes only a
+ * normal promote request and reports an unplanned refusal plainly, so agents
+ * cannot waive pending planning or plan review.
  */
 export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): ToolDefinition {
   return {
@@ -2609,7 +3323,7 @@ export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): 
       "Manually promote a held task out of its hold column, releasing it regardless of the " +
       "hold's release kind (the explicit operator action a 'manual' hold waits for). Defaults " +
       "to the current task. Returns the destination column, or a rejection reason when the task " +
-      "is not held or the destination is full.",
+      "is not held, is still waiting on planning or plan review, or the destination is full.",
     parameters: taskPromoteParams,
     execute: async (_id: string, params: Static<typeof taskPromoteParams>) => {
       const taskId = params.task_id?.trim() || currentTaskId;
@@ -2621,13 +3335,20 @@ export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): 
               type: "text" as const,
               text: `Promoted ${taskId} to column '${outcome.toColumn}'.`,
             }],
-            details: { taskId, released: true, toColumn: outcome.toColumn },
+            details: {
+              taskId,
+              released: true,
+              toColumn: outcome.toColumn,
+            },
           };
         }
+        const message = outcome.rejection === "unplanned-for-execution"
+          ? `${taskId} is still waiting on planning or plan review.`
+          : outcome.rejection ?? "unknown";
         return {
           content: [{
             type: "text" as const,
-            text: `ERROR: Could not promote ${taskId}: ${outcome.rejection ?? "unknown"}.`,
+            text: `ERROR: Could not promote ${taskId}: ${message}.`,
           }],
           details: { taskId, released: false, rejection: outcome.rejection },
           isError: true,
@@ -2639,6 +3360,251 @@ export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): 
           details: {},
           isError: true,
         };
+      }
+    },
+  };
+}
+
+/*
+FNXC:ChatTaskMutationTools 2026-07-26-12:00:
+Chat permission-parity (#2376) adds these lifecycle tools so permanent-agent chat can archive/delete/retry/etc under the same task_agent_mutation gate as heartbeat/executor.
+Keep catch blocks typed as unknown (no-explicit-any) and surface err.message via instanceof — the PR lint gate fails bare `any` here even though older factories still use the disable-comment pattern.
+*/
+function toolErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+export function createTaskDeleteTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_task_delete",
+    label: "Delete Task",
+    description:
+      "Soft-delete a task from active Fusion board views. " +
+      "The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. " +
+      "If the task is still referenced as a lineage parent by another task, deletion is rejected unless removeLineageReferences:true is passed.",
+    parameters: taskDeleteParams,
+    execute: async (_id: string, params: Static<typeof taskDeleteParams>) => {
+      try {
+        const task = await store.deleteTask(params.id, {
+          allowResurrection: params.allowResurrection === true,
+          removeLineageReferences: params.removeLineageReferences === true,
+          auditContext: { agentId: "chat", runId: `chat-delete-${params.id}-${Date.now()}`, taskId: params.id },
+        });
+        return { content: [{ type: "text" as const, text: `Deleted ${task.id}` }], details: { taskId: task.id } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to delete task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+export function createTaskRetryTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_task_retry",
+    label: "Retry Task",
+    description: "Retry a failed task. Clears failure state and re-queues the task for execution.",
+    parameters: taskRetryParams,
+    execute: async (_id: string, params: Static<typeof taskRetryParams>) => {
+      try {
+        const task = await store.getTask(params.id);
+        if (task.status !== "failed" && task.status !== "stuck-killed") {
+          return { content: [{ type: "text" as const, text: `Task ${params.id} is not in a retryable state (status: ${task.status || "none"})` }], details: { taskId: params.id, currentStatus: task.status }, isError: true };
+        }
+        await store.updateTask(params.id, { status: null, error: null });
+        /*
+        FNXC:TaskRetry 2026-07-31-23:59 (review finding on #3152 — the move resolved, the REPORT did not):
+        The rebound target is resolved once and reused for the move, the log line, the response text
+        and `details.newColumn`. Converting only the `moveTask` argument left three places still
+        naming `"todo"`, so on a renamed board the card correctly landed in (say) `backlog` while the
+        operator and the task log were both told it went to `todo` — a lie that is worse than the
+        original literal, because the original at least agreed with itself.
+
+        `details.newColumn` is the one that travels: it is machine-readable output other tooling can
+        act on, so a wrong value there is not merely cosmetic.
+        */
+        const retryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
+        await store.moveTask(params.id, retryTarget);
+        await store.logEntry(params.id, "Retry requested via chat tool", `Task reset to ${retryTarget} for retry`);
+        return { content: [{ type: "text" as const, text: `Retried ${params.id} → ${retryTarget}` }], details: { taskId: params.id, newColumn: retryTarget } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to retry task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+export function createTaskPauseTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_task_pause",
+    label: "Pause Task",
+    description: "Pause an active task so the executor will not pick it up on the next heartbeat.",
+    parameters: taskPauseParams,
+    execute: async (_id: string, params: Static<typeof taskPauseParams>) => {
+      try {
+        const task = await store.pauseTask(params.id, true);
+        return { content: [{ type: "text" as const, text: `Paused ${task.id}` }], details: { taskId: task.id, column: task.column } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to pause task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+export function createTaskUnpauseTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_task_unpause",
+    label: "Unpause Task",
+    description: "Resume a previously paused task so the executor can pick it up again.",
+    parameters: taskUnpauseParams,
+    execute: async (_id: string, params: Static<typeof taskUnpauseParams>) => {
+      try {
+        const task = await store.pauseTask(params.id, false);
+        return { content: [{ type: "text" as const, text: `Unpaused ${task.id}` }], details: { taskId: task.id, column: task.column } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to unpause task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+export function createTaskDuplicateTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_task_duplicate",
+    label: "Duplicate Task",
+    description: "Duplicate an existing task, preserving its description and workflow (dependencies are not copied).",
+    parameters: taskDuplicateParams,
+    execute: async (_id: string, params: Static<typeof taskDuplicateParams>) => {
+      try {
+        const task = await store.duplicateTask(params.id);
+        return { content: [{ type: "text" as const, text: `Duplicated to ${task.id}` }], details: { taskId: task.id } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to duplicate task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+/*
+FNXC:ChatTaskMutationTools 2026-07-26-12:00:
+fn_task_merge targets params.task_id only; the ambient currentTaskId arg is retained for call-site parity with other task tools but is intentionally unused (project chat passes "").
+Prefix with underscore so the lint gate does not fail on the unused parameter.
+*/
+export function createTaskMergeTool(store: TaskStore, _currentTaskId: string): ToolDefinition {
+  return {
+    name: "fn_task_merge",
+    label: "Merge Task",
+    description:
+      "Merge a task into the current/parent task. The target task is closed and its work is rolled into the parent.",
+    parameters: taskMergeParams,
+    execute: async (_id: string, params: Static<typeof taskMergeParams>) => {
+      const targetId = params.task_id?.trim();
+      if (!targetId) return { content: [{ type: "text" as const, text: "ERROR: task_id is required." }], details: {}, isError: true };
+      try {
+        const result = await store.mergeTask(targetId);
+        const mergedInto = result?.task?.id ?? targetId;
+        return { content: [{ type: "text" as const, text: `Merged ${targetId} into ${mergedInto}` }], details: { targetId, mergedInto } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to merge task: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+export function createTaskUpdateTool(store: TaskStore, taskId: string): ToolDefinition {
+  return {
+    name: "fn_task_update",
+    label: "Update Step / Custom Fields / Dependencies",
+    description:
+      "Update a task step status, dependencies, or workflow custom fields without leaving chat. " +
+      "Use step+status to report progress, dependencies to rewire blockers, or custom_fields to set workflow-defined fields.",
+    parameters: taskUpdateParams,
+    execute: async (_id: string, params: Static<typeof taskUpdateParams>) => {
+      try {
+        if (params.custom_fields !== undefined) {
+          const res = await store.updateTaskCustomFields(taskId, params.custom_fields);
+          if (!res.ok) {
+            const r = res.rejection;
+            return {
+              content: [{ type: "text" as const, text: `ERROR: custom field '${r.fieldId}' rejected (${r.code}): ${r.detail}` }],
+              details: { fieldId: r.fieldId, code: r.code, detail: r.detail },
+              isError: true,
+            };
+          }
+        }
+        if (params.dependencies !== undefined) {
+          if (params.dependencies.includes(taskId)) {
+            return { content: [{ type: "text" as const, text: "ERROR: self-dependency not allowed." }], details: {}, isError: true };
+          }
+          const invalidIds: string[] = [];
+          for (const depId of params.dependencies) {
+            try { await store.getTask(depId); } catch { invalidIds.push(depId); }
+          }
+          if (invalidIds.length) {
+            return { content: [{ type: "text" as const, text: `ERROR: Unknown dependency task(s): ${invalidIds.join(", ")}` }], details: {}, isError: true };
+          }
+          await store.updateTask(taskId, { dependencies: params.dependencies });
+        }
+        if (params.step !== undefined && params.status !== undefined) {
+          const task = params.summary === undefined
+            ? await store.updateStep(taskId, params.step, params.status)
+            : await store.updateStep(taskId, params.step, params.status, { summary: params.summary });
+          const reminder = params.status === "done" && !params.summary?.trim()
+            ? " No step summary recorded — call fn_task_update again for this step with `summary` to record what it delivered."
+            : "";
+          return { content: [{ type: "text" as const, text: `Updated ${taskId}: step ${params.step} → ${params.status}.${reminder}` }], details: { taskId: task.id, step: params.step, status: params.status } };
+        }
+        if (params.custom_fields !== undefined || params.dependencies !== undefined) {
+          return { content: [{ type: "text" as const, text: "Updated." }], details: {} };
+        }
+        return { content: [{ type: "text" as const, text: "No-op: provide step+status, dependencies, or custom_fields." }], details: {} };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${toolErrorMessage(err)}` }], details: {}, isError: true };
+      }
+    },
+  };
+}
+
+export function createTaskAddDepTool(store: TaskStore, taskId: string): ToolDefinition {
+  return {
+    name: "fn_task_add_dep",
+    label: "Add Task Dependency",
+    description:
+      "Add a dependency to the current task. Adding a dependency to an in-progress task will stop execution " +
+      "and discard current work. Confirm is required for in-progress tasks.",
+    parameters: taskAddDepParams,
+    execute: async (_id: string, params: Static<typeof taskAddDepParams>) => {
+      try {
+        const depId = params.task_id?.trim();
+        if (!depId) return { content: [{ type: "text" as const, text: "ERROR: task_id is required." }], details: {}, isError: true };
+        const task = await store.getTask(taskId);
+        /*
+        FNXC:WorkflowResolvedColumns 2026-07-30-00:30:
+        The board's WIP lanes, not the literal. This guard is the only thing standing between an
+        operator and losing in-flight work: adding a dependency to a running task stops execution and
+        discards it, so the confirmation must fire on whatever lane that board calls "in progress".
+        Keyed on the literal it was silently skipped on every renamed board — the work is destroyed
+        with no prompt, which is the failure you cannot undo.
+
+        Same shape as the terminal-column resolution earlier in this file: seed the legacy id as the
+        floor, union the resolved trait columns, and degrade to the legacy id alone if the workflow
+        cannot be read.
+        */
+        const wipColumns = new Set<string>(["in-progress"]);
+        try {
+          const wipIr = await fusionCore.resolveWorkflowIrForTask(store, taskId);
+          if (wipIr) for (const id of fusionCore.columnsWithFlag(wipIr, "countsTowardWip")) wipColumns.add(id);
+        } catch { /* degraded: legacy id only */ }
+        if (wipColumns.has(task.column) && params.confirm !== true) {
+          return {
+            content: [{ type: "text" as const, text: "WARNING: adding a dependency to an in-progress task will stop execution and discard current work. Pass confirm:true to proceed." }],
+            details: { requiresConfirm: true, taskId },
+          };
+        }
+        if (depId === taskId) return { content: [{ type: "text" as const, text: "ERROR: cannot add self-dependency." }], details: {}, isError: true };
+        await store.updateTask(taskId, { dependencies: [...(task.dependencies || []), depId] });
+        return { content: [{ type: "text" as const, text: `Added dependency ${depId} to ${taskId}` }], details: { taskId, dependency: depId } };
+      } catch (err: unknown) {
+        return { content: [{ type: "text" as const, text: `ERROR: Failed to add dependency: ${toolErrorMessage(err)}` }], details: {}, isError: true };
       }
     },
   };
@@ -3240,6 +4206,30 @@ export function createWorkflowAuthoringTools(
   ];
 }
 
+/**
+ * Resolve an active memory-search topic/focus to its effective value.
+ *
+ * RUFU-068: a conversation's focus is a within-project read filter that scopes
+ * recall to a working topic. Values that mean "no filter" collapse to `undefined`
+ * so the caller searches whole-project scope (project default):
+ *   - undefined / null → undefined (whole scope)
+ *   - empty or whitespace-only string → undefined
+ *   - "all" or "*" (operator way to clear the filter) → undefined
+ * Any other non-empty trimmed string is the active topic.
+ */
+// FNXC:MemoryFocusEngine 2026-08-13-15:57: per-conversation memory focus (RUFU-068).
+// A conversation can carry an active topic; recall (fn_memory_search) must scope to
+// it as a WITHIN-project read filter. 'all'/'*'/empty/undefined mean no filter →
+// whole-project scope (project default). The resolved topic is pushed through
+// searchProjectMemory → backend.search (Stash REST &topic= for SQL-side filtering),
+// never a client-side post-query filter.
+export function resolveMemorySearchTopic(focus: string | null | undefined): string | undefined {
+  if (focus == null) return undefined;
+  const trimmed = focus.trim();
+  if (trimmed === "" || trimmed === "all" || trimmed === "*") return undefined;
+  return trimmed;
+}
+
 export function createMemorySearchTool(rootDir: string, settings?: MemoryToolSettings, options?: MemoryToolOptions): ToolDefinition {
   return {
     name: "fn_memory_search",
@@ -3255,9 +4245,18 @@ export function createMemorySearchTool(rootDir: string, settings?: MemoryToolSet
           ? await searchAgentMemoryWithQmd(rootDir, options.agentMemory, params.query, limit)
           : await searchAgentMemoryFile(rootDir, options.agentMemory, params.query, limit)
         : [];
+      // FNXC:MemoryFocusEngine 2026-08-13-15:57: scope the project recall to the
+      // active topic when a focus is set — either explicitly via params.topic, or
+      // from the enclosing conversation's focus (options.focus). 'all'/''/'*' clears
+      // to whole-project scope. This is a WITHIN-project read filter; it never
+      // weakens cross-project scope isolation. The topic reaches searchProjectMemory
+      // → backend.search, which (for Stash) pushes it as a &topic= query param for
+      // SQL-enforced filtering — we never post-filter results in-memory.
+      const activeTopic = resolveMemorySearchTopic(params.topic ?? options?.focus);
       const projectResults = await searchProjectMemory(rootDir, {
         query: params.query,
         limit,
+        ...(activeTopic ? { topic: activeTopic } : {}),
       }, settings);
       const results = [...agentResults, ...projectResults]
         .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
@@ -3616,6 +4615,8 @@ export const missionCreateParams = Type.Object({
 });
 export const missionUpdateParams = Type.Object({ id: Type.String(), title: Type.Optional(Type.String()), description: Type.Optional(Type.String()) });
 export const missionDeleteParams = Type.Object({ id: Type.String() });
+export const missionSetStatusParams = Type.Object({ id: Type.String(), status: Type.Union(fusionCore.MISSION_STATUSES.map((status) => Type.Literal(status))), reason: Type.Optional(Type.String()) });
+export const missionReconcileParams = Type.Object({ id: Type.Optional(Type.String()), dryRun: Type.Optional(Type.Boolean()) });
 export const milestoneAddParams = Type.Object({ missionId: Type.String(), title: Type.String(), description: Type.Optional(Type.String()) });
 export const milestoneUpdateParams = Type.Object({ id: Type.String(), title: Type.Optional(Type.String()), description: Type.Optional(Type.String()), acceptanceCriteria: Type.Optional(Type.String()) });
 export const milestoneDeleteParams = Type.Object({ milestoneId: Type.String(), force: Type.Optional(Type.Boolean()) });
@@ -3625,7 +4626,11 @@ export const sliceDeleteParams = Type.Object({ sliceId: Type.String(), force: Ty
 export const featureAddParams = Type.Object({ sliceId: Type.String(), title: Type.String(), description: Type.Optional(Type.String()), acceptanceCriteria: Type.Optional(Type.String()) });
 export const featureUpdateParams = Type.Object({ id: Type.String(), title: Type.Optional(Type.String()), description: Type.Optional(Type.String()), acceptanceCriteria: Type.Optional(Type.String()) });
 export const featureDeleteParams = Type.Object({ featureId: Type.String(), force: Type.Optional(Type.Boolean()) });
+export const featureSetStatusParams = Type.Object({ id: Type.String(), status: Type.Union(fusionCore.FEATURE_STATUSES.map((status) => Type.Literal(status))), reason: Type.Optional(Type.String()) });
 export const featureLinkTaskParams = Type.Object({ featureId: Type.String(), taskId: Type.String() });
+export const featureRepointTaskParams = featureLinkTaskParams;
+export const featureUnlinkTaskParams = Type.Object({ featureId: Type.String() });
+export const featureRepairValidationParams = Type.Object({ id: Type.String(), action: Type.Union([Type.Literal("clear"), Type.Literal("re_run")]), reason: Type.Optional(Type.String()) });
 export const researchFindingPromoteParams = Type.Object({
   runId: Type.String(),
   findingId: Type.String(),
@@ -3641,13 +4646,110 @@ const missionToolResult = (text: string, details: Record<string, unknown>, isErr
   content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}),
 });
 const optionalText = (value: string | undefined) => value?.trim() || undefined;
+
+/*
+FNXC:MissionToolParity 2026-07-23-12:29:
+Engine-managed agent surfaces must render hierarchy IDs and statuses because downstream mission
+operations require those identifiers. Keep rich optional gate prose bounded in text while details
+retains the complete MissionStore hierarchy for programmatic callers.
+*/
+function formatMissionHierarchy(mission: MissionWithHierarchy): string {
+  const lines: string[] = [];
+  const renderBoundedField = (indent: string, label: string, value: string | undefined) => {
+    const trimmed = value?.trim();
+    if (!trimmed) return;
+    if (trimmed.length > 240) {
+      lines.push(`${indent}${label} ${trimmed.slice(0, 240)}… (truncated, ${trimmed.length} chars)`);
+      return;
+    }
+    lines.push(`${indent}${label} ${trimmed}`);
+  };
+
+  lines.push(`${mission.id}: ${mission.title}`);
+  lines.push(`Status: ${mission.status}`);
+  lines.push(`Created: ${mission.createdAt}`);
+  lines.push(`Updated: ${mission.updatedAt}`);
+  if (mission.description) lines.push(`Description: ${mission.description}`);
+  if (mission.baseBranch) lines.push(`Base branch: ${mission.baseBranch}`);
+  if (mission.eventCount !== undefined) lines.push(`Events: ${mission.eventCount}`);
+  lines.push("");
+
+  lines.push("Linked Goals:");
+  if ((mission.linkedGoals?.length ?? 0) === 0) {
+    lines.push("No linked goals.");
+  } else {
+    for (const goal of mission.linkedGoals ?? []) lines.push(`- ${goal.id}: ${goal.title} (${goal.status})`);
+  }
+  lines.push("");
+
+  if (mission.milestones.length === 0) {
+    lines.push("No milestones yet.");
+    return lines.join("\n");
+  }
+
+  lines.push("Milestones:");
+  for (const milestone of mission.milestones) {
+    const icon = milestone.status === "complete" ? "✓" : milestone.status === "active" ? "●" : "○";
+    lines.push(`  ${icon} ${milestone.id}: ${milestone.title} (${milestone.status})`);
+    renderBoundedField("    ", "AC:", milestone.acceptanceCriteria);
+    if (milestone.slices.length === 0) {
+      lines.push("    No slices.");
+      continue;
+    }
+
+    for (const slice of milestone.slices) {
+      const icon = slice.status === "complete" ? "✓" : slice.status === "active" ? "●" : "○";
+      const activated = slice.activatedAt ? ` [activated: ${slice.activatedAt}]` : "";
+      lines.push(`    ${icon} ${slice.id}: ${slice.title} (${slice.status})${activated}`);
+      renderBoundedField("      ", "Verification:", slice.verification);
+      if (slice.features.length === 0) {
+        lines.push("      No features.");
+        continue;
+      }
+
+      for (const feature of slice.features) {
+        const icon = feature.status === "done" ? "✓" : feature.status === "in-progress" ? "▸" : feature.status === "triaged" ? "●" : "○";
+        const taskLink = feature.taskId ? ` → ${feature.taskId}` : "";
+        lines.push(`      ${icon} ${feature.id}: ${feature.title} (${feature.status})${taskLink}`);
+        renderBoundedField("        ", "AC:", feature.acceptanceCriteria);
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
 /* FNXC:MissionToolParity 2026-07-30-09:56: A supplied empty update value must remain an empty string so MissionStore can clear it, matching the pi-extension contract; only omitted values leave a field unchanged. */
 const updateFields = (params: Record<string, unknown>, fields: string[]) => Object.fromEntries(
   fields.filter((field) => params[field] !== undefined).map((field) => [field, (params[field] as string).trim()]),
 );
 
 /** Create the project-scoped Mission hierarchy surface shared by engine lanes and dashboard chat. */
-export function createMissionTools(store: TaskStore): ToolDefinition[] {
+export interface MissionToolActorContext {
+  agentId?: string;
+  agentName?: string;
+}
+
+/**
+ * FNXC:MissionAutonomyAudit 2026-07-23-16:10:
+ * Mission tool calls may arm remediation through lifecycle changes. Preserve the
+ * runtime agent identity when available; tool surfaces without one remain
+ * explicitly attributable to the engine instead of the generic mission store.
+ */
+function missionToolActor(context: MissionToolActorContext): fusionCore.MissionTransitionActor {
+  if (context.agentId) {
+    return {
+      type: "agent",
+      id: context.agentId,
+      ...(context.agentName ? { displayName: context.agentName } : {}),
+      source: "engine-agent-tool",
+    };
+  }
+  return { type: "system", id: "engine-mission-tools", displayName: "Engine mission tools", source: "engine-agent-tool" };
+}
+
+export function createMissionTools(store: TaskStore, context: MissionToolActorContext = {}): ToolDefinition[] {
+  const actor = missionToolActor(context);
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const tool = (name: string, label: string, description: string, parameters: any, execute: (params: any) => Promise<ReturnType<typeof missionToolResult>>): ToolDefinition => ({
     name, label, description, parameters,
@@ -3656,10 +4758,19 @@ export function createMissionTools(store: TaskStore): ToolDefinition[] {
   /* eslint-enable @typescript-eslint/no-explicit-any */
   return [
     tool("fn_mission_list", "List Missions", "List all missions with their current status.", missionListParams, async () => { const missions = await store.getMissionStore().listMissions(); return missionToolResult(missions.length ? `Missions (${missions.length})\n${missions.map((m) => `- ${m.id}: ${m.title} (${m.status})`).join("\n")}` : "No missions yet.", { missions, count: missions.length }); }),
-    tool("fn_mission_show", "Show Mission", "Show a mission with its full milestone, slice, and feature hierarchy.", missionShowParams, async ({ id }) => { const mission = await store.getMissionStore().getMissionWithHierarchy(id); return mission ? missionToolResult(`${mission.id}: ${mission.title}`, { mission }) : missionToolResult(`Mission ${id} not found`, { code: "MISSION_NOT_FOUND", missionId: id }, true); }),
-    tool("fn_mission_create", "Create Mission", "Create a high-level mission.", missionCreateParams, async (p) => { const ms = store.getMissionStore(); const mission = await ms.createMission({ title: p.title.trim(), description: optionalText(p.description), baseBranch: optionalText(p.baseBranch) }); const updated = p.autoAdvance === undefined ? mission : await ms.updateMission(mission.id, { autoAdvance: p.autoAdvance }); return missionToolResult(`Created ${updated.id}: ${updated.title}`, { mission: updated }); }),
-    tool("fn_mission_update", "Update Mission", "Partially update a mission.", missionUpdateParams, async (p) => { const updates = updateFields(p, ["title", "description"]); if (!Object.keys(updates).length) return missionToolResult("No fields to update", {}, true); const mission = await store.getMissionStore().updateMission(p.id, updates); return missionToolResult(`Updated ${mission.id}: ${mission.title}`, { mission }); }),
+    tool("fn_mission_show", "Show Mission", "Show a mission with its full milestone, slice, and feature hierarchy.", missionShowParams, async ({ id }) => { const mission = await store.getMissionStore().getMissionWithHierarchy(id); return mission ? missionToolResult(formatMissionHierarchy(mission), { mission }) : missionToolResult(`Mission ${id} not found`, { code: "MISSION_NOT_FOUND", missionId: id }, true); }),
+    tool("fn_mission_create", "Create Mission", "Create a high-level mission.", missionCreateParams, async (p) => { const ms = store.getMissionStore(); const mission = await ms.createMission({ title: p.title.trim(), description: optionalText(p.description), baseBranch: optionalText(p.baseBranch) }); const updated = p.autoAdvance === undefined ? mission : await ms.updateMission(mission.id, { autoAdvance: p.autoAdvance }, { actor }); return missionToolResult(`Created ${updated.id}: ${updated.title}`, { mission: updated }); }),
+    tool("fn_mission_update", "Update Mission", "Partially update a mission.", missionUpdateParams, async (p) => { const updates = updateFields(p, ["title", "description"]); if (!Object.keys(updates).length) return missionToolResult("No fields to update", {}, true); const mission = await store.getMissionStore().updateMission(p.id, updates, { actor }); return missionToolResult(`Updated ${mission.id}: ${mission.title}`, { mission }); }),
+    tool("fn_mission_set_status", "Set Mission Status", "Set a mission lifecycle status.", missionSetStatusParams, async (p) => {
+      if (!fusionCore.MISSION_STATUSES.includes(p.status)) return missionToolResult(`Invalid status. Must be one of: ${fusionCore.MISSION_STATUSES.join(", ")}`, {}, true);
+      const mission = await store.getMissionStore().updateMission(p.id, { status: p.status }, { actor, reason: p.reason });
+      return missionToolResult(`Set ${mission.id} status to ${mission.status}`, { mission });
+    }),
     tool("fn_mission_delete", "Delete Mission", "Delete a mission and its hierarchy.", missionDeleteParams, async ({ id }) => { await store.getMissionStore().deleteMission(id); return missionToolResult(`Deleted ${id}`, { missionId: id }); }),
+    tool("fn_mission_reconcile", "Reconcile Mission", "Reconcile mission state against deterministic delivery ground truth.", missionReconcileParams, async (p) => {
+      const result = await reconcileMissionState({ taskStore: store, missionStore: store.getMissionStore() }, { missionId: p.id, dryRun: p.dryRun === true, source: "tool", actor });
+      return missionToolResult(`Reconciled ${p.id ?? "project"}`, result as unknown as Record<string, unknown>);
+    }),
     tool("fn_milestone_add", "Add Milestone", "Add a milestone to a mission.", milestoneAddParams, async (p) => { const milestone = await store.getMissionStore().addMilestone(p.missionId, { title: p.title.trim(), description: optionalText(p.description) }); return missionToolResult(`Added ${milestone.id}`, { milestone }); }),
     tool("fn_milestone_update", "Update Milestone", "Partially update a milestone.", milestoneUpdateParams, async (p) => { const updates = updateFields(p, ["title", "description", "acceptanceCriteria"]); if (!Object.keys(updates).length) return missionToolResult("No fields to update", {}, true); const milestone = await store.getMissionStore().updateMilestone(p.id, updates); return missionToolResult(`Updated ${milestone.id}`, { milestone }); }),
     tool("fn_milestone_delete", "Delete Milestone", "Delete a milestone and descendants.", milestoneDeleteParams, async (p) => { await store.getMissionStore().deleteMilestone(p.milestoneId, p.force === true); return missionToolResult(`Deleted ${p.milestoneId}`, { milestoneId: p.milestoneId }); }),
@@ -3668,14 +4779,69 @@ export function createMissionTools(store: TaskStore): ToolDefinition[] {
     tool("fn_slice_delete", "Delete Slice", "Delete a slice and descendants.", sliceDeleteParams, async (p) => { await store.getMissionStore().deleteSlice(p.sliceId, p.force === true); return missionToolResult(`Deleted ${p.sliceId}`, { sliceId: p.sliceId }); }),
     tool("fn_feature_add", "Add Feature", "Add a feature to a slice.", featureAddParams, async (p) => { const feature = await store.getMissionStore().addFeature(p.sliceId, { title: p.title.trim(), description: optionalText(p.description), acceptanceCriteria: optionalText(p.acceptanceCriteria) }); return missionToolResult(`Added ${feature.id}`, { feature }); }),
     tool("fn_feature_update", "Update Feature", "Partially update a feature.", featureUpdateParams, async (p) => { const updates = updateFields(p, ["title", "description", "acceptanceCriteria"]); if (!Object.keys(updates).length) return missionToolResult("No fields to update", {}, true); const feature = await store.getMissionStore().updateFeature(p.id, updates); return missionToolResult(`Updated ${feature.id}`, { feature }); }),
+    tool("fn_feature_repair_validation", "Repair Feature Validation", "Clear a stale validation badge or re-run validation.", featureRepairValidationParams, async (p) => {
+      const missionStore = store.getMissionStore();
+      if (!("repairFeatureValidationState" in missionStore)) {
+        return missionToolResult("Validation repair requires the PostgreSQL mission store", { code: "POSTGRES_REQUIRED" }, true);
+      }
+      const feature = await missionStore.getFeature(p.id);
+      if (!feature) return missionToolResult(`Feature ${p.id} not found`, { code: "FEATURE_NOT_FOUND", featureId: p.id }, true);
+      const eligibility = fusionCore.featureValidationRepairEligibility(feature);
+      if ((p.action === "clear" && !eligibility.clear) || (p.action === "re_run" && !eligibility.reRun)) {
+        return missionToolResult(`Cannot ${p.action === "clear" ? "clear" : "re-run"} validation for ${feature.id}: current loop state is ${feature.loopState ?? "idle"} and status is ${feature.status}.`, { code: "FEATURE_REPAIR_INELIGIBLE", feature }, true);
+      }
+      if (p.action === "re_run") {
+        const repaired = await missionStore.repairFeatureValidationState(p.id, { action: p.action, actor, reason: p.reason });
+        return missionToolResult(`Re-ran validation for ${p.id}`, { feature: repaired.feature, run: repaired.run });
+      }
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const currentFeature = await missionStore.getFeature(p.id);
+        if (!currentFeature) return missionToolResult(`Feature ${p.id} not found`, { code: "FEATURE_NOT_FOUND", featureId: p.id }, true);
+        const targets = await resolveFeatureRepairTargets(store, currentFeature);
+        try {
+          const repaired = await missionStore.repairFeatureValidationState(p.id, {
+            action: "clear", actor, reason: p.reason, resolvedStatus: targets.status,
+            resolvedLoopState: targets.resumeImplementation ? "implementing" : "idle", groundTruth: targets.groundTruth,
+          });
+          return missionToolResult(`Cleared validation state for ${p.id}`, { feature: repaired.feature ?? repaired });
+        } catch (error) {
+          if (!(error instanceof fusionCore.RepairGroundTruthStaleError) || attempt === 1) {
+            if (error instanceof fusionCore.RepairGroundTruthStaleError) return missionToolResult("Linked task state changed while repairing; re-check the feature and retry.", { code: "FEATURE_REPAIR_STALE" }, true);
+            throw error;
+          }
+        }
+      }
+      return missionToolResult("Linked task state changed while repairing; re-check the feature and retry.", { code: "FEATURE_REPAIR_STALE" }, true);
+    }),
+    /* FNXC:MissionStatusWrites 2026-08-10-12:47: Dedicated status tools preserve the linked-task guard; generic partial updates intentionally cannot bypass it. */
+    tool("fn_feature_set_status", "Set Feature Status", "Set a feature lifecycle status.", featureSetStatusParams, async (p) => {
+      if (!fusionCore.FEATURE_STATUSES.includes(p.status)) return missionToolResult(`Invalid status. Must be one of: ${fusionCore.FEATURE_STATUSES.join(", ")}`, {}, true);
+      const missionStore = store.getMissionStore(); const feature = await missionStore.getFeature(p.id);
+      if (!feature) return missionToolResult(`Feature ${p.id} not found`, { code: "FEATURE_NOT_FOUND", featureId: p.id }, true);
+      if ((["triaged", "in-progress", "done", "blocked"] as const).includes(p.status) && !feature.taskId) {
+        return missionToolResult(`Cannot set status to '${p.status}' without a linked task. Use the triage endpoint to create and link a task first, or link an existing task via fn_feature_link_task.`, { error: "FEATURE_TASK_REQUIRED" }, true);
+      }
+      const updated = await missionStore.updateFeatureStatus(p.id, p.status, { actor, reason: p.reason });
+      return missionToolResult(`Set ${updated.id} status to ${updated.status}`, { feature: updated });
+    }),
     tool("fn_feature_delete", "Delete Feature", "Delete a feature, respecting linked-task guards.", featureDeleteParams, async (p) => { await store.getMissionStore().deleteFeature(p.featureId, p.force ===true); return missionToolResult(`Deleted ${p.featureId}`, { featureId: p.featureId }); }),
     tool("fn_feature_link_task", "Link Feature to Task", "Link a feature to a live project-scoped task.", featureLinkTaskParams, async (p) => { const feature = await store.getMissionStore().linkFeatureToTask(p.featureId, p.taskId); return missionToolResult(`Linked ${feature.id} to ${p.taskId}`, { feature }); }),
+    tool("fn_feature_repoint_task", "Re-point Feature to Task", "Atomically re-point an already-linked feature's single-valued taskId to a different live project-scoped task, correcting a mis-pinned link without the status-lossy unlink then link two-step. Same-task re-point is an idempotent no-op.", featureRepointTaskParams, async (p) => { const feature = await store.getMissionStore().repointFeatureToTask(p.featureId, p.taskId); return missionToolResult(`Re-pointed ${feature.id} to ${p.taskId}`, { feature }); }),
+    tool("fn_feature_unlink_task", "Unlink Feature from Task", "Detach a feature from its linked task entirely, clearing its single-valued taskId and demoting its status to defined (for use before the documented safe duplicate-cleanup flow). Fails if the feature is not currently linked.", featureUnlinkTaskParams, async (p) => { const feature = await store.getMissionStore().unlinkFeatureFromTask(p.featureId); return missionToolResult(`Unlinked ${feature.id} from its task`, { feature }); }),
     tool("fn_research_promote_finding", "Promote Research Finding", "Promote a completed research finding into a canonical mission feature.", researchFindingPromoteParams, async (p) => {
       const missionStore = store.getMissionStore();
       if (!("addResearchFeature" in missionStore)) return missionToolResult("Research promotion requires the PostgreSQL mission store", { code: "POSTGRES_REQUIRED" }, true);
       let promoted: Awaited<ReturnType<typeof fusionCore.promoteResearchFinding>>;
       try {
-        promoted = await fusionCore.promoteResearchFinding(store.getResearchStore() as never, missionStore, p);
+        const layer = store.getAsyncLayer();
+        promoted = await fusionCore.promoteResearchFinding(
+          store.getResearchStore() as never,
+          missionStore,
+          p,
+          layer
+            ? fusionCore.createRecallCaptureWriter({ layer, logger: fusionCore.createLogger("research-recall-capture") })
+            : fusionCore.NOOP_RECALL_CAPTURE_WRITER,
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return missionToolResult(message, { code: message.includes("not completed") ? "RUN_NOT_COMPLETED" : message.includes("not found") ? "FINDING_OR_RUN_NOT_FOUND" : "PROMOTION_FAILED", runId: p.runId, findingId: p.findingId }, true);
@@ -3719,6 +4885,19 @@ const ideationToolResult = (text: string, details: Record<string, unknown>, isEr
   content: [{ type: "text" as const, text }], details, ...(isError ? { isError: true } : {}),
 });
 
+/*
+FNXC:Ideation 2026-07-23-12:13:
+Convergence requires a canonical candidate ID, so every shared agent-facing
+ideation response that exposes candidates must render their ID and provenance
+in text rather than leaving them discoverable only in structured details.
+*/
+const formatIdeationCandidate = (candidate: IdeationCandidate): string => [
+  `- ${candidate.id} (${candidate.origin})`,
+  `  Source reference: ${candidate.sourceRef ?? "none"}`,
+  "  Content:",
+  ...candidate.content.split("\n").map((line) => `    ${line}`),
+].join("\n");
+
 /** Create the persisted ideation surface shared by executor, triage, heartbeat, and chat. */
 export function createIdeationTools(store: TaskStore): ToolDefinition[] {
   /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -3737,7 +4916,11 @@ export function createIdeationTools(store: TaskStore): ToolDefinition[] {
     }),
     tool("fn_ideation_show", "Show Ideation Session", "Show one ideation session and its divergent candidates.", ideationShowParams, async ({ id }) => {
       const session = await store.getIdeationStore().getSessionWithCandidates(id);
-      return session ? ideationToolResult(`${session.id}: ${session.title}`, { session }) : ideationToolResult(`Ideation session ${id} not found`, { code: "IDEATION_SESSION_NOT_FOUND", sessionId: id }, true);
+      if (!session) return ideationToolResult(`Ideation session ${id} not found`, { code: "IDEATION_SESSION_NOT_FOUND", sessionId: id }, true);
+      const candidates = session.candidates.length
+        ? `Candidates (${session.candidates.length})\n${session.candidates.map(formatIdeationCandidate).join("\n")}`
+        : "Candidates (0): no divergent candidates recorded.";
+      return ideationToolResult(`${session.id}: ${session.title} (${session.status})\n${candidates}`, { session });
     }),
     tool("fn_ideation_start", "Start Ideation", "Create a bounded persisted ideation session.", ideationStartParams, async ({ title, prompt }) => {
       const session = await store.getIdeationStore().createSession({ title, prompt });
@@ -3747,7 +4930,7 @@ export function createIdeationTools(store: TaskStore): ToolDefinition[] {
       const ideation = store.getIdeationStore();
       const created = [];
       for (const candidate of candidates) created.push(await ideation.addCandidate(sessionId, candidate));
-      return ideationToolResult(`Recorded ${created.length} candidate${created.length === 1 ? "" : "s"}`, { candidates: created });
+      return ideationToolResult(`Recorded ${created.length} candidate${created.length === 1 ? "" : "s"}\n${created.map(formatIdeationCandidate).join("\n")}`, { candidates: created });
     }),
     tool("fn_ideation_converge", "Converge Ideation", "Select a candidate and atomically create or attach its canonical Mission handoff.", ideationConvergeParams, async ({ sessionId, candidateId, targetMissionId, targetFeatureId }) => {
       const session = await store.getIdeationStore().convergeSession(sessionId, candidateId, { targetMissionId, targetFeatureId });
@@ -4088,9 +5271,44 @@ export function createGetAgentConfigTool(agentStore: AgentStore, callingAgentId:
   };
 }
 
-function isCallerPrivileged(caller: { id: string; role: string; reportsTo?: string | null } | null): boolean {
+/*
+FNXC:AgentProvisioningGate 2026-07-26-13:05:
+Deliberate decision: only the "ceo" role is provisioning-privileged. Top-level position
+(reportsTo == null) is NOT trust — any orphaned/imported/misconfigured top-level agent used
+to auto-bypass resolveAgentProvisioningPolicy entirely, making the deny/require-approval
+branches unreachable for it. Operator trust is expressed via
+settings.agentProvisioning.trustedAgentIds/trustedRoles, not org position. Top-level
+non-ceo agents now flow through the normal approval policy (default mode "trusted-only"
+=> require-approval).
+*/
+/*
+FNXC:AgentProvisioning 2026-07-26-18:20:
+Provisioning privilege comes from OPERATOR CONFIGURATION only — `agentProvisioning.trustedAgentIds`
+and `agentProvisioning.trustedRoles` — never from a hardcoded role name and never from org-chart
+position.
+
+Two earlier shapes were both wrong. `caller.reportsTo == null` made EVERY top-level agent privileged,
+so an agent that created a manager-less agent escalated permanently. Replacing it with
+`caller.role === "ceo"` swapped one implicit rule for a magic string: it silently grants a role that
+any agent config can claim, while an operator who genuinely wants a privileged agent has no supported
+way to say so other than naming it "ceo".
+
+Fails CLOSED: with no resolvable settings there is no privileged caller. This governs ONLY the
+org-chart escape hatch (creating/deleting agents outside your own direct reports). It is deliberately
+NOT fed to `resolveAgentProvisioningPolicy` as `isPrivileged`, because that flag short-circuits the
+policy before `alwaysApproveDelete` — a trusted caller should still route a delete through approval.
+The policy applies the same trusted-id/trusted-role rules itself, in the right order.
+*/
+function isCallerPrivileged(
+  caller: { id: string; role: string; reportsTo?: string | null } | null,
+  settings: ProjectSettings | undefined,
+): boolean {
   if (!caller) return false;
-  return caller.role === "ceo" || caller.reportsTo == null;
+  const provisioning = settings?.agentProvisioning;
+  if (!provisioning) return false;
+  if ((provisioning.trustedAgentIds ?? []).includes(caller.id)) return true;
+  const trustedRoles = (provisioning.trustedRoles ?? []).map((role) => role.toLowerCase());
+  return Boolean(caller.role) && trustedRoles.includes(caller.role.toLowerCase());
 }
 
 export function createUpdateAgentConfigTool(agentStore: AgentStore, callingAgentId: string): ToolDefinition {
@@ -4200,7 +5418,7 @@ export function createUpdateAgentConfigTool(agentStore: AgentStore, callingAgent
  * @param taskStore - TaskStore for task creation
  * @returns ToolDefinition for the `fn_delegate_task` tool
  */
-type AgentProvisioningToolOptions = {
+export type AgentProvisioningToolOptions = {
   hireApprovalEnabled?: boolean;
   approvalRequestStore?: ApprovalRequestStore;
   settingsProvider?: () => Promise<ProjectSettings | undefined>;
@@ -4219,7 +5437,9 @@ export function createAgentCreateTool(
     parameters: createAgentParams,
     execute: async (_id: string, params: Static<typeof createAgentParams>) => {
       const caller = await agentStore.getAgent(callingAgentId);
-      const privileged = isCallerPrivileged(caller);
+      // FNXC:AgentProvisioning 2026-07-26-18:20: settings resolve BEFORE the org-chart check because privilege is now operator-configured rather than role-derived.
+      const settings = await options?.settingsProvider?.();
+      const privileged = isCallerPrivileged(caller, settings);
       const reportsTo = params.reportsTo ?? callingAgentId;
 
       if (!privileged && reportsTo !== callingAgentId) {
@@ -4229,14 +5449,20 @@ export function createAgentCreateTool(
         };
       }
 
-      const settings = await options?.settingsProvider?.();
-      const fallbackSettings = !options?.settingsProvider && !options?.approvalRequestStore
-        ? { agentProvisioning: { approvalMode: "never" as const } }
-        : settings;
+      /*
+      FNXC:AgentProvisioningGate 2026-07-26-13:10:
+      Never synthesize approvalMode "never" when the factory receives no options. All three
+      production call sites (heartbeat idle + task lanes, executor lane) previously passed no
+      options, so the synthesized "never" disabled the provisioning gate everywhere outside
+      tests. With no settingsProvider the policy now resolves with settings undefined
+      (normalizeMode default "trusted-only"); a require-approval decision with no
+      approvalRequestStore fails CLOSED below — never silently allows.
+      */
+      // FNXC:AgentProvisioning 2026-07-26-18:20: `isPrivileged` is deliberately NOT forwarded — it short-circuits the policy ahead of `alwaysApproveDelete`. The policy re-applies trusted-id/trusted-role itself, in the correct order.
       const policy = resolveAgentProvisioningPolicy({
         tool: "fn_agent_create",
-        caller: caller ? { id: caller.id, role: caller.role, isPrivileged: privileged } : undefined,
-        settings: fallbackSettings,
+        caller: caller ? { id: caller.id, role: caller.role } : undefined,
+        settings,
       });
       await options?.runAuditor?.database({ type: "agent:create:requested", target: callingAgentId, metadata: { policy } });
 
@@ -4337,7 +5563,9 @@ export function createAgentDeleteTool(
         };
       }
 
-      const privileged = isCallerPrivileged(caller);
+      // FNXC:AgentProvisioning 2026-07-26-18:20: operator-configured privilege; see isCallerPrivileged.
+      const deleteSettings = await options?.settingsProvider?.();
+      const privileged = isCallerPrivileged(caller, deleteSettings);
       if (!privileged && target.reportsTo !== callingAgentId) {
         return {
           content: [{ type: "text" as const, text: "ERROR: You can only delete agents that report to you" }],
@@ -4349,14 +5577,18 @@ export function createAgentDeleteTool(
         return { content: [{ type: "text" as const, text: `ERROR: Cannot delete ephemeral/runtime agent ${params.agent_id}` }], details: {} };
       }
 
-      const settings = await options?.settingsProvider?.();
-      const fallbackSettings = !options?.settingsProvider && !options?.approvalRequestStore
-        ? { agentProvisioning: { approvalMode: "never" as const } }
-        : settings;
+      /*
+      FNXC:AgentProvisioningGate 2026-07-26-13:10:
+      Same fail-closed contract as fn_agent_create: no synthesized "never" mode when options
+      are absent; settings undefined resolves to the "trusted-only" default and a
+      require-approval decision with no approvalRequestStore is DENIED below.
+      */
+      // FNXC:AgentProvisioning 2026-07-26-18:20: reuse the already-resolved settings; `isPrivileged` is not forwarded so `alwaysApproveDelete` still applies to trusted callers.
+      const settings = deleteSettings;
       const policy = resolveAgentProvisioningPolicy({
         tool: "fn_agent_delete",
-        caller: caller ? { id: caller.id, role: caller.role, isPrivileged: privileged } : undefined,
-        settings: fallbackSettings,
+        caller: caller ? { id: caller.id, role: caller.role } : undefined,
+        settings,
       });
       await options?.runAuditor?.database({ type: "agent:delete:requested", target: target.id, metadata: { policy } });
 
@@ -4464,13 +5696,36 @@ export function createDelegateTaskTool(
     name: "fn_delegate_task",
     label: "Delegate Task",
     description:
-      "Create a new task and assign it to a specific agent for execution. The task goes to " +
-      "'todo' and will be picked up by the target agent on their next heartbeat cycle. " +
+      "Create a new task and assign it to a specific agent for execution. The task goes to the " +
+      "selected workflow's ready lane and will be picked up by the target agent on their next heartbeat cycle. " +
       "Use fn_list_agents first to find available agents and their capabilities. " +
       "Optionally pass workflow_id to select a workflow at creation time; use " +
       "fn_workflow_list to discover valid IDs.",
     parameters: delegateTaskParams,
     execute: async (_id: string, params: Static<typeof delegateTaskParams>) => {
+      /*
+      FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+      Caller-side policy gate, mirroring fn_task_create. The target-agent check below is a
+      routing rule, not an authorization one — it never asked whether the CALLER may create
+      work at all. Fail open only on a settings read error so a store hiccup cannot strand
+      delegation for permanent agents.
+      */
+      if (options?.callerIsEphemeral) {
+        const settings = typeof (taskStore as { getSettings?: unknown }).getSettings === "function"
+          ? await taskStore.getSettings().catch(() => ({} as Settings))
+          : ({} as Settings);
+        if (!isAgentDelegateTaskToolAvailable(settings as Settings, true)) {
+          const policy = fusionCore.resolveEphemeralTaskCreationPolicy(settings as Settings);
+          const message = policy === "deny"
+            ? "Ephemeral task-worker agents are not allowed to create tasks (ephemeral agent task creation is denied for this project), and delegation creates a task."
+            : "Ephemeral task-worker agents must route new work through fn_task_create for operator validation; delegation cannot bypass that review.";
+          return {
+            content: [{ type: "text" as const, text: `ERROR: ${message}` }],
+            details: { error: message, rule: "ephemeral-agents-cannot-create-tasks", policy },
+            isError: true,
+          };
+        }
+      }
       // Validate target agent exists
       const agent = await agentStore.getAgent(params.agent_id);
       if (!agent) {
@@ -4509,25 +5764,35 @@ export function createDelegateTaskTool(
 
       try {
         const workflowId = params.workflow_id?.trim() || undefined;
-        const lineage = await resolveApprovedMissionLineage(taskStore, params.mission_lineage, options?.sourceTaskId);
-        if ("error" in lineage) {
+        /*
+        FNXC:MissionAdmission 2026-07-22-13:07:
+        Freeform chat/user-directed delegation may omit mission_lineage.
+        requireMissionLineage (idle heartbeat patrol) still hard-requires an approved chain.
+        */
+        const lineage = await resolveApprovedMissionLineage(
+          taskStore,
+          params.mission_lineage,
+          options?.requireMissionLineage ? undefined : options?.sourceTaskId,
+          { required: options?.requireMissionLineage === true },
+        );
+        if (lineage && "error" in lineage) {
           return { content: [{ type: "text" as const, text: `ERROR: ${lineage.error}` }], details: { rule: "mission-lineage-required" }, isError: true };
         }
-        // Create task assigned to the target agent
+        const readyColumn = await resolveDelegationReadyColumn(taskStore, workflowId);
         const { task, wasDuplicate } = await createAgentTask(taskStore, {
           description: params.description,
           dependencies: params.dependencies,
-          column: "todo",
+          column: readyColumn,
           assignedAgentId: params.agent_id,
           ...(workflowId ? { workflowId } : {}),
-          missionId: lineage.missionId,
-          sliceId: lineage.sliceId,
+          ...(lineage ? { missionId: lineage.missionId, sliceId: lineage.sliceId } : {}),
+          ...definedFeatureBootstrapInput(taskStore, lineage),
           source: {
             sourceType: "api",
             sourceParentTaskId: options?.sourceTaskId,
             sourceAgentId: options?.sourceAgentId,
             sourceMetadata: {
-              missionLineage: lineage,
+              ...(lineage ? { missionLineage: lineage } : {}),
               ...(override ? { executorRoleOverride: true } : {}),
             },
           },
@@ -4699,7 +5964,7 @@ export function createSendMessageTool(
       "Send a message to another agent or user. The recipient will be woken if they have " +
       "`messageResponseMode: 'immediate'` configured. When replying, include `reply_to_message_id`; omit " +
       "`to_id` to reply to that message's sender only when the parent was addressed to you. Otherwise provide " +
-      "the exact recipient ID and appropriate type explicitly.",
+      "the exact recipient ID and appropriate type explicitly. Use mail for structured reports and approval items; use chat for quick back-and-forth.",
     parameters: sendMessageParams,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     execute: async (_id: string, params: Static<typeof sendMessageParams>, _signal?: any, _onUpdate?: any, _ctx?: any) => {
@@ -4718,6 +5983,17 @@ export function createSendMessageTool(
       }
 
       try {
+        if (params.mail_kind === "approval") {
+          return { content: [{ type: "text" as const, text: "ERROR: approval mail is emitted by the engine only" }], details: {} };
+        }
+        if (params.mail_kind === "report" && !params.report) {
+          return { content: [{ type: "text" as const, text: "ERROR: mail_kind report requires report" }], details: {} };
+        }
+        if (params.report) {
+          if (!params.report.title.trim()) return { content: [{ type: "text" as const, text: "ERROR: report.title must be a non-empty string" }], details: {} };
+          if (params.report.sections.length === 0) return { content: [{ type: "text" as const, text: "ERROR: report.sections must not be empty" }], details: {} };
+          if (params.report.sections.some((section) => !section.heading.trim() || !section.body.trim())) return { content: [{ type: "text" as const, text: "ERROR: report sections require non-empty heading and body" }], details: {} };
+        }
         const replyToMessageId = params.reply_to_message_id?.trim();
 
         if (params.reply_to_message_id !== undefined && !replyToMessageId) {
@@ -4804,7 +6080,13 @@ export function createSendMessageTool(
             toType: recipient.type,
             content,
             type: messageType,
-            ...(replyToMessageId ? { metadata: { replyTo: { messageId: replyToMessageId } } } : {}),
+            ...((replyToMessageId || params.mail_kind || params.report) ? {
+              metadata: {
+                ...(replyToMessageId ? { replyTo: { messageId: replyToMessageId } } : {}),
+                ...(params.mail_kind ? { mailKind: params.mail_kind } : {}),
+                ...(params.report ? { report: params.report } : {}),
+              },
+            } : {}),
           }),
           correlation: { kind: "direct", fromAgentId, toId: recipient.id },
         }, options?.autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 }, async () => {
@@ -4930,10 +6212,12 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
           .map((type) => registry.getProvider(type))
           .filter((provider): provider is NonNullable<typeof provider> => Boolean(provider)),
       });
+      const layer = options.store.getAsyncLayer();
       orchestratorState.orchestrator = new ResearchOrchestrator({
         store: resolveResearchStore(),
         stepRunner,
         maxConcurrentRuns: resolved.limits.maxConcurrentRuns,
+        ...(layer ? { recallCaptureWriter: fusionCore.createRecallCaptureWriter({ layer, logger: fusionCore.createLogger("research-recall-capture") }) } : {}),
       });
     }
 
@@ -5322,112 +6606,6 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           details: {},
         };
       }
-    },
-  };
-}
-
-export function createAcquireRepoWorktreeTool(opts: {
-  workspaceRootDir: string;
-  workspaceRepos: string[];
-  task: import("@fusion/core").Task;
-  store: TaskStore;
-  settings: Partial<Settings>;
-  logger?: { log: (m: string) => void; warn: (m: string) => void };
-  secretsStore?: Pick<import("@fusion/core").SecretsStore, "listEnvExportable">;
-  runContext?: RunMutationContext;
-  audit?: Pick<RunAuditor, "git" | "filesystem">;
-  /*
-  FNXC:Workspace 2026-06-21-22:30:
-  F2 — executor-supplied callback invoked after a SUCCESSFUL fresh acquire so the
-  acquired sub-repo worktree path is registered in the executor's per-task
-  activeWorktrees Set (KTD2). Without this the Set only ever held the browse-only
-  root and the "task holds N sub-repo paths" invariant was hollow — owner/liveness
-  checks never saw live sub-repo worktrees. Not called on the already-acquired
-  short-circuit (the path was registered on the original fresh acquire).
-  */
-  onAcquired?: (worktreePath: string) => void;
-  // FNXC:Workspace 2026-06-22 — thread the configured worktree-init runner so sub-repo worktrees run configured setup.
-  runConfiguredCommand?: import("./worktree-acquisition.js").AcquireWorkspaceRepoWorktreeOptions["runConfiguredCommand"];
-  taskEnv?: NodeJS.ProcessEnv;
-}): ToolDefinition {
-  const { workspaceRootDir, workspaceRepos, task, store, settings, logger, secretsStore, runContext, audit, onAcquired, runConfiguredCommand, taskEnv } = opts;
-  return {
-    name: "fn_acquire_repo_worktree",
-    label: "Acquire Repo Worktree",
-    description:
-      "Acquire an isolated git worktree for a sub-repo in this workspace. " +
-      "Call this before editing files in a sub-repo; work in the returned path. " +
-      `Available repos: ${workspaceRepos.join(", ")}.`,
-    parameters: acquireRepoWorktreeParams,
-    execute: async (_id: string, params: Static<typeof acquireRepoWorktreeParams>) => {
-      const { repo } = params;
-      if (!workspaceRepos.includes(repo)) {
-        return {
-          content: [{ type: "text" as const, text: `ERROR: Unknown repo: "${repo}". Available: ${workspaceRepos.join(", ")}` }],
-          details: {},
-          isError: true,
-        };
-      }
-      const freshTask = await store.getTask(task.id);
-      /*
-      FNXC:Workspace 2026-06-21-22:30:
-      F1 — acquireWorkspaceRepoWorktree can throw WorkspaceRepoAcquireBusyError on
-      same-sub-repo contention (KTD4) or a generic failure. Both must surface as a
-      structured isError tool result, never an uncaught throw that crashes the agent
-      loop. The busy message is sanitized — it does NOT leak the holder task id into
-      agent-facing text (only into details). runContext is forwarded so the helper's
-      audit/log entries keep run attribution.
-      */
-      let result: Awaited<ReturnType<typeof acquireWorkspaceRepoWorktree>>;
-      try {
-        result = await acquireWorkspaceRepoWorktree({
-          repoRelPath: repo,
-          workspaceRootDir,
-          task: freshTask,
-          store,
-          settings,
-          logger,
-          secretsStore,
-          audit,
-          runContext,
-          runConfiguredCommand,
-          taskEnv,
-        });
-      } catch (err) {
-        if (err instanceof WorkspaceRepoAcquireBusyError) {
-          return {
-            content: [{ type: "text" as const, text: `Sub-repo ${repo} is temporarily locked by another task's acquisition; retry fn_acquire_repo_worktree shortly.` }],
-            details: { holderTaskId: err.holderTaskId },
-            isError: true,
-          };
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text" as const, text: `ERROR: Failed to acquire worktree for ${repo}: ${message}` }],
-          details: {},
-          isError: true,
-        };
-      }
-      // FNXC:Workspace 2026-06-21-22:30: F2 — register a freshly-acquired sub-repo worktree in the executor's activeWorktrees Set (KTD2) so owner/liveness checks see live per-repo worktrees, not just the browse-only root.
-      // FNXC:Workspace 2026-06-22-09:00: register UNCONDITIONALLY, including the
-      // already-acquired short-circuit. After an executor restart activeWorktrees is an
-      // empty Map; a resumed workspace task with pre-existing task.workspaceWorktrees hits
-      // the alreadyAcquired path, so skipping onAcquired left the sub-repo path unregistered
-      // in-memory and conflict/liveness checks missed it. Set.add is idempotent, so re-firing
-      // on a fresh acquire is a harmless no-op.
-      onAcquired?.(result.worktreePath);
-      await store.logEntry(
-        task.id,
-        result.alreadyAcquired
-          ? `fn_acquire_repo_worktree: reusing existing worktree for ${repo} at ${result.worktreePath}`
-          : `fn_acquire_repo_worktree: created worktree for ${repo} at ${result.worktreePath} (branch: ${result.branch})`,
-        undefined,
-        runContext,
-      );
-      return {
-        content: [{ type: "text" as const, text: `Worktree ready at: ${result.worktreePath} (branch: ${result.branch}, alreadyAcquired: ${result.alreadyAcquired})` }],
-        details: result,
-      };
     },
   };
 }

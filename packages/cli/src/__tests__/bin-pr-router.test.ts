@@ -9,6 +9,13 @@ describe("bin pr router wiring", () => {
     expect(source).toContain('case "pr":');
     expect(source).toContain('case "create":');
     expect(source).toContain("runPrCreate(id, parsePrCreateOptions(args.slice(3)), projectName)");
+    /*
+    FNXC:CliTests 2026-08-23-16:45:
+    THE SPECIFIER FOLLOWS WHERE `bin.ts` ACTUALLY LIVES. #2398's domain-folder refactor rewrote this
+    pin to `../commands/pr.js` for a relocated entrypoint, but `bin.ts` stayed at `src/bin.ts`, so
+    the guard pinned a specifier no source file contains — it asserted a file layout that does not
+    exist rather than the routing it exists to protect.
+    */
     expect(source).toContain('await import("./commands/pr.js")');
   });
 

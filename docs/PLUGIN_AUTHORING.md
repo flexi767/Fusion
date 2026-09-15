@@ -12,6 +12,7 @@ A comprehensive guide to creating Fusion plugins that extend the task board with
 6. [Registering Routes](#6-registering-routes)
 7. [Registering UI Slots](#7-registering-ui-slots)
 8. [Registering Top-Level Dashboard Views](#8-registering-top-level-dashboard-views)
+   - [Theming & Overlay Layering for Dashboard Views](#theming--overlay-layering-for-dashboard-views)
 9. [Registering Agent Runtimes](#9-registering-agent-runtimes)
 10. [Plugin Context API Reference](#10-plugin-context-api-reference)
 11. [Plugin Lifecycle States](#11-plugin-lifecycle-states)
@@ -353,6 +354,7 @@ const plugin: FusionPlugin = {
 
 ### Hook Behavior
 
+- **Single-load lifecycle**: For one project in one Fusion process, Fusion invokes `onLoad` exactly once for each intentional load lifecycle, including when the host and engine bootstrap concurrently. Plugin authors do not need process-local locking to defend against an accidental second host/engine startup load. Explicit enable→load and `reloadPlugin` are new lifecycles and can invoke `onLoad` again after unload; request-scoped temporary loaders for *another* project root may also load and then stop a plugin while discovering skills. Keep registration idempotent where inexpensive so these intentional lifecycles remain safe.
 - **Context parity**: `onUnload` receives the same `PluginContext` shape as `onLoad`.
 - **Timeout**: 5 seconds per invocation (logged and skipped if exceeded)
 - **Error Isolation**: Hook failures never block other hooks or abort startup
@@ -593,6 +595,71 @@ Route handlers receive the same loader-built `PluginContext` used by hooks/tools
 - Route path: `/status`
 - Full URL: `/api/plugins/fusion-plugin-notification/status`
 
+### UI metadata endpoints
+
+<!-- FNXC:UiMetadataApi 2026-07-14-00:00: Frontend plugins and command palettes must discover the host's registered view ids and Settings metadata through authenticated, read-only APIs instead of hardcoding dashboard-owned ids, labels, or search terms. -->
+
+Frontend integrations can enumerate the host UI before presenting navigation or settings commands. Both endpoints inherit the dashboard's standard `/api` authentication, are read-only, return static project-independent metadata, and do not require a project id.
+
+`GET /api/views` returns every registered built-in view id in dashboard order. This is the full registry, not a live navigation menu: it includes ids that are flag-gated or experimental (for example `graph`, `todos`, `secrets`), and internal, non-navigable destinations (see `internal` below). Whether any given id is currently reachable in the UI depends on feature flags and plugins the endpoint does not evaluate, so treat the list as the set of known view ids rather than a guaranteed set of visible navigation entries.
+
+```json
+{
+  "views": [
+    { "id": "board", "label": "Board", "labelKey": "nav.board" },
+    { "id": "command-center", "label": "Dashboard", "labelKey": "nav.commandCenter" },
+    {
+      "id": "dev-server",
+      "label": "Dev Server",
+      "labelKey": "nav.devServer",
+      "aliases": ["devserver"]
+    },
+    {
+      "id": "task-detail",
+      "label": "Task Detail",
+      "internal": true
+    }
+  ]
+}
+```
+
+`aliases` lists accepted legacy ids; use the canonical `id` for new links. `internal: true` identifies a programmatic destination that is not a normal navigation entry. Optional fields are omitted when they do not apply.
+
+`label` is the guaranteed English display string. `labelKey` is present only for views whose title the dashboard itself renders through that translation key, so a few ids (for example `graph`, whose label comes from a plugin manifest, and the internal `task-detail`) carry no `labelKey` at all — fall back to `label` when it is absent. Note also that some keys are not yet present in the shipped translation catalogs because the dashboard supplies their English text inline; resolving such a key yields nothing, so treat `labelKey` as best-effort localization support rather than a guaranteed lookup.
+
+`GET /api/settings/sections` returns selectable Settings sections; non-selectable group-header rows are excluded:
+
+```json
+{
+  "sections": [
+    {
+      "id": "appearance",
+      "label": "Appearance",
+      "labelKey": "settings.nav.appearance",
+      "scope": "global",
+      "group": "Preferences",
+      "keywords": ["theme", "color", "sidebar"],
+      "searchableKeys": [],
+      "advanced": false
+    },
+    {
+      "id": "authentication",
+      "label": "Authentication",
+      "labelKey": "settings.nav.authentication",
+      "scope": null,
+      "group": "AI & Models",
+      "keywords": ["login", "OAuth", "API key"],
+      "searchableKeys": [],
+      "advanced": false
+    }
+  ]
+}
+```
+
+`scope` is `global`, `project`, or `null` for sections backed by a dedicated subsystem rather than a settings blob. `group` is the Settings navigation group label, `keywords` and `searchableKeys` support command/search matching, and `advanced` indicates whether the dashboard hides the section until Advanced settings are enabled.
+
+`keywords` and `searchableKeys` are best-effort, non-contractual search hints, not a stable API surface. `searchableKeys` in particular exposes raw i18n translation-key strings that back a section's searchable copy; their exact values, ordering, and presence may change between releases as the dashboard's internal translation keys evolve. Use them to widen local search matching, but do not treat any specific key string as a stable identifier or depend on it programmatically.
+
 ### Supported Methods
 
 - `GET`
@@ -802,6 +869,7 @@ Both `packages/desktop/src/local-runtime.ts` (`createDashboardServerDefault`) an
 Runtime host context contract:
 - Registered views receive a `context` object from the dashboard host (`PluginDashboardViewContext`).
 - Context includes the active `projectId`, current visible `tasks`, optional `workflowSteps`, `openTaskDetail` for launching the native task detail flow, and `openFile(path, options?)` for opening project-relative files in the dashboard's built-in file viewer.
+- Optional `beginNativeStructureDrag(dataTransfer, ref)` writes only the host-owned native-structure MIME. It returns `false` on touch-primary devices, so callers must not widen `effectAllowed`; plugins must not reimplement the protocol.
 - Keep view-specific UI behavior in the plugin; treat host context as service/data injection only.
 
 Placement guidance:
@@ -809,10 +877,58 @@ Placement guidance:
 - `overflow`: desktop header overflow menu
 - `more`: mobile More sheet / secondary nav surfaces
 
+### Shared dashboard-view layout contract
+
+<!-- FNXC:StandardizedViewLayout 2026-09-13-22:31: FN-379 standardizes every dashboard destination on one layout/header/rail/action contract, so plugin views must cooperate with the host chrome instead of forking a second header or a private rail width. -->
+
+Full dashboard destinations share one composition: a single header, an optional tab strip, the content, and an optional contextual footer. Plugin views participate through opt-in, backward-compatible exports:
+
+| Import | Purpose |
+| --- | --- |
+| `@fusion/dashboard/app/components/ViewLayout` | Bounded shell: header, optional tabs, body, optional footer. Pass `contentOwnsScroll` only when the child owns the entire flex/scroll chain (canvas, transcript, terminal, table). |
+| `@fusion/dashboard/app/components/ViewHeader` | The single visible title/action owner, including the tactile `ChevronLeft` return before the title via `backAction`. |
+| `@fusion/dashboard/app/components/ViewSidebar` | The desktop/tablet collection rail with the shared accessible separator. |
+| `@fusion/dashboard/app/components/ViewActionButton` | The shared creation/action button (`kind="create"` renders the common `Plus`); labels collapse visually on phones while the localized accessible name is retained. |
+| `@fusion/dashboard/app/plugins/PluginDashboardViewHeader` | Cooperative header for plugin views: outside a full host it renders `ViewHeader`; inside one it keeps a single title and portals the plugin's live actions into the host header. |
+
+Rules:
+- Never render a second title when the host already provides chrome; use `PluginDashboardViewHeader` so the host owns the visible header.
+- Never publish a private sidebar width key. The rail width is one project-scoped preference owned by `ViewLayoutContext`/`useViewSidebarWidth`; a host may clamp the rendered width but only the provider persists the operator preference.
+- Put primary creation in the header, not in a footer or an empty-state duplicate.
+- On phones, show the list first and return through the header chevron; do not add a separate textual Back row.
+- The `layout` contract on `PluginDashboardViewHost` is optional. Views registered before FN-379, and uncontrolled third-party extensions, keep their previous host fallback rendering.
+
 Project-scoped UI state guidance:
 - Persist plugin view layout/state in browser storage using a plugin-owned base key and the shared project-scoped pattern (`kb:${projectId}:${baseKey}`).
 - For dependency graph layout, the canonical base key is `fusion-plugin-dependency-graph:positions`.
 - Do not persist plugin UI state in task metadata or server-side task records.
+
+### Theming & Overlay Layering for Dashboard Views
+
+Use only the [stable theme token contract](./dashboard-guide.md#stable-theme-token-contract-integrators--plugins) for plugin UI. It provides supported surface, text, spacing, status, motion, and layering variables; internal CSS names may change without notice.
+
+```css
+.my-plugin-panel {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.my-plugin-owned-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--fusion-max-z) + 1);
+  pointer-events: auto;
+}
+```
+
+For overlays that should share Fusion's root stacking context, append the plugin element to the supported `#plugin-overlay-root` mount point:
+
+```ts
+const overlayRoot = document.querySelector("#plugin-overlay-root");
+overlayRoot?.append(pluginOverlayElement);
+```
+
+The mount point is fixed and click-through; set `pointer-events: auto` on interactive plugin children. Its layer follows `--fusion-max-z` as Fusion's monotonic floating-window stack rises, so plugins do not need to track dashboard window focus in JavaScript.
 
 ---
 
@@ -1546,7 +1662,7 @@ const skills: PluginSkillContribution[] = [
 Plugin skills are discovered per requesting project: the Skills view and workflow editor surface `plugin:<id>` skills only when that plugin is enabled for that project's plugin state, even if the daemon was started from a different directory.
 
 <!-- FNXC:PluginSkills 2026-07-12-00:00: GitHub #2017 requires plugin skill bodies to be available anywhere native skills are available. The engine threads enabled plugin skill body discovery paths into agent sessions, and the dashboard reads the resolved plugin-package SKILL.md/reference files instead of showing a runtime placeholder. -->
-Enabled plugin skills are delivered to agent sessions from their plugin-package `SKILL.md` files. Fusion resolves the first `skillFiles` entry (or the compatibility fallback) through the plugin root, adds the skill body directory to the session's skill discovery paths, and keeps the requested skill name in the same selection filter used for native and installed skills. The Skills view also reads the resolved `SKILL.md` plus sibling reference files from disk, so users can inspect the exact guidance agents receive.
+Enabled plugin skills are delivered to every agent session from their plugin-package `SKILL.md` files. Fusion resolves the first `skillFiles` entry (or the compatibility fallback) through the plugin root and adds the skill body directory to the session's skill discovery paths. Project skill `+`/`-` settings remain the authority for availability; per-agent skill metadata can force resolved enabled skills to be read first but never filters other available skills or re-enables a disabled skill. The Skills view also reads the resolved `SKILL.md` plus sibling reference files from disk, so users can inspect the exact guidance agents receive.
 
 ## 16. Registering Workflow Steps
 
@@ -1686,10 +1802,9 @@ A plugin trait may **not** declare these flags (rejected at validation, and as a
 backstop at registry registration):
 
 - `complete` — a terminal-success column that silently satisfies dependencies.
-- `archived` — globally hidden column semantics.
 
-A plugin needing those semantics composes its trait **alongside** the built-in
-`complete` / `archived` trait on the same column.
+A plugin needing terminal-success semantics composes its trait **alongside** the built-in
+`complete` trait on the same column. Fusion has no task-archive trait or hidden archive column.
 
 ### Versioned hook-descriptor schema
 
@@ -1893,3 +2008,24 @@ const setupHooks: PluginSetupHooks = {
 ```
 
 `checkSetup` is required. `install` and `uninstall` are optional.
+
+## Declarative MCP servers
+
+Plugins may declare MCP servers with `mcpServers`. Declarations are active only in projects where the plugin is enabled; Fusion does not install the referenced binary.
+
+```ts
+mcpServers: [{
+  name: "roslyn-navigator",
+  transport: "stdio",
+  command: "cwm-roslyn-navigator",
+  args: [],
+  env: { TOKEN: { secretRef: "roslyn-token", scope: "project" } },
+  enabledByDefault: true,
+}]
+```
+
+`enabledByDefault` defaults to `true`. Plugin declarations cannot set `enabled`: project settings own enablement. Effective precedence is global settings, enabled plugin declarations, then project settings by name. A project definition overrides a plugin declaration and a same-named project `enabled:false` entry tombstones it. Use Fusion secret references for sensitive `env` or `headers`; never ship plaintext credentials. Missing commands retain normal per-server MCP spawn-failure isolation.
+
+## Todo Lists: second first-party extraction
+
+`plugins/fusion-plugin-todos` is the second first-party extraction after Roadmaps. It demonstrates an atomic vertical boundary: the plugin owns its `/api/plugins/fusion-plugin-todos/todos/*` route definitions and dashboard view, while the host owns only generic plugin loading, project enablement, and a narrow dashboard callback context for opening planning and ingesting created tasks. Do not retain a host route or feature flag when extracting a surface: enabled plugin state must be the sole authority for both API registration and navigation visibility.

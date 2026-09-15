@@ -30,7 +30,7 @@ import kbExtension, {
   __setCachedStoreForTesting,
   closeCachedStores,
 } from "../extension.js";
-import type { TaskStore } from "@fusion/core";
+import { SecretsStore, type TaskStore } from "@fusion/core";
 
 export { pgDescribe };
 
@@ -120,7 +120,19 @@ export interface PgExtensionHarness {
  * entries never leak across tests.
  */
 export function createPgExtensionHarness(prefix: string): PgExtensionHarness {
-  const pg = createSharedPgTaskStoreTestHarness({ prefix });
+  /*
+  FNXC:WorkflowAgentRouting 2026-08-07-18:40:
+  FN-8764 made AgentStore.init() unconditionally provision the four durable built-in
+  workflow-owner agents, and that provisioning requires a bound asyncLayer.projectId
+  (backendProjectId rejects the empty/unbound partition to avoid mixing ownership on a
+  shared PG cluster). Bind this CLI-extension harness to a real projectId end-to-end so the
+  connection GUC `fusion.project_id`, the layer's projectId, and the seeded config row all
+  agree: agents (explicit project_id) and their config revisions (GUC-default project_id)
+  land in the SAME partition, so the (project_id, agent_id) FK on agent_config_revisions holds.
+  A project-agnostic bind (projectId "") would split those writes across partitions and
+  reintroduce the FN-8764 provisioning throw.
+  */
+  const pg = createSharedPgTaskStoreTestHarness({ prefix, projectId: `ext_${prefix}` });
   return {
     rootDir: pg.rootDir,
     store: pg.store,
@@ -135,6 +147,22 @@ export function createPgExtensionHarness(prefix: string): PgExtensionHarness {
     },
     afterAll: pg.afterAll,
   };
+}
+
+/**
+ * Install an in-memory-key SecretsStore so extension tests exercise real encryption without
+ * resolving the developer's global Fusion key directory.
+ */
+export function injectSecretsStore(harness: PgExtensionHarness): SecretsStore {
+  const layer = harness.store().getAsyncLayer();
+  if (!layer) throw new Error("harness store has no async layer");
+  const noopDb = {
+    prepare: () => { throw new Error("sync DB not available in backend-mode test"); },
+    bumpLastModified: () => {},
+  };
+  const secretsStore = new SecretsStore(noopDb as never, noopDb as never, async () => Buffer.alloc(32, 7), { asyncLayer: layer });
+  harness.store().secretsStore = secretsStore;
+  return secretsStore;
 }
 
 /** Look up a registered tool, failing the test loudly if it was never registered. */

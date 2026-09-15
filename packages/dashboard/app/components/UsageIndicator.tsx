@@ -1,10 +1,12 @@
+import { ViewHeader } from "./ViewHeader";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { CSSProperties, DragEvent } from "react";
-import { X, RefreshCw, Activity, TrendingUp, CheckCircle, AlertTriangle, Eye, GripVertical, ChevronUp, ChevronDown } from "lucide-react";
+import { RefreshCw, Activity, TrendingUp, CheckCircle, AlertTriangle, Eye, GripVertical, ChevronUp, ChevronDown } from "lucide-react";
 import type { ProviderUsage, UsageWindow } from "../api";
 import { useUsageData } from "../hooks/useUsageData";
 import { ProviderIcon } from "./ProviderIcon";
+import { inferProviderIconKey } from "../utils/providerIconKey";
 import { getScopedItem, setScopedItem } from "../utils/projectStorage";
 import "./UsageIndicator.css";
 
@@ -408,57 +410,10 @@ interface ProviderCardProps {
   onMoveDown: () => void;
 }
 
-/**
- * Map provider names to ProviderIcon provider keys
- */
-function getProviderIconKey(providerName: string): string {
-  const normalized = providerName.toLowerCase();
-  
-  // Map common provider names to their icon keys
-  if (normalized.includes('claude') || normalized.includes('anthropic')) {
-    return 'anthropic';
-  }
-  if (normalized.includes('codex') || normalized.includes('openai') || normalized.includes('gpt')) {
-    return 'openai';
-  }
-  if (normalized.includes('gemini') || normalized.includes('google') || normalized.includes('antigravity')) {
-    return 'google';
-  }
-  if (normalized.includes('ollama')) {
-    return 'ollama';
-  }
-  if (normalized.includes('minimax')) {
-    return 'minimax';
-  }
-  if (normalized.includes('zai') || normalized.includes('zhipu')) {
-    return 'zai';
-  }
-  if (normalized.includes('kimi') || normalized.includes('moonshot')) {
-    return 'kimi';
-  }
-  if (normalized.includes('bedrock') || normalized.includes('amazon')) {
-    return 'bedrock';
-  }
-  if (normalized.includes('xai') || normalized.includes('grok')) {
-    return 'xai';
-  }
-  /*
-  FNXC:UsageIndicator 2026-07-10-00:00:
-  Cursor usage cards are rendered by the generic ProviderCard path, so provider-name mapping is the only frontend-specific requirement: route "Cursor" to the existing cursor-cli icon token and SVG.
-  */
-  if (normalized.includes('cursor')) {
-    return 'cursor-cli';
-  }
-  if (normalized.includes('opencode')) {
-    return 'opencode';
-  }
-  if (normalized.includes('copilot') || normalized === 'github copilot') {
-    return 'github-copilot';
-  }
-
-  // Return the original name as fallback (ProviderIcon will show a default icon)
-  return providerName;
-}
+/*
+FNXC:UsageIndicator 2026-07-22-17:04:
+FN-8500 makes usage cards consume the canonical provider/model inference seam rather than duplicate it. This keeps Xiaomi MiMo labels and every existing shared mapping aligned with model, task, and analytics surfaces.
+*/
 
 /**
  * Provider card showing status and usage windows
@@ -522,7 +477,7 @@ function ProviderCard({
     >
       <div className="usage-provider-header">
         <div className="usage-provider-info">
-          <ProviderIcon provider={getProviderIconKey(provider.name)} size="md" />
+          <ProviderIcon provider={inferProviderIconKey(provider.name)} size="md" />
           <span className="usage-provider-name">{provider.name}</span>
           {hiddenCount > 0 && (
             <button
@@ -719,7 +674,7 @@ export function UsageIndicator({ isOpen, onClose, projectId, anchorRect, present
         refresh();
       }
     }
-    
+
     // Update ref for next render
     wasOpenRef.current = isOpen;
   }, [isOpen, lastUpdated, refresh]);
@@ -961,11 +916,20 @@ export function UsageIndicator({ isOpen, onClose, projectId, anchorRect, present
             : sizeStyle
         }
       >
-        <div className="modal-header">
-          <div className="usage-header">
-            <Activity size={18} className="usage-header-icon" />
-            <h3>{t("usage.title", "Usage")}</h3>
-          </div>
+        {/*
+        FNXC:StandardizedViewLayout 2026-09-13-21:49:
+        Usage adopts the shared header: one title owner, the view-mode group as header actions, and the canonical
+        close only when this surface owns its dismissal. The embedded right-dock presentation still delegates the
+        exit to its host, so no close control is invented there.
+        */}
+        <ViewHeader
+          className="modal-header"
+          headingLevel={3}
+          icon={Activity}
+          title={t("usage.title", "Usage")}
+          onClose={isEmbedded ? undefined : onClose}
+          closeButtonProps={{ "aria-label": t("actions.closeModal", "Close usage modal"), "data-testid": "usage-modal-close" }}
+          actions={(
           <div className="usage-header-actions">
             <div className="usage-view-toggle" role="group" aria-label={t("usage.viewModeLabel", "Usage view mode")}>
               <button
@@ -985,20 +949,9 @@ export function UsageIndicator({ isOpen, onClose, projectId, anchorRect, present
                 {t("usage.viewModeRemaining", "Remaining")}
               </button>
             </div>
-            {/* FNXC:UsageIndicator 2026-06-22-00:00: embedded presentation drops the
-                modal close button; the right-dock owns dismissal. */}
-            {!isEmbedded && (
-              <button
-                className="modal-close"
-                onClick={onClose}
-                aria-label={t("actions.closeModal", "Close usage modal")}
-                data-testid="usage-modal-close"
-              >
-                <X size={20} />
-              </button>
-            )}
           </div>
-        </div>
+          )}
+        />
 
         <div className="usage-content" ref={contentRef}>
           {(!hasFetched && !error) && providers.length === 0 ? (

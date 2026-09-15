@@ -655,6 +655,7 @@ export function irToFlow(def: WorkflowDefinition): {
             ...dataIrKind(inner, innerKind),
             label: nodeLabel(inner),
             config: { ...(inner.config ?? {}) },
+            ...(inner.reviewerAgentId ? { reviewerAgentId: inner.reviewerAgentId } : {}),
             ...(templateBoundary ? { templateBoundary } : {}),
             ...(optionalGroupBoundary ? { optionalGroupBoundary } : {}),
           },
@@ -695,6 +696,7 @@ export function irToFlow(def: WorkflowDefinition): {
         ...dataIrKind(node, kind),
         label: nodeLabel(node),
         config: { ...(node.config ?? {}) },
+        ...(node.reviewerAgentId ? { reviewerAgentId: node.reviewerAgentId } : {}),
         column,
       },
       deletable: node.kind !== "start" && node.kind !== "end",
@@ -821,10 +823,14 @@ export function flowToIr(
         config: { ...baseCfg, template: { nodes: templateNodes, edges: templateEdges } },
       };
     }
+    const reviewerAgentId = typeof data.reviewerAgentId === "string" && data.reviewerAgentId.trim()
+      ? data.reviewerAgentId
+      : undefined;
     return {
       id: localId,
       kind: originalKind ?? (data.kind as WorkflowIrNode["kind"]),
       config: config && Object.keys(config).length ? config : undefined,
+      ...(reviewerAgentId ? { reviewerAgentId } : {}),
     };
   }
 
@@ -865,6 +871,7 @@ export function flowToIr(
             id: c.id,
             name: c.name,
             traits: c.traits,
+            ...(c.description ? { description: c.description } : {}),
             ...(c.agent ? { agent: c.agent } : {}),
           }))
         : [],
@@ -1230,15 +1237,6 @@ export function validateColumnsClient(
         message: `Column '${col.name || col.id}' is both a completion column and an intake column`,
       });
     }
-    if (flags.archived && flags.countsTowardWip) {
-      violations.push({
-        code: "archived-with-wip",
-        severity: "error",
-        columnId: col.id,
-        traitIds: traitIdsWithFlags(col.traits, byId, ["archived", "countsTowardWip"]),
-        message: `Column '${col.name || col.id}' is archived but counts toward WIP`,
-      });
-    }
     if (flags.intake) intakeCount += 1;
   }
 
@@ -1505,6 +1503,7 @@ export function insertFragment(
             ...dataIrKind(inner, innerKind),
             label: nodeLabel(inner),
             config: { ...(inner.config ?? {}) },
+            ...(inner.reviewerAgentId ? { reviewerAgentId: inner.reviewerAgentId } : {}),
             ...(templateBoundary ? { templateBoundary } : {}),
             ...(optionalGroupBoundary ? { optionalGroupBoundary } : {}),
           },

@@ -1,5 +1,5 @@
 // Shared mocks/fixtures for AgentDetailView.*.test.tsx — see FN-4088
-import { createElement } from "react";
+import { createElement, useState } from "react";
 import { vi } from "vitest";
 import type { AgentCapability, AgentDetail } from "../../api";
 
@@ -24,6 +24,7 @@ export const mockUpdateAgentInstructions = vi.fn<ApiModule["updateAgentInstructi
 export const mockUpdateAgentSoul = vi.fn<ApiModule["updateAgentSoul"]>();
 export const mockUpdateAgentMemory = vi.fn<ApiModule["updateAgentMemory"]>();
 export const mockFetchAgentMemoryFiles = vi.fn<ApiModule["fetchAgentMemoryFiles"]>();
+export const mockFetchAgentMemoryConsolidations = vi.fn<ApiModule["fetchAgentMemoryConsolidations"]>();
 export const mockFetchAgentMemoryFile = vi.fn<ApiModule["fetchAgentMemoryFile"]>();
 export const mockSaveAgentMemoryFile = vi.fn<ApiModule["saveAgentMemoryFile"]>();
 export const mockFetchWorkspaceFileContent = vi.fn<ApiModule["fetchWorkspaceFileContent"]>();
@@ -53,6 +54,8 @@ vi.mock("../../api", () => ({
   fetchAgent: (...args: Parameters<ApiModule["fetchAgent"]>) => mockFetchAgent(...args),
   fetchAgents: (...args: Parameters<ApiModule["fetchAgents"]>) => mockFetchAgents(...args),
   updateAgent: (...args: Parameters<ApiModule["updateAgent"]>) => mockUpdateAgent(...args),
+  isAgentHeartbeatEnabled: (agent: { runtimeConfig?: { enabled?: boolean } }) => agent.runtimeConfig?.enabled !== false,
+  withAgentHeartbeatEnabled: (agent: { runtimeConfig?: Record<string, unknown> }, enabled: boolean) => ({ ...(agent.runtimeConfig ?? {}), enabled }),
   updateAgentState: (...args: Parameters<ApiModule["updateAgentState"]>) => mockUpdateAgentState(...args),
   deleteAgent: (...args: Parameters<ApiModule["deleteAgent"]>) => mockDeleteAgent(...args),
   fetchAgentLogs: vi.fn(),
@@ -70,6 +73,7 @@ vi.mock("../../api", () => ({
   updateAgentSoul: (...args: Parameters<ApiModule["updateAgentSoul"]>) => mockUpdateAgentSoul(...args),
   updateAgentMemory: (...args: Parameters<ApiModule["updateAgentMemory"]>) => mockUpdateAgentMemory(...args),
   fetchAgentMemoryFiles: (...args: Parameters<ApiModule["fetchAgentMemoryFiles"]>) => mockFetchAgentMemoryFiles(...args),
+  fetchAgentMemoryConsolidations: (...args: Parameters<ApiModule["fetchAgentMemoryConsolidations"]>) => mockFetchAgentMemoryConsolidations(...args),
   fetchAgentMemoryFile: (...args: Parameters<ApiModule["fetchAgentMemoryFile"]>) => mockFetchAgentMemoryFile(...args),
   saveAgentMemoryFile: (...args: Parameters<ApiModule["saveAgentMemoryFile"]>) => mockSaveAgentMemoryFile(...args),
   fetchAgentTasks: (...args: Parameters<ApiModule["fetchAgentTasks"]>) => mockFetchAgentTasks(...args),
@@ -92,22 +96,69 @@ vi.mock("../../api", () => ({
 }));
 
 vi.mock("../AgentLogViewer", () => ({
-  AgentLogViewer: ({ entries }: { entries: Array<{ text: string; detail?: string }> }) => createElement(
-    "div",
-    { "data-testid": "agent-log-viewer" },
-    ...entries.map((e, i) => createElement(
+  AgentLogViewer: ({
+    entries,
+    showMissingDetailHint = false,
+  }: {
+    entries: Array<{ text: string; detail?: string; type?: string }>;
+    showMissingDetailHint?: boolean;
+  }) => {
+    const [expanded, setExpanded] = useState(false);
+    const [showStart, setShowStart] = useState(false);
+    const tailEntries = entries.slice(-60);
+    const reconnectMarker = entries.find((entry) => entry.text.includes("Log stream reconnected"));
+    const renderedEntries = entries.length > 60
+      ? (showStart ? entries.slice(0, 60) : reconnectMarker ? [reconnectMarker, ...tailEntries.slice(-59)] : tailEntries)
+      : entries;
+    return createElement(
       "div",
-      { key: i },
-      createElement("span", null, e.text),
-      e.detail
+      { "data-testid": "agent-log-viewer" },
+      showMissingDetailHint && entries.some((entry) =>
+        (entry.type === "tool" || entry.type === "tool_result") && !entry.detail)
         ? createElement(
-          "button",
-          { type: "button", "data-testid": "tool-detail-toggle", "aria-expanded": "false" },
-          "Show output",
+          "div",
+          { "data-testid": "agent-log-missing-detail-hint", role: "note" },
+          "Some tool details are unavailable.",
         )
         : null,
-    )),
-  ),
+      createElement(
+        "div",
+        { className: "agent-log-viewer-scroll", onScroll: (event: { currentTarget: { scrollTop: number } }) => { if (event.currentTarget.scrollTop === 0) setShowStart(true); } },
+        ...renderedEntries.map((entry, index) => {
+        const exceedsPreview = Boolean(entry.detail && (entry.detail.length > 600 || entry.detail.split("\n").length > 6));
+        return createElement(
+          "div",
+          { key: index, className: "agent-log-text" },
+          createElement("span", null, entry.text),
+          entry.detail
+            ? createElement(
+              "pre",
+              {
+                "data-testid": "tool-detail-content",
+                className: exceedsPreview && !expanded
+                  ? "agent-log-tool-detail-content agent-log-tool-detail-content--preview"
+                  : "agent-log-tool-detail-content",
+              },
+              entry.detail,
+            )
+            : null,
+          exceedsPreview
+            ? createElement(
+              "button",
+              {
+                type: "button",
+                "data-testid": "tool-detail-toggle",
+                "aria-expanded": String(expanded),
+                onClick: () => setExpanded((value) => !value),
+              },
+              expanded ? "Show less" : "Show more",
+            )
+            : null,
+        );
+      }),
+      ),
+    );
+  },
 }));
 
 vi.mock("../CustomModelDropdown", () => ({
@@ -162,7 +213,7 @@ vi.mock("../CustomModelDropdown", () => ({
             value: thinkingLevel ?? "",
             onChange: (e: Event) => onThinkingLevelChange((e.target as HTMLSelectElement).value),
           },
-          ...["off", "minimal", "low", "medium", "high", "xhigh"].map((level) => createElement("option", { key: level, value: level }, level)),
+          ...["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => createElement("option", { key: level, value: level }, level)),
         )
         : null,
       ...Array.from(new Set(models.map((model) => model.provider))).map((provider) => createElement(
@@ -344,6 +395,7 @@ export function setupAgentDetailMocks() {
   mockFetchWorkspaceFileContent.mockResolvedValue({ content: "", mtime: "2024-01-01T00:00:00.000Z", size: 0 });
   mockSaveWorkspaceFileContent.mockResolvedValue({ success: true, mtime: "2024-01-01T00:00:00.000Z", size: 0 });
   mockUpdateAgentInstructions.mockResolvedValue({} as any);
+  mockFetchAgentMemoryConsolidations.mockResolvedValue({ agentId: "agent-001", events: [] });
   mockFetchAgentMemoryFiles.mockResolvedValue({
     files: [
       {

@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { WORKFLOW_STEP_NOT_RUN_REASONS as CORE_WORKFLOW_STEP_NOT_RUN_REASONS } from "@fusion/core";
 import type { Task } from "@fusion/core";
-import { getUnifiedTaskProgress, isPlanReviewRunning } from "../taskProgress";
+import {
+  getRunningOptionalGateBadge,
+  getRunningWorkflowStepLabel,
+  getUnifiedTaskProgress,
+  isNonPlanningOptionalGateBadge,
+  mapWorkflowStatus,
+  WORKFLOW_STEP_NOT_RUN_REASONS,
+  isPlanReviewRunning,
+} from "../taskProgress";
 
 /*
 FNXC:WorkflowSteps 2026-06-25-00:00 — graph-native progress model (plan U3).
@@ -34,7 +43,209 @@ describe("isPlanReviewRunning", () => {
   });
 });
 
+/*
+FNXC:TaskCardOptionalGateBadge 2026-07-21-22:30:
+Lane-owned optional gates badge only in their planning/review columns while running.
+*/
+describe("getRunningOptionalGateBadge", () => {
+  const runningPlanReview = {
+    workflowStepId: "plan-review",
+    workflowStepName: "Plan Review",
+    status: "pending" as const,
+    startedAt: "2026-07-11T12:00:00.000Z",
+  };
+  const runningCodeReview = {
+    workflowStepId: "code-review",
+    workflowStepName: "Code Review",
+    status: "pending" as const,
+    startedAt: "2026-07-11T12:00:00.000Z",
+  };
+  const runningBrowser = {
+    workflowStepId: "browser-verification",
+    workflowStepName: "Browser Verification",
+    status: "pending" as const,
+    startedAt: "2026-07-11T12:00:00.000Z",
+  };
+
+  /*
+  FNXC:TaskCardOptionalGateBadge 2026-07-27-06:10:
+  Plan Review badges in EVERY column it can run in. The enumeration is the point: placement is the
+  WORKFLOW's call — the built-in coding workflows run this node in the planning column, a custom or
+  future workflow may place it elsewhere — so the badge must key on the running gate, not on a lane
+  allowlist that silently hides every placement it did not anticipate.
+  */
+  it("badges Plan Review in every column the gate can run in", () => {
+    for (const column of ["triage", "todo", "in-progress"] as const) {
+      const badge = getRunningOptionalGateBadge({
+        ...makeTask({
+          enabledWorkflowSteps: ["plan-review"],
+          workflowStepResults: [runningPlanReview],
+        }),
+        column,
+      } as Task);
+      expect(badge?.label).toBe("Plan Review");
+      expect(badge?.testId).toBe("reviewing");
+    }
+    // The replan half of the loop badges the same way, wherever the remediation node lives.
+    expect(getRunningOptionalGateBadge({
+      ...makeTask({
+        enabledWorkflowSteps: ["plan-replan"],
+        workflowStepResults: [{ ...runningPlanReview, workflowStepId: "plan-replan", workflowStepName: "Plan Replan" }],
+      }),
+      column: "triage",
+    } as Task)).toMatchObject({ label: "Plan Review", testId: "reviewing" });
+  });
+
+  it("badges Code Review and Browser Verification on in-review only", () => {
+    expect(getRunningOptionalGateBadge({
+      ...makeTask({
+        enabledWorkflowSteps: ["code-review"],
+        workflowStepResults: [runningCodeReview],
+      }),
+      column: "in-review",
+    } as Task)).toMatchObject({ label: "Code Review", testId: "code-review" });
+
+    expect(getRunningOptionalGateBadge({
+      ...makeTask({
+        enabledWorkflowSteps: ["browser-verification"],
+        workflowStepResults: [runningBrowser],
+      }),
+      column: "in-review",
+    } as Task)).toMatchObject({ label: "Browser Verification", testId: "browser-verification" });
+
+    expect(getRunningOptionalGateBadge({
+      ...makeTask({
+        enabledWorkflowSteps: ["code-review"],
+        workflowStepResults: [runningCodeReview],
+      }),
+      column: "in-progress",
+    } as Task)).toBeUndefined();
+  });
+
+  it("returns undefined when the gate is not running", () => {
+    expect(getRunningOptionalGateBadge({
+      ...makeTask({
+        enabledWorkflowSteps: ["code-review"],
+        workflowStepResults: [{
+          workflowStepId: "code-review",
+          workflowStepName: "Code Review",
+          status: "pending",
+        }],
+      }),
+      column: "in-review",
+    } as Task)).toBeUndefined();
+  });
+});
+
+/*
+FNXC:TaskCardBadgePrecedence 2026-08-06-14:53:
+A running non-planning review gate owns the lifecycle badge over stale Planning. Plan Review remains
+an intentional second badge because it is nested planning, not a contradictory review-lane state.
+*/
+describe("review-gate badge precedence", () => {
+  const planReviewPassed = {
+    workflowStepId: "plan-review",
+    workflowStepName: "Plan Review",
+    status: "passed" as const,
+    startedAt: "2026-08-06T14:40:00.000Z",
+    completedAt: "2026-08-06T14:41:00.000Z",
+  };
+  const codeReviewRunning = {
+    workflowStepId: "code-review",
+    workflowStepName: "Code Review",
+    status: "pending" as const,
+    startedAt: "2026-08-06T14:42:00.000Z",
+  };
+
+  it("makes running Code Review authoritative after Plan Review completes", () => {
+    const task = {
+      ...makeTask({
+        enabledWorkflowSteps: ["plan-review", "code-review"],
+        workflowStepResults: [planReviewPassed, codeReviewRunning],
+      }),
+      column: "in-review",
+    } as Task;
+
+    const badge = getRunningOptionalGateBadge(task);
+    expect(badge).toMatchObject({ workflowStepId: "code-review", label: "Code Review" });
+    expect(isNonPlanningOptionalGateBadge(badge)).toBe(true);
+    expect(getRunningWorkflowStepLabel(task)).toBe("Code Review");
+  });
+
+  it("uses lifecycle order, not snapshot array order, when stale Plan Review and Code Review both run", () => {
+    const task = {
+      ...makeTask({
+        enabledWorkflowSteps: ["plan-review", "code-review"],
+        workflowStepResults: [codeReviewRunning, {
+          workflowStepId: "plan-review",
+          workflowStepName: "Plan Review",
+          status: "pending",
+          startedAt: "2026-08-06T14:41:00.000Z",
+        }],
+      }),
+      column: "in-review",
+    } as Task;
+
+    expect(getRunningOptionalGateBadge(task)?.workflowStepId).toBe("code-review");
+    expect(getRunningWorkflowStepLabel(task)).toBe("Code Review");
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["empty", []],
+    ["pending", [{ ...codeReviewRunning, startedAt: undefined }]],
+    ["completed", [{ ...codeReviewRunning, status: "passed" as const, completedAt: "2026-08-06T14:43:00.000Z" }]],
+    ["failed", [{ ...codeReviewRunning, status: "failed" as const, completedAt: "2026-08-06T14:43:00.000Z" }]],
+    ["skipped", [{ ...codeReviewRunning, status: "skipped" as const, completedAt: "2026-08-06T14:43:00.000Z" }]],
+  ])("does not treat %s Code Review data as an active override", (_name, workflowStepResults) => {
+    const badge = getRunningOptionalGateBadge({
+      ...makeTask({ enabledWorkflowSteps: ["code-review"], workflowStepResults: workflowStepResults as Task["workflowStepResults"] }),
+      column: "in-review",
+    } as Task);
+    expect(isNonPlanningOptionalGateBadge(badge)).toBe(false);
+  });
+
+  it("retains Planning plus Plan Review as the deliberate nested presentation", () => {
+    const task = {
+      ...makeTask({
+        enabledWorkflowSteps: ["plan-review", "code-review"],
+        workflowStepResults: [{
+          workflowStepId: "plan-review",
+          workflowStepName: "Plan Review",
+          status: "pending",
+          startedAt: "2026-08-06T14:40:00.000Z",
+        }],
+      }),
+      column: "todo",
+    } as Task;
+
+    const badge = getRunningOptionalGateBadge(task);
+    expect(badge?.workflowStepId).toBe("plan-review");
+    expect(isNonPlanningOptionalGateBadge(badge)).toBe(false);
+  });
+});
+
 describe("getUnifiedTaskProgress", () => {
+  it("maps not-run checks distinctly while preserving completed progress", () => {
+    const notRun = {
+      workflowStepId: "verification",
+      workflowStepName: "Verification",
+      status: "skipped",
+      notRunReason: "not-configured",
+    } as const;
+    expect(mapWorkflowStatus(notRun)).toBe("not_run");
+    expect(mapWorkflowStatus({ ...notRun, notRunReason: undefined })).toBe("skipped");
+    expect(mapWorkflowStatus({ ...notRun, status: "passed", notRunReason: undefined })).toBe("done");
+
+    const progress = getUnifiedTaskProgress(makeTask({
+      enabledWorkflowSteps: ["verification"],
+      workflowStepResults: [notRun],
+    }));
+    expect(progress).toMatchObject({ total: 1, completed: 1 });
+    expect(progress.items[0]?.status).toBe("not_run");
+    expect(WORKFLOW_STEP_NOT_RUN_REASONS).toEqual(CORE_WORKFLOW_STEP_NOT_RUN_REASONS);
+  });
+
   it("resolves workflow step names from result.workflowStepName without a lookup", () => {
     const progress = getUnifiedTaskProgress(
       makeTask({
@@ -52,6 +263,50 @@ describe("getUnifiedTaskProgress", () => {
     const item = progress.items.find((i) => i.id === "workflow-browser-verification");
     expect(item?.name).toBe("Browser Verification");
     expect(item?.status).toBe("done");
+  });
+
+  /*
+  FNXC:TaskCardWorkflowProgress 2026-07-21-22:26:
+  Implementation scope is the WIP progress contract: Plan Review / Code Review and other lane-owned gates stay out of the in-progress checklist while full scope keeps the complete pipeline for detail and badges.
+  */
+  it("implementation scope keeps only WIP steps, not Plan Review or Code Review", () => {
+    const task = makeTask({
+      steps: [
+        { name: "Implement feature", status: "done" },
+        { name: "Add tests", status: "in-progress" },
+      ] as Task["steps"],
+      enabledWorkflowSteps: ["plan-review", "code-review", "browser-verification"],
+      workflowStepResults: [
+        {
+          workflowStepId: "plan-review",
+          workflowStepName: "Plan Review",
+          status: "passed",
+          startedAt: "2026-07-11T12:00:00.000Z",
+          completedAt: "2026-07-11T12:01:00.000Z",
+        },
+        {
+          workflowStepId: "code-review",
+          workflowStepName: "Code Review",
+          status: "pending",
+        },
+      ],
+    });
+
+    const full = getUnifiedTaskProgress(task);
+    expect(full.items.map((item) => item.id)).toEqual([
+      "workflow-plan-review",
+      "step-0",
+      "step-1",
+      "workflow-code-review",
+      "workflow-browser-verification",
+    ]);
+    expect(full.total).toBe(5);
+    expect(full.completed).toBe(2);
+
+    const implementation = getUnifiedTaskProgress(task, { scope: "implementation" });
+    expect(implementation.items.map((item) => item.id)).toEqual(["step-0", "step-1"]);
+    expect(implementation.total).toBe(2);
+    expect(implementation.completed).toBe(1);
   });
 
   it("falls back to the workflow step id when no result name is available", () => {
@@ -257,6 +512,42 @@ describe("getUnifiedTaskProgress", () => {
     ]);
   });
 
+  it("keeps repeated verification occurrences distinct by history index", () => {
+    const progress = getUnifiedTaskProgress(makeTask({
+      steps: [
+        { name: "Testing & Verification", status: "done" },
+        { name: "Fix: repair retry guard", status: "done" },
+        { name: "Testing & Verification", status: "pending" },
+      ],
+    }));
+
+    expect(progress.items.map((item) => ({ id: item.id, name: item.name, status: item.status }))).toEqual([
+      { id: "step-0", name: "Testing & Verification", status: "done" },
+      { id: "step-1", name: "Fix: repair retry guard", status: "done" },
+      { id: "step-2", name: "Testing & Verification", status: "pending" },
+    ]);
+  });
+
+  it("passes remediation names through verbatim in full and implementation scopes", () => {
+    const remediationName = "Fix: concise retry guard headline";
+    const task = makeTask({
+      steps: [
+        { name: "Implement retry guard", status: "done" },
+        {
+          name: remediationName,
+          status: "pending",
+          remediation: { wave: 1, gate: "Code Review", gateStepId: "code-review", detail: "Long reviewer explanation" },
+        },
+      ] as Task["steps"],
+    });
+
+    const full = getUnifiedTaskProgress(task);
+    const implementation = getUnifiedTaskProgress(task, { scope: "implementation" });
+    for (const progress of [full, implementation]) {
+      expect(progress.items).toContainEqual(expect.objectContaining({ id: "step-1", name: remediationName, status: "pending" }));
+    }
+  });
+
   it("maps impl step statuses straight through and skipped as completed", () => {
     const progress = getUnifiedTaskProgress(
       makeTask({
@@ -272,5 +563,61 @@ describe("getUnifiedTaskProgress", () => {
     expect(progress.total).toBe(4);
     // done + skipped count as completed; in-progress + pending do not.
     expect(progress.completed).toBe(2);
+  });
+});
+
+/*
+FNXC:WorkflowLifecycleColumns 2026-07-31-15:50:
+
+THE INVARIANT: the running-gate badge appears in the board's OWN review lane.
+
+CENSUS-INVISIBLE, in a HALF-CONVERTED file. `REVIEW_LANE_COLUMNS` is a `Set` literal — a definition,
+not a comparison — sitting under a Plan Review badge whose own column restriction had already been
+removed. One converted badge and one unconverted one, deciding sibling questions about the same card.
+
+Keyed on the literal, the code-review / browser-verification / post-merge badges never appeared on a
+renamed board: the gate WAS running and the card showed nothing, which reads as an idle card rather
+than a missing badge. Cosmetic in consequence, but it is the surface an operator watches to know a
+review is in flight.
+
+The caller is wired in the same change — `ListView` already owns `columnFlagsById`, so the resolved
+answer was one lookup away. An unwired parameter is the class this program's caller audit found five
+times; adding a sixth would have been careless.
+
+REVERT PROOF, measured: restore the literal gate and the renamed-lane case returns undefined.
+*/
+describe("the running-gate badge resolves the review lane", () => {
+  const REVIEW_FLAGS = { mergeBlocker: true } as never;
+  /* `makeTask` is file-scoped but `runningCodeReview` is not, so the shape is restated here. My
+     first draft hand-rolled `status: "in-progress"` and produced no RUNNING item at all — a gate
+     counts as running only when it is `pending` WITH a `startedAt` — so the renamed case failed for
+     the wrong reason. The fixture has to match the branch under test. */
+  const codeReviewRunning = (column: string) => ({
+    ...makeTask({
+      enabledWorkflowSteps: ["code-review"],
+      workflowStepResults: [{
+        workflowStepId: "code-review",
+        workflowStepName: "Code Review",
+        status: "pending" as const,
+        startedAt: "2026-07-11T12:00:00.000Z",
+      }],
+    }),
+    column,
+  }) as never;
+
+  it("badges a card in a RENAMED review lane", () => {
+    /* testId is `code-review`, not the plan-review badge's `reviewing` — I asserted the latter first
+       and the failure was mine, not the product's. */
+    expect(getRunningOptionalGateBadge(codeReviewRunning("signoff"), REVIEW_FLAGS)?.testId).toBe("code-review");
+  });
+
+  it("still does not badge a card outside the review lane", () => {
+    // The gate must stay a gate — badging everywhere is its own bug.
+    expect(getRunningOptionalGateBadge(codeReviewRunning("building"), { countsTowardWip: true } as never)).toBeUndefined();
+  });
+
+  it("keeps the legacy id when no flags are supplied", () => {
+    expect(getRunningOptionalGateBadge(codeReviewRunning("in-review"))?.testId).toBe("code-review");
+    expect(getRunningOptionalGateBadge(codeReviewRunning("signoff"))).toBeUndefined();
   });
 });

@@ -3,6 +3,10 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import type { Task, TaskDetail } from "@fusion/core";
 import { useModalManager } from "../useModalManager";
 import { scopedKey } from "../../utils/projectStorage";
+import {
+  ALL_WORKFLOWS_BOARD_VIEW_ID,
+  BOARD_WORKFLOW_SELECTION_STORAGE_KEY,
+} from "../../utils/boardWorkflowSelection";
 
 function createTaskDetail(id: string): TaskDetail {
   return {
@@ -77,6 +81,106 @@ describe("useModalManager", () => {
     expect(result.current.anyModalOpen).toBe(false);
   });
 
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  Switching the active project must dismiss project-scoped modals and drop pending
+  planning payloads (so Planning does not reopen the previous project's session),
+  while cross-project modals like Settings stay open.
+  */
+  it("closeProjectScopedModals dismisses project-scoped modals and clears planning payloads, keeping settings open", () => {
+    const { result } = renderHook(() =>
+      useModalManager({ projectId: "proj_1", planningSessions: [{ id: "plan-1" }] }),
+    );
+
+    act(() => {
+      result.current.openDetailTask(createTaskDetail("FN-1"));
+      result.current.openGroupModal("group-1");
+      result.current.openNewTaskWithDescription("draft");
+      result.current.openPlanningWithSession("plan-1");
+      result.current.openGitHubImport();
+      result.current.openFiles("project", "/README.md");
+      result.current.openActivityLog();
+      result.current.openGitManager();
+      result.current.openWorkflowEditor();
+      result.current.openScripts();
+      result.current.toggleTerminal();
+      result.current.openSettings("general");
+    });
+
+    act(() => {
+      result.current.closeProjectScopedModals();
+    });
+
+    expect(result.current.detailTask).toBeNull();
+    expect(result.current.groupModalGroupId).toBeNull();
+    expect(result.current.newTaskModalOpen).toBe(false);
+    expect(result.current.newTaskInitialDescription).toBeNull();
+    expect(result.current.isPlanningOpen).toBe(false);
+    expect(result.current.planningResumeSessionId).toBeUndefined();
+    expect(result.current.planningInitialPlan).toBeNull();
+    expect(result.current.githubImportOpen).toBe(false);
+    expect(result.current.filesOpen).toBe(false);
+    expect(result.current.fileBrowserInitialFile).toBeNull();
+    expect(result.current.activityLogOpen).toBe(false);
+    expect(result.current.gitManagerOpen).toBe(false);
+    expect(result.current.workflowEditorOpen).toBe(false);
+    expect(result.current.scriptsOpen).toBe(false);
+    expect(result.current.terminalOpen).toBe(false);
+    // Cross-project surfaces survive the swap.
+    expect(result.current.settingsOpen).toBe(true);
+  });
+
+  it("inherits the selected board workflow for new task opens while preserving explicit choices", () => {
+    const projectId = "proj_1";
+    const selectionKey = scopedKey(BOARD_WORKFLOW_SELECTION_STORAGE_KEY, projectId);
+    const { result } = renderHook(() =>
+      useModalManager({ projectId, planningSessions: [] }),
+    );
+
+    act(() => {
+      result.current.openNewTask();
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBeUndefined();
+
+    localStorage.setItem(selectionKey, "coding");
+    act(() => {
+      result.current.openNewTask();
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBe("coding");
+
+    act(() => {
+      result.current.openNewTask("explicit");
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBe("explicit");
+
+    act(() => {
+      result.current.openNewTask(null);
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBeNull();
+
+    act(() => {
+      result.current.openNewTask({ type: "click" } as never);
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBe("coding");
+
+    localStorage.setItem(selectionKey, ALL_WORKFLOWS_BOARD_VIEW_ID);
+    act(() => {
+      result.current.openNewTask();
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBeUndefined();
+
+    localStorage.setItem(selectionKey, "coding");
+    act(() => {
+      result.current.openNewTaskWithDescription("draft");
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBe("coding");
+
+    act(() => {
+      result.current.closeNewTask();
+    });
+    expect(result.current.newTaskInitialWorkflowId).toBeUndefined();
+  });
+
   it("opens the new task modal with a seeded description and resets it on close", () => {
     const { result } = renderHook(() =>
       useModalManager({ projectId: "proj_1", planningSessions: [] }),
@@ -113,12 +217,27 @@ describe("useModalManager", () => {
       useModalManager({ projectId, planningSessions: [{ id: "plan-1" }] }),
     );
 
+    const sourceIssue = {
+      provider: "github" as const,
+      repository: "owner/repo",
+      issueNumber: 42,
+      url: "https://github.com/owner/repo/issues/42",
+      title: "Seeded issue",
+    };
     act(() => {
-      result.current.openPlanningWithInitialPlan("Build dashboard");
+      result.current.openPlanningWithInitialPlan("Build dashboard", undefined, sourceIssue);
     });
 
     expect(result.current.isPlanningOpen).toBe(true);
     expect(result.current.planningInitialPlan).toBe("Build dashboard");
+    expect(result.current.planningSourceIssue).toEqual(sourceIssue);
+
+    act(() => {
+      result.current.clearPlanningInitialPlan();
+    });
+
+    expect(result.current.planningInitialPlan).toBeNull();
+    expect(result.current.planningSourceIssue).toBeUndefined();
 
     act(() => {
       result.current.closePlanning();
@@ -127,6 +246,7 @@ describe("useModalManager", () => {
     expect(result.current.isPlanningOpen).toBe(false);
     expect(result.current.planningInitialPlan).toBeNull();
     expect(result.current.planningResumeSessionId).toBeUndefined();
+    expect(result.current.planningSourceIssue).toBeUndefined();
     expect(localStorage.getItem(quickEntryKey)).toBe("quick draft");
     expect(localStorage.getItem(inlineCreateKey)).toBe("inline draft");
 
@@ -136,6 +256,14 @@ describe("useModalManager", () => {
 
     expect(result.current.isPlanningOpen).toBe(true);
     expect(result.current.planningResumeSessionId).toBe("plan-1");
+    expect(result.current.planningSourceIssue).toBeUndefined();
+
+    act(() => {
+      result.current.openPlanningWithInitialPlan("Seed another issue", undefined, sourceIssue);
+      result.current.openPlanning();
+    });
+
+    expect(result.current.planningSourceIssue).toBeUndefined();
   });
 
   it("clears scoped quick-add drafts after single-task planning completion", () => {
@@ -415,6 +543,48 @@ describe("useModalManager", () => {
 
     expect(result.current.detailTask?.id).toBe("FN-B");
     expect(result.current.detailTask?.title).toBe("renamed");
+  });
+
+  it("applies equal-clock derived and clock-less lifecycle detail patches", () => {
+    const task = createTaskDetail("FN-LOCAL");
+    const { result } = renderHook(() => useModalManager({ projectId: "proj_1", planningSessions: [] }));
+    act(() => { result.current.openDetailTask(task); });
+
+    act(() => {
+      result.current.updateDetailTask({ ...task, prInfo: { number: 42 } } as Partial<TaskDetail>);
+      result.current.updateDetailTask({ column: "done", status: "completed" });
+    });
+
+    expect(result.current.detailTask).toMatchObject({ column: "done", status: "completed", prInfo: { number: 42 } });
+  });
+
+  it("keeps lifecycle state for a present strictly older local patch", () => {
+    const task = { ...createTaskDetail("FN-STALE"), updatedAt: "2026-08-09T10:00:00.000Z", columnMovedAt: "2026-08-09T10:00:00.000Z", status: "executing" };
+    const { result } = renderHook(() => useModalManager({ projectId: "proj_1", planningSessions: [] }));
+    act(() => { result.current.openDetailTask(task); });
+    act(() => {
+      result.current.updateDetailTask({
+        title: "Fresh local metadata",
+        column: "done",
+        columnMovedAt: "2026-08-09T09:00:00.000Z",
+        status: "completed",
+        updatedAt: "2026-08-09T09:00:00.000Z",
+      });
+    });
+
+    expect(result.current.detailTask).toMatchObject({
+      title: "Fresh local metadata",
+      column: "todo",
+      columnMovedAt: task.columnMovedAt,
+      status: "executing",
+      updatedAt: task.updatedAt,
+    });
+  });
+
+  it("ignores a detail patch safely before a task is open", () => {
+    const { result } = renderHook(() => useModalManager({ projectId: "proj_1", planningSessions: [] }));
+    act(() => { result.current.updateDetailTask({ title: "No detail" }); });
+    expect(result.current.detailTask).toBeNull();
   });
 
   it("tracks a target workflow id for normal workflow editor opens and resets it on close", () => {

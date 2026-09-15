@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { BUILTIN_CODING_WORKFLOW_IR, BUILTIN_STEPWISE_CODING_WORKFLOW_IR } from "@fusion/core";
-import type { TaskDetail, WorkflowIr } from "@fusion/core";
+import { BUILTIN_CODING_WORKFLOW_IR, BUILTIN_STEPWISE_CODING_WORKFLOW_IR, upsertWorkflowStepResult } from "@fusion/core";
+import type { TaskDetail, WorkflowIr, WorkflowStepResult } from "@fusion/core";
 
 import {
   PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
   WorkflowGraphExecutor,
   type WorkflowNodeHandler,
-} from "../workflow-graph-executor.js";
+} from "../workflows/workflow-graph-executor.js";
+import { workflowStepVerdictNoNotesNotice } from "../executor/workflow-step-verdict.js";
 
 /*
 FNXC:WorkflowOptionalGroup 2026-06-21-14:05:
@@ -281,6 +282,38 @@ describe("WorkflowGraphExecutor optional-group", () => {
     expect(result.outcome).toBe("success");
   });
 
+  it("fences a Code Review edge when scope changes after terminal result persistence", async () => {
+    const calls: string[] = [];
+    const records: WorkflowStepResult[] = [];
+    const edgeAdmission = vi.fn(async () => false);
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: async (node) => {
+          calls.push(node.id);
+          return node.id === "review"
+            ? { outcome: "success", value: "APPROVE", contextPatch: { repositoryScopeRevision: 2 } }
+            : { outcome: "success" };
+        },
+      },
+      recordWorkflowStepResult: async (_taskId, result) => { records.push(result); return true; },
+      isRepositoryScopeReviewEdgeCurrent: edgeAdmission,
+    });
+    const ir = reviseGroupIr();
+    const group = ir.nodes.find((node) => node.id === "group");
+    if (!group) throw new Error("review group missing");
+    group.config = { ...group.config, reviewKind: "code" };
+
+    const result = await executor.run(taskWith(["group"]), settingsOn(), ir);
+
+    /* FNXC:RepositoryScope 2026-08-21-03:05: The callback models an operator scope mutation after terminal CAS. */
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ workflowStepId: "group", status: "passed", repositoryScopeRevision: 2 }),
+    ]));
+    expect(edgeAdmission).toHaveBeenCalledWith("FN-OG", "group", 2);
+    expect(calls).not.toContain("after");
+    expect(result.outcome).toBe("failure");
+  });
+
   it("pre-merge advisory REVISE requests a bounded fix and aborts forward traversal when scheduled", async () => {
     const calls: string[] = [];
     const records: unknown[] = [];
@@ -299,9 +332,13 @@ describe("WorkflowGraphExecutor optional-group", () => {
       requestPreMergeOptionalStepFix: requestFix,
     });
 
-    const result = await executor.run(taskWith(["group"]), settingsOn(), reviseGroupIr());
+    const ir = reviseGroupIr();
+    const group = ir.nodes.find((node) => node.id === "group");
+    if (!group) throw new Error("review group missing");
+    group.config = { ...group.config, reviewKind: "code" };
+    const result = await executor.run(taskWith(["group"]), settingsOn(), ir);
 
-    expect(requestFix).toHaveBeenCalledWith("FN-OG", {
+    expect(requestFix).toHaveBeenCalledWith("FN-OG", expect.objectContaining({
       stepName: "Code Review",
       feedback: "Fix the review finding",
       phase: "pre-merge",
@@ -309,12 +346,38 @@ describe("WorkflowGraphExecutor optional-group", () => {
       verdict: "REVISE",
       nodeId: "group",
       maxRevisions: undefined,
-    });
+    }));
     expect(calls).not.toContain("after");
     expect(result.context["node:group:fixScheduled"]).toBe(true);
     expect(records).toEqual(expect.arrayContaining([
-      expect.objectContaining({ workflowStepId: "group", status: "advisory_failure", verdict: "REVISE", output: "Fix the review finding" }),
+      expect.objectContaining({ workflowStepId: "group", status: "pending", reviewKind: "code" }),
+      expect.objectContaining({ workflowStepId: "group", status: "advisory_failure", verdict: "REVISE", output: "Fix the review finding", reviewKind: "code" }),
     ]));
+  });
+
+  it("preserves a typed missing-artifact failure through the optional-group remediation seam", async () => {
+    const requestFix = vi.fn(async () => true);
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        gate: async (node) => node.id === "review"
+          ? {
+              outcome: "failure",
+              value: "required-artifact-missing:PROMPT.md",
+              contextPatch: { output: "PROMPT.md could not be loaded" },
+            }
+          : { outcome: "success" },
+      },
+      requestPreMergeOptionalStepFix: requestFix,
+    });
+
+    const result = await executor.run(taskWith(["group"]), settingsOn(), reviseGroupIr({ gateMode: "gate" }));
+
+    expect(requestFix).toHaveBeenCalledWith("FN-OG", expect.objectContaining({
+      stepName: "Code Review",
+      status: "failed",
+      failureValue: "required-artifact-missing:PROMPT.md",
+    }));
+    expect(result.context["node:group:fixScheduled"]).toBe(true);
   });
 
   it("threads optional-group maxRevisions into the pre-merge fix seam", async () => {
@@ -356,6 +419,62 @@ describe("WorkflowGraphExecutor optional-group", () => {
       expect(result.context["node:group:fixScheduled"]).toBeUndefined();
       if (requestFix) expect(requestFix).toHaveBeenCalledOnce();
     }
+  });
+
+  it("records and logs passed optional-group review notes without fabricating legacy detail", async () => {
+    const note = "Reviewed the scoped implementation and focused tests; both satisfy the task.";
+    const records: WorkflowStepResult[] = [];
+    const logs: Array<[string, string | undefined]> = [];
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: async (node) => node.id === "review"
+          ? { outcome: "success", value: "APPROVE", contextPatch: { output: note, notes: note } }
+          : { outcome: "success" },
+      },
+      recordWorkflowStepResult: async (_taskId, result) => { records.push(result); },
+      logTaskEntry: (summary, detail) => { logs.push([summary, detail]); },
+    });
+    await executor.run(taskWith(["group"]), settingsOn(), reviseGroupIr());
+
+    expect(records.at(-1)).toMatchObject({ status: "passed", verdict: "APPROVE", output: note, notes: note });
+    expect(logs).toContainEqual(["[pre-merge] Workflow step completed: Code Review", note]);
+
+    const legacyLogs: Array<[string, string | undefined]> = [];
+    const legacyRecords: WorkflowStepResult[] = [];
+    const legacyExecutor = new WorkflowGraphExecutor({
+      handlers: { prompt: async (node) => node.id === "review" ? { outcome: "success", value: "APPROVE" } : { outcome: "success" } },
+      recordWorkflowStepResult: async (_taskId, result) => { legacyRecords.push(result); },
+      logTaskEntry: (summary, detail) => { legacyLogs.push([summary, detail]); },
+    });
+    await legacyExecutor.run(taskWith(["group"]), settingsOn(), reviseGroupIr());
+
+    expect(legacyRecords.at(-1)).not.toHaveProperty("notes");
+    expect(legacyLogs).toContainEqual(["[pre-merge] Workflow step completed: Code Review", undefined]);
+
+    const failedRepairNotice = workflowStepVerdictNoNotesNotice("APPROVE", "failed-soft");
+    const failedRepairPatch = { output: failedRepairNotice, notes: failedRepairNotice };
+    const failedRepairRecords: WorkflowStepResult[] = [];
+    const failedRepairLogs: Array<[string, string | undefined]> = [];
+    const failedRepairExecutor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: async (node) => node.id === "review"
+          ? { outcome: "success", value: "APPROVE", contextPatch: failedRepairPatch }
+          : { outcome: "success" },
+      },
+      recordWorkflowStepResult: async (_taskId, result) => { failedRepairRecords.push(result); },
+      logTaskEntry: (summary, detail) => { failedRepairLogs.push([summary, detail]); },
+    });
+    await failedRepairExecutor.run(taskWith(["group"]), settingsOn(), reviseGroupIr());
+
+    expect(failedRepairPatch).not.toHaveProperty("notesMissing");
+    expect(failedRepairRecords.at(-1)).toMatchObject({
+      status: "passed",
+      verdict: "APPROVE",
+      output: failedRepairNotice,
+      notes: failedRepairNotice,
+    });
+    expect(failedRepairRecords.at(-1)).not.toHaveProperty("notesMissing");
+    expect(failedRepairLogs).toContainEqual(["[pre-merge] Workflow step completed: Code Review", failedRepairNotice]);
   });
 
   it("requests fixes for pre-merge gate REVISE but not post-merge, non-REVISE, or fast-mode skipped outcomes", async () => {
@@ -508,6 +627,29 @@ describe("WorkflowGraphExecutor optional-group", () => {
         output: expect.stringContaining("Unable to select a usable model"),
       }),
     ]));
+  });
+
+  it("keeps Plan Review task-storage read failures in place without sending the task to planning", async () => {
+    const requestFix = vi.fn(async () => true);
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: async (node) => node.id === "plan-review-step"
+          ? {
+              outcome: "failure",
+              value: "required-artifact-read-failed:PROMPT.md",
+              contextPatch: { output: "PROMPT.md task storage read failed" },
+            }
+          : { outcome: "success" },
+      },
+      requestPreMergeOptionalStepFix: requestFix,
+    });
+
+    const result = await executor.run(taskWith(["plan-review"]), settingsOn(), BUILTIN_CODING_WORKFLOW_IR);
+
+    expect(requestFix).not.toHaveBeenCalled();
+    expect(result.outcome).toBe("failure");
+    expect(result.context["node:plan-review:value"]).toBe(PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE);
+    expect(result.visitedNodeIds).not.toContain("plan-replan");
   });
 
   it("uses an explicit graph replan node for Plan Review REVISE and does not execute before replan completes", async () => {
@@ -690,8 +832,79 @@ describe("WorkflowGraphExecutor optional-group", () => {
     expect(result.outcome).toBe("success");
     expect(calls).toEqual(["execute"]);
     expect(requestFix).not.toHaveBeenCalled();
-    expect(logs).toContain("[pre-merge] Workflow step already passed: Plan Review");
+    expect(logs).toContain("[pre-merge] Workflow step already satisfied: Plan Review");
   });
+
+  it.each(["passed", "live pending lease"] as const)(
+    "reruns Plan Review when a dependency superseded the prior %s and its old completion log",
+    async (priorState) => {
+      const calls: string[] = [];
+      const logs: string[] = [];
+      const ir: WorkflowIr = {
+        version: "v2",
+        name: "plan-review-superseded",
+        columns: [{ id: "work", name: "Work", traits: [] }],
+        nodes: [
+          { id: "start", kind: "start" },
+          {
+            id: "plan-review",
+            kind: "optional-group",
+            config: {
+              name: "Plan Review",
+              defaultOn: true,
+              template: {
+                nodes: [{ id: "plan-review-step", kind: "prompt", config: { prompt: "review replanned spec" } }],
+                edges: [],
+              },
+            },
+          },
+          { id: "execute", kind: "prompt", config: { prompt: "execute" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "plan-review" },
+          { from: "plan-review", to: "execute", condition: "success" },
+          { from: "execute", to: "end" },
+        ],
+      };
+      const executor = new WorkflowGraphExecutor({
+        handlers: {
+          prompt: async (node) => {
+            calls.push(node.id);
+            return { outcome: "success" };
+          },
+        },
+        runLoopNowForTests: () => Date.parse("2026-08-04T02:00:01.000Z"),
+        logTaskEntry: (summary) => { logs.push(summary); },
+      });
+
+      const result = await executor.run({
+        ...taskWith(["plan-review"]),
+        id: "FN-plan-review-superseded",
+        workflowStepResults: [{
+          workflowStepId: "plan-review",
+          workflowStepName: "Plan Review",
+          phase: "pre-merge",
+          status: priorState === "passed" ? "passed" : "pending",
+          ...(priorState === "live pending lease"
+            ? { startedAt: "2026-08-04T02:00:00.000Z", leaseOwner: "planner:old-episode" }
+            : { completedAt: "2026-08-04T01:00:00.000Z" }),
+          supersededAt: "2026-08-04T02:00:00.000Z",
+          supersededReason: "dependency-change",
+        }],
+        log: [{
+          timestamp: "2026-08-04T01:00:00.000Z",
+          action: "[pre-merge] Workflow step completed: Plan Review",
+        }],
+      } as TaskDetail, settingsOn(), ir);
+
+      expect(result.outcome).toBe("success");
+      expect(calls).toEqual(["plan-review-step", "execute"]);
+      expect(logs).not.toContain(
+        "[pre-merge] Plan Review already in progress (lease held) — not dispatching a second reviewer",
+      );
+    },
+  );
 
   it("repairs missing Plan Review result from the latest completed log before execution", async () => {
     const records: Array<{ workflowStepId: string; status: string; notes?: string }> = [];
@@ -860,19 +1073,31 @@ describe("WorkflowGraphExecutor optional-group", () => {
         stepName: groupId === "code-review" ? "Code Review" : "Browser Verification",
         feedback: `${groupId} finding`,
         nodeId: groupId,
-        maxRevisions: groupId === "code-review" ? "unbounded" : 3,
+        maxRevisions: 3,
       }));
       expect(calls).not.toContain("review");
       expect(result.context[`node:${groupId}:fixScheduled`]).toBe(true);
     }
 
+    /*
+    FNXC:WorkflowIr 2026-08-23-19:35:
+    The pre-merge order was changed so `completion-summary` runs BEFORE `code-review`
+    (browser-verification -> completion-summary -> code-review), and the two builtin IRs diverge after
+    code-review: the coding IR routes to `review`, the stepwise IR straight to `merge-gate`. The pinned
+    successor is therefore per-IR; the invariant under test is unchanged — each optional group has a
+    success edge to the next pre-merge stage and a failure edge to its own remediation node.
+    */
+    const successSuccessors = new Map<typeof BUILTIN_CODING_WORKFLOW_IR, Record<string, string>>([
+      [BUILTIN_CODING_WORKFLOW_IR, { "browser-verification": "completion-summary", "code-review": "review" }],
+      [BUILTIN_STEPWISE_CODING_WORKFLOW_IR, { "browser-verification": "completion-summary", "code-review": "merge-gate" }],
+    ]);
     for (const ir of [BUILTIN_CODING_WORKFLOW_IR, BUILTIN_STEPWISE_CODING_WORKFLOW_IR]) {
       for (const groupId of ["browser-verification", "code-review"] as const) {
         const node = ir.nodes.find((candidate) => candidate.id === groupId);
         expect(node).toMatchObject({ kind: "optional-group" });
         expect(node?.config?.phase).toBeUndefined();
         expect(ir.edges).toEqual(expect.arrayContaining([
-          expect.objectContaining({ from: groupId, to: groupId === "browser-verification" ? "code-review" : "completion-summary", condition: "success" }),
+          expect.objectContaining({ from: groupId, to: successSuccessors.get(ir)?.[groupId], condition: "success" }),
           expect.objectContaining({
             from: groupId,
             to: groupId === "browser-verification" ? "browser-verification-remediation" : "code-review-remediation",
@@ -912,10 +1137,174 @@ describe("WorkflowGraphExecutor optional-group", () => {
         stepName: groupId === "code-review" ? "Code Review" : "Browser Verification",
         feedback: `stepwise ${groupId} finding`,
         nodeId: groupId,
-        maxRevisions: groupId === "code-review" ? "unbounded" : 3,
+        maxRevisions: 3,
       }));
       expect(stepwiseResult.context[`node:${groupId}:fixScheduled`]).toBe(true);
     }
+  });
+
+  /*
+   * FNXC:WorkflowReviewKind 2026-08-05-03:08:
+   * Marked top-level nodes are direct-review producers even without skillName.
+   * Exercise each writer through normal, failure, and retry paths so the marker
+   * is a declaration snapshot rather than a success-only presentation hint.
+   */
+  it.each([
+    ["prompt", "plan"],
+    ["gate", "code"],
+    ["script", "plan"],
+  ] as const)("snapshots marked custom top-level %s results without skillName across terminal outcomes", async (kind, reviewKind) => {
+    const records: Array<{ status: string; reviewKind?: string; source?: string }> = [];
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "marked-top-level-review",
+      columns: [{ id: "work", name: "Work", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "review", kind, config: { reviewKind } },
+        { id: "end", kind: "end" },
+      ],
+      edges: [{ from: "start", to: "review" }, { from: "review", to: "end", condition: "success" }, { from: "review", to: "end", condition: "failure" }],
+    };
+    const executor = new WorkflowGraphExecutor({
+      handlers: { [kind]: async () => ({ outcome: "failure", contextPatch: { notes: "declared review failure" } }) },
+      recordWorkflowStepResult: async (_taskId, result) => { records.push(result); },
+    });
+
+    await executor.run(taskWith([]), settingsOn(), ir);
+
+    expect(records).toEqual([
+      expect.objectContaining({ workflowStepId: "review", source: "node", status: "pending", reviewKind }),
+      expect.objectContaining({ workflowStepId: "review", source: "node", status: "failed", reviewKind, notes: "declared review failure" }),
+    ]);
+  });
+
+  it.each([
+    ["prompt", "plan"],
+    ["gate", "code"],
+    ["script", "plan"],
+  ] as const)("snapshots marked custom top-level %s results on normal completion without skillName", async (kind, reviewKind) => {
+    const records: Array<{ status: string; reviewKind?: string; source?: string }> = [];
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "marked-top-level-review-success",
+      columns: [{ id: "work", name: "Work", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "review", kind, config: { reviewKind } },
+        { id: "end", kind: "end" },
+      ],
+      edges: [{ from: "start", to: "review" }, { from: "review", to: "end", condition: "success" }],
+    };
+    const executor = new WorkflowGraphExecutor({
+      handlers: { [kind]: async () => ({ outcome: "success", contextPatch: { output: "declared review passed" } }) },
+      recordWorkflowStepResult: async (_taskId, result) => { records.push(result); },
+    });
+
+    await executor.run(taskWith([]), settingsOn(), ir);
+
+    expect(records).toEqual([
+      expect.objectContaining({ workflowStepId: "review", source: "node", status: "pending", reviewKind }),
+      expect.objectContaining({ workflowStepId: "review", source: "node", status: "passed", reviewKind, output: "declared review passed" }),
+    ]);
+  });
+
+  it.each([
+    ["prompt", "plan"],
+    ["gate", "code"],
+    ["script", "plan"],
+  ] as const)("preserves %s reviewKind on current and prior failed retry records", async (kind, reviewKind) => {
+    let stored: WorkflowStepResult[] = [];
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "marked-top-level-review-retry",
+      columns: [{ id: "work", name: "Work", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "review", kind, config: { reviewKind } },
+        { id: "end", kind: "end" },
+      ],
+      edges: [{ from: "start", to: "review" }, { from: "review", to: "end", condition: "failure" }],
+    };
+    const executor = new WorkflowGraphExecutor({
+      handlers: { [kind]: async () => ({ outcome: "failure", contextPatch: { notes: "retryable finding" } }) },
+      recordWorkflowStepResult: async (_taskId, result) => { stored = upsertWorkflowStepResult(stored, result); },
+    });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-05T03:21:00.000Z"));
+      await executor.run(taskWith([]), settingsOn(), ir);
+      vi.setSystemTime(new Date("2026-08-05T03:22:00.000Z"));
+      await executor.run(taskWith([]), settingsOn(), ir);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(stored).toEqual([
+      expect.objectContaining({ status: "failed", reviewKind, priorAttempts: [expect.objectContaining({ status: "failed", reviewKind })] }),
+    ]);
+  });
+
+  it("snapshots a marked custom optional-group review kind on pending and terminal results", async () => {
+    const records: Array<{ status: string; reviewKind?: string; source?: string }> = [];
+    const ir = optionalGroupIr();
+    const group = ir.nodes.find((node) => node.id === "group");
+    if (!group) throw new Error("test workflow group missing");
+    group.config = { ...group.config, reviewKind: "code" };
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt: async () => ({ outcome: "success", contextPatch: { output: "review feedback" } }) },
+      recordWorkflowStepResult: async (_taskId, result) => { records.push(result); },
+    });
+
+    await executor.run(taskWith(["group"]), settingsOn(), ir);
+
+    expect(records.filter((result) => result.source === "optional-group")).toEqual([
+      expect.objectContaining({ status: "pending", reviewKind: "code" }),
+      expect.objectContaining({ status: "passed", reviewKind: "code" }),
+    ]);
+  });
+
+  /*
+   * FNXC:WorkflowReviewKind 2026-08-05-03:32:
+   * Optional groups replace their pending result after every execution. The
+   * declared marker must survive failed retries on both the current result and
+   * its bounded audit snapshot; it is not inferred from the template outcome.
+   */
+  it("preserves optional-group reviewKind on current and prior failed retries", async () => {
+    let stored: WorkflowStepResult[] = [];
+    const ir = optionalGroupIr();
+    const group = ir.nodes.find((node) => node.id === "group");
+    if (!group) throw new Error("test workflow group missing");
+    group.config = { ...group.config, reviewKind: "code" };
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: async (node) => node.id === "optstep"
+          ? { outcome: "failure", contextPatch: { notes: "retryable group finding" } }
+          : { outcome: "success" },
+      },
+      recordWorkflowStepResult: async (_taskId, result) => { stored = upsertWorkflowStepResult(stored, result); },
+    });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-05T03:32:00.000Z"));
+      await executor.run(taskWith(["group"]), settingsOn(), ir);
+      vi.setSystemTime(new Date("2026-08-05T03:33:00.000Z"));
+      await executor.run(taskWith(["group"]), settingsOn(), ir);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(stored).toEqual([
+      expect.objectContaining({
+        workflowStepId: "group",
+        source: "optional-group",
+        status: "failed",
+        reviewKind: "code",
+        priorAttempts: [expect.objectContaining({ status: "failed", reviewKind: "code" })],
+      }),
+    ]);
   });
 
   it("blocks builtin coding review and merge when Code Review requests revision and no remediation is scheduled", async () => {

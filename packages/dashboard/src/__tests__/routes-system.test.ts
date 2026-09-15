@@ -26,8 +26,6 @@ import { __resetBatchImportRateLimiter, __setCreateFnAgentForRefine } from "../r
 import * as agentGenerationModule from "../agent-generation.js";
 import { __resetPlanningState, __setCreateFnAgent, planningStreamManager } from "../planning.js";
 import * as planningModule from "../planning.js";
-import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
-import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
@@ -206,8 +204,6 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({}),
     updateSettings: vi.fn(),
@@ -255,6 +251,21 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
       getMissionTask: vi.fn(),
       deleteMissionTask: vi.fn(),
     }),
+    /*
+    FNXC:PluginMcpServers 2026-07-24-01:25:
+    FN-8491 (3cd023fa4) binds a project-scoped plugin-MCP provider on every getProjectContext.
+    Exposing getProjectScopedPluginMcpServers marks this mock as runtime-owned so the binder
+    short-circuits instead of calling getPluginStore().
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
+    /*
+    FNXC:PluginEnablementScope 2026-07-24-01:25:
+    getProjectPluginLoader (moved into routes/context.ts 2026-07-22) calls
+    scopedStore.getPluginStore() to decide between the host loader and a scoped fallback.
+    Returning undefined matches the undefined options.pluginStore, so routes resolve the
+    pluginLoader passed to createApiRoutes — the contract these tests assert.
+    */
+    getPluginStore: vi.fn(),
     ...overrides,
   } as unknown as TaskStore;
 }
@@ -508,7 +519,6 @@ describe("GET /api/system-stats", () => {
         "in-progress": 1,
         "in-review": 1,
         done: 0,
-        archived: 0,
       },
       active: 2,
       agents: {
@@ -630,7 +640,6 @@ describe("GET /api/system-stats", () => {
         "in-progress": 0,
         "in-review": 0,
         done: 0,
-        archived: 0,
       },
       active: 0,
       agents: {
@@ -663,7 +672,7 @@ describe("GET /api/system-stats", () => {
       },
       taskStats: {
         total: 2,
-        byColumn: { triage: 0, todo: 1, "in-progress": 1, "in-review": 0, done: 0, archived: 0 },
+        byColumn: { triage: 0, todo: 1, "in-progress": 1, "in-review": 0, done: 0 },
         active: 1,
         agents: { idle: 1, active: 0, running: 1, error: 0 },
       },
@@ -701,7 +710,7 @@ describe("GET /api/system-stats", () => {
           }),
           taskStats: {
             total: 1,
-            byColumn: { triage: 0, todo: 0, "in-progress": 1, "in-review": 0, done: 0, archived: 0 },
+            byColumn: { triage: 0, todo: 0, "in-progress": 1, "in-review": 0, done: 0 },
             active: 1,
             agents: { idle: 0, active: 0, running: 0, error: 0 },
           },

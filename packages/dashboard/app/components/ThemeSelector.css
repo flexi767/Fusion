@@ -312,6 +312,86 @@
   --swatch-sample-4: #72c7a1;
 }
 
+.theme-swatch-midnight {
+  --swatch-sample-1: var(--midnight-swatch-sample-1);
+  --swatch-sample-2: var(--midnight-swatch-sample-2);
+  --swatch-sample-3: var(--midnight-swatch-sample-3);
+  --swatch-sample-4: var(--midnight-swatch-sample-4);
+}
+
+.theme-swatch-velvet {
+  --swatch-sample-1: var(--velvet-swatch-sample-1);
+  --swatch-sample-2: var(--velvet-swatch-sample-2);
+  --swatch-sample-3: var(--velvet-swatch-sample-3);
+  --swatch-sample-4: var(--velvet-swatch-sample-4);
+}
+
+/* FNXC:DashboardTheming 2026-08-23-01:51: Iceberg maps only global mode-specific preview variables so its chip remains accurate while any other persisted theme is active. */
+.theme-swatch-iceberg {
+  --swatch-sample-1: var(--iceberg-swatch-sample-1);
+  --swatch-sample-2: var(--iceberg-swatch-sample-2);
+  --swatch-sample-3: var(--iceberg-swatch-sample-3);
+  --swatch-sample-4: var(--iceberg-swatch-sample-4);
+}
+
+/* FNXC:DashboardTheming 2026-08-27-04:23: Flexoki maps only global mode-specific preview variables so its chip remains accurate while any other persisted theme is active. */
+.theme-swatch-flexoki {
+  --swatch-sample-1: var(--flexoki-swatch-sample-1);
+  --swatch-sample-2: var(--flexoki-swatch-sample-2);
+  --swatch-sample-3: var(--flexoki-swatch-sample-3);
+  --swatch-sample-4: var(--flexoki-swatch-sample-4);
+}
+
+/* FNXC:DashboardTheming 2026-08-28-07:45: Cozy Cartoon maps only its global mode-specific cream, coral, and lavender samples so the pastel preview remains accurate before selection and stays synchronized with the persisted theme registry. */
+.theme-swatch-cozy-cartoon {
+  --swatch-sample-1: var(--cozy-cartoon-swatch-sample-1);
+  --swatch-sample-2: var(--cozy-cartoon-swatch-sample-2);
+  --swatch-sample-3: var(--cozy-cartoon-swatch-sample-3);
+  --swatch-sample-4: var(--cozy-cartoon-swatch-sample-4);
+}
+
+.theme-swatch-aurora {
+  --swatch-sample-1: var(--aurora-swatch-sample-1);
+  --swatch-sample-2: var(--aurora-swatch-sample-2);
+  --swatch-sample-3: var(--aurora-swatch-sample-3);
+  --swatch-sample-4: var(--aurora-swatch-sample-4);
+}
+
+.theme-swatch-calm {
+  --swatch-sample-1: var(--calm-swatch-sample-1);
+  --swatch-sample-2: var(--calm-swatch-sample-2);
+  --swatch-sample-3: var(--calm-swatch-sample-3);
+  --swatch-sample-4: var(--calm-swatch-sample-4);
+}
+
+.theme-swatch-dawn {
+  --swatch-sample-1: var(--dawn-swatch-sample-1);
+  --swatch-sample-2: var(--dawn-swatch-sample-2);
+  --swatch-sample-3: var(--dawn-swatch-sample-3);
+  --swatch-sample-4: var(--dawn-swatch-sample-4);
+}
+
+.theme-swatch-sage {
+  --swatch-sample-1: var(--sage-swatch-sample-1);
+  --swatch-sample-2: var(--sage-swatch-sample-2);
+  --swatch-sample-3: var(--sage-swatch-sample-3);
+  --swatch-sample-4: var(--sage-swatch-sample-4);
+}
+
+.theme-swatch-factory-dark {
+  --swatch-sample-1: var(--factory-dark-swatch-sample-1);
+  --swatch-sample-2: var(--factory-dark-swatch-sample-2);
+  --swatch-sample-3: var(--factory-dark-swatch-sample-3);
+  --swatch-sample-4: var(--factory-dark-swatch-sample-4);
+}
+
+.theme-swatch-factory-light {
+  --swatch-sample-1: var(--factory-light-swatch-sample-1);
+  --swatch-sample-2: var(--factory-light-swatch-sample-2);
+  --swatch-sample-3: var(--factory-light-swatch-sample-3);
+  --swatch-sample-4: var(--factory-light-swatch-sample-4);
+}
+
 .theme-swatch-silver {
   --swatch-sample-1: #27272a;
   --swatch-sample-2: #3f3f46;
@@ -625,6 +705,13 @@
   --swatch-sample-4: #be6e3c;
 }
 
+.theme-swatch-medieval {
+  --swatch-sample-1: var(--medieval-swatch-sample-1);
+  --swatch-sample-2: var(--medieval-swatch-sample-2);
+  --swatch-sample-3: var(--medieval-swatch-sample-3);
+  --swatch-sample-4: var(--medieval-swatch-sample-4);
+}
+
 .theme-swatch-terminal {
   --swatch-sample-1: #0a0a0a;
   --swatch-sample-2: #0f120d;
@@ -644,6 +731,14 @@
   --swatch-sample-2: color-mix(in srgb, #252a32 78%, transparent);
   --swatch-sample-3: #d7dde6;
   --swatch-sample-4: #9ca6b4;
+}
+
+/* FNXC:LiquidGlassTheme 2026-09-09-15:50: The shared four-sample swatch previews Liquid Glass depth and blue/cyan functional accents without depending on the currently active theme tokens. */
+.theme-swatch-liquid-glass {
+  --swatch-sample-1: oklch(0.18 0.025 255);
+  --swatch-sample-2: oklch(0.32 0.045 250);
+  --swatch-sample-3: oklch(0.72 0.16 245);
+  --swatch-sample-4: oklch(0.78 0.14 205);
 }
 
 .theme-swatch-horizon {
@@ -1013,6 +1108,13 @@
   --swatch-sample-4: #747f8c;
 }
 
+[data-theme="light"] .theme-swatch-liquid-glass {
+  --swatch-sample-1: oklch(0.955 0.012 245);
+  --swatch-sample-2: oklch(0.985 0.01 245);
+  --swatch-sample-3: oklch(0.55 0.19 250);
+  --swatch-sample-4: oklch(0.55 0.15 215);
+}
+
 [data-theme="light"] .theme-swatch-slate {
   --swatch-sample-1: #f1f5f9;
   --swatch-sample-2: #e2e8f0;
@@ -1139,6 +1241,84 @@
   --swatch-sample-4: #397c49;
 }
 
+[data-theme="light"] .theme-swatch-midnight {
+  --swatch-sample-1: var(--midnight-swatch-sample-1);
+  --swatch-sample-2: var(--midnight-swatch-sample-2);
+  --swatch-sample-3: var(--midnight-swatch-sample-3);
+  --swatch-sample-4: var(--midnight-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-velvet {
+  --swatch-sample-1: var(--velvet-swatch-sample-1);
+  --swatch-sample-2: var(--velvet-swatch-sample-2);
+  --swatch-sample-3: var(--velvet-swatch-sample-3);
+  --swatch-sample-4: var(--velvet-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-iceberg {
+  --swatch-sample-1: var(--iceberg-swatch-sample-1);
+  --swatch-sample-2: var(--iceberg-swatch-sample-2);
+  --swatch-sample-3: var(--iceberg-swatch-sample-3);
+  --swatch-sample-4: var(--iceberg-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-flexoki {
+  --swatch-sample-1: var(--flexoki-swatch-sample-1);
+  --swatch-sample-2: var(--flexoki-swatch-sample-2);
+  --swatch-sample-3: var(--flexoki-swatch-sample-3);
+  --swatch-sample-4: var(--flexoki-swatch-sample-4);
+}
+
+/* FNXC:DashboardTheming 2026-08-28-07:45: The light selector chip resolves the Cozy Cartoon flagship pastel samples globally instead of borrowing active-theme colors. */
+[data-theme="light"] .theme-swatch-cozy-cartoon {
+  --swatch-sample-1: var(--cozy-cartoon-swatch-sample-1);
+  --swatch-sample-2: var(--cozy-cartoon-swatch-sample-2);
+  --swatch-sample-3: var(--cozy-cartoon-swatch-sample-3);
+  --swatch-sample-4: var(--cozy-cartoon-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-aurora {
+  --swatch-sample-1: var(--aurora-swatch-sample-1);
+  --swatch-sample-2: var(--aurora-swatch-sample-2);
+  --swatch-sample-3: var(--aurora-swatch-sample-3);
+  --swatch-sample-4: var(--aurora-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-calm {
+  --swatch-sample-1: var(--calm-swatch-sample-1);
+  --swatch-sample-2: var(--calm-swatch-sample-2);
+  --swatch-sample-3: var(--calm-swatch-sample-3);
+  --swatch-sample-4: var(--calm-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-dawn {
+  --swatch-sample-1: var(--dawn-swatch-sample-1);
+  --swatch-sample-2: var(--dawn-swatch-sample-2);
+  --swatch-sample-3: var(--dawn-swatch-sample-3);
+  --swatch-sample-4: var(--dawn-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-sage {
+  --swatch-sample-1: var(--sage-swatch-sample-1);
+  --swatch-sample-2: var(--sage-swatch-sample-2);
+  --swatch-sample-3: var(--sage-swatch-sample-3);
+  --swatch-sample-4: var(--sage-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-factory-dark {
+  --swatch-sample-1: var(--factory-dark-swatch-sample-1);
+  --swatch-sample-2: var(--factory-dark-swatch-sample-2);
+  --swatch-sample-3: var(--factory-dark-swatch-sample-3);
+  --swatch-sample-4: var(--factory-dark-swatch-sample-4);
+}
+
+[data-theme="light"] .theme-swatch-factory-light {
+  --swatch-sample-1: var(--factory-light-swatch-sample-1);
+  --swatch-sample-2: var(--factory-light-swatch-sample-2);
+  --swatch-sample-3: var(--factory-light-swatch-sample-3);
+  --swatch-sample-4: var(--factory-light-swatch-sample-4);
+}
+
 [data-theme="light"] .theme-swatch-silver {
   --swatch-sample-1: #fafafa;
   --swatch-sample-2: #f4f4f5;
@@ -1255,4 +1435,12 @@
   .theme-font-size-toggle {
     grid-template-columns: 1fr;
   }
+}
+
+
+[data-theme="light"] .theme-swatch-medieval {
+  --swatch-sample-1: var(--medieval-swatch-sample-1);
+  --swatch-sample-2: var(--medieval-swatch-sample-2);
+  --swatch-sample-3: var(--medieval-swatch-sample-3);
+  --swatch-sample-4: var(--medieval-swatch-sample-4);
 }

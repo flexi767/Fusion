@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { createLogger, getMaxAgentActivitySeq, queryAgentActivityEvents } from "@fusion/core";
 import type {
   TaskStore,
   MissionStore,
@@ -31,6 +32,44 @@ import type { AiSessionStore } from "./ai-session-store.js";
 let activeConnections = 0;
 let highWaterMark = 0;
 let nextConnectionId = 1;
+
+/*
+FNXC:EngineDiagnostics 2026-07-26-08:15:
+SSE open/close fires on every dashboard tab, reconnect, and focus flip. Logging each +/- connection at info filled the TUI log pane with steady-state transport chatter. Gate behind FUSION_DEBUG=sse (or FUSION_DEBUG=1/all/*). Keep backpressure and real failures on warn/error.
+*/
+function isSseDebugEnabled(): boolean {
+  const raw = process.env.FUSION_DEBUG?.trim();
+  if (!raw) return false;
+  if (raw === "1" || raw === "true" || raw === "all" || raw === "*") return true;
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .includes("sse");
+}
+
+const sseLog = createLogger("sse");
+function sseDebug(message: string): void {
+  if (!isSseDebugEnabled()) return;
+  sseLog.debug(message);
+}
+
+/*
+FNXC:AgentActivityStream 2026-08-12-00:00:
+The durable agent-activity seq tail polls every 2s in production — that interval IS the
+cross-process delivery guarantee for short-lived out-of-process writers that never emit an
+in-process nudge. The PG integration test for that path could only prove delivery by sleeping
+a full real poll cycle (~2.1s), which is exactly the kind of real time-wait FN-5048 forbids.
+Expose a bounded env test-seam (FUSION_AGENT_ACTIVITY_POLL_MS) so that test can drive the poll
+fast without weakening the real 2s default or the delivery contract. Read per-connection so a
+test can set it before opening the SSE; clamp to >=10ms so a bad value can never busy-spin.
+*/
+function resolveAgentActivityPollMs(): number {
+  const raw = process.env.FUSION_AGENT_ACTIVITY_POLL_MS?.trim();
+  if (!raw) return 2_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 2_000;
+  return Math.max(10, Math.floor(parsed));
+}
 
 const SSE_CLIENT_ID_MAX_LENGTH = 128;
 /*
@@ -157,12 +196,20 @@ export function stripTaskListHeavyFields<T>(task: T): T {
     return task;
   }
 
-  if (!("log" in task)) {
-    return task;
+  const candidate = task as Record<string, unknown>;
+  /*
+  FNXC:PromoteVisibility 2026-08-13-22:02:
+  Release-gate verdicts are response-only GET /api/tasks enrichments. Strip one defensively at the
+  SSE boundary so a future event producer cannot persist a stale Promote approval in browser state.
+  */
+  const { releaseGate: _transientReleaseGate, ...taskWithoutReleaseGate } = candidate;
+
+  if (!("log" in taskWithoutReleaseGate)) {
+    return taskWithoutReleaseGate as T;
   }
 
-  const candidate = task as Record<string, unknown>;
-  const existingTimed = candidate.timedExecutionMs;
+  const taskCandidate = taskWithoutReleaseGate as Record<string, unknown>;
+  const existingTimed = taskCandidate.timedExecutionMs;
   // Mirror the slim REST path (listTasks): aggregate `[timing] … in <N>ms`
   // log entries before stripping the log so the board card has the same
   // total-execution figure on SSE updates as on the initial fetch.
@@ -172,15 +219,15 @@ export function stripTaskListHeavyFields<T>(task: T): T {
   const timedExecutionMs =
     typeof existingTimed === "number"
       ? existingTimed
-      : sumTimedLogEntries(candidate.log);
+      : sumTimedLogEntries(taskCandidate.log);
 
   return {
-    ...task,
+    ...taskWithoutReleaseGate,
     // FN-5105/FN-5135: preserve deletedAt in SSE slim payloads for soft-delete suppression.
     log: [],
     timedExecutionMs,
-    tokenUsage: candidate.tokenUsage,
-    workflowStepResults: candidate.workflowStepResults,
+    tokenUsage: taskCandidate.tokenUsage,
+    workflowStepResults: taskCandidate.workflowStepResults,
   } as T;
 }
 
@@ -204,7 +251,26 @@ function sumTimedLogEntries(log: unknown): number {
   return total;
 }
 
-function stripTaskEventHeavyFields<T>(payload: T): T {
+/*
+FNXC:TaskEventProjectScope 2026-09-01-06:16:
+Task rows intentionally have no dashboard project field, so task lifecycle frames must inherit the
+scope of their stream. Stamping both envelopes and nested tasks lets clients reject foreign same-ID
+updates without changing the core Task domain contract.
+*/
+export function withTaskEventProjectId<T>(payload: T, projectId: string | undefined): T {
+  if (!projectId || !payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const envelope = payload as Record<string, unknown>;
+  const nestedTask = envelope.task;
+  return {
+    ...envelope,
+    projectId,
+    ...(nestedTask && typeof nestedTask === "object" && !Array.isArray(nestedTask)
+      ? { task: { ...(nestedTask as Record<string, unknown>), projectId } }
+      : {}),
+  } as T;
+}
+
+export function stripTaskEventHeavyFields<T>(payload: T): T {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return payload;
   }
@@ -534,7 +600,7 @@ export function createSSE(
     if (activeConnections > highWaterMark) {
       highWaterMark = activeConnections;
     }
-    console.log(`[sse] + connection (active=${activeConnections}, hwm=${highWaterMark})`);
+    sseDebug(`[sse] + connection (active=${activeConnections}, hwm=${highWaterMark})`);
 
     // Send initial heartbeat
     res.write(": connected\n\n");
@@ -544,8 +610,8 @@ export function createSSE(
       const result = safeWrite(res, data);
       if (result === "ok") return;
       if (result === "backpressure") {
-        console.warn(
-          `[sse] connection ${connectionId} backpressure exceeded ` +
+        sseLog.warn(
+          `connection ${connectionId} backpressure exceeded ` +
             `(buffered=${res.writableLength}B, threshold=${SSE_MAX_BUFFERED_BYTES}B); closing`,
         );
         closeConnection("backpressure");
@@ -555,15 +621,159 @@ export function createSSE(
       cleanup("send-failed");
     };
 
+    /*
+    FNXC:AgentActivityStream 2026-08-09-09:38:
+    This durable seq tail, rather than the in-process store event, is the cross-process delivery guarantee. A dashboard can only observe short-lived CLI/store writers by polling their committed outbox rows.
+
+    A descending `since` page would return the newest backlog rows first and permanently skip older rows when the mark advances. Drain ascending pages, advance only after the frame writes, and serialize drains: two concurrent readers can otherwise send the same seq range.
+    */
+    const AGENT_ACTIVITY_PAGE_SIZE = 100;
+    const AGENT_ACTIVITY_MAX_PAGES_PER_DRAIN = 20;
+    const AGENT_ACTIVITY_BACKLOG_LIMIT = 5_000n;
+    let activityClosed = false;
+    let activityInitialized = false;
+    let activityInitializing = false;
+    let activityDraining = false;
+    let activityRerun = false;
+    /*
+    FNXC:AgentActivityStream 2026-08-09-12:42:
+    The typed facade nudge carries the just-committed row. Retain the earliest seq observed
+    while seeding so a racing MAX() result cannot advance past it.
+    */
+    let firstNudgedActivitySeq: string | null = null;
+    let lastDeliveredSeq = "0";
+    const activityLayer = store.getAsyncLayer();
+
+    const sendAgentActivityFrame = (payload: unknown): boolean => {
+      if (activityClosed) return false;
+      send(`event: agent:activity\ndata: ${JSON.stringify(payload)}\n\n`);
+      // send() synchronously runs cleanup for dead/backpressured sockets.
+      return !activityClosed;
+    };
+
+    const drainAgentActivity = async (): Promise<void> => {
+      if (!activityLayer || activityClosed || !activityInitialized) return;
+      if (activityDraining) {
+        activityRerun = true;
+        return;
+      }
+
+      activityDraining = true;
+      try {
+        const maxSeq = await getMaxAgentActivitySeq(activityLayer);
+        if (BigInt(maxSeq) - BigInt(lastDeliveredSeq) > AGENT_ACTIVITY_BACKLOG_LIMIT) {
+          // FNXC:AgentActivityStream 2026-08-09-09:38: flooding a reconnected browser is worse than a documented gap it can close with GET /api/agent-activity.
+          if (sendAgentActivityFrame({ truncated: true, fromSeq: lastDeliveredSeq, toSeq: maxSeq })) {
+            lastDeliveredSeq = maxSeq;
+          }
+          return;
+        }
+
+        let pages = 0;
+        while (!activityClosed && pages < AGENT_ACTIVITY_MAX_PAGES_PER_DRAIN) {
+          const page = await queryAgentActivityEvents(activityLayer, {
+            since: lastDeliveredSeq,
+            order: "asc",
+            limit: AGENT_ACTIVITY_PAGE_SIZE,
+          });
+          for (const event of page.events) {
+            if (!sendAgentActivityFrame(event)) return;
+            // Preserve at-least-once delivery: a failed frame leaves this mark unchanged.
+            lastDeliveredSeq = event.seq;
+          }
+          pages++;
+          if (page.events.length < AGENT_ACTIVITY_PAGE_SIZE) return;
+        }
+
+        // The periodic tick resumes a capped backlog without monopolizing this request's event loop.
+      } catch (error) {
+        // FNXC:AgentActivityStream 2026-08-09-09:38: polling failure is retryable monitoring loss, never permission to optimistically advance the durable cursor.
+        sseLog.warn(`agent activity tail failed for connection ${connectionId}; will retry`, error);
+      } finally {
+        activityDraining = false;
+        if (activityRerun && !activityClosed) {
+          activityRerun = false;
+          void drainAgentActivity();
+        }
+      }
+    };
+
+    const initializeAgentActivityTail = async (): Promise<void> => {
+      if (!activityLayer || activityClosed || activityInitialized || activityInitializing) return;
+      activityInitializing = true;
+      try {
+        // Seed at connection time so history remains a deliberate REST read, not an SSE replay.
+        const initialSeq = await getMaxAgentActivitySeq(activityLayer);
+        /*
+        FNXC:AgentActivityStream 2026-08-09-12:27:
+        The initial in-process nudge is only a latency signal; short-lived writers can commit
+        from another process with no local nudge at all. Re-read the durable high-water mark
+        before publishing the seed. A changed mark means a commit raced initialization, so drain
+        from the first mark rather than advancing past it. The interval remains the recovery path
+        for a commit after this bounded check.
+        */
+        const verifiedSeq = await getMaxAgentActivitySeq(activityLayer);
+        /*
+        FNXC:AgentActivityStream 2026-08-09-12:42:
+        An in-process nudge includes its persisted seq. If that commit races the seed MAX(),
+        start immediately before that one row rather than at zero: this delivers the raced row
+        without replaying pre-connect history. An untyped nudge is only a low-latency request;
+        the durable verification/poll remains its correctness fallback.
+        */
+        const nudgedFloor = firstNudgedActivitySeq
+          ? (BigInt(firstNudgedActivitySeq) - 1n).toString()
+          : initialSeq;
+        lastDeliveredSeq = BigInt(nudgedFloor) < BigInt(initialSeq) ? nudgedFloor : initialSeq;
+        activityInitialized = true;
+        if (activityRerun || verifiedSeq !== initialSeq) {
+          activityRerun = false;
+          void drainAgentActivity();
+        }
+      } catch (error) {
+        // Do not seed from "0" after a failed read: that would replay unbounded history.
+        sseLog.warn(`agent activity tail could not establish initial cursor for connection ${connectionId}`, error);
+      } finally {
+        activityInitializing = false;
+      }
+    };
+    const onAgentActivityNudge = (event?: { seq?: unknown }) => {
+      if (!activityInitialized) {
+        const seq = event?.seq;
+        if (typeof seq === "string" && /^\d+$/.test(seq) && BigInt(seq) > 0n) {
+          if (!firstNudgedActivitySeq || BigInt(seq) < BigInt(firstNudgedActivitySeq)) {
+            firstNudgedActivitySeq = seq;
+          }
+        }
+        activityRerun = true;
+        void initializeAgentActivityTail();
+        return;
+      }
+      void drainAgentActivity();
+    };
+    const agentActivityPoll = setInterval(onAgentActivityNudge, resolveAgentActivityPollMs());
+    agentActivityPoll.unref?.();
     // --- Event handler definitions ---
+    const taskEventProjectId = projectId ?? store.getProjectId?.() ?? undefined;
+    let warnedMismatchedTaskEventStore = false;
+    const sendTaskEvent = (event: string, payload: unknown, strip: (value: unknown) => unknown) => {
+      const emittingProjectId = store.getProjectId?.() ?? undefined;
+      if (projectId && emittingProjectId && emittingProjectId !== projectId) {
+        if (!warnedMismatchedTaskEventStore) {
+          warnedMismatchedTaskEventStore = true;
+          sseLog.warn(`connection ${connectionId} dropped task event from mismatched project store`);
+        }
+        return;
+      }
+      send(`event: ${event}\ndata: ${JSON.stringify(withTaskEventProjectId(strip(payload), taskEventProjectId))}\n\n`);
+    };
     const onCreated = (task: unknown) => {
-      send(`event: task:created\ndata: ${JSON.stringify(stripTaskListHeavyFields(task))}\n\n`);
+      sendTaskEvent("task:created", task, stripTaskListHeavyFields);
     };
     const onMoved = (data: unknown) => {
-      send(`event: task:moved\ndata: ${JSON.stringify(stripTaskEventHeavyFields(data))}\n\n`);
+      sendTaskEvent("task:moved", data, stripTaskEventHeavyFields);
     };
     const onUpdated = (task: unknown) => {
-      send(`event: task:updated\ndata: ${JSON.stringify(stripTaskListHeavyFields(task))}\n\n`);
+      sendTaskEvent("task:updated", task, stripTaskListHeavyFields);
     };
     const onTaskAssigned = (agent: unknown, taskId: string) => {
       const payload = {
@@ -577,10 +787,10 @@ export function createSSE(
       send(`event: task:assigned\ndata: ${JSON.stringify(payload)}\n\n`);
     };
     const onDeleted = (task: unknown) => {
-      send(`event: task:deleted\ndata: ${JSON.stringify(stripTaskListHeavyFields(task))}\n\n`);
+      sendTaskEvent("task:deleted", task, stripTaskListHeavyFields);
     };
     const onMerged = (result: unknown) => {
-      send(`event: task:merged\ndata: ${JSON.stringify(stripTaskEventHeavyFields(result))}\n\n`);
+      sendTaskEvent("task:merged", result, stripTaskEventHeavyFields);
     };
     const onAgentLog = (entry: AgentLogEntry) => {
       const payload = {
@@ -589,7 +799,7 @@ export function createSSE(
         type: entry.type,
         agent: entry.agent,
       };
-      send(`event: agent:log\ndata: ${JSON.stringify(payload)}\n\n`);
+      sendTaskEvent("agent:log", payload, (value) => value);
     };
     const onWorkflowSettingValuesUpdated = (data: {
       workflowId: string;
@@ -671,6 +881,9 @@ export function createSSE(
     };
     const onFeatureLinked = (data: unknown) => {
       send(`event: feature:linked\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    const onFeatureUnlinked = (data: unknown) => {
+      send(`event: feature:unlinked\ndata: ${JSON.stringify(data)}\n\n`);
     };
     const onAssertionCreated = (data: unknown) => {
       send(`event: assertion:created\ndata: ${JSON.stringify(data)}\n\n`);
@@ -905,9 +1118,12 @@ export function createSSE(
       cleaned = true;
       unregisterManagedConnection(connectionId);
       activeConnections--;
-      console.log(`[sse] - connection (active=${activeConnections})`);
+      sseDebug(`[sse] - connection (active=${activeConnections})`);
       if (clientStaleTimer) clearTimeout(clientStaleTimer);
       clearInterval(heartbeat);
+      activityClosed = true;
+      clearInterval(agentActivityPoll);
+      store.off("agent:activity", onAgentActivityNudge);
       store.off("task:created", onCreated);
       store.off("task:moved", onMoved);
       store.off("task:updated", onUpdated);
@@ -932,6 +1148,7 @@ export function createSSE(
         missionStore.off("feature:updated", onFeatureUpdated);
         missionStore.off("feature:deleted", onFeatureDeleted);
         missionStore.off("feature:linked", onFeatureLinked);
+        missionStore.off("feature:unlinked", onFeatureUnlinked);
         missionStore.off("assertion:created", onAssertionCreated);
         missionStore.off("assertion:updated", onAssertionUpdated);
         missionStore.off("assertion:deleted", onAssertionDeleted);
@@ -1032,6 +1249,9 @@ export function createSSE(
     Agent log streaming is authoritative evidence that an in-review agent is active even when the task row has not changed. Forward compact log metadata on the board stream so clients can clear false Stalled/Merge stalled badges without rewriting the full task for every log line.
     */
     store.on("agent:log", onAgentLog);
+    // Subscribe before seeding so an in-process append cannot be lost in the seed-query window.
+    store.on("agent:activity", onAgentActivityNudge);
+    void initializeAgentActivityTail();
     store.on("artifact:registered", onArtifactRegistered);
     store.on("artifact:updated", onArtifactUpdated);
     store.on("workflow:setting-values-updated", onWorkflowSettingValuesUpdated);
@@ -1051,6 +1271,7 @@ export function createSSE(
       missionStore.on("feature:updated", onFeatureUpdated);
       missionStore.on("feature:deleted", onFeatureDeleted);
       missionStore.on("feature:linked", onFeatureLinked);
+      missionStore.on("feature:unlinked", onFeatureUnlinked);
       missionStore.on("assertion:created", onAssertionCreated);
       missionStore.on("assertion:updated", onAssertionUpdated);
       missionStore.on("assertion:deleted", onAssertionDeleted);

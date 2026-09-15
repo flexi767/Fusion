@@ -45,6 +45,7 @@ function createOptions(overrides: Partial<Parameters<typeof useProjectActions>[0
     openSetupWizard: vi.fn(),
     closeSetupWizard: vi.fn(),
     closeModelOnboarding: vi.fn(),
+    closeProjectScopedModals: vi.fn(),
     ...overrides,
   };
 }
@@ -61,11 +62,11 @@ describe("useProjectActions", () => {
 
   it("handleSelectProject sets current project, view mode, and URL project state", () => {
     window.history.replaceState({ preserved: "state" }, "", "/?task=FN-1&view=mailbox#message-1");
-    const options = createOptions();
+    const options = createOptions({ currentProject: null });
     const { result } = renderHook(() => useProjectActions(options));
 
     act(() => {
-      result.current.handleSelectProject(PROJECT);
+      void result.current.handleSelectProject(PROJECT);
     });
 
     expect(options.setCurrentProject).toHaveBeenCalledWith(PROJECT);
@@ -100,6 +101,58 @@ describe("useProjectActions", () => {
 
     expect(new URLSearchParams(window.location.search).get("project")).toBe("proj_unique_b");
     expect(window.location.search).not.toContain("Duplicate");
+  });
+
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  Project swap must dismiss the previous project's modals (task detail, planning payloads,
+  git manager, …) via closeProjectScopedModals, but re-selecting the current project is a
+  no-op navigation and must not close anything the user has open.
+  */
+  it("handleSelectProject dismisses project-scoped modals when switching to a different project", () => {
+    const otherProject: ProjectInfo = { ...PROJECT, id: "proj_other", name: "Other" };
+    const options = createOptions();
+    const { result } = renderHook(() => useProjectActions(options));
+
+    act(() => {
+      result.current.handleSelectProject(otherProject);
+    });
+
+    expect(options.closeProjectScopedModals).toHaveBeenCalledTimes(1);
+  });
+
+  it("handleSelectProject leaves modals alone when re-selecting the current project", () => {
+    const options = createOptions();
+    const { result } = renderHook(() => useProjectActions(options));
+
+    act(() => {
+      result.current.handleSelectProject(PROJECT);
+    });
+
+    expect(options.closeProjectScopedModals).not.toHaveBeenCalled();
+  });
+
+  it("handleViewAllProjects dismisses project-scoped modals", () => {
+    const options = createOptions();
+    const { result } = renderHook(() => useProjectActions(options));
+
+    act(() => {
+      result.current.handleViewAllProjects();
+    });
+
+    expect(options.closeProjectScopedModals).toHaveBeenCalledTimes(1);
+  });
+
+  it("handleSetupComplete dismisses project-scoped modals when landing on a different project", () => {
+    const newProject: ProjectInfo = { ...PROJECT, id: "proj_new", name: "New" };
+    const options = createOptions();
+    const { result } = renderHook(() => useProjectActions(options));
+
+    act(() => {
+      result.current.handleSetupComplete(newProject);
+    });
+
+    expect(options.closeProjectScopedModals).toHaveBeenCalledTimes(1);
   });
 
   it("handleViewAllProjects clears current project, sets overview, and removes only URL project state", () => {
@@ -187,6 +240,26 @@ describe("useProjectActions", () => {
     expect(options.addToast).toHaveBeenCalledWith("Failed to remove project Demo", "error");
   });
 
+  it("attend la garde et n’applique aucun effet de portée quand elle refuse", async () => {
+    const guard = vi.fn().mockResolvedValue(false);
+    const options = createOptions({ requestCloseProjectScopedUi: guard });
+    const otherProject = { ...PROJECT, id: "other" };
+    const { result } = renderHook(() => useProjectActions(options));
+
+    await act(async () => {
+      expect(await result.current.handleSelectProject(otherProject)).toBe(false);
+      expect(await result.current.handleViewAllProjects()).toBe(false);
+      await result.current.handleRemoveProject(PROJECT);
+    });
+
+    expect(guard).toHaveBeenCalledTimes(3);
+    expect(options.setCurrentProject).not.toHaveBeenCalled();
+    expect(options.clearCurrentProject).not.toHaveBeenCalled();
+    expect(options.closeProjectScopedModals).not.toHaveBeenCalled();
+    expect(mockUnregisterProject).not.toHaveBeenCalled();
+    expect(new URLSearchParams(window.location.search).get("project")).toBeNull();
+  });
+
   it("handleToggleFavorite delegates and shows error toast on failure", async () => {
     const options = createOptions({
       toggleFavoriteProvider: vi.fn().mockRejectedValue(new Error("boom")),
@@ -213,5 +286,40 @@ describe("useProjectActions", () => {
 
     expect(options.toggleFavoriteModel).toHaveBeenCalledWith("claude-sonnet-4-5");
     expect(options.addToast).toHaveBeenCalledWith("Failed to update model favorites", "error");
+  });
+
+  /*
+  FNXC:GithubStarAsk 2026-08-19-03:59:
+  The post-onboarding GitHub star ask is earned by FINISHING onboarding. Closing the flow is the
+  operator saying "leave me alone", so the dismissal path must close the modal and ask nothing.
+  */
+  it("reports a finished onboarding so the star ask can fire, but not a dismissed one", () => {
+    const onOnboardingCompleted = vi.fn();
+    const options = createOptions({ onOnboardingCompleted });
+    const { result } = renderHook(() => useProjectActions(options));
+
+    act(() => {
+      result.current.handleModelOnboardingComplete();
+    });
+    expect(options.closeModelOnboarding).toHaveBeenCalledTimes(1);
+    expect(onOnboardingCompleted).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current.handleModelOnboardingComplete("dismissed");
+    });
+    expect(options.closeModelOnboarding).toHaveBeenCalledTimes(2);
+    expect(onOnboardingCompleted).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes onboarding without a completion listener wired", () => {
+    const options = createOptions();
+    const { result } = renderHook(() => useProjectActions(options));
+
+    expect(() => {
+      act(() => {
+        result.current.handleModelOnboardingComplete("completed");
+      });
+    }).not.toThrow();
+    expect(options.closeModelOnboarding).toHaveBeenCalledTimes(1);
   });
 });

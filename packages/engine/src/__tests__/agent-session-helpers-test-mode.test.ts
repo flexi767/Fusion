@@ -5,7 +5,7 @@ import {
   resolveMergerSessionModel,
   resolvePlanningSessionModel,
   resolveValidatorSessionModel,
-} from "../agent-session-helpers.js";
+} from "../agents/agent-session-helpers.js";
 
 const assignedAgentRuntimeConfig = {
   modelProvider: "anthropic",
@@ -27,6 +27,14 @@ describe("agent-session-helpers test mode overrides", () => {
     };
 
     expect(resolveExecutorSessionModel("openai", "gpt-4.1", settings, assignedAgentRuntimeConfig)).toEqual({
+      provider: "mock",
+      modelId: "scripted",
+    });
+    expect(resolveExecutorSessionModel(undefined, undefined, {
+      ...settings,
+      fastCheapProvider: "anthropic",
+      fastCheapModelId: "claude-haiku",
+    }, assignedAgentRuntimeConfig, undefined, "fast")).toEqual({
       provider: "mock",
       modelId: "scripted",
     });
@@ -123,6 +131,19 @@ describe("agent-session-helpers test mode overrides", () => {
       defaultModelId: "claude-sonnet-4-5",
       fallbackProvider: undefined,
       fallbackModelId: undefined,
+    });
+  });
+});
+
+describe("role-aware heartbeat test mode", () => {
+  it("still forces mock for a supplied permanent workflow role", () => {
+    expect(resolveHeartbeatSessionModels({
+      testMode: true,
+      mergerProvider: "real-provider",
+      mergerModelId: "real-model",
+    }, { enabled: false }, { roles: ["merger"] })).toMatchObject({
+      defaultProvider: "mock",
+      defaultModelId: "scripted",
     });
   });
 });

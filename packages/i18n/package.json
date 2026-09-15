@@ -1,6 +1,6 @@
 {
   "name": "@fusion/i18n",
-  "version": "0.39.31-beta.0",
+  "version": "0.39.37-beta.4",
   "license": "MIT",
   "description": "Fusion i18n: authored translation catalogs and shared i18next configuration for the Fusion dashboard and terminal UI.",
   "type": "module",
@@ -23,12 +23,12 @@
   },
   "dependencies": {
     "@fusion/core": "workspace:*",
-    "i18next": "^26.3.1"
+    "i18next": "^26.3.6"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.10"
   },
   "engines": {
     "node": ">=22.5.0"

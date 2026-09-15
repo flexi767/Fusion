@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { Settings, LayoutGrid, List, Search, X, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, FileText, Brain, CheckSquare, Lock, Gauge, Lightbulb, ChevronDown, ChevronRight, PanelRight } from "lucide-react";
+import { Settings, LayoutGrid, List, Search, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, Brain, Lock, Gauge, Lightbulb, PanelsTopLeft, ChevronDown, ChevronRight, PanelRight, Star } from "lucide-react";
 import "./Header.css";
 // ProjectSelector styles used by the imported standalone component.
 import "./ProjectSelector.css";
 import { ProjectSelector as StandaloneProjectSelector } from "./ProjectSelector";
+import { useProjectBookmarks } from "../hooks/useProjectBookmarks";
 import type { ProjectInfo } from "../api";
-import type { NodeConfig, ProjectStatus } from "@fusion/core";
+import type { NodeConfig, ProjectStatus, Task } from "@fusion/core";
 import { NodeStatusIndicator } from "./NodeStatusIndicator";
 import { NodeHealthDot } from "./NodeHealthDot";
 import { PluginSlot } from "./PluginSlot";
@@ -16,12 +17,12 @@ import type { TaskView } from "../hooks/useViewState";
 import type { PluginDashboardViewEntry } from "../api";
 import { buildPluginTaskViewId, isPluginViewId } from "../plugins/pluginViewRegistry";
 import { getPluginNavIcon } from "./pluginNavIcon";
+import { TaskSearchInput } from "./TaskSearchInput";
 import type { ShellHostContext } from "../shell-host";
+import { ViewActionButton } from "./ViewActionButton";
 export { resolveReportContextRefs } from "../utils/reportContextRefs";
 
 export { useViewportMode };
-
-const NO_BRANCH_FILTER_VALUE = "__fusion:no-branch__";
 
 // Status icon config for project selector dropdown
 const PROJECT_STATUS_CONFIG: Record<ProjectStatus, { color: string }> = {
@@ -71,21 +72,19 @@ export interface HeaderProps {
   /** Opens the top-level workspace-aware file browser modal. */
   onOpenFiles?: () => void;
   filesOpen?: boolean;
-  todosEnabled?: boolean;
   view?: TaskView;
   onChangeView?: (view: TaskView) => void;
+  /** Opens the existing App-owned full New Task modal. */
+  onNewTask?: () => void;
   /** Whether to show the skills tab in the view toggle */
   showSkillsTab?: boolean;
   /** When true, shows the Agents view tab button. Hidden by default (experimental feature). */
   showAgentsTab?: boolean;
   searchQuery?: string;
   onSearchChange?: (query: string) => void;
-  branchFilter?: string;
-  baseBranchFilter?: string;
-  branchOptions?: string[];
-  baseBranchOptions?: string[];
-  onBranchFilterChange?: (value: string) => void;
-  onBaseBranchFilterChange?: (value: string) => void;
+  taskSearchTasks?: readonly Pick<Task, "id" | "title">[];
+  /** Alpha desktop search navigates to Task Detail without changing board filters. */
+  onSelectSearchTask?: (task: Pick<Task, "id" | "title">) => void;
   /** Multi-project props */
   projects?: ProjectInfo[];
   currentProject?: ProjectInfo | null;
@@ -111,12 +110,12 @@ export interface HeaderProps {
   availableNodes?: NodeConfig[];
   /** Currently selected node (null for local) */
   currentNode?: NodeConfig | null;
-  /** Callback when a node is selected */
-  onSelectNode?: (node: NodeConfig | null) => void;
+  /** Callback when a node is selected; false keeps the selector open when a project-scoped guard refuses the transition. */
+  onSelectNode?: (node: NodeConfig | null) => void | boolean | Promise<void | boolean>;
   /** Whether the current view is a remote node */
   isRemote?: boolean;
   /** Experimental feature flags controlling visibility of nav items. */
-  experimentalFeatures?: { insights?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean; evalsView?: boolean; ideationView?: boolean; goalsView?: boolean; leftSidebarNav?: boolean; rightDock?: boolean };
+  experimentalFeatures?: { insights?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean; evalsView?: boolean; ideationView?: boolean; whiteboardView?: boolean; goalsView?: boolean; leftSidebarNav?: boolean; rightDock?: boolean };
   pluginDashboardViews?: PluginDashboardViewEntry[];
   shellConnectionControl?: ReactNode;
 }
@@ -135,19 +134,15 @@ export function Header({
   onOpenGitManager,
   onOpenWorkflowEditor,
   onOpenFiles,
-  todosEnabled,
   view = "board",
   onChangeView,
+  onNewTask,
   showSkillsTab,
   showAgentsTab,
   searchQuery = "",
   onSearchChange,
-  branchFilter = "",
-  baseBranchFilter = "",
-  branchOptions = [],
-  baseBranchOptions = [],
-  onBranchFilterChange,
-  onBaseBranchFilterChange,
+  taskSearchTasks,
+  onSelectSearchTask,
   projects = [],
   currentProject,
   onSelectProject,
@@ -189,6 +184,9 @@ export function Header({
   The right dock is persistent and owns its own collapse control, so Header must not render a duplicate right-dock toggle or repurpose the More views overflow trigger on tablet/desktop.
   */
   const [isMobileSearchOpen, setIsMobileSearchOpen] = useState(false);
+  const [isAlphaSearchOpen, setIsAlphaSearchOpen] = useState(false);
+  const [alphaSearchQuery, setAlphaSearchQuery] = useState("");
+  const alphaSearchTriggerRef = useRef<HTMLButtonElement>(null);
   const [isNonMobileSearchOpen, setIsNonMobileSearchOpen] = useState(false);
   // Track when user has explicitly closed the search (used for toggle visibility)
   const [isNonMobileSearchExplicitlyClosed, setIsNonMobileSearchExplicitlyClosed] = useState(false);
@@ -198,8 +196,6 @@ export function Header({
   const [isViewOverflowOpen, setIsViewOverflowOpen] = useState(false);
   const overflowButtonRef = useRef<HTMLButtonElement>(null);
   const overflowMenuRef = useRef<HTMLDivElement>(null);
-  const mobileSearchRef = useRef<HTMLDivElement>(null);
-  const mobileSearchInputRef = useRef<HTMLInputElement>(null);
   const nodeSelectorRef = useRef<HTMLDivElement>(null);
   const mobileProjectSwitchRef = useRef<HTMLDivElement>(null);
   const viewOverflowRef = useRef<HTMLDivElement>(null);
@@ -211,13 +207,80 @@ export function Header({
     [availableNodes]
   );
   const showNodeSelector = remoteNodes.length > 0;
+  const { bookmarkedIds, toggleBookmark, isBookmarked } = useProjectBookmarks();
+  /*
+  FNXC:ProjectSelector 2026-07-26-00:00:
+  Mobile project switching must separate favorites at the top while sharing the desktop localStorage bookmark store. Preserve the incoming order within each section so grouping never changes the project's canonical ordering.
+  */
+  const mobileProjectGroups = useMemo(() => {
+    const favorites = projects.filter((project) => bookmarkedIds.has(project.id));
+    const others = projects.filter((project) => !bookmarkedIds.has(project.id));
+    return { favorites, others };
+  }, [bookmarkedIds, projects]);
+
+  /*
+  FNXC:ProjectSelector 2026-07-26-00:00:
+  Mobile rows use the same localStorage bookmark toggle as desktop. Stop propagation so bookmarking never selects a project or closes the switcher.
+  */
+  const renderMobileProjectItem = (project: ProjectInfo) => {
+    const isCurrent = currentProject?.id === project.id;
+    const bookmarked = isBookmarked(project.id);
+    const statusColor = PROJECT_STATUS_CONFIG[project.status]?.color;
+    return (
+      <button
+        key={project.id}
+        className={`mobile-project-switch-item${isCurrent ? " mobile-project-switch-item--current" : ""}`}
+        onClick={() => {
+          onSelectProject?.(project);
+          setIsMobileProjectSwitchOpen(false);
+        }}
+        role="option"
+        aria-selected={isCurrent}
+        data-testid={`mobile-project-switch-item-${project.id}`}
+      >
+        <span
+          className="mobile-project-switch-dot"
+          style={{ backgroundColor: statusColor || "var(--text-muted)" }}
+        />
+        <div className="mobile-project-switch-info">
+          <span className="mobile-project-switch-name">{project.name}</span>
+          <span className="mobile-project-switch-path">
+            {getTrailingPath(project.path, 2)}
+          </span>
+        </div>
+        <span
+          role="button"
+          tabIndex={0}
+          className={`mobile-project-switch-bookmark${bookmarked ? " bookmarked" : ""}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            toggleBookmark(project.id);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              event.stopPropagation();
+              toggleBookmark(project.id);
+            }
+          }}
+          aria-label={bookmarked
+            ? t("projectSelector.removeBookmark", "Remove bookmark")
+            : t("projectSelector.addBookmark", "Bookmark project")}
+          data-testid={`mobile-bookmark-toggle-${project.id}`}
+        >
+          <Star size={14} fill={bookmarked ? "currentColor" : "none"} />
+        </span>
+        {isCurrent && <Check size={14} className="mobile-project-switch-check" />}
+      </button>
+    );
+  };
 
   const hasViewOverflowItems = useMemo(() => {
     return !!(
       onChangeView ||
       experimentalFeatures?.researchView ||
       experimentalFeatures?.ideationView ||
-      todosEnabled ||
+      experimentalFeatures?.whiteboardView ||
       experimentalFeatures?.insights ||
 
       showSkillsTab ||
@@ -227,12 +290,27 @@ export function Header({
       isTablet ||
       pluginDashboardViews.some((entry) => entry.view.placement !== "primary")
     );
-  }, [onChangeView, experimentalFeatures, todosEnabled, showSkillsTab, hideFullNav, isTablet, pluginDashboardViews]);
+  }, [onChangeView, experimentalFeatures, showSkillsTab, hideFullNav, isTablet, pluginDashboardViews]);
 
   // Keep mobile search open if there's an active search query
   const shouldShowMobileSearch = isMobileSearchOpen || searchQuery.length > 0;
 
   const canShowNonMobileSearch = (view === "board" || view === "list") && !isMobile && onSearchChange;
+  const showAlphaDesktopSearch = Boolean(mode === "desktop" && canShowNonMobileSearch);
+  const closeAlphaSearch = useCallback(() => {
+    setIsAlphaSearchOpen(false);
+    setAlphaSearchQuery("");
+    window.setTimeout(() => alphaSearchTriggerRef.current?.focus(), 0);
+  }, []);
+
+  useEffect(() => {
+    if (!isAlphaSearchOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeAlphaSearch();
+    };
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => document.removeEventListener("keydown", closeOnEscape, true);
+  }, [closeAlphaSearch, isAlphaSearchOpen]);
   // Non-mobile search: toggled open OR has active query, but not if explicitly closed.
   const shouldShowNonMobileSearch = (isNonMobileSearchOpen || searchQuery.length > 0) && !isNonMobileSearchExplicitlyClosed;
   /*
@@ -240,7 +318,6 @@ export function Header({
   Closing board/list search must suppress the populated floating panel until App clears searchQuery, then immediately restore the Open search affordance. Keep the explicit-close state out of the empty-query toggle gate so an open-but-empty dismissal cannot strand the header without a search trigger.
   */
   const canShowNonMobileSearchToggle = Boolean(canShowNonMobileSearch && !shouldShowNonMobileSearch && searchQuery.length === 0);
-  const showBoardBranchFilters = view === "board";
 
   // Reset explicit close flag when query becomes empty (so active-query reopen behavior is ready for the next search).
   useEffect(() => {
@@ -394,7 +471,7 @@ export function Header({
               fill="currentColor"
             />
           </svg>
-          <h1 className="logo">{t("appName", "Fusion")}</h1>
+          {!isMobile && <h1 className="logo">{t("appName", "Fusion")}</h1>}
         </div>
 
         {/* Mobile Project Switch - dropdown trigger next to logo when at least one project exists (mobile only) */}
@@ -418,35 +495,27 @@ export function Header({
                 aria-label={t("header.selectProject", "Select project")}
                 data-testid="mobile-project-switch-dropdown"
               >
-                {projects.map((project) => {
-                  const isCurrent = currentProject?.id === project.id;
-                  const statusColor = PROJECT_STATUS_CONFIG[project.status]?.color;
-                  return (
-                    <button
-                      key={project.id}
-                      className={`mobile-project-switch-item${isCurrent ? " mobile-project-switch-item--current" : ""}`}
-                      onClick={() => {
-                        onSelectProject(project);
-                        setIsMobileProjectSwitchOpen(false);
-                      }}
-                      role="option"
-                      aria-selected={isCurrent}
-                      data-testid={`mobile-project-switch-item-${project.id}`}
-                    >
-                      <span
-                        className="mobile-project-switch-dot"
-                        style={{ backgroundColor: statusColor || "var(--text-muted)" }}
-                      />
-                      <div className="mobile-project-switch-info">
-                        <span className="mobile-project-switch-name">{project.name}</span>
-                        <span className="mobile-project-switch-path">
-                          {getTrailingPath(project.path, 2)}
-                        </span>
-                      </div>
-                      {isCurrent && <Check size={14} className="mobile-project-switch-check" />}
-                    </button>
-                  );
-                })}
+                {mobileProjectGroups.favorites.length > 0 && (
+                  <div data-testid="mobile-project-switch-favorites">
+                    <div className="mobile-project-switch-section-label">
+                      {t("header.favoriteProjects", "Favorites")}
+                    </div>
+                    {mobileProjectGroups.favorites.map(renderMobileProjectItem)}
+                  </div>
+                )}
+                {mobileProjectGroups.favorites.length > 0 && mobileProjectGroups.others.length > 0 && (
+                  <>
+                    <div className="mobile-project-switch-divider" />
+                    <div className="mobile-project-switch-section-label">
+                      {t("header.allProjects", "All projects")}
+                    </div>
+                  </>
+                )}
+                {mobileProjectGroups.others.length > 0 && (
+                  <div data-testid="mobile-project-switch-others">
+                    {mobileProjectGroups.others.map(renderMobileProjectItem)}
+                  </div>
+                )}
                 {onViewAllProjects && (
                   <>
                     <div className="mobile-project-switch-divider" />
@@ -525,8 +594,9 @@ export function Header({
                     <button
                       className={`node-selector-option${!isRemote ? " node-selector-option--active" : ""}`}
                       onClick={() => {
-                        onSelectNode?.(null);
-                        setIsNodeSelectorOpen(false);
+                        void Promise.resolve(onSelectNode?.(null)).then((accepted) => {
+                          if (accepted !== false) setIsNodeSelectorOpen(false);
+                        });
                       }}
                       role="option"
                       aria-selected={!isRemote}
@@ -542,8 +612,9 @@ export function Header({
                         key={node.id}
                         className={`node-selector-option${currentNode?.id === node.id ? " node-selector-option--active" : ""}`}
                         onClick={() => {
-                          onSelectNode?.(node);
-                          setIsNodeSelectorOpen(false);
+                          void Promise.resolve(onSelectNode?.(node)).then((accepted) => {
+                            if (accepted !== false) setIsNodeSelectorOpen(false);
+                          });
                         }}
                         role="option"
                         aria-selected={currentNode?.id === node.id}
@@ -564,31 +635,6 @@ export function Header({
 
       <div className="header-actions">
         {shellConnectionControl}
-        {/* Mobile View Toggle - compact board/list switcher in header when mobile nav is active */}
-        {hideFullNav && onChangeView && (view === "board" || view === "list") && (
-          <div className="view-toggle" data-testid="mobile-view-toggle">
-            <button
-              className={`view-toggle-btn${view === "board" ? " active" : ""}`}
-              onClick={() => onChangeView("board")}
-              title={t("header.boardView", "Board view")}
-              aria-label={t("header.boardView", "Board view")}
-              aria-pressed={view === "board"}
-              data-testid="mobile-view-toggle-board"
-            >
-              <LayoutGrid size={16} />
-            </button>
-            <button
-              className={`view-toggle-btn${view === "list" ? " active" : ""}`}
-              onClick={() => onChangeView("list")}
-              title={t("header.listView", "List view")}
-              aria-label={t("header.listView", "List view")}
-              aria-pressed={view === "list"}
-              data-testid="mobile-view-toggle-list"
-            >
-              <List size={16} />
-            </button>
-          </div>
-        )}
 
         {/* Mobile Search Trigger - only on mobile, show trigger button in header */}
         {onSearchChange && isMobile && (hideFullNav || view === "board" || view === "list") && !shouldShowMobileSearch && (
@@ -604,12 +650,16 @@ export function Header({
           </button>
         )}
 
-        {/* Usage button on mobile when mobile bottom nav is active */}
+        {/*
+        FNXC:MobileUsage 2026-09-13-22:47:
+        The mobile project header keeps a one-tap Usage shortcut so AI quota status is reachable without opening the shared navigation menu. Show it only while mobile navigation owns the primary destinations; the legacy compact header retains its existing Usage entry in the overflow menu.
+        */}
         {isMobile && hideFullNav && onOpenUsage && (
           <button
             className="btn-icon"
             onClick={(event) => onOpenUsage(event.currentTarget.getBoundingClientRect())}
             title={t("header.viewUsage", "View usage")}
+            aria-label={t("header.viewUsage", "View usage")}
             data-testid="mobile-header-usage-btn"
           >
             <Activity size={16} />
@@ -627,8 +677,43 @@ export function Header({
         {/**
          * FNXC:Header 2026-06-21-00:00:
          * Desktop and tablet header search must render after the workflow portal slot so a populated WorkflowSwitcher appears left of the search icon while preserving the mobile search trigger's existing position and behavior.
+         *
+         * FNXC:AlphaTaskSearch 2026-09-12-21:52:
+         * On Alpha desktop Board and List, Search alternates in this exact action slot between the magnifier and the shared inline combobox. Its transient query and task-detail selection remain isolated from the Board/List filter; close, Escape, and selection clear the field and restore focus to the recreated trigger without any modal or backdrop.
          */}
-        {canShowNonMobileSearchToggle && (
+        {showAlphaDesktopSearch && onSearchChange && (
+          isAlphaSearchOpen ? (
+            <TaskSearchInput
+              query={alphaSearchQuery}
+              tasks={taskSearchTasks}
+              onSearchChange={setAlphaSearchQuery}
+              onSelectTask={(task) => {
+                const selected = taskSearchTasks?.find((candidate) => candidate.id.toLocaleLowerCase() === task.id.toLocaleLowerCase());
+                if (selected) onSelectSearchTask?.(selected);
+                closeAlphaSearch();
+              }}
+              onClose={closeAlphaSearch}
+              autoFocus
+              className="header-search--alpha-inline"
+              testId="alpha-desktop-header-search-input"
+            />
+          ) : (
+            <button
+              ref={alphaSearchTriggerRef}
+              type="button"
+              className="btn-icon"
+              onClick={() => setIsAlphaSearchOpen(true)}
+              title={t("header.openSearch", "Open search")}
+              aria-label={t("header.openSearch", "Open search")}
+              aria-expanded={false}
+              data-testid="alpha-desktop-header-search-btn"
+            >
+              <Search size={16} />
+            </button>
+          )
+        )}
+
+        {canShowNonMobileSearchToggle && !showAlphaDesktopSearch && (
           <button
             className="btn-icon"
             onClick={handleNonMobileSearchToggle}
@@ -652,15 +737,22 @@ export function Header({
             >
               <LayoutGrid size={16} />
             </button>
-            <button
-              className={`view-toggle-btn${view === "list" ? " active" : ""}`}
-              onClick={() => onChangeView("list")}
-              title={t("header.listView", "List view")}
-              aria-label={t("header.listView", "List view")}
-              aria-pressed={view === "list"}
-            >
-              <List size={16} />
-            </button>
+            {/*
+            FNXC:ListInRightDock 2026-09-14-04:42:
+            FN-382: on a phone the toggle still switches to the List page; on tablet and desktop List lives in the
+            right dock, so the toggle would either duplicate that tool or navigate away from the current destination.
+            */}
+            {isMobile ? (
+              <button
+                className={`view-toggle-btn${view === "list" ? " active" : ""}`}
+                onClick={() => onChangeView("list")}
+                title={t("header.listView", "List view")}
+                aria-label={t("header.listView", "List view")}
+                aria-pressed={view === "list"}
+              >
+                <List size={16} />
+              </button>
+            ) : null}
             {showAgentsTab && (
               <button
                 className={`view-toggle-btn${view === "agents" ? " active" : ""}`}
@@ -709,21 +801,6 @@ export function Header({
                 <span className="status-dot status-dot--pending header-chat-unread-dot" aria-label={t("header.unreadChatResponse", "Unread chat response")} />
               )}
             </button>
-            {!isTablet && (
-              /*
-              FNXC:Navigation 2026-06-21-18:25:
-              The top-level documents destination now displays as Artifacts (FN-6890), but the documents route id remains stable for navigation and tests.
-              */
-              <button
-                className={`view-toggle-btn${view === "documents" ? " active" : ""}`}
-                onClick={() => onChangeView("documents")}
-                title={t("header.documentsView", "Artifacts view")}
-                aria-label={t("header.documentsView", "Artifacts view")}
-                aria-pressed={view === "documents"}
-              >
-                <FileText size={16} />
-              </button>
-            )}
             <button
               className={`view-toggle-btn${view === "mailbox" ? " active" : ""}`}
               onClick={() => (onOpenMailbox ? onOpenMailbox() : onChangeView("mailbox"))}
@@ -765,7 +842,7 @@ export function Header({
               <>
                 <button
                   ref={viewOverflowTriggerRef}
-                  className={`view-toggle-btn${(["research", "ideation", "skills", "insights", "memory", "secrets", "dev-server", "devserver", "graph", "todos"].includes(view) || (isTablet && view === "documents") || (experimentalFeatures?.evalsView && view === "evals") || (experimentalFeatures?.goalsView && view === "goalsView") || isPluginViewId(view)) ? " active" : ""}`}
+                  className={`view-toggle-btn${(["research", "ideation", "whiteboard", "skills", "insights", "memory", "secrets", "dev-server", "devserver", "graph"].includes(view) || (experimentalFeatures?.evalsView && view === "evals") || (experimentalFeatures?.goalsView && view === "goalsView") || isPluginViewId(view)) ? " active" : ""}`}
                   onClick={() => {
                     setIsViewOverflowOpen((prev) => !prev);
                   }}
@@ -840,6 +917,13 @@ export function Header({
                         <span>{t("nav.ideation", "Ideation")}</span>
                       </button>
                     )}
+                    {experimentalFeatures?.whiteboardView && (
+                      <button className={`view-toggle-overflow-item${view === "whiteboard" ? " active" : ""}`} onClick={() => { onChangeView("whiteboard"); setIsViewOverflowOpen(false); }} role="menuitem" data-testid="view-overflow-whiteboard">
+                        <PanelsTopLeft size={14} />
+                        <span>{t("nav.whiteboard", "Whiteboard")}</span>
+                        <span className="btn-badge">{t("common.alpha", "Alpha")}</span>
+                      </button>
+                    )}
                     {experimentalFeatures?.insights && (
                       <button
                         className={`view-toggle-overflow-item${view === "insights" ? " active" : ""}`}
@@ -866,7 +950,7 @@ export function Header({
                         data-testid="view-overflow-skills"
                       >
                         <Zap size={14} />
-                        <span>{t("header.skillsView", "Skills")}</span>
+                        <span>{t("header.skillsView", "Skills & Snippets")}</span>
                       </button>
                     )}
                     {experimentalFeatures?.memoryView && (
@@ -895,20 +979,6 @@ export function Header({
                       <Lock size={14} />
                       <span>{t("header.secretsView", "Secrets")}</span>
                     </button>
-                    {isTablet && (
-                      <button
-                        className={`view-toggle-overflow-item${view === "documents" ? " active" : ""}`}
-                        onClick={() => {
-                          onChangeView("documents");
-                          setIsViewOverflowOpen(false);
-                        }}
-                        role="menuitem"
-                        data-testid="view-overflow-documents"
-                      >
-                        <FileText size={14} />
-                        <span>{t("header.documentsView", "Artifacts view")}</span>
-                      </button>
-                    )}
                     {experimentalFeatures?.devServerView && (
                       <button
                         className={`view-toggle-overflow-item${view === "dev-server" || view === "devserver" ? " active" : ""}`}
@@ -922,20 +992,6 @@ export function Header({
                         <Monitor size={14} />
                         <span>{t("header.devServerView", "Dev Server")}</span>
                         <span className="visually-hidden" data-testid="view-toggle-dev-server" />
-                      </button>
-                    )}
-                    {todosEnabled && onChangeView && (
-                      <button
-                        className={`view-toggle-overflow-item${view === "todos" ? " active" : ""}`}
-                        onClick={() => {
-                          onChangeView("todos");
-                          setIsViewOverflowOpen(false);
-                        }}
-                        role="menuitem"
-                        data-testid="view-overflow-todos"
-                      >
-                        <CheckSquare size={14} />
-                        <span>{t("header.todosView", "Todos")}</span>
                       </button>
                     )}
                     {pluginDashboardViews
@@ -1046,6 +1102,7 @@ export function Header({
             <PanelRight size={16} />
           </button>
         )}
+
 
         {/* Compact overflow menu trigger (mobile only — tablet uses the right-sidebar toggle above) */}
         {isMobile && !hideFullNav && (
@@ -1188,134 +1245,50 @@ export function Header({
             </button>
           </div>
         )}
+
+        {/*
+        FNXC:MobileTaskNavigation 2026-08-20-05:47:
+        Issue #2226 moves mobile Board/List navigation to the footer so Header can expose App's single full-task modal entry point from every active project view. The Planning column keeps its separate quick-entry composer.
+
+        FNXC:StandardizedViewActions 2026-09-13-22:40:
+        The App-owned create-task control keeps its established placement — tablet/mobile only — and merely adopts the shared action primitive so its shape matches every other creation entry. Desktop creation stays with its dedicated surfaces and shortcuts, so standardizing the button must not reintroduce a retired desktop Header duplicate. List is excluded at every viewport because its own header preserves the selected-workflow argument.
+        */}
+        {mode !== "desktop" && projectId && onNewTask && view !== "list" ? (
+          <ViewActionButton
+            kind="create"
+            onClick={onNewTask}
+            label={t("newTaskModal.title", "New Task")}
+            title={t("newTaskModal.title", "New Task")}
+            data-testid="mobile-header-new-task"
+          />
+        ) : null}
       </div>
     </header>
 
     {/* Desktop/Tablet Search - floating below header, in board or list view */}
-    {canShowNonMobileSearch && shouldShowNonMobileSearch && (
+    {canShowNonMobileSearch && shouldShowNonMobileSearch && !showAlphaDesktopSearch && (
       <div className="header-floating-search">
-        <div className="header-search">
-          <Search size={14} className="header-search-icon" />
-          <input
-            autoFocus
-            type="text"
-            placeholder={t("header.searchTasks", "Search tasks...")}
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className="header-search-input"
-          />
-          <button
-            className="header-search-clear"
-            onClick={handleNonMobileSearchClose}
-            aria-label={t("header.closeSearch", "Close search")}
-          >
-            <X size={14} />
-          </button>
-        </div>
-        {showBoardBranchFilters && (
-          <div className="header-branch-filters" data-testid="header-branch-filters-desktop">
-            <label className="header-branch-filter-label">
-              <span>{t("header.workingBranch", "Working branch")}</span>
-              <select
-                className="header-branch-filter-select"
-                value={branchFilter}
-                onChange={(event) => onBranchFilterChange?.(event.target.value)}
-                data-testid="working-branch-filter"
-              >
-                <option value="">{t("header.allWorkingBranches", "All working branches")}</option>
-                <option value={NO_BRANCH_FILTER_VALUE}>{t("header.noWorkingBranch", "No working branch")}</option>
-                {branchOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="header-branch-filter-label">
-              <span>{t("header.baseBranch", "Base branch")}</span>
-              <select
-                className="header-branch-filter-select"
-                value={baseBranchFilter}
-                onChange={(event) => onBaseBranchFilterChange?.(event.target.value)}
-                data-testid="target-branch-filter"
-              >
-                <option value="">{t("header.allBaseBranches", "All base branches")}</option>
-                <option value={NO_BRANCH_FILTER_VALUE}>{t("header.noBaseBranch", "No base branch")}</option>
-                {baseBranchOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-        )}
+        <TaskSearchInput
+          query={searchQuery}
+          tasks={taskSearchTasks}
+          onSearchChange={onSearchChange}
+          onClose={handleNonMobileSearchClose}
+          autoFocus
+        />
       </div>
     )}
 
     {/* Mobile Search Expanded - floating below header */}
     {onSearchChange && isMobile && shouldShowMobileSearch && (
       <div className="header-floating-search">
-        <div
-          ref={mobileSearchRef}
-          className="header-search mobile-search-expanded"
-        >
-          <Search size={14} className="header-search-icon" />
-          <input
-            ref={mobileSearchInputRef}
-            autoFocus
-            type="text"
-            placeholder={t("header.searchTasks", "Search tasks...")}
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className="header-search-input"
-          />
-          <button
-            className="header-search-clear"
-            onClick={handleMobileSearchClose}
-            aria-label={t("header.closeSearch", "Close search")}
-          >
-            <X size={14} />
-          </button>
-        </div>
-        {showBoardBranchFilters && (
-          <div className="header-branch-filters" data-testid="header-branch-filters-mobile">
-            <label className="header-branch-filter-label">
-              <span>{t("header.workingBranch", "Working branch")}</span>
-              <select
-                className="header-branch-filter-select"
-                value={branchFilter}
-                onChange={(event) => onBranchFilterChange?.(event.target.value)}
-                data-testid="working-branch-filter-mobile"
-              >
-                <option value="">{t("header.allWorkingBranches", "All working branches")}</option>
-                <option value={NO_BRANCH_FILTER_VALUE}>{t("header.noWorkingBranch", "No working branch")}</option>
-                {branchOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="header-branch-filter-label">
-              <span>{t("header.baseBranch", "Base branch")}</span>
-              <select
-                className="header-branch-filter-select"
-                value={baseBranchFilter}
-                onChange={(event) => onBaseBranchFilterChange?.(event.target.value)}
-                data-testid="target-branch-filter-mobile"
-              >
-                <option value="">{t("header.allBaseBranches", "All base branches")}</option>
-                <option value={NO_BRANCH_FILTER_VALUE}>{t("header.noBaseBranch", "No base branch")}</option>
-                {baseBranchOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-        )}
+        <TaskSearchInput
+          query={searchQuery}
+          tasks={taskSearchTasks}
+          onSearchChange={onSearchChange}
+          onClose={handleMobileSearchClose}
+          autoFocus
+          className="mobile-search-expanded"
+        />
       </div>
     )}
   </div>

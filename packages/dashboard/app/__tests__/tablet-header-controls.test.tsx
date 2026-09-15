@@ -85,7 +85,8 @@ describe("tablet header controls", () => {
   it("renders view toggle inline on tablet", () => {
     renderTabletHeader({ onChangeView: noop, showAgentsTab: true });
     expect(screen.getByTitle("Board view")).toBeDefined();
-    expect(screen.getByTitle("List view")).toBeDefined();
+    // FN-382: tablet reaches List through the right dock, not the header toggle.
+    expect(screen.queryByTitle("List view")).toBeNull();
     expect(screen.getByTitle("Agents view")).toBeDefined();
     expect(screen.getByTestId("view-toggle-command-center")).toBeDefined();
     expect(screen.queryByTitle("Artifacts view")).toBeNull();
@@ -95,27 +96,18 @@ describe("tablet header controls", () => {
     expect(screen.queryByTitle("Insights view")).toBeNull();
   });
 
-  it("places tablet Command Center inline immediately after Agents and Artifacts only in overflow", () => {
-    renderTabletHeader({ onChangeView: noop, showAgentsTab: true });
+  it.each([
+    ["tablet", renderTabletHeader],
+    ["desktop", renderDesktopHeader],
+  ] as const)("keeps Command Center inline and omits standalone mailbox-category destinations on %s", (_surface, renderHeader) => {
+    renderHeader({ onChangeView: noop, showAgentsTab: true });
 
     expect(screen.getByTestId("view-toggle-command-center").previousElementSibling).toBe(screen.getByTitle("Agents view"));
     expect(screen.queryByTitle("Artifacts view")).toBeNull();
-
     fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
-    expect(screen.getByTestId("view-overflow-documents")).toHaveTextContent("Artifacts view");
-    expect(screen.queryByTestId("view-overflow-command-center")).toBeNull();
-  });
-
-  it("keeps desktop Artifacts and Command Center inline without Command Center overflow", () => {
-    renderDesktopHeader({ onChangeView: noop, showAgentsTab: true });
-
-    expect(screen.getByTitle("Artifacts view")).toBeDefined();
-    expect(screen.getByTestId("view-toggle-command-center")).toBeDefined();
-    expect(screen.getByTestId("view-toggle-command-center").previousElementSibling).toBe(screen.getByTitle("Agents view"));
-
-    fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
-    expect(screen.queryByTestId("view-overflow-command-center")).toBeNull();
     expect(screen.queryByTestId("view-overflow-documents")).toBeNull();
+    expect(screen.queryByTestId("view-overflow-recommendations")).toBeNull();
+    expect(screen.queryByTestId("view-overflow-command-center")).toBeNull();
   });
 
   it("renders view toggle overflow trigger on tablet when overflow items are available", () => {
@@ -123,11 +115,11 @@ describe("tablet header controls", () => {
     expect(screen.getByTestId("view-toggle-overflow-trigger")).toBeDefined();
   });
 
-  it("opens overflow menu with Insights and Skills on tablet when trigger is clicked", () => {
+  it("opens overflow menu with Insights and Skills & Snippets on tablet when trigger is clicked", () => {
     renderTabletHeader({ onChangeView: noop, showSkillsTab: true, experimentalFeatures: { insights: true } });
     fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
     expect(screen.getByTestId("view-overflow-insights")).toBeDefined();
-    expect(screen.getByTestId("view-overflow-skills")).toBeDefined();
+    expect(screen.getByTestId("view-overflow-skills")).toHaveTextContent("Skills & Snippets");
   });
 
   it("calls onChangeView from overflow menu on tablet", () => {

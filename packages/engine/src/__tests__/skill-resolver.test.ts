@@ -2,6 +2,7 @@
  * Unit tests for skill resolver.
  */
 
+import { resolvePluginSkillEnabled } from "@fusion/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /*
@@ -13,6 +14,7 @@ const mockFiles initializes and throws TDZ "Cannot access before initialization"
 const { mockPiLog, mockFiles, mockDirs, mockDirCounter } = vi.hoisted(() => ({
   mockPiLog: {
     log: vi.fn(),
+    debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   },
@@ -30,7 +32,7 @@ import {
   resolveProjectRoot,
   createSkillsOverrideFromSelection,
   type SkillSelectionResult,
-} from "../skill-resolver.js";
+} from "../cli-runtime/skill-resolver.js";
 
 // ── Mock Setup ───────────────────────────────────────────────────────────────
 
@@ -635,7 +637,7 @@ describe("createSkillsOverrideFromSelection", () => {
         diagnostics: [],
       });
 
-      expect(result.skills.map((skill) => skill.name)).toEqual(["pr"]);
+      expect(result.skills.map((skill) => skill.name)).toEqual(["pr", "gamma"]);
       expect(result.diagnostics.some((diagnostic) => diagnostic.message.includes("not found"))).toBe(false);
     });
 
@@ -659,7 +661,7 @@ describe("createSkillsOverrideFromSelection", () => {
         diagnostics: [],
       });
 
-      expect(result.skills).toHaveLength(0);
+      expect(result.skills).toHaveLength(1);
       expect(result.diagnostics).toHaveLength(1);
       expect(result.diagnostics[0].type).toBe("info");
       expect(result.diagnostics[0].message).toContain("Requested skill 'review/absent' not found");
@@ -687,7 +689,8 @@ describe("createSkillsOverrideFromSelection", () => {
 
       expect(result.skills).toHaveLength(0);
       expect(result.diagnostics).toHaveLength(1);
-      expect(result.diagnostics[0].type).toBe("warning");
+      // Intentional exclusions are info diagnostics (debug-gated emission), not warn.
+      expect(result.diagnostics[0].type).toBe("info");
       expect(result.diagnostics[0].message).toContain("disabled by project execution settings");
       expect(result.diagnostics.some((diagnostic) => diagnostic.message.includes("not found"))).toBe(false);
     });
@@ -707,7 +710,11 @@ describe("createSkillsOverrideFromSelection", () => {
         diagnostics: [],
       };
 
-      expect(createSkillsOverrideFromSelection(selection)(base)).toBe(base);
+      expect(createSkillsOverrideFromSelection(selection)(base)).toEqual({
+        ...base,
+        resolvedForcedSkills: [],
+        unresolvedForcedSkills: [],
+      });
     });
 
     it("preserves base diagnostics alongside new diagnostics", () => {
@@ -754,10 +761,12 @@ describe("createSkillsOverrideFromSelection", () => {
 
       override(base);
 
-      expect(mockPiLog.log).toHaveBeenCalled();
-      const lastCall = mockPiLog.log.mock.calls[mockPiLog.log.mock.calls.length - 1][0] as string;
+      // type=info skill diagnostics (not-found / listings) are debug-gated for the TUI.
+      expect(mockPiLog.debug).toHaveBeenCalled();
+      const lastCall = mockPiLog.debug.mock.calls[mockPiLog.debug.mock.calls.length - 1][0] as string;
       expect(lastCall).toContain("[skills]");
       expect(lastCall).toContain("nonexistent");
+      expect(mockPiLog.log).not.toHaveBeenCalledWith(expect.stringContaining("nonexistent"));
     });
 
     it("includes sessionPurpose in structured logger messages when provided", () => {
@@ -782,12 +791,12 @@ describe("createSkillsOverrideFromSelection", () => {
 
       override(base);
 
-      const lastCall = mockPiLog.log.mock.calls[mockPiLog.log.mock.calls.length - 1][0] as string;
+      const lastCall = mockPiLog.debug.mock.calls[mockPiLog.debug.mock.calls.length - 1][0] as string;
       expect(lastCall).toContain("[reviewer]");
       expect(lastCall).toContain("missing-skill");
     });
 
-    it("produces warning diagnostic for disabled skills (exists but excluded by patterns)", () => {
+    it("produces info diagnostic for disabled skills (exists but excluded by patterns)", () => {
       // Simulate a skill that exists but was disabled by project exclusion pattern
       const selection: SkillSelectionResult = {
         allowedSkillPaths: new Set<string>(),
@@ -813,15 +822,16 @@ describe("createSkillsOverrideFromSelection", () => {
       // Skill should be filtered out (excluded)
       expect(result.skills).toHaveLength(0);
 
-      // Should produce warning diagnostic for disabled skill (ResourceDiagnostic only supports warning|error|collision)
+      // Intentional exclusions are info (debug-gated emission), not operator warnings
       expect(result.diagnostics).toHaveLength(1);
-      expect(result.diagnostics[0].type).toBe("warning");
+      expect(result.diagnostics[0].type).toBe("info");
       expect(result.diagnostics[0].message).toContain("disabled");
       expect(result.diagnostics[0].message).toContain("disabled-skill");
 
-      // Verify logging
-      expect(mockPiLog.warn).toHaveBeenCalled();
-      const lastCall = mockPiLog.warn.mock.calls[mockPiLog.warn.mock.calls.length - 1][0] as string;
+      // Verify logging routes to debug, not warn
+      expect(mockPiLog.warn).not.toHaveBeenCalled();
+      expect(mockPiLog.debug).toHaveBeenCalled();
+      const lastCall = mockPiLog.debug.mock.calls[mockPiLog.debug.mock.calls.length - 1][0] as string;
       expect(lastCall).toContain("disabled");
     });
 
@@ -943,9 +953,9 @@ describe("createSkillsOverrideFromSelection", () => {
       );
       expect(missingInfo).toBeDefined();
 
-      // Verify structured logger info output
-      expect(mockPiLog.log).toHaveBeenCalled();
-      const loggedMessages = mockPiLog.log.mock.calls.map(c => c[0] as string);
+      // type=info skill diagnostics go through debug (not log)
+      expect(mockPiLog.debug).toHaveBeenCalled();
+      const loggedMessages = mockPiLog.debug.mock.calls.map(c => c[0] as string);
       const hasExecutorPrefix = loggedMessages.some(m => m.includes("[executor]") && m.includes("missing-skill"));
       expect(hasExecutorPrefix).toBe(true);
     });
@@ -1048,7 +1058,8 @@ describe("createSkillsOverrideFromSelection", () => {
 
       override({ skills: [], diagnostics: [] });
 
-      expect(mockPiLog.log).toHaveBeenCalled();
+      expect(mockPiLog.debug).toHaveBeenCalled();
+      expect(mockPiLog.log).toHaveBeenCalledWith(expect.stringContaining("[skills] [executor] 0 skill(s) available"));
       expect(consoleErrorSpy).not.toHaveBeenCalled();
       expect(consoleWarnSpy).not.toHaveBeenCalled();
       expect(consoleLogSpy).not.toHaveBeenCalled();
@@ -1152,6 +1163,78 @@ describe("createSkillsOverrideFromSelection", () => {
       expect(notFoundInfoDiagnostics).toHaveLength(0);
     });
 
+    it("keeps nested skills available when legacy flat exclusions are ignored by the Skills view", () => {
+      const settings = { skills: ["-api-versioning/SKILL.md"] };
+      const dir = createMockProjectDir(settings);
+      const selection = resolveSessionSkills({ projectRootDir: dir });
+      const result = createSkillsOverrideFromSelection(selection, {
+        sessionPurpose: "executor",
+      })({
+        skills: [
+          { name: "api-versioning", filePath: "/plugins/foo/skills/api/api-versioning/SKILL.md", description: "", baseDir: "", sourceInfo: {} as any, disableModelInvocation: false },
+          { name: "unrelated", filePath: "/plugins/foo/skills/other/unrelated/SKILL.md", description: "", baseDir: "", sourceInfo: {} as any, disableModelInvocation: false },
+        ],
+        diagnostics: [],
+      });
+
+      expect(resolvePluginSkillEnabled(
+        settings,
+        "foo",
+        "api-versioning",
+        true,
+        "skills/api/api-versioning/SKILL.md",
+      )).toBe(true);
+      expect(result.skills.map((skill) => skill.name)).toEqual(["api-versioning", "unrelated"]);
+      expect(result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("api-versioning/SKILL.md") && diagnostic.message.includes("disabled"),
+      )).toBe(false);
+    });
+
+    it("does not let a legacy flat enable create an empty allow-list for nested skills", () => {
+      const settings = { skills: ["+api-versioning/SKILL.md"] };
+      const dir = createMockProjectDir(settings);
+      const selection = resolveSessionSkills({ projectRootDir: dir });
+      const result = createSkillsOverrideFromSelection(selection)({
+        skills: [
+          { name: "api-versioning", filePath: "/plugins/foo/skills/api/api-versioning/SKILL.md", description: "", baseDir: "", sourceInfo: {} as any, disableModelInvocation: false },
+          { name: "unrelated", filePath: "/plugins/foo/skills/other/unrelated/SKILL.md", description: "", baseDir: "", sourceInfo: {} as any, disableModelInvocation: false },
+        ],
+        diagnostics: [],
+      });
+
+      expect(resolvePluginSkillEnabled(
+        settings,
+        "foo",
+        "api-versioning",
+        true,
+        "skills/api/api-versioning/SKILL.md",
+      )).toBe(true);
+      expect(result.skills.map((skill) => skill.name)).toEqual(["api-versioning", "unrelated"]);
+      expect(result.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("api-versioning/SKILL.md") && diagnostic.message.includes("not found"),
+      )).toBe(false);
+    });
+
+    it.each([
+      "-api/api-versioning/SKILL.md",
+      "-skills/api/api-versioning/SKILL.md",
+    ])("excludes nested skills for the canonical path %s", (pattern) => {
+      const dir = createMockProjectDir({ skills: [pattern] });
+      const selection = resolveSessionSkills({ projectRootDir: dir });
+      const result = createSkillsOverrideFromSelection(selection)({
+        skills: [
+          { name: "api-versioning", filePath: "/plugins/foo/skills/api/api-versioning/SKILL.md", description: "", baseDir: "", sourceInfo: {} as any, disableModelInvocation: false },
+        ],
+        diagnostics: [],
+      });
+
+      expect(result.skills).toEqual([]);
+      expect(result.diagnostics).toContainEqual(expect.objectContaining({
+        type: "info",
+        message: expect.stringContaining("disabled by project execution settings"),
+      }));
+    });
+
     it("exclusion patterns with /SKILL.md suffix correctly exclude pi-discovered skills", () => {
       const dir = createMockProjectDir({
         skills: ["+web-research/SKILL.md", "-paperclip/SKILL.md"],
@@ -1184,5 +1267,31 @@ describe("createSkillsOverrideFromSelection", () => {
       );
       expect(disabledWarning).toBeDefined();
     });
+  });
+});
+
+describe("FN-9114 forced-vs-filter semantics (GitHub #1422)", () => {
+  beforeEach(() => { mockFiles.clear(); mockDirs.clear(); mockDirCounter.value = 0; mockPiLog.log.mockClear(); });
+  it("keeps all enabled skills for forced and default agents while resolving only available forced intent", () => {
+    const dir = createMockProjectDir({ skills: ["+alpha/SKILL.md", "+beta/SKILL.md", "+gamma/SKILL.md", "-delta/SKILL.md"] });
+    const selection = resolveSessionSkills({ projectRootDir: dir, forcedSkillNames: ["alpha", "delta", "missing"], sessionPurpose: "executor" });
+    const result = createSkillsOverrideFromSelection(selection, { forcedSkillNames: ["alpha", "delta", "missing"], sessionPurpose: "executor" })({
+      skills: ["alpha", "beta", "gamma", "delta"].map((name) => ({ name, filePath: `/tmp/skills/${name}/SKILL.md` })) as never[], diagnostics: [],
+    });
+    expect(result.skills.map((skill) => skill.name)).toEqual(["alpha", "beta", "gamma"]);
+    expect(result.resolvedForcedSkills).toEqual([{ requestedName: "alpha", skillName: "alpha" }]);
+    expect(result.unresolvedForcedSkills).toEqual([{ requestedName: "delta", reason: "disabled-by-settings" }, { requestedName: "missing", reason: "not-found" }]);
+    expect(mockPiLog.log).toHaveBeenCalledWith(expect.stringContaining("forced: [alpha]"));
+  });
+
+  it("returns empty resolution channels for an unconfigured heartbeat session", () => {
+    const result = createSkillsOverrideFromSelection(
+      resolveSessionSkills({ projectRootDir: "/no-settings", sessionPurpose: "heartbeat" }),
+      { sessionPurpose: "heartbeat" },
+    )({ skills: [{ name: "alpha", filePath: "/tmp/skills/alpha/SKILL.md" }] as never[], diagnostics: [] });
+
+    expect(result.skills.map((skill) => skill.name)).toEqual(["alpha"]);
+    expect(result.resolvedForcedSkills).toEqual([]);
+    expect(result.unresolvedForcedSkills).toEqual([]);
   });
 });

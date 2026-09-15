@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { createInstance } from "i18next";
@@ -5,6 +7,8 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import { TaskTokenStatsPanel } from "../TaskTokenStatsPanel";
 import type { Task } from "@fusion/core";
 import realEnApp from "../../../../i18n/locales/en/app.json";
+
+const taskTokenStatsPanelCss = readFileSync(resolve(__dirname, "../TaskTokenStatsPanel.css"), "utf8");
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -165,6 +169,42 @@ describe("TaskTokenStatsPanel", () => {
     expect(screen.getAllByText("4m 0s").length).toBeGreaterThan(0);
   });
 
+  it("renders restored completed timestamps, cumulative duration, and token totals together", () => {
+    const tokenUsage = {
+      inputTokens: 1200,
+      outputTokens: 450,
+      cachedTokens: 210,
+      cacheWriteTokens: 15,
+      totalTokens: 1875,
+      firstUsedAt: "2026-05-15T13:00:00.000Z",
+      lastUsedAt: "2026-05-15T13:15:00.000Z",
+    };
+    render(
+      <TaskTokenStatsPanel
+        loading={false}
+        tokenUsage={tokenUsage}
+        task={makeTask({
+          column: "done",
+          status: undefined,
+          firstExecutionAt: "2026-05-15T13:00:00.000Z",
+          executionStartedAt: "2026-05-15T13:10:00.000Z",
+          executionCompletedAt: "2026-05-15T13:15:00.000Z",
+          cumulativeActiveMs: 300_000,
+          cumulativePlanningMs: 120_000,
+          tokenUsage,
+          workflowStepResults: [],
+          log: [],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Total execution time").closest(".task-token-stats-panel__metric")).toHaveTextContent("7m 0s");
+    expect(screen.getByText("1,200")).toBeInTheDocument();
+    expect(screen.getByText("1,875")).toBeInTheDocument();
+    expect(screen.getByText((_, element) => element?.tagName === "TIME" && element.getAttribute("datetime") === tokenUsage.firstUsedAt)).toBeInTheDocument();
+    expect(screen.getByText((_, element) => element?.tagName === "TIME" && element.getAttribute("datetime") === tokenUsage.lastUsedAt)).toBeInTheDocument();
+  });
+
   it("uses end-to-end execution window for total execution time when available", () => {
     render(
       <TaskTokenStatsPanel
@@ -215,6 +255,33 @@ describe("TaskTokenStatsPanel", () => {
       const metric = screen.getByText("Total execution time").closest(".task-token-stats-panel__metric");
       expect(metric).toHaveTextContent("5m 0s");
       expect(screen.getByText("Wall-clock since first execution")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps poisoned total execution time at task age", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-15T15:00:00.000Z"));
+    try {
+      render(
+        <TaskTokenStatsPanel
+          loading={false}
+          tokenUsage={undefined}
+          task={makeTask({
+            column: "in-review",
+            createdAt: "2026-05-15T08:00:00.000Z",
+            cumulativeActiveMs: 4 * 24 * 60 * 60_000,
+            executionStartedAt: undefined,
+            workflowStepResults: [],
+            log: [],
+          })}
+        />,
+      );
+
+      const metric = screen.getByText("Total execution time").closest(".task-token-stats-panel__metric");
+      expect(metric).toHaveTextContent("420m 0s");
+      expect(metric).not.toHaveTextContent("4d");
     } finally {
       vi.useRealTimers();
     }
@@ -285,6 +352,74 @@ describe("TaskTokenStatsPanel", () => {
    * options, and assert the Execution Details label resolves to the leaf string
    * without i18next's "returned an object instead of string" fallback.
    */
+  /*
+  FNXC:TaskStatsProvenance 2026-07-22-14:45:
+  Duplicate triage (FN-8510/8511/8513/8514) needs task provenance visible in the UI:
+  the Stats tab must show source type, the parent task whose executor filed this task,
+  the creating agent, and the triage near-duplicate marker when recorded.
+  */
+  it("renders creation provenance including parent task, agent, and near-duplicate marker", () => {
+    render(<TaskTokenStatsPanel loading={false} tokenUsage={undefined} task={makeTask({
+      sourceType: "api",
+      sourceParentTaskId: "FN-8504",
+      sourceAgentId: "executor-9",
+      sourceMetadata: { nearDuplicateOf: "FN-8510", issueUrl: "https://github.com/Runfusion/Fusion/issues/2356" },
+    })} />);
+
+    expect(screen.getByText("Provenance")).toBeInTheDocument();
+    expect(screen.getByText("api")).toBeInTheDocument();
+    expect(screen.getByText("Parent task")).toBeInTheDocument();
+    expect(screen.getByText("FN-8504")).toBeInTheDocument();
+    expect(screen.getByText("Creating agent")).toBeInTheDocument();
+    expect(screen.getByText("executor-9")).toBeInTheDocument();
+    expect(screen.getByText("Flagged near-duplicate of")).toBeInTheDocument();
+    expect(screen.getByText("FN-8510")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://github.com/Runfusion/Fusion/issues/2356" }))
+      .toHaveAttribute("href", "https://github.com/Runfusion/Fusion/issues/2356");
+  });
+
+  /*
+  FNXC:TaskStatsProvenance 2026-07-22-21:47:
+  The desktop and narrow/mobile task detail both mount this shared Stats panel. A populated
+  imported task must keep its safe external-link contract while component CSS binds its color to
+  the active theme accent instead of browser-default blue.
+  */
+  it("uses the active theme accent for populated imported-source links across shared Stats surfaces", () => {
+    const issueUrl = "https://github.com/Runfusion/Fusion/issues/2410";
+    render(<TaskTokenStatsPanel loading={false} tokenUsage={undefined} task={makeTask({
+      sourceType: "github",
+      sourceMetadata: { issueUrl },
+    })} />);
+
+    const importedSource = screen.getByRole("link", { name: issueUrl });
+    expect(importedSource).toHaveClass("task-token-stats-panel__imported-source-link");
+    expect(importedSource).toHaveAttribute("href", issueUrl);
+    expect(importedSource).toHaveAttribute("target", "_blank");
+    expect(importedSource).toHaveAttribute("rel", "noreferrer");
+    expect(taskTokenStatsPanelCss).toMatch(
+      /\.task-token-stats-panel__imported-source-link\s*\{[^}]*color:\s*var\(--accent\);[^}]*\}/,
+    );
+    expect(taskTokenStatsPanelCss).not.toMatch(
+      /\.task-token-stats-panel__imported-source-link\s*\{[^}]*color:\s*(?:blue|#[0-9a-f]{3,8}|rgb)/i,
+    );
+  });
+
+  it("renders a non-http issueUrl as plain text, never as a link", () => {
+    render(<TaskTokenStatsPanel loading={false} tokenUsage={undefined} task={makeTask({
+      sourceType: "api",
+      sourceMetadata: { issueUrl: "javascript:alert(1)" },
+    })} />);
+
+    expect(screen.getByText("javascript:alert(1)")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "javascript:alert(1)" })).toBeNull();
+  });
+
+  it("omits the provenance section when the task has no recorded source", () => {
+    render(<TaskTokenStatsPanel loading={false} tokenUsage={undefined} task={makeTask()} />);
+
+    expect(screen.queryByText("Provenance")).toBeNull();
+  });
+
   it("renders the execution-mode label against the real locale bundle without an object-key crash", async () => {
     const instance = createInstance();
     await instance.use(initReactI18next).init({

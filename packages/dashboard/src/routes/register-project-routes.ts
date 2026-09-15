@@ -10,8 +10,13 @@ import {
   ProjectIdentityConflictError,
   readProjectIdentity,
   writeProjectIdentity,
+  resolveWorkflowIrForTask,
+  columnsWithFlag,
+  resolveTaskLifecycleColumns,
+  isTerminalColumnRole,
+  resolveEffectiveConcurrency,
 } from "@fusion/core";
-import type { CentralCore as CentralCoreApi } from "@fusion/core";
+import type { CentralCore as CentralCoreApi, WorkflowIr } from "@fusion/core";
 import { ApiError, badRequest, notFound } from "../api-error.js";
 import { execFileAsync } from "../exec-file.js";
 import { getOrCreateProjectStore, evictProjectStore } from "../project-store-resolver.js";
@@ -316,16 +321,6 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
         throw badRequest("cloneUrl can only be provided when gitSetupMode is 'clone'");
       }
 
-      /*
-      FNXC:ProjectSetup 2026-07-18-04:30:
-      skipGitInit is the dashboard's confirmed "create anyway without a git
-      repo" choice when git is missing on the host. Never valid for clone mode
-      (cloning requires git by definition).
-      */
-      const skipGitInit = req.body?.skipGitInit === true;
-      if (skipGitInit && normalizedGitSetupMode === "clone") {
-        throw badRequest("skipGitInit cannot be combined with clone mode");
-      }
       if (normalizedGitSetupMode === "clone" && normalizedCloneUrl === undefined) {
         throw badRequest("cloneUrl must be a non-empty string when gitSetupMode is 'clone'");
       }
@@ -441,7 +436,6 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
           name: normalizedName,
           isolationMode,
           nodeId,
-          skipGitInit,
         });
         const project = ensured.project;
 
@@ -456,7 +450,11 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
           // Best-effort stamp only.
         }
 
-        return { activeProject, outcome: ensured.outcome };
+        return {
+          activeProject,
+          outcome: ensured.outcome,
+          integrationBranches: ensured.integrationBranches ?? [],
+        };
       });
 
       /*
@@ -526,6 +524,31 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
           });
         } catch {
           // Non-fatal: project registration succeeded; settings can be configured later
+        }
+      }
+
+      /*
+      FNXC:IntegrationBranchReadiness 2026-08-24-00:53:
+      FN-183 exposes the single-repository reconciliation result at every dashboard registration
+      outcome, including existing and reattached projects. Persist it only into a blank project
+      scope and never for active workspace mode, so an operator's explicit integrationBranch or
+      legacy baseBranch remains authoritative and per-member workspace defaults do not bleed here.
+      */
+      const [integrationBranch] = activeProjectWithOutcome.integrationBranches;
+      if (activeProjectWithOutcome.integrationBranches.length === 1 && integrationBranch?.action !== "unavailable") {
+        try {
+          const store = await getOrCreateProjectStore(activeProjectWithOutcome.activeProject.id);
+          const scopedSettings = await store.getSettingsByScope();
+          const projectSettings = scopedSettings.project as typeof scopedSettings.project & { baseBranch?: unknown };
+          const integrationBranchIsBlank = typeof projectSettings.integrationBranch !== "string"
+            || projectSettings.integrationBranch.trim().length === 0;
+          const baseBranchIsBlank = typeof projectSettings.baseBranch !== "string"
+            || projectSettings.baseBranch.trim().length === 0;
+          if (projectSettings.workspaceMode !== true && integrationBranchIsBlank && baseBranchIsBlank) {
+            await store.updateSettings({ integrationBranch: integrationBranch.branch });
+          }
+        } catch {
+          // FNXC:IntegrationBranchReadiness 2026-08-24-00:53: Settings persistence is non-fatal after registration.
         }
       }
 
@@ -918,15 +941,65 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
 
         // Compute live task counts from the project-specific store
         const tasks = await projectStore.listTasks({ slim: true });
-        const activeCols = new Set(["triage", "todo", "in-progress", "in-review"]);
-        const activeTaskCount = tasks.filter((t) => activeCols.has(t.column)).length;
+        /*
+        FNXC:WorkflowLifecycleColumns 2026-07-31-08:10:
+        Project-health "active tasks" is the negation of each card's OWN terminal lanes.
+
+        CENSUS-INVISIBLE: a `Set` literal is a definition, not a comparison. On a renamed board it
+        matched nothing, so project health reported **0 active tasks** beside an in-flight agent
+        count that was still correct — the same silent-zero shape as the analytics tallies fixed in
+        #2780. A zero next to a populated neighbour reads as "this project is idle", not as "this
+        number is broken".
+
+        Note the set also listed `triage`, a column U11 deleted, so one of its four entries had been
+        dead on every board since that cutover.
+
+        Resolved per card through one shared IR cache; a card whose workflow will not resolve keeps
+        the legacy answer via `isTerminalColumnRole`'s own degraded mode.
+        */
+        const activeIrCache = new Map<string, never>();
+        const terminalByTaskId = new Map<string, boolean>();
+        for (const t of tasks) {
+          const lanes = await resolveTaskLifecycleColumns(projectStore, t.id, activeIrCache as never).catch(() => undefined);
+          terminalByTaskId.set(
+            t.id,
+            lanes === undefined
+              ? isTerminalColumnRole(undefined, t.column)
+              : t.column === lanes.complete,
+          );
+        }
+        const activeTaskCount = tasks.filter((t) => !terminalByTaskId.get(t.id)).length;
         /*
          * FNXC:GlobalConcurrencyControls 2026-06-26-23:46:
          * Project health In-Flight Agents is a live read-layer count, not persisted slot bookkeeping.
          * Include all shared top-level slot holders, including active in-review reviewer/merger/fix agents, so project-level health matches global concurrency without mutating stored health.
          */
         const inFlightAgentCount = countRunningAgentTasks(tasks);
-        const totalTasksCompleted = tasks.filter((t) => t.column === "done" || t.column === "archived").length;
+        /*
+        FNXC:WorkflowResolvedColumns 2026-07-31-00:40 (batch-core):
+        Project-health "tasks completed" — landed work, resolved from each task's own workflow. Keyed
+        on the literal pair, a board that renamed its complete lane reported 0 completed forever, so
+        project health read as a project that had never finished anything.
+
+        SHARED cache across the whole board, so this is one IR resolution per distinct WORKFLOW rather
+        than per task: this iterates every task in the project and a per-task resolve would make a
+        health read scale with board size.
+
+        Every Complete column counts as landed. Done remains the fallback when the IR cannot be read or resolves empty, as v1-upgraded workflows carry no traits.
+        */
+        const healthIrCache = new Map<string, WorkflowIr>();
+        let totalTasksCompleted = 0;
+        for (const t of tasks) {
+          let landed: Set<string>;
+          try {
+            const ir = await resolveWorkflowIrForTask(projectStore, t.id, healthIrCache);
+            const lanes = columnsWithFlag(ir, "complete");
+            landed = new Set(lanes.length > 0 ? lanes : ["done"]);
+          } catch {
+            landed = new Set(["done"]);
+          }
+          if (landed.has(t.column)) totalTasksCompleted += 1;
+        }
 
         // Get central health metadata (if available) to preserve non-count fields
         const centralHealth = await central.getProjectHealth(req.params.id);
@@ -972,8 +1045,17 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
         throw notFound("Project not found");
       }
 
+      /*
+      FNXC:CapacityModel 2026-08-21-15:25:
+      FN-9185 replaces this route's historical literal `2` with the target project's
+      live settings blob. Registry metadata only establishes existence and rootDir.
+      */
+      const settings = await (await getOrCreateProjectStore(req.params.id)).getSettingsFast();
+      const capacity = resolveEffectiveConcurrency(settings);
       res.json({
-        maxConcurrent: 2,
+        maxConcurrent: capacity.maxConcurrent,
+        maxWorktrees: capacity.worktreeLimit ?? settings.maxWorktrees,
+        worktreeLimitEnabled: settings.worktreeLimitEnabled !== false,
         rootDir: project.path,
       });
     } catch (err: unknown) {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { AutoRecoveryDispatcher } from "../../auto-recovery.js";
+import { AutoRecoveryDispatcher } from "../../healing/auto-recovery.js";
 import { BranchWorktreeAutoRecoveryHandler } from "../../auto-recovery-handlers/branch-worktree.js";
 
 const branchConflictMocks = vi.hoisted(() => ({
@@ -8,7 +8,7 @@ const branchConflictMocks = vi.hoisted(() => ({
   reanchorBranchToBase: vi.fn(),
 }));
 
-vi.mock("../../branch-conflicts.js", () => ({
+vi.mock("../../execution/branch-conflicts.js", () => ({
   inspectBranchConflict: branchConflictMocks.inspectBranchConflict,
   classifyBootstrapMisbinding: branchConflictMocks.classifyBootstrapMisbinding,
   reanchorBranchToBase: branchConflictMocks.reanchorBranchToBase,
@@ -59,7 +59,9 @@ describe("reliability interaction: branch/worktree auto-recovery", () => {
     });
 
     expect(decision.action).toBe("retry");
-    expect(taskStore.updateTask).toHaveBeenCalledWith(t.id, { branch: null, baseCommitSha: null });
+    // FNXC:BranchWriteProvenance 2026-08-23-18:30: clearing `branch` is a branch write, so recovery
+    // now stamps `branchWriteOrigin: "engine"` on it; the assertion records that provenance.
+    expect(taskStore.updateTask).toHaveBeenCalledWith(t.id, { branch: null, baseCommitSha: null, branchWriteOrigin: "engine" });
     expect(taskStore.moveTask).toHaveBeenCalledWith(t.id, "todo", expect.objectContaining({ moveSource: "engine" }));
     expect(audit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "branch-worktree:auto-requeue" }));
   });

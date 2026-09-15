@@ -1,5 +1,6 @@
-import type { McpServerDefinition, TaskStore } from "@fusion/core";
-import { validateMcpServerDefinitionDetailed } from "@fusion/core";
+import type { McpServerDefinition, PluginMcpServerContribution, TaskStore } from "@fusion/core";
+import { mapPluginMcpServerContribution, resolveEffectiveConcurrency, validateMcpServerDefinitionDetailed } from "@fusion/core";
+import { resolveFusionMemoryMcpEntry } from "@fusion/core/mcp-builtin-servers";
 import {
   discoverMcpServers,
   resolveMcpServersForRuntime,
@@ -73,17 +74,28 @@ function stripMcpSecretDescriptor(secret: { field: "env" | "headers" | "token"; 
   };
 }
 
+/*
+ * FNXC:MemoryMcp 2026-08-11-00:19:
+ * Validation supplies the route's explicit project root to the runtime resolver. This keeps the
+ * direct probe path behaviorally aligned with session resolution without exposing Node entry
+ * resolution to the browser.
+ */
+export async function resolveMcpServersForMcpProbe(options: Parameters<typeof resolveMcpServersForRuntime>[0]) {
+  return resolveMcpServersForRuntime(options);
+}
+
 async function resolveMcpServerForValidation(
   scopedStore: TaskStore,
   request: { name?: string; definition?: McpServerDefinition },
 ) {
   if (request.definition) {
     const secrets = await scopedStore.getSecretsStore();
-    const resolved = await resolveMcpServersForRuntime({
+    const resolved = await resolveMcpServersForMcpProbe({
       globalSettings: { mcpServers: { enabled: true, servers: [request.definition] } },
       projectSettings: undefined,
       secrets,
       reader: {},
+      projectRoot: scopedStore.getRootDir(),
     });
     if (resolved.errors.length > 0 || resolved.servers.length === 0) {
       throw badRequest("Unable to resolve MCP server secrets", { errors: resolved.errors.map((error) => ({ serverName: error.serverName, path: error.path, message: error.message })) });
@@ -100,21 +112,54 @@ async function resolveMcpServerForValidation(
 }
 
 export const registerConfigMcpPiSettingsRoutes: ApiRouteRegistrar = (ctx) => {
-  const { router, getProjectContext, options, rethrowAsApiError } = ctx;
+  const { router, getProjectContext, rethrowAsApiError } = ctx;
 
   router.get("/config", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const settings = await scopedStore.getSettingsFast();
+      const capacity = resolveEffectiveConcurrency(settings);
       res.json({
-        maxConcurrent: settings.maxConcurrent ?? options?.maxConcurrent ?? 2,
-        maxTriageConcurrent: settings.maxTriageConcurrent ?? settings.maxConcurrent ?? 2,
-        maxWorktrees: settings.maxWorktrees ?? 4,
+        maxConcurrent: capacity.maxConcurrent,
+        maxWorktrees: capacity.worktreeLimit ?? settings.maxWorktrees,
+        worktreeLimitEnabled: settings.worktreeLimitEnabled !== false,
         rootDir: scopedStore.getRootDir(),
       });
     } catch {
       const { store: scopedStore } = await getProjectContext(req);
-      res.json({ maxConcurrent: options?.maxConcurrent ?? 2, maxTriageConcurrent: options?.maxConcurrent ?? 2, maxWorktrees: 4, rootDir: scopedStore.getRootDir() });
+      // FNXC:CapacityModel 2026-08-21-15:25: a failed live read reports shipped resolver defaults,
+      // never a private route literal or a stale boot option.
+      const capacity = resolveEffectiveConcurrency(undefined);
+      res.json({ maxConcurrent: capacity.maxConcurrent, maxWorktrees: capacity.worktreeLimit, worktreeLimitEnabled: true, rootDir: scopedStore.getRootDir() });
+    }
+  });
+
+  router.get("/mcp/plugin-servers", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const provider = scopedStore as TaskStore & {
+        getProjectScopedPluginMcpServers?: () => Promise<Array<{ pluginId: string; server: PluginMcpServerContribution }>> | Array<{ pluginId: string; server: PluginMcpServerContribution }>;
+      };
+      // FNXC:PluginMcpServers 2026-07-22-12:00:
+      // FN-8491 exposes only the active project's provider-filtered entries.
+      // This route must not enumerate a raw loader/runner because its output is
+      // not constrained by project_plugin_states and could leak across projects.
+      const entries = typeof provider.getProjectScopedPluginMcpServers === "function"
+        ? await provider.getProjectScopedPluginMcpServers()
+        : [];
+      /*
+      FNXC:MemoryMcp 2026-08-10-19:45:
+      The browser receives only whether Fusion can resolve its built-in MCP entry.
+      Entry resolution uses Node filesystem state and must remain outside the SPA bundle.
+      */
+      res.json({
+        servers: entries
+          .filter((entry) => mapPluginMcpServerContribution(entry?.server))
+          .map((entry) => ({ pluginId: entry.pluginId, server: entry.server })),
+        fusionMemoryMcpAvailable: resolveFusionMemoryMcpEntry() !== null,
+      });
+    } catch (error) {
+      rethrowAsApiError(error, "Failed to load project plugin MCP servers");
     }
   });
 

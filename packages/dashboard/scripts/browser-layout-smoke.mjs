@@ -1,20 +1,81 @@
 #!/usr/bin/env node
-/* global WebSocket, URL, fetch, console, setTimeout, clearTimeout */
+/* global WebSocket, URL, URLSearchParams, fetch, console, setTimeout, clearTimeout */
 
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { superviseSpawn } from "@fusion/core";
-import { readFile, readdir, rm, stat, mkdtemp } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { superviseSpawn, SUPPORTED_LOCALES } from "@fusion/core";
+import { readFile, readdir, rm, stat, mkdtemp, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const dashboardRoot = path.resolve(import.meta.dirname, "..");
+const workspaceRoot = path.resolve(dashboardRoot, "..", "..");
 const appRoot = path.join(dashboardRoot, "app");
 const clientDistRoot = path.join(dashboardRoot, "dist", "client");
+const i18nLocalesRoot = path.resolve(dashboardRoot, "..", "i18n", "locales");
 const requireBrowser = process.argv.includes("--require-browser") || process.env.FUSION_BROWSER_SMOKE_REQUIRE === "1";
+const screenshotPath = process.env.FUSION_BROWSER_SMOKE_SCREENSHOT;
+
+/*
+FNXC:BoardSafeGeometry 2026-09-12-17:34:
+Every Board data state and Alpha mode uses the same measurable contract: its border box ends at the shell-owned footer or pill boundary, each column has equal top and bottom spacing within one pixel, and the document never owns vertical overflow. Overflowing populated columns keep vertical scrolling inside the column and expose their last card rather than shortening the Board.
+
+FNXC:MobilePillBrowserSmoke 2026-09-13-10:32:
+Mobile pill checks use the reported visual viewport bounds rather than assuming its top is zero. Both the pill and the complete scrollable popover must remain inside a shifted iOS canvas while preserving their exclusive shared edge.
+*/
+export function mobilePillGeometryMatches(layout, viewportHeight, tolerance = 1) {
+  const visualTop = typeof layout.viewportOffsetTop === "number" ? layout.viewportOffsetTop : 0;
+  const visualHeight = typeof layout.viewportHeight === "number" ? layout.viewportHeight : viewportHeight;
+  const visualBottom = visualTop + visualHeight;
+  return Boolean(layout.pill && layout.popover)
+    && layout.pill.top >= visualTop - tolerance
+    && layout.pill.bottom <= visualBottom + tolerance
+    && layout.popover.top >= visualTop - tolerance
+    && layout.popover.bottom < layout.pill.top
+    && layout.popoverLastItemReachable === true
+    && layout.documentOverflowX <= tolerance;
+}
+
+export function createMobilePillSmokeViewportMetrics(layoutViewportHeight, keyboardOpen) {
+  const viewportOffsetTop = keyboardOpen ? 40 : 0;
+  const keyboardOverlap = keyboardOpen ? 160 : 0;
+  return {
+    keyboardOpen,
+    keyboardOverlap,
+    viewportHeight: keyboardOpen
+      ? Math.max(1, layoutViewportHeight - keyboardOverlap - viewportOffsetTop)
+      : null,
+    viewportOffsetTop,
+  };
+}
+
+export function boardSafeGeometryMatches(layout, tolerance = 1) {
+  const topGaps = layout.columnTops.map((top) => top - layout.boardTop);
+  const bottomGaps = layout.columnBottoms.map((bottom) => layout.lowerBoundary - bottom);
+  return layout.columnBottoms.length > 0
+    && layout.columnHeights.every((height) => height > 0)
+    && Math.abs(layout.boardBottom - layout.lowerBoundary) <= tolerance
+    && Math.abs(layout.boardPaddingTop - layout.boardPaddingBottom) <= tolerance
+    && topGaps.every((gap, index) => Math.abs(gap - bottomGaps[index]) <= tolerance)
+    && layout.documentScrollable === false
+    && (layout.state !== "populated" || (layout.columnScrollable.every(Boolean) && layout.lastCardsReachable.every(Boolean)));
+}
+const agentHeartbeatMobileScreenshotPath = process.env.FUSION_AGENT_HEARTBEAT_MOBILE_SCREENSHOT;
+const agentHeartbeatDesktopScreenshotPath = process.env.FUSION_AGENT_HEARTBEAT_DESKTOP_SCREENSHOT;
+const gitManagerBeforeMobileScreenshotPath = process.env.FUSION_GIT_MANAGER_BEFORE_MOBILE_SCREENSHOT;
+const gitManagerAfterMobileScreenshotPath = process.env.FUSION_GIT_MANAGER_AFTER_MOBILE_SCREENSHOT;
+const gitHubImportBeforeMobileScreenshotPath = process.env.FUSION_GITHUB_IMPORT_BEFORE_MOBILE_SCREENSHOT;
+const gitHubImportAfterMobileScreenshotPath = process.env.FUSION_GITHUB_IMPORT_AFTER_MOBILE_SCREENSHOT;
+const gitHubImportAfterShortScreenshotPath = process.env.FUSION_GITHUB_IMPORT_AFTER_SHORT_SCREENSHOT;
+const resolvedGithubDesktopScreenshotPath = process.env.FUSION_RESOLVED_GITHUB_DESKTOP_SCREENSHOT;
+const resolvedGithubMobileScreenshotPath = process.env.FUSION_RESOLVED_GITHUB_MOBILE_SCREENSHOT;
+const planApprovalDesktopScreenshotPath = process.env.FUSION_PLAN_APPROVAL_DESKTOP_SCREENSHOT;
+const planApprovalMobileScreenshotPath = process.env.FUSION_PLAN_APPROVAL_MOBILE_SCREENSHOT;
+const smokeTheme = process.env.FUSION_BROWSER_SMOKE_THEME === "light" ? "light" : "dark";
 
 function log(message) {
   console.log(`[dashboard-browser-smoke] ${message}`);
@@ -24,13 +85,72 @@ function fail(message) {
   throw new Error(message);
 }
 
-async function loadDashboardCss() {
-  try {
-    return await readEmittedClientCss();
-  } catch {
-    await runCommand("pnpm", ["--filter", "@fusion/dashboard", "build:client"], dashboardRoot);
-    return readEmittedClientCss();
+function escapeHtml(value) {
+  return value.replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function validateQuickAddSaveLabels(labels) {
+  for (const [locale, label] of labels) {
+    if (typeof locale !== "string" || locale.length === 0 || typeof label !== "string" || label.trim().length === 0) {
+      fail(`Quick Add Save fixture requires a non-empty tasks.save translation for locale ${String(locale)}.`);
+    }
   }
+  return labels;
+}
+
+function loadShippedQuickAddSaveLabels() {
+  return validateQuickAddSaveLabels(SUPPORTED_LOCALES
+    .map((locale) => {
+      const catalog = JSON.parse(readFileSync(path.join(i18nLocalesRoot, locale, "app.json"), "utf8"));
+      return [locale, catalog?.tasks?.save];
+    })
+    // Preserve the emitted fixture section's existing deterministic order while deriving its members.
+    .sort(([left], [right]) => left.localeCompare(right)));
+}
+
+const QUICK_ADD_COMPOSER_VARIANTS = [
+  ["board", "", "minimum", "300px", "disabled"],
+  ["board", "", "wide", "600px", "disabled"],
+  ["list", "quick-entry--single-line", "minimum", "300px", "enabled"],
+  ["list", "quick-entry--single-line", "wide", "600px", "enabled"],
+];
+
+const shippedQuickAddSaveLabels = loadShippedQuickAddSaveLabels();
+export const QUICK_ADD_SAVE_FIXTURE_COUNT = QUICK_ADD_COMPOSER_VARIANTS.length * shippedQuickAddSaveLabels.length;
+
+export function buildQuickAddSaveFixtures(labels = shippedQuickAddSaveLabels) {
+  return QUICK_ADD_COMPOSER_VARIANTS.flatMap(([surface, modifier, width, maxWidth, state]) => validateQuickAddSaveLabels(labels).map(([locale, label]) => `
+    <section class="quick-entry-smoke-fixture" data-smoke="quick-add-save-${surface}-${width}-${locale}" ${surface === "board" ? 'data-alpha-surface="true"' : ""} style="width: min(${maxWidth}, calc(100vw - 24px)); margin: 0 auto 12px;">
+      <div class="quick-entry-box quick-entry-box--expanded ${modifier}" data-smoke="quick-add-${surface}-composer">
+        <div class="quick-entry-actions" data-smoke="quick-add-save-row">
+          ${surface === "board" ? '<div class="quick-entry-options-group" data-smoke="quick-add-options"><button class="btn btn-sm" type="button">Workflow</button><button class="btn btn-sm" type="button">Deps</button><button class="btn btn-sm" type="button">Models</button></div>' : ""}
+          <div class="quick-entry-primary-group">
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-attach" type="button" aria-label="Attach"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-github-toggle" type="button" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-session-advisor-toggle" type="button" aria-label="Session advisor"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7s2-3 5-3 5 3 5 3-2 3-5 3-5-3-5-3Z"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-priority-button" type="button" aria-label="Priority"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-fast-toggle" type="button" aria-label="Fast"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-task-create btn-sm" data-testid="quick-entry-save" data-smoke="quick-add-save-button" data-locale="${escapeHtml(locale)}" type="button" ${state === "disabled" ? "disabled" : ""}><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" style="vertical-align: middle; margin-right: 4px;"><path d="M2 6h8"/></svg>${escapeHtml(label)}</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  `)).join("");
+}
+
+/*
+FNXC:GitHubImport 2026-07-23-13:05:
+The mobile GitHub action-bar regression measures emitted CSS, so every smoke invocation must
+rebuild the client before loading it. Reusing a stale dist/client artifact could make geometry
+assertions pass against styles predating the one-row compact-layout requirement.
+*/
+async function loadDashboardCss() {
+  await runCommand("pnpm", ["--filter", "@fusion/dashboard", "build:client"], dashboardRoot);
+  return readEmittedClientCss();
 }
 
 async function readEmittedClientCss() {
@@ -82,7 +202,7 @@ function runCommand(command, commandArgs, cwd) {
   });
 }
 
-export function createSmokeHtml() {
+export function createSmokeHtml(options = {}) {
   const columns = [
     ["triage", "Triage", "1"],
     ["todo", "Todo", "2"],
@@ -115,6 +235,12 @@ export function createSmokeHtml() {
       </section>
     `)
     .join("");
+  const agentsOverviewCards = Array.from({ length: 13 }, (_, index) => `
+    <div class="live-agent-card" role="button" tabindex="0"${index === 12 ? ' data-smoke="agents-overview-last-card"' : ""}>
+      <div class="live-agent-card-header"><span class="live-agent-card-name">Active agent ${index + 1}</span></div>
+      <div class="live-agent-card-transcript">Waiting for workflow output and heartbeat activity.</div>
+      <div class="live-agent-card-footer">Active</div>
+    </div>`).join("");
 
   /*
   FNXC:QuickAddActionRow 2026-07-17-12:00:
@@ -128,56 +254,53 @@ export function createSmokeHtml() {
   The fixture must include all five production icon controls before Save, including the session
   advisor toggle. Omitting it understates the primary group's minimum width and could conceal a
   300px overflow or wrap regression on either Board or List.
+
+  FNXC:QuickAddActionRow 2026-08-07-23:56:
+  pt-BR joined the supported translations (the scaffold was previously empty and now carries
+  machine-drafted translations) — add it here so the smoke keeps measuring the widest
+  emitted-font label across every shipped locale.
+
+  FNXC:QuickAddActionRow 2026-08-10-19:11:
+  FN-8952 replaces the stale 24-fixture expectation desynchronized by pt-BR with fixtures and
+  counts derived from SUPPORTED_LOCALES plus each shipped tasks.save catalog value. Catalog text
+  is HTML-escaped before interpolation because QuickEntryBox renders a React text child: arbitrary
+  metacharacters must remain literal measured glyphs, never become fixture markup.
   */
-  const localizedSaveLabels = [
-    ["en", "Save"],
-    ["es", "Guardar"],
-    ["fr", "Enregistrer"],
-    ["ko", "저장"],
-    ["zh-CN", "保存"],
-    ["zh-TW", "儲存"],
-  ];
-  const quickAddComposerFixtures = [
-    ["board", "", "minimum", "300px", "disabled"],
-    ["board", "", "wide", "600px", "disabled"],
-    ["list", "quick-entry--single-line", "minimum", "300px", "enabled"],
-    ["list", "quick-entry--single-line", "wide", "600px", "enabled"],
-  ].flatMap(([surface, modifier, width, maxWidth, state]) => localizedSaveLabels.map(([locale, label]) => `
-    <section class="quick-entry-smoke-fixture" data-smoke="quick-add-save-${surface}-${width}-${locale}" style="width: min(${maxWidth}, calc(100vw - 24px)); margin: 0 auto 12px;">
-      <div class="quick-entry-box quick-entry-box--expanded ${modifier}" data-smoke="quick-add-${surface}-composer">
-        <div class="quick-entry-actions" data-smoke="quick-add-save-row">
-          <div class="quick-entry-primary-group">
-            <button class="btn btn-icon btn-sm" data-testid="quick-entry-attach" type="button" aria-label="Attach"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
-            <button class="btn btn-icon btn-sm" data-testid="quick-entry-github-toggle" type="button" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
-            <button class="btn btn-icon btn-sm" data-testid="quick-entry-session-advisor-toggle" type="button" aria-label="Session advisor"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7s2-3 5-3 5 3 5 3-2 3-5 3-5-3-5-3Z"/></svg></button>
-            <button class="btn btn-icon btn-sm" data-testid="quick-entry-priority-button" type="button" aria-label="Priority"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
-            <button class="btn btn-icon btn-sm" data-testid="quick-entry-fast-toggle" type="button" aria-label="Fast"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
-            <button class="btn btn-task-create btn-sm" data-testid="quick-entry-save" data-smoke="quick-add-save-button" data-locale="${locale}" type="button" ${state === "disabled" ? "disabled" : ""}><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" style="vertical-align: middle; margin-right: 4px;"><path d="M2 6h8"/></svg>${label}</button>
-          </div>
-        </div>
-      </div>
-    </section>
-  `)).join("");
+  const quickAddComposerFixtures = buildQuickAddSaveFixtures(options.quickAddSaveLabels);
 
   /*
-  FNXC:TaskDetailModalResponsive 2026-07-19-12:00:
-  FN-8396 mirrors Task Detail's direct and wrapped SVG structures so Blink can
-  prove the scoped row rule normalizes ProviderIcon alongside the CSS-only
-  Oversight Eye/EyeOff contract at every responsive breakpoint.
+  FNXC:TaskDetailFooterActions 2026-09-06-00:31:
+  FN-300's browser fixture mirrors the relocated flat footer menu instead of the removed icon row. Keep the full Oversight and Priority groups long enough to exercise the production viewport cap and vertical scrolling, while optional-state variants prove the menu remains horizontally contained when GitHub or Oversight actions are absent.
   */
-  const taskDetailInlineRowFixtures = [
+  const taskDetailActionsMenuFixtures = [
     ["full", true, true],
     ["without-github", false, true],
     ["without-oversight", true, false],
     ["without-optionals", false, false],
   ].map(([variant, includeGithub, includeOversight]) => `
-    <section data-smoke="task-detail-inline-row-${variant}" aria-label="Task Detail inline action ${variant} fixture">
-      <div class="detail-meta-inline-controls" data-testid="detail-meta-inline-controls">
-        <button class="btn btn-icon btn-sm" data-testid="detail-inline-attach" type="button" aria-label="Attach file"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8"/></svg></button>
-        ${includeGithub ? '<button class="btn btn-icon btn-sm" data-testid="detail-inline-github-toggle" type="button" aria-label="Toggle GitHub tracking"><span class="provider-icon"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8h12"/></svg></span></button>' : ""}
-        ${includeOversight ? '<button class="btn btn-icon btn-sm detail-oversight-menu-trigger" data-testid="detail-oversight-menu-trigger" type="button" aria-label="Oversight actions"><svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12Z"/></svg></button>' : ""}
-        <div class="detail-priority-picker"><button class="btn btn-icon btn-sm" data-testid="detail-priority-trigger" type="button" aria-label="Priority: Normal"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7h10"/></svg></button></div>
-        <button class="btn btn-icon btn-sm detail-execution-mode-toggle" data-testid="detail-execution-mode-toggle" type="button" aria-label="Execution mode: fast"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 2v10"/></svg></button>
+    <section class="detail-actions-dropdown" data-smoke="task-detail-actions-menu-${variant}" aria-label="Task Detail footer Actions ${variant} fixture">
+      <div class="detail-actions-menu" role="menu">
+        <button class="detail-actions-menu-item" data-testid="detail-inline-attach" type="button" role="menuitem">Attach file</button>
+        ${includeGithub ? '<button class="detail-actions-menu-item" data-testid="detail-inline-github-toggle" type="button" role="menuitem" aria-pressed="true">Toggle GitHub tracking</button>' : ""}
+        ${includeOversight ? `
+          <span class="detail-actions-menu-item detail-actions-menu-note" data-testid="detail-actions-oversight-heading" role="note">Oversight: on</span>
+          <button class="detail-actions-menu-item" data-testid="detail-oversight-level-__inherit__" type="button" role="menuitem" aria-pressed="true">Inherit (Standard)</button>
+          <button class="detail-actions-menu-item" data-testid="detail-oversight-level-off" type="button" role="menuitem" aria-pressed="false">Off</button>
+          <button class="detail-actions-menu-item" data-testid="detail-oversight-level-light" type="button" role="menuitem" aria-pressed="false">Light</button>
+          <button class="detail-actions-menu-item" data-testid="detail-oversight-level-standard" type="button" role="menuitem" aria-pressed="false">Standard</button>
+          <button class="detail-actions-menu-item" data-testid="detail-oversight-level-thorough" type="button" role="menuitem" aria-pressed="false">Thorough</button>
+          <button class="detail-actions-menu-item" data-testid="detail-session-advisor-toggle" type="button" role="menuitem" aria-pressed="true">Session advisor: on (inherited)</button>
+          <span class="detail-actions-menu-item detail-actions-menu-note" data-testid="detail-oversight-controls-label" role="note">Overseer controls</span>
+          <button class="detail-actions-menu-item" data-testid="detail-overseer-nudge" type="button" role="menuitem">Manual nudge</button>
+          <button class="detail-actions-menu-item" data-testid="detail-overseer-stop" type="button" role="menuitem">Stop oversight</button>
+          <button class="detail-actions-menu-item" data-testid="detail-overseer-explain" type="button" role="menuitem" aria-pressed="false">Explain current action</button>
+        ` : ""}
+        <span class="detail-actions-menu-item detail-actions-menu-note" data-testid="detail-actions-priority-heading" role="note">Priority</span>
+        <button class="detail-actions-menu-item" data-testid="detail-priority-option-low" type="button" role="menuitem" aria-pressed="false">Low</button>
+        <button class="detail-actions-menu-item" data-testid="detail-priority-option-normal" type="button" role="menuitem" aria-pressed="true">Normal</button>
+        <button class="detail-actions-menu-item" data-testid="detail-priority-option-high" type="button" role="menuitem" aria-pressed="false">High</button>
+        <button class="detail-actions-menu-item" data-testid="detail-priority-option-urgent" type="button" role="menuitem" aria-pressed="false">Urgent</button>
+        <button class="detail-actions-menu-item" data-testid="detail-execution-mode-toggle" type="button" role="menuitem" aria-pressed="true">Execution mode: fast</button>
       </div>
     </section>
   `).join("");
@@ -188,6 +311,81 @@ export function createSmokeHtml() {
   measure the shared ViewHeader flex geometry. Exercise the unread Inbox's tightest
   badge + Compose + Mark all read + Refresh row and both Compose + Refresh-only states.
   */
+  /*
+  FNXC:GitHubImport 2026-07-23-12:18:
+  FN-8548 mirrors the selected GitHub issue's four-action footer with the emitted dashboard CSS.
+  Blink must measure the production responsive contract at each supported phone width because jsdom
+  cannot detect wrapping, flex-track shrinkage, overflow, or touch-target geometry.
+  */
+  /*
+  FNXC:CommandCenterGithub 2026-08-03-04:08:
+  FN-8750 needs a real-browser, production-CSS fixture because jsdom cannot measure fixed-table tracks,
+  long-word wrapping, or page overflow. The fixture mirrors URL/no-URL, exact/approximate, and title-fallback rows
+  so the desktop and mobile proof captures show the same resilient resolved-issue contract operators use.
+  */
+  const resolvedGithubTableFixture = `
+    <section class="command-center" data-smoke="github-resolved-table" aria-label="Resolved GitHub issues">
+      <div class="cc-tabpanel" role="tabpanel">
+        <section class="cc-area">
+          <div class="cc-area-section">
+            <h3 class="cc-area-section-title">Resolved issues</h3>
+            <div class="cc-table-wrap cc-github-resolved-table-wrap">
+              <table class="cc-table cc-github-resolved-table">
+                <thead><tr><th scope="col">Issue</th><th scope="col">Resolving task</th><th scope="col">Resolved at</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td class="cc-github-resolved-issue-cell"><a class="cc-github-resolved-issue-link" href="https://github.com/acme/a-deliberately-long-repository-reference/issues/123" target="_blank" rel="noopener noreferrer">acme/a-deliberately-long-repository-reference#123</a></td>
+                    <td class="cc-github-resolved-task-cell"><span class="cc-github-resolved-task"><span class="cc-github-resolved-task-title">Resolve a deliberately long imported GitHub issue title without forcing the Command Center table beyond its responsive container</span><span class="cc-stat-sub cc-github-resolved-task-id">FN-100</span></span></td>
+                    <td class="cc-github-resolved-date-cell"><span class="cc-github-resolved-date"><span>6/10/2026, 12:34 PM</span></span></td>
+                  </tr>
+                  <tr>
+                    <td class="cc-github-resolved-issue-cell"><span class="cc-github-resolved-issue-ref">(unknown)</span></td>
+                    <td class="cc-github-resolved-task-cell"><span class="cc-github-resolved-task"><span class="cc-github-resolved-task-title">FN-101</span></span></td>
+                    <td class="cc-github-resolved-date-cell"><span class="cc-github-resolved-date"><span>6/09/2026, 8:00 AM</span><span class="cc-stat-sub cc-github-resolved-date-approx">approx</span></span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  `;
+
+  /*
+  FNXC:PlanReviewReplan 2026-08-04-06:35 FN-8768:
+  Mirror both exhausted-review operator surfaces so Blink can prove the card badge and detail banner
+  remain visible and contained at mobile and desktop widths, not merely that fixture HTML loaded.
+  */
+  const planApprovalFixture = `
+    <section data-smoke="plan-review-replan-cap-approval" aria-label="Plan Review approval escalation" style="width:min(680px, calc(100vw - var(--space-xl))); margin:auto; padding:var(--space-lg);">
+      <article class="card" data-column="todo">
+        <div class="card-header"><span class="card-id">FN-8768</span><h3 class="card-title">Dependency changed during planning</h3></div>
+        <div class="card-meta"><span class="card-status-badge card-status-badge--todo awaiting-approval awaiting-approval--plan-review-replan-cap" data-awaiting-approval-reason="plan-review-replan-cap">Plan Review needs approval</span></div>
+      </article>
+      <div class="detail-plan-approval-banner detail-plan-approval-banner--replan-cap" data-awaiting-approval-reason="plan-review-replan-cap">
+        <strong>Plan Review needs approval</strong>
+        <span>Automatic revisions reached their limit. Review the latest plan, then approve it or send it back for replanning.</span>
+      </div>
+    </section>`;
+
+  const githubImportMobileActionFixture = `
+    <section data-smoke="github-import-mobile-actions" aria-label="GitHub issue detail actions">
+      <div class="github-import-detail-actions" data-testid="github-import-detail-actions">
+        <form class="github-import-issue-comment-composer">
+          <textarea class="input github-import-issue-comment-composer__input" aria-label="Add comment"></textarea>
+          <button class="btn btn-primary github-import-issue-comment-composer__submit" type="submit">Add comment</button>
+        </form>
+        <div class="github-import-detail-action-row" data-testid="github-import-detail-action-row">
+          <button class="btn btn-danger github-import-issue-close" type="button">Close issue</button>
+          <button class="btn github-import-action" type="button">Plan</button>
+          <button class="btn github-import-action" type="button">Chat</button>
+          <button class="btn btn-primary github-import-action" type="button">Import as task</button>
+        </div>
+      </div>
+    </section>
+  `;
+
   const mailboxMobileHeaderFixtures = [
     ["unread-inbox", '<span class="mailbox-unread-badge">9</span><button class="btn btn-sm btn-primary" data-testid="mailbox-header-compose" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2h10v10H2z"/></svg><span>Compose</span></button><button class="btn btn-sm btn-secondary" data-testid="mailbox-mark-all-read" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7l3 3 7-7"/></svg><span>Mark all read</span></button><button class="btn-icon" data-testid="mailbox-refresh" type="button" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7a5 5 0 1 0 2-4"/></svg></button>'],
     ["read-inbox", '<button class="btn btn-sm btn-primary" data-testid="mailbox-header-compose" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2h10v10H2z"/></svg><span>Compose</span></button><button class="btn-icon" data-testid="mailbox-refresh" type="button" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7a5 5 0 1 0 2-4"/></svg></button>'],
@@ -201,6 +399,76 @@ export function createSmokeHtml() {
     </section>
   `).join("");
 
+  /*
+  FNXC:GitManagerMobileSpacing 2026-08-01-19:10:
+  FN-8702 measures the emitted standalone FloatingWindow chain and the embedded container separately.
+  The phone-only gutter reset must align every standalone shell edge below 768px without turning the
+  embedded pane or the 768px-and-up movable window into a viewport sheet.
+  */
+  const gitManagerFixtures = `
+    <section class="floating-window floating-window--git-manager" data-smoke="git-manager-standalone" style="width: min(680px, calc(100vw - var(--space-2xl))); height: min(640px, calc(100dvh - var(--space-2xl)));">
+      <div class="floating-window__body" data-smoke="git-manager-standalone-body">
+        <section class="modal gm-modal" data-smoke="git-manager-standalone-modal">
+          <header class="modal-header" data-smoke="git-manager-standalone-header"><h2>Git Manager</h2><div class="gm-header-actions"><button class="modal-close" data-smoke="git-manager-standalone-close" type="button" aria-label="Close Git Manager">×</button></div></header>
+          <div class="gm-layout" data-smoke="git-manager-standalone-layout"><nav class="gm-sidebar"><button class="gm-nav-item active" type="button">Status</button><button class="gm-nav-item" type="button">Changes</button></nav><main class="gm-content" data-smoke="git-manager-standalone-content"><div class="gm-loading">Loading repository</div><div class="gm-error">Fixture error state stays contained</div><div class="gm-panel">${"Long populated Git Manager row ".repeat(30)}</div></main></div>
+        </section>
+      </div>
+      <i class="floating-window__resize-handle floating-window__resize-handle--se" aria-hidden="true"></i>
+    </section>
+    <section class="git-manager-embedded" data-smoke="git-manager-embedded-host" style="width: min(320px, calc(100vw - var(--space-lg))); height: 420px;">
+      <section class="modal gm-modal gm-modal--embedded" data-smoke="git-manager-embedded-modal">
+        <header class="modal-header" data-smoke="git-manager-embedded-header"><h2>Git Manager</h2><div class="gm-header-actions"><button class="modal-close" data-smoke="git-manager-embedded-close" type="button" aria-label="Close embedded Git Manager">×</button></div></header>
+        <div class="gm-layout" data-smoke="git-manager-embedded-layout"><nav class="gm-sidebar"><button class="gm-nav-item active" type="button">Status</button></nav><main class="gm-content" data-smoke="git-manager-embedded-content"><div class="gm-loading">Loading repository</div><div class="gm-error">Embedded fixture error state stays contained</div><div class="gm-panel">${"Embedded populated row ".repeat(30)}</div></main></div>
+      </section>
+    </section>`;
+
+  /*
+  FNXC:GitHubImport 2026-08-02-02:45:
+  FN-8722 mirrors the standalone FloatingWindow chain rather than a generic overlay so Chromium
+  measures the inherited resize-handle gutter on the real sheet host. The fixture includes the
+  header/close control, controls, populated list, pagination, and footer plus embedded and detail
+  controls; all states must remain horizontally contained without changing their own geometry.
+  */
+  const gitHubImportFixtures = `
+    <section class="floating-window floating-window--github-import" data-smoke="github-import-standalone" style="width: min(1200px, calc(100vw - var(--space-2xl))); height: min(720px, calc(100dvh - var(--space-2xl)));">
+      <div class="floating-window__body" data-smoke="github-import-standalone-body">
+        <section class="modal modal-lg github-import-modal" data-smoke="github-import-standalone-modal">
+          <header class="modal-header github-import-modal__header" data-smoke="github-import-standalone-header"><div><h3>Import from GitHub</h3><p class="github-import-modal__subtitle">Load issues or pull requests from the selected repository.</p></div><button class="modal-close" data-smoke="github-import-standalone-close" type="button" aria-label="Close import modal">×</button></header>
+          <div class="modal-body github-import-modal__body" data-smoke="github-import-standalone-content">
+            <div class="github-import-controls" data-smoke="github-import-standalone-controls"><div class="github-import-provider"><button class="github-import-tab active" type="button">GitHub</button></div><div class="github-import-tabs"><button class="github-import-tab active" type="button">Issues</button><button class="github-import-tab" type="button">Pull requests</button></div><div class="github-import-toolbar"><div class="github-import-toolbar__zone github-import-toolbar__zone--remote"><span class="github-import-remote-pill"><span class="github-import-remote-pill__name">origin</span><span class="github-import-remote-pill__repo">owner/repository</span></span></div><div class="github-import-toolbar__zone github-import-toolbar__zone--filter"><button class="btn github-import-filter-trigger" type="button">Filter</button></div><div class="github-import-toolbar__zone github-import-toolbar__zone--action"><button class="btn btn-primary github-import-load-button" type="button">Load</button></div></div></div>
+            <section class="github-import-list-pane" data-smoke="github-import-standalone-list"><header class="github-import-pane-header"><h4>Issues</h4><button class="modal-close" type="button" aria-label="List action">×</button></header><div class="github-import-pane-content"><div class="issues-list"><button class="issue-item" type="button"><span class="issue-main"><span class="issue-heading-row"><span class="issue-number">#8722</span><span class="issue-title">A deliberately long populated GitHub issue title that must stay inside the import sheet</span></span></span></button><button class="issue-item imported" type="button">Already imported issue</button></div></div></section>
+            <nav class="github-import-pagination" data-smoke="github-import-standalone-pagination"><button class="btn" type="button">Previous</button><button class="btn" type="button">Next</button></nav>
+          </div>
+          <footer class="modal-actions github-import-modal__actions" data-smoke="github-import-standalone-footer"><button class="btn" type="button">Cancel</button><button class="btn btn-primary" type="button">Import as task</button></footer>
+        </section>
+      </div>
+      <i class="floating-window__resize-handle floating-window__resize-handle--se" aria-hidden="true"></i>
+    </section>
+    <section class="github-import-embedded" data-smoke="github-import-embedded-host" style="width: min(320px, calc(100vw - var(--space-lg))); height: 420px;">
+      <section class="modal modal-lg github-import-modal github-import-modal--embedded" data-smoke="github-import-embedded-modal"><header class="github-import-modal__embedded-header" data-smoke="github-import-embedded-header"><h2 class="github-import-modal__embedded-title">Import Tasks</h2></header><div class="github-import-modal__body" data-smoke="github-import-embedded-content"><div class="github-import-state github-import-state--empty">Embedded empty state</div></div></section>
+    </section>
+    <section class="floating-window floating-window--github-import-detail" data-smoke="github-import-detail" style="width: min(760px, calc(100vw - var(--space-2xl))); height: min(680px, calc(100dvh - var(--space-2xl)));"><div class="floating-window__body" data-smoke="github-import-detail-body"><section class="github-import-detail-panel" data-smoke="github-import-detail-panel"><header class="github-import-pane-header"><h4>Issue detail</h4><button class="modal-close" data-smoke="github-import-detail-close" type="button" aria-label="Close detail">×</button></header><div class="github-import-pane-content">Detail control fixture</div></section></div><i class="floating-window__resize-handle floating-window__resize-handle--se" aria-hidden="true"></i></section>`;
+
+  /*
+  FNXC:AlphaMobileDrawer 2026-09-10-23:18:
+  The real-browser regression mounts the shipped React drawer and ViewHeader components instead of duplicating their DOM in this HTML template. That keeps Blink's geometry evidence tied to production header ownership, portal structure, and provider props while direct FloatingWindow and Terminal adaptations remain represented by their production class contracts.
+  */
+  const alphaDrawerFixtures = `
+    <section data-smoke="alpha-drawer-fixtures" hidden>
+      <div data-smoke="alpha-drawer-production-root"></div>
+      <div class="floating-window-overlay floating-window-overlay--modal floating-window-overlay--alpha-mobile-drawer" data-smoke="alpha-drawer-floating"><section class="floating-window floating-window--alpha-mobile-drawer"><header class="floating-window__header"><h2>Floating</h2></header><div class="floating-window__body"><button type="button">Floating final control</button></div></section></div>
+      <div class="terminal-modal-overlay" data-smoke="alpha-drawer-terminal"><section class="terminal-modal"><header class="terminal-header"><h2>Terminal</h2></header><div class="terminal-body">Terminal content</div><button type="button">Terminal final control</button></section></div>
+    </section>
+    <section data-smoke="alpha-board-fixture" hidden style="position:fixed;inset:0;display:flex;min-height:0;background:var(--bg);">
+      <div class="dashboard-project-shell">
+        <main class="project-content project-content--with-alpha-nav">
+          <div class="board-workflow-view" data-smoke="alpha-board-production-root"></div>
+        </main>
+      </div>
+      <div data-smoke="alpha-pill-production-root"></div>
+      <footer class="executor-status-bar" data-smoke="alpha-footer">Executor status</footer>
+    </section>`;
+
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -208,9 +476,14 @@ export function createSmokeHtml() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Fusion dashboard browser smoke</title>
     <link rel="stylesheet" href="/app.css" />
+    <style>.alpha-browser-production-fixture { display: none !important; } html[data-alpha-drawer-fixtures-visible="true"] .alpha-browser-production-fixture { display: flex !important; }</style>
   </head>
-  <body data-theme="dark">
+  <body data-theme="${smokeTheme}">
     <div id="root">
+      ${gitManagerFixtures}
+      ${gitHubImportFixtures}
+      ${alphaDrawerFixtures}
+      <script type="module" src="/alpha-drawer-production-fixture.js"></script>
       <div class="header-wrapper">
         <header class="header" data-smoke="header">
           <div class="header-left">
@@ -249,13 +522,15 @@ export function createSmokeHtml() {
             <button class="btn-icon" data-smoke="show-command-center-charts" type="button" aria-label="Show Command Center charts fixture">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5"></path><path d="M4 19h16"></path><path d="M8 15l3-4 3 2 4-6"></path></svg>
             </button>
+            <button class="btn-icon" data-smoke="show-agents-overview-scroll" type="button" aria-label="Show Agents overview scroll fixture">Agents overview</button>
           </div>
         </header>
       </div>
 
       <main class="project-content project-content--with-footer project-content--with-mobile-nav">
         <section class="board" data-smoke="board">${columnMarkup}</section>
-        <section class="list-view" data-smoke="list" hidden>
+        <!-- FNXC:ListView 2026-08-03-06:41: Mirror ListView's measured single-pane marker so the native mobile smoke exercises the production CSS selector introduced by FN-8754 instead of showing both the table and cards. -->
+        <section class="list-view list-view--single-pane" data-smoke="list" hidden>
           <div class="list-create-area">
             <div class="quick-entry-box quick-entry-box--collapsed" data-testid="quick-entry-box">
               <div class="quick-entry-main-row">
@@ -280,13 +555,17 @@ export function createSmokeHtml() {
         ${quickAddComposerFixtures}
       </section>
 
-      <section data-smoke="task-detail-inline-row-fixtures" aria-label="Task Detail inline action layout fixtures">
-        ${taskDetailInlineRowFixtures}
+      <section data-smoke="task-detail-actions-menu-fixtures" aria-label="Task Detail footer Actions menu layout fixtures">
+        ${taskDetailActionsMenuFixtures}
       </section>
 
       <section data-smoke="mailbox-mobile-header-fixtures" aria-label="Mailbox mobile header layout fixtures">
         ${mailboxMobileHeaderFixtures}
       </section>
+
+      ${githubImportMobileActionFixture}
+      ${resolvedGithubTableFixture}
+      ${planApprovalFixture}
 
       <footer class="executor-status-bar">
         <div class="executor-status-bar__segment">
@@ -474,9 +753,43 @@ export function createSmokeHtml() {
       </section>
 
       <!--
+      FNXC:AgentsOverviewScroll 2026-08-10-10:02:
+      Real Blink must verify this flex scroll chain because jsdom has no layout engine. This fixture mirrors the production chain asserted by AgentsOverviewBar.mobile-scroll.test.tsx, including metrics, panel, grid, and realistic live-agent cards.
+      -->
+      <section data-smoke="agents-overview-scroll" hidden>
+        <section class="agents-view" aria-label="Agents overview scroll fixture" style="height: min(calc(var(--space-2xl) * 16), calc(100dvh - var(--space-2xl)));">
+          <section class="agents-overview-bar" aria-label="Agents overview">
+            <button class="agents-overview-bar__toggle" type="button" aria-expanded="true"><span class="agents-overview-bar__title-wrap"><span class="agents-overview-bar__title">Overview</span></span><span class="agents-overview-bar__meta text-secondary">13 active</span></button>
+            <div class="agents-overview-bar__content" data-smoke="agents-overview-scroll-owner">
+              <div class="agent-metrics-bar agents-overview-bar__metrics"><div class="agent-metric-card agent-metric-card--active">Active</div><div class="agent-metric-card agent-metric-card--tasks">Tasks</div><div class="agent-metric-card agent-metric-card--success">Success</div><div class="agent-metric-card agent-metric-card--runs">Runs</div></div>
+              <div class="active-agents-panel agents-overview-bar__active-panel"><div class="active-agents-panel-header">Active Agents (13)</div><div class="active-agents-grid">${agentsOverviewCards}</div></div>
+            </div>
+          </section>
+          <div class="agents-view-content">Sibling Agents content</div>
+        </section>
+        <section class="agents-view" data-smoke="agents-overview-scroll-empty" style="height: min(calc(var(--space-2xl) * 16), calc(100dvh - var(--space-2xl)));">
+          <section class="agents-overview-bar" aria-label="Empty Agents overview"><button class="agents-overview-bar__toggle" type="button" aria-expanded="true">Overview</button><div class="agents-overview-bar__content" data-smoke="agents-overview-empty-scroll-owner"><div class="agent-metrics-bar agents-overview-bar__metrics"><div class="agent-metric-card agent-metric-card--active">Active</div><div class="agent-metric-card agent-metric-card--tasks">Tasks</div><div class="agent-metric-card agent-metric-card--success">Success</div><div class="agent-metric-card agent-metric-card--runs">Runs</div></div></div></section>
+        </section>
+      </section>
+
+      <!--
       FNXC:CommandCenterTesting 2026-06-19-02:04:
       FN-6685 requires a real-Blink desktop and mobile gate for the FN-6683/FN-6684 recharts surfaces because jsdom cannot compute ResponsiveContainer parent height, min-content shrink, or overflow. This fixture mirrors Command Center tabpanel/card wrappers and includes populated pie/line plus empty states so emitted dashboard CSS owns the sizing chain under test.
       -->
+      <!-- FNXC:AgentHeartbeatControls 2026-07-23-14:20: Production-CSS smoke keeps durable per-agent and project controls visible at both viewports while task-worker cards leave no control shell. -->
+      <section class="agents-view" data-smoke="agent-heartbeat-controls" aria-label="Agent heartbeat controls">
+        <header class="view-header"><h2 class="view-header__title">Agents</h2><div class="agents-view-primary-actions"><button class="btn-icon agent-controls-trigger" type="button" aria-label="Controls">Controls</button></div></header>
+        <div class="agent-controls-bulk-actions" role="menu" aria-label="Bulk agent actions">
+          <button class="agent-detail-bulk-menu-item" type="button" role="menuitem" data-smoke="enable-all-heartbeats">Enable all heartbeats</button>
+          <button class="agent-detail-bulk-menu-item" type="button" role="menuitem" data-smoke="disable-all-heartbeats">Disable all heartbeats</button>
+        </div>
+        <div class="agent-board" data-smoke="agent-heartbeat-board">
+          <article class="agent-board-card"><div class="agent-board-name">Enabled durable agent</div><div class="agent-board-actions"><button class="btn btn-sm agent-heartbeat-toggle" type="button" aria-pressed="true" data-smoke="agent-heartbeat-toggle">Disable heartbeat</button></div></article>
+          <article class="agent-board-card"><div class="agent-board-name">Disabled durable agent</div><div class="agent-board-actions"><button class="btn btn-sm agent-heartbeat-toggle" type="button" aria-pressed="false" data-smoke="agent-heartbeat-toggle">Enable heartbeat</button></div></article>
+          <article class="agent-board-card" data-smoke="ephemeral-agent-card"><div class="agent-board-name">Task worker (excluded)</div><div class="agent-board-actions"></div></article>
+        </div>
+      </section>
+
       <section data-smoke="command-center-charts" hidden>
         <div class="command-center" data-testid="command-center">
           <header class="cc-header">
@@ -575,6 +888,7 @@ export function createSmokeHtml() {
       const prPanel = document.querySelector('[data-smoke="pr-panel"]');
       const prChecks = document.querySelector('[data-smoke="pr-checks"]');
       const commandCenterCharts = document.querySelector('[data-smoke="command-center-charts"]');
+      const agentsOverviewScroll = document.querySelector('[data-smoke="agents-overview-scroll"]');
 
       function setView(view) {
         const isList = view === 'list';
@@ -589,6 +903,7 @@ export function createSmokeHtml() {
         prPanel.hidden = name !== 'pr-panel';
         prChecks.hidden = name !== 'pr-checks';
         commandCenterCharts.hidden = name !== 'command-center-charts';
+        agentsOverviewScroll.hidden = name !== 'agents-overview-scroll';
       }
 
       boardButton.addEventListener('click', () => setView('board'));
@@ -597,6 +912,7 @@ export function createSmokeHtml() {
       document.querySelector('[data-smoke="show-pr-panel"]').addEventListener('click', () => showSmokeSection('pr-panel'));
       document.querySelector('[data-smoke="show-pr-checks"]').addEventListener('click', () => showSmokeSection('pr-checks'));
       document.querySelector('[data-smoke="show-command-center-charts"]').addEventListener('click', () => showSmokeSection('command-center-charts'));
+      document.querySelector('[data-smoke="show-agents-overview-scroll"]').addEventListener('click', () => showSmokeSection('agents-overview-scroll'));
       document.querySelector('[data-smoke="open-modal"]').addEventListener('click', () => {
         modalOverlay.classList.add('open');
         nav.hidden = true;
@@ -610,13 +926,436 @@ export function createSmokeHtml() {
 </html>`;
 }
 
+export function createAlphaDrawerProductionFixtureSource() {
+  const componentPath = (relativePath) => path.join(appRoot, relativePath).replaceAll("\\", "/");
+  const imports = {
+    alphaDrawer: componentPath("components/AlphaMobileDrawer.tsx"),
+    projectOverview: componentPath("components/ProjectOverview.tsx"),
+    planningKeepAlive: componentPath("components/dashboard/PlanningKeepAlive.tsx"),
+    appModals: componentPath("components/AppModals.tsx"),
+    mainContent: componentPath("components/dashboard/MainContent.tsx"),
+    mainViewKeepAlive: componentPath("components/dashboard/MainViewKeepAlive.tsx"),
+    mobileNavBar: componentPath("components/MobileNavBar.tsx"),
+    taskDetail: componentPath("components/TaskDetailModal.tsx"),
+    chatView: componentPath("components/ChatView.tsx"),
+    pluginHost: componentPath("plugins/PluginDashboardViewHost.tsx"),
+    pluginRegistry: componentPath("plugins/pluginViewRegistry.tsx"),
+    todoPlugin: path.join(workspaceRoot, "plugins", "fusion-plugin-todos", "src", "dashboard-view.tsx").replaceAll("\\", "/"),
+    i18n: componentPath("i18n/index.ts"),
+    confirm: componentPath("hooks/useConfirm.ts"),
+    navigation: componentPath("hooks/useNavigationHistory.ts"),
+    fileBrowser: componentPath("context/FileBrowserContext.tsx"),
+  };
+  return `
+    import React, { Suspense, useEffect, useState } from "react";
+    import { createRoot } from "react-dom/client";
+    import { flushSync } from "react-dom";
+    import { I18nextProvider } from "react-i18next";
+    import { AlphaMobileDrawer, AlphaProjectsDrawer, AlphaPlanningDrawer } from ${JSON.stringify(imports.alphaDrawer)};
+    import { ProjectOverview } from ${JSON.stringify(imports.projectOverview)};
+    import { PlanningKeepAlive } from ${JSON.stringify(imports.planningKeepAlive)};
+    import { AlphaUsageDrawer } from ${JSON.stringify(imports.appModals)};
+    import { AlphaMainContentDrawer } from ${JSON.stringify(imports.mainContent)};
+    import { MainViewKeepAlive } from ${JSON.stringify(imports.mainViewKeepAlive)};
+    import { MobileNavBar } from ${JSON.stringify(imports.mobileNavBar)};
+    import { TaskDetailModal } from ${JSON.stringify(imports.taskDetail)};
+    import { ChatView } from ${JSON.stringify(imports.chatView)};
+    import { PluginDashboardViewHost } from ${JSON.stringify(imports.pluginHost)};
+    import { registerPluginView } from ${JSON.stringify(imports.pluginRegistry)};
+    import { TodoDashboardView } from ${JSON.stringify(imports.todoPlugin)};
+    import i18n from ${JSON.stringify(imports.i18n)};
+    import { ConfirmDialogProvider } from ${JSON.stringify(imports.confirm)};
+    import { NavigationHistoryProvider } from ${JSON.stringify(imports.navigation)};
+    import { FileBrowserProvider } from ${JSON.stringify(imports.fileBrowser)};
+
+    /*
+    FNXC:AlphaMobileDrawer 2026-09-10-23:59:
+    Browser geometry must exercise the exported bridges used by App, MainViewKeepAlive, MainContent, and AppModals rather than reconstructing AlphaMobileDrawer ownership flags. The fixture supplies deterministic transport data only; every provider retains its production shell, header, scroll owner, and controls.
+    */
+    const session = { id: "smoke-chat-session", title: "Drawer conversation", agentId: "agent-smoke", status: "active", createdAt: "2026-09-10T00:00:00.000Z", updatedAt: "2026-09-10T00:00:00.000Z", lastMessageAt: "2026-09-10T00:00:00.000Z", lastMessagePreview: "Visible message", tags: [] };
+    let boardTransportState = "skeleton";
+    const messages = Array.from({ length: 36 }, (_, index) => ({ id: "smoke-message-" + index, sessionId: session.id, role: index % 2 ? "assistant" : "user", content: "Production chat message " + index, createdAt: "2026-09-10T00:00:00.000Z" }));
+    const json = (value) => Promise.resolve(new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } }));
+    globalThis.fetch = (input) => {
+      const url = new URL(typeof input === "string" ? input : input.url, location.href);
+      const pathname = url.pathname;
+      if (pathname.endsWith("/tasks/board-workflows")) {
+        if (boardTransportState === "skeleton") return new Promise(() => {});
+        if (boardTransportState === "empty") return json({ flagEnabled: true, defaultWorkflowId: null, taskWorkflowIds: {}, workflows: [] });
+        return json({
+          flagEnabled: true,
+          defaultWorkflowId: "smoke-workflow",
+          taskWorkflowIds: Object.fromEntries(createBoardTasks(boardTransportState).map((task) => [task.id, "smoke-workflow"])),
+          workflows: [{ id: "smoke-workflow", name: "Production workflow", columns: [{ id: "todo", name: "Todo", flags: { hold: true } }] }],
+        });
+      }
+      if (pathname.endsWith("/chat/sessions/" + session.id + "/messages")) return json({ messages });
+      if (pathname.endsWith("/chat/sessions/" + session.id)) return json({ session });
+      if (pathname.endsWith("/chat/sessions")) return json({ sessions: [session], nextCursor: null });
+      if (pathname.endsWith("/chat/tags")) return json({ tags: [] });
+      if (pathname.endsWith("/todos")) return json([]);
+      if (pathname.includes("/usage")) return json({ providers: [] });
+      if (pathname.includes("/project-health")) return json({ status: "healthy", activeTasks: 0, completedTasks: 0 });
+      if (pathname.includes("/workflows")) return json({ workflows: [] });
+      if (pathname.includes("/models")) return json({ models: [], favoriteProviders: [], favoriteModels: [] });
+      if (pathname.includes("/agents")) return json([]);
+      if (pathname.includes("/tasks/")) return json({});
+      if (pathname.includes("/tasks")) return json([]);
+      if (pathname.includes("/settings")) return json({ experimentalFeatures: {} });
+      return json({});
+    };
+    globalThis.EventSource = class { addEventListener() {} removeEventListener() {} close() {} };
+    registerPluginView("fusion-plugin-todos", "todos", TodoDashboardView);
+
+    const project = { id: "smoke-project", name: "Smoke Project", path: ".", status: "active", createdAt: "2026-09-10T00:00:00.000Z", updatedAt: "2026-09-10T00:00:00.000Z" };
+    const task = { id: "FN-SMOKE", title: "Drawer task", description: "A long production task detail used to prove the real scrolling surface. ".repeat(20), column: "todo", status: null, priority: "normal", dependencies: [], steps: [], logs: [], createdAt: "2026-09-10T00:00:00.000Z", updatedAt: "2026-09-10T00:00:00.000Z" };
+    const createBoardTask = (id, title, sourceMetadata) => ({ id, title, description: title, column: "todo", status: null, priority: "normal", dependencies: [], steps: [], logs: [], sourceMetadata, createdAt: "2026-09-10T00:00:00.000Z", updatedAt: "2026-09-10T00:00:00.000Z" });
+    const createBoardTasks = (state) => {
+      if (state === "populated") return Array.from({ length: 24 }, (_, index) => createBoardTask("FN-BOARD-" + index, "Production Alpha task " + index));
+      if (state === "duplicated") return [createBoardTask("FN-DUPLICATE-A", "Duplicate candidate"), createBoardTask("FN-DUPLICATE-B", "Duplicate candidate", { nearDuplicateOf: "FN-DUPLICATE-A" })];
+      if (state === "pagination-error") return [createBoardTask("FN-PAGE-ERROR", "Pagination retry remains reachable")];
+      return [];
+    };
+    const noop = () => {};
+    const asyncTask = async () => task;
+    const modalManager = { closePlanning: noop, clearPlanningInitialPlan: noop, planningInitialPlan: null, planningSourceIssue: null, planningWorkflowId: null, planningResumeSessionId: null };
+    const navigation = { pushNav: noop, replaceCurrent: noop, removeNav: noop };
+
+    const drawerProps = (title) => ({ open: true, title, onClose: noop });
+    const chatMainContentProps = {
+      ChatView,
+      currentProject: project,
+      addToast: noop,
+      experimentalFeatures: {},
+      setQuickChatOpen: noop,
+      onOpenSessionInNewWindow: noop,
+      onSendAsReport: noop,
+    };
+
+    function ProductionProvider({ id }) {
+      if (id === "short") return React.createElement(AlphaMobileDrawer, { ...drawerProps("Short"), testId: "alpha-drawer-short" }, React.createElement("button", { type: "button", "data-smoke": "alpha-drawer-short-final" }, "Short final control"));
+      if (id === "projects") return React.createElement(AlphaProjectsDrawer, drawerProps("Projects"), React.createElement(ProjectOverview, { projects: [project], onSelectProject: noop, onAddProject: noop, onPauseProject: noop, onResumeProject: noop, onRemoveProject: noop }));
+      if (id === "planning") return React.createElement(AlphaPlanningDrawer, drawerProps("Planning"), React.createElement(PlanningKeepAlive, { active: true, projectId: project.id, tasks: [], bgPlanningSessions: [], modalManager, handleChangeTaskView: noop, handlePlanningTaskCreated: noop, handlePlanningTasksCreated: noop, openBoardTaskDetail: noop, openWorkflowEditorWithNav: noop }));
+      if (id === "usage") return React.createElement(AlphaUsageDrawer, { ...drawerProps("Usage"), projectId: project.id });
+      if (id === "task-detail" || id === "long") return React.createElement(TaskDetailModal, { task, projectId: project.id, alphaMobileDrawer: true, onClose: noop, onOpenDetail: noop, onDeleteTask: asyncTask, onMergeTask: async () => ({ success: true }), addToast: noop });
+      if (id === "plugin") return React.createElement(AlphaMainContentDrawer, { ...drawerProps("Todo"), taskView: "plugin:fusion-plugin-todos:todos" }, React.createElement(Suspense, { fallback: null }, React.createElement(PluginDashboardViewHost, { taskView: "plugin:fusion-plugin-todos:todos", context: { projectId: project.id, tasks: [], workflowSteps: [], openTaskDetail: noop } })));
+      return React.createElement(MainViewKeepAlive, { activeId: "chat", mountedIds: ["chat"], projectKey: project.id, mainContentProps: chatMainContentProps, alphaMobileDrawer: { activeId: "chat", title: "Chat", onClose: noop } });
+    }
+
+    function Fixture() {
+      const [activeProvider, setActiveProvider] = useState("short");
+      useEffect(() => { globalThis.__alphaDrawerProductionFixture = { open: setActiveProvider }; document.documentElement.dataset.alphaDrawerProductionReady = "true"; }, []);
+      return React.createElement("div", { "data-smoke-provider": activeProvider }, React.createElement(ProductionProvider, { id: activeProvider }));
+    }
+
+    /*
+    FNXC:MobilePillBrowserSmoke 2026-09-13-09:10:
+    Browser geometry mounts the production MobileNavBar and opens its real popover. Synthetic pill markup cannot prove that keyboard metrics, measured height publication, focusable controls, and the shared boundary remain wired together.
+    */
+    function ProductionMobileNavFixture() {
+      const [state, setState] = useState({ keyboardOpen: false, keyboardOverlap: 0, viewportHeight: null, viewportOffsetTop: 0, menuOpen: false });
+      useEffect(() => {
+        globalThis.__alphaPillProductionFixture = {
+          configure(next) { flushSync(() => setState((current) => ({ ...current, ...next }))); },
+        };
+        document.documentElement.dataset.alphaPillProductionReady = "true";
+      }, []);
+      return React.createElement(MobileNavBar, {
+        view: "board",
+        onChangeView: noop,
+        footerVisible: false,
+        keyboardOpen: state.keyboardOpen,
+        keyboardMetrics: state,
+        alphaMenuOpen: state.menuOpen,
+        onAlphaMenuOpenChange: (menuOpen) => setState((current) => ({ ...current, menuOpen })),
+        onOpenSettings: noop,
+        onOpenActivityLog: noop,
+        onOpenMailbox: noop,
+        onOpenGitManager: noop,
+        onOpenWorkflowEditor: noop,
+        onOpenSchedules: noop,
+        onOpenScripts: noop,
+        onToggleTerminal: noop,
+        onOpenFiles: noop,
+        onOpenGitHubImport: noop,
+        onOpenPlanning: noop,
+        onOpenUsage: noop,
+        onViewAllProjects: noop,
+        projectId: project.id,
+      });
+    }
+
+    function ProductionBoardFixture() {
+      const [boardState, setBoardState] = useState("skeleton");
+      useEffect(() => {
+        globalThis.__alphaBoardProductionFixture = {
+          show(nextState) {
+            boardTransportState = nextState;
+            flushSync(() => setBoardState(nextState));
+          },
+        };
+        document.documentElement.dataset.alphaBoardProductionReady = "true";
+      }, []);
+      const boardTasks = createBoardTasks(boardState);
+      const boardProject = { ...project, id: "smoke-board-" + boardState };
+      const boardProps = {
+        showBackendConnectionErrorPage: false,
+        projectsError: null,
+        t: (key, fallback) => fallback || key,
+        retryingProjects: false,
+        handleRetryProjects: async () => {},
+        shellApi: null,
+        taskView: "board",
+        modalManager: { openNewTaskWithDescription: noop },
+        handleChangeTaskView: noop,
+        refreshAppSettings: async () => {},
+        addToast: noop,
+        currentProject: boardProject,
+        ChatView,
+        viewMode: "project",
+        tasks: boardTasks,
+        filteredBoardTasks: boardTasks,
+        workflowSteps: [],
+        remoteData: { tasks: boardTasks },
+        setQuickChatOpen: noop,
+        capacityRiskBannerEnabled: false,
+        capacityRiskDismissed: false,
+        capacityRiskSignal: { level: "low", reasons: [] },
+        maxConcurrent: 2,
+        maxWorktrees: 4,
+        showWorktreeGrouping: false,
+        moveTask: async () => boardTasks[0],
+        pauseTask: async () => boardTasks[0],
+        openBoardTaskDetail: noop,
+        openTaskDetailInMainPanel: noop,
+        openGroupModalWithNav: noop,
+        handleBoardQuickCreate: async () => boardTasks[0],
+        openNewTaskWithNav: noop,
+        toggleAutoMerge: async () => {},
+        togglePlanAutoApprove: async () => {},
+        autoMerge: true,
+        planAutoApproveEnabled: false,
+        mergeStrategy: "direct",
+        globalPaused: false,
+        updateTask: async () => boardTasks[0],
+        retryTask: async () => boardTasks[0],
+        revertTask: async () => ({ task: boardTasks[0] }),
+        deleteTask: async () => boardTasks[0],
+        currentTasksTotal: boardTasks.length,
+        currentTasksHasMore: boardState === "pagination-error",
+        currentTasksPaginationError: boardState === "pagination-error" ? "request-failed" : null,
+        retryCurrentTasksPagination: async () => {},
+        searchQuery: "",
+        availableModels: [],
+        favoriteProviders: [],
+        favoriteModels: [],
+        handleOpenDetailWithTab: noop,
+        handleToggleFavorite: async () => {},
+        handleToggleModelFavorite: async () => {},
+        staleHighFanoutBlockerAgeThresholdMs: 0,
+        prAuthAvailable: false,
+        openWorkflowEditorWithNav: noop,
+        openCreateWorkflowWithNav: noop,
+        sidebarActive: true,
+        isMobile: false,
+        isRemote: false,
+        experimentalFeatures: {},
+        ingestCreatedTasks: noop,
+        openDetailTask: noop,
+        popOutTaskDetail: noop,
+        onOpenChatWithPrefill: noop,
+        closeTaskDetailMainPanel: noop,
+        setMainPanelDetailTask: noop,
+        handleDismissCapacityRisk: noop,
+      };
+      return React.createElement(MainContent, boardProps);
+    }
+
+    const providers = (child) => React.createElement(I18nextProvider, { i18n }, React.createElement(NavigationHistoryProvider, { value: navigation }, React.createElement(ConfirmDialogProvider, { skipConfirmations: true }, React.createElement(FileBrowserProvider, { openFile: noop }, child))));
+    flushSync(() => createRoot(document.querySelector('[data-smoke="alpha-drawer-production-root"]')).render(providers(React.createElement(Fixture))));
+    flushSync(() => createRoot(document.querySelector('[data-smoke="alpha-board-production-root"]')).render(providers(React.createElement(ProductionBoardFixture))));
+    flushSync(() => createRoot(document.querySelector('[data-smoke="alpha-pill-production-root"]')).render(providers(React.createElement(ProductionMobileNavFixture))));
+  `;
+}
+async function buildAlphaDrawerProductionFixture() {
+  const { build: buildVite } = await import("vite");
+  const virtualId = "virtual:fusion-alpha-drawer-production-fixture";
+  const resolvedVirtualId = `\0${virtualId}`;
+  const output = await buildVite({
+    configFile: false,
+    root: dashboardRoot,
+    logLevel: "error",
+    define: { __BUILD_VERSION__: JSON.stringify("browser-smoke") },
+    resolve: {
+      alias: [
+        { find: "@fusion/core/detect-content-language", replacement: path.join(workspaceRoot, "packages/core/src/i18n/detect-content-language.ts") },
+        { find: "@fusion/core/task-delete-attribution", replacement: path.join(workspaceRoot, "packages/core/src/task-delete-attribution.ts") },
+        { find: "@fusion/core/column-roles", replacement: path.join(workspaceRoot, "packages/core/src/column-roles.ts") },
+        { find: "@fusion/core", replacement: path.join(workspaceRoot, "packages/core/src/types.ts") },
+        { find: "@fusion/dashboard/app/components/TaskCard", replacement: path.join(appRoot, "components/TaskCard.tsx") },
+        { find: "@fusion/dashboard/app/components/ViewHeader", replacement: path.join(appRoot, "components/ViewHeader.tsx") },
+        { find: "@fusion/dashboard/app/plugins/types", replacement: path.join(appRoot, "plugins/types.ts") },
+        { find: "@fusion/dashboard/app/utils/projectStorage", replacement: path.join(appRoot, "utils/projectStorage.ts") },
+      ],
+    },
+    plugins: [{
+      name: "fusion-alpha-drawer-production-fixture",
+      resolveId(id) {
+        if (id === virtualId) return resolvedVirtualId;
+        if (id.includes("cpufeatures.node")) return "\0virtual:fusion-empty-native-module";
+        return null;
+      },
+      load(id) {
+        if (id === resolvedVirtualId) return createAlphaDrawerProductionFixtureSource();
+        if (id === "\0virtual:fusion-empty-native-module") return "export default {};";
+        return null;
+      },
+    }],
+    build: {
+      write: false,
+      minify: true,
+      rollupOptions: { input: virtualId, output: { format: "iife", inlineDynamicImports: true } },
+    },
+  });
+  const outputs = Array.isArray(output) ? output.flatMap((result) => result.output) : output.output;
+  const chunk = outputs.find((entry) => entry.type === "chunk");
+  if (!chunk) fail("Alpha drawer production fixture did not emit a JavaScript chunk.");
+  return chunk.code;
+}
+
+const STANDARD_BOARD_SMOKE_PROJECT_ID = "fn-362-layout";
+const STANDARD_BOARD_SMOKE_WORKFLOW = {
+  id: "builtin:coding",
+  name: "Coding",
+  columns: [
+    { id: "todo", name: "Todo", flags: { hold: true, intake: true } },
+    { id: "in-progress", name: "In Progress", flags: { countsTowardWip: true } },
+    { id: "in-review", name: "In Review", flags: { countsTowardWip: true, mergeBlocker: true, mergeOrchestration: true, humanReview: true } },
+    { id: "done", name: "Done", flags: { complete: true } },
+  ],
+};
+
+function parseStandardBoardSmokeScenario(url) {
+  return {
+    alpha: url.searchParams.get("smokeAlpha") ?? "absent",
+    state: url.searchParams.get("smokeState") ?? "populated",
+    projectId: url.searchParams.get("project") ?? STANDARD_BOARD_SMOKE_PROJECT_ID,
+  };
+}
+
+function standardBoardSmokeTasks(state) {
+  if (state !== "populated" && state !== "duplicated") return [];
+  return Array.from({ length: 18 }, (_, index) => ({
+    id: `FN-362-${index}`,
+    title: state === "duplicated" && index < 2 ? "Carte dupliquée" : `Carte ${index + 1}`,
+    description: "Real App browser geometry fixture",
+    status: "in-progress",
+    column: "in-progress",
+    dependencies: [],
+    steps: [],
+    currentStep: 0,
+    log: [],
+    createdAt: "2026-09-12T00:00:00.000Z",
+    updatedAt: "2026-09-12T00:00:00.000Z",
+  }));
+}
+
+/*
+FNXC:StandardBoardHeight 2026-09-12-19:19:
+The official-design geometry regression must render the emitted production App, consume HTTP API states, and let Chromium compute every rectangle and scroll metric. The static CSS fixture remains broad smoke coverage, but it cannot substitute for this App-shell proof or predefine the values under assertion.
+*/
+function handleStandardBoardSmokeApi(req, res, scenario) {
+  const requestUrl = new URL(req.url, "http://127.0.0.1");
+  const pathname = requestUrl.pathname;
+  const tasks = standardBoardSmokeTasks(scenario.state);
+  let payload;
+  if (pathname === "/api/projects" || pathname === "/api/projects/across-nodes") {
+    payload = [{ id: scenario.projectId, name: "FN-362 Layout", path: "/fixture", status: "active", isolationMode: "in-process", createdAt: "", updatedAt: "" }];
+  } else if (pathname === "/api/settings") {
+    payload = scenario.alpha === "false" ? { experimentalFeatures: { alphaUpdates: false } } : { experimentalFeatures: {} };
+  } else if (pathname === "/api/config") {
+    payload = { maxConcurrent: 2, rootDir: "/fixture" };
+  } else if (pathname === "/api/tasks/board-workflows") {
+    if (scenario.state === "skeleton") {
+      setTimeout(() => {
+        if (res.writableEnded || res.destroyed) return;
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ flagEnabled: true, defaultWorkflowId: STANDARD_BOARD_SMOKE_WORKFLOW.id, workflows: [STANDARD_BOARD_SMOKE_WORKFLOW], taskWorkflowIds: {} }));
+      }, 1_000);
+      return true;
+    }
+    payload = scenario.state === "no-workflow"
+      ? { flagEnabled: true, defaultWorkflowId: "", workflows: [], taskWorkflowIds: {} }
+      : { flagEnabled: true, defaultWorkflowId: STANDARD_BOARD_SMOKE_WORKFLOW.id, workflows: [STANDARD_BOARD_SMOKE_WORKFLOW], taskWorkflowIds: Object.fromEntries(tasks.map((task) => [task.id, STANDARD_BOARD_SMOKE_WORKFLOW.id])) };
+  } else if (pathname === "/api/tasks") {
+    payload = tasks;
+  } else if (pathname === "/api/tasks/page") {
+    payload = { tasks, total: tasks.length, hasMore: false, nextCursor: null };
+  } else if (pathname === "/api/tasks/completed" || pathname === "/api/tasks/done") {
+    payload = { tasks: [], total: 0, hasMore: false, nextCursor: null, counts: { byColumn: {}, byWorkflow: {} } };
+  } else if (pathname === "/api/health") {
+    payload = { status: "ok", version: "smoke", uptime: 1, engine: { available: true }, database: { healthy: true, corruptionDetected: false, corruptionErrors: [], lastCheckedAt: null, isRunning: false }, taskIdIntegrity: { status: "ok", checkedAt: "2026-09-12T00:00:00.000Z", anomalies: [], recommendedAction: null } };
+  } else if (pathname === "/api/executor/stats") {
+    payload = { globalPause: false, enginePaused: false, maxConcurrent: 2, lastActivityAt: "2026-09-12T00:00:00.000Z" };
+  } else if (pathname === "/api/agents/stats") {
+    payload = { todoTaskCount: 0, idleNonEphemeralCount: 1 };
+  } else if (pathname.startsWith("/api/events")) {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    res.write(": connected\n\n");
+    return true;
+  } else {
+    payload = pathname.includes("count") ? { unreadCount: 0 } : [];
+  }
+  res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+  return true;
+}
+
 async function startFixtureServer() {
-  const css = await loadDashboardCss();
+  const [css, alphaDrawerScript, productionIndexHtml] = await Promise.all([
+    loadDashboardCss(),
+    buildAlphaDrawerProductionFixture(),
+    readFile(path.join(clientDistRoot, "index.html"), "utf8"),
+  ]);
   const html = createSmokeHtml();
-  const server = createServer((req, res) => {
+  let activeStandardBoardScenario = null;
+  const server = createServer(async (req, res) => {
+    const requestUrl = new URL(req.url, "http://127.0.0.1");
+    if (requestUrl.pathname === "/production-app/") {
+      activeStandardBoardScenario = parseStandardBoardSmokeScenario(requestUrl);
+    }
+    const scenario = activeStandardBoardScenario;
+    if (scenario && process.env.FUSION_BROWSER_SMOKE_STANDARD_BOARD_ONLY === "1") log(`production App request: ${req.url}`);
+    if (scenario && req.url?.startsWith("/api/")) {
+      handleStandardBoardSmokeApi(req, res, scenario);
+      return;
+    }
+    if (requestUrl.pathname === "/production-app/") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(productionIndexHtml);
+      return;
+    }
+    if (req.url?.startsWith("/assets/")) {
+      const assetPath = path.join(clientDistRoot, req.url.split("?")[0].replace(/^\//, ""));
+      try {
+        const body = await readFile(assetPath);
+        const contentType = assetPath.endsWith(".css") ? "text/css" : assetPath.endsWith(".js") ? "text/javascript" : "application/octet-stream";
+        res.writeHead(200, { "content-type": contentType });
+        res.end(body);
+      } catch {
+        res.writeHead(404);
+        res.end();
+      }
+      return;
+    }
     if (req.url === "/app.css") {
       res.writeHead(200, { "content-type": "text/css; charset=utf-8" });
       res.end(css);
+      return;
+    }
+    if (req.url === "/alpha-drawer-production-fixture.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      res.end(alphaDrawerScript);
       return;
     }
 
@@ -633,6 +1372,32 @@ async function startFixtureServer() {
     server,
     url: `http://127.0.0.1:${server.address().port}/`,
   };
+}
+
+/*
+FNXC:DashboardBrowserSmoke 2026-08-04-12:24:
+Prepare emitted client CSS and bind the fixture server before starting Chrome's supervised 60-second lifetime. A cold client build can take several minutes on supported development hosts; that build time must not consume the browser's geometry-check budget or kill Chrome before the first named assertion.
+*/
+export async function prepareBrowserSmoke(executable, {
+  startFixture = startFixtureServer,
+  launch = launchBrowser,
+  closeFixture = (fixture) => closeServer(fixture.server),
+} = {}) {
+  const fixture = await startFixture();
+  try {
+    const launched = await launch(executable);
+    return { fixture, launched };
+  } catch (error) {
+    try {
+      await closeFixture(fixture);
+    } catch (cleanupError) {
+      console.warn(
+        "[dashboard-browser-smoke] fixture cleanup after browser launch failure also failed:",
+        cleanupError,
+      );
+    }
+    throw error;
+  }
 }
 
 async function findBrowserExecutable() {
@@ -688,7 +1453,7 @@ async function launchBrowser(executable) {
     "about:blank",
   ], {
     stdio: ["ignore", "pipe", "pipe"],
-    maxLifetimeMs: 60_000,
+    maxLifetimeMs: process.env.FUSION_BROWSER_SMOKE_STANDARD_BOARD_ONLY === "1" ? 180_000 : 60_000,
   });
   const browser = supervised.child;
 
@@ -837,6 +1602,25 @@ async function createPage(browserWsUrl) {
   return cdpConnect(target.webSocketDebuggerUrl);
 }
 
+async function createIsolatedPage(browserWsUrl) {
+  const browser = await cdpConnect(browserWsUrl);
+  const { browserContextId } = await browser.send("Target.createBrowserContext");
+  const { targetId } = await browser.send("Target.createTarget", { url: "about:blank", browserContextId });
+  const browserEndpoint = new URL(browserWsUrl);
+  const targets = await fetch(new URL("/json/list", `http://127.0.0.1:${browserEndpoint.port}`)).then((response) => response.json());
+  const target = targets.find((candidate) => candidate.id === targetId);
+  if (!target?.webSocketDebuggerUrl) fail("Unable to resolve isolated browser target.");
+  const page = await cdpConnect(target.webSocketDebuggerUrl);
+  return {
+    page,
+    close: async () => {
+      page.close();
+      await browser.send("Target.disposeBrowserContext", { browserContextId });
+      browser.close();
+    },
+  };
+}
+
 async function evaluate(page, expression) {
   const result = await page.send("Runtime.evaluate", {
     expression,
@@ -844,9 +1628,34 @@ async function evaluate(page, expression) {
     returnByValue: true,
   });
   if (result.exceptionDetails) {
-    fail(result.exceptionDetails.text ?? "Browser evaluation failed");
+    fail(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Browser evaluation failed");
   }
   return result.result.value;
+}
+
+/*
+FNXC:CommandCenterGithub 2026-08-03-04:32:
+FN-8750 proof captures must preserve the production fixture layout so overflow checks at later viewports
+measure the table rather than a temporary overlay. Render a disposable clone in an isolated host,
+which keeps unrelated dashboard UI out of the artifact without mutating the measured fixture.
+*/
+async function captureFixtureScreenshot(page, selector, outputPath) {
+  await evaluate(page, `(async () => {
+    const fixture = document.querySelector(${JSON.stringify(selector)});
+    const host = document.createElement("div");
+    host.dataset.smokeCaptureHost = "true";
+    host.style.cssText = "position: fixed; inset: 0; z-index: 9999; display: flex; overflow: auto; background: var(--bg);";
+    const clone = fixture.cloneNode(true);
+    host.append(clone);
+    document.body.append(host);
+    await new Promise(requestAnimationFrame);
+  })()`);
+  try {
+    const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+    await writeFile(outputPath, Buffer.from(screenshot.data, "base64"));
+  } finally {
+    await evaluate(page, "document.querySelector('[data-smoke-capture-host]').remove()");
+  }
 }
 
 function assertSmokeResult(name, passed, details) {
@@ -939,7 +1748,7 @@ function commandCenterChartsPass(layout) {
       && empty.overflowY !== "scroll");
 }
 
-async function runSmokeChecks(page, pageUrl) {
+async function runSmokeChecks(page, pageUrl, browserWsUrl) {
   await page.send("Page.enable");
   await page.send("Runtime.enable");
   await page.send("Emulation.setDeviceMetricsOverride", {
@@ -953,6 +1762,436 @@ async function runSmokeChecks(page, pageUrl) {
   await page.send("Page.navigate", { url: pageUrl });
   await loaded;
   await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+  if (process.env.FUSION_BROWSER_SMOKE_STANDARD_BOARD_ONLY === "1") {
+    await runProductionAppBoardChecks(page, pageUrl, browserWsUrl);
+    return;
+  }
+
+  const collectAgentHeartbeatControlLayout = () => evaluate(page, `(() => {
+    const fixture = document.querySelector('[data-smoke="agent-heartbeat-controls"]');
+    const viewportWidth = window.innerWidth;
+    const controls = [...fixture.querySelectorAll('[data-smoke="agent-heartbeat-toggle"], [data-smoke="enable-all-heartbeats"], [data-smoke="disable-all-heartbeats"]')].map((control) => {
+      const rect = control.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, width: rect.width, height: rect.height };
+    });
+    const worker = fixture.querySelector('[data-smoke="ephemeral-agent-card"]');
+    return { viewportWidth, controls, workerToggleCount: worker.querySelectorAll('[data-smoke="agent-heartbeat-toggle"]').length, fixtureOverflow: fixture.scrollWidth - fixture.clientWidth, documentOverflow: document.documentElement.scrollWidth - viewportWidth };
+  })()`);
+
+  const collectResolvedGithubTableLayout = () => evaluate(page, `(() => {
+    const fixture = document.querySelector('[data-smoke="github-resolved-table"]');
+    const table = fixture.querySelector('.cc-github-resolved-table');
+    const title = fixture.querySelector('.cc-github-resolved-task-title');
+    const link = fixture.querySelector('.cc-github-resolved-issue-link');
+    const fixtureRect = fixture.getBoundingClientRect();
+    const titleRect = title.getBoundingClientRect();
+    const linkStyle = getComputedStyle(link);
+    return {
+      documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      fixtureOverflow: fixture.scrollWidth - fixture.clientWidth,
+      tableOverflow: table.scrollWidth - table.clientWidth,
+      titleHeight: titleRect.height,
+      titleWidth: titleRect.width,
+      fixtureWidth: fixtureRect.width,
+      linkColor: linkStyle.color,
+      linkTextDecoration: linkStyle.textDecorationLine,
+    };
+  })()`);
+
+  const collectPlanApprovalLayout = () => evaluate(page, `(() => {
+    const fixture = document.querySelector('[data-smoke="plan-review-replan-cap-approval"]');
+    const card = fixture.querySelector('.card');
+    const badge = fixture.querySelector('.awaiting-approval--plan-review-replan-cap');
+    const banner = fixture.querySelector('.detail-plan-approval-banner--replan-cap');
+    const rect = (node) => {
+      const box = node.getBoundingClientRect();
+      return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width, height: box.height };
+    };
+    return {
+      viewportWidth: window.innerWidth,
+      documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      fixtureOverflow: fixture.scrollWidth - fixture.clientWidth,
+      fixture: rect(fixture),
+      card: rect(card),
+      badge: rect(badge),
+      banner: rect(banner),
+      badgeReason: badge.getAttribute('data-awaiting-approval-reason'),
+      bannerReason: banner.getAttribute('data-awaiting-approval-reason'),
+    };
+  })()`);
+
+  const planApprovalLayoutPasses = (layout) => layout.documentOverflow <= 1
+    && layout.fixtureOverflow <= 1
+    && layout.fixture.width > 0
+    && layout.card.height > 0
+    && layout.banner.height > 0
+    && layout.badge.width > 0
+    && layout.card.left >= layout.fixture.left - 1
+    && layout.card.right <= layout.fixture.right + 1
+    && layout.banner.left >= layout.fixture.left - 1
+    && layout.banner.right <= layout.fixture.right + 1
+    && layout.badge.left >= layout.card.left - 1
+    && layout.badge.right <= layout.card.right + 1
+    && layout.banner.top >= layout.card.bottom - 1
+    && layout.badgeReason === "plan-review-replan-cap"
+    && layout.bannerReason === "plan-review-replan-cap";
+
+  const collectAlphaDrawerLayout = () => evaluate(page, `(async () => {
+    const root = document.documentElement;
+    root.dataset.alphaMobileDrawers = 'true';
+    root.dataset.viewportMode = 'mobile';
+    root.dataset.alphaDrawerFixturesVisible = 'true';
+    const fixture = document.querySelector('[data-smoke="alpha-drawer-fixtures"]');
+    fixture.hidden = false;
+    const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const waitFor = async (read, label) => {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const value = read();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error('Timed out waiting for production Alpha drawer ' + label);
+    };
+    await waitFor(() => globalThis.__alphaDrawerProductionFixture, 'controller');
+    const rect = (node) => {
+      const box = node.getBoundingClientRect();
+      return { top: box.top, bottom: box.bottom, left: box.left, right: box.right, width: box.width, height: box.height };
+    };
+    const isVisible = (node) => {
+      const style = getComputedStyle(node);
+      return style.visibility !== 'hidden' && style.display !== 'none' && node.getBoundingClientRect().height > 0;
+    };
+    const scrollControlIntoView = (control, panel) => {
+      let owner = control.parentElement;
+      while (owner && owner !== panel) {
+        if (owner.scrollHeight > owner.clientHeight) owner.scrollTop = owner.scrollHeight;
+        owner = owner.parentElement;
+      }
+    };
+    const providerConfig = [
+      { id: 'short', final: '[data-smoke="alpha-drawer-short-final"]' },
+      { id: 'projects', final: '.project-overview button, .project-overview [role="button"]' },
+      { id: 'planning', final: '.planning-view textarea, .planning-view button' },
+      { id: 'usage', final: '.usage-popover button' },
+      { id: 'task-detail', final: '.task-detail-content button' },
+      { id: 'plugin', final: '[data-testid="todo-view-root"] button, [data-testid="todo-view-root"] input' },
+      { id: 'long', final: '.task-detail-content button' },
+      { id: 'chat', final: '[data-testid="chat-input"]' },
+    ];
+    const providerResults = [];
+    for (const config of providerConfig) {
+      globalThis.__alphaDrawerProductionFixture.open(config.id);
+      await nextFrame();
+      const host = await waitFor(() => document.querySelector('[data-smoke-provider="' + config.id + '"]'), config.id + ' host');
+      if (config.id === 'chat') {
+        const sessionButton = await waitFor(() => host.querySelector('[data-testid="chat-session-smoke-chat-session"]'), 'Chat session');
+        sessionButton.click();
+      }
+      const panel = await waitFor(() => host.querySelector('.alpha-mobile-drawer__panel'), config.id + ' panel');
+      const finalControl = await waitFor(() => {
+        const controls = host.querySelectorAll(config.final);
+        return controls.length > 0 ? controls.item(controls.length - 1) : null;
+      }, config.id + ' final control');
+      scrollControlIntoView(finalControl, panel);
+      await nextFrame();
+      const panelRect = rect(panel);
+      const controlRect = rect(finalControl);
+      const visibleHeaderRows = [...panel.querySelectorAll(':scope > .alpha-mobile-drawer__header, .view-header, .modal-header')].filter(isVisible);
+      const visibleChatTitles = config.id === 'chat' ? [...panel.querySelectorAll('h1,h2,h3')].filter((heading) => heading.textContent.trim() === 'Chat' && !heading.classList.contains('visually-hidden') && isVisible(heading)).length : undefined;
+      providerResults.push({
+        id: config.id,
+        panel: panelRect,
+        headerCount: visibleHeaderRows.length,
+        closeCount: panel.querySelectorAll(':scope > .alpha-mobile-drawer__close').length,
+        handleCount: panel.querySelectorAll(':scope > .alpha-mobile-drawer__handle-target').length,
+        finalReachable: controlRect.top >= panelRect.top - 1 && controlRect.bottom <= panelRect.bottom + 1,
+        inputFocusable: config.id === 'chat' ? !finalControl.disabled && finalControl.tabIndex >= 0 : undefined,
+        visibleChatTitles,
+        productionMarkers: {
+          projects: Boolean(host.querySelector('.project-overview')),
+          planning: Boolean(host.querySelector('[data-testid="planning-view"]')),
+          usage: Boolean(host.querySelector('.usage-popover')),
+          taskDetail: Boolean(host.querySelector('.task-detail-content')),
+          plugin: Boolean(host.querySelector('[data-testid="todo-view-root"]')),
+          chat: Boolean(host.querySelector('.chat-view')),
+        },
+      });
+    }
+    const floatingPanel = document.querySelector('[data-smoke="alpha-drawer-floating"] .floating-window');
+    const terminalPanel = document.querySelector('[data-smoke="alpha-drawer-terminal"] .terminal-modal');
+    const panels = [...providerResults.map((result) => result.panel), rect(floatingPanel), rect(terminalPanel)];
+    const chat = providerResults.find((result) => result.id === 'chat');
+    return {
+      panels,
+      providerResults,
+      productionReady: root.dataset.alphaDrawerProductionReady === 'true',
+      productionProviderCount: providerResults.filter((result) => Object.values(result.productionMarkers).some(Boolean)).length,
+      inputVisible: chat.finalReachable,
+      inputFocusable: chat.inputFocusable,
+      visibleChatTitles: chat.visibleChatTitles,
+      horizontalOverflow: Math.max(...panels.map((panel) => panel.right - window.innerWidth), 0),
+    };
+  })()`);
+  /*
+  FNXC:AlphaBoardPillGeometry 2026-09-11-16:53:
+  Blink measures the production MainContent → Board tree for loading, no-workflow, populated, duplicate, and pagination-error states. The fixture changes only transport/props and shell reservations; it never replaces Board output with synthetic columns or cards.
+  */
+  const collectBoardLayout = (state, mode, systemOffset = 0, layoutViewportHeight = 0) => evaluate(page, `(async () => {
+    const root = document.documentElement;
+    const mode = ${JSON.stringify(String(mode))};
+    const mobileMode = mode.startsWith('mobile');
+    const keyboardMetrics = ${JSON.stringify(createMobilePillSmokeViewportMetrics(layoutViewportHeight, String(mode) === "mobile-keyboard"))};
+    const { keyboardOpen, keyboardOverlap, viewportHeight, viewportOffsetTop } = keyboardMetrics;
+    root.dataset.viewportMode = mobileMode ? 'mobile' : mode;
+    root.style.setProperty('--mobile-nav-alpha-system-offset', ${JSON.stringify(String(systemOffset))} + 'px');
+    const fixture = document.querySelector('[data-smoke="alpha-board-fixture"]');
+    fixture.hidden = false;
+    const content = fixture.querySelector('.project-content');
+    content.className = mobileMode ? 'project-content project-content--with-alpha-nav' : 'project-content project-content--with-footer';
+    const footer = fixture.querySelector('[data-smoke="alpha-footer"]');
+    footer.style.display = mode === 'desktop' || mode === 'tablet' ? '' : 'none';
+    const state = ${JSON.stringify(String(state))};
+    const waitFor = async (read, label) => {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const value = read();
+        if (value) return value;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error('Timed out waiting for production Board ' + label);
+    };
+    const controller = await waitFor(() => globalThis.__alphaBoardProductionFixture, 'controller');
+    const pillController = await waitFor(() => globalThis.__alphaPillProductionFixture, 'pill controller');
+    pillController.configure({
+      keyboardOpen,
+      keyboardOverlap,
+      viewportHeight,
+      viewportOffsetTop,
+      menuOpen: mobileMode,
+    });
+    const pill = mobileMode ? await waitFor(() => fixture.querySelector('.mobile-nav-bar--alpha'), 'production pill') : null;
+    controller.show(state);
+    const board = await waitFor(() => {
+      const candidate = fixture.querySelector('#board');
+      if (!candidate) return null;
+      if (state === 'skeleton' && candidate.dataset.testid !== 'board-workflows-skeleton') return null;
+      if (state === 'empty' && candidate.dataset.testid !== 'board-workflows-empty') return null;
+      if (!['skeleton', 'empty'].includes(state) && !candidate.classList.contains('board-workflow-columns')) return null;
+      return candidate;
+    }, state);
+    const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await nextFrame();
+    if (mobileMode) await nextFrame();
+    else root.style.setProperty('--mobile-nav-height', '0px');
+    const popover = mobileMode ? await waitFor(() => fixture.querySelector('.alpha-mobile-navigation-popover'), 'production pill popover') : null;
+    const lowerBoundary = mobileMode ? pill.getBoundingClientRect().top : footer.getBoundingClientRect().top;
+    const boardRect = board.getBoundingClientRect();
+    const columns = [...board.querySelectorAll(':scope > .column, :scope > .board-workflows-skeleton__column')].map((column) => {
+      const box = column.getBoundingClientRect();
+      const body = column.querySelector('.column-body');
+      const scrollable = body ? body.scrollHeight > body.clientHeight && ['auto', 'scroll'].includes(getComputedStyle(body).overflowY) : false;
+      if (scrollable) body.scrollTop = body.scrollHeight - body.clientHeight;
+      const lastCard = body?.querySelector('.card:last-of-type');
+      const bodyBox = body?.getBoundingClientRect();
+      const lastCardBox = lastCard?.getBoundingClientRect();
+      const lastCardReachable = !scrollable || Boolean(bodyBox && lastCardBox && lastCardBox.bottom <= bodyBox.bottom + 1);
+      return { top: box.top, bottom: box.bottom, height: box.height, scrollable, lastCardReachable };
+    });
+    return {
+      state,
+      mode,
+      lowerBoundary,
+      boardTop: boardRect.top,
+      boardBottom: boardRect.bottom,
+      columnTops: columns.map((column) => column.top),
+      columnBottoms: columns.map((column) => column.bottom),
+      columnHeights: columns.map((column) => column.height),
+      columnScrollable: columns.map((column) => column.scrollable),
+      lastCardsReachable: columns.map((column) => column.lastCardReachable),
+      documentScrollable: document.documentElement.scrollHeight > document.documentElement.clientHeight + 1,
+      boardPaddingTop: Number.parseFloat(getComputedStyle(board).paddingTop),
+      boardPaddingBottom: Number.parseFloat(getComputedStyle(board).paddingBottom),
+      controlOrder: pill ? [...pill.children].map((child) => child.className) : [],
+      pill: pill ? rect(pill) : null,
+      popover: popover ? rect(popover) : null,
+      popoverLastItemReachable: popover ? (() => {
+        const items = [...popover.querySelectorAll('.mobile-more-item')];
+        if (items.length === 0) return false;
+        popover.scrollTop = popover.scrollHeight;
+        const popoverRect = popover.getBoundingClientRect();
+        const lastRect = items.at(-1).getBoundingClientRect();
+        return lastRect.bottom <= popoverRect.bottom + 1;
+      })() : null,
+      productionBoard: board.id === 'board' && (state === 'skeleton' || state === 'empty' || board.querySelectorAll('.card').length > 0),
+      paginationRetryVisible: state !== 'pagination-error' || Boolean(board.querySelector('.column-pagination-error button')),
+      duplicateCardCount: state !== 'duplicated' ? 0 : board.querySelectorAll('.column-body .card').length,
+      keyboardOpen,
+      viewportHeight,
+      viewportOffsetTop,
+      documentOverflowX: document.documentElement.scrollWidth - window.innerWidth,
+      fixtureOverflowY: fixture.scrollHeight - fixture.clientHeight,
+    };
+  })()`);
+
+  const collectAgentsOverviewScrollLayout = () => evaluate(page, `(() => {
+    document.querySelector('[data-smoke="show-agents-overview-scroll"]').click();
+    const section = document.querySelector('[data-smoke="agents-overview-scroll"]');
+    const fixture = section.querySelector('.agents-view');
+    const owner = section.querySelector('[data-smoke="agents-overview-scroll-owner"]');
+    const lastCard = section.querySelector('[data-smoke="agents-overview-last-card"]');
+    const sibling = fixture.querySelector('.agents-view-content');
+    const empty = section.querySelector('[data-smoke="agents-overview-scroll-empty"]');
+    const emptyOwner = section.querySelector('[data-smoke="agents-overview-empty-scroll-owner"]');
+    owner.scrollTop = owner.scrollHeight - owner.clientHeight;
+    const ownerRect = owner.getBoundingClientRect();
+    const lastRect = lastCard.getBoundingClientRect();
+    const toggleRect = empty.querySelector('.agents-overview-bar__toggle').getBoundingClientRect();
+    const emptyRect = empty.getBoundingClientRect();
+    return {
+      overflowY: getComputedStyle(owner).overflowY,
+      overflow: owner.scrollHeight - owner.clientHeight,
+      lastCard: { top: lastRect.top, bottom: lastRect.bottom },
+      owner: { top: ownerRect.top, bottom: ownerRect.bottom },
+      siblingHeight: sibling.clientHeight,
+      documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      emptyOverflow: emptyOwner.scrollHeight - emptyOwner.clientHeight,
+      emptyToggleVisible: toggleRect.top >= emptyRect.top - 1 && toggleRect.bottom <= emptyRect.bottom + 1,
+    };
+  })()`);
+
+  for (const { width, height, deviceScaleFactor, mobile } of [
+    { width: 390, height: 844, deviceScaleFactor: 2, mobile: true },
+    { width: 1280, height: 700, deviceScaleFactor: 1, mobile: false },
+  ]) {
+    await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor, mobile });
+    const agentsOverviewLayout = await collectAgentsOverviewScrollLayout();
+    const viewport = `${width}×${height}`;
+    assertSmokeResult(
+      `Agents Overview scroll owner reaches every active card at ${viewport}`,
+      (agentsOverviewLayout.overflowY === "auto" || agentsOverviewLayout.overflowY === "scroll")
+        && agentsOverviewLayout.overflow > 0
+        && agentsOverviewLayout.lastCard.bottom <= agentsOverviewLayout.owner.bottom + 1
+        && agentsOverviewLayout.lastCard.top >= agentsOverviewLayout.owner.top - 1
+        && agentsOverviewLayout.siblingHeight > 0
+        && agentsOverviewLayout.documentOverflow <= 1,
+      JSON.stringify(agentsOverviewLayout),
+    );
+    assertSmokeResult(
+      `Agents Overview empty scroll owner stays unclipped at ${viewport}`,
+      agentsOverviewLayout.emptyOverflow <= 1 && agentsOverviewLayout.emptyToggleVisible,
+      JSON.stringify(agentsOverviewLayout),
+    );
+  }
+  for (const { name, width, height } of [
+    { name: "portrait", width: 390, height: 844 },
+    { name: "short landscape", width: 844, height: 390 },
+    { name: "keyboard viewport", width: 390, height: 400 },
+  ]) {
+    await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 2, mobile: true });
+    const layout = await collectAlphaDrawerLayout();
+    const expectedHeight = layout.panels[0].height;
+    assertSmokeResult(
+      `Alpha drawers share one reachable geometry in ${name}`,
+      expectedHeight > 0
+        && layout.productionReady
+        && layout.panels.every((panel) => Math.abs(panel.height - expectedHeight) <= 1)
+        && layout.productionProviderCount === 7
+        && layout.providerResults.every((provider) => provider.headerCount === 1 && provider.closeCount === 0 && provider.handleCount === 1 && provider.finalReachable)
+        && layout.inputVisible
+        && layout.inputFocusable
+        && layout.visibleChatTitles === 1
+        && layout.horizontalOverflow <= 1,
+      JSON.stringify(layout),
+    );
+  }
+  await evaluate(page, `(() => {
+    document.querySelector('[data-smoke="alpha-drawer-fixtures"]').hidden = true;
+    delete document.documentElement.dataset.alphaDrawerFixturesVisible;
+    delete document.documentElement.dataset.alphaMobileDrawers;
+    return true;
+  })()`);
+  for (const { name, width, height, mode, systemOffset } of [
+    { name: "desktop footer", width: 1200, height: 844, mode: "desktop", systemOffset: 0 },
+    { name: "tablet footer", width: 768, height: 844, mode: "tablet", systemOffset: 0 },
+    { name: "mobile pill", width: 390, height: 844, mode: "mobile", systemOffset: 24 },
+    { name: "mobile landscape pill", width: 844, height: 390, mode: "mobile", systemOffset: 18 },
+    { name: "mobile shifted keyboard viewport", width: 390, height: 400, mode: "mobile-keyboard", systemOffset: 0 },
+  ]) {
+    const mobile = mode.startsWith("mobile");
+    await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: mobile ? 2 : 1, mobile });
+    for (const state of ["skeleton", "empty", "populated", "duplicated", "pagination-error"]) {
+      const layout = await collectBoardLayout(state, mode, systemOffset, height);
+      assertSmokeResult(
+        `Official Board ${state} fills the safe height above the ${name}`,
+        boardSafeGeometryMatches(layout)
+          && layout.productionBoard
+          && layout.paginationRetryVisible
+          && (state !== "duplicated" || layout.duplicateCardCount === 2)
+          && (!mobile || (
+            layout.controlOrder.length === 5
+            && layout.controlOrder.at(-1) === 'alpha-mobile-menu-trigger'
+            && mobilePillGeometryMatches(layout, height)
+          ))
+          && (mode !== "mobile-keyboard" || layout.keyboardOpen)
+          && layout.documentOverflowX <= 1
+          && layout.fixtureOverflowY <= 1,
+        JSON.stringify(layout),
+      );
+    }
+  }
+  await evaluate(page, `(() => {
+    document.querySelector('[data-smoke="alpha-board-fixture"]').hidden = true;
+    document.documentElement.style.removeProperty('--mobile-nav-alpha-system-offset');
+    document.documentElement.style.removeProperty('--mobile-nav-height');
+    delete document.documentElement.dataset.viewportMode;
+    return true;
+  })()`);
+  await page.send("Emulation.setDeviceMetricsOverride", {
+    width: 390,
+    height: 844,
+    deviceScaleFactor: 2,
+    mobile: true,
+  });
+
+  const mobileResolvedGithubTableLayout = await collectResolvedGithubTableLayout();
+  assertSmokeResult(
+    "resolved GitHub table wraps long content without mobile page overflow",
+    mobileResolvedGithubTableLayout.documentOverflow <= 1
+      && mobileResolvedGithubTableLayout.fixtureOverflow <= 1
+      && mobileResolvedGithubTableLayout.tableOverflow <= 1
+      && mobileResolvedGithubTableLayout.titleHeight > 0
+      && mobileResolvedGithubTableLayout.titleWidth <= mobileResolvedGithubTableLayout.fixtureWidth
+      && mobileResolvedGithubTableLayout.linkColor !== ""
+      && mobileResolvedGithubTableLayout.linkTextDecoration.includes("underline"),
+    JSON.stringify(mobileResolvedGithubTableLayout),
+  );
+  if (resolvedGithubMobileScreenshotPath) {
+    await captureFixtureScreenshot(page, '[data-smoke="github-resolved-table"]', resolvedGithubMobileScreenshotPath);
+    log(`saved resolved GitHub mobile screenshot to ${resolvedGithubMobileScreenshotPath}`);
+  }
+  if (planApprovalMobileScreenshotPath) {
+    await captureFixtureScreenshot(page, '[data-smoke="plan-review-replan-cap-approval"]', planApprovalMobileScreenshotPath);
+    log(`saved Plan Review approval mobile screenshot to ${planApprovalMobileScreenshotPath}`);
+  }
+  const mobilePlanApprovalLayout = await collectPlanApprovalLayout();
+  assertSmokeResult(
+    "Plan Review approval card and detail banner stay visible and contained on mobile",
+    planApprovalLayoutPasses(mobilePlanApprovalLayout),
+    JSON.stringify(mobilePlanApprovalLayout),
+  );
+
+  const mobileAgentHeartbeatLayout = await collectAgentHeartbeatControlLayout();
+  assertSmokeResult(
+    "agent heartbeat controls stay visible on mobile and omit ephemeral shells",
+    mobileAgentHeartbeatLayout.controls.length === 4 && mobileAgentHeartbeatLayout.controls.every((control) => control.width > 0 && control.height > 0 && control.left >= 0 && control.right <= mobileAgentHeartbeatLayout.viewportWidth + 1) && mobileAgentHeartbeatLayout.workerToggleCount === 0 && mobileAgentHeartbeatLayout.fixtureOverflow <= 1 && mobileAgentHeartbeatLayout.documentOverflow <= 1,
+    JSON.stringify(mobileAgentHeartbeatLayout),
+  );
+  if (agentHeartbeatMobileScreenshotPath) {
+    /* FNXC:AgentHeartbeatControls 2026-07-23-14:30: Optional proof captures document the durable-agent controls and omitted task-worker shell at the tested mobile viewport. */
+    await evaluate(page, "document.querySelector('[data-smoke=\"agent-heartbeat-controls\"]').scrollIntoView({ block: 'start' })");
+    const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+    await writeFile(agentHeartbeatMobileScreenshotPath, Buffer.from(screenshot.data, "base64"));
+    log(`saved agent heartbeat mobile screenshot to ${agentHeartbeatMobileScreenshotPath}`);
+  }
 
   const initialLayout = await evaluate(page, `(() => {
     const viewportWidth = window.innerWidth;
@@ -1073,6 +2312,170 @@ async function runSmokeChecks(page, pageUrl) {
     JSON.stringify(modalLayout),
   );
 
+  /*
+  FNXC:GitManagerMobileSpacing 2026-08-01-19:10:
+  Real Chromium must prove the original 390px body-gutter failure is gone across the header,
+  close control, layout, and populated/error content. The strict 767.98px boundary intentionally
+  does not claim a false 768px containment failure: production flex shrinking contains that child,
+  while its desktop/tablet gutter and movable geometry must remain present.
+  */
+  for (const width of [390, 767, 768, 1024]) {
+    await page.send("Emulation.setDeviceMetricsOverride", {
+      width,
+      height: 844,
+      deviceScaleFactor: width < 768 ? 2 : 1,
+      mobile: width < 768,
+    });
+    await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+    const gitManagerLayout = await evaluate(page, `(() => {
+      const viewportWidth = window.innerWidth;
+      const readRect = (selector) => {
+        const rect = document.querySelector(selector).getBoundingClientRect();
+        return { left: rect.left, right: rect.right, width: rect.width, top: rect.top, bottom: rect.bottom };
+      };
+      const standalone = document.querySelector('[data-smoke="git-manager-standalone"]');
+      const standaloneBody = document.querySelector('[data-smoke="git-manager-standalone-body"]');
+      const embeddedHost = document.querySelector('[data-smoke="git-manager-embedded-host"]');
+      return {
+        viewportWidth,
+        documentOverflow: document.documentElement.scrollWidth - viewportWidth,
+        standalone: {
+          host: readRect('[data-smoke="git-manager-standalone"]'),
+          body: readRect('[data-smoke="git-manager-standalone-body"]'),
+          modal: readRect('[data-smoke="git-manager-standalone-modal"]'),
+          header: readRect('[data-smoke="git-manager-standalone-header"]'),
+          close: readRect('[data-smoke="git-manager-standalone-close"]'),
+          layout: readRect('[data-smoke="git-manager-standalone-layout"]'),
+          content: readRect('[data-smoke="git-manager-standalone-content"]'),
+          bodyMarginInlineEnd: getComputedStyle(standaloneBody).marginInlineEnd,
+          overflow: standalone.scrollWidth - standalone.clientWidth,
+          resizeHandleDisplay: getComputedStyle(standalone.querySelector('.floating-window__resize-handle')).display,
+        },
+        embedded: {
+          host: readRect('[data-smoke="git-manager-embedded-host"]'),
+          modal: readRect('[data-smoke="git-manager-embedded-modal"]'),
+          header: readRect('[data-smoke="git-manager-embedded-header"]'),
+          close: readRect('[data-smoke="git-manager-embedded-close"]'),
+          layout: readRect('[data-smoke="git-manager-embedded-layout"]'),
+          content: readRect('[data-smoke="git-manager-embedded-content"]'),
+          overflow: embeddedHost.scrollWidth - embeddedHost.clientWidth,
+        },
+      };
+    })()`);
+    if (width === 390 && gitManagerBeforeMobileScreenshotPath) {
+      /*
+      FNXC:GitManagerMobileSpacing 2026-08-01-19:31:
+      FN-8702 preserves an executable reproduction by temporarily restoring the inherited desktop
+      resize-handle gutter. Chromium must observe that resulting right-edge asymmetry before the
+      production phone-sheet assertion proves the reset removes it.
+      */
+      const preFixLayout = await evaluate(page, `(() => {
+        const body = document.querySelector('[data-smoke="git-manager-standalone-body"]');
+        body.style.marginInlineEnd = 'var(--space-lg)';
+        const rect = body.getBoundingClientRect();
+        return { right: rect.right, marginInlineEnd: getComputedStyle(body).marginInlineEnd, viewportWidth: window.innerWidth };
+      })()`);
+      assertSmokeResult(
+        "Git Manager 390px desktop-gutter reproduction",
+        parseFloat(preFixLayout.marginInlineEnd) > 0 && preFixLayout.right < preFixLayout.viewportWidth - 1,
+        JSON.stringify(preFixLayout),
+      );
+      const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+      await writeFile(gitManagerBeforeMobileScreenshotPath, Buffer.from(screenshot.data, "base64"));
+      await evaluate(page, "document.querySelector('[data-smoke=\"git-manager-standalone-body\"]').style.removeProperty('margin-inline-end')");
+      log(`saved Git Manager before mobile screenshot to ${gitManagerBeforeMobileScreenshotPath}`);
+    }
+    if (width === 390 && gitManagerAfterMobileScreenshotPath) {
+      const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+      await writeFile(gitManagerAfterMobileScreenshotPath, Buffer.from(screenshot.data, "base64"));
+      log(`saved Git Manager after mobile screenshot to ${gitManagerAfterMobileScreenshotPath}`);
+    }
+
+    const standaloneRects = Object.values(gitManagerLayout.standalone)
+      .filter((value) => value && typeof value === "object" && "left" in value);
+    const embeddedRects = Object.values(gitManagerLayout.embedded)
+      .filter((value) => value && typeof value === "object" && "left" in value);
+    const embeddedContained = embeddedRects.every((rect) => rect.left >= gitManagerLayout.embedded.host.left - 1
+      && rect.right <= gitManagerLayout.embedded.host.right + 1);
+    const standaloneContained = standaloneRects.every((rect) => rect.left >= -1 && rect.right <= width + 1);
+    const common = gitManagerLayout.documentOverflow <= 1
+      && gitManagerLayout.standalone.overflow <= 1
+      && gitManagerLayout.embedded.overflow <= 1
+      && standaloneContained
+      && embeddedContained
+      && gitManagerLayout.standalone.close.right <= gitManagerLayout.standalone.header.right + 1
+      && gitManagerLayout.embedded.close.right <= gitManagerLayout.embedded.header.right + 1;
+    const passed = width < 768
+      ? common
+        && Math.abs(gitManagerLayout.standalone.host.left) <= 1
+        && Math.abs(gitManagerLayout.standalone.host.right - width) <= 1
+        && Math.abs(gitManagerLayout.standalone.body.right - width) <= 1
+        && Math.abs(gitManagerLayout.standalone.modal.right - width) <= 1
+        && gitManagerLayout.standalone.bodyMarginInlineEnd === "0px"
+        && gitManagerLayout.embedded.modal.width < width
+      : common
+        && gitManagerLayout.standalone.host.width < width - 1
+        && parseFloat(gitManagerLayout.standalone.bodyMarginInlineEnd) > 0
+        && gitManagerLayout.standalone.resizeHandleDisplay !== "none"
+        && gitManagerLayout.embedded.modal.width < width;
+    assertSmokeResult(`Git Manager standalone and embedded geometry at ${width}px`, passed, JSON.stringify(gitManagerLayout));
+  }
+
+  /*
+  FNXC:GitHubImport 2026-08-02-02:45:
+  FN-8722 requires both branches of FloatingWindow's width-or-height sheet predicate. Positive
+  assertions cover the real standalone regions at phone, wide-short, and desktop-short viewports,
+  while non-short 768px/desktop retain the desktop gutter and visible resize handle. Embedded and
+  detail fixtures are controls: they remain contained but receive no standalone-only reset.
+  */
+  for (const [width, height] of [[390, 844], [768, 480], [1024, 480], [768, 844], [1024, 844]]) {
+    const isSheet = width < 768 || height <= 480;
+    await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: width < 768 ? 2 : 1, mobile: width < 768 });
+    await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+    const layout = await evaluate(page, `(() => {
+      const viewportWidth = window.innerWidth;
+      const readRect = (selector) => { const rect = document.querySelector(selector).getBoundingClientRect(); return { left: rect.left, right: rect.right, width: rect.width, top: rect.top, bottom: rect.bottom }; };
+      const standalone = document.querySelector('[data-smoke="github-import-standalone"]');
+      const standaloneBody = document.querySelector('[data-smoke="github-import-standalone-body"]');
+      const embeddedHost = document.querySelector('[data-smoke="github-import-embedded-host"]');
+      const detail = document.querySelector('[data-smoke="github-import-detail"]');
+      return { viewportWidth, documentOverflow: document.documentElement.scrollWidth - viewportWidth, standalone: { host: readRect('[data-smoke="github-import-standalone"]'), body: readRect('[data-smoke="github-import-standalone-body"]'), modal: readRect('[data-smoke="github-import-standalone-modal"]'), header: readRect('[data-smoke="github-import-standalone-header"]'), close: readRect('[data-smoke="github-import-standalone-close"]'), controls: readRect('[data-smoke="github-import-standalone-controls"]'), list: readRect('[data-smoke="github-import-standalone-list"]'), pagination: readRect('[data-smoke="github-import-standalone-pagination"]'), footer: readRect('[data-smoke="github-import-standalone-footer"]'), bodyMarginInlineEnd: getComputedStyle(standaloneBody).marginInlineEnd, overflow: standalone.scrollWidth - standalone.clientWidth, resizeHandleDisplay: getComputedStyle(standalone.querySelector('.floating-window__resize-handle')).display }, embedded: { host: readRect('[data-smoke="github-import-embedded-host"]'), modal: readRect('[data-smoke="github-import-embedded-modal"]'), header: readRect('[data-smoke="github-import-embedded-header"]'), content: readRect('[data-smoke="github-import-embedded-content"]'), overflow: embeddedHost.scrollWidth - embeddedHost.clientWidth }, detail: { host: readRect('[data-smoke="github-import-detail"]'), body: readRect('[data-smoke="github-import-detail-body"]'), panel: readRect('[data-smoke="github-import-detail-panel"]'), close: readRect('[data-smoke="github-import-detail-close"]'), overflow: detail.scrollWidth - detail.clientWidth } };
+    })()`);
+    if (width === 390 && gitHubImportBeforeMobileScreenshotPath) {
+      const preFixLayout = await evaluate(page, `(() => { const body = document.querySelector('[data-smoke="github-import-standalone-body"]'); body.style.marginInlineEnd = 'var(--space-lg)'; const rect = body.getBoundingClientRect(); return { right: rect.right, marginInlineEnd: getComputedStyle(body).marginInlineEnd, viewportWidth: window.innerWidth }; })()`);
+      assertSmokeResult("GitHub Import 390px desktop-gutter reproduction", parseFloat(preFixLayout.marginInlineEnd) > 0 && preFixLayout.right < preFixLayout.viewportWidth - 1, JSON.stringify(preFixLayout));
+      const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+      await writeFile(gitHubImportBeforeMobileScreenshotPath, Buffer.from(screenshot.data, "base64"));
+      await evaluate(page, "document.querySelector('[data-smoke=\"github-import-standalone-body\"]').style.removeProperty('margin-inline-end')");
+      log(`saved GitHub Import before mobile screenshot to ${gitHubImportBeforeMobileScreenshotPath}`);
+    }
+    if (isSheet && ((width === 390 && gitHubImportAfterMobileScreenshotPath) || (width === 768 && height === 480 && gitHubImportAfterShortScreenshotPath))) {
+      const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+      const target = width === 390 ? gitHubImportAfterMobileScreenshotPath : gitHubImportAfterShortScreenshotPath;
+      await writeFile(target, Buffer.from(screenshot.data, "base64"));
+      log(`saved GitHub Import sheet screenshot to ${target}`);
+    }
+    const standaloneRects = [layout.standalone.body, layout.standalone.modal, layout.standalone.header, layout.standalone.close, layout.standalone.controls, layout.standalone.list, layout.standalone.pagination, layout.standalone.footer];
+    const embeddedRects = [layout.embedded.modal, layout.embedded.header, layout.embedded.content];
+    const detailRects = [layout.detail.body, layout.detail.panel, layout.detail.close];
+    const standaloneContained = standaloneRects.every((rect) => rect.left >= -1 && rect.right <= width + 1);
+    const embeddedContained = embeddedRects.every((rect) => rect.left >= layout.embedded.host.left - 1 && rect.right <= layout.embedded.host.right + 1);
+    const detailContained = detailRects.every((rect) => rect.left >= -1 && rect.right <= width + 1);
+    const common = layout.documentOverflow <= 1 && layout.standalone.overflow <= 1 && layout.embedded.overflow <= 1 && layout.detail.overflow <= 1 && standaloneContained && embeddedContained && detailContained && layout.standalone.close.right <= layout.standalone.header.right + 1 && layout.detail.close.right <= layout.detail.panel.right + 1;
+    const passed = isSheet
+      ? common && Math.abs(layout.standalone.host.left) <= 1 && Math.abs(layout.standalone.host.right - width) <= 1 && Math.abs(layout.standalone.body.right - width) <= 1 && Math.abs(layout.standalone.modal.right - width) <= 1 && layout.standalone.bodyMarginInlineEnd === "0px" && layout.standalone.resizeHandleDisplay === "none"
+      : common && layout.standalone.host.width < width - 1 && parseFloat(layout.standalone.bodyMarginInlineEnd) > 0 && layout.standalone.resizeHandleDisplay !== "none";
+    assertSmokeResult(`GitHub Import standalone, embedded, and detail geometry at ${width}x${height}`, passed, JSON.stringify(layout));
+  }
+
+  await page.send("Emulation.setDeviceMetricsOverride", {
+    width: 390,
+    height: 844,
+    deviceScaleFactor: 2,
+    mobile: true,
+  });
+  await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+
   const prCreateModalLayout = await evaluate(page, `(() => {
     document.querySelector('[data-smoke="show-pr-create"]').click();
     const modal = document.querySelector('[data-smoke="pr-create-modal"] .modal.modal-lg');
@@ -1174,7 +2577,12 @@ async function runSmokeChecks(page, pageUrl) {
         locale: save.dataset.locale,
         label: save.textContent.trim(),
         saveWidth: rect.width,
+        saveHeight: rect.height,
         saveOverflow: save.scrollWidth - save.clientWidth,
+        optionOverflow: (() => {
+          const options = fixture.querySelector('[data-smoke="quick-add-options"]');
+          return options ? options.scrollWidth - options.clientWidth : 0;
+        })(),
         rowOverflow: row.scrollWidth - row.clientWidth,
         composerOverflow: composer.scrollWidth - composer.clientWidth,
         saveRight: rect.right,
@@ -1183,43 +2591,94 @@ async function runSmokeChecks(page, pageUrl) {
     });
   })()`);
 
-  const collectTaskDetailInlineIconSizes = () => evaluate(page, `(() => {
-    return [...document.querySelectorAll('section[data-smoke^="task-detail-inline-row-"]:not([data-smoke="task-detail-inline-row-fixtures"])')].map((fixture) => {
-      const row = fixture.querySelector('.detail-meta-inline-controls');
-      const icons = [...row.querySelectorAll('svg')].map((svg) => {
-        const style = getComputedStyle(svg);
-        return { width: style.width, height: style.height };
-      });
+  const collectAlphaPalette = () => evaluate(page, `(() => {
+    const root = document.querySelector('[data-alpha-surface="true"]');
+    const style = getComputedStyle(root);
+    return ['--alpha-neutral-background', '--alpha-neutral-foreground', '--alpha-neutral-border', '--alpha-neutral-accent']
+      .map((name) => style.getPropertyValue(name).trim());
+  })()`);
+
+  /*
+  FNXC:HomemadeAlphaFocus 2026-09-11-01:04:
+  The browser smoke focuses production Board, Chat, and portaled Quick Entry control classes and reads their resolved box shadows. This guards the complete-shadow alias contract that DOM emulators cannot validate through `:focus-visible`, including color-theme stability and light/dark palette changes.
+  */
+  const collectAlphaFocusShadows = () => evaluate(page, `(() => {
+    const boardRoot = document.querySelector('[data-smoke="board"]');
+    const boardCard = boardRoot.querySelector('.card');
+    boardRoot.setAttribute('data-alpha-surface', 'true');
+    boardCard.tabIndex = 0;
+
+    const chatRoot = document.createElement('section');
+    chatRoot.setAttribute('data-alpha-surface', 'true');
+    chatRoot.innerHTML = '<button type="button" class="chat-input-stop">Stop</button>';
+    document.body.append(chatRoot);
+
+    const portalRoot = document.createElement('section');
+    portalRoot.setAttribute('data-alpha-portal', 'true');
+    portalRoot.innerHTML = '<button type="button" class="quick-entry-toggle">Options</button>';
+    document.body.append(portalRoot);
+
+    const controls = [boardCard, chatRoot.querySelector('.chat-input-stop'), portalRoot.querySelector('.quick-entry-toggle')];
+    const shadows = controls.map((control) => {
+      control.focus();
+      return getComputedStyle(control).boxShadow;
+    });
+    boardRoot.removeAttribute('data-alpha-surface');
+    chatRoot.remove();
+    portalRoot.remove();
+    return shadows;
+  })()`);
+
+  const collectTaskDetailActionsMenuLayout = () => evaluate(page, `(() => {
+    return [...document.querySelectorAll('section[data-smoke^="task-detail-actions-menu-"]:not([data-smoke="task-detail-actions-menu-fixtures"])')].map((fixture) => {
+      const menu = fixture.querySelector('.detail-actions-menu');
+      const menuRect = menu.getBoundingClientRect();
+      const items = [...menu.querySelectorAll('.detail-actions-menu-item')];
+      const style = getComputedStyle(menu);
       return {
         fixture: fixture.dataset.smoke,
-        rowOverflow: row.scrollWidth - row.clientWidth,
-        icons,
+        horizontalOverflow: menu.scrollWidth - menu.clientWidth,
+        verticalOverflow: menu.scrollHeight - menu.clientHeight,
+        overflowX: style.overflowX,
+        overflowY: style.overflowY,
+        itemCount: items.length,
+        noteCount: menu.querySelectorAll('.detail-actions-menu-note').length,
+        itemsContained: items.every((item) => {
+          const rect = item.getBoundingClientRect();
+          return rect.left >= menuRect.left - 1 && rect.right <= menuRect.right + 1;
+        }),
+        hasOversightHeading: Boolean(menu.querySelector('[data-testid="detail-actions-oversight-heading"]')),
+        hasPriorityHeading: Boolean(menu.querySelector('[data-testid="detail-actions-priority-heading"]')),
       };
     });
   })()`);
 
   /*
-  FNXC:TaskDetailModalResponsive 2026-07-19-12:00:
-  Visible SVG dimensions are a browser-only invariant: every optional-control
-  variant must measure the compact token at mobile, tablet, and desktop, rather
-  than relying on CSS-source parsing or a tablet-only regression check.
+  FNXC:TaskDetailFooterActions 2026-09-06-00:31:
+  Blink verifies the relocated menu's horizontal containment and scrolling at the compact mobile height as well as the supported tablet and desktop widths. The full variant must overflow vertically on the short viewport so this smoke exercises the actual scroll surface instead of merely parsing its CSS.
   */
-  for (const [name, width, height, deviceScaleFactor, mobile] of [
-    ["mobile", 390, 844, 2, true],
-    ["tablet", 900, 900, 1, false],
-    ["desktop", 1440, 900, 1, false],
+  for (const [name, width, height, deviceScaleFactor, mobile, expectFullMenuScroll] of [
+    ["short mobile", 390, 480, 2, true, true],
+    ["tablet", 900, 900, 1, false, false],
+    ["desktop", 1440, 900, 1, false, false],
   ]) {
     await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor, mobile });
     await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
-    const taskDetailIconSizes = await collectTaskDetailInlineIconSizes();
+    const taskDetailActionsMenus = await collectTaskDetailActionsMenuLayout();
+    const fullMenu = taskDetailActionsMenus.find((fixture) => fixture.fixture === "task-detail-actions-menu-full");
     assertSmokeResult(
-      `Task Detail inline action icons are uniformly 14px at ${name}`,
-      taskDetailIconSizes.length === 4
-        && taskDetailIconSizes.every((fixture) => fixture.rowOverflow <= 1
-          && fixture.icons.length >= 3
-          && fixture.icons.every((icon) => icon.width === "14px" && icon.height === "14px")
-          && new Set(fixture.icons.map((icon) => `${icon.width}×${icon.height}`)).size === 1),
-      JSON.stringify(taskDetailIconSizes),
+      `Task Detail footer Actions menus stay contained and scrollable at ${name}`,
+      taskDetailActionsMenus.length === 4
+        && taskDetailActionsMenus.every((fixture) => fixture.horizontalOverflow <= 1
+          && fixture.overflowX === "hidden"
+          && fixture.overflowY === "auto"
+          && fixture.itemCount >= 7
+          && fixture.noteCount >= 1
+          && fixture.itemsContained
+          && fixture.hasPriorityHeading)
+        && fullMenu?.hasOversightHeading === true
+        && (!expectFullMenuScroll || (fullMenu?.verticalOverflow ?? 0) > 1),
+      JSON.stringify(taskDetailActionsMenus),
     );
   }
 
@@ -1267,6 +2726,131 @@ async function runSmokeChecks(page, pageUrl) {
     JSON.stringify(mailboxMobileHeaderLayout),
   );
 
+  /*
+  FNXC:GitHubImport 2026-07-23-12:18:
+  Four GitHub issue actions must remain one contained, non-overlapping row at 320px, 390px, and
+  412px. This verifies the full labels and usable 44px minimum targets in a real browser instead
+  of relying on jsdom's zero-layout model or a CSS-source-only assertion.
+  */
+  for (const width of [320, 390, 412]) {
+    await page.send("Emulation.setDeviceMetricsOverride", {
+      width,
+      height: 844,
+      deviceScaleFactor: 2,
+      mobile: true,
+    });
+    await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+    const githubImportActionsLayout = await evaluate(page, `(() => {
+      const bar = document.querySelector('[data-smoke="github-import-mobile-actions"] .github-import-detail-actions');
+      const actionRow = bar.querySelector('.github-import-detail-action-row');
+      const barRect = bar.getBoundingClientRect();
+      const actionRowRect = actionRow.getBoundingClientRect();
+      const composer = bar.querySelector('.github-import-issue-comment-composer');
+      const composerRect = composer.getBoundingClientRect();
+      const buttons = [...actionRow.querySelectorAll('button')].map((button) => {
+        const rect = button.getBoundingClientRect();
+        const style = getComputedStyle(button);
+        return {
+          label: button.innerText.trim(),
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          width: rect.width,
+          height: rect.height,
+          overflowX: button.scrollWidth - button.clientWidth,
+          overflowY: button.scrollHeight - button.clientHeight,
+          display: style.display,
+          visibility: style.visibility,
+          opacity: style.opacity,
+          textOverflow: style.textOverflow,
+        };
+      });
+      return {
+        composer: {
+          bottom: composerRect.bottom,
+          top: composerRect.top,
+        },
+        actionRow: {
+          left: actionRowRect.left,
+          right: actionRowRect.right,
+          top: actionRowRect.top,
+          bottom: actionRowRect.bottom,
+          overflowX: actionRow.scrollWidth - actionRow.clientWidth,
+          overflowY: actionRow.scrollHeight - actionRow.clientHeight,
+        },
+        bar: {
+          left: barRect.left,
+          right: barRect.right,
+          top: barRect.top,
+          bottom: barRect.bottom,
+          overflowX: bar.scrollWidth - bar.clientWidth,
+          overflowY: bar.scrollHeight - bar.clientHeight,
+        },
+        buttons,
+      };
+    })()`);
+    const expectedLabels = ["Close issue", "Plan", "Chat", "Import as task"];
+    assertSmokeResult(
+      `GitHub issue actions remain a visible one-row touch-safe layout at ${width}px`,
+      githubImportActionsLayout.buttons.length === expectedLabels.length
+        && githubImportActionsLayout.buttons.every((button, index, buttons) =>
+          button.label === expectedLabels[index]
+          && button.top === buttons[0].top
+          && button.bottom === buttons[0].bottom
+          && button.left >= githubImportActionsLayout.actionRow.left - 1
+          && button.right <= githubImportActionsLayout.actionRow.right + 1
+          && button.width >= 44
+          && button.height >= 44
+          && button.overflowX <= 1
+          && button.overflowY <= 1
+          && button.display !== "none"
+          && button.visibility !== "hidden"
+          && button.opacity !== "0"
+          && button.textOverflow !== "ellipsis")
+        && githubImportActionsLayout.buttons.every((button, index, buttons) =>
+          index === 0 || buttons[index - 1].right <= button.left + 1)
+        && githubImportActionsLayout.actionRow.overflowX <= 1
+        && githubImportActionsLayout.actionRow.overflowY <= 1
+        && githubImportActionsLayout.composer.bottom <= githubImportActionsLayout.actionRow.top + 1
+        && githubImportActionsLayout.bar.overflowX <= 1
+        && githubImportActionsLayout.bar.overflowY <= 1,
+      JSON.stringify(githubImportActionsLayout),
+    );
+
+    if (screenshotPath && width === 390) {
+      const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+      await writeFile(screenshotPath, Buffer.from(screenshot.data, "base64"));
+      log(`saved GitHub import mobile screenshot to ${screenshotPath}`);
+    }
+  }
+
+  await evaluate(page, "document.body.dataset.theme = 'dark'; document.body.dataset.colorTheme = 'cozy-cartoon'; true");
+  const darkCozyAlphaPalette = await collectAlphaPalette();
+  const darkCozyAlphaFocusShadows = await collectAlphaFocusShadows();
+  await evaluate(page, "document.body.dataset.colorTheme = 'shadcn-purple'; true");
+  const darkPurpleAlphaPalette = await collectAlphaPalette();
+  const darkPurpleAlphaFocusShadows = await collectAlphaFocusShadows();
+  await evaluate(page, "document.body.dataset.theme = 'light'; true");
+  const lightPurpleAlphaPalette = await collectAlphaPalette();
+  const lightPurpleAlphaFocusShadows = await collectAlphaFocusShadows();
+  assertSmokeResult(
+    "homemade Alpha palette ignores Fusion colors and responds only to light/dark",
+    darkCozyAlphaPalette.every(Boolean)
+      && JSON.stringify(darkCozyAlphaPalette) === JSON.stringify(darkPurpleAlphaPalette)
+      && JSON.stringify(lightPurpleAlphaPalette) !== JSON.stringify(darkPurpleAlphaPalette),
+    JSON.stringify({ darkCozyAlphaPalette, darkPurpleAlphaPalette, lightPurpleAlphaPalette }),
+  );
+  assertSmokeResult(
+    "homemade Alpha Board, Chat, and portal focus shadows are valid and theme-neutral",
+    darkCozyAlphaFocusShadows.length === 3
+      && darkCozyAlphaFocusShadows.every((shadow) => shadow && shadow !== "none")
+      && JSON.stringify(darkCozyAlphaFocusShadows) === JSON.stringify(darkPurpleAlphaFocusShadows)
+      && JSON.stringify(lightPurpleAlphaFocusShadows) !== JSON.stringify(darkPurpleAlphaFocusShadows),
+    JSON.stringify({ darkCozyAlphaFocusShadows, darkPurpleAlphaFocusShadows, lightPurpleAlphaFocusShadows }),
+  );
+  await evaluate(page, `document.body.dataset.theme = ${JSON.stringify(smokeTheme)}; true`);
+
   await page.send("Emulation.setDeviceMetricsOverride", {
     width: 412,
     height: 915,
@@ -1281,9 +2865,12 @@ async function runSmokeChecks(page, pageUrl) {
     .map((layout) => layout.saveWidth));
   assertSmokeResult(
     "Quick Add localized Save labels fit at the 300px supported minimum on mobile",
-    frenchMobileWidth === widestMobileWidth
-      && mobileQuickAddSaveLayout.length === 24
+    Number.isFinite(frenchMobileWidth)
+      && frenchMobileWidth === widestMobileWidth
+      && mobileQuickAddSaveLayout.length === QUICK_ADD_SAVE_FIXTURE_COUNT
       && mobileQuickAddSaveLayout.every((layout) => layout.saveOverflow <= 1
+        && layout.saveHeight <= 44
+        && layout.optionOverflow <= 1
         && layout.rowOverflow <= 1
         && layout.composerOverflow <= 1
         && layout.saveRight <= layout.composerRight + 1),
@@ -1297,6 +2884,46 @@ async function runSmokeChecks(page, pageUrl) {
     mobile: false,
   });
   await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+  const desktopResolvedGithubTableLayout = await collectResolvedGithubTableLayout();
+  assertSmokeResult(
+    "resolved GitHub table keeps readable desktop columns without overflow",
+    desktopResolvedGithubTableLayout.documentOverflow <= 1
+      && desktopResolvedGithubTableLayout.fixtureOverflow <= 1
+      && desktopResolvedGithubTableLayout.tableOverflow <= 1
+      && desktopResolvedGithubTableLayout.titleHeight > 0
+      && desktopResolvedGithubTableLayout.titleWidth <= desktopResolvedGithubTableLayout.fixtureWidth
+      && desktopResolvedGithubTableLayout.linkColor !== ""
+      && desktopResolvedGithubTableLayout.linkTextDecoration.includes("underline"),
+    JSON.stringify(desktopResolvedGithubTableLayout),
+  );
+  if (resolvedGithubDesktopScreenshotPath) {
+    await captureFixtureScreenshot(page, '[data-smoke="github-resolved-table"]', resolvedGithubDesktopScreenshotPath);
+    log(`saved resolved GitHub desktop screenshot to ${resolvedGithubDesktopScreenshotPath}`);
+  }
+  if (planApprovalDesktopScreenshotPath) {
+    await captureFixtureScreenshot(page, '[data-smoke="plan-review-replan-cap-approval"]', planApprovalDesktopScreenshotPath);
+    log(`saved Plan Review approval desktop screenshot to ${planApprovalDesktopScreenshotPath}`);
+  }
+  const desktopPlanApprovalLayout = await collectPlanApprovalLayout();
+  assertSmokeResult(
+    "Plan Review approval card and detail banner stay visible and contained on desktop",
+    planApprovalLayoutPasses(desktopPlanApprovalLayout),
+    JSON.stringify(desktopPlanApprovalLayout),
+  );
+
+  const desktopAgentHeartbeatLayout = await collectAgentHeartbeatControlLayout();
+  assertSmokeResult(
+    "agent heartbeat controls stay visible on desktop and omit ephemeral shells",
+    desktopAgentHeartbeatLayout.controls.length === 4 && desktopAgentHeartbeatLayout.controls.every((control) => control.width > 0 && control.height > 0 && control.left >= 0 && control.right <= desktopAgentHeartbeatLayout.viewportWidth + 1) && desktopAgentHeartbeatLayout.workerToggleCount === 0 && desktopAgentHeartbeatLayout.fixtureOverflow <= 1 && desktopAgentHeartbeatLayout.documentOverflow <= 1,
+    JSON.stringify(desktopAgentHeartbeatLayout),
+  );
+  if (agentHeartbeatDesktopScreenshotPath) {
+    await evaluate(page, "document.querySelector('[data-smoke=\"agent-heartbeat-controls\"]').scrollIntoView({ block: 'start' })");
+    const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+    await writeFile(agentHeartbeatDesktopScreenshotPath, Buffer.from(screenshot.data, "base64"));
+    log(`saved agent heartbeat desktop screenshot to ${agentHeartbeatDesktopScreenshotPath}`);
+  }
+
   const desktopQuickAddSaveLayout = await collectQuickAddSaveLayout();
   const frenchDesktopWidth = desktopQuickAddSaveLayout.find((layout) => layout.fixture === "quick-add-save-board-minimum-fr")?.saveWidth;
   const widestDesktopWidth = Math.max(...desktopQuickAddSaveLayout
@@ -1304,9 +2931,12 @@ async function runSmokeChecks(page, pageUrl) {
     .map((layout) => layout.saveWidth));
   assertSmokeResult(
     "Quick Add localized Save labels fit at the 300px supported minimum on desktop",
-    frenchDesktopWidth === widestDesktopWidth
-      && desktopQuickAddSaveLayout.length === 24
+    Number.isFinite(frenchDesktopWidth)
+      && frenchDesktopWidth === widestDesktopWidth
+      && desktopQuickAddSaveLayout.length === QUICK_ADD_SAVE_FIXTURE_COUNT
       && desktopQuickAddSaveLayout.every((layout) => layout.saveOverflow <= 1
+        && layout.saveHeight <= 32
+        && layout.optionOverflow <= 1
         && layout.rowOverflow <= 1
         && layout.composerOverflow <= 1
         && layout.saveRight <= layout.composerRight + 1),
@@ -1399,6 +3029,191 @@ async function runSmokeChecks(page, pageUrl) {
     ),
     JSON.stringify(chatComposerLayout),
   );
+
+  await runProductionAppBoardChecks(page, pageUrl, browserWsUrl);
+
+}
+
+const PRODUCTION_APP_BOARD_VIEWPORTS = [
+  { name: "desktop", width: 1200, height: 844, expectedMode: "desktop", touch: false, screenWidth: 1200, screenHeight: 844 },
+  { name: "tablet", width: 768, height: 844, expectedMode: "tablet", touch: true, screenWidth: 768, screenHeight: 1024 },
+  { name: "mobile portrait", width: 390, height: 844, expectedMode: "mobile", touch: true, screenWidth: 390, screenHeight: 844 },
+  { name: "mobile short landscape", width: 844, height: 390, expectedMode: "mobile", touch: true, screenWidth: 844, screenHeight: 390 },
+];
+const PRODUCTION_APP_BOARD_STATES = ["skeleton", "no-workflow", "empty", "populated", "duplicated"];
+
+/*
+FNXC:StandardBoardHeight 2026-09-12-20:20:
+The production App smoke must cross every historical Alpha-settings shape, Board data state, and supported viewport to prove stale values cannot disable the official design. Tablet proof uses a touch-capable physical screen and asserts App's published viewport mode; every workflow-bearing state exercises both selected and aggregate Board render paths, while the no-workflow state has no aggregate destination by definition.
+*/
+export function createProductionAppBoardScenarios() {
+  return ["absent", "false"].flatMap((alpha) =>
+    PRODUCTION_APP_BOARD_VIEWPORTS.flatMap((viewport) =>
+      PRODUCTION_APP_BOARD_STATES.flatMap((state) =>
+        (state === "no-workflow" ? [false] : [false, true]).map((aggregate) => ({
+          alpha,
+          state,
+          aggregate,
+          ...viewport,
+        })),
+      ),
+    ),
+  );
+}
+
+async function runProductionAppBoardChecks(page, pageUrl, browserWsUrl) {
+  let activePage = page;
+  let closeActivePage = null;
+  const productionAppUrl = new URL("production-app/", pageUrl);
+  const loadProductionBoard = async ({ alpha, state, width, height, expectedMode, touch, screenWidth, screenHeight, aggregate }) => {
+    if (process.env.FUSION_BROWSER_SMOKE_STANDARD_BOARD_ONLY === "1") log(`production App scenario: ${alpha}/${state}/${width}x${height}/${expectedMode}/${aggregate ? "aggregate" : "selected"}`);
+    await activePage.send("Emulation.setDeviceMetricsOverride", {
+      width,
+      height,
+      deviceScaleFactor: touch ? 2 : 1,
+      mobile: touch,
+      screenWidth,
+      screenHeight,
+    });
+    await activePage.send("Emulation.setTouchEmulationEnabled", { enabled: touch, maxTouchPoints: touch ? 5 : 1 });
+    const projectId = `${STANDARD_BOARD_SMOKE_PROJECT_ID}-${alpha}-${state}-${expectedMode}-${aggregate ? "aggregate" : "selected"}`;
+    productionAppUrl.search = new URLSearchParams({
+      project: projectId,
+      smokeAlpha: alpha,
+      smokeState: state,
+    }).toString();
+    await evaluate(activePage, `(() => {
+      localStorage.setItem(${JSON.stringify(`kb:${projectId}:kb-dashboard-task-view`)}, 'board');
+      localStorage.setItem('kb-dashboard-task-view', 'board');
+      sessionStorage.setItem(${JSON.stringify(`kb:${projectId}:kb-dashboard-task-view-session`)}, 'board');
+      return true;
+    })()`);
+    const appLoaded = activePage.once("Page.loadEventFired");
+    await activePage.send("Page.navigate", { url: productionAppUrl.href });
+    await appLoaded;
+    await evaluate(activePage, `new Promise((resolve, reject) => {
+      const deadline = performance.now() + 10000;
+      const poll = () => {
+        const boardTab = document.querySelector('[data-testid="mobile-nav-tab-tasks"]')
+          ?? [...document.querySelectorAll('button')].find((button) => ['Tasks', 'Board'].includes(button.textContent.trim()));
+        if (!document.querySelector('.dashboard-project-stack .project-content .board') && boardTab?.getAttribute('aria-selected') !== 'true') boardTab?.click();
+        const board = document.querySelector('.dashboard-project-stack .project-content .board');
+        const cards = board?.querySelectorAll('[data-virtual-task-row]') ?? [];
+        const duplicateCount = [...cards].filter((card) => card.textContent.includes('Carte dupliquée')).length;
+        const expectedState = ${JSON.stringify(String(state))};
+        const dataReady = expectedState === 'populated' ? cards.length >= 1
+          : expectedState === 'duplicated' ? duplicateCount === 2
+          : expectedState === 'skeleton' ? board?.classList.contains('board-workflows-skeleton')
+          : expectedState === 'no-workflow' ? board?.matches('[data-testid="board-workflows-empty"]')
+          : board?.classList.contains('board-workflow-columns') && cards.length === 0;
+        if (board && document.querySelector('.executor-status-bar') && dataReady) return resolve(true);
+        if (performance.now() >= deadline) return reject(new Error('Timed out waiting for emitted App Board: ' + document.body.innerText.slice(0, 500)));
+        setTimeout(poll, 25);
+      };
+      poll();
+    })`);
+    if (aggregate) {
+      await evaluate(activePage, `(() => {
+        const trigger = document.querySelector('[data-testid="workflow-switcher"]');
+        if (!trigger) throw new Error('Missing production workflow switcher');
+        trigger.click();
+        return true;
+      })()`);
+      await evaluate(activePage, `new Promise((resolve, reject) => {
+        const deadline = performance.now() + 5000;
+        const poll = () => {
+          const option = document.querySelector('[data-testid="workflow-switcher-option-__all_workflows__"]');
+          if (option) { option.click(); return resolve(true); }
+          if (performance.now() >= deadline) return reject(new Error('Timed out waiting for aggregate workflow option'));
+          setTimeout(poll, 25);
+        };
+        poll();
+      })`);
+    }
+    return evaluate(activePage, `(() => {
+      const board = document.querySelector('.dashboard-project-stack .project-content .board');
+      const footer = document.querySelector('.executor-status-bar');
+      const nav = document.querySelector('.mobile-nav-bar');
+      const workflowSwitcher = document.querySelector('[data-testid="workflow-switcher"]');
+      if (!board || !footer) throw new Error('Emitted App did not render the standard Board/footer shell');
+      const boardRect = board.getBoundingClientRect();
+      const footerRect = footer.getBoundingClientRect();
+      const columns = [...board.querySelectorAll('.column, .board-workflows-skeleton__column')];
+      const bodies = columns.map((column) => column.querySelector('.column-body')).filter(Boolean);
+      for (const body of bodies) body.scrollTop = body.scrollHeight;
+      const lastCards = bodies.map((body) => body.querySelector('[data-virtual-task-row]:last-of-type'));
+      return {
+        alphaSurface: board.closest('[data-alpha-surface]')?.getAttribute('data-alpha-surface'),
+        viewportMode: document.documentElement.dataset.viewportMode,
+        boardTop: boardRect.top,
+        boardBottom: boardRect.bottom,
+        lowerBoundary: footerRect.top,
+        columnTops: columns.map((column) => column.getBoundingClientRect().top),
+        columnBottoms: columns.map((column) => column.getBoundingClientRect().bottom),
+        columnHeights: columns.map((column) => column.getBoundingClientRect().height),
+        columnScrollable: bodies.map((body) => body.scrollHeight > body.clientHeight && ['auto', 'scroll'].includes(getComputedStyle(body).overflowY)),
+        lastCardsReachable: bodies.map((body, index) => !lastCards[index] || lastCards[index].getBoundingClientRect().bottom <= body.getBoundingClientRect().bottom + 1),
+        documentScrollable: document.documentElement.scrollHeight > document.documentElement.clientHeight + 1 || document.body.scrollHeight > document.body.clientHeight + 1,
+        boardPaddingTop: Number.parseFloat(getComputedStyle(board).paddingTop),
+        boardPaddingBottom: Number.parseFloat(getComputedStyle(board).paddingBottom),
+        footerVisible: footerRect.height > 0 && footerRect.bottom <= window.innerHeight + 1,
+        navVisible: !nav || nav.getBoundingClientRect().height > 0,
+        selectedBranch: ${JSON.stringify(String(state))} === 'no-workflow'
+          ? !workflowSwitcher
+          : ${JSON.stringify(Boolean(aggregate))}
+            ? workflowSwitcher?.getAttribute('aria-label')?.includes('All workflows') === true
+            : Boolean(workflowSwitcher) && workflowSwitcher?.getAttribute('aria-label')?.includes('All workflows') === false,
+        duplicateCount: [...board.querySelectorAll('[data-virtual-task-row]')].filter((card) => card.textContent.includes('Carte dupliquée')).length,
+        boardClass: board.className,
+      };
+    })()`);
+  };
+
+  const scenarios = createProductionAppBoardScenarios();
+  const requestedScenarioIndex = Number.parseInt(process.env.FUSION_BROWSER_SMOKE_STANDARD_BOARD_SCENARIO ?? "", 10);
+  const selectedScenarios = Number.isInteger(requestedScenarioIndex) ? [scenarios[requestedScenarioIndex]].filter(Boolean) : scenarios;
+  for (const [scenarioIndex, scenario] of selectedScenarios.entries()) {
+    if (scenarioIndex > 0 && browserWsUrl) {
+      if (closeActivePage) {
+        await closeActivePage();
+      } else {
+        const previousPageStopped = activePage.once("Page.loadEventFired");
+        await activePage.send("Page.navigate", { url: "about:blank" });
+        await previousPageStopped;
+      }
+      const isolated = await createIsolatedPage(browserWsUrl);
+      activePage = isolated.page;
+      closeActivePage = isolated.close;
+      await activePage.send("Page.enable");
+      await activePage.send("Runtime.enable");
+      const fixtureLoaded = activePage.once("Page.loadEventFired");
+      await activePage.send("Page.navigate", { url: pageUrl });
+      await fixtureLoaded;
+    }
+    const layout = await loadProductionBoard(scenario);
+    if (process.env.FUSION_BROWSER_SMOKE_STANDARD_BOARD_ONLY === "1") log(`production App layout: ${JSON.stringify(layout)}`);
+    const hasColumns = layout.columnHeights.length > 0;
+    const populated = scenario.state === "populated" || scenario.state === "duplicated";
+    const topGaps = layout.columnTops.map((top) => top - layout.boardTop);
+    const bottomGaps = layout.columnBottoms.map((bottom) => layout.lowerBoundary - bottom);
+    const geometryMatches = Math.abs(layout.boardBottom - layout.lowerBoundary) <= 1
+      && Math.abs(layout.boardPaddingTop - layout.boardPaddingBottom) <= 1
+      && (!hasColumns || (layout.columnHeights.every((height) => height > 0)
+        && topGaps.every((gap, index) => Math.abs(gap - bottomGaps[index]) <= 1)))
+      && (!populated || (layout.columnScrollable.some(Boolean) && layout.lastCardsReachable.every(Boolean)));
+    assertSmokeResult(
+      `Emitted App ${scenario.aggregate ? "aggregate" : "selected"} Board ${scenario.state} (historical Alpha ${scenario.alpha}) uses real safe geometry on ${scenario.name}`,
+      layout.alphaSurface === "true"
+        && layout.viewportMode === scenario.expectedMode
+        && geometryMatches
+        && layout.footerVisible
+        && layout.navVisible
+        && layout.selectedBranch
+        && !layout.documentScrollable
+        && (scenario.state !== "duplicated" || layout.duplicateCount === 2),
+      JSON.stringify(layout),
+    );
+  }
 }
 
 async function main() {
@@ -1419,20 +3234,25 @@ async function main() {
   }
 
   log("using local browser; this fixture smoke checks real CSS layout but does not replace full dashboard E2E coverage.");
-  const launched = await launchBrowser(executable);
   let fixture;
+  let launched;
   let page;
   try {
-    fixture = await startFixtureServer();
+    ({ fixture, launched } = await prepareBrowserSmoke(executable));
     page = await createPage(launched.wsUrl);
-    await runSmokeChecks(page, fixture.url);
+    await runSmokeChecks(page, fixture.url, launched.wsUrl);
   } finally {
     page?.close();
+    // FNXC:StandardBoardHeight 2026-09-12-19:19: The emitted App keeps SSE connections open; stop their browser owner before awaiting server.close().
+    if (launched) {
+      await stopBrowser(launched.browser);
+    }
     if (fixture) {
       await closeServer(fixture.server);
     }
-    await stopBrowser(launched.browser);
-    await rm(launched.userDataDir, { recursive: true, force: true });
+    if (launched) {
+      await rm(launched.userDataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
   }
 }
 

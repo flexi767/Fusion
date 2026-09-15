@@ -1,19 +1,20 @@
 import { Suspense, lazy, type ComponentType, type ReactNode } from "react";
 import {
-  CheckSquare,
   Folder,
-  ListTodo,
   GitBranch,
   GitPullRequest,
   History,
+  List as ListIcon,
   Lock,
   MessageSquare,
   Monitor,
+  StickyNote,
   type LucideProps,
 } from "lucide-react";
 import type { GithubIssueAction, Task, TaskDetail, WorkflowStep } from "@fusion/core";
 import type { PluginDashboardViewEntry } from "../api";
 import type { ToastType } from "../hooks/useToast";
+import type { ChatSessionInfo } from "../hooks/useChat";
 import { buildPluginTaskViewId } from "../plugins/pluginViewRegistry";
 import { PluginDashboardViewHost } from "../plugins/PluginDashboardViewHost";
 import type { DetailTaskTab, PluginDashboardViewContext } from "../plugins/types";
@@ -22,7 +23,7 @@ import { PageErrorBoundary } from "./ErrorBoundary";
 import { getPluginNavIcon } from "./pluginNavIcon";
 import { ActivityLogModal } from "./ActivityLogModal";
 import { GitManagerModal } from "./GitManagerModal";
-import { DockTaskList } from "./DockTaskList";
+import { attachNativeStructureRefToDrag } from "../utils/nativeStructureDrag";
 
 /*
 FNXC:Navigation 2026-06-22-00:40:
@@ -30,20 +31,22 @@ Dev Server and Secrets are right-dock tools (moved off the left sidebar). They r
 */
 const DevServerView = lazy(() => import("./DevServerView").then((m) => ({ default: m.DevServerView })));
 const SecretsView = lazy(() => import("./SecretsView").then((m) => ({ default: m.SecretsView })));
-const TodoView = lazy(() => import("./TodoView").then((m) => ({ default: m.TodoView })));
 const PullRequestView = lazy(() => import("./PullRequestView").then((m) => ({ default: m.PullRequestView })));
 const ChatView = lazy(() => import("./ChatView").then((m) => ({ default: m.ChatView })));
+const NotesView = lazy(() => import("./NotesView").then((m) => ({ default: m.NotesView })));
+
+export type OverflowViewHostMode = "standard" | "alpha-desktop";
 
 export type OverflowViewKey =
   | "usage"
   | "activity-log"
   | "git-manager"
-  | "tasks"
   | "files"
   | "chat"
+  | "list"
+  | "notes"
   | "devserver"
   | "secrets"
-  | "todos"
   | "pull-requests"
   | `plugin:${string}:${string}`;
 
@@ -58,16 +61,12 @@ export interface OverflowViewFeatureState {
 
 export interface OverflowViewRenderProps {
   projectId?: string;
-  /*
-  FNXC:RightDockFiles 2026-06-22-15:00:
-  `surface` tells a registry render function which host it is mounting into so it can pick a deterministic layout instead of relying on a fragile CSS container query.
-  The compact right-dock body leaves this undefined ("dock"); the RightDockExpandModal sets `surface="expand"` so DockFilesView forces its LEFT|RIGHT two-pane layout regardless of measured container width.
-  */
+  /** Explicit host contract; shared consumers default to standard behavior. */
+  hostMode?: OverflowViewHostMode;
+  experimentalFeatures?: OverflowViewFeatureState;
+  /** Per-task resolved column traits, threaded from App via useRightDockController. */
+  columnFlagsByTaskId?: ReadonlyMap<string, { complete?: boolean; countsTowardWip?: boolean; mergeBlocker?: boolean; humanReview?: boolean; intake?: boolean; hold?: boolean }>;
   surface?: "dock" | "expand";
-  /*
-  FNXC:RightDockFiles 2026-06-23-00:50:
-  Measured outer width (px) of the compact right dock body host, threaded from RightDock so a registry render function can deterministically pick a wide layout from the actual dock size. Only set on the "dock" surface; the expand pop-out leaves it undefined (it already forces its wide layout via surface="expand").
-  */
   dockWidth?: number;
   addToast: (message: string, type?: ToastType) => void;
   settingsLoaded?: boolean;
@@ -78,8 +77,13 @@ export interface OverflowViewRenderProps {
   pluginContext?: PluginDashboardViewContext;
   onOpenSettings?: (section?: string) => void;
   onOpenTaskDetail?: (taskId: string) => void;
-  onOpenTaskInDock?: (task: Task | TaskDetail) => void;
+  onOpenSessionInNewWindow?: (session: ChatSessionInfo) => void;
+  openChatWindows?: ReadonlyMap<string, "open" | "minimized">;
+  /** Opens New Task with a reverted source task's original description. */
+  onReviseTask?: (task: Task | TaskDetail) => void;
+  onUpdateTask?: (id: string, updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean; githubTracking?: { enabled?: boolean } }) => Promise<Task>;
   onDeleteTask?: (id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; githubIssueAction?: GithubIssueAction; allowResurrection?: boolean }) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
   onOpenDetail?: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
   onSendSelectionToTask?: (description: string) => void;
   onCreateTaskFromInsight?: (payload: { insightId: string; title: string; description: string }) => Promise<void> | void;
@@ -94,6 +98,16 @@ export interface OverflowViewRenderProps {
   onOpenGitHubImport?: () => void;
   onOpenGitManager?: () => void;
   onOpenSchedules?: () => void;
+  notesController?: import("../hooks/useNotes").UseNotesController;
+  onOpenNote?: (note: import("@fusion/core").ProjectNoteSummary) => void;
+  registerNotesGuard?: (guard: () => boolean | Promise<boolean>, onAccepted?: () => void) => () => void;
+  /*
+  FNXC:ListInRightDock 2026-09-14-03:31:
+  FN-382: the dock renders the REAL List surface, supplied by its owner rather than rebuilt here. Threading a render
+  callback instead of ~35 task props keeps one wiring of tasks, handlers and Quick Entry, so the dock cannot drift
+  from the dedicated route. The tab is absent whenever the owner provides no renderer (phone hosts, tests).
+  */
+  renderListView?: () => ReactNode;
 }
 
 export interface OverflowViewEntry {
@@ -104,23 +118,21 @@ export interface OverflowViewEntry {
   render?: (props: OverflowViewRenderProps) => ReactNode;
   onActivate?: (props: OverflowViewRenderProps) => void;
   isVisible?: (options: OverflowViewVisibilityOptions) => boolean;
+  isExpandable?: (options: OverflowViewVisibilityOptions) => boolean;
 }
 
 export interface OverflowViewVisibilityOptions {
   experimentalFeatures?: OverflowViewFeatureState;
+  hostMode?: OverflowViewHostMode;
   showSkillsTab?: boolean;
-  todosEnabled?: boolean;
   pluginDashboardViews?: PluginDashboardViewEntry[];
+  /** FN-382: true only where the host actually supplies the List surface, i.e. the non-mobile dock. */
+  listViewAvailable?: boolean;
 }
 
 /*
-FNXC:RightDockFiles 2026-06-23-00:50:
-When the dock body is at least this wide there is clearly room for the Files tree|viewer two-pane split, so the dock forces DockFilesView layout="two-pane" deterministically instead of relying on the unreliable @container dock-files query (its root content-box often measured under the breakpoint and kept the view stacked). Matched to the CSS @container dock-files (min-width: 640px) breakpoint; compared against the threaded outer dock width (the dock chrome padding is small relative to 640px of content, so 640 outer width safely implies enough body width for two panes).
-*/
-const RIGHT_DOCK_FILES_TWO_PANE_MIN_WIDTH = 640;
-/*
 FNXC:RightDockChat 2026-06-27-23:12:
-ChatView's desktop split pane is unusable in the default 360px right dock, so compact dock hosts force ChatView's narrow list/detail layout until the dock is wider than the tablet/mobile breakpoint. The expanded pop-out keeps the full desktop layout.
+ChatView shares one full-pane list/detail flow across dock widths, so compact dock hosts retain the narrow-layout signal only for surrounding chat chrome. The expanded pop-out keeps the same navigation contract.
 */
 const RIGHT_DOCK_CHAT_COMPACT_MAX_WIDTH = 768;
 
@@ -143,69 +155,73 @@ FN-6882 makes the right dock a tools rail for Activity, Activity Log, GitHub Imp
 FNXC:Navigation 2026-06-22-00:00:
 Right-dock tools render INLINE inside the dock container, not as popup modals: usage, activity-log, and git-manager use each modal's `presentation="embedded"` mode instead of launching an overlay. (github-import and automation remain launcher actions here only until their left-sidebar/main destinations land, then they leave the dock.)
 */
+/*
+FNXC:RightDockTasks 2026-09-12-01:35:
+Tasks is not a dock destination: Board and List already own task browsing. Programmatic task detail remains a temporary layer over the selected tool, so legacy stored "tasks" falls back through the ordinary Files default without leaving a tab, title, or expanded modal.
+*/
 export const STATIC_OVERFLOW_VIEW_ENTRIES: readonly OverflowViewEntry[] = [
-  /*
-  FNXC:RightDockTasks 2026-06-28-16:45:
-  Tasks is the leading right-dock inline view, but the persisted/default selection remains Files. It hosts the compact task list on both dock and expand surfaces; the dock-only detail surface is selected by RightDock when a task snapshot exists.
-  */
-  {
-    key: "tasks",
-    label: "Tasks",
-    icon: ListTodo,
-    testId: "right-dock-tab-tasks",
-    render: (props) => wrapOverflowView(
-      <DockTaskList
-        tasks={props.tasks ?? []}
-        projectId={props.projectId}
-        onOpenTask={props.onOpenTaskInDock}
-        onDeleteTask={props.onDeleteTask}
-        addToast={props.addToast}
-        prAuthAvailable={false}
-        autoMergeEnabled={false}
-      />,
-    ),
-  },
   /* FNXC:Navigation 2026-06-22-00:20: Files remains the default right-dock tool when no valid stored view exists. */
   {
     key: "files",
     label: "Files",
     icon: Folder,
     testId: "right-dock-tab-files",
-    /*
-    FNXC:RightDockFiles 2026-06-22-15:00:
-    Map the host surface to a deterministic DockFilesView layout. The expand pop-out gets `layout="two-pane"` so the tree+viewer render LEFT|RIGHT without depending on the @container query matching inside the modal body. The compact dock keeps `layout="auto"` (the container-query single-panel stack).
-
-    FNXC:RightDockFiles 2026-06-23-00:50:
-    Extend the deterministic approach to the DOCK itself: when the dock body is dragged wide (threaded `dockWidth` >= 640px) force the same LEFT|RIGHT two-pane split deterministically, NOT via the unreliable @container dock-files query (which kept the wide dock stacked because the root content-box measured under the breakpoint). Below the threshold the narrow dock keeps the single-panel stacked nav. The expand pop-out is always two-pane.
-    */
-    render: (props) => wrapOverflowView(
-      <DockFilesView
-        projectId={props.projectId}
-        openFile={props.openFile}
-        layout={
-          props.surface === "expand"
-          || (props.surface === "dock" && (props.dockWidth ?? 0) >= RIGHT_DOCK_FILES_TWO_PANE_MIN_WIDTH)
-            ? "two-pane"
-            : "auto"
-        }
-      />,
-    ),
+    render: (props) => wrapOverflowView(<DockFilesView projectId={props.projectId} openFile={props.openFile} />),
   },
   /*
   FNXC:Navigation 2026-06-27-00:00:
   The right dock hosts the full ChatView as an always-visible inline tool so the compact dock body and the floating expand modal reuse the same conversational surface without adding another navigation destination.
+  */
+  /*
+  FNXC:AlphaDesktopRightDock 2026-09-11-21:48:
+  Only the explicit Alpha desktop host turns Chat into a list-only window launcher and disables generic expansion. Standard tablet, desktop, floating, and absent-host callers retain the existing list/detail contract.
   */
   {
     key: "chat",
     label: "Chat",
     icon: MessageSquare,
     testId: "right-dock-tab-chat",
+    isExpandable: (options) => options.hostMode !== "alpha-desktop",
     render: (props) => wrapOverflowView(
       <ChatView
         projectId={props.projectId}
         addToast={props.addToast}
+        experimentalFeatures={{ ...(props.experimentalFeatures ?? {}) }}
+        onOpenSessionInNewWindow={props.onOpenSessionInNewWindow}
+        openChatWindows={props.openChatWindows}
+        listOnly={props.hostMode === "alpha-desktop"}
         compactLayout={props.surface === "dock" && (props.dockWidth ?? RIGHT_DOCK_CHAT_COMPACT_MAX_WIDTH) <= RIGHT_DOCK_CHAT_COMPACT_MAX_WIDTH}
       />,
+    ),
+  },
+  /*
+  FNXC:ListInRightDock 2026-09-14-03:31:
+  FN-382: List is a dock tool on every non-mobile host, so tasks can be read and created over whatever page is open
+  instead of navigating to a dedicated route. It renders its owner's real List surface and is deliberately NOT
+  expandable: the expand modal would create a second List owner beside the dock one.
+  */
+  {
+    key: "list",
+    label: "List",
+    icon: ListIcon,
+    testId: "right-dock-tab-list",
+    isVisible: (options) => Boolean(options.listViewAvailable),
+    isExpandable: () => false,
+    render: (props) => (props.renderListView ? wrapOverflowView(props.renderListView()) : null),
+  },
+  /*
+  FNXC:AlphaDesktopRightDock 2026-09-11-21:48:
+  Notes is an inline, non-expandable tool only in the explicit Alpha desktop dock. Standard docks exclude it entirely, preventing stale stored selections from creating a hidden or modal Notes owner.
+  */
+  {
+    key: "notes",
+    label: "Notes",
+    icon: StickyNote,
+    testId: "right-dock-tab-notes",
+    isVisible: (options) => options.hostMode === "alpha-desktop",
+    isExpandable: () => false,
+    render: (props) => wrapOverflowView(
+      <NotesView projectId={props.projectId} addToast={props.addToast} controller={props.notesController} onOpenNote={props.onOpenNote} compact listOnly />,
     ),
   },
   {
@@ -246,29 +262,14 @@ export const STATIC_OVERFLOW_VIEW_ENTRIES: readonly OverflowViewEntry[] = [
     icon: Monitor,
     testId: "right-dock-tab-devserver",
     isVisible: (options) => options.experimentalFeatures?.devServerView === true,
-    render: (props) => wrapOverflowView(<DevServerView tasks={props.tasks} addToast={props.addToast} projectId={props.projectId} />),
+    render: (props) => wrapOverflowView(<DevServerView tasks={props.tasks} addToast={props.addToast} projectId={props.projectId} columnFlagsByTaskId={props.columnFlagsByTaskId} />),
   },
   {
     key: "secrets",
     label: "Secrets",
     icon: Lock,
     testId: "right-dock-tab-secrets",
-    render: (props) => wrapOverflowView(<SecretsView addToast={props.addToast} />),
-  },
-  {
-    key: "todos",
-    label: "Todos",
-    icon: CheckSquare,
-    testId: "right-dock-tab-todos",
-    isVisible: (options) => options.todosEnabled === true,
-    render: (props) => wrapOverflowView(
-      <TodoView
-        projectId={props.projectId}
-        addToast={props.addToast}
-        onPlanningMode={props.onPlanningMode}
-        onTaskCreated={props.onTaskCreated}
-      />,
-    ),
+    render: (props) => wrapOverflowView(<SecretsView addToast={props.addToast} projectId={props.projectId} />),
   },
   {
     key: "pull-requests",
@@ -299,16 +300,27 @@ function buildPluginOverflowViewEntries(pluginDashboardViews: PluginDashboardVie
         render: (props: OverflowViewRenderProps) => wrapOverflowView(
           <PluginDashboardViewHost
             taskView={pluginTaskView}
-            context={props.pluginContext ?? {
-              projectId: props.projectId,
-              tasks: (props.tasks ?? []) as Task[],
-              workflowSteps: props.workflowSteps ?? [],
-              subscribePluginEvents: props.subscribePluginEvents,
-              openTaskDetail: props.onOpenDetail ?? (() => undefined),
-              openFile: props.openFile ?? (() => undefined),
-              renderTaskCard: props.renderTaskCard,
-              addToast: props.addToast,
-            }}
+            context={props.pluginContext
+              ? {
+                ...props.pluginContext,
+                // FNXC:NativeStructurePluginDrag 2026-08-09-05:48: Right-dock callers pass a
+                // prebuilt context, so inject the host drag seam here too rather than letting that
+                // path bypass the fallback context below.
+                beginNativeStructureDrag: props.pluginContext.beginNativeStructureDrag ?? attachNativeStructureRefToDrag,
+              }
+              : {
+                projectId: props.projectId,
+                tasks: (props.tasks ?? []) as Task[],
+                workflowSteps: props.workflowSteps ?? [],
+                subscribePluginEvents: props.subscribePluginEvents,
+                openTaskDetail: props.onOpenDetail ?? (() => undefined),
+                openFile: props.openFile ?? (() => undefined),
+                beginNativeStructureDrag: attachNativeStructureRefToDrag,
+                renderTaskCard: props.renderTaskCard,
+                addToast: props.addToast,
+                openPlanningMode: props.onPlanningMode,
+                onTaskCreated: props.onTaskCreated,
+              }}
           />,
         ),
       } satisfies OverflowViewEntry;
@@ -326,4 +338,8 @@ export function findOverflowViewEntry(key: OverflowViewKey, options: OverflowVie
 
 export function isOverflowViewKeyVisible(key: string, options: OverflowViewVisibilityOptions = {}): key is OverflowViewKey {
   return getVisibleOverflowViewEntries(options).some((entry) => entry.key === key);
+}
+
+export function isOverflowViewEntryExpandable(entry: OverflowViewEntry | undefined, options: OverflowViewVisibilityOptions = {}): boolean {
+  return Boolean(entry?.render && (entry.isExpandable?.(options) ?? true));
 }

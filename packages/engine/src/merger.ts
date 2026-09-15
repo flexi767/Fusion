@@ -2,9 +2,9 @@
 import { execSync, exec } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { promisify } from "node:util";
-import { IDENTITY_GUARD_BYPASS_ENV } from "./worktree-hooks.js";
-import { mergeEffectiveSettings } from "./effective-settings.js";
-import { buildUserCommentsPromptSection, selectUserCommentsForAgentContext } from "./agent-user-comments.js";
+import { IDENTITY_GUARD_BYPASS_ENV } from "./worktree/worktree-hooks.js";
+import { mergeEffectiveSettings } from "./project/effective-settings.js";
+import { buildUserCommentsPromptSection, selectUserCommentsForAgentContext } from "./agents/agent-user-comments.js";
 
 // Internal git plumbing intentionally bypasses sandbox backends.
 const execAsync = promisify(exec);
@@ -23,9 +23,23 @@ const execFileAsync: (file: string, args: string[], opts?: import("node:child_pr
  * checks for the exact value "1" so a leaked/empty var cannot accidentally
  * bypass agent commits.
  */
-function mergerCommitEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, [IDENTITY_GUARD_BYPASS_ENV]: "1" };
+/*
+FNXC:GitIdentity 2026-08-18-07:55:
+Every merge commit runs through this env, which is why the identity is applied here rather than at
+eight separate call sites. Without it these commits inherited whatever git identity the host
+happened to have — and on a host with none (container, CI, fresh machine) git refuses to commit at
+all, so the merge stalled at `status:merging` with no error surfaced. `resolveCommitIdentity`
+returns undefined only when the operator sets `commitAuthorEnabled: false`, which restores the old
+ambient-config behaviour for anyone who wants commits authored as themselves.
+*/
+function mergerCommitEnv(identity?: CommitIdentity): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    [IDENTITY_GUARD_BYPASS_ENV]: "1",
+    ...commitIdentityEnv(identity ?? resolveCommitIdentity()),
+  };
 }
+import { commitIdentityEnv, resolveCommitIdentity, type CommitIdentity } from "./git-identity.js";
 import {
   detectMissingWorkspaceEntry,
   runVerificationCommand as runVerificationCommandShared,
@@ -35,7 +49,7 @@ import {
   VERIFICATION_LOG_MAX_CHARS,
   type VerificationCommandResult,
   type VerificationResult,
-} from "./verification-utils.js";
+} from "./execution/verification-utils.js";
 import { resolveSandboxBackend } from "./sandbox/index.js";
 import type { SandboxBackend } from "./sandbox/types.js";
 
@@ -49,11 +63,11 @@ export {
   VERIFICATION_LOG_MAX_CHARS,
   type VerificationCommandResult,
   type VerificationResult,
-} from "./verification-utils.js";
+} from "./execution/verification-utils.js";
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   computeLockfileHash,
   getConfiguredWorktreeInitCommand,
@@ -63,20 +77,22 @@ import {
   INSTALL_MARKER_RELPATH,
   readInstallMarker,
   writeInstallMarker,
-} from "./merge-dependency-sync.js";
-import { resolveTaskWorkingBranch } from "./worktree-names.js";
+} from "./merge/merge-dependency-sync.js";
+import { resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
 import {
   collectOwnTaskCommitsForRange,
   filterFilesToOwnTaskCommits,
   SilentNoOpAttributionMismatchError,
-} from "./branch-attribution.js";
-import { isBranchAuthoritativeForTask } from "./branch-conflicts.js";
+} from "./execution/branch-attribution.js";
+import { isBranchAuthoritativeForTask } from "./execution/branch-conflicts.js";
 import { hostname } from "node:os";
 import {
   assertNotWorkspaceTaskMerge,
   buildTaskLineageTrailer,
   evaluateNoCommitsNoOpFinalize,
   getTaskMergeBlocker,
+  isPreMergeStepsNotRunBlocker,
+  PreMergeStepsNotRunError,
   normalizeMergeConflictStrategy,
   normalizeMergeStrategyOverlapBehavior,
   normalizePostMergeAuditMode,
@@ -85,6 +101,7 @@ import {
   resolveTitleSummarizerSettingsModel,
   resolveAgentPrompt,
   resolvePersistAgentThinkingLog,
+  resolveAgentMemoryInclusionMode,
   summarizeCommitBody,
   summarizeCommitSubject,
   summarizeMergeCommit,
@@ -106,22 +123,48 @@ import {
   isMergeRequestContractShadowEnabled,
   resolveMergerFallbackModel,
   resolveWorkflowIrForTask,
-  resolveReboundTarget,
+  resolvePreMergeGateForTask,
+  resolveRequiredPreMergeStepIds,
   resolveCompleteColumn,
   resolveMergeOrchestrationColumn,
+  resolveTaskLifecycleColumns,
+  isFusionDeletableBranch,
+  classifyTaskBranchOrigin,
+  type WorkflowIr,
+  type OverlapWaitLandedPath
 } from "@fusion/core";
-import { evaluateAutoMergeFactProviders } from "./auto-merge-fact-providers.js";
-import { resolveMergePolicy } from "./merge-trait.js";
+import { evaluateAutoMergeFactProviders } from "./merge/auto-merge-fact-providers.js";
+import { resolveMergePolicy } from "./merge/merge-trait.js";
 import { describeModel, promptWithFallback } from "./pi.js";
-import { accumulateSessionTokenUsage } from "./session-token-usage.js";
-import { createResolvedAgentSession, extractRuntimeHint, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel } from "./agent-session-helpers.js";
-import { createFallbackModelObserver } from "./fallback-model-observer.js";
-import { buildSessionSkillContext } from "./session-skill-context.js";
-import { resolveMcpServersForStore } from "./mcp-resolution.js";
-import { classifyTaskWorktree, getRegisteredWorktreeBranches, isRepoRootPath, RemovalReason, removeWorktree, type WorktreePool } from "./worktree-pool.js";
-import { activeSessionRegistry } from "./active-session-registry.js";
-import { AgentLogger } from "./agent-logger.js";
+import { accumulateSessionTokenUsage } from "./execution/session-token-usage.js";
+import { createResolvedAgentSession, extractRuntimeHint, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel } from "./agents/agent-session-helpers.js";
+import { createFallbackModelObserver } from "./auth/fallback-model-observer.js";
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-14:40 (fleet — long-tail fallback arms):
+DELIBERATE-LITERAL — the no-resolution fallback for the already-converted guard below.
+
+A named set rather than an inline `=== "<id>"` arm. Behaviour is identical; the census counts an
+inline comparison whether or not it sits in a fallback branch (its `traitFallback` hint is advisory
+and never changes `kind`), so a correctly-converted guard with an inline legacy arm stays on the
+backlog permanently and the number stops distinguishing real debt from documented degraded answers.
+*/
+const LEGACY_COMPLETE_LANES: readonly string[] = ["done"];
+
+import { buildSessionSkillContext } from "./cli-runtime/session-skill-context.js";
+import { resolveMcpServersForStore } from "./mcp/mcp-resolution.js";
+import { classifyTaskWorktree, getRegisteredWorktreeBranches, isRepoRootPath } from "./worktree/worktree-pool.js";
+import { RemovalReason, removeWorktree } from "./worktree/worktree-backend.js";
+import { activeSessionRegistry } from "./agents/active-session-registry.js";
+import { AgentLogger } from "./agents/agent-logger.js";
+import { attachAgentUsageTelemetry, emitAgentSessionStart } from "./agents/agent-usage-telemetry.js";
 import { mergerLog } from "./logger.js";
+import { emitBoundedRunAudit } from "./util/emit-bounded-run-audit.js";
+
+/*
+FNXC:EngineDiagnostics 2026-07-26-10:10:
+Merger intermediate plumbing (per-file auto-resolve, fetch/rebase/checkout bookkeeping, verification skip/pass, attempt N/3 start, merge details stored, fast-forward continue paths, staging allowlists, no-op already-merged) is debug-only (FUSION_DEBUG=merger). Keep log/warn/error for outcomes operators act on: conflict AI, autostash recovery, push results, verification-fix attempts, commits landing, route selection, completeTask, and real failures.
+*/
 
 // FNXC:CodeOrganization 2026-07-15-12:00:
 // Domain satellites re-exported so existing merger.js import paths stay stable.
@@ -129,10 +172,10 @@ export {
   LOCKFILE_PATTERNS,
   GENERATED_PATTERNS,
   matchGlob,
-} from "./merger-glob.js";
-export type { ConflictType } from "./merger-glob.js";
-import { matchGlob, LOCKFILE_PATTERNS, GENERATED_PATTERNS } from "./merger-glob.js";
-import type { ConflictType } from "./merger-glob.js";
+} from "./merge/merger-glob.js";
+export type { ConflictType } from "./merge/merger-glob.js";
+import { matchGlob, LOCKFILE_PATTERNS, GENERATED_PATTERNS } from "./merge/merger-glob.js";
+import type { ConflictType } from "./merge/merger-glob.js";
 
 export {
   parsePnpmWorkspaceGlobs,
@@ -142,12 +185,12 @@ export {
   deriveScopedPnpmTestCommand,
   deriveFileScopedPnpmTestCommand,
   inferDefaultTestCommand,
-} from "./merger-workspace-test-commands.js";
-export type { InferredTestCommand } from "./merger-workspace-test-commands.js";
+} from "./merge/merger-workspace-test-commands.js";
+export type { InferredTestCommand } from "./merge/merger-workspace-test-commands.js";
 import {
   packageNamesForFiles,
   inferDefaultTestCommand,
-} from "./merger-workspace-test-commands.js";
+} from "./merge/merger-workspace-test-commands.js";
 
 export {
   parseDiffStat,
@@ -158,8 +201,8 @@ export {
   assertSquashOverlapsFileScope,
   formatFileScopeViolationAgentLog,
   enforceSquashFileScopeInvariant,
-} from "./merger-file-scope.js";
-export type { DiffFileEntry, DiffScopeResult, StagedFilesReader } from "./merger-file-scope.js";
+} from "./merge/merger-file-scope.js";
+export type { DiffFileEntry, DiffScopeResult, StagedFilesReader } from "./merge/merger-file-scope.js";
 import {
   parseDiffStat,
   extractFileScope,
@@ -167,31 +210,31 @@ import {
   partitionConflictsByFileScope,
   FileScopeViolationError,
   enforceSquashFileScopeInvariant,
-} from "./merger-file-scope.js";
-import type { DiffScopeResult } from "./merger-file-scope.js";
+} from "./merge/merger-file-scope.js";
+import type { DiffScopeResult } from "./merge/merger-file-scope.js";
 
 export {
   VerificationError,
   MergeAbortedError,
   OutOfScopeVerificationError,
   throwIfAborted,
-} from "./merger-errors.js";
+} from "./merge/merger-errors.js";
 import {
   VerificationError,
   OutOfScopeVerificationError,
   throwIfAborted,
-} from "./merger-errors.js";
+} from "./merge/merger-errors.js";
 
 export {
   FUSION_TASK_ID_TRAILER_KEY,
   toTaskToken,
   classifyOwnedLandedEvidence,
-} from "./merger-owned-landed.js";
-export type { OwnedLandedClassification } from "./merger-owned-landed.js";
+} from "./merge/merger-owned-landed.js";
+export type { OwnedLandedClassification } from "./merge/merger-owned-landed.js";
 import {
   FUSION_TASK_ID_TRAILER_KEY,
   classifyOwnedLandedEvidence,
-} from "./merger-owned-landed.js";
+} from "./merge/merger-owned-landed.js";
 
 export {
   getConflictedFiles,
@@ -203,15 +246,15 @@ export {
   detectResolvableConflicts,
   autoResolveFile,
   resolveConflicts,
-} from "./merger-conflict-resolution.js";
-export type { ConflictResolution, ConflictCategory } from "./merger-conflict-resolution.js";
+} from "./merge/merger-conflict-resolution.js";
+export type { ConflictResolution, ConflictCategory } from "./merge/merger-conflict-resolution.js";
 import {
   getConflictedFiles,
   classifyConflict,
   resolveWithOurs,
   resolveWithTheirs,
   resolveTrivialWhitespace,
-} from "./merger-conflict-resolution.js";
+} from "./merge/merger-conflict-resolution.js";
 
 export {
   parseFailingFilesFromOutput,
@@ -219,14 +262,14 @@ export {
   parseShortstatSummary,
   getBranchChangedFiles,
   quoteArg,
-} from "./merger-git-parse.js";
+} from "./merge/merger-git-parse.js";
 import {
   parseFailingFilesFromOutput,
   parsePorcelainZ,
   parseShortstatSummary,
   getBranchChangedFiles,
   quoteArg,
-} from "./merger-git-parse.js";
+} from "./merge/merger-git-parse.js";
 
 export {
   AUTOSTASH_LABEL_PREFIX,
@@ -236,7 +279,7 @@ export {
   parseAutostashTaskId,
   parseAutostashCreatedAt,
   parseAutostashSourcePhase,
-} from "./merger-autostash-labels.js";
+} from "./merge/merger-autostash-labels.js";
 import {
   AUTOSTASH_LABEL_PREFIX,
   LEGACY_AI_SYNC_LABEL_PREFIX,
@@ -244,18 +287,21 @@ import {
   parseAutostashTaskId,
   parseAutostashCreatedAt,
   parseAutostashSourcePhase,
-} from "./merger-autostash-labels.js";
+} from "./merge/merger-autostash-labels.js";
 
 
-import { regenerateBareMergeSubject } from "./merger-bare-subject.js";
-export { regenerateBareMergeSubject, BARE_MERGE_SUBJECT_RE } from "./merger-bare-subject.js";
-import { isUsageLimitError, checkSessionError, type UsageLimitPauser } from "./usage-limit-detector.js";
-import { isContextLimitError } from "./context-limit-detector.js";
-import { withRateLimitRetry } from "./rate-limit-retry.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import { regenerateBareMergeSubject } from "./merge/merger-bare-subject.js";
+export { regenerateBareMergeSubject, BARE_MERGE_SUBJECT_RE } from "./merge/merger-bare-subject.js";
+import { isUsageLimitError, checkSessionError, type UsageLimitPauser } from "./errors/usage-limit-detector.js";
+import { isContextLimitError } from "./errors/context-limit-detector.js";
+import { withRateLimitRetry } from "./errors/rate-limit-retry.js";
+import { cancellableSleep } from "./errors/retry-with-backoff.js";
+import { TRANSIENT_ERROR_PATTERNS } from "./errors/transient-error-patterns.js";
+import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agents/agent-instructions.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createRunAuditor, generateSyntheticRunId, type EngineRunContext, type RunAuditor } from "./run-audit.js";
+import { createRunAuditor, generateSyntheticRunId, type EngineRunContext, type RunAuditor } from "./util/run-audit.js";
+import { resolveAgentActivityAttribution } from "@fusion/core";
 import { createWebFetchTool } from "./agent-tools.js";
 import {
   auditSquashMerge,
@@ -263,20 +309,10 @@ import {
   type PostMergeAuditInput,
   type PostMergeAuditStrategy,
   type SquashAuditFindings,
-} from "./merger-squash-audit.js";
-import { detectMergeOverlap, restoreBranchWinsFiles } from "./merger-overlap-guard.js";
-import {
-  checkDiffVolume,
-  DiffVolumeRegressionError,
-  resolveDiffVolumeGateSettings,
-  formatDiffVolumeFindings,
-} from "./merger-diff-volume-gate.js";
-export {
-  resolveDiffVolumeGateSettings,
-  formatDiffVolumeFindings,
-} from "./merger-diff-volume-gate.js";
-import { detectAlreadyLandedOnMain, type AlreadyMergedDetectionStrategy } from "./already-merged-detector.js";
-import { decideAutoPrerebase, probeDivergence, runAutoPrerebase } from "./merger-auto-prerebase.js";
+} from "./merge/merger-squash-audit.js";
+import { detectMergeOverlap, restoreBranchWinsFiles } from "./merge/merger-overlap-guard.js";
+import { detectAlreadyLandedOnMain, type AlreadyMergedDetectionStrategy } from "./merge/already-merged-detector.js";
+import { decideAutoPrerebase, probeDivergence, runAutoPrerebase } from "./merge/merger-auto-prerebase.js";
 import {
   acquireReuseHandoff,
   ensureUsableMergeIntegrationRoot,
@@ -286,39 +322,48 @@ import {
   resolveIntegrationRemote,
   resolveMergeIntegrationRoot,
   type HandoffResult,
-} from "./merger-integration-worktree.js";
-import { acquireTaskWorktree } from "./worktree-acquisition.js";
-import { resolveIntegrationBranch } from "./integration-branch.js";
-import { evaluateBranchGroupPromotion, resolveBranchGroupMergeRouting } from "./group-merge-coordinator.js";
-import { advanceIntegrationBranchRef, IntegrationBranchConcurrentAdvanceError } from "./merger-ref-update-advance.js";
-import { syncWorktreeToHead, type SyncWorktreeResult } from "./worktree-ref-sync.js";
-import { appendAutoWidenedScopeToPrompt, evaluateScopeAutoWiden } from "./merger-scope-auto-widen.js";
+} from "./merge/merger-integration-worktree.js";
+import { acquireTaskWorktree } from "./worktree/worktree-acquisition.js";
+import { resolveIntegrationBranch } from "./merge/integration-branch.js";
+import { isPushAfterMergeEnabled } from "./merge/push-after-merge-policy.js";
+import { evaluateBranchGroupPromotion, resolveBranchGroupMergeRouting } from "./merge/group-merge-coordinator.js";
+import { advanceIntegrationBranchRef, IntegrationBranchConcurrentAdvanceError } from "./merge/merger-ref-update-advance.js";
+import { syncWorktreeToHead, type SyncWorktreeResult } from "./worktree/worktree-ref-sync.js";
+import { appendAutoWidenedScopeToPrompt, evaluateScopeAutoWiden } from "./merge/merger-scope-auto-widen.js";
+import { moveTaskToContainedBackwardTarget } from "./execution/lifecycle-move.js";
 
-export { DiffVolumeRegressionError } from "./merger-diff-volume-gate.js";
-export { IntegrationBranchConcurrentAdvanceError } from "./merger-ref-update-advance.js";
+export { IntegrationBranchConcurrentAdvanceError } from "./merge/merger-ref-update-advance.js";
 
 /*
 FNXC:WorkflowMergeLifecycle 2026-07-19-07:40 (U7 / R2/R7/KTD-10):
-Merge lifecycle moves derive their target column from the task's workflow IR, not
-literal enum ids: a recoverable merge-failure rebound targets the KTD-10 backlog
-column (hold → intake → first), a merge-lane failure parks in the merge-
-orchestration column, and completion moves to the complete-trait column.
-builtin:coding resolves these to todo / in-review / done so the default pipeline
-is byte-identical; a custom workflow (the benchmark) lands in its own backlog /
-Merging / Done columns. One IR resolution per merge op (not an enumeration loop);
-any resolution failure falls back to the legacy literal so a merge is never stranded.
+Merge-lane and completion moves resolve the workflow's own merge and complete columns.
+
+FNXC:LifecycleContainment 2026-08-28-03:03:
+FN-207 routes every recoverable merge failure through the contained-backward seam instead of this
+resolver: review returns to WIP, WIP returns to hold, missing targets stay in place, and capacity
+refusal never substitutes another column.
+
+FNXC:LifecycleContainment 2026-08-28-03:19:
+All legacy merger blocker branches share one exported routing seam so their review-to-WIP behavior,
+no-target containment, and capacity deferral are exercised without duplicating a full Git merge.
 */
+export async function reboundLegacyMergeTask(store: TaskStore, taskId: string) {
+  return moveTaskToContainedBackwardTarget(store, taskId, "merge-failure-rebound", {
+    preserveProgress: true,
+    moveSource: "engine",
+  });
+}
+
 async function resolveMergerLifecycleColumn(
   store: TaskStore,
   taskId: string,
-  which: "rebound" | "complete" | "merge",
+  which: "complete" | "merge",
 ): Promise<string> {
-  const fallback = which === "complete" ? "done" : which === "merge" ? "in-review" : "todo";
+  const fallback = which === "complete" ? "done" : "in-review";
   try {
     const ir = await resolveWorkflowIrForTask(store, taskId);
     if (which === "complete") return resolveCompleteColumn(ir) ?? fallback;
-    if (which === "merge") return resolveMergeOrchestrationColumn(ir) ?? fallback;
-    return resolveReboundTarget(ir) ?? fallback;
+    return resolveMergeOrchestrationColumn(ir) ?? fallback;
   } catch {
     return fallback;
   }
@@ -491,9 +536,81 @@ const PULL_REBASE_TIMEOUT_MS = 120_000;
 const PUSH_TIMEOUT_MS = 60_000;
 const PUSH_NON_FF_MAX_RETRIES = 3;
 const PUSH_NON_FF_RETRY_BACKOFF_MS = [2_000, 5_000, 10_000];
+const PUSH_TRANSIENT_RETRY_BACKOFF_MS = [2_000, 5_000];
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const TRANSIENT_GIT_PUSH_PATTERNS = [
+  /could not resolve host/i,
+  /temporary failure in name resolution/i,
+  /network is unreachable/i,
+  /failed to connect/i,
+  /couldn't connect/i,
+  /rpc failed;\s*http\s+(?:429|5\d\d)/i,
+  /remote end hung up unexpectedly/i,
+  /unexpected disconnect while reading sideband packet/i,
+  /send failure:\s*broken pipe/i,
+  /connection closed by remote host/i,
+];
+
+export function isTransientGitPushError(message: string): boolean {
+  return TRANSIENT_ERROR_PATTERNS.some((pattern) => pattern.test(message))
+    || TRANSIENT_GIT_PUSH_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+async function sleepForPushRetry(ms: number, signal: AbortSignal | undefined, taskId: string): Promise<void> {
+  try {
+    await cancellableSleep(ms, signal);
+  } catch (error: unknown) {
+    throwIfAborted(signal, taskId);
+    throw error;
+  }
+}
+
+/*
+FNXC:MergePush 2026-08-16-02:17:
+Post-merge delivery must recover from short-lived Git transport failures for every remote and
+hosting provider without depending on an operator-specific notification channel. Retry only
+recognized transient transport errors, keep configuration/auth/rejection failures immediate, and
+make both the bounded backoff and every subsequent attempt cancellation-aware.
+*/
+export async function pushWithTransientRetries(
+  push: () => Promise<unknown>,
+  options: {
+    taskId: string;
+    signal?: AbortSignal;
+    retryBackoffMs?: readonly number[];
+    onRetry?: (event: { attempt: number; maxRetries: number; delayMs: number; error: string }) => void | Promise<void>;
+  },
+): Promise<void> {
+  const retryBackoffMs = options.retryBackoffMs ?? PUSH_TRANSIENT_RETRY_BACKOFF_MS;
+  let attempt = 0;
+
+  while (true) {
+    throwIfAborted(options.signal, options.taskId);
+    try {
+      await push();
+      return;
+    } catch (error: unknown) {
+      rethrowIfMergeAborted(error);
+      throwIfAborted(options.signal, options.taskId);
+      const message = getCommandErrorMessage(error);
+      const delayMs = retryBackoffMs[attempt];
+      if (delayMs === undefined || !isTransientGitPushError(message)) throw error;
+
+      attempt += 1;
+      try {
+        await options.onRetry?.({
+          attempt,
+          maxRetries: retryBackoffMs.length,
+          delayMs,
+          error: message,
+        });
+      } catch {
+        // Retry diagnostics are best-effort and must not suppress delivery.
+      }
+
+      await sleepForPushRetry(delayMs, options.signal, options.taskId);
+    }
+  }
 }
 
 export async function emitMergeAttemptAuditEvent(params: {
@@ -537,53 +654,6 @@ const MERGE_USER_COMMENTS_MAX_CHARS = 4000;
  */
 export const summarizeVerificationOutputLocal = summarizeVerificationOutput;
 
-
-async function resetToIntegrationTarget(rootDir: string, integrationTargetSha: string): Promise<void> {
-  await execAsync(`git reset --hard ${quoteArg(integrationTargetSha)}`, {
-    cwd: rootDir,
-    encoding: "utf-8",
-  });
-  await execAsync("git clean -fd", {
-    cwd: rootDir,
-    encoding: "utf-8",
-  });
-}
-
-async function runDiffVolumeGate(params: {
-  rootDir: string;
-  branch: string;
-  integrationTargetSha: string;
-  taskId: string;
-  settings?: Settings;
-  store?: TaskStore;
-}): Promise<void> {
-  try {
-    const gateSettings = resolveDiffVolumeGateSettings(params.settings);
-    await checkDiffVolume({
-      rootDir: params.rootDir,
-      branch: params.branch,
-      integrationTargetSha: params.integrationTargetSha,
-      minLines: gateSettings.minLines,
-      threshold: gateSettings.threshold,
-      allowlistGlobs: gateSettings.allowlistGlobs,
-      taskId: params.taskId,
-    });
-  } catch (error: unknown) {
-    if (!(error instanceof DiffVolumeRegressionError)) throw error;
-    await resetToIntegrationTarget(params.rootDir, params.integrationTargetSha);
-    const details = formatDiffVolumeFindings(error.findings);
-    if (params.store) {
-      await params.store.appendAgentLog(
-        params.taskId,
-        `Diff-volume gate blocked auto-resolved squash before commit`,
-        "tool_error",
-        details,
-        "merger",
-      );
-    }
-    throw error;
-  }
-}
 
 export async function getStagedFiles(cwd: string): Promise<string[]> {
   try {
@@ -748,7 +818,7 @@ const VERIFICATION_EXTRA_ENV: NodeJS.ProcessEnv = Object.fromEntries(
   ).filter(([key]) => !(key in process.env)),
 );
 
-async function runDeterministicVerification(
+export async function runDeterministicVerification(
   store: TaskStore,
   rootDir: string,
   taskId: string,
@@ -764,7 +834,16 @@ async function runDeterministicVerification(
 
   // Nothing to verify
   if (!testCommand && !buildCommand) {
-    mergerLog.log(`${taskId}: no verification commands configured — skipping`);
+    mergerLog.debug(`${taskId}: no verification commands configured — skipping`);
+    /*
+    FNXC:WorkflowStepNotRun 2026-08-28-14:13:
+    Merge verification with no configured command is non-blocking, but it is not a pass. Return the
+    explicit marker and persist an honest log before the success logging path can run.
+    */
+    result.notRun = true;
+    const message = "Deterministic merge verification not executed because no test or build command is configured — NOTHING WAS VERIFIED.";
+    await store.logEntry(taskId, message);
+    await store.appendAgentLog(taskId, message, "status", undefined, "merger");
     return result;
   }
 
@@ -790,7 +869,7 @@ async function runDeterministicVerification(
     if (cacheHit) {
       const sha7 = treeSha.slice(0, 7);
       const msg = `Skipping deterministic verification — cached pass for tree ${sha7} (recorded at ${cacheHit.recordedAt}, by ${cacheHit.taskId ?? "unknown"})`;
-      mergerLog.log(`${taskId}: ${msg}`);
+      mergerLog.debug(`${taskId}: ${msg}`);
       await store.logEntry(taskId, msg);
       await store.appendAgentLog(taskId, msg, "status", undefined, "merger");
       const syntheticResult: VerificationCommandResult = {
@@ -812,7 +891,7 @@ async function runDeterministicVerification(
   const testSourceLabel = (testSource === "inferred" || testSource === "inferred-scoped") ? ` [${testSource}]` : "";
   const buildSourceLabel = buildSource === "inferred" ? " [inferred]" : "";
 
-  mergerLog.log(
+  mergerLog.debug(
     `${taskId}: running deterministic verification` +
     (hasTestCommand ? ` [test:${testSourceLabel} ${normalizedTestCommand}]` : "") +
     (hasBuildCommand ? ` [build:${buildSourceLabel} ${normalizedBuildCommand}]` : ""),
@@ -1009,7 +1088,8 @@ async function runDeterministicVerification(
     }
   }
 
-  mergerLog.log(`${taskId}: deterministic verification passed`);
+  // FNXC:EngineDiagnostics 2026-07-26-09:33: merge verification success/cache bookkeeping is expected steady-state; failures stay error/warn.
+  mergerLog.debug(`${taskId}: deterministic verification passed`);
   await store.logEntry(taskId, "Deterministic merge verification passed");
   await store.appendAgentLog(taskId, "Deterministic merge verification passed", "status", undefined, "merger");
 
@@ -1017,7 +1097,7 @@ async function runDeterministicVerification(
   if (treeSha) {
     try {
       await store.recordVerificationCachePass(treeSha, effectiveTestCommand, effectiveBuildCommand, taskId);
-      mergerLog.log(`${taskId}: Recorded verification pass for tree ${treeSha.slice(0, 7)}`);
+      mergerLog.debug(`${taskId}: Recorded verification pass for tree ${treeSha.slice(0, 7)}`);
       await store.logEntry(taskId, `Recorded verification pass for tree ${treeSha.slice(0, 7)}`);
     } catch (err) {
       mergerLog.warn(`${taskId}: could not record verification cache pass: ${String(err)}`);
@@ -1092,11 +1172,13 @@ async function attemptInMergeVerificationFix(
       taskId,
       agent: "merger",
       persistAgentToolOutput: settings.persistAgentToolOutput,
-      // Merger agents are task-scoped ephemeral workers.
-    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
+      /* FNXC:WorkflowAgentRouting 2026-08-07-04:13: Merger workflow sessions use durable routed principals and permanent-agent logging policy. */
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: false }),
       onAgentText: options.onAgentText,
       onAgentTool: options.onAgentTool,
     });
+    { attachAgentUsageTelemetry(logger, { store, agentId: null, taskId, nodeId: null, lane: "merger" }); }
+
 
     // Build skill selection context
     let skillContext = undefined;
@@ -1128,6 +1210,18 @@ async function attemptInMergeVerificationFix(
     const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
     const mergerTask = await store.getTask(taskId).catch(() => undefined);
     const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig, mergerTask);
+  // FNXC:CommandCenterActivity 2026-08-09-11:12: Merger ownership and model resolve
+  // after logger construction; refresh before any model callbacks publish usage events.
+  attachAgentUsageTelemetry(logger, {
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
+
 
     // FNXC:Settings-MergerModel 2026-07-16-00:00: merger retries use the dedicated project fallback lane before the shared global fallback pair.
 
@@ -1162,6 +1256,7 @@ Do not refactor, rename broadly, or make opportunistic improvements.
       onToolEnd: logger.onToolEnd,
       defaultProvider: mergerSessionModel.provider,
       defaultModelId: mergerSessionModel.modelId,
+      ...(mergerSessionModel.credentialInstanceId ? { credentialInstanceId: mergerSessionModel.credentialInstanceId } : {}),
       fallbackProvider: mergerFallbackModel.provider,
       fallbackModelId: mergerFallbackModel.modelId,
       fallbackThinkingLevel: resolveMergerFallbackThinkingLevel(settings, mergerTask?.mergerThinkingLevel),
@@ -1191,6 +1286,15 @@ Do not refactor, rename broadly, or make opportunistic improvements.
     // Register so engine.stop() can dispose this session — without this the
     // fix agent keeps streaming past shutdown because it's not the autostash
     // session that the engine tracks.
+  emitAgentSessionStart({
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
     options.onSession?.(session);
 
     const runId = mergeRunContext?.runId;
@@ -1888,7 +1992,23 @@ async function sweepAutostashOrphans(
         live.push(orphan);
         continue;
       }
-      if (!sourceTask || (sourceTask.column !== "done" && sourceTask.column !== "archived")) {
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-08-02-10:50 (fleet: merger.ts terminal guards):
+      "Is the source task finished?" from its own workflow, unioned with the legacy Done fallback — a row can outlive
+      the column it is stored in, and this guard decides whether an orphaned stash is still LIVE. Being too
+      strict here keeps a stash alive forever (harmless clutter); being too loose discards a stash whose task
+      is still running (lost work), so over-inclusion of terminal ids is the safe direction, exactly as in
+      `resolveTerminalColumnsFor`.
+
+      With the literal Done check, a renamed board answered "not finished" for every completed task, so every
+      orphaned stash stayed classified as live and was never cleaned up.
+      */
+      const sourceLifecycle = await resolveTaskLifecycleColumns(store, sourceTaskId);
+      const sourceTerminal = new Set([
+        sourceLifecycle?.complete ?? "done",
+        "done",
+      ]);
+      if (!sourceTask || !sourceTerminal.has(sourceTask.column)) {
         live.push(orphan);
         continue;
       }
@@ -2194,7 +2314,7 @@ export async function dropAutostashBySha(
   for (let attempt = 0; attempt < 5; attempt++) {
     const ref = await findStashRefBySha(rootDir, sha);
     if (!ref) {
-      mergerLog.log(`${taskId}: autostash ${sha.slice(0, 7)} no longer in stash list (already dropped)`);
+      mergerLog.debug(`${taskId}: autostash ${sha.slice(0, 7)} no longer in stash list (already dropped)`);
       return { dropped: true };
     }
 
@@ -2211,7 +2331,7 @@ export async function dropAutostashBySha(
       continue;
     }
     if (refSha !== sha) {
-      mergerLog.log(`${taskId}: autostash ${sha.slice(0, 7)} shifted off ${ref} (now ${refSha.slice(0, 7)}); re-resolving`);
+      mergerLog.debug(`${taskId}: autostash ${sha.slice(0, 7)} shifted off ${ref} (now ${refSha.slice(0, 7)}); re-resolving`);
       continue;
     }
 
@@ -2325,8 +2445,8 @@ async function runAiAgentForAutostashConflict(params: {
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    // Merger agents are task-scoped ephemeral workers.
-    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
+    /* FNXC:WorkflowAgentRouting 2026-08-07-04:13: Merger workflow sessions use durable routed principals and permanent-agent logging policy. */
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: false }),
     onAgentText: options.onAgentText
       ? (_id: string, delta: string) => options.onAgentText!(delta)
       : undefined,
@@ -2334,6 +2454,8 @@ async function runAiAgentForAutostashConflict(params: {
       ? (_id: string, name: string) => options.onAgentTool!(name)
       : undefined,
   });
+    { attachAgentUsageTelemetry(agentLogger, { store, agentId: null, taskId, nodeId: null, lane: "merger" }); }
+
 
   // Skill / runtime resolution mirrors runAiAgentForCommit.
   let taskForSkillContext: Awaited<ReturnType<typeof store.getTask>> | null = null;
@@ -2362,6 +2484,18 @@ async function runAiAgentForAutostashConflict(params: {
   const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
   const mergerTask = await store.getTask(taskId).catch(() => undefined);
     const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig, mergerTask);
+  // FNXC:CommandCenterActivity 2026-08-09-11:12: Merger ownership and model resolve
+  // after logger construction; refresh before any model callbacks publish usage events.
+  attachAgentUsageTelemetry(agentLogger, {
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
+
 
   // FNXC:Settings-MergerModel 2026-07-16-00:00: merger retries use the dedicated project fallback lane before the shared global fallback pair.
 
@@ -2411,6 +2545,7 @@ ${fileList}
     onToolEnd: agentLogger.onToolEnd,
     defaultProvider: mergerSessionModel.provider,
     defaultModelId: mergerSessionModel.modelId,
+      ...(mergerSessionModel.credentialInstanceId ? { credentialInstanceId: mergerSessionModel.credentialInstanceId } : {}),
     fallbackProvider: mergerFallbackModel.provider,
     fallbackModelId: mergerFallbackModel.modelId,
     fallbackThinkingLevel: resolveMergerFallbackThinkingLevel(settings, mergerTask?.mergerThinkingLevel),
@@ -2436,6 +2571,15 @@ ${fileList}
       taskId,
       taskTitle: taskForSkillContext?.title,
     }),
+  });
+  emitAgentSessionStart({
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
   });
   options.onSession?.(session);
 
@@ -2740,8 +2884,8 @@ async function runAiAgentForAutostashHardFail(params: {
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    // Merger agents are task-scoped ephemeral workers.
-    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
+    /* FNXC:WorkflowAgentRouting 2026-08-07-04:13: Merger workflow sessions use durable routed principals and permanent-agent logging policy. */
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: false }),
     onAgentText: options.onAgentText
       ? (_id: string, delta: string) => options.onAgentText!(delta)
       : undefined,
@@ -2749,6 +2893,8 @@ async function runAiAgentForAutostashHardFail(params: {
       ? (_id: string, name: string) => options.onAgentTool!(name)
       : undefined,
   });
+    { attachAgentUsageTelemetry(agentLogger, { store, agentId: null, taskId, nodeId: null, lane: "merger" }); }
+
 
   let taskForSkillContext: Awaited<ReturnType<typeof store.getTask>> | null = null;
   let skillContext = undefined;
@@ -2776,6 +2922,18 @@ async function runAiAgentForAutostashHardFail(params: {
   const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
   const mergerTask = await store.getTask(taskId).catch(() => undefined);
     const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig, mergerTask);
+  // FNXC:CommandCenterActivity 2026-08-09-11:12: Merger ownership and model resolve
+  // after logger construction; refresh before any model callbacks publish usage events.
+  attachAgentUsageTelemetry(agentLogger, {
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
+
 
   // FNXC:Settings-MergerModel 2026-07-16-00:00: merger retries use the dedicated project fallback lane before the shared global fallback pair.
 
@@ -2835,6 +2993,7 @@ ${fileList}
     onToolEnd: agentLogger.onToolEnd,
     defaultProvider: mergerSessionModel.provider,
     defaultModelId: mergerSessionModel.modelId,
+      ...(mergerSessionModel.credentialInstanceId ? { credentialInstanceId: mergerSessionModel.credentialInstanceId } : {}),
     fallbackProvider: mergerFallbackModel.provider,
     fallbackModelId: mergerFallbackModel.modelId,
     fallbackThinkingLevel: resolveMergerFallbackThinkingLevel(settings, mergerTask?.mergerThinkingLevel),
@@ -2860,6 +3019,15 @@ ${fileList}
       taskId,
       taskTitle: taskForSkillContext?.title,
     }),
+  });
+  emitAgentSessionStart({
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
   });
   options.onSession?.(session);
 
@@ -3587,8 +3755,8 @@ export async function commitOrAmendMergeWithFixes(
   preAttemptHeadSha: string,
   authorArg: string,
   diffStat?: string,
-  settings?: Settings,
-  signal?: AbortSignal,
+  _settings?: Settings,
+  _signal?: AbortSignal,
   aiSummary?: string | null,
   aiBody?: string | null,
   aiSubject?: string | null,
@@ -3664,7 +3832,7 @@ export async function commitOrAmendMergeWithFixes(
     const cap = (arr: string[], n = 20) =>
       arr.length <= n ? arr.join(", ") : `${arr.slice(0, n).join(", ")} ... (+${arr.length - n} more)`;
 
-    mergerLog.log(
+    mergerLog.debug(
       `${taskId}: staging allowlist — squash: [${cap([...squashStaged])}], fixModified: [${cap([...fixModifiedFiles])}]`,
     );
 
@@ -3761,7 +3929,7 @@ export async function commitOrAmendMergeWithFixes(
       // HEAD), then ancestor short-circuit (branch already reachable from
       // integration target via a different commit path), then squash-restore.
       if (trailerOnHead) {
-        mergerLog.log(
+        mergerLog.debug(
           `${taskId}: HEAD already carries Fusion-Task-Id trailer — treating in-merge fix finalize as no-op success`,
         );
         return { ok: true, reason: "head-task-trailer" };
@@ -3791,7 +3959,7 @@ export async function commitOrAmendMergeWithFixes(
         branchAlreadyOnIntegrationTarget &&
         (branchTipCarriesTaskTrailer || branchTip.length === 0)
       ) {
-        mergerLog.log(`${taskId}: branch already on integration target (ancestor) — no-op success`);
+        mergerLog.debug(`${taskId}: branch already on integration target (ancestor) — no-op success`);
         return { ok: true, reason: "branch-already-merged" };
       }
 
@@ -3831,7 +3999,7 @@ export async function commitOrAmendMergeWithFixes(
             for (const sha of recentShas) {
               const pid = await commitPatchId(rootDir, sha);
               if (pid === branchPatchId) {
-                mergerLog.log(
+                mergerLog.debug(
                   `${taskId}: branch content already on integration target (equivalent patch-id with ${sha}) — no-op success`,
                 );
                 return { ok: true, reason: "branch-already-merged" };
@@ -3886,7 +4054,7 @@ export async function commitOrAmendMergeWithFixes(
       });
       if (restoredStagedOut.trim().length === 0) {
         if (squashRestoreReportedUpToDate && (branchTipCarriesTaskTrailer || branchTip.length === 0)) {
-          mergerLog.log(`${taskId}: squash-restore reported already up to date; treating as branch-already-merged`);
+          mergerLog.debug(`${taskId}: squash-restore reported already up to date; treating as branch-already-merged`);
           return { ok: true, reason: "branch-already-merged" };
         }
 
@@ -3905,7 +4073,7 @@ export async function commitOrAmendMergeWithFixes(
             baseCommitSha: preAttemptHeadSha,
           });
           if (landed) {
-            mergerLog.log(
+            mergerLog.debug(
               `${taskId}: recovered finalize no-content as already-landed branch=${branch} tip=${branchTip.slice(0, 8)} integrationTarget=${preAttemptHeadSha.slice(0, 8)} via=${landed.strategy}`,
             );
             await auditor?.database({
@@ -3929,7 +4097,7 @@ export async function commitOrAmendMergeWithFixes(
         return { ok: false, reason: "fix-produced-no-content" };
       }
 
-      mergerLog.log(`${taskId}: restored squash state after no-op verification fix; proceeding to commit`);
+      mergerLog.debug(`${taskId}: restored squash state after no-op verification fix; proceeding to commit`);
     }
 
     // Build the message from the actual commit content rather than the
@@ -3979,14 +4147,6 @@ export async function commitOrAmendMergeWithFixes(
           auditor,
         });
       }
-      await runDiffVolumeGate({
-        rootDir,
-        branch,
-        integrationTargetSha: preAttemptHeadSha,
-        taskId,
-        settings,
-        store,
-      });
       await execAsync(
         `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
         { cwd: rootDir, env: mergerCommitEnv() },
@@ -4011,14 +4171,6 @@ export async function commitOrAmendMergeWithFixes(
         auditor,
       });
     }
-    await runDiffVolumeGate({
-      rootDir,
-      branch,
-      integrationTargetSha: preAttemptHeadSha,
-      taskId,
-      settings,
-      store,
-    });
     await execAsync(
       `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
       { cwd: rootDir, env: mergerCommitEnv() },
@@ -4029,7 +4181,7 @@ export async function commitOrAmendMergeWithFixes(
     mergerLog.log(`${taskId}: amended merge commit with verification fixes (deterministic message)`);
     return { ok: true, reason: "committed" };
   } catch (err: unknown) {
-    if (err instanceof DiffVolumeRegressionError || err instanceof FileScopeViolationError) {
+    if (err instanceof FileScopeViolationError) {
       throw err;
     }
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -4905,9 +5057,22 @@ export async function findWorktreeUser(
   excludeTaskId: string,
 ): Promise<string | null> {
   const tasks = await store.listTasks({ slim: true, includeArchived: false });
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-08-02-10:55 (fleet: merger.ts):
+  The worktree-conflict scan asks "is another UNFINISHED task holding this worktree?". Resolved per task, but
+  ONLY for rows that actually share the worktree path — the path test is free and eliminates all but a
+  handful, so the lane resolution never runs over the whole board. (The naive order — resolve, then filter —
+  is what made the github-tracking reconciler scan proportional to task history; PR #2714 review.)
+  */
+  const conflictIrCache = new Map<string, WorkflowIr>();
   for (const t of tasks) {
     if (t.id === excludeTaskId) continue;
-    if (t.worktree === worktreePath && t.column !== "done") {
+    if (t.worktree !== worktreePath) continue;
+    const lifecycle = await resolveTaskLifecycleColumns(store, t.id, conflictIrCache);
+    /* Resolved complete lane UNION the legacy id: the guard already accepted either, and a set
+       states that once instead of two comparisons that must be kept in step. */
+    const completeLanes = new Set<string>([lifecycle?.complete, ...LEGACY_COMPLETE_LANES].filter((c): c is string => c !== undefined));
+    if (!completeLanes.has(t.column)) {
       return t.id;
     }
   }
@@ -4925,10 +5090,7 @@ export interface MergerOptions {
   onAgentText?: (delta: string) => void;
   /** Called with agent tool usage */
   onAgentTool?: (toolName: string) => void;
-  /** Worktree pool — when provided and `recycleWorktrees` is enabled,
-   *  worktrees are released to the pool instead of being removed. */
-  pool?: WorktreePool;
-  /** Usage limit pauser — triggers global pause when API limits are detected. */
+  /** Usage limit pauser — parks only the affected provider-routed task. */
   usageLimitPauser?: UsageLimitPauser;
   /** Called with the agent session immediately after creation. Enables the
    *  caller (e.g. dashboard.ts) to track and externally dispose the session
@@ -4941,7 +5103,7 @@ export interface MergerOptions {
   /** Allow synchronization when local checkout is dirty during merge reconciliation. */
   allowDirtyLocalCheckoutSync?: boolean;
   /** Plugin runner for runtime selection. When provided, enables plugin runtime lookup. */
-  pluginRunner?: import("./plugin-runner.js").PluginRunner;
+  pluginRunner?: import("./plugins/plugin-runner.js").PluginRunner;
   /**
    * Injected group-PR sync callback (KTD7, U6). When a shared branch-group
    * member lands and its group has a persisted open PR, the merger uses this to
@@ -4949,7 +5111,7 @@ export interface MergerOptions {
    * non-fatal and retryable on the next landing. Injected from the CLI layer so
    * the engine never imports the dashboard GitHub client.
    */
-  syncGroupPr?: import("./group-merge-coordinator.js").SyncGroupPrFn;
+  syncGroupPr?: import("./merge/group-merge-coordinator.js").SyncGroupPrFn;
   /**
    * Test seam (T14): the group-PR sync is fired-and-forgotten so a hung GitHub
    * call can never stall merge completion. When provided, the merger hands the
@@ -4959,6 +5121,34 @@ export interface MergerOptions {
   onGroupPrSyncSettled?: (settled: Promise<void>) => void;
 }
 
+
+export async function captureSingleCommitLandedPaths(
+  rootDir: string,
+  sha: string,
+  repository = ".",
+): Promise<OverlapWaitLandedPath[]> {
+  const { stdout } = await execAsync(`git show --format= --name-status -z ${quoteArg(sha)}`, {
+    cwd: rootDir,
+    encoding: "utf-8",
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const fields = stdout.split("\0").filter(Boolean);
+  const paths: OverlapWaitLandedPath[] = [];
+  for (let index = 0; index < fields.length;) {
+    const statusToken = fields[index++]!;
+    const code = statusToken[0];
+    if (code === "R" || code === "C") {
+      const previousPath = fields[index++];
+      const path = fields[index++];
+      if (previousPath && path) paths.push({ repository, previousPath, path, status: "renamed" });
+      continue;
+    }
+    const path = fields[index++];
+    if (!path) continue;
+    paths.push({ repository, path, status: code === "A" ? "added" : code === "D" ? "deleted" : "modified" });
+  }
+  return paths;
+}
 
 export async function captureSingleCommitLandedMetadata(
   rootDir: string,
@@ -5749,13 +5939,31 @@ export function isNonFastForwardPushError(message: string): boolean {
     || normalized.includes("failed to push some refs");
 }
 
-function isRebaseInProgress(rootDir: string): boolean {
-  try {
-    execSync("git rev-parse --verify REBASE_HEAD", {
+/*
+FNXC:MergePush 2026-07-22-18:48:
+Tchori-Labs/Fusion#5 exposed that `REBASE_HEAD` can remain resolvable after `git rebase --continue` completed. Rebase state is defined by Git's worktree-specific state directories; checking those directories prevents a completed conflicting rebase from receiving a spurious second `--continue` and being reported as a failed push.
+
+FNXC:MergePush 2026-07-22-21:20:
+Resolved via `git rev-parse --git-path rebase-merge|rebase-apply` (worktree-specific, so it is correct for the linked clean-room worktree, not just the main root). Executed with the package-standard async exec + timeout rather than `execSync` since every caller awaits inside an async merge/finalize flow.
+
+FNXC:MergePush 2026-07-23-00:00:
+Split into a strict probe and a best-effort wrapper because "swallow probe error to `false`" is only safe at the abort guards (where `false` means "skip `--abort`" and cleanup still removes the worktree). At the completion check inside `pullWithRebaseAndResolveConflicts`, `false` means "rebase resolved → return", which flows straight into the `HEAD:refs/heads/<branch>` push — so an errored probe during a still-in-progress rebase would push a partially-replayed HEAD and report success. `probeRebaseInProgress` surfaces the probe error so the completion site can fail cleanly (`{pushed:false}`) instead; `isRebaseInProgress` keeps the fail-safe-to-`false` semantics the two abort guards rely on.
+*/
+async function probeRebaseInProgress(rootDir: string): Promise<boolean> {
+  const gitPath = async (name: "rebase-merge" | "rebase-apply") => {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--git-path", name], {
       cwd: rootDir,
-      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: PUSH_TIMEOUT_MS,
     });
-    return true;
+    return resolve(rootDir, String(stdout).trim());
+  };
+  return existsSync(await gitPath("rebase-merge")) || existsSync(await gitPath("rebase-apply"));
+}
+
+export async function isRebaseInProgress(rootDir: string): Promise<boolean> {
+  try {
+    return await probeRebaseInProgress(rootDir);
   } catch {
     return false;
   }
@@ -5803,7 +6011,7 @@ async function resolveComplexRebaseConflictsWithAi(
   conflictedFiles: string[],
   options?: {
     onAgentText?: (delta: string) => void;
-    pluginRunner?: import("./plugin-runner.js").PluginRunner;
+    pluginRunner?: import("./plugins/plugin-runner.js").PluginRunner;
     signal?: AbortSignal;
     runtimeHint?: string;
     assignedAgentRuntimeConfig?: Record<string, unknown>;
@@ -5829,16 +6037,30 @@ You are assisting with a paused \`git pull --rebase\`.
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    // Merger agents are task-scoped ephemeral workers.
-    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
+    /* FNXC:WorkflowAgentRouting 2026-08-07-04:13: Merger workflow sessions use durable routed principals and permanent-agent logging policy. */
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: false }),
     onAgentText: options?.onAgentText
       ? (_id, delta) => options.onAgentText?.(delta)
       : undefined,
   });
+    { attachAgentUsageTelemetry(agentLogger, { store, agentId: null, taskId, nodeId: null, lane: "merger" }); }
+
 
   throwIfAborted(options?.signal, taskId);
   const mergerTask = await store.getTask(taskId).catch(() => undefined);
   const mergerSessionModel = resolveMergerSessionModel(settings, options?.assignedAgentRuntimeConfig, mergerTask);
+  // FNXC:CommandCenterActivity 2026-08-09-11:12: Merger ownership and model resolve
+  // after logger construction; refresh before any model callbacks publish usage events.
+  attachAgentUsageTelemetry(agentLogger, {
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
+
 
   // FNXC:Settings-MergerModel 2026-07-16-00:00: merger retries use the dedicated project fallback lane before the shared global fallback pair.
 
@@ -5856,6 +6078,7 @@ You are assisting with a paused \`git pull --rebase\`.
     onToolEnd: agentLogger.onToolEnd,
     defaultProvider: mergerSessionModel.provider,
     defaultModelId: mergerSessionModel.modelId,
+      ...(mergerSessionModel.credentialInstanceId ? { credentialInstanceId: mergerSessionModel.credentialInstanceId } : {}),
     fallbackProvider: mergerFallbackModel.provider,
     fallbackModelId: mergerFallbackModel.modelId,
     fallbackThinkingLevel: resolveMergerFallbackThinkingLevel(settings, mergerTask?.mergerThinkingLevel),
@@ -5880,6 +6103,15 @@ You are assisting with a paused \`git pull --rebase\`.
   // Register so engine.stop() can dispose this session — without this, an
   // in-progress rebase conflict resolution keeps streaming past shutdown
   // (the engine only tracks the autostash session by default).
+  emitAgentSessionStart({
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
   options?.onSession?.(session);
 
   const prompt = [
@@ -5990,7 +6222,7 @@ async function pullWithRebaseAndResolveConflicts(
       maxBuffer: VERIFICATION_COMMAND_MAX_BUFFER,
       encoding: "utf-8",
     });
-    mergerLog.log(`${taskId}: git pull --rebase succeeded for ${remote}/${branch}`);
+    mergerLog.debug(`${taskId}: git pull --rebase succeeded for ${remote}/${branch}`);
     return;
   } catch (pullError: unknown) {
     const conflictedFiles = await getConflictedFiles(rootDir);
@@ -6007,7 +6239,11 @@ async function pullWithRebaseAndResolveConflicts(
 
       for (let attempt = 1; attempt <= 10; attempt++) {
         throwIfAborted(options?.signal, taskId);
-        if (!isRebaseInProgress(rootDir)) {
+        // Strict probe here: a swallowed probe error must not be read as
+        // "rebase resolved", because returning declares completion and pushes
+        // HEAD. A surfaced probe error propagates to the resolution catch and
+        // becomes a clean {pushed:false} instead of a partial-HEAD push.
+        if (!(await probeRebaseInProgress(rootDir))) {
           mergerLog.log(`${taskId}: rebase conflicts resolved`);
           return;
         }
@@ -6041,7 +6277,7 @@ async function pullWithRebaseAndResolveConflicts(
 
       throw new Error("Exceeded maximum rebase conflict resolution attempts");
     } catch (resolutionError: unknown) {
-      if (isRebaseInProgress(rootDir)) {
+      if (await isRebaseInProgress(rootDir)) {
         try {
           await execAsync("git rebase --abort", {
             cwd: rootDir,
@@ -6101,7 +6337,7 @@ export async function pushToRemoteAfterMerge(
   }
 
   const { remote, branch } = target;
-  mergerLog.log(`${taskId}: push-after-merge enabled; syncing ${remote}/${branch}`);
+  mergerLog.debug(`${taskId}: push-after-merge enabled; syncing ${remote}/${branch}`);
 
   try {
     throwIfAborted(options?.signal, taskId);
@@ -6116,18 +6352,32 @@ export async function pushToRemoteAfterMerge(
   const pushCommand = options?.pushHeadRefspec
     ? `git push ${quoteArg(remote)} ${quoteArg(`HEAD:refs/heads/${branch}`)}`
     : `git push ${quoteArg(remote)} ${quoteArg(branch)}`;
-
-  try {
-    throwIfAborted(options?.signal, taskId);
-    await execAsync(pushCommand, {
+  const runTargetPush = () => pushWithTransientRetries(
+    () => execAsync(pushCommand, {
       cwd: rootDir,
       timeout: PUSH_TIMEOUT_MS,
       maxBuffer: VERIFICATION_COMMAND_MAX_BUFFER,
       encoding: "utf-8",
-    });
+    }),
+    {
+      taskId,
+      signal: options?.signal,
+      onRetry: ({ attempt, maxRetries, delayMs, error }) => {
+        mergerLog.warn(
+          `${taskId}: temporary Git transport failure; retrying push in ${delayMs}ms (${attempt}/${maxRetries}): ${error}`,
+        );
+      },
+    },
+  );
+
+  try {
+    throwIfAborted(options?.signal, taskId);
+    await runTargetPush();
     mergerLog.log(`${taskId}: pushed merged result to ${remote}/${branch}`);
     return { pushed: true };
   } catch (firstPushError: unknown) {
+    // FNXC:MergePush 2026-08-16-05:14: Cancellation from the shared initial push must reach the caller's aborted-push audit path instead of being recorded as a terminal delivery failure.
+    rethrowIfMergeAborted(firstPushError);
     let lastMessage = getCommandErrorMessage(firstPushError);
     mergerLog.warn(`${taskId}: initial push failed: ${lastMessage}`);
 
@@ -6149,12 +6399,7 @@ export async function pushToRemoteAfterMerge(
         throwIfAborted(options?.signal, taskId);
         await pullWithRebaseAndResolveConflicts(store, rootDir, taskId, settings, remote, branch, options);
         throwIfAborted(options?.signal, taskId);
-        await execAsync(pushCommand, {
-          cwd: rootDir,
-          timeout: PUSH_TIMEOUT_MS,
-          maxBuffer: VERIFICATION_COMMAND_MAX_BUFFER,
-          encoding: "utf-8",
-        });
+        await runTargetPush();
         mergerLog.log(`${taskId}: push succeeded after non-fast-forward retry (attempt ${attempt}/${maxRetries})`);
         return { pushed: true };
       } catch (retryError: unknown) {
@@ -6165,7 +6410,11 @@ export async function pushToRemoteAfterMerge(
           break;
         }
         throwIfAborted(options?.signal, taskId);
-        await delay(PUSH_NON_FF_RETRY_BACKOFF_MS[attempt - 1] ?? PUSH_NON_FF_RETRY_BACKOFF_MS.at(-1)!);
+        await sleepForPushRetry(
+          PUSH_NON_FF_RETRY_BACKOFF_MS[attempt - 1] ?? PUSH_NON_FF_RETRY_BACKOFF_MS.at(-1)!,
+          options?.signal,
+          taskId,
+        );
       }
     }
     return { pushed: false, error: lastMessage };
@@ -6186,11 +6435,6 @@ workflow steps run exclusively as the workflow graph's own post-merge optional-g
  * Attempt 2 (if enabled and Attempt 1 failed): Auto-resolve lock/generated files, retry AI
  * Attempt 3 (if enabled and Attempt 2 failed): Reset and use git merge -X theirs --squash
  *
- * When `options.pool` is provided and `recycleWorktrees` is enabled in
- * settings, the worktree is detached from its branch and released to the
- * idle pool instead of being removed. The task's branch is always deleted
- * regardless of pooling. On next task execution, the pooled worktree will
- * be acquired and prepared with a fresh branch via {@link WorktreePool.prepareForTask}.
  */
 
 /**
@@ -6216,6 +6460,21 @@ workflow steps run exclusively as the workflow graph's own post-merge optional-g
  *   - On finalize, best-effort cleanup of the stranded `task.worktree` and
  *     `fusion/<id>` branch keeps `.worktrees/` and the branch namespace tidy.
  */
+/*
+ * FNXC:ReviewGatedRemediation 2026-08-23-05:23:
+ * Empty-diff finalizers must resolve the selected workflow's required pre-merge gates, not infer
+ * verification from implementation-step names. Legacy callers without a workflow selection retain
+ * their historical guard behavior.
+ */
+async function resolveNoOpFinalizeGateIds(store: TaskStore, task: Task): Promise<ReadonlySet<string> | undefined> {
+  const selection = store.getTaskWorkflowSelectionAsync
+    ? await store.getTaskWorkflowSelectionAsync(task.id)
+    : store.getTaskWorkflowSelection?.(task.id);
+  if (!selection) return undefined;
+  const ir = await resolveWorkflowIrForTask(store, task.id).catch(() => undefined);
+  return ir ? resolveRequiredPreMergeStepIds(ir, task.enabledWorkflowSteps) : undefined;
+}
+
 async function tryEarlyEmptyOwnDiffFinalize(input: {
   task: Task;
   taskId: string;
@@ -6278,7 +6537,9 @@ async function tryEarlyEmptyOwnDiffFinalize(input: {
     return null;
   }
 
-  const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task);
+  const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task, {
+    requiredVerificationStepIds: await resolveNoOpFinalizeGateIds(store, task),
+  });
   if (noCommitsFinalize.blocked) {
     const reason = noCommitsFinalize.reason ?? "no-commits task has incomplete work with no net branch changes";
     /*
@@ -6309,7 +6570,7 @@ async function tryEarlyEmptyOwnDiffFinalize(input: {
         lane: "early-empty-own-diff",
       },
     });
-    await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "rebound"), { preserveProgress: true, moveSource: "engine" } as any);
+    await reboundLegacyMergeTask(store, taskId);
     return {
       task,
       branch,
@@ -6428,7 +6689,7 @@ async function tryEarlyEmptyOwnDiffFinalize(input: {
       }
     }
   }
-  if (ownedBranchOnEntry) {
+  if (ownedBranchOnEntry && isFusionDeletableBranch(task, ownedBranchOnEntry)) {
     try {
       // Branch must be deleted from the project root, not from inside a
       // worktree that may still be checked out to it.
@@ -6445,9 +6706,13 @@ async function tryEarlyEmptyOwnDiffFinalize(input: {
   }
   if (worktreeRemoved || branchDeleted) {
     try {
+      /*
+      FNXC:BranchNaming 2026-08-28-06:41:
+      FN-213 couples each cleared pointer to its own predicate. In particular, omitting the branch key when the branch survives prevents a branch write whose provenance was conditionally absent from failing after the worktree was already removed.
+      */
       await store.updateTask(taskId, {
-        worktree: worktreeRemoved ? null : task.worktree,
-        branch: branchDeleted ? null : task.branch,
+        ...(worktreeRemoved ? { worktree: null } : {}),
+        ...(branchDeleted ? { branch: null, branchWriteOrigin: "engine" as const } : {}),
       });
       // Keep the in-memory task in sync with the DB so the returned
       // MergeResult.task does not advertise a removed path / deleted branch.
@@ -6493,7 +6758,7 @@ export async function syncGroupPrOnLanding(input: {
   store: Pick<TaskStore, "getBranchGroup" | "listTasksByBranchGroup" | "updateBranchGroup">;
   groupId: string;
   cwd: string;
-  syncGroupPr: import("./group-merge-coordinator.js").SyncGroupPrFn;
+  syncGroupPr: import("./merge/group-merge-coordinator.js").SyncGroupPrFn;
 }): Promise<void> {
   const { store, groupId, cwd, syncGroupPr } = input;
   const latestGroup = await store.getBranchGroup(groupId);
@@ -6554,10 +6819,15 @@ export async function aiMergeTask(
   // reachable via direct unit tests/importers, so enforce the workspace merge-boundary
   // here too (throws the named WorkspaceTaskMergeError) before any git work.
   assertNotWorkspaceTaskMerge(task);
-  if (task.column === "done" || task.column === "archived") {
+  const finalizedLifecycle = await resolveTaskLifecycleColumns(store, taskId);
+  const finalizedColumns = new Set([
+    finalizedLifecycle?.complete ?? "done",
+    "done",
+  ]);
+  if (finalizedColumns.has(task.column)) {
     const message = `merger: skipping squash for ${taskId} — task already finalized (column=${task.column})`;
     mergerLog.log(message);
-    await (store as any).recordRunAuditEvent?.({
+    await emitBoundedRunAudit(store, {
       domain: "database",
       mutationType: "task:auto-merge-skipped-already-done",
       target: taskId,
@@ -6565,7 +6835,7 @@ export async function aiMergeTask(
         column: task.column,
         mergeConfirmed: task.mergeDetails?.mergeConfirmed ?? false,
       },
-    });
+    }, { log: mergerLog });
     return {
       task,
       branch: resolveTaskWorkingBranch(task),
@@ -6577,8 +6847,34 @@ export async function aiMergeTask(
       branchDeleted: false,
     };
   }
-  const mergeBlocker = getTaskMergeBlocker(task, { manual: options.manual === true });
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-17:10 (MERGING WAS BROKEN ON A RENAMED BOARD):
+  `getTaskMergeBlocker`'s identity check RETURNS A BLOCKER when the column is not a review lane, so
+  calling it without `reviewColumns` on a board whose review lane is renamed produced
+  `Cannot merge FN-x: task is in 'signoff', must be in 'in-review'` — and the merge threw. Not a
+  degraded message: no task could be merged at all.
+
+  The helper's own comment records this exact defect being fixed in `moves.ts`; these two merge
+  entry points were missed. Resolve the task's own review lanes and pass them.
+  */
+  let mergeGate;
+  try {
+    mergeGate = await resolvePreMergeGateForTask(store, taskId, task.enabledWorkflowSteps, task);
+  } catch {
+    throw new Error(`Cannot merge ${taskId}: merge gate could not resolve the task workflow`);
+  }
+  if (mergeGate.provenance === "default" && !mergeGate.selectionAbsent) {
+    throw new Error(`Cannot merge ${taskId}: merge gate could not resolve the task workflow`);
+  }
+  const mergeBlocker = getTaskMergeBlocker(task, {
+    manual: options.manual === true,
+    reviewColumns: mergeGate.reviewColumns.size > 0 ? mergeGate.reviewColumns : new Set(["in-review"]),
+    /* FNXC:LegacyPreMergeGate 2026-08-23-08:32: Legacy tasks without a persisted optional-group selection predate graph gates. New planned tasks always persist an explicit list, including Review Level 0's []. */
+    requiredPreMergeStepIds: Array.isArray(task.enabledWorkflowSteps) ? mergeGate.requiredPreMergeStepIds : undefined,
+  });
   if (mergeBlocker) {
+    /* FNXC:RequiredPreMergeSteps 2026-08-22-22:40: an unrun enabled gate is a deferral (typed), not a failure — see PreMergeStepsNotRunError. */
+    if (isPreMergeStepsNotRunBlocker(mergeBlocker)) throw new PreMergeStepsNotRunError(taskId);
     throw new Error(`Cannot merge ${taskId}: ${mergeBlocker}`);
   }
 
@@ -6622,7 +6918,7 @@ export async function aiMergeTask(
       settings,
     });
     try {
-      await (store as any).recordRunAuditEvent?.({
+      await emitBoundedRunAudit(store, {
         taskId,
         agentId: "merger",
         runId: `merge-${taskId}`,
@@ -6636,7 +6932,7 @@ export async function aiMergeTask(
           effectiveEligible: promotionEligibility.eligible,
           reason: promotionEligibility.reason,
         },
-      });
+      }, { log: mergerLog });
     } catch {
       // best-effort audit
     }
@@ -6663,7 +6959,7 @@ export async function aiMergeTask(
       }).catch((err) => {
         // Non-fatal: never fail the merge/landing because PR sync failed.
         try {
-          void store.recordRunAuditEvent({
+          void emitBoundedRunAudit(store, {
             taskId,
             agentId: "merger",
             runId: `merge-${taskId}`,
@@ -6674,7 +6970,7 @@ export async function aiMergeTask(
               groupId,
               error: err instanceof Error ? err.message : String(err),
             },
-          });
+          }, { log: mergerLog });
         } catch {
           // best-effort audit
         }
@@ -6685,7 +6981,7 @@ export async function aiMergeTask(
   if (groupRouting) {
     const auditRunId = `merge-${taskId}`;
     try {
-      await (store as any).recordRunAuditEvent?.({
+      await emitBoundedRunAudit(store, {
         taskId,
         agentId: "merger",
         runId: auditRunId,
@@ -6698,7 +6994,7 @@ export async function aiMergeTask(
           mergeTargetBranch: mergeTarget.branch,
           mergeTargetSource: mergeTarget.source,
         },
-      });
+      }, { log: mergerLog });
     } catch {
       // best-effort audit
     }
@@ -6713,7 +7009,7 @@ export async function aiMergeTask(
       `${taskId}: merge target rejected (${mergeTarget.rejected.reason}): ${mergeTarget.rejected.source}=${mergeTarget.rejected.branch} → using ${mergeTarget.branch}`,
     );
     try {
-      await (store as any).recordRunAuditEvent?.({
+      await emitBoundedRunAudit(store, {
         domain: "git",
         mutationType: "merge:merge-target-rejected-fusion-sibling",
         target: taskId,
@@ -6724,7 +7020,7 @@ export async function aiMergeTask(
           fallbackBranch: mergeTarget.branch,
           fallbackSource: mergeTarget.source,
         },
-      });
+      }, { log: mergerLog });
     } catch {
       // best-effort audit; never block the merge on telemetry
     }
@@ -6855,18 +7151,8 @@ export async function aiMergeTask(
     //   - FN-4811 active-session: skip a match whose path is currently owned
     //     by a DIFFERENT task in `activeSessionRegistry`. Same-task or unowned
     //     paths are eligible for direct reuse.
-    //   - FN-4954 pool-lease: when `recycleWorktrees=true` AND a pool is
-    //     attached, skip the direct-reuse shortcut and fall through to
-    //     `acquireTaskWorktree`, which integrates with `WorktreePool.acquire`
-    //     so the pool's `leased` map stays consistent. Without that fall-through
-    //     the new path would bypass pool bookkeeping and could collide with
-    //     `PoolDoubleLeaseError`.
     const expectedBranch = resolveTaskWorkingBranch(task);
-    // FN-4954: when a worktree pool is attached and recycling is enabled, pool
-    // semantics REQUIRE going through `acquireTaskWorktree` so `WorktreePool`'s
-    // lease bookkeeping stays consistent. Skip the direct-reuse shortcut here
-    // and fall through to the existing acquisition path.
-    const directReuseEligible = !(options.pool && settings.recycleWorktrees);
+    const directReuseEligible = true;
     if (directReuseEligible) {
       try {
         const { stdout: porcelain } = await execAsync(
@@ -6955,7 +7241,12 @@ export async function aiMergeTask(
             rootDir,
             integrationBranch: mergeTarget.branch,
           });
-          await store.updateTask(taskId, { worktree: reusableMatch.path, branch: reusableMatch.branch });
+          /*
+           * FNXC:BranchWriteOrigin 2026-08-20-14:40: FN-9161's store validation requires an explicit write origin on every branch write.
+           * FNXC:BranchWriteOrigin 2026-08-28-10:12: merge-reuse can re-pin an operator-override branch, so the stamp derives from the
+           * classifier (#3523 Greptile P1) — hardcoding "engine" here made cleanup eligible to delete operator-supplied branches.
+           */
+          await store.updateTask(taskId, { worktree: reusableMatch.path, branch: reusableMatch.branch, branchWriteOrigin: classifyTaskBranchOrigin(task, reusableMatch.branch) === "operator-supplied" ? "operator" : "engine" });
           await emitReuseHandoffAuditEvent(
             "merge:reuse-fallback-reused-existing-registration",
             {
@@ -7000,12 +7291,16 @@ export async function aiMergeTask(
       projectRootDir,
     );
 
+    /*
+    FNXC:WorktreeBaseRefresh 2026-08-01-16:04:
+    Merge deliberately leaves refreshStaleBase off. The merge lane owns its rebase policy through
+    decideAutoPrerebase/runAutoPrerebase; refreshing here would double-rebase a branch after review.
+    */
     const acquisition = await acquireTaskWorktree({
       task,
       rootDir: projectRootDir,
       store,
       settings,
-      pool: options.pool,
       logger: mergerLog,
       audit,
       runContext: engineRunContext,
@@ -7371,7 +7666,9 @@ export async function aiMergeTask(
       // — NOT a legitimate no-op. Demote to the unproven-recovery path which
       // moves the task back to todo with progress preserved instead of
       // clearing modifiedFiles to [].
-      const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task);
+      const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task, {
+        requiredVerificationStepIds: await resolveNoOpFinalizeGateIds(store, task),
+      });
       if (noCommitsFinalize.blocked) {
         const reason = noCommitsFinalize.reason ?? "no-commits task has incomplete work with no net branch changes";
         /*
@@ -7390,7 +7687,7 @@ export async function aiMergeTask(
             lane: "legacy-no-op-classifier",
           }, null, 2),
         );
-        await (store as any).recordRunAuditEvent?.({
+        await emitBoundedRunAudit(store, {
           domain: "database",
           mutationType: "task:no-commits-finalize-blocked-incomplete-steps",
           target: taskId,
@@ -7402,8 +7699,8 @@ export async function aiMergeTask(
             baseRef: classification.baseRef,
             lane: "legacy-no-op-classifier",
           },
-        });
-        await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "rebound"), { preserveProgress: true, moveSource: "engine" } as any);
+        }, { log: mergerLog });
+        await reboundLegacyMergeTask(store, taskId);
         await releaseReuseHandoffEarly("no-commits-incomplete-blocked");
         return {
           task,
@@ -7428,7 +7725,7 @@ export async function aiMergeTask(
             classification: classification.kind,
           }, null, 2),
         );
-        await (store as any).recordRunAuditEvent?.({
+        await emitBoundedRunAudit(store, {
           domain: "database",
           mutationType: "task:finalize-lost-work-blocked",
           target: taskId,
@@ -7436,8 +7733,8 @@ export async function aiMergeTask(
             modifiedFilesCount: task.modifiedFiles.length,
             classification: classification.kind,
           },
-        });
-        await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "rebound"), { preserveProgress: true, moveSource: "engine" } as any);
+        }, { log: mergerLog });
+        await reboundLegacyMergeTask(store, taskId);
         await releaseReuseHandoffEarly("lost-work-blocked");
         return {
           task,
@@ -7494,13 +7791,13 @@ export async function aiMergeTask(
       `Finalize blocked: unproven ownership evidence (${classification.reason}); no owned landed commit was found — auto-retrying via todo requeue`,
       JSON.stringify(classification.details, null, 2),
     );
-    await (store as any).recordRunAuditEvent?.({
+    await emitBoundedRunAudit(store, {
       domain: "database",
       mutationType: "task:finalize-unproven-blocked",
       target: taskId,
       metadata: { reason: classification.reason, details: classification.details, autoRetry: true },
-    });
-    await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "rebound"), { preserveProgress: true, moveSource: "engine" } as any);
+    }, { log: mergerLog });
+    await reboundLegacyMergeTask(store, taskId);
     await releaseReuseHandoffEarly(unprovenError);
     return {
       task,
@@ -7629,13 +7926,13 @@ export async function aiMergeTask(
         `Finalize blocked: unproven ownership evidence (${classification.reason}); branch missing and no owned landed commit was found — auto-retrying via todo requeue`,
         JSON.stringify(classification.details, null, 2),
       );
-      await (store as any).recordRunAuditEvent?.({
+      await emitBoundedRunAudit(store, {
         domain: "database",
         mutationType: "task:finalize-unproven-blocked",
         target: taskId,
         metadata: { reason: classification.reason, details: classification.details, branchMissing: true, autoRetry: true },
-      });
-      await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "rebound"), { preserveProgress: true, moveSource: "engine" } as any);
+      }, { log: mergerLog });
+      await reboundLegacyMergeTask(store, taskId);
       return result;
     }
 
@@ -7675,7 +7972,9 @@ export async function aiMergeTask(
       result.mergeTargetSource = mergeTarget.source;
       mergerLog.log(`${taskId}: branch missing; recovered owned landed commit ${classification.commit.sha.slice(0, 8)}`);
     } else {
-      const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task);
+      const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task, {
+        requiredVerificationStepIds: await resolveNoOpFinalizeGateIds(store, task),
+      });
       if (noCommitsFinalize.blocked) {
         const reason = noCommitsFinalize.reason ?? "no-commits task has incomplete work with no net branch changes";
         /*
@@ -7697,7 +7996,7 @@ export async function aiMergeTask(
             lane: "legacy-branch-missing-no-op",
           }, null, 2),
         );
-        await (store as any).recordRunAuditEvent?.({
+        await emitBoundedRunAudit(store, {
           domain: "database",
           mutationType: "task:no-commits-finalize-blocked-incomplete-steps",
           target: taskId,
@@ -7709,8 +8008,8 @@ export async function aiMergeTask(
             baseRef: classification.baseRef,
             lane: "legacy-branch-missing-no-op",
           },
-        });
-        await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "rebound"), { preserveProgress: true, moveSource: "engine" } as any);
+        }, { log: mergerLog });
+        await reboundLegacyMergeTask(store, taskId);
         return result;
       }
       const noOpReason = `branch has zero commits ahead of ${classification.baseRef}`;
@@ -7760,7 +8059,7 @@ export async function aiMergeTask(
       stdio: "pipe",
     }).trim();
     if (reuseTaskWorktreeMerge) {
-      mergerLog.log(
+      mergerLog.debug(
         `${taskId}: reusing task worktree — detaching HEAD at '${mergeTarget.branch}' before merge (${mergeTarget.source})`,
       );
       await execAsync(`git checkout --detach "${mergeTarget.branch}"`, {
@@ -7768,7 +8067,7 @@ export async function aiMergeTask(
       });
       await audit.git({ type: "branch:checkout", target: mergeTarget.branch });
     } else if (currentBranch !== mergeTarget.branch) {
-      mergerLog.log(`${taskId}: rootDir on '${currentBranch}', checking out '${mergeTarget.branch}' before merge (${mergeTarget.source})`);
+      mergerLog.debug(`${taskId}: rootDir on '${currentBranch}', checking out '${mergeTarget.branch}' before merge (${mergeTarget.source})`);
       await execAsync(`git checkout "${mergeTarget.branch}"`, {
         cwd: rootDir,
       });
@@ -7965,7 +8264,7 @@ export async function aiMergeTask(
       throwIfAborted(options.signal, taskId);
       await execAsync(`git rebase "${localHead}"`, { cwd: worktreePath });
       rebaseHappened = true;
-      mergerLog.log(`${taskId}: rebased ${branch} onto local HEAD ${localHead.slice(0, 8)}${label ? ` (${label})` : ""}`);
+      mergerLog.debug(`${taskId}: rebased ${branch} onto local HEAD ${localHead.slice(0, 8)}${label ? ` (${label})` : ""}`);
       await store.appendAgentLog(
         taskId,
         `Pre-merge rebase: ${branch} → local HEAD ${localHead.slice(0, 8)}${label ? ` (${label})` : ""}`,
@@ -7992,12 +8291,12 @@ export async function aiMergeTask(
   if (settings.worktreeRebaseBeforeMerge !== false) {
     try {
       if (!integrationRemote) {
-        mergerLog.log(`${taskId}: no integration remote resolvable — skipping remote rebase stage (local-base stage may still run)`);
+        mergerLog.debug(`${taskId}: no integration remote resolvable — skipping remote rebase stage (local-base stage may still run)`);
       } else if (!worktreePath) {
         mergerLog.warn(`${taskId}: no worktreePath — skipping remote rebase stage`);
       } else {
         throwIfAborted(options.signal, taskId);
-        mergerLog.log(`${taskId}: fetching ${integrationRemote} before merge`);
+        mergerLog.debug(`${taskId}: fetching ${integrationRemote} before merge`);
         await execAsync(`git fetch ${quoteArg(integrationRemote)}`, { cwd: rootDir });
 
         try {
@@ -8005,7 +8304,7 @@ export async function aiMergeTask(
           throwIfAborted(options.signal, taskId);
           await execAsync(`git rebase ${quoteArg(remoteRef)}`, { cwd: worktreePath });
           rebaseHappened = true;
-          mergerLog.log(`${taskId}: rebased ${branch} onto ${remoteRef}`);
+          mergerLog.debug(`${taskId}: rebased ${branch} onto ${remoteRef}`);
           await store.appendAgentLog(
             taskId,
             `Pre-merge rebase: ${branch} → ${remoteRef}`,
@@ -8128,7 +8427,7 @@ export async function aiMergeTask(
           );
           preferMainRebaseFailureMessage = undefined;
           rebaseHappened = true;
-          mergerLog.log(
+          mergerLog.debug(
             `${taskId}: Layer 1 recovery — rebased ${branch} --onto ${rebaseTarget.slice(0, 8)} dropping commits up to dep tip ${depTip.slice(0, 8)} (executionStartBranch=${task.executionStartBranch})`,
           );
           await store.logEntry(
@@ -8248,7 +8547,7 @@ export async function aiMergeTask(
               throw replayErr;
             }
           } else {
-            mergerLog.log(
+            mergerLog.debug(
               `${taskId}: Layer 2 found no duplicate-content commits to drop (window=500)`,
             );
           }
@@ -8474,7 +8773,7 @@ export async function aiMergeTask(
 
   // Log what verification commands will be used
   if (effectiveTestCommand || effectiveBuildCommand) {
-    mergerLog.log(
+    mergerLog.debug(
       `${taskId}: merge verification commands` +
       (effectiveTestCommand ? ` [test: ${effectiveTestCommand} (${effectiveTestSource || "explicit"})]` : "") +
       (effectiveBuildCommand ? ` [build: ${effectiveBuildCommand} (${effectiveBuildSource || "explicit"})]` : ""),
@@ -8482,7 +8781,7 @@ export async function aiMergeTask(
   }
 
   const mergeAttempt = async (attemptNum: 1 | 2 | 3): Promise<boolean> => {
-    mergerLog.log(`${taskId}: merge attempt ${attemptNum}/3...`);
+    mergerLog.debug(`${taskId}: merge attempt ${attemptNum}/3...`);
     const attemptLabel = attemptNum === 1
       ? "Attempt 1: AI merge"
       : attemptNum === 2
@@ -8612,11 +8911,7 @@ export async function aiMergeTask(
         throw error;
       }
 
-      if (
-        error instanceof DiffVolumeRegressionError
-        || error?.name === "DiffVolumeRegressionError"
-        || error?.name === "FileScopeViolationError"
-      ) {
+      if (error?.name === "FileScopeViolationError") {
         throw error;
       }
 
@@ -8715,7 +9010,7 @@ export async function aiMergeTask(
               // message deterministically from branch step commits.
               const authorArg = getCommitAuthorArg(settings);
               const { stdout: finalizeHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
-              mergerLog.log(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
+              mergerLog.debug(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
               const finalized = await commitOrAmendMergeWithFixes(
                 rootDir,
                 taskId,
@@ -8864,7 +9159,7 @@ export async function aiMergeTask(
           if (fixSuccess) {
             const authorArg = getCommitAuthorArg(settings);
             const { stdout: finalizeHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
-            mergerLog.log(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
+            mergerLog.debug(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
             const finalized = await commitOrAmendMergeWithFixes(
               rootDir,
               taskId,
@@ -9173,7 +9468,7 @@ export async function aiMergeTask(
       }
     } else if (auditSha && postMergeAuditMode === "off") {
       await store.appendAgentLog(taskId, "post-merge audit skipped (mode=off)", "status", undefined, "merger");
-      mergerLog.log(`${taskId}: post-merge audit skipped (mode=off)`);
+      mergerLog.debug(`${taskId}: post-merge audit skipped (mode=off)`);
     }
     if (isEmptyCommit) {
       mergerLog.warn(
@@ -9229,7 +9524,7 @@ export async function aiMergeTask(
           landedFilesAttributionRestricted = capture.landedFilesAttributionRestricted;
           landedFilesCaptureFallback = capture.landedFilesCaptureFallback;
           if (capture.noOpVerifiedShortCircuit) {
-            mergerLog.log(`${taskId}: rebase-strategy landed-files capture: zero own commits — verified-short-circuit`);
+            mergerLog.debug(`${taskId}: rebase-strategy landed-files capture: zero own commits — verified-short-circuit`);
           }
         } else {
           const { stdout: landedFilesOutput } = await execAsync(`git show --name-only --format= ${quoteArg(recordedSha)}`, {
@@ -9316,6 +9611,21 @@ export async function aiMergeTask(
       mergeDetails,
       modifiedFiles: noOpVerifiedShortCircuit ? undefined : landedFiles && landedFiles.length > 0 ? landedFiles : undefined,
     });
+    if (typeof (store as Partial<TaskStore>).publishTaskOverlapDeliveries === "function") {
+      const currentTask = await store.getTask(taskId);
+      const paths = recordedSha ? await captureSingleCommitLandedPaths(rootDir, recordedSha) : [];
+      await store.publishTaskOverlapDeliveries(taskId, [{
+        blockerTaskId: taskId,
+        blockerLineageId: currentTask?.lineageId,
+        repository: ".",
+        target: mergeTarget.branch,
+        landedSha: recordedSha,
+        paths,
+        noOp: noOpVerifiedShortCircuit === true || mergeWasEmpty,
+        evidence: landedFilesCaptureFallback === "attribution-failed" ? "unavailable" : "merge-details",
+        summary: currentTask?.summary,
+      }]);
+    }
     if (recordedSha) {
       const currentTask = await store.getTask(taskId);
       if (currentTask?.lineageId) {
@@ -9332,7 +9642,7 @@ export async function aiMergeTask(
         });
       }
     }
-    mergerLog.log(`${taskId}: merge details stored (commitSha: ${recordedSha?.slice(0, 8) ?? "<deferred>"})`);
+    mergerLog.debug(`${taskId}: merge details stored (commitSha: ${recordedSha?.slice(0, 8) ?? "<deferred>"})`);
 
     // Surface the high-level outcome on the agent-log timeline so users can
     // see the merge's strategy, attempt count, and final commit at a glance.
@@ -9483,19 +9793,23 @@ export async function aiMergeTask(
     }
   }
 
-  // 6. Delete branch
-  try {
-    await execAsync(`git branch -d "${branch}"`, { cwd: rootDir });
-    result.branchDeleted = true;
-    // Audit trail: record branch deletion (FN-1404)
-    await audit.git({ type: "branch:delete", target: branch });
-  } catch {
+  // 6. Delete only a Fusion-proven branch; a skipped delete has no audit event.
+  if (isFusionDeletableBranch(task, branch)) {
     try {
-      await execAsync(`git branch -D "${branch}"`, { cwd: rootDir });
+      await execAsync(`git branch -d "${branch}"`, { cwd: rootDir });
       result.branchDeleted = true;
-      // Audit trail: record branch deletion (force) (FN-1404)
-      await audit.git({ type: "branch:delete", target: branch, metadata: { force: true } });
-    } catch { /* non-fatal */ }
+      // Audit trail: record branch deletion (FN-1404)
+      await audit.git({ type: "branch:delete", target: branch });
+    } catch {
+      try {
+        await execAsync(`git branch -D "${branch}"`, { cwd: rootDir });
+        result.branchDeleted = true;
+        // Audit trail: record branch deletion (force) (FN-1404)
+        await audit.git({ type: "branch:delete", target: branch, metadata: { force: true } });
+      } catch { /* non-fatal */ }
+    }
+  } else {
+    mergerLog.log(`${taskId}: kept operator-supplied branch ${branch}`);
   }
 
   if (result.branchDeleted) {
@@ -9526,38 +9840,8 @@ export async function aiMergeTask(
   if (worktreePath && existsSync(worktreePath)) {
     const otherUser = await findWorktreeUser(store, worktreePath, taskId);
     if (otherUser) {
-      mergerLog.log(`Worktree retained — still needed by ${otherUser}`);
+      mergerLog.debug(`Worktree retained — still needed by ${otherUser}`);
       result.worktreeRemoved = false;
-    } else if (options.pool && settings.recycleWorktrees) {
-      if (activeSessionRegistry.isPathActive(worktreePath)) {
-        mergerLog.warn(`${taskId}: skipping pooled release for active session path ${worktreePath}`);
-        await audit?.git({
-          type: "worktree:removal-refused-active-session",
-          target: worktreePath,
-          metadata: { taskId, reason: RemovalReason.MergerCleanup, kind: "merger" },
-        });
-        result.worktreeRemoved = false;
-      } else {
-        try {
-          const onBranch = await execAsync("git symbolic-ref --quiet HEAD", { cwd: worktreePath, timeout: 5_000, encoding: "utf-8" })
-            .then(() => true)
-            .catch(() => false);
-          if (onBranch) {
-            await execAsync("git checkout --detach HEAD", { cwd: worktreePath, timeout: 10_000, encoding: "utf-8" });
-          }
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          mergerLog.warn(`${taskId}: failed to detach pooled worktree before release: ${msg}`);
-        }
-        try {
-          await store.updateTask(taskId, { worktree: null, branch: null });
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          mergerLog.warn(`${taskId}: failed to clear worktree pointer before pool release: ${msg}`);
-        }
-        options.pool.release(worktreePath, taskId);
-        result.worktreeRemoved = false;
-      }
     } else {
       try {
         if (activeSessionRegistry.isPathActive(worktreePath)) {
@@ -9583,7 +9867,7 @@ export async function aiMergeTask(
         }
         if (result.worktreeRemoved) {
           try {
-            await store.updateTask(taskId, { worktree: null, branch: null });
+            await store.updateTask(taskId, { worktree: null, branch: null, branchWriteOrigin: "engine" });
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             mergerLog.warn(`${taskId}: failed to clear worktree pointer after removal: ${msg}`);
@@ -9594,7 +9878,7 @@ export async function aiMergeTask(
   }
 
   // 8b. Push to remote if configured
-  if (settings.pushAfterMerge && settings.mergeStrategy !== "pull-request") {
+  if (isPushAfterMergeEnabled(settings, { lane: "single-repo" })) {
     try {
       throwIfAborted(options.signal, taskId);
       const pushTask = await store.getTask(taskId).catch(() => null);
@@ -9700,24 +9984,42 @@ export async function aiMergeTask(
         result.pushError = pushResult.error;
       }
     } catch (err: any) {
-      mergerLog.error(`${taskId}: push to remote error: ${err.message}`);
-      result.pushedToRemote = false;
-      result.pushError = err.message;
-      await audit.git({
-        type: "push:origin",
-        target: taskId,
-        metadata: {
-          integrationBranch: mergeTarget.branch,
-          remote: settings.pushRemote || "origin",
-          outcome: "failed",
-          stderrPreview: err.message,
-        },
-      }).catch(() => undefined);
-      await store.logEntry(
-        taskId,
-        `Push to remote threw after merge — task marked done anyway; local main may diverge from origin: ${err.message}`,
-        "PushToRemoteFailed",
-      ).catch(() => undefined);
+      if (err instanceof Error && err.name === "MergeAbortedError") {
+        // FNXC:MergePush 2026-08-16-03:39: The retained public merger must preserve shutdown cancellation as an aborted delivery outcome after the local merge is finalized.
+        const message = "Push after merge aborted by shutdown signal; the local merge remains finalized";
+        mergerLog.warn(`${taskId}: ${message}`);
+        result.pushedToRemote = false;
+        result.pushError = message;
+        await audit.git({
+          type: "push:origin",
+          target: taskId,
+          metadata: {
+            integrationBranch: mergeTarget.branch,
+            remote: settings.pushRemote || "origin",
+            outcome: "aborted",
+          },
+        }).catch(() => undefined);
+        await store.logEntry(taskId, message, "PushToRemoteFailed").catch(() => undefined);
+      } else {
+        mergerLog.error(`${taskId}: push to remote error: ${err.message}`);
+        result.pushedToRemote = false;
+        result.pushError = err.message;
+        await audit.git({
+          type: "push:origin",
+          target: taskId,
+          metadata: {
+            integrationBranch: mergeTarget.branch,
+            remote: settings.pushRemote || "origin",
+            outcome: "failed",
+            stderrPreview: err.message,
+          },
+        }).catch(() => undefined);
+        await store.logEntry(
+          taskId,
+          `Push to remote threw after merge — task marked done anyway; local main may diverge from origin: ${err.message}`,
+          "PushToRemoteFailed",
+        ).catch(() => undefined);
+      }
     }
   }
 
@@ -9831,7 +10133,7 @@ export async function tryFastForwardFromOrigin(
   try {
     await execAsync(`git fetch ${quoteArg(remote)} ${quoteArg(currentBranch)}`, { cwd: rootDir });
   } catch (err) {
-    mergerLog.log(`${taskId}: pre-merge fetch failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
+    mergerLog.debug(`${taskId}: pre-merge fetch failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
 
@@ -9854,15 +10156,15 @@ export async function tryFastForwardFromOrigin(
 
   if (behind === 0) return; // already up to date
   if (ahead > 0) {
-    mergerLog.log(`${taskId}: local ${currentBranch} has ${ahead} unpushed commit(s); skipping fast-forward`);
+    mergerLog.debug(`${taskId}: local ${currentBranch} has ${ahead} unpushed commit(s); skipping fast-forward`);
     return;
   }
 
   try {
     await execAsync(`git merge --ff-only ${quoteArg(remoteRef)}`, { cwd: rootDir });
-    mergerLog.log(`${taskId}: fast-forwarded ${currentBranch} by ${behind} commit(s) from ${remote}`);
+    mergerLog.debug(`${taskId}: fast-forwarded ${currentBranch} by ${behind} commit(s) from ${remote}`);
   } catch (err) {
-    mergerLog.log(`${taskId}: fast-forward failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
+    mergerLog.debug(`${taskId}: fast-forward failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -10147,14 +10449,6 @@ export async function executeMergeAttempt(
               resetLabel: "file-scope invariant violation",
               auditor: params.auditor,
             });
-            await runDiffVolumeGate({
-              rootDir,
-              branch,
-              integrationTargetSha: params.preAttemptHeadSha || "HEAD",
-              taskId,
-              settings,
-              store,
-            });
             await execAsync(
               `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
               { cwd: rootDir, env: mergerCommitEnv() },
@@ -10192,7 +10486,7 @@ export async function executeMergeAttempt(
         ).trim() === "0";
 
         if (squashIsEmpty) {
-          mergerLog.log(`${taskId}: squash merge staged nothing — already merged`);
+          mergerLog.debug(`${taskId}: squash merge staged nothing — already merged`);
           aiTracker.mergeWasEmpty = true;
           // Run deterministic verification (nothing staged but still verify)
           if (testCommand || buildCommand) {
@@ -10226,7 +10520,7 @@ export async function executeMergeAttempt(
       ).trim() === "0";
 
       if (squashIsEmpty) {
-        mergerLog.log(`${taskId}: squash merge staged nothing — already merged`);
+        mergerLog.debug(`${taskId}: squash merge staged nothing — already merged`);
         aiTracker.mergeWasEmpty = true;
         // Run deterministic verification (nothing staged but still verify)
         if (testCommand || buildCommand) {
@@ -10397,7 +10691,7 @@ export async function executeMergeAttempt(
         `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
         { cwd: rootDir, env: mergerCommitEnv() },
       );
-      mergerLog.log(`${taskId}: rewrote AI-authored merge commit message with deterministic body`);
+      mergerLog.debug(`${taskId}: rewrote AI-authored merge commit message with deterministic body`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       mergerLog.warn(`${taskId}: failed to canonicalize merge commit message (${msg}) — keeping AI-written message`);
@@ -10434,7 +10728,6 @@ export async function executeMergeAttempt(
     // verification failure anyway — there are no conflicts to resolve.
     if (
       error?.name === "VerificationError"
-      || error?.name === "DiffVolumeRegressionError"
       || error?.name === "FileScopeViolationError"
     ) {
       throw error;
@@ -10463,7 +10756,7 @@ export async function attemptWithSideStrategy(
 ): Promise<boolean> {
   const { rootDir, branch, taskId } = params;
 
-  mergerLog.log(`${taskId}: attempting merge with -X ${side} strategy`);
+  mergerLog.debug(`${taskId}: attempting merge with -X ${side} strategy`);
 
   try {
     throwIfAborted(params.options.signal, taskId);
@@ -10484,7 +10777,7 @@ export async function attemptWithSideStrategy(
 
     return finalizeSideStrategyAttempt(params, side, aiTracker);
   } catch (error) {
-    if (error instanceof Error && (error.name === "MergeAbortedError" || error.name === "DiffVolumeRegressionError" || error.name === "FileScopeViolationError")) {
+    if (error instanceof Error && (error.name === "MergeAbortedError" || error.name === "FileScopeViolationError")) {
       throw error;
     }
     mergerLog.error(`${taskId}: -X ${side} merge failed: ${error}`);
@@ -10525,7 +10818,7 @@ async function attemptWithMixedSideStrategy(
 
     return finalizeSideStrategyAttempt(params, strategy.defaultSide, aiTracker);
   } catch (error) {
-    if (error instanceof Error && (error.name === "MergeAbortedError" || error.name === "DiffVolumeRegressionError" || error.name === "FileScopeViolationError")) {
+    if (error instanceof Error && (error.name === "MergeAbortedError" || error.name === "FileScopeViolationError")) {
       throw error;
     }
     mergerLog.error(`${taskId}: overlap-aware merge failed: ${error}`);
@@ -10593,14 +10886,6 @@ async function finalizeSideStrategyAttempt(
     task: await store.getTask(taskId),
     resetLabel: "file-scope invariant violation",
     auditor: params.auditor,
-  });
-  await runDiffVolumeGate({
-    rootDir,
-    branch,
-    integrationTargetSha: params.preAttemptHeadSha || "HEAD",
-    taskId,
-    settings,
-    store,
   });
   await execAsync(
     `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
@@ -10701,7 +10986,6 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     testCommand,
     buildCommand,
     preMergeRebaseFallthrough,
-    preAttemptHeadSha,
   } = params;
 
   // Merge per-task effective workflow settings (U3, KTD-3) — this worker re-fetches
@@ -10730,22 +11014,23 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
       const { message } = params as { message: string };
       buildFailed = true;
       buildErrorMessage = message;
-      return { 
+      return {
         content: [{ type: "text", text: `Build failure reported: ${message}` }],
-        details: undefined 
+        details: undefined
       };
     },
   };
 
-  mergerLog.log(`${taskId}: ${hasConflicts ? "resolving conflicts + " : ""}writing commit message`);
+  // FNXC:EngineDiagnostics 2026-07-26-10:10: routine finalize bookkeeping; conflict/AI outcomes log elsewhere.
+  mergerLog.debug(`${taskId}: ${hasConflicts ? "resolving conflicts + " : ""}writing commit message`);
 
   const agentLogger = new AgentLogger({
     store,
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    // Merger agents are task-scoped ephemeral workers.
-    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
+    /* FNXC:WorkflowAgentRouting 2026-08-07-04:13: Merger workflow sessions use durable routed principals and permanent-agent logging policy. */
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: false }),
     onAgentText: options.onAgentText
       ? (_id, delta) => options.onAgentText!(delta)
       : undefined,
@@ -10753,6 +11038,8 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
       ? (_id, name) => options.onAgentTool!(name)
       : undefined,
   });
+    { attachAgentUsageTelemetry(agentLogger, { store, agentId: null, taskId, nodeId: null, lane: "merger" }); }
+
 
   // Resolve per-agent custom instructions for the merger role
   let mergerInstructions = "";
@@ -10761,7 +11048,13 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
       const agents = await options.agentStore.listAgents({ role: "merger" });
       for (const agent of agents) {
         if (agent.instructionsText || agent.instructionsPath) {
-          mergerInstructions = await resolveAgentInstructions(agent, rootDir);
+          /*
+          FNXC:MemoryPreSteering 2026-08-11-11:54:
+          FN-8934 requires merger prompts to honor the selected principal's memory mode.
+          Passing the resolved mode prevents off/index settings from silently receiving full-memory steering.
+          */
+          const memoryMode = resolveAgentMemoryInclusionMode({ agent, globalSettings: settings }).mode;
+          mergerInstructions = await resolveAgentInstructions(agent, rootDir, undefined, memoryMode);
           break;
         }
       }
@@ -10805,10 +11098,23 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
   const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
   const mergerTask = await store.getTask(taskId).catch(() => undefined);
     const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig, mergerTask);
+  // FNXC:CommandCenterActivity 2026-08-09-11:12: Merger ownership and model resolve
+  // after logger construction; refresh before any model callbacks publish usage events.
+  attachAgentUsageTelemetry(agentLogger, {
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
+
 
   // FNXC:Settings-MergerModel 2026-07-16-00:00: merger retries use the dedicated project fallback lane before the shared global fallback pair.
 
   const mergerFallbackModel = resolveMergerFallbackModel(settings);
+  const mergerFusionTools = [reportBuildFailureTool, createWebFetchTool()];
 
   // FN-5279: Layer 3 / merge-authoring AI runs in the resolved integration
   // root so arbiter edits land in the reused task worktree when handoff mode
@@ -10820,13 +11126,15 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     cwd: rootDir,
     systemPrompt: mergerSystemPrompt,
     tools: "coding",
-    customTools: [reportBuildFailureTool, createWebFetchTool()],
+    customTools: mergerFusionTools,
+    fusionTools: mergerFusionTools,
     onText: agentLogger.onText,
     onThinking: agentLogger.onThinking,
     onToolStart: agentLogger.onToolStart,
     onToolEnd: agentLogger.onToolEnd,
     defaultProvider: mergerSessionModel.provider,
     defaultModelId: mergerSessionModel.modelId,
+      ...(mergerSessionModel.credentialInstanceId ? { credentialInstanceId: mergerSessionModel.credentialInstanceId } : {}),
     fallbackProvider: mergerFallbackModel.provider,
     fallbackModelId: mergerFallbackModel.modelId,
     fallbackThinkingLevel: resolveMergerFallbackThinkingLevel(settings, mergerTask?.mergerThinkingLevel),
@@ -10855,6 +11163,15 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     }),
   });
 
+  emitAgentSessionStart({
+    store,
+    agentId: mergerTask?.assignedAgentId ?? null,
+    taskId,
+    nodeId: mergerTask?.effectiveNodeId ?? mergerTask?.nodeId ?? null,
+    model: mergerSessionModel.modelId ?? null,
+    provider: mergerSessionModel.provider ?? null,
+    lane: "merger",
+  });
   options.onSession?.(session);
 
   try {
@@ -10878,7 +11195,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
 
     // Attempt prompting with fresh session (first attempt).
     // Log message distinguishes fresh-session start from compaction recovery path.
-    mergerLog.log(`${taskId}: starting fresh merge agent session`);
+    mergerLog.debug(`${taskId}: starting fresh merge agent session`);
 
     try {
       await withRateLimitRetry(async () => {
@@ -10968,7 +11285,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
       // If build command was configured, agent should have committed or reported failure
       if (!buildCommand) {
         throwIfAborted(options.signal, taskId);
-        mergerLog.log("Agent didn't commit — committing with fallback message");
+        mergerLog.debug("Agent didn't commit — committing with fallback message");
         // Body cascade: branch's commit log → AI summary of diff stat →
         // diff stat itself → synthetic placeholder. Guarantees the merge
         // commit carries a non-empty body even when the AI agent didn't
@@ -10995,14 +11312,6 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
           aiBody: aiBody?.trim().length ? aiBody : safeBody,
           aiSubject,
         });
-        await runDiffVolumeGate({
-          rootDir,
-          branch,
-          integrationTargetSha: preAttemptHeadSha || "HEAD",
-          taskId,
-          settings,
-          store,
-        });
         await execAsync(
           `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
           { cwd: rootDir, env: mergerCommitEnv() },
@@ -11023,7 +11332,12 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     mergerLog.error(`Agent failed: ${err.message}`);
 
     if (options.usageLimitPauser && isUsageLimitError(err.message)) {
-      await options.usageLimitPauser.onUsageLimitHit("merger", taskId, err.message);
+      await options.usageLimitPauser.onUsageLimitHit(
+        "merger",
+        taskId,
+        err.message,
+        session.state?.model?.provider ?? mergerSessionModel.provider,
+      );
     }
 
     throw err;
@@ -11216,7 +11530,12 @@ async function runConfiguredMergeWorktreeCommand(
   };
 }
 
-async function completeTask(
+/*
+FNXC:AgentActivityStream 2026-08-09-21:19:
+Completion is the single merger finalization seam shared by successful merge paths. It is exported
+so its durable agent-activity outbox write can be tested without a synthetic git or AI session.
+*/
+export async function completeTask(
   store: TaskStore,
   taskId: string,
   result: MergeResult,
@@ -11225,8 +11544,16 @@ async function completeTask(
   const preMoveTask = await store.getTask(taskId);
   // Clear transient status before moving to done
   await store.updateTask(taskId, { status: null });
-  // Use moveTask for proper event emission
-  const task = await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "complete"));
+  /*
+  FNXC:MergerMoveAttribution 2026-08-29-07:37:
+  Legacy merger completion remains a forward merge authority. Its own neutral provenance keeps the
+  lifecycle timeline legible without borrowing graph/remediation/plan-approval literals that alter
+  review-entry auditing and reopen field-clearing semantics; plugins observe this source too.
+  */
+  // Use moveTask for proper event emission.
+  const task = await store.moveTask(taskId, await resolveMergerLifecycleColumn(store, taskId, "complete"), {
+    workflowMoveSource: "merger-complete-task",
+  });
   const settings = await store.getSettings();
   if (isMergeRequestContractShadowEnabled(settings) && preMoveTask?.autoMerge !== false) {
     const mergeRequestRecord = await store.getMergeRequestRecordAsync(taskId);
@@ -11235,5 +11562,12 @@ async function completeTask(
     }
   }
   result.task = task;
+  try {
+    /*
+    FNXC:AgentActivityStream 2026-08-09-11:50:
+    A landed SHA is the completion's natural idempotency discriminator; completed retries without one converge on the fixed done token. The configured merge route is a closed metadata enum, so monitoring retains the actual route without accepting arbitrary strategy prose.
+    */
+    await store.recordAgentActivity({ type: "task:completed", attributionClaim: resolveAgentActivityAttribution([{ id: preMoveTask?.assignedAgentId ?? "merger", provenance: preMoveTask?.assignedAgentId ? "roster" : "lane" }], "merger"), taskId, occurredAt: new Date().toISOString(), discriminator: result.commitSha ?? "done", metadata: { sha: result.commitSha, strategy: settings.mergeStrategy } });
+  } catch { /* FNXC:AgentActivityStream 2026-08-09-09:09: monitoring never blocks completion. */ }
   store.emit("task:merged", result);
 }

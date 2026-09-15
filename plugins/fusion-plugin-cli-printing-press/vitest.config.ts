@@ -25,8 +25,24 @@ const quarantinedCliPrintingPressTests = [
 export default defineConfig({
   resolve: {
     alias: {
+      /*
+      FNXC:VitestAliases 2026-07-30-13:10:
+      Must precede the broader `@fusion/core` alias: Vite string aliases match by PREFIX, so that key
+      rewrites this subpath to `index.ts/task-delete-attribution` and resolution fails. Reached here
+      transitively — this project aliases `@fusion/dashboard`, and `app/api/client.ts` imports the
+      browser-safe delete-attribution leaf.
+      */
+      "@fusion/core/column-roles": fileURLToPath(new URL("../../packages/core/src/column-roles.ts", import.meta.url)),
+      "@fusion/core/task-delete-attribution": fileURLToPath(new URL("../../packages/core/src/task-delete-attribution.ts", import.meta.url)),
       "@fusion/core": fileURLToPath(new URL("../../packages/core/src/index.ts", import.meta.url)),
       "@fusion/plugin-sdk": fileURLToPath(new URL("../../packages/plugin-sdk/src/index.ts", import.meta.url)),
+      /*
+      FNXC:VitestAliases 2026-09-13-22:40:
+      Manage paints the standardized cooperative header through its dashboard subpath; the specific entry must
+      precede the package alias because string aliases match by PREFIX.
+      */
+      "@fusion/dashboard/app/plugins/PluginDashboardViewHeader": fileURLToPath(new URL("../../packages/dashboard/app/plugins/PluginDashboardViewHeader.tsx", import.meta.url)),
+      "@fusion/dashboard/app/plugins/types": fileURLToPath(new URL("../../packages/dashboard/app/plugins/types.ts", import.meta.url)),
       "@fusion/dashboard": fileURLToPath(new URL("../../packages/dashboard/app/index.ts", import.meta.url)),
     },
   },
@@ -41,5 +57,15 @@ export default defineConfig({
     pool: "threads",
     maxWorkers,
     minWorkers: 1,
+    /*
+    FNXC:PluginPgTestTimeout 2026-07-23-22:15:
+    The shared PG test harness (packages/core/src/__test-utils__/pg-test-harness.ts) pays its
+    golden-schema-template cold start inside the FIRST pg test of a vitest invocation, which is
+    budgeted for the 15s testTimeout its home package (@fusion/core) configures. Plugin packages
+    ran at vitest's 5s default, so the whatsapp-chat persistence.pg.test.ts timed out on loaded
+    CI runners (full-suite shard 4, 2026-07-24). Align every pg-harness-consuming plugin with
+    core's budget.
+    */
+    testTimeout: 15_000,
   },
 });

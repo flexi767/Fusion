@@ -2,13 +2,51 @@ import { describe, expect, it, vi } from "vitest";
 import { BUILTIN_CODING_WORKFLOW_IR } from "@fusion/core";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
 
-import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
+import { WorkflowGraphExecutor } from "../workflows/workflow-graph-executor.js";
+import { createMergeGateHandler } from "../workflow-node-runners/merge-runner.js";
 
 const task = { id: "FN-5767" } as TaskDetail;
 
 function settingsOn() {
   return { experimentalFeatures: { workflowGraphExecutor: true } };
 }
+
+describe("merge gate shared-member provenance", () => {
+  const liveMember = vi.fn(async () => true);
+  const invokeGate = (
+    taskOverride: Partial<TaskDetail>,
+    isLiveSharedBranchMember = liveMember,
+    autoMerge = false,
+  ) =>
+    createMergeGateHandler({ isLiveSharedBranchMember })(
+      { id: "merge-gate", kind: "merge-gate" } as never,
+      { task: { ...task, ...taskOverride }, settings: { autoMerge } } as never,
+    );
+
+  it.each([
+    [{ autoMerge: undefined }, "unset"],
+    [{ autoMerge: false, autoMergeProvenance: "user" }, "user"],
+    [{ autoMerge: false, autoMergeProvenance: "mission" }, "mission"],
+    [{ autoMerge: false, autoMergeProvenance: "legacy-stamp" }, "legacy"],
+  ] as const)("holds project-Off %s values before consulting liveness", async (taskOverride) => {
+    const resolver = vi.fn(async () => true);
+    await expect(invokeGate(taskOverride, resolver, false)).resolves.toMatchObject({ value: "auto-off" });
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit task On under project Off", async () => {
+    await expect(invokeGate({ autoMerge: true }, liveMember, false)).resolves.toMatchObject({ value: "auto-on" });
+  });
+
+  it.each(["mission", "legacy-stamp", undefined] as const)("keeps a live member flowing for non-user false provenance when project On (%s)", async (autoMergeProvenance) => {
+    await expect(invokeGate({ autoMerge: false, autoMergeProvenance }, liveMember, true)).resolves.toMatchObject({ value: "auto-on" });
+  });
+
+  it("holds user Off when project On and keeps non-live false values manual", async () => {
+    await expect(invokeGate({ autoMerge: false, autoMergeProvenance: "user" }, liveMember, true)).resolves.toMatchObject({ value: "auto-off" });
+    await expect(invokeGate({ autoMerge: false, autoMergeProvenance: "mission" }, async () => false, true)).resolves.toMatchObject({ value: "auto-off" });
+  });
+});
 
 describe("WorkflowGraphExecutor traversal", () => {
   it("walks linear graph", async () => {

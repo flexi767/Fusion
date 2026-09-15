@@ -1,9 +1,11 @@
 import "./SecretsView.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, ChevronDown, ChevronRight, Copy, Eye, EyeOff, Lock, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy, Eye, EyeOff, Lock, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { ViewHeader } from "./ViewHeader";
+import { ViewActionButton } from "./ViewActionButton";
 import { copyTextToClipboard } from "../utils/copyToClipboard";
+import { withProjectId } from "../api/client/health";
 
 type ToastKind = "info" | "success" | "error";
 type SecretScope = "project" | "global";
@@ -22,6 +24,7 @@ interface SecretRecord {
 
 interface SecretsViewProps {
   addToast?: (msg: string, kind?: ToastKind) => void;
+  projectId?: string;
 }
 
 const RESERVED_SYNC_PASSPHRASE_KEY = "__sync_passphrase__";
@@ -57,11 +60,13 @@ const spinningActionIconProps = {
   className: "secrets-action-icon spin",
 } as const;
 
-export const SecretsView = ({ addToast }: SecretsViewProps) => {
+export const SecretsView = ({ addToast, projectId }: SecretsViewProps) => {
   const { t } = useTranslation("app");
   const [secrets, setSecrets] = useState<SecretRecord[]>([]);
+  const [secretsProjectId, setSecretsProjectId] = useState<string | undefined>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorProjectId, setErrorProjectId] = useState<string | undefined>();
   const [formError, setFormError] = useState<string | null>(null);
   const [editing, setEditing] = useState<SecretRecord | null>(null);
   const [showModal, setShowModal] = useState(false);
@@ -71,6 +76,7 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
   const [revealedValues, setRevealedValues] = useState<Record<string, string | null>>({});
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [syncPassphraseConfigured, setSyncPassphraseConfigured] = useState(false);
+  const [syncStatusProjectId, setSyncStatusProjectId] = useState<string | undefined>();
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [syncPassphrase, setSyncPassphrase] = useState("");
   const [syncPassphraseConfirm, setSyncPassphraseConfirm] = useState("");
@@ -84,6 +90,20 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
   const [syncDisclosureOpen, setSyncDisclosureOpen] = useState(false);
   const revealTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const copyTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const projectRequestVersionRef = useRef(0);
+  const syncRequestVersionRef = useRef(0);
+  const activeProjectIdRef = useRef(projectId);
+  if (activeProjectIdRef.current !== projectId) {
+    activeProjectIdRef.current = projectId;
+    projectRequestVersionRef.current += 1;
+    syncRequestVersionRef.current += 1;
+  }
+
+  /*
+  FNXC:Secrets 2026-08-05-21:37:
+  Dashboard secret requests must carry the selected project identity before the API resolves a store. Global scope remains shared in central.secrets_global; this query only prevents the daemon launch-store fallback from receiving project UI mutations.
+  */
+  const projectUrl = useCallback((path: string) => withProjectId(path, projectId), [projectId]);
 
   const request = useCallback(async <T,>(url: string, init?: RequestInit): Promise<T> => {
     const response = await fetch(url, {
@@ -102,35 +122,68 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
   }, []);
 
   const loadSecrets = useCallback(async () => {
+    const requestProjectId = projectId;
+    if (activeProjectIdRef.current !== requestProjectId) return;
+    const requestVersion = ++projectRequestVersionRef.current;
     setLoading(true);
     setError(null);
+    setErrorProjectId(undefined);
     try {
-      const data = await request<{ secrets: SecretRecord[] }>("/api/secrets");
-      setSecrets(data.secrets);
+      const data = await request<{ secrets: SecretRecord[] }>(projectUrl("/api/secrets"));
+      if (requestVersion === projectRequestVersionRef.current && activeProjectIdRef.current === requestProjectId) {
+        setSecrets(data.secrets);
+        setSecretsProjectId(requestProjectId);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestVersion === projectRequestVersionRef.current && activeProjectIdRef.current === requestProjectId) {
+        setError(err instanceof Error ? err.message : String(err));
+        setErrorProjectId(requestProjectId);
+      }
     } finally {
-      setLoading(false);
+      if (requestVersion === projectRequestVersionRef.current && activeProjectIdRef.current === requestProjectId) setLoading(false);
     }
-  }, [request]);
+  }, [projectId, projectUrl, request]);
 
   const loadSyncPassphraseStatus = useCallback(async () => {
+    const requestProjectId = projectId;
+    if (activeProjectIdRef.current !== requestProjectId) return;
+    const requestVersion = ++syncRequestVersionRef.current;
     try {
-      const data = await request<{ configured: boolean }>("/api/secrets/sync-passphrase");
-      setSyncPassphraseConfigured(Boolean(data.configured));
+      const data = await request<{ configured: boolean }>(projectUrl("/api/secrets/sync-passphrase"));
+      if (requestVersion === syncRequestVersionRef.current && activeProjectIdRef.current === requestProjectId) {
+        setSyncPassphraseConfigured(Boolean(data.configured));
+        setSyncStatusProjectId(requestProjectId);
+      }
     } catch (err) {
-      addToast?.(t("secrets.errorLoadSyncStatus", "Failed to load sync passphrase status: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
+      if (requestVersion === syncRequestVersionRef.current && activeProjectIdRef.current === requestProjectId) addToast?.(t("secrets.errorLoadSyncStatus", "Failed to load sync passphrase status: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     }
-  }, [addToast, request]);
+  }, [addToast, projectId, projectUrl, request, t]);
 
   useEffect(() => {
+    setSecrets([]);
+    setSecretsProjectId(undefined);
+    setRevealedValues({});
+    setCopiedId(null);
+    setSyncPassphraseConfigured(false);
+    setSyncStatusProjectId(undefined);
+    setError(null);
+    setErrorProjectId(undefined);
+    setFormError(null);
+    setEditing(null);
+    setShowModal(false);
+    setShowValue(false);
+    setShowDeleteId(null);
+    setSyncModalOpen(false);
+    setSyncPassphrase("");
+    setSyncPassphraseConfirm("");
+    setSyncSaving(false);
     void loadSecrets();
     void loadSyncPassphraseStatus();
     return () => {
       revealTimersRef.current.forEach((timer) => clearTimeout(timer));
       copyTimersRef.current.forEach((timer) => clearTimeout(timer));
     };
-  }, [loadSecrets, loadSyncPassphraseStatus]);
+  }, [loadSecrets, loadSyncPassphraseStatus, projectId]);
 
   const closeSyncModal = () => {
     setSyncModalOpen(false);
@@ -138,36 +191,44 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
     setSyncPassphraseConfirm("");
   };
 
-  const saveSyncPassphrase = async (passphrase: string) => {
-    await request<{ success: boolean }>("/api/secrets/sync-passphrase", {
+  const saveSyncPassphrase = async (passphrase: string, requestProjectId: string | undefined) => {
+    await request<{ success: boolean }>(withProjectId("/api/secrets/sync-passphrase", requestProjectId), {
       method: "PUT",
       body: JSON.stringify({ passphrase }),
     });
   };
 
+  /*
+  FNXC:Secrets 2026-08-05-22:19:
+  A mutation started for project A can resolve after the dashboard selects B. Its completion may persist at A, but must not close B's dialog, clear B's draft, show an A toast, or trigger a B refresh.
+  */
   const submitSyncPassphrase = async () => {
+    const requestProjectId = projectId;
     setSyncSaving(true);
     try {
-      await saveSyncPassphrase(syncPassphrase);
+      await saveSyncPassphrase(syncPassphrase, requestProjectId);
+      if (activeProjectIdRef.current !== requestProjectId) return;
       addToast?.(syncPassphraseConfigured ? t("secrets.syncPassphraseRotated", "Sync passphrase rotated") : t("secrets.syncPassphraseSet", "Sync passphrase set"), "success");
       closeSyncModal();
       await loadSyncPassphraseStatus();
     } catch (err) {
-      addToast?.(t("secrets.errorSaveSyncPassphrase", "Failed to save sync passphrase: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
+      if (activeProjectIdRef.current === requestProjectId) addToast?.(t("secrets.errorSaveSyncPassphrase", "Failed to save sync passphrase: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     } finally {
-      setSyncSaving(false);
+      if (activeProjectIdRef.current === requestProjectId) setSyncSaving(false);
     }
   };
 
   const clearSyncPassphraseHandler = async () => {
     const confirmed = window.confirm(t("secrets.confirmClearSyncPassphrase", "Clear the cross-node sync passphrase? Existing sync pairs will stop working until you set a new passphrase."));
     if (!confirmed) return;
+    const requestProjectId = projectId;
     try {
-      await request<{ success: boolean }>("/api/secrets/sync-passphrase", { method: "DELETE" });
+      await request<{ success: boolean }>(withProjectId("/api/secrets/sync-passphrase", requestProjectId), { method: "DELETE" });
+      if (activeProjectIdRef.current !== requestProjectId) return;
       addToast?.(t("secrets.syncPassphraseCleared", "Sync passphrase cleared"), "success");
       await loadSyncPassphraseStatus();
     } catch (err) {
-      addToast?.(t("secrets.errorClearSyncPassphrase", "Failed to clear sync passphrase: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
+      if (activeProjectIdRef.current === requestProjectId) addToast?.(t("secrets.errorClearSyncPassphrase", "Failed to clear sync passphrase: {{error}}", { error: err instanceof Error ? err.message : String(err) }), "error");
     }
   };
 
@@ -196,6 +257,7 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
   };
 
   const submit = async () => {
+    const requestProjectId = projectId;
     setFormError(null);
     try {
       if (editing) {
@@ -207,12 +269,12 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
           envExportKey: form.envExportable ? (form.envExportKey || null) : null,
         };
         if (form.value) body.value = form.value;
-        await request(`/api/secrets/${editing.scope}/${editing.id}`, {
+        await request(projectUrl(`/api/secrets/${editing.scope}/${editing.id}`), {
           method: "PATCH",
           body: JSON.stringify(body),
         });
       } else {
-        await request("/api/secrets", {
+        await request(projectUrl("/api/secrets"), {
           method: "POST",
           body: JSON.stringify({
             scope: form.scope,
@@ -225,11 +287,12 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
           }),
         });
       }
+      if (activeProjectIdRef.current !== requestProjectId) return;
       setShowModal(false);
       setForm(EMPTY_FORM);
       await loadSecrets();
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : String(err));
+      if (activeProjectIdRef.current === requestProjectId) setFormError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -243,7 +306,9 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
   };
 
   const revealSecret = async (secret: SecretRecord) => {
-    const data = await request<{ key: string; value: string }>(`/api/secrets/${secret.scope}/${secret.id}/reveal`, { method: "POST" });
+    const requestProjectId = projectId;
+    const data = await request<{ key: string; value: string }>(projectUrl(`/api/secrets/${secret.scope}/${secret.id}/reveal`), { method: "POST" });
+    if (activeProjectIdRef.current !== requestProjectId) return;
     setRevealedValues((current) => ({ ...current, [secret.id]: data.value }));
     addToast?.(t("secrets.revealed", "Revealed"), "success");
     const timer = setTimeout(() => {
@@ -279,16 +344,24 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
   };
 
   const deleteSecret = async (secret: SecretRecord) => {
-    await request(`/api/secrets/${secret.scope}/${secret.id}`, { method: "DELETE" });
+    const requestProjectId = projectId;
+    await request(withProjectId(`/api/secrets/${secret.scope}/${secret.id}`, requestProjectId), { method: "DELETE" });
+    if (activeProjectIdRef.current !== requestProjectId) return;
     setShowDeleteId(null);
     await loadSecrets();
   };
 
+  /*
+  FNXC:Secrets 2026-08-05-21:57:
+  Project switches render before effects can clear state. Associate asynchronous secret and sync responses with their request project so A-only rows, revealed values, and configured status never paint while B is selected.
+  */
+  const secretsAreCurrent = secretsProjectId === projectId;
+  const syncStatusIsCurrent = syncStatusProjectId === projectId;
   const sortedSecrets = useMemo(
-    () => [...secrets]
+    () => [...(secretsAreCurrent ? secrets : [])]
       .filter((secret) => !(secret.scope === "global" && secret.key === RESERVED_SYNC_PASSPHRASE_KEY))
       .sort((a, b) => a.key.localeCompare(b.key)),
-    [secrets],
+    [secrets, secretsAreCurrent],
   );
 
   const syncPassphraseMatches = syncPassphrase.length > 0 && syncPassphrase === syncPassphraseConfirm;
@@ -304,15 +377,15 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
         title={t("secrets.title", "Secrets")}
         actions={
           <>
-            <button className="btn btn-sm" onClick={() => void loadSecrets()}><RefreshCw {...actionIconProps} /> {t("secrets.refresh", "Refresh")}</button>
-            <button className="btn btn-primary btn-sm" onClick={openCreate}><Plus {...actionIconProps} /> {t("secrets.addSecret", "Add Secret")}</button>
+            <ViewActionButton icon={RefreshCw} iconClassName="secrets-action-icon" label={t("secrets.refresh", "Refresh")} onClick={() => void loadSecrets()} />
+            <ViewActionButton kind="create" iconClassName="secrets-action-icon" label={t("secrets.addSecret", "Add Secret")} onClick={openCreate} />
           </>
         }
       />
 
-      {error ? <div className="form-error">{error}</div> : null}
-      {loading ? <div className="secrets-loading"><RefreshCw {...spinningActionIconProps} /> {t("secrets.loading", "Loading…")}</div> : null}
-      {!loading && sortedSecrets.length === 0 ? <div className="secrets-empty">{t("secrets.empty", "No secrets found.")}</div> : null}
+      {error && errorProjectId === projectId ? <div className="form-error">{error}</div> : null}
+      {loading || !secretsAreCurrent ? <div className="secrets-loading"><RefreshCw {...spinningActionIconProps} /> {t("secrets.loading", "Loading…")}</div> : null}
+      {!loading && secretsAreCurrent && sortedSecrets.length === 0 ? <div className="secrets-empty">{t("secrets.empty", "No secrets found.")}</div> : null}
 
       <div className="secrets-list">
         {sortedSecrets.map((secret) => {
@@ -383,10 +456,10 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
         {syncDisclosureOpen ? (
           <div id="secrets-sync-disclosure-panel" className="secrets-sync-disclosure-panel">
             <div className="secrets-sync-header">
-              <p className="secrets-sync-status"><span className={`status-dot ${syncPassphraseConfigured ? "status-dot--online" : "status-dot--pending"}`} aria-hidden="true" /> {syncPassphraseConfigured ? t("secrets.syncConfigured", "Configured") : t("secrets.syncNotConfigured", "Not configured")}</p>
+              <p className="secrets-sync-status"><span className={`status-dot ${syncStatusIsCurrent && syncPassphraseConfigured ? "status-dot--online" : "status-dot--pending"}`} aria-hidden="true" /> {syncStatusIsCurrent && syncPassphraseConfigured ? t("secrets.syncConfigured", "Configured") : t("secrets.syncNotConfigured", "Not configured")}</p>
               <div className="secrets-sync-actions">
-                <button className="btn" onClick={() => setSyncModalOpen(true)}>{syncPassphraseConfigured ? t("secrets.rotateSyncPassphrase", "Rotate") : t("secrets.setPassphrase", "Set passphrase")}</button>
-                {syncPassphraseConfigured ? <button className="btn btn-danger" onClick={() => void clearSyncPassphraseHandler()}>{t("secrets.clearSyncPassphrase", "Clear")}</button> : null}
+                <button className="btn" onClick={() => setSyncModalOpen(true)}>{syncStatusIsCurrent && syncPassphraseConfigured ? t("secrets.rotateSyncPassphrase", "Rotate") : t("secrets.setPassphrase", "Set passphrase")}</button>
+                {syncStatusIsCurrent && syncPassphraseConfigured ? <button className="btn btn-danger" onClick={() => void clearSyncPassphraseHandler()}>{t("secrets.clearSyncPassphrase", "Clear")}</button> : null}
               </div>
             </div>
             <p className="secrets-sync-copy">
@@ -399,10 +472,14 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
       {syncModalOpen ? (
         <div className="modal-overlay open" role="presentation">
           <div className="modal" role="dialog" aria-modal="true" aria-label={syncPassphraseConfigured ? t("secrets.rotateSyncPassphraseModalTitle", "Rotate sync passphrase") : t("secrets.setSyncPassphraseModalTitle", "Set sync passphrase")}>
-            <div className="modal-header">
-              <h3>{syncPassphraseConfigured ? t("secrets.rotateSyncPassphraseModalTitle", "Rotate sync passphrase") : t("secrets.setSyncPassphraseModalTitle", "Set sync passphrase")}</h3>
-              <button className="modal-close" onClick={closeSyncModal} aria-label={t("secrets.closeAriaLabel", "Close")}>×</button>
-            </div>
+            {/* FNXC:StandardizedViewLayout 2026-09-13-21:49: Nested secret dialogs share the canonical header. */}
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={syncPassphraseConfigured ? t("secrets.rotateSyncPassphraseModalTitle", "Rotate sync passphrase") : t("secrets.setSyncPassphraseModalTitle", "Set sync passphrase")}
+              onClose={closeSyncModal}
+              closeButtonProps={{ "aria-label": t("secrets.closeAriaLabel", "Close") }}
+            />
             <div className="secrets-modal-body">
               <div className="form-group"><label>{t("secrets.passphraseLabel", "Passphrase")}</label><input aria-label={t("secrets.passphraseLabel", "Passphrase")} className="input" type="password" autoComplete="new-password" value={syncPassphrase} onChange={(e) => setSyncPassphrase(e.target.value)} /></div>
               <div className="form-group"><label>{t("secrets.confirmPassphraseLabel", "Confirm passphrase")}</label><input aria-label={t("secrets.confirmPassphraseLabel", "Confirm passphrase")} className="input" type="password" autoComplete="new-password" value={syncPassphraseConfirm} onChange={(e) => setSyncPassphraseConfirm(e.target.value)} /></div>
@@ -416,10 +493,13 @@ export const SecretsView = ({ addToast }: SecretsViewProps) => {
       {showModal ? (
         <div className="modal-overlay open" role="presentation">
           <div className="modal" role="dialog" aria-modal="true" aria-label={editing ? t("secrets.editSecretModalTitle", "Edit secret") : t("secrets.addSecretModalTitle", "Add secret")}>
-            <div className="modal-header">
-              <h3>{editing ? t("secrets.editSecretModalTitle", "Edit secret") : t("secrets.addSecretModalTitle", "Add secret")}</h3>
-              <button className="modal-close" onClick={() => setShowModal(false)} aria-label={t("secrets.closeAriaLabel", "Close")}>×</button>
-            </div>
+            <ViewHeader
+              className="modal-header"
+              headingLevel={3}
+              title={editing ? t("secrets.editSecretModalTitle", "Edit secret") : t("secrets.addSecretModalTitle", "Add secret")}
+              onClose={() => setShowModal(false)}
+              closeButtonProps={{ "aria-label": t("secrets.closeAriaLabel", "Close") }}
+            />
             <div className="secrets-modal-body">
               <div className="form-group"><label>{t("secrets.keyLabel", "Key")}</label><input className="input" value={form.key} onChange={(e) => setForm((c) => ({ ...c, key: e.target.value }))} /></div>
               <div className="form-group"><label>{t("secrets.valueLabel", "Value")}</label><div className="secrets-value-row"><input className="input" type={showValue ? "text" : "password"} autoComplete="off" spellCheck={false} value={form.value} onChange={(e) => setForm((c) => ({ ...c, value: e.target.value }))} /><button type="button" className="btn btn-icon secrets-visibility-toggle" onClick={() => setShowValue((s) => !s)} aria-label={showValue ? t("secrets.hideValueAriaLabel", "Hide value") : t("secrets.showValueAriaLabel", "Show value")}>{showValue ? <EyeOff {...actionIconProps} /> : <Eye {...actionIconProps} />}</button></div></div>

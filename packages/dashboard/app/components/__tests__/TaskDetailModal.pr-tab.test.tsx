@@ -24,7 +24,6 @@ describe("TaskDetailModal Pull Request tab", () => {
       <TaskDetailModal
         task={makeTask({ column: "todo" })}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -38,7 +37,6 @@ describe("TaskDetailModal Pull Request tab", () => {
       <TaskDetailModal
         task={makeTask({ column: "in-review" })}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -63,7 +61,6 @@ describe("TaskDetailModal Pull Request tab", () => {
       <TaskDetailModal
         task={makeTask({ column: "in-review", inReviewStall })}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -72,11 +69,11 @@ describe("TaskDetailModal Pull Request tab", () => {
     );
 
     expect(screen.queryByTestId("pr-panel-stub")).toBeNull();
-    expect(container.querySelector(".detail-in-review-stall")).toBeNull();
+    expect(document.querySelector(".detail-in-review-stall")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Pull Request" }));
 
     expect(screen.getByTestId("pr-panel-stub")).toBeInTheDocument();
-    expect(container.querySelector(".detail-in-review-stall")).toBeTruthy();
+    expect(document.querySelector(".detail-in-review-stall")).toBeTruthy();
   });
 });

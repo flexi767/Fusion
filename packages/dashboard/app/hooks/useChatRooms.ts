@@ -49,7 +49,7 @@ export interface UseChatRoomsResult {
   createRoom: (input: { name: string; memberAgentIds: string[] }) => Promise<ChatRoom>;
   updateRoomSettings: (roomId: string, updates: { thinkingLevel?: string | null }) => Promise<ChatRoom>;
   deleteRoom: (roomId: string) => Promise<void>;
-  sendRoomMessage: (content: string, opts?: { attachments?: ChatAttachment[]; files?: File[] }) => Promise<void>;
+  sendRoomMessage: (content: string, opts?: { attachments?: ChatAttachment[]; files?: File[]; onDelivered?: () => void }) => Promise<void>;
   clearRoom: (roomId: string) => Promise<void>;
   refreshRooms: () => Promise<void>;
 }
@@ -167,10 +167,12 @@ export function useChatRooms(
 
   const roomsRef = useRef(rooms);
   const activeRoomRef = useRef(activeRoom);
+  const messagesRef = useRef(messages);
   const projectContextVersionRef = useRef(0);
   const previousProjectIdRef = useRef<string | undefined>(projectId);
   roomsRef.current = rooms;
   activeRoomRef.current = activeRoom;
+  messagesRef.current = messages;
 
   if (previousProjectIdRef.current !== projectId) {
     previousProjectIdRef.current = projectId;
@@ -192,21 +194,29 @@ export function useChatRooms(
     const cachedMembers = readCache<ChatRoomMember[]>(membersCacheKey(room.id), { maxAgeMs: SWR_DEFAULT_MAX_AGE_MS });
     const hasCachedMessages = Array.isArray(cachedMessages) && cachedMessages.length > 0;
     const hasCachedMembers = Array.isArray(cachedMembers) && cachedMembers.length > 0;
+    const hasRetainedMessages = activeRoomRef.current?.id === room.id
+      && messagesRef.current.length > 0
+      && messagesRef.current.every((message) => message.roomId === room.id);
 
+    /*
+    FNXC:ChatTranscriptRevalidation 2026-08-19-18:09:
+    A same-room background revalidation must not blank a populated selected transcript or
+    invalidate its reader anchor. Only a new room with neither cache nor in-memory rows owns the
+    blocking loader; the active room keeps its rows until its fenced response arrives.
+    */
     if (hasCachedMessages || hasCachedMembers) {
       timer.mark("cache-hit");
-      if (hasCachedMessages) {
+      if (hasCachedMessages && !hasRetainedMessages) {
         setMessages(cachedMessages);
         timer.mark("hydrate");
       }
       if (hasCachedMembers) {
         setActiveRoomMembers(cachedMembers);
       }
-      setMessagesLoading(false);
-    } else {
+    } else if (!hasRetainedMessages) {
       setMessages([]);
-      setMessagesLoading(true);
     }
+    setMessagesLoading(!hasCachedMessages && !hasRetainedMessages);
 
     try {
       const [membersData, messagesData] = await Promise.all([
@@ -231,8 +241,10 @@ export function useChatRooms(
         setMessages([]);
       }
     } finally {
-      setMessagesLoading(false);
-      timer.complete({ warm: hasCachedMessages, membersCached: hasCachedMembers });
+      if (activeRoomRef.current?.id === room.id) {
+        setMessagesLoading(false);
+      }
+      timer.complete({ warm: hasCachedMessages || hasRetainedMessages, membersCached: hasCachedMembers });
     }
   }, [membersCacheKey, messagesCacheKey, projectId]);
 
@@ -340,7 +352,7 @@ export function useChatRooms(
    * FNXC:RoomChatReliability 2026-07-01-00:00:
    * Responder/provider failures can occur after the room user message is persisted. Keep the optimistic or recovered user row visible for delivered sends even when the reply-generation or refresh step fails, because that turn is already part of the room transcript context.
    */
-  const sendRoomMessage = useCallback(async (content: string, opts?: { attachments?: ChatAttachment[]; files?: File[] }) => {
+  const sendRoomMessage = useCallback(async (content: string, opts?: { attachments?: ChatAttachment[]; files?: File[]; onDelivered?: () => void }) => {
     const activeRoomSnapshot = activeRoomRef.current;
     const roomId = activeRoomSnapshot?.id;
     if (!roomId) {
@@ -389,6 +401,15 @@ export function useChatRooms(
         ...(mergedAttachments.length ? { attachments: mergedAttachments } : {}),
       }, projectId);
       userMessageDelivered = true;
+      /*
+      FNXC:ChatRooms 2026-08-10-05:53:
+      Delivery is signalled immediately after the post accepts every uploaded file, before reconciliation and refetch, so composer previews dismiss promptly. Isolate consumers so their callback cannot corrupt the delivered-versus-undelivered error contract.
+      */
+      try {
+        opts?.onDelivered?.();
+      } catch {
+        // Consumer callbacks must not turn an accepted room turn into a delivery failure.
+      }
 
       if (postResult.message?.createdAt && activeRoomSnapshot) {
         setRooms((previous) => upsertRoom(previous, { ...activeRoomSnapshot, updatedAt: postResult.message.createdAt }));

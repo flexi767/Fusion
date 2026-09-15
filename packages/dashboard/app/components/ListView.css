@@ -287,11 +287,21 @@ List rows and mobile cards expose the same task lifecycle menu as Board cards fr
 
 /* New class for QuickEntryBox positioned above the table in list view.
    FNXC:ListView 2026-06-23-20:15: Remove the divider above quick-add by eliminating top padding; the controls and quick-add share the same surface without a visible seam. */
+/*
+FNXC:ListQuickEntrySpacing 2026-09-14-05:42:
+The composer sat inside a --space-xl gutter that was sized for a full-width page. In a narrow host (the right dock)
+that gutter ate most of the row while the composer itself already carries its own padding, so the collapsed box read
+as a small field floating in a large empty frame. One modest inset here; the box owns the rest.
+*/
 .list-quick-entry-above-table {
   width: 100%;
-  padding: 0 var(--space-xl) var(--space-md);
+  padding: 0 var(--space-sm) var(--space-sm);
   background: var(--surface);
   border-top: 0;
+}
+
+.list-quick-entry-above-table .quick-entry-box--collapsed {
+  margin-bottom: 0;
 }
 
 .list-quick-entry-above-table .quick-entry-box {
@@ -367,7 +377,7 @@ List rows and mobile cards expose the same task lifecycle menu as Board cards fr
   gap: var(--space-sm);
 }
 
-/* Drop zones for drag and drop */
+/* Clickable workflow column filters. */
 .list-drop-zones {
   display: flex;
   gap: var(--space-sm);
@@ -402,12 +412,6 @@ List rows and mobile cards expose the same task lifecycle menu as Board cards fr
   box-shadow: 0 0 0 1px var(--todo);
 }
 
-.list-drop-zone.drag-over {
-  border-color: var(--todo);
-  box-shadow: 0 0 0 1px var(--todo);
-  background: color-mix(in srgb, var(--todo) 10%, transparent);
-}
-
 .drop-zone-dot {
   width: 8px;
   height: 8px;
@@ -439,64 +443,38 @@ List rows and mobile cards expose the same task lifecycle menu as Board cards fr
 }
 
 /*
-FNXC:ListView 2026-06-22-00:40:
-Widen the split resize column so the task-list sidebar is easy to grab and drag (the 4px --space-xs target was hard to hit). The handle shows a centered grip line that brightens on hover/focus.
-
-FNXC:ListView 2026-06-22-18:00:
-List view should not show a wide divider gutter. Collapse the grid handle column to zero width and let the transparent resize handle overlap the single 1px sidebar border, preserving a comfortable touch target without making the visible divider wider.
+FNXC:StandardizedViewLayout 2026-09-13-21:43:
+List reuses the canonical sidebar and separator rather than retaining a second width key or pointer controller. The task table remains the rail itself; no second task-list panel is introduced.
 */
 .list-split-layout {
   display: grid;
-  grid-template-columns: auto 0 minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   height: 100%;
   min-height: 0;
 }
 
-/*
-FNXC:SidebarDivider 2026-06-22-18:00:
-The static 1px divider line lives on the sidebar pane's right border while the resize handle column has no visible width. This keeps one normal divider line between the task list and detail pane without a large gutter.
-*/
 .list-split-sidebar {
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
+}
+
+.list-split-sidebar__panel {
   overflow: auto;
-  border-right: 1px solid var(--border);
+  border-right: var(--btn-border-width) solid var(--border);
 }
 
-/*
-FNXC:SidebarDivider 2026-06-22-18:00:
-The List split resize control is a transparent var(--space-sm)-wide drag hit-area that overlaps the single pane border. It tints a narrow centered band only on hover/active/focus, matching the left sidebar handle's "large target, slim visual" behavior without widening the visible divider.
-*/
-.list-split-resize-handle {
-  position: relative;
-  left: calc(var(--space-sm) / -2);
-  width: var(--space-sm);
-  cursor: col-resize;
+.list-single-pane-sidebar {
+  width: 100%;
+  height: auto;
+  overflow: visible;
   background: transparent;
-  touch-action: none;
-  z-index: 2;
-  transition: background var(--transition-fast);
 }
 
-.list-split-resize-handle::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: var(--space-xs);
-  transform: translateX(-50%);
-}
-
-.list-split-resize-handle:hover::before,
-.list-split-resize-handle:active::before,
-.list-split-resize-handle:focus-visible::before {
-  background: color-mix(in srgb, var(--todo) 30%, transparent);
-}
-
-.list-split-resize-handle:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring-strong);
+.list-single-pane-sidebar > .view-sidebar__panel {
+  flex: 1;
+  overflow: visible;
+  background: transparent;
 }
 
 /*
@@ -599,10 +577,6 @@ No border-left on the detail pane. Keeping a border-left here would produce a se
   box-shadow: inset 0 0 0 1px var(--todo);
 }
 
-.list-row.dragging {
-  opacity: 0.4;
-}
-
 .list-row.failed {
   border-left: 3px solid var(--color-error-dark);
 }
@@ -612,13 +586,8 @@ No border-left on the detail pane. Keeping a border-left here would produce a se
 }
 
 /*
-FNXC:ListView 2026-06-20-03:25:
-FN-6774 removes the saturated stuck-task edge stripe from list rows. Keep the subtle triage background and stuck status badge so stuck rows stay distinguishable without changing the neutral row border.
+FNXC:StuckTagRemoval 2026-08-17-22:30: Operator removed stuck-task tagging from the dashboard; engine recovery sweeps still consume taskStuckTimeoutMs server-side.
 */
-.list-row.stuck {
-  background: color-mix(in srgb, var(--triage) 8%, transparent);
-}
-
 /*
 FNXC:ListView 2026-06-16-00:00:
 FN-6529 requires list-view agent-active tasks to use a simple static highlight instead of the animated board-card glow, so the list row keeps a flat inset indicator and subtle background without referencing agent-glow.
@@ -774,20 +743,14 @@ rows while preserving their existing badge geometry.
   background: var(--status-done-bg);
   color: var(--done);
 }
-.list-status-badge--archived {
-  background: var(--status-archived-bg);
+.list-status-badge--reverted {
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
   color: var(--text-muted);
 }
 
 .list-status-badge.failed {
   background: var(--status-error-bg);
   color: var(--color-error-dark);
-}
-
-.list-status-badge.stuck {
-  background: color-mix(in srgb, var(--triage) 20%, transparent);
-  color: var(--triage);
-  animation: stuck-pulse 2s ease-in-out infinite;
 }
 
 .list-status-badge.pulsing {
@@ -990,9 +953,29 @@ rows while preserving their existing badge geometry.
   border-bottom: 1px solid var(--border);
 }
 
+/*
+FNXC:ListViewWindowing 2026-07-26-11:40:
+Each list section renders only a window of its tasks so a large project cannot inflate the DOM to the
+point where mobile browsers reclaim the backgrounded tab. This is the container for the shared
+"Load more" affordance that reveals the next increment; it only positions the button — the button
+itself reuses the board's `.btn.btn-secondary.btn-sm` primitive so List and Board read as one system.
+*/
+.list-section-load-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-md);
+  border-bottom: 1px solid var(--border);
+}
+
+.list-section-load-more-row:hover {
+  background: transparent; /* not a task row — suppress the row hover affordance */
+}
+
 /* === List View Single-Pane Responsive ===
-FNXC:ListView 2026-07-10-00:00 (FN-7809):
-Tablet-width List view shares the mobile single-pane scaffolding so the full-width toolbar and QuickEntryBox are not clipped by the desktop split sidebar. Mobile behavior stays unchanged; desktop split rules remain active above the tablet tier.
+FNXC:ListView 2026-08-03-05:47 (FN-8754):
+The component now decides split capability from measured List width. Keep these compact rules available
+at tablet widths, but do not hide split chrome with a viewport-only media rule: a tablet List surface
+can have sufficient room after dashboard chrome is accounted for.
 */
 @media (max-width: 1024px) {
   .list-toolbar {
@@ -1023,21 +1006,6 @@ Tablet-width List view shares the mobile single-pane scaffolding so the full-wid
     overflow-x: auto;
   }
 
-  .list-split-layout {
-    display: block;
-  }
-
-  .list-split-sidebar,
-  .list-split-detail {
-    overflow: visible;
-    border: none;
-    padding: 0;
-  }
-
-  .list-split-resize-handle,
-  .list-split-detail {
-    display: none;
-  }
 
   .list-table {
     min-width: auto;
@@ -1059,138 +1027,12 @@ Tablet-width List view shares the mobile single-pane scaffolding so the full-wid
 
 /* === List View Single-Pane Cards (FN-1140, FN-7809) === */
 @media (max-width: 1024px) {
-  /* Hide the table on mobile — card layout is rendered via JS */
-  .list-table {
+  /* The JS-measured single-pane route renders cards; a wide tablet keeps its table and split detail. */
+  .list-view--single-pane .list-table {
     display: none;
   }
 
   /* Mobile card layout */
-  .list-cards {
-    display: flex;
-    flex-direction: column;
-    width: 100%;
-    padding: var(--space-sm) var(--space-md);
-    padding-bottom: max(var(--space-md), env(safe-area-inset-bottom, 0px));
-  }
-
-  .list-card-section-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    padding: var(--space-md) var(--space-md) var(--space-sm);
-    cursor: pointer;
-    min-height: 36px;
-    user-select: none;
-    -webkit-tap-highlight-color: transparent;
-  }
-
-  .list-card-section-header:active {
-    opacity: 0.7;
-  }
-
-  .list-card-section-header:focus-visible {
-    outline: 2px solid var(--todo);
-    outline-offset: 1px;
-    border-radius: var(--radius-sm);
-  }
-
-  .list-card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: var(--space-md);
-    margin: var(--space-xs) 0;
-    cursor: pointer;
-    transition: background var(--transition-fast), border-color var(--transition-fast);
-    min-height: 36px;
-    position: relative;
-    -webkit-tap-highlight-color: transparent;
-  }
-
-  .list-card:hover {
-    background: var(--card-hover);
-    border-color: var(--text-muted);
-  }
-
-  .list-card:focus-visible {
-    outline: none;
-    box-shadow: var(--focus-ring-strong);
-  }
-
-  .list-card:active {
-    background: var(--surface);
-    transform: scale(0.99);
-  }
-
-  .list-card.agent-active {
-    border-color: var(--in-progress);
-    background: color-mix(in srgb, var(--in-progress) 8%, transparent);
-    box-shadow: inset 0 0 0 calc(var(--space-xs) / 4) var(--in-progress);
-  }
-
-  .list-card-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-  }
-
-  .list-card-row + .list-card-row {
-    margin-top: var(--space-sm);
-  }
-
-  .list-card-id {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-muted);
-    flex-shrink: 0;
-  }
-
-  .list-card-spacer {
-    flex: 1;
-  }
-
-  .list-card-title {
-    font-size: 14px;
-    line-height: 1.4;
-    color: var(--text);
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    word-break: break-word;
-  }
-
-  .list-card-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    flex-wrap: wrap;
-  }
-
-  .list-card-checkbox {
-    position: absolute;
-    top: var(--space-xs);
-    left: var(--space-xs);
-    min-width: 36px;
-    min-height: 36px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .list-card--selectable {
-    padding-left: var(--space-2xl);
-  }
-
-  .list-card-empty {
-    padding: var(--space-lg) var(--space-md);
-    text-align: center;
-    font-size: 13px;
-    color: var(--text-muted);
-    font-style: italic;
-    background: transparent;
-  }
 
   /* Drop zones hidden on mobile — drag not practical on touch */
   .list-drop-zones {
@@ -1335,4 +1177,157 @@ ListView needs a neutral workflow-loading shell under the same flag-aware gate a
   .list-workflow-skeleton {
     padding: var(--space-md);
   }
+}
+
+/*
+FNXC:TaskListPagination 2026-09-09-00:33:
+ListView shares the current/search request owner with Board. Its footer renders only a live request or an explicit retry, and remains non-interactive after a true terminal page.
+*/
+.list-pagination-footer {
+  padding: var(--space-sm);
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.list-pagination-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  color: var(--color-error);
+}
+
+/*
+FNXC:ListCards 2026-09-14-06:24:
+Card geometry follows the RENDER MODE, not the viewport. These rules used to live in a max-width media query, so a
+narrow non-phone host — the right-dock List — rendered card markup with no card styles at all while the phone looked
+correct. The list root carries .list-view--cards whenever it renders cards, and the phone gets them through the same
+class because it is always single-pane.
+*/
+.list-view--cards .list-cards {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: var(--space-sm) var(--space-md);
+  padding-bottom: max(var(--space-md), env(safe-area-inset-bottom, 0px));
+}
+
+.list-view--cards .list-card-section-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-md) var(--space-md) var(--space-sm);
+  cursor: pointer;
+  min-height: 36px;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.list-view--cards .list-card-section-header:active {
+  opacity: 0.7;
+}
+
+.list-view--cards .list-card-section-header:focus-visible {
+  outline: 2px solid var(--todo);
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
+}
+
+.list-view--cards .list-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+  margin: var(--space-xs) 0;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+  min-height: 36px;
+  position: relative;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.list-view--cards .list-card:hover {
+  background: var(--card-hover);
+  border-color: var(--text-muted);
+}
+
+.list-view--cards .list-card:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-strong);
+}
+
+.list-view--cards .list-card:active {
+  background: var(--surface);
+  transform: scale(0.99);
+}
+
+.list-view--cards .list-card.agent-active {
+  border-color: var(--in-progress);
+  background: color-mix(in srgb, var(--in-progress) 8%, transparent);
+  box-shadow: inset 0 0 0 calc(var(--space-xs) / 4) var(--in-progress);
+}
+
+.list-view--cards .list-card-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.list-view--cards .list-card-row + .list-card-row {
+  margin-top: var(--space-sm);
+}
+
+.list-view--cards .list-card-id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.list-view--cards .list-card-spacer {
+  flex: 1;
+}
+
+.list-view--cards .list-card-title {
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.list-view--cards .list-card-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.list-view--cards .list-card-checkbox {
+  position: absolute;
+  top: var(--space-xs);
+  left: var(--space-xs);
+  min-width: 36px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.list-view--cards .list-card--selectable {
+  padding-left: var(--space-2xl);
+}
+
+.list-view--cards .list-card-empty {
+  padding: var(--space-lg) var(--space-md);
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+  background: transparent;
 }

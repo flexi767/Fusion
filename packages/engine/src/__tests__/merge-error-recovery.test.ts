@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import type { Settings, Task } from "@fusion/core";
+import {
+  PreMergeStepsNotRunError,
+  PRE_MERGE_STEPS_NOT_RUN_BLOCKER,
+  validateCustomFieldPatch,
+  type Settings,
+  type Task,
+} from "@fusion/core";
 
 const testState = vi.hoisted(() => {
   class MockVerificationError extends Error {
@@ -33,8 +39,8 @@ vi.mock("../merger.js", () => ({
 // (these classes are imported from ./merger-ai.js). A bare replacement mock left them undefined,
 // so `instanceof undefined` threw on every recovery path (24 pre-existing red tests). Re-export the
 // REAL error classes via importOriginal so the instanceof guards evaluate; only runAiMerge is faked.
-vi.mock("../merger-ai.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../merger-ai.js")>();
+vi.mock("../merge/merger-ai.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../merge/merger-ai.js")>();
   return {
     ...actual,
     runAiMerge: testState.runAiMerge,
@@ -70,7 +76,7 @@ vi.mock("../runtimes/in-process-runtime.js", () => ({
 import { ProjectEngine } from "../project-engine.js";
 import { runtimeLog } from "../logger.js";
 import { VerificationError } from "../merger.js";
-import { runAiMerge } from "../merger-ai.js";
+import { AiMergeBlockedError, runAiMerge } from "../merge/merger-ai.js";
 
 type MockTask = {
   id: string;
@@ -87,12 +93,15 @@ type MockTask = {
   verificationFailureCount?: number;
   mergeConflictBounceCount?: number;
   mergeTransientRetryCount?: number;
+  awaitingApprovalReason?: "merge-blocked-by-policy" | null;
   branch?: string;
   worktree?: string;
   sourceType?: string;
   sourceParentTaskId?: string;
+  customFields?: Record<string, unknown>;
   updatedAt: string;
   log: Array<{ action?: string }>;
+  aiMergeReviewReconciliation?: { candidateSha?: string };
 };
 
 type MockTaskStore = {
@@ -108,6 +117,7 @@ type MockTaskStore = {
   recordRunAuditEvent: ReturnType<typeof vi.fn>;
   on: ReturnType<typeof vi.fn>;
   off: ReturnType<typeof vi.fn>;
+  emit: ReturnType<typeof vi.fn>;
 };
 
 const TASK_ID = "FN-2084";
@@ -146,6 +156,17 @@ function makeStore({
       globalPause: false,
       enginePaused: false,
       pollIntervalMs: 15_000,
+      /*
+      FNXC:EngineTests 2026-08-23-18:49:
+      `baseBranch` is not decoration here: the auto-merge sweep resolves each candidate's shared-
+      branch integration target through `resolveIntegrationBranch`, which falls back to SHELLING OUT
+      to `git symbolic-ref .../origin/HEAD` when settings name no branch. Real subprocess I/O cannot
+      be advanced by `vi.advanceTimersByTimeAsync`, so under fake timers the sweep never settles: its
+      `finally` never runs, no retry timer is rescheduled, and the failure surfaces as a missing log
+      line far from the cause. Naming the branch — as every real project does — keeps resolution in
+      settings and off the real clock.
+      */
+      baseBranch: "main",
       // FNXC:MergerUnification 2026-06-21-19:05: U0 unified merges onto runAiMerge;
       // these tests mock/assert runAiMerge directly. No `merger.mode` pin needed —
       // the dispatch ignores the value.
@@ -169,6 +190,7 @@ function makeStore({
     recordRunAuditEvent: vi.fn(async () => undefined),
     on: vi.fn(),
     off: vi.fn(),
+    emit: vi.fn(),
   };
 }
 
@@ -257,63 +279,14 @@ describe("ProjectEngine merge error recovery", () => {
     vi.useRealTimers();
   });
 
-  it("creates one recovery follow-up for live autostash orphans and dedupes by parent task", async () => {
-    const store = makeStore();
-    store.listTasks.mockResolvedValueOnce([]).mockResolvedValueOnce([
-      { id: "FN-9000", column: "todo", sourceType: "recovery", sourceParentTaskId: "FN-7777" },
-    ]);
-
-    const engine = createEngine(store);
-    const privateEngine = engine as unknown as {
-      wireAutostashOrphanRecovery: (store: MockTaskStore) => void;
-      autostashOrphansHandler?: (data: { rootDir: string; records: Array<any> }) => Promise<void>;
-    };
-
-    privateEngine.wireAutostashOrphanRecovery(store);
-    await privateEngine.autostashOrphansHandler?.({
-      rootDir: "/tmp/project",
-      records: [
-        {
-          sha: "abcdef1234567",
-          ref: "stash@{0}",
-          label: "fusion-merger-autostash:FN-7777:finalize-reset:1",
-          sourceTaskId: "FN-7777",
-          createdAt: new Date().toISOString(),
-          changedPaths: ["a.ts"],
-          classification: "live",
-          sourcePhase: "finalize-reset",
-          detectedByTaskId: "FN-1234",
-          detectedAt: new Date().toISOString(),
-        },
-      ],
-    });
-    await privateEngine.autostashOrphansHandler?.({
-      rootDir: "/tmp/project",
-      records: [
-        {
-          sha: "abcdef1234567",
-          ref: "stash@{0}",
-          label: "fusion-merger-autostash:FN-7777:finalize-reset:1",
-          sourceTaskId: "FN-7777",
-          createdAt: new Date().toISOString(),
-          changedPaths: ["a.ts"],
-          classification: "live",
-          sourcePhase: "finalize-reset",
-          detectedByTaskId: "FN-1234",
-          detectedAt: new Date().toISOString(),
-        },
-      ],
-    });
-
-    expect(store.createTask).toHaveBeenCalledTimes(1);
-  });
 
   it("uses default retry interval when interval settings retrieval fails", async () => {
     vi.useFakeTimers();
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
     const store = makeStore();
     store.getSettings
-      .mockResolvedValueOnce({ autoMerge: true, globalPause: false, enginePaused: false })
+      // baseBranch: see makeStore — an unnamed integration branch shells out to git under fake timers.
+      .mockResolvedValueOnce({ autoMerge: true, globalPause: false, enginePaused: false, baseBranch: "main" })
       .mockRejectedValueOnce(new Error("interval unavailable"));
 
     const engine = createEngine(store);
@@ -326,6 +299,10 @@ describe("ProjectEngine merge error recovery", () => {
     await vi.advanceTimersByTimeAsync(15_000);
     await vi.runAllTicks();
 
+    // eslint-disable-next-line no-console
+    await vi.advanceTimersByTimeAsync(60_000);
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    console.warn("PROBE counts:", JSON.stringify(Object.fromEntries(Object.entries(store).filter(([, v]) => typeof v === "function" && (v as any).mock).map(([k, v]) => [k, (v as any).mock.calls.length]).filter(([, n]) => (n as number) > 0))), "timers:", vi.getTimerCount(), "warns:", JSON.stringify(warnSpy.mock.calls), "errors:", JSON.stringify(errorSpy.mock.calls));
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("Auto-merge retry: failed to read pollIntervalMs, using default 15s: interval unavailable"),
     );
@@ -408,6 +385,80 @@ describe("ProjectEngine merge error recovery", () => {
     expect(hasErrorLog(errorSpy, "failed to bounce")).toBe(false);
   });
 
+  it("parks typed AI review blocks containing conflicts without retrying or bouncing", async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const store = makeStore({
+      tasks: [makeTask({ mergeRetries: 0, aiMergeReviewReconciliation: { candidateSha: "abc123def456" } }), makeTask({ mergeRetries: 3, aiMergeReviewReconciliation: { candidateSha: "abc123def456" } })],
+    });
+    vi.mocked(runAiMerge).mockRejectedValueOnce(
+      new AiMergeBlockedError(TASK_ID, ["review assertions conflicts with builtin settings"]),
+    );
+
+    const engine = createEngine(store);
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: "failed",
+      mergeRetries: 3,
+      error: "AI merge review blocked landing at abc123def456: review assertions conflicts with builtin settings. Rebase/re-push, dismiss a finding with a reason, or land manually.",
+    });
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ status: null }));
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalledWith(TASK_ID, expect.any(String), "MergeConflictBounce");
+    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
+    const canMergeTask = (engine as unknown as { canMergeTask: (task: MockTask, retries: number) => boolean }).canMergeTask.bind(engine);
+    expect(canMergeTask(makeTask({ status: "failed", updatedAt: new Date(0).toISOString() }), 3)).toBe(false);
+    vi.useRealTimers();
+  });
+
+  /*
+  FNXC:RequiredPreMergeSteps 2026-08-22-22:40 (FN-9191 wedge):
+  SYMPTOM: FN-9191 sat `in-review` with `status:"failed"` and
+  `error: "Cannot merge FN-9191: task has enabled pre-merge workflow steps that never ran"`,
+  even though BOTH enabled gates (Plan Review, Code Review) later ran and APPROVED. The sweep
+  enqueued the card ~2s after `fn_task_done`, ~18s before the graph started its own Code Review
+  node; the door refused correctly, and THIS error path turned a not-yet answer into a terminal
+  park. Every later merge — including the graph's own merge node at 02:04:38 — then died on
+  `task is marked 'failed'`.
+  ASSERTION: a `PreMergeStepsNotRunError` writes no status, burns no retry, and moves nothing.
+  */
+  it("defers (does not park) when a merge door refuses only because a pre-merge gate has not run", async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const store = makeStore({ tasks: [makeTask({ mergeRetries: 0 }), makeTask({ mergeRetries: 0 })] });
+    vi.mocked(runAiMerge).mockRejectedValueOnce(new PreMergeStepsNotRunError(TASK_ID));
+
+    const engine = createEngine(store);
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.addTaskComment).not.toHaveBeenCalled();
+    expect(store.logEntry).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.stringContaining(PRE_MERGE_STEPS_NOT_RUN_BLOCKER),
+      "MergeDeferredPendingPreMergeSteps",
+    );
+    expect(store.logEntry).not.toHaveBeenCalledWith(TASK_ID, expect.any(String), "MergeNonConflictFailure");
+    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
+    vi.useRealTimers();
+  });
+
+  it("still parks other non-conflict merge failures as failed", async () => {
+    const store = makeStore({ tasks: [makeTask({ mergeRetries: 0 }), makeTask({ mergeRetries: 0 })] });
+    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("remote rejected the push"));
+
+    const engine = createEngine(store);
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: "failed", error: expect.stringContaining("remote rejected the push") }),
+    );
+    expect(store.logEntry).toHaveBeenCalledWith(TASK_ID, expect.any(String), "MergeNonConflictFailure");
+  });
+
   it("logs when bouncing fails after conflict retries are exhausted", async () => {
     const store = makeStore({
       tasks: [makeTask({ mergeRetries: 2 }), makeTask({ mergeRetries: 3 })],
@@ -424,213 +475,12 @@ describe("ProjectEngine merge error recovery", () => {
     expect(hasErrorLog(errorSpy, "db write failed")).toBe(true);
   });
 
-  it("parks task and creates follow-up when conflict bounce cap is exceeded", async () => {
-    // Already bounced twice (cap is 2) — next bounce would be 3, exceeding cap
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
 
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
 
-    expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "in-progress");
-    expect(store.updateTask).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({
-        status: "failed",
-        mergeRetries: 3,
-      }),
-    );
-    expect(store.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({ column: "triage", priority: "high" }),
-    );
-  });
 
-  it("skips duplicate conflict follow-up creation when active recovery task exists for same parent", async () => {
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-      listedTasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        {
-          ...makeTask({ id: "FN-7778", column: "triage", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: TASK_ID,
-        },
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
 
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
 
-    expect(store.createTask).not.toHaveBeenCalled();
-    expect(store.addTaskComment).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("follow-up already exists (FN-7778"),
-      "agent",
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("skipped duplicate follow-up (existing FN-7778"),
-      "MergeConflictGiveUp",
-    );
-  });
 
-  it("skips conflict follow-up creation when another active recovery owns the same branch", async () => {
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-      listedTasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        {
-          ...makeTask({ id: "FN-8888", column: "todo", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: "FN-1111",
-        },
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
-
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
-
-    expect(store.createTask).not.toHaveBeenCalled();
-    expect(store.addTaskComment).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("follow-up already exists (FN-8888)"),
-      "agent",
-    );
-  });
-
-  it("creates a new conflict follow-up when previous recovery tasks are done or archived", async () => {
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-      listedTasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        {
-          ...makeTask({ id: "FN-9001", column: "done", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: TASK_ID,
-        },
-        {
-          ...makeTask({ id: "FN-9002", column: "archived", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: "FN-1111",
-        },
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
-
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
-
-    expect(store.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        source: expect.objectContaining({
-          sourceType: "recovery",
-          sourceParentTaskId: TASK_ID,
-        }),
-      }),
-    );
-  });
-
-  it("skips duplicate conflict follow-up creation when active recovery exists for parent", async () => {
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-      listedTasks: [
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        {
-          ...makeTask({ id: "FN-7777", column: "triage", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: TASK_ID,
-        },
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
-
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
-
-    expect(store.createTask).not.toHaveBeenCalled();
-    expect(store.addTaskComment).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("Skipping duplicate follow-up creation"),
-      "agent",
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("skipped duplicate follow-up (existing FN-7777"),
-      "MergeConflictGiveUp",
-    );
-  });
-
-  it("skips conflict follow-up creation when active recovery already owns same branch", async () => {
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-      listedTasks: [
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        {
-          ...makeTask({ id: "FN-8888", column: "todo", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: "FN-OTHER",
-        },
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
-
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
-
-    expect(store.createTask).not.toHaveBeenCalled();
-    expect(store.logEntry).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("skipped duplicate follow-up (existing FN-8888)"),
-      "MergeConflictGiveUp",
-    );
-  });
-
-  it("creates new conflict follow-up when prior recovery is archived", async () => {
-    const store = makeStore({
-      tasks: [
-        makeTask({ mergeRetries: 2, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-      ],
-      listedTasks: [
-        makeTask({ mergeRetries: 3, mergeConflictBounceCount: 2, branch: "fusion/fn-2084" }),
-        {
-          ...makeTask({ id: "FN-6666", column: "archived", branch: "fusion/fn-2084" }),
-          sourceType: "recovery",
-          sourceParentTaskId: TASK_ID,
-        },
-      ],
-    });
-    vi.mocked(runAiMerge).mockRejectedValueOnce(new Error("merge conflict detected"));
-
-    const engine = createEngine(store);
-    await runMergeCycle(engine);
-
-    expect(store.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({ column: "triage", priority: "high" }),
-    );
-  });
 
   it("re-enqueues direct merge on transient non-conflict errors", async () => {
     vi.useFakeTimers();
@@ -883,6 +733,25 @@ describe("ProjectEngine merge error recovery", () => {
     vi.useRealTimers();
   });
 
+  it("uses the transient budget for structured GitHub transport outcomes", async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const structuredRateLimit = Object.assign(new Error("GitHub rate limiting response"), { code: "rate-limited" });
+    const store = makeStore();
+    const processPullRequestMerge = vi.fn(async () => { throw structuredRateLimit; });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      mergeTransientRetryCount: 1,
+      status: null,
+    });
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ mergeRetries: expect.any(Number) }));
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 5_000);
+    vi.useRealTimers();
+  });
+
   it("logs when non-direct merge strategy recovery update fails", async () => {
     const store = makeStore({
       updateTask: vi.fn(async () => {
@@ -901,15 +770,420 @@ describe("ProjectEngine merge error recovery", () => {
     await expect(runMergeCycle(engine)).resolves.toBeUndefined();
 
     expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
-    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
-      status: "failed",
-      mergeRetries: 3,
-      error: "PR API timeout",
-    });
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({
+      status: null,
+      mergeRetries: 1,
+      error: null,
+    }));
     expect(hasErrorLog(errorSpy, `failed to update ${TASK_ID} after merge strategy error`)).toBe(
       true,
     );
     expect(hasErrorLog(errorSpy, "persist failed")).toBe(true);
+  });
+
+  it("accounts pull-request retryable failures one at a time with durable backoff", async () => {
+    vi.useFakeTimers();
+    const store = makeStore();
+    const processPullRequestMerge = vi.fn(async () => { throw new Error("unexpected GitHub response"); });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({
+      mergeRetries: 1,
+      status: null,
+    }));
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ mergeRetries: 3, status: "failed" }));
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
+    vi.useRealTimers();
+  });
+
+  it("does not let its retry log move the durable PR backoff past the scheduled timer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-09T03:11:00.000Z"));
+    const task = makeTask({ updatedAt: "2026-08-09T03:10:00.000Z" });
+    const store = makeStore({ tasks: [task] });
+    store.getTask.mockImplementation(async () => task);
+    store.updateTask.mockImplementation(async (_taskId: string, patch: Partial<MockTask>) => {
+      Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+    });
+    // Task logs also update `updatedAt` in the production store. Model a later
+    // timestamp to prove the retry patch, rather than its log, owns the anchor.
+    store.logEntry.mockImplementation(async () => {
+      task.updatedAt = new Date(Date.now() + 1).toISOString();
+    });
+    const processPullRequestMerge = vi
+      .fn<(...args: unknown[]) => Promise<"merged" | "waiting" | "skipped">>()
+      .mockRejectedValueOnce(new Error("unexpected GitHub response"))
+      .mockResolvedValueOnce("merged");
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    (engine as unknown as { started: boolean }).started = true;
+
+    await runMergeCycle(engine);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("uses the persisted retry count for the 10s ladder and truthful final boundary", async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const retrying = makeTask({ mergeRetries: 1, updatedAt: new Date(Date.now() - 20_000).toISOString() });
+    const retryingStore = makeStore({ tasks: [retrying, retrying] });
+    const retryingEngine = createEngine(retryingStore, {
+      getMergeStrategy: () => "pull-request",
+      processPullRequestMerge: vi.fn(async () => { throw new Error("unexpected GitHub response"); }),
+    });
+
+    await runMergeCycle(retryingEngine);
+    expect(retryingStore.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      mergeRetries: 2,
+      status: null,
+      error: null,
+    });
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 10_000);
+    await retryingEngine.stop();
+
+    const twentySecondAttempt = makeTask({ mergeRetries: 2, updatedAt: new Date(Date.now() - 30_000).toISOString() });
+    const twentySecondStore = makeStore({ tasks: [twentySecondAttempt, twentySecondAttempt], settings: { maxAutoMergeRetries: 4 } });
+    const twentySecondEngine = createEngine(twentySecondStore, {
+      getMergeStrategy: () => "pull-request",
+      processPullRequestMerge: vi.fn(async () => { throw new Error("unexpected GitHub response"); }),
+    });
+    await runMergeCycle(twentySecondEngine);
+    expect(twentySecondStore.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      mergeRetries: 3,
+      status: null,
+      error: null,
+    });
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 20_000);
+    await twentySecondEngine.stop();
+
+    const finalAttempt = makeTask({ mergeRetries: 2, updatedAt: new Date(Date.now() - 30_000).toISOString() });
+    const finalStore = makeStore({ tasks: [finalAttempt, finalAttempt], settings: { maxAutoMergeRetries: 3 } });
+    const finalEngine = createEngine(finalStore, {
+      getMergeStrategy: () => "pull-request",
+      processPullRequestMerge: vi.fn(async () => { throw new Error("unexpected GitHub response"); }),
+    });
+
+    await runMergeCycle(finalEngine);
+    expect(finalStore.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: "failed",
+      mergeRetries: 3,
+      error: "unexpected GitHub response",
+    });
+    expect(finalStore.logEntry).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.stringContaining("3/3 actual failures"),
+      "MergeRetriesExhausted",
+    );
+    await finalEngine.stop();
+    vi.useRealTimers();
+  });
+
+  it("reschedules an early PR retry rejected by drain admission", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-09T04:05:00.000Z"));
+    const task = makeTask({ mergeRetries: 1, updatedAt: new Date().toISOString() });
+    const store = makeStore({ tasks: [task] });
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    (engine as unknown as { started: boolean }).started = true;
+
+    // Model a duplicate/restart enqueue which arrives before the persisted not-before.
+    await runMergeCycle(engine);
+    expect(processPullRequestMerge).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+    await engine.stop();
+    vi.useRealTimers();
+  });
+
+  it("parks exhausted pull-request transient retries without consuming the normal retry budget", async () => {
+    const atCap = ProjectEngine.MAX_AUTO_MERGE_TRANSIENT_RETRIES;
+    const task = makeTask({
+      mergeRetries: 1,
+      mergeTransientRetryCount: atCap,
+      updatedAt: new Date(Date.now() - 6_000).toISOString(),
+    });
+    const store = makeStore({ tasks: [task, task] });
+    const processPullRequestMerge = vi.fn(async () => { throw new Error("socket hang up"); });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: "failed",
+      error: "socket hang up",
+    });
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ mergeRetries: expect.any(Number) }));
+    expect(store.logEntry).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.stringContaining("transient retries exhausted"),
+      "MergeTransientRetryExhausted",
+    );
+  });
+
+  it("parks exhausted structured GitHub transport retries without consuming mergeRetries", async () => {
+    const task = makeTask({
+      mergeRetries: 1,
+      mergeTransientRetryCount: ProjectEngine.MAX_AUTO_MERGE_TRANSIENT_RETRIES,
+      updatedAt: new Date(Date.now() - 6_000).toISOString(),
+    });
+    const store = makeStore({ tasks: [task, task] });
+    const structuredTimeout = Object.assign(new Error("GitHub request timed out"), { code: "timeout" });
+    const processPullRequestMerge = vi.fn(async () => { throw structuredTimeout; });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: "failed",
+      error: "GitHub request timed out",
+    });
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ mergeRetries: expect.any(Number) }));
+    expect(store.logEntry).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.stringContaining("transient retries exhausted"),
+      "MergeTransientRetryExhausted",
+    );
+  });
+
+  it("keeps PR retry metadata outside workflow custom fields", async () => {
+    const customFieldPatch = { __fusionPrMergeRetryNotBefore: "2026-08-09T02:40:00.000Z" };
+    expect(validateCustomFieldPatch([], customFieldPatch)).toMatchObject({
+      ok: false,
+      rejection: { code: "no-fields-defined" },
+    });
+
+    const updateTask = vi.fn(async (_taskId: string, patch: Record<string, unknown>) => {
+      if (patch.customFields !== undefined) {
+        const validation = validateCustomFieldPatch([], patch.customFields as Record<string, unknown>);
+        if (!validation.ok) throw new Error(validation.rejection.detail);
+      }
+    });
+    const store = makeStore({ updateTask });
+    const processPullRequestMerge = vi.fn(async () => { throw new Error("unexpected GitHub response"); });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(updateTask).toHaveBeenCalledWith(TASK_ID, {
+      mergeRetries: 1,
+      status: null,
+      error: null,
+    });
+  });
+
+  it("parks structured pull-request policy blocks without consuming retries", async () => {
+    const store = makeStore();
+    const policyError = Object.assign(new Error("Pull request is blocked by branch protection."), { code: "merge-blocked-by-policy" });
+    const processPullRequestMerge = vi.fn(async () => { throw policyError; });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({
+      status: "awaiting-approval",
+      error: policyError.message,
+      awaitingApprovalReason: "merge-blocked-by-policy",
+    }));
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ mergeRetries: expect.any(Number) }));
+  });
+
+  it("parks non-retryable structured pull-request failures honestly", async () => {
+    const priorAttempt = makeTask({ mergeRetries: 2, updatedAt: new Date(Date.now() - 30_000).toISOString() });
+    const store = makeStore({ tasks: [priorAttempt, priorAttempt] });
+    const permissionError = Object.assign(new Error("GitHub denied access to this resource."), { code: "permission" });
+    const processPullRequestMerge = vi.fn(async () => { throw permissionError; });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({
+      status: "failed",
+      error: permissionError.message,
+    }));
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ mergeRetries: 3 }));
+  });
+
+  it("keeps a policy hold parked when the public auto-enqueue surface is invoked", async () => {
+    const parked = makeTask({
+      status: "awaiting-approval",
+      error: "Pull request is blocked by branch protection.",
+    });
+    const store = makeStore({ tasks: [parked] });
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    await engine.start();
+
+    expect(engine.enqueueMerge(TASK_ID)).toBe(true);
+    await vi.waitFor(() => expect(store.getTask).toHaveBeenCalled());
+    expect(processPullRequestMerge).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    await engine.stop();
+  });
+
+  it("resumes a policy hold through manual onMerge without changing retry counters", async () => {
+    const parked = makeTask({
+      status: "awaiting-approval",
+      error: "Pull request is blocked by branch protection.",
+      mergeRetries: 2,
+      mergeTransientRetryCount: 1,
+    });
+    const store = makeStore({ tasks: [parked, parked, parked] });
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    await engine.start();
+    await engine.onMerge(TASK_ID);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: null,
+      error: null,
+      awaitingApprovalReason: null,
+    });
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+    // The resume itself preserves both budgets; successful completion then closes
+    // that retry episode and clears the durable retry/backoff state.
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      mergeRetries: 0,
+      mergeTransientRetryCount: 0,
+    });
+    await engine.stop();
+  });
+
+  it("resumes a policy hold through the interpreter merge requester", async () => {
+    const parked = makeTask({
+      status: "awaiting-approval",
+      error: "Pull request is blocked by branch protection.",
+      mergeRetries: 2,
+      mergeTransientRetryCount: 1,
+    });
+    const store = makeStore({ tasks: [parked, parked, parked] });
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    await engine.start();
+
+    await engine.requestInterpreterMerge(TASK_ID);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: null,
+      error: null,
+      awaitingApprovalReason: null,
+    });
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+    await engine.stop();
+  });
+
+  it("cancels a pending PR retry wake when an operator merges during backoff", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-09T04:18:00.000Z"));
+    const task = makeTask();
+    const store = makeStore({ tasks: [task] });
+    store.getTask.mockImplementation(async () => task);
+    store.updateTask.mockImplementation(async (_taskId: string, patch: Partial<MockTask>) => {
+      Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+    });
+    const processPullRequestMerge = vi
+      .fn<(...args: unknown[]) => Promise<"merged" | "waiting" | "skipped">>()
+      .mockRejectedValueOnce(new Error("unexpected GitHub response"))
+      .mockResolvedValueOnce("merged");
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    (engine as unknown as { started: boolean }).started = true;
+
+    await runMergeCycle(engine);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+    await engine.onMerge(TASK_ID);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(2);
+    await engine.stop();
+    vi.useRealTimers();
+  });
+
+  it("blocks the real periodic sweep until the durable PR retry backoff elapses", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-09T02:39:00.000Z"));
+    const task = makeTask({ updatedAt: new Date().toISOString() });
+    const store = makeStore({ tasks: [task] });
+    store.getTask.mockImplementation(async () => task);
+    store.updateTask.mockImplementation(async (_taskId: string, patch: Partial<MockTask>) => {
+      Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+    });
+    const processPullRequestMerge = vi
+      .fn<(...args: unknown[]) => Promise<"merged" | "waiting" | "skipped">>()
+      .mockRejectedValueOnce(new Error("unexpected GitHub response"))
+      .mockResolvedValueOnce("merged");
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    (engine as unknown as { started: boolean }).started = true;
+    const privateEngine = engine as unknown as {
+      enqueueEligibleInReviewTasks: (tasks: Task[], settings: Pick<Settings, "autoMerge" | "maxAutoMergeRetries">) => Promise<number>;
+    };
+
+    await runMergeCycle(engine);
+    expect(task.mergeRetries).toBe(1);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+
+    // FNXC:AutoMergeRetries 2026-08-09-03:23: This production periodic-sweep
+    // dispatcher, rather than a predicate unit test, must honor the retry anchor.
+    await expect(privateEngine.enqueueEligibleInReviewTasks([task as Task], {
+      autoMerge: true,
+      maxAutoMergeRetries: 3,
+    })).resolves.toBe(0);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("keeps a re-blocked policy hold out of sweeps and preserves both retry counters", async () => {
+    const task = makeTask({
+      status: "awaiting-approval",
+      error: "Pull request is blocked by branch protection.",
+      mergeRetries: 2,
+      mergeTransientRetryCount: 1,
+    });
+    const store = makeStore({ tasks: [task] });
+    store.getTask.mockImplementation(async () => task);
+    store.updateTask.mockImplementation(async (_taskId: string, patch: Partial<MockTask>) => {
+      Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+    });
+    const policyError = Object.assign(new Error("Pull request is blocked by branch protection."), {
+      code: "merge-blocked-by-policy",
+    });
+    const processPullRequestMerge = vi.fn(async () => { throw policyError; });
+    const engine = createEngine(store, { getMergeStrategy: () => "pull-request", processPullRequestMerge });
+    await engine.start();
+    const privateEngine = engine as unknown as {
+      enqueueEligibleInReviewTasks: (tasks: Task[], settings: Pick<Settings, "autoMerge" | "maxAutoMergeRetries">) => Promise<number>;
+    };
+
+    await expect(privateEngine.enqueueEligibleInReviewTasks([task as Task], {
+      autoMerge: true,
+      maxAutoMergeRetries: 3,
+    })).resolves.toBe(0);
+    expect(processPullRequestMerge).not.toHaveBeenCalled();
+
+    await engine.onMerge(TASK_ID);
+    expect(processPullRequestMerge).toHaveBeenCalledTimes(1);
+    expect(task.status).toBe("awaiting-approval");
+    expect(task.mergeRetries).toBe(2);
+    expect(task.mergeTransientRetryCount).toBe(1);
+    expect(task.error).toBe(policyError.message);
+    await engine.stop();
+  });
+
+  it("treats absent or malformed pull-request retry anchors as elapsed", () => {
+    const store = makeStore();
+    const engine = createEngine(store);
+    const privateEngine = engine as unknown as { canMergeTask: (task: MockTask, cap: number, review?: boolean, enforcePrBackoff?: boolean) => boolean };
+    expect(privateEngine.canMergeTask(makeTask(), 3, undefined, true)).toBe(true);
+    expect(privateEngine.canMergeTask(makeTask({ mergeRetries: 1, updatedAt: "not-a-date" }), 3, undefined, true)).toBe(true);
+    expect(privateEngine.canMergeTask(makeTask({ status: "awaiting-approval" }), 3, undefined, true)).toBe(false);
   });
 
   it("treats post-finalize verification failures as a no-op diagnostic", async () => {
@@ -1046,75 +1320,7 @@ describe("ProjectEngine merge error recovery", () => {
     expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress");
   });
 
-  it("caps verification-failure bounces and creates a follow-up task", async () => {
-    const verificationError = new Error("Deterministic test verification failed");
-    verificationError.name = "VerificationError";
-    vi.mocked(runAiMerge).mockRejectedValueOnce(verificationError);
 
-    // Task already bounced 2 times — this attempt would push it to 3 (the cap)
-    const store = makeStore({
-      tasks: [
-        makeTask({ verificationFailureCount: 2, title: "do the thing" }),
-      ],
-    });
-    const engine = createEngine(store);
-
-    await runMergeCycle(engine);
-
-    // Original task is failed (not bounced back)
-    expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "in-progress");
-    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({
-      status: "failed",
-      verificationFailureCount: 3,
-    }));
-
-    // Follow-up triage task created with context
-    expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
-      column: "triage",
-      priority: "high",
-      description: expect.stringContaining(TASK_ID),
-    }));
-
-    // Comment links the follow-up
-    expect(store.addTaskComment).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("FN-9999"),
-      "agent",
-    );
-  });
-
-  it("skips duplicate verification follow-up creation when active recovery task exists", async () => {
-    const verificationError = new Error("Deterministic test verification failed");
-    verificationError.name = "VerificationError";
-    vi.mocked(runAiMerge).mockRejectedValueOnce(verificationError);
-
-    const store = makeStore({
-      tasks: [makeTask({ verificationFailureCount: 2, title: "do the thing" })],
-      listedTasks: [
-        makeTask({ verificationFailureCount: 2, title: "do the thing" }),
-        {
-          ...makeTask({ id: "FN-7777", column: "triage" }),
-          sourceType: "recovery",
-          sourceParentTaskId: TASK_ID,
-        },
-      ],
-    });
-    const engine = createEngine(store);
-
-    await runMergeCycle(engine);
-
-    expect(store.createTask).not.toHaveBeenCalled();
-    expect(store.addTaskComment).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("Reusing existing follow-up FN-7777"),
-      "agent",
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.stringContaining("skipped creating duplicate follow-up (existing FN-7777)"),
-      "VerificationError",
-    );
-  });
 
   it("logs when verification-error recovery fails", async () => {
     const verificationError = new Error("Deterministic test verification failed");
@@ -1294,4 +1500,76 @@ describe("ProjectEngine merge error recovery", () => {
     releasePr?.();
     await engine.stop();
   });
+  /*
+  FNXC:AutostashRecovery 2026-07-29-11:20 (U9):
+  Replaces the deleted "creates one recovery follow-up for live autostash orphans"
+  test. The follow-up-CARD engine is gone (project-engine.ts:4801); a `live`
+  autostash orphan is now surfaced by a durable log entry PLUS an operator comment
+  on the parent, because the parent may already be `done` and merged — if nothing
+  is said the stash becomes invisible and real uncommitted work is silently lost.
+
+  The production comment is explicit that `record.label` "must never be dropped
+  from the message or truncated" — it is the handle `git stash` recovery needs.
+  That is the invariant under test here, and it had NO working assertion: the file
+  was red, so every claim it made was inert.
+
+  Only `live` orphans notify: a subsumed/dead stash holds no unique work, and
+  commenting on those would train operators to ignore the notice.
+  */
+  it("surfaces a live autostash orphan as a log entry and parent comment that keep the stash label", async () => {
+    const store = makeStore();
+    const engine = createEngine(store);
+    await engine.start();
+
+    const handler = store.on.mock.calls.find(
+      (call: unknown[]) => call[0] === "merger:autostashOrphans",
+    )?.[1] as ((payload: { rootDir: string; records: unknown[] }) => Promise<void>) | undefined;
+    if (!handler) throw new Error("merger:autostashOrphans handler was not registered");
+
+    try {
+    await handler({
+      rootDir: "/tmp/proj_test",
+      records: [
+        {
+          classification: "live",
+          sha: "abcdef1234567890",
+          label: "fusion-autostash/FN-2084/pre-merge",
+          sourceTaskId: "FN-2084",
+          detectedByTaskId: "FN-9001",
+          sourcePhase: "pre-merge",
+        },
+        // A non-live orphan must stay silent.
+        {
+          classification: "subsumed",
+          sha: "999999999999",
+          label: "fusion-autostash/FN-2084/subsumed",
+          sourceTaskId: "FN-2084",
+        },
+      ],
+    });
+
+    // Exactly one notification pair — the subsumed record is not surfaced.
+    expect(store.addTaskComment).toHaveBeenCalledTimes(1);
+    expect(store.logEntry).toHaveBeenCalledTimes(1);
+
+    const [commentTaskId, commentBody] = store.addTaskComment.mock.calls[0] as [string, string];
+    expect(commentTaskId).toBe("FN-2084");
+    // The stash label is the recovery handle: it must survive verbatim, untruncated.
+    expect(commentBody).toContain("fusion-autostash/FN-2084/pre-merge");
+    expect(commentBody).toContain("abcdef1");
+    expect(commentBody).toContain("FN-9001");
+    expect(commentBody).toContain("pre-merge");
+
+    const [logTaskId, logMessage, logDetail] = store.logEntry.mock.calls[0] as [string, string, string];
+    expect(logTaskId).toBe("FN-2084");
+    expect(logMessage).toContain("fusion-autostash/FN-2084/pre-merge");
+    expect(logDetail).toContain("fusion-autostash/FN-2084/pre-merge");
+    } finally {
+      // Always stop: a thrown assertion that leaves the engine running kills the
+      // vitest worker, and a crashed run reports NO failures at all — which reads
+      // as "this guard is untested" instead of "this guard just failed".
+      await engine.stop();
+    }
+  });
+
 });

@@ -1,3 +1,4 @@
+import { ViewHeader } from "./ViewHeader";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
@@ -7,6 +8,7 @@ import type { ToastType } from "../hooks/useToast";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import "./AddNodeModal.css";
 
+import { FloatingWindow } from "./FloatingWindow";
 export interface AddNodeInput {
   name: string;
   type: "local" | "remote";
@@ -255,14 +257,22 @@ export function AddNodeModal({ isOpen, onClose, onSubmit, onDiscoverRemoteProjec
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay open" onClick={closeModal}>
-      <div className="modal modal-md add-node-modal" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-label={t("nodes.addNode", "Add Node")}>
-        <div className="modal-header">
-          <h3>{t("nodes.addNode", "Add Node")}</h3>
-          <button className="modal-close" onClick={closeModal} disabled={isSubmitting} aria-label={t("nodes.closeNodeModal", "Close add node modal")}>
-            &times;
-          </button>
-        </div>
+    /* FNXC:ModalTouchGeometry 2026-07-26-13:15: Shared FloatingWindow owns this modal's touch drag, resize, clamping, and persistence while phone and short viewports retain their sheet behavior. */
+    <FloatingWindow windowKey="add-node" title={t("nodes.addNode", "Add Node")} ariaLabel={t("nodes.addNode", "Add Node")} onClose={closeModal} hideHeader dragHandleSelector=".modal-header" className="floating-window--add-node" defaultSize={{ width: 720, height: 560 }} minSize={{ width: 360, height: 280 }} persistGeometryKey="floating-window:add-node" suspendGeometryPersistenceOnMobile suspendGeometryPersistenceOnShortViewport closeOnOutsidePointerDown>
+      <div className="modal modal-md add-node-modal">
+        {/*
+        FNXC:StandardizedViewLayout 2026-09-13-21:49:
+        FN-379 gives every recorded dialog the shared header: one title owner, the canonical close control, and the
+        same tokens as full destinations. The local `.modal-header` class is preserved so the window drag handle
+        selector keeps resolving.
+        */}
+        <ViewHeader
+          className="modal-header"
+          headingLevel={3}
+          title={t("nodes.addNode", "Add Node")}
+          onClose={closeModal}
+          closeButtonProps={{ disabled: isSubmitting, "aria-label": t("nodes.closeNodeModal", "Close add node modal") }}
+        />
 
         <div className="modal-body add-node-modal__body">
           <p className="add-node-modal__description">{t("nodes.description", "Register an existing Fusion node by providing its connection details and concurrency settings.")}</p>
@@ -468,6 +478,6 @@ export function AddNodeModal({ isOpen, onClose, onSubmit, onDiscoverRemoteProjec
           </button>
         </div>
       </div>
-    </div>
+    </FloatingWindow>
   );
 }

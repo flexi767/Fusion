@@ -109,9 +109,9 @@ const DISPLAY: Record<string, WorkflowSettingDisplay> = {
     label: "Code Review revision cap",
     /*
      * FNXC:WorkflowRevisionBudget 2026-06-30-19:47:
-     * Built-in workflow values are editable even when definitions are read-only, so this label is the operator-facing cap for Code Review remediation without requiring a workflow duplicate.
+     * Built-in workflow values are editable even when definitions are read-only, so this label is the operator-facing override for Code Review remediation without requiring a workflow duplicate. Empty values preserve each workflow's authored node cap.
      */
-    description: "Leave empty for unbounded automatic Code Review remediation; set 0 to disable automatic revision.",
+    description: "Leave empty to use this workflow's authored Code Review default; set 0 to disable automatic revision.",
   },
   planReviewReplanCap: {
     group: "review",
@@ -123,16 +123,6 @@ const DISPLAY: Record<string, WorkflowSettingDisplay> = {
      * its default in the editable workflow setting.
      */
     description: "Leave empty to use the built-in Plan Review replan default; set 0 to require approval after the first REVISE.",
-  },
-  triageProactiveSubtaskSplittingEnabled: {
-    group: "steps",
-    label: "Automatic large-task splitting",
-    /*
-     * FNXC:TriagePolicy 2026-07-04-00:00:
-     * Workflow Settings is the canonical operator surface for this workflow/project policy. The copy must make the default enabled state clear and preserve trust that explicit `breakIntoSubtasks: true` requests still split even when automatic large-task splitting is off.
-     */
-    description:
-      "Default enabled. When off, triage keeps oversized tasks whole unless breakIntoSubtasks: true is explicitly requested.",
   },
   workflowStepTimeoutMs: {
     group: "steps",
@@ -181,6 +171,11 @@ const DISPLAY: Record<string, WorkflowSettingDisplay> = {
    * workflow's stored value here is the effective oversight level for every task
    * under it that does not set a per-task override (FN-7515, TaskForm selector).
    */
+  memoryConsolidationEnabled: {
+    group: "oversight",
+    label: "Memory consolidation enabled",
+    description: "Enable the Memory Keeper's deterministic knowledge-graph and recall consolidation tick.",
+  },
   plannerOversightLevel: {
     group: "oversight",
     label: "Planner oversight level",

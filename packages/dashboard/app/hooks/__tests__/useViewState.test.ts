@@ -34,6 +34,9 @@ describe("useViewState", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    // The hook also mirrors the live view into sessionStorage for same-tab reload/discard restore;
+    // clear it too or one test's view leaks into the next test's landing resolution.
+    sessionStorage.clear();
     vi.spyOn(pluginViewRegistry, "isPluginViewRegistered").mockImplementation(() => false);
   });
 
@@ -134,7 +137,24 @@ describe("useViewState", () => {
     await waitFor(() => {
       expect(result.current.taskView).toBe("command-center");
     });
-    expect(localStorage.getItem("kb-dashboard-task-view")).toBe("command-center");
+    expect(localStorage.getItem("kb-dashboard-task-view")).toBe("reliability");
+  });
+
+  it.each(["documents", "recommendations"] as const)("migrates the retired %s destination to Mailbox", async (legacyView) => {
+    localStorage.setItem("kb-dashboard-task-view", legacyView);
+    const { result } = renderHook(() => useViewState(createOptions()));
+    await waitFor(() => expect(result.current.taskView).toBe("mailbox"));
+  });
+
+  it.each(["documents", "recommendations"] as const)("migrates the retired %s deep link to Mailbox", async (legacyView) => {
+    const originalUrl = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState({}, "", `?view=${legacyView}`);
+    try {
+      const { result } = renderHook(() => useViewState(createOptions()));
+      await waitFor(() => expect(result.current.taskView).toBe("mailbox"));
+    } finally {
+      window.history.replaceState({}, "", originalUrl || "/");
+    }
   });
 
   it("migrates legacy reliability URL param to Command Center", async () => {
@@ -147,7 +167,7 @@ describe("useViewState", () => {
       await waitFor(() => {
         expect(result.current.taskView).toBe("command-center");
       });
-      expect(localStorage.getItem("kb-dashboard-task-view")).toBe("command-center");
+      expect(localStorage.getItem("kb-dashboard-task-view")).toBeNull();
     } finally {
       window.history.replaceState({}, "", originalUrl || "/");
     }
@@ -161,7 +181,7 @@ describe("useViewState", () => {
     await waitFor(() => {
       expect(result.current.taskView).toBe("board");
     });
-    expect(localStorage.getItem("kb-dashboard-task-view")).toBe("board");
+    expect(localStorage.getItem("kb-dashboard-task-view")).toBe("stash-recovery");
   });
 
   it("migrates retired stash recovery URL param to board", async () => {
@@ -175,10 +195,21 @@ describe("useViewState", () => {
       await waitFor(() => {
         expect(result.current.taskView).toBe("board");
       });
-      expect(localStorage.getItem("kb-dashboard-task-view")).toBe("board");
+      expect(localStorage.getItem("kb-dashboard-task-view")).toBe("list");
     } finally {
       window.history.replaceState({}, "", originalUrl || "/");
     }
+  });
+
+  it("falls back to board for persisted Todo state even when its static bundle is registered", async () => {
+    vi.spyOn(pluginViewRegistry, "isPluginViewRegistered").mockReturnValue(true);
+    localStorage.setItem("kb-dashboard-task-view", "todos");
+
+    const { result } = renderHook(() => useViewState(createOptions()));
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("board");
+    });
   });
 
   it("migrates legacy roadmaps state to plugin view when registered", async () => {
@@ -213,14 +244,15 @@ describe("useViewState", () => {
     expect(localStorage.getItem("kb-dashboard-view-mode")).toBe("project");
   });
 
-  it("persists taskView changes to localStorage", async () => {
-    const { result } = renderHook(() => useViewState(createOptions()));
+  it("persists taskView changes only under the resolved project key", async () => {
+    const { result } = renderHook(() => useViewState(createOptions({ currentProject: PROJECT })));
 
     await act(async () => {
       result.current.setTaskView("list");
     });
 
-    expect(localStorage.getItem("kb-dashboard-task-view")).toBe("list");
+    expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("list");
+    expect(localStorage.getItem("kb-dashboard-task-view")).toBeNull();
   });
 
   it("handleChangeTaskView updates taskView state", async () => {
@@ -505,7 +537,8 @@ describe("useViewState", () => {
     window.history.replaceState({}, "", originalSearch ? `?${originalSearch.replace(/^\?/, "")}` : "/");
   });
 
-  it("restores and persists plugin task views using the canonical composite key", async () => {
+  it("restores and persists registered plugin task views using the canonical composite key", async () => {
+    vi.spyOn(pluginViewRegistry, "isPluginViewRegistered").mockReturnValue(true);
     localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "plugin:fusion-plugin-dependency-graph:graph");
 
     const { result } = renderHook(() =>
@@ -525,6 +558,23 @@ describe("useViewState", () => {
     });
 
     expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("plugin:fusion-plugin-dependency-graph:graph");
+  });
+
+  it("normalizes a persisted but unavailable plugin view to board in the current project", async () => {
+    localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "plugin:fusion-plugin-dependency-graph:graph");
+
+    const { result } = renderHook(() =>
+      useViewState(
+        createOptions({
+          currentProject: PROJECT,
+        }),
+      ),
+    );
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("board");
+      expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("board");
+    });
   });
 
   it("rejects invalid plugin view IDs and falls back to board", async () => {
@@ -576,6 +626,8 @@ describe("useViewState", () => {
 
     for (const view of legacyViews) {
       localStorage.clear();
+      // Each loop iteration is a separate fresh boot, not a same-tab reload.
+      sessionStorage.clear();
       localStorage.setItem(`kb:proj_123:kb-dashboard-task-view`, view);
 
       const { result } = renderHook(() =>
@@ -627,29 +679,52 @@ describe("useViewState", () => {
     });
   });
 
-  // FNXC:ViewState FN-7649: Switching projects (rerender with a new currentProject) must not land on Settings when the newly selected project's scoped persisted view is settings; it resolves to board. Mirrors the existing command-center project-switch coverage above.
-  it("lands on board when switching to a project whose persisted scoped taskView is settings", async () => {
+  it.each(["settings", "command-center"] as const)(
+    "restores %s only on an explicit project return while keeping fresh-boot guards",
+    async (returnView) => {
+      const projectA: ProjectInfo = { ...PROJECT, id: "proj_a", name: "Project A" };
+      const projectB: ProjectInfo = { ...PROJECT, id: "proj_b", name: "Project B" };
+
+      localStorage.setItem("kb:proj_a:kb-dashboard-task-view", returnView);
+      localStorage.setItem("kb:proj_b:kb-dashboard-task-view", "chat");
+
+      const { result, rerender } = renderHook(
+        ({ project }) => useViewState(createOptions({ currentProject: project })),
+        { initialProps: { project: projectB } },
+      );
+
+      await waitFor(() => expect(result.current.taskView).toBe("chat"));
+      expect(localStorage.getItem("kb:proj_b:kb-dashboard-task-view")).toBe("chat");
+
+      rerender({ project: projectA });
+      await waitFor(() => expect(result.current.taskView).toBe(returnView));
+      expect(localStorage.getItem("kb:proj_a:kb-dashboard-task-view")).toBe(returnView);
+
+      rerender({ project: projectB });
+      await waitFor(() => expect(result.current.taskView).toBe("chat"));
+      expect(localStorage.getItem("kb:proj_b:kb-dashboard-task-view")).toBe("chat");
+    },
+  );
+
+  it("restores chat for A after A → B → A without reading B's view", async () => {
     const projectA: ProjectInfo = { ...PROJECT, id: "proj_a", name: "Project A" };
     const projectB: ProjectInfo = { ...PROJECT, id: "proj_b", name: "Project B" };
-
-    localStorage.setItem("kb:proj_a:kb-dashboard-task-view", "list");
-    localStorage.setItem("kb:proj_b:kb-dashboard-task-view", "settings");
+    localStorage.setItem("kb:proj_a:kb-dashboard-task-view", "chat");
+    localStorage.setItem("kb:proj_b:kb-dashboard-task-view", "agents");
 
     const { result, rerender } = renderHook(
       ({ project }) => useViewState(createOptions({ currentProject: project })),
       { initialProps: { project: projectA } },
     );
+    await waitFor(() => expect(result.current.taskView).toBe("chat"));
 
-    await waitFor(() => {
-      expect(result.current.taskView).toBe("list");
-    });
-
-    // Switch to project B, whose persisted view is settings - must land on board, not settings.
     rerender({ project: projectB });
+    await waitFor(() => expect(result.current.taskView).toBe("agents"));
 
-    await waitFor(() => {
-      expect(result.current.taskView).toBe("board");
-    });
+    rerender({ project: projectA });
+    await waitFor(() => expect(result.current.taskView).toBe("chat"));
+    expect(localStorage.getItem("kb:proj_a:kb-dashboard-task-view")).toBe("chat");
+    expect(localStorage.getItem("kb:proj_b:kb-dashboard-task-view")).toBe("agents");
   });
 
   it("no cross-project bleed when switching projects", async () => {
@@ -689,5 +764,61 @@ describe("useViewState", () => {
 
     // Project A's view should still be insights (not affected by project B load)
     expect(resultA.current.taskView).toBe("insights");
+  });
+
+  // ── Session task-view copy is project-scoped ONLY ─────────────────
+  /*
+  FNXC:ViewState 2026-07-26-20:50:
+  The per-tab session copy documented itself as "never mirrored unscoped", but `scopedKey(base,
+  undefined)` returns the BARE key and the persist effect runs during boot and every project-switch
+  window with `currentProject === undefined` — so it DID write the unscoped mirror, and the
+  initializer read it back for first paint. That is the leak the doc forbade: the previous project's
+  view landing in the next project's session. These tests pin both halves (never written, never read)
+  so the claim cannot go back to being aspirational.
+  */
+  it("never writes the unscoped session task-view mirror while the project is unknown", async () => {
+    const { result } = renderHook(() => useViewState(createOptions({ currentProject: null })));
+
+    await act(async () => {
+      result.current.handleChangeTaskView("insights");
+    });
+
+    expect(result.current.taskView).toBe("insights");
+    expect(localStorage.getItem("kb-dashboard-task-view")).toBeNull();
+    expect(sessionStorage.getItem("kb-dashboard-task-view-session")).toBeNull();
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it("still writes the project-scoped session copy once a project is known", async () => {
+    const { result } = renderHook(() => useViewState(createOptions({ currentProject: PROJECT })));
+
+    await act(async () => {
+      result.current.handleChangeTaskView("insights");
+    });
+
+    expect(sessionStorage.getItem("kb:proj_123:kb-dashboard-task-view-session")).toBe("insights");
+    expect(sessionStorage.getItem("kb-dashboard-task-view-session")).toBeNull();
+  });
+
+  it("never paints an unscoped session task-view left behind by an earlier build", async () => {
+    // A pre-fix build (or another project's tab) wrote the bare key.
+    sessionStorage.setItem("kb-dashboard-task-view-session", "insights");
+    localStorage.setItem("kb-dashboard-task-view", "list");
+    localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "list");
+
+    // Every rendered value, so the FIRST PAINT (the initializer's value) is asserted too — the
+    // unscoped read only ever affected first paint, which a post-effect assertion cannot see.
+    const painted: string[] = [];
+    const { result } = renderHook(() => {
+      const state = useViewState(createOptions({ currentProject: PROJECT }));
+      painted.push(state.taskView);
+      return state;
+    });
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("list");
+    });
+    expect(painted[0]).toBe("list");
+    expect(painted).not.toContain("insights");
   });
 });

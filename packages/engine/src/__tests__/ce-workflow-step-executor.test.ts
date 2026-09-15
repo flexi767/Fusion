@@ -23,11 +23,28 @@
  * line on prompt so the parse path completes cleanly.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { BUILTIN_WORKFLOWS, type WorkflowIr } from "@fusion/core";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BUILTIN_WORKFLOWS, resolveTaskOutputLanguage, type WorkflowIr } from "@fusion/core";
 import "./executor-test-helpers.js";
+// captureBaseCommitSha was peeled off TaskExecutor into executor/worktree-git-refs.ts (wave 18),
+// so the old per-test `vi.spyOn(executor, "captureBaseCommitSha")` seam no longer exists.
+// Stub it at its module home; everything else in that module stays real.
+vi.mock("../executor/worktree-git-refs.js", async (importOriginal) => ({
+  ...(await importOriginal() as object),
+  captureBaseCommitSha: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../worktree/review-diff-fingerprint.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../worktree/review-diff-fingerprint.js")>(),
+  resolveContentReviewInputProof: vi.fn(async () => ({ kind: "fingerprint", fingerprint: "ce-review-proof" })),
+}));
 import { TaskExecutor } from "../executor.js";
-import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
+import type { PluginRunner } from "../plugins/plugin-runner.js";
+import { WorkflowGraphExecutor } from "../workflows/workflow-graph-executor.js";
+import { MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
+import { WorktreeBaseRefreshError } from "../worktree/worktree-acquisition.js";
 import {
   createMockStore,
   mockedCreateFnAgent,
@@ -35,6 +52,49 @@ import {
   mockedExistsSync,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
+
+describe("typed worktree base refresh graph refusal", () => {
+  it("does not immediately retry or erase a code-node refresh reason", async () => {
+    /*
+    FNXC:WorktreeBaseRefresh 2026-08-01-16:33:
+    The graph must stop before its code handler/session when reuse cannot prove a current,
+    durable-aligned checkout. The refresh outcome remains routable rather than generic exception.
+    */
+    const handler = vi.fn();
+    const prepare = vi.fn().mockRejectedValue(new WorktreeBaseRefreshError({
+      kind: "base-reconciliation-required",
+      executionSafe: false,
+      durableBaseSha: "c0",
+      baseSha: "c1",
+    }));
+    const graph = new WorkflowGraphExecutor({
+      handlers: { code: handler },
+      prepareNodeExecution: prepare,
+      maxRetriesPerNode: 3,
+    });
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "typed-refresh-refusal",
+      columns: [{ id: "in-progress", name: "In Progress", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "execute", kind: "code", column: "in-progress", config: { source: "return {};" } },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "execute" },
+        { from: "execute", to: "end", condition: "success" },
+      ],
+    };
+
+    const result = await graph.run({ id: "FN-REFRESH", column: "in-progress", steps: [] } as any, {}, ir);
+
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(handler).not.toHaveBeenCalled();
+    expect(result.outcome).toBe("failure");
+    expect(result.context?.["node:execute:value"]).toBe("base-reconciliation-required");
+  });
+});
 
 type CapturedSession = {
   customTools?: Array<{ name?: string }>;
@@ -49,7 +109,7 @@ type CapturedSession = {
  * that emits the given output line, then resolves. Returns the capture holder.
  */
 function captureSession(
-  output = '{"verdict":"APPROVE","notes":""}',
+  output = '{"verdict":"APPROVE","notes":"Reviewed the scoped work and found it correct."}',
   questionTool?: { name: string; args: Record<string, unknown> },
 ): { last?: CapturedSession; all: CapturedSession[] } {
   const holder: { last?: CapturedSession; all: CapturedSession[] } = { all: [] };
@@ -97,10 +157,50 @@ function captureSession(
   return holder;
 }
 
-function makeExecutor(store: ReturnType<typeof createMockStore>) {
+function makeExecutor(
+  store: ReturnType<typeof createMockStore>,
+  pluginRunner?: PluginRunner,
+) {
   const agentStore = { getAgent: vi.fn().mockResolvedValue(null), createAgent: vi.fn() };
-  const executor = new TaskExecutor(store as any, "/tmp/test", { agentStore } as any);
+  const executor = new TaskExecutor(store as any, "/tmp/test", { agentStore, pluginRunner } as any);
   return { executor, agentStore };
+}
+
+const tempDirs: string[] = [];
+
+async function createPluginSkillFixture(skillName: string, body: string): Promise<{ pluginRoot: string; skillDir: string; skillFile: string }> {
+  const pluginRoot = await mkdtemp(join(tmpdir(), "workflow-step-plugin-skill-"));
+  tempDirs.push(pluginRoot);
+  const skillDir = join(pluginRoot, "skills", skillName);
+  const skillFile = join(skillDir, "SKILL.md");
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(skillFile, `---\nname: ${skillName}\ndescription: Test plugin skill\n---\n\n${body}`, "utf-8");
+  return { pluginRoot, skillDir, skillFile };
+}
+
+async function expectCapturedSkillBody(
+  cap: ReturnType<typeof captureSession>,
+  projectRootDir: string,
+  agentDir: string,
+  skillName: string,
+  skillFile: string,
+  distinctiveBody: string,
+) {
+  const { DefaultResourceLoader } = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
+  const { createSkillsOverrideFromSelection, resolveSessionSkills } = await vi.importActual<typeof import("../cli-runtime/skill-resolver.js")>("../cli-runtime/skill-resolver.js");
+  const requestedSkillNames = cap.last?.skillSelection?.requestedSkillNames;
+  const selection = resolveSessionSkills({ projectRootDir, requestedSkillNames, sessionPurpose: "executor" });
+  const loader = new DefaultResourceLoader({
+    cwd: projectRootDir,
+    agentDir,
+    additionalSkillPaths: cap.last?.additionalSkillPaths,
+    skillsOverride: createSkillsOverrideFromSelection(selection, { requestedSkillNames, sessionPurpose: "executor" }),
+  });
+  await loader.reload();
+
+  const skill = (loader.getSkills().skills as Array<{ name: string; filePath: string }>).find((candidate) => candidate.name === skillName);
+  expect(skill?.filePath).toBe(skillFile);
+  await expect(readFile(skillFile, "utf-8")).resolves.toContain(distinctiveBody);
 }
 
 function baseStepTask(overrides: Record<string, unknown> = {}) {
@@ -186,8 +286,13 @@ function quietGit() {
 }
 
 describe("CE workflow-step executor integration", () => {
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
   beforeEach(() => {
     resetExecutorMocks();
+    mockedExistsSync.mockReturnValue(true);
     quietGit();
   });
 
@@ -224,6 +329,49 @@ describe("CE workflow-step executor integration", () => {
       expect(captured.step.prompt).toContain("Plan the work.");
     });
 
+    it("preserves the graph-start output target when a later prompt step sees edited input and settings", async () => {
+      const store = createMockStore();
+      const live = baseStepTask({
+        description: "Necesito desplegar el flujo de validación del proyecto en español.",
+      });
+      store.getTask.mockResolvedValue(live as any);
+      const { executor } = makeExecutor(store);
+      const graphStartTarget = resolveTaskOutputLanguage(
+        { taskOutputLanguage: "input" },
+        "Bonjour, ceci est une demande détaillée pour déployer le flux de validation.",
+      );
+      const executeWorkflowStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true, output: "ok" });
+      const node = {
+        id: "language-snapshot-review",
+        kind: "prompt",
+        column: "review",
+        config: { prompt: "Review the implementation." },
+      };
+
+      await (executor as any).runGraphCustomNode(
+        node,
+        live,
+        { taskOutputLanguage: "interface", language: "es" },
+        undefined,
+        undefined,
+        graphStartTarget,
+      );
+
+      /*
+      FNXC:TaskOutputLanguage 2026-08-19-16:34:
+      A graph can yield before a custom prompt node executes. The node must use the
+      graph-start target rather than re-detecting this later live Spanish description.
+      */
+      expect(executeWorkflowStep).toHaveBeenCalledWith(
+        expect.objectContaining({ description: live.description }),
+        expect.anything(),
+        expect.any(String),
+        expect.objectContaining({ taskOutputLanguage: "interface", language: "es" }),
+        expect.anything(),
+        expect.objectContaining({ outputLanguage: graphStartTarget }),
+      );
+    });
+
     it("lets the graph prepare a task worktree before the first CE coding-mode node runs", async () => {
       const store = createMockStore();
       let live = baseStepTask({
@@ -241,7 +389,6 @@ describe("CE workflow-step executor integration", () => {
         path: "/tmp/test/.worktrees/swift-falcon",
         branch: "fusion/fn-ce-1",
       });
-      vi.spyOn(executor as any, "captureBaseCommitSha").mockResolvedValue(undefined);
 
       const captured: { step?: any; worktreePath?: string } = {};
       vi.spyOn(executor as any, "executeWorkflowStep").mockImplementation(async (...args: any[]) => {
@@ -311,7 +458,6 @@ describe("CE workflow-step executor integration", () => {
         path: "/tmp/test/.worktrees/fresh-ce-checkout",
         branch: "fusion/fn-ce-1",
       });
-      vi.spyOn(executor as any, "captureBaseCommitSha").mockResolvedValue(undefined);
 
       const captured: { worktreePath?: string } = {};
       vi.spyOn(executor as any, "executeWorkflowStep").mockImplementation(async (...args: any[]) => {
@@ -388,7 +534,6 @@ describe("CE workflow-step executor integration", () => {
         path: "/tmp/test/.worktrees/acquired-code-review",
         branch: "fusion/fn-ce-1",
       });
-      vi.spyOn(executor as any, "captureBaseCommitSha").mockResolvedValue(undefined);
       const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true, output: "APPROVE" });
       const requirements: any[] = [];
       const codeReview = {
@@ -434,7 +579,7 @@ describe("CE workflow-step executor integration", () => {
       expect(result.context["node:code-review:outcome"]).not.toBe("no-worktree-for-write-node");
     });
 
-    it("keeps disabled inline fixes and Plan Review read-only during graph preparation", async () => {
+    it("prepares a Code Review checkout while keeping Plan Review checkout-free", async () => {
       const requirements: any[] = [];
       const graph = new WorkflowGraphExecutor({
         prepareNodeExecution: (_node, _task, requirement) => { requirements.push(requirement); },
@@ -458,9 +603,8 @@ describe("CE workflow-step executor integration", () => {
       };
       await graph.run(baseStepTask({ enabledWorkflowSteps: ["code-review", "plan-review"] }) as any, {
         experimentalFeatures: {},
-        reviewerInlineFixes: false,
       }, ir);
-      expect(requirements).toEqual([]);
+      expect(requirements).toEqual([{ requiresWorktree: true, reason: "write-capable-node" }]);
     });
 
     it("finalizes a merge-confirmed workflow graph task that is stranded before done", async () => {
@@ -494,7 +638,7 @@ describe("CE workflow-step executor integration", () => {
       expect(live.mergeDetails?.mergeConfirmed).toBe(true);
     });
 
-    it("lets stale no-op merge proof fall through when implementation steps are incomplete", async () => {
+    it("finalizes durable no-op merge proof without replaying pre-merge implementation", async () => {
       const store = createMockStore();
       const live = baseStepTask({
         column: "in-progress",
@@ -510,19 +654,14 @@ describe("CE workflow-step executor integration", () => {
       const { executor } = makeExecutor(store);
 
       /*
-       * FNXC:WorkflowMerge 2026-06-29-23:12:
-       * A no-op merge confirmation without a landed commit is not implementation proof. When reopened work still has incomplete legacy steps, execute() must continue to stale-merge cleanup/reverification instead of consuming the run in merge-confirmed finalization.
+       * FNXC:ConfirmedMergeFinalization 2026-09-03-05:40:
+       * Durable merge confirmation is the terminal authority. FN-180 reconciliation skips stale
+       * pre-merge checklist entries rather than replaying implementation after the merge boundary.
        */
       const handled = await (executor as any).finalizeMergeConfirmedWorkflowGraphTask("FN-CE-1", "test");
 
-      expect(handled).toBe(false);
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-CE-1", "done", expect.anything());
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-CE-1",
-        expect.stringContaining("merge-confirmed finalization blocked"),
-        undefined,
-        undefined,
-      );
+      expect(handled).toBe(true);
+      expect(store.moveTask).toHaveBeenCalledWith("FN-CE-1", "done", expect.anything());
     });
 
     it("blocks the merge requester when graph traversal reaches merge before implementation steps finish", async () => {
@@ -563,24 +702,51 @@ describe("CE workflow-step executor integration", () => {
         live,
       );
 
+      /*
+      FNXC:WorkflowMerge 2026-08-23-23:50:
+      FN-9157 made an unprovable merge boundary its own TERMINAL failure value
+      (`MERGE_BOUNDARY_UNPROVEN_VALUE`) instead of the retryable `implementation-incomplete`
+      classification, precisely so a card that cannot prove implementation is parked rather than
+      re-entering the bounded merge retry. The property this case owns — the requester is never
+      called and the card never reaches review — is unchanged.
+      */
       expect(result).toEqual(expect.objectContaining({
         outcome: "failure",
-        value: "implementation-incomplete",
+        value: MERGE_BOUNDARY_UNPROVEN_VALUE,
       }));
       expect(mergeRequester).not.toHaveBeenCalled();
-      // FNXC:WorkflowMerge 2026-07-07-08:38: The merge boundary (executor.ts:6305, 6fc50d8d9e) now moves the task to in-review and logs the boundary move BEFORE the implementation-proof gate runs, then the proof failure is logged separately. The proof-failure text (executor.ts:6345) changed from the static "implementation steps are incomplete" to the parse-step-aware "implementation did not run: parsed coding steps are missing or incomplete". Assert both log entries so the new two-stage merge-boundary behavior is pinned.
+      /*
+      FNXC:WorkflowMerge 2026-07-30-11:40:
+      The boundary no longer MOVES then checks — it blocks first. `ensureWorkflowMergeBoundaryTask`
+      (executor.ts:7809) now returns early when a foreach step-execute region has incomplete proof,
+      logging "Workflow merge boundary blocked: <reason>" and leaving the card where it is. The
+      previous two-stage sequence this test pinned is gone: the string "Workflow merge boundary moved
+      task to in-review before requesting merge" no longer exists anywhere in production.
+
+      That change is an improvement worth asserting rather than tolerating, so this pins the stronger
+      property the new order gives us: an unproven card is NOT moved into the review column at all.
+      The old assertion could only say "it was moved, then blocked".
+
+      Log text asserted by its stable prefix, not the whole sentence — the reason clause enumerates
+      missing foreach instance ids, which is legitimately volatile detail, and pinning it verbatim
+      would make this test fail on unrelated node-id changes.
+      */
       expect(store.logEntry).toHaveBeenCalledWith(
         "FN-CE-1",
-        "Workflow merge boundary moved task to in-review before requesting merge",
+        expect.stringContaining("Workflow merge boundary blocked:"),
         undefined,
         undefined,
       );
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-CE-1",
-        "Workflow merge blocked before requester: implementation did not run: parsed coding steps are missing or incomplete",
-        undefined,
-        undefined,
-      );
+      /*
+      FNXC:WorkflowMerge 2026-08-23-23:50:
+      The later "implementation did not run:" diagnostic belonged to the implementation-proof check
+      that ran AFTER the boundary; FN-9157's boundary now refuses first (here: "no pre-merge node
+      result recorded"), so that second log line is unreachable on this path and asserting it would
+      only re-describe the retired two-stage order.
+      */
+      // The card must never reach the review column on unproven implementation.
+      expect(store.moveTask).not.toHaveBeenCalledWith("FN-CE-1", "in-review", expect.anything());
+      expect(store.moveTask).not.toHaveBeenCalledWith("FN-CE-1", "in-review");
     });
 
     it("uses moveTask for workflow graph column transitions so lifecycle notifications fire", async () => {
@@ -629,6 +795,20 @@ describe("CE workflow-step executor integration", () => {
       let live = baseStepTask({
         column: "in-progress",
         steps: [{ name: "Implement", status: "done" }],
+        /*
+        FNXC:WorkflowMerge 2026-07-30-12:05:
+        The merge boundary now REFUSES a foreach step-execute region with no pre-merge node
+        proof (executor.ts:7808) — it logs "Workflow merge boundary blocked: no pre-merge node
+        result recorded" and returns without moving. This fixture must therefore model a run
+        that actually FINISHED its per-instance work, or it measures the block instead of the
+        behaviour its name describes.
+
+        Shape matched to the evaluator: `source: "node"` and `phase: "pre-merge"` are what it
+        filters on, and `passed` is terminal for it.
+        */
+        workflowStepResults: [
+          { workflowStepId: "steps#0:step-execute", workflowStepName: "Implement", source: "node", phase: "pre-merge", status: "passed" },
+        ],
       });
       store.getTask.mockImplementation(async () => live as any);
       store.moveTask.mockImplementation(async (_id: string, column: string) => {
@@ -695,6 +875,17 @@ describe("CE workflow-step executor integration", () => {
             source: "node",
             status: "passed",
           },
+          /*
+          FNXC:WorkflowMerge 2026-07-30-12:15:
+          A `plan` result alone no longer clears the boundary: it proves SOME pre-merge node ran,
+          but the gate also requires an instance result per foreach step-execute
+          (`missingInstanceIds`, executor.ts:7813). Without these two the boundary blocks with
+          "foreach step instances incomplete" and the checklist projection this test exists to
+          assert never happens — so the fixture would be measuring the block, not the projection.
+          One instance per declared step, matching the two steps above.
+          */
+          { workflowStepId: "steps#0:step-execute", workflowStepName: "Diagnose", phase: "pre-merge", source: "node", status: "passed" },
+          { workflowStepId: "steps#1:step-execute", workflowStepName: "Implement", phase: "pre-merge", source: "node", status: "passed" },
         ],
       });
       store.getTask.mockImplementation(async () => live as any);
@@ -935,6 +1126,15 @@ Ship FIVE kinds. Do NOT add roadmap-item in this task.
       expect(cap.last?.systemPrompt).toContain("Ship FIVE kinds. Do NOT add roadmap-item in this task.");
       expect(cap.last?.systemPrompt).toContain("PROMPT.md is the authoritative current contract");
       expect(cap.last?.systemPrompt).toContain("Do not enforce superseded requirements from the original Task Description");
+      /*
+       * FNXC:CodeReviewSurfaceCoverage 2026-08-04-06:35:
+       * Review starts from changed files but follows necessary consumers and
+       * tests, then restarts the complete procedure after any inline repair.
+       */
+      expect(cap.last?.systemPrompt).toContain("modified-file list is the starting point");
+      expect(cap.last?.systemPrompt).toContain("necessary callers, selectors, shared helpers, consumers, and tests");
+      expect(cap.last?.systemPrompt).not.toContain("Review ONLY the files listed above");
+      expect(cap.last?.systemPrompt).not.toContain("## Same-Session Fix Policy");
     });
 
     it("does not restore the historical task description when PROMPT.md is unavailable", async () => {
@@ -943,16 +1143,97 @@ Ship FIVE kinds. Do NOT add roadmap-item in this task.
       const cap = captureSession();
       vi.spyOn(executor as any, "readTaskArtifact").mockResolvedValue(undefined);
 
-      await (executor as any).executeWorkflowStep(
+      const result = await (executor as any).executeWorkflowStep(
         baseStepTask({ description: "Original request: ship SIX kinds including roadmap-item." }),
         makeStep({ name: "Code Review", optionalGroupId: "code-review", gateMode: "gate" }),
         "/tmp/wt",
         {},
       );
 
-      expect(cap.last?.systemPrompt).toContain("Approved Task Contract Unavailable");
-      expect(cap.last?.systemPrompt).toContain("Task Description is historical input only and is not a substitute contract");
-      expect(cap.last?.systemPrompt).toContain("Return REVISE with the single reason that the approved contract could not be loaded");
+      expect(cap.all).toHaveLength(0);
+      expect(result).toMatchObject({
+        success: false,
+        verdict: "REVISE",
+        failureValue: 'required-artifact-missing:["PROMPT.md"]',
+      });
+    });
+
+    /*
+    FNXC:PlanReview 2026-07-21-16:30:
+    Execution must refuse to create a reviewer when the authoritative PROMPT.md is unavailable, preserving the fail-closed workflow contract at the actual session-creation seam.
+    */
+    it("fails Plan Review closed before creating a reviewer when PROMPT.md is unavailable", async () => {
+      const store = createMockStore();
+      const { executor } = makeExecutor(store);
+      const cap = captureSession();
+      vi.spyOn(executor as any, "readTaskArtifact").mockResolvedValue(undefined);
+
+      const result = await (executor as any).executeWorkflowStep(
+        baseStepTask(),
+        makeStep({ id: "graph:plan-review-step", name: "Plan Review", optionalGroupId: "plan-review", gateMode: "gate" }),
+        "/tmp/wt",
+        {},
+      );
+
+      expect(cap.all).toHaveLength(0);
+      expect(result).toMatchObject({
+        success: false,
+        revisionRequested: true,
+        verdict: "REVISE",
+        failureValue: 'required-artifact-missing:["PROMPT.md"]',
+        notes: expect.stringContaining("PROMPT.md could not be loaded"),
+      });
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "FN-CE-1",
+        expect.stringContaining("Plan Review refused to run without PROMPT.md"),
+      );
+    });
+
+    it("distinguishes a task-storage read error from a confirmed missing PROMPT.md", async () => {
+      const store = createMockStore();
+      const { executor } = makeExecutor(store);
+      const cap = captureSession();
+      vi.spyOn(executor as any, "readTaskArtifact").mockRejectedValue(new Error("database unavailable"));
+
+      const result = await (executor as any).executeWorkflowStep(
+        baseStepTask(),
+        makeStep({ id: "graph:plan-review-step", name: "Plan Review", optionalGroupId: "plan-review", gateMode: "gate" }),
+        "/tmp/wt",
+        {},
+      );
+
+      expect(cap.all).toHaveLength(0);
+      expect(result).toMatchObject({
+        success: false,
+        failureValue: "required-artifact-read-failed:PROMPT.md",
+        error: expect.stringContaining("task storage failed"),
+      });
+      expect(result.verdict).toBeUndefined();
+    });
+
+    it.each([
+      ["Code Review", "code-review"],
+      ["Browser Verification", "browser-verification"],
+    ])("fails %s closed before creating a reviewer when PROMPT.md is unavailable", async (name, optionalGroupId) => {
+      const store = createMockStore();
+      const { executor } = makeExecutor(store);
+      const cap = captureSession();
+      vi.spyOn(executor as any, "readTaskArtifact").mockResolvedValue(undefined);
+
+      const result = await (executor as any).executeWorkflowStep(
+        baseStepTask(),
+        makeStep({ name, optionalGroupId, gateMode: "gate" }),
+        "/tmp/wt",
+        {},
+      );
+
+      expect(cap.all).toHaveLength(0);
+      expect(result).toMatchObject({
+        success: false,
+        revisionRequested: true,
+        verdict: "REVISE",
+        failureValue: 'required-artifact-missing:["PROMPT.md"]',
+      });
     });
 
     it.each([
@@ -1089,7 +1370,7 @@ Ship FIVE kinds. Do NOT add roadmap-item in this task.
       },
     );
 
-    it("warns loudly and does not set additionalSkillPaths when a skill step lacks FUSION_CE_SKILLS_DIR", async () => {
+    it("warns when the named CE skill has no viable multi-source discovery path", async () => {
       const store = createMockStore();
       const { executor } = makeExecutor(store);
       const cap = captureSession();
@@ -1108,8 +1389,98 @@ Ship FIVE kinds. Do NOT add roadmap-item in this task.
       expect(requested).toContain("ce-work");
       expect(cap.last?.additionalSkillPaths).toBeUndefined();
       expect(skillLoadWarnings(store)).toEqual([
-        "[skill-load] Workflow step 'Execute' requests skill 'compound-engineering:ce-work' but FUSION_CE_SKILLS_DIR is unset — the skill cannot be discovered; the step runs with role-fallback skills only.",
+        "[skill-load] Workflow step 'Execute' requests skill 'compound-engineering:ce-work' but it cannot be discovered from configured plugin body directories or FUSION_CE_SKILLS_DIR; the step runs with role-fallback skills only.",
       ]);
+    });
+
+    it("does not warn when the requested plugin skill body is discoverable without a CE directory", async () => {
+      const distinctiveBody = "Security scan methodology from the plugin fixture.";
+      const { pluginRoot, skillDir, skillFile } = await createPluginSkillFixture("security-scan", distinctiveBody);
+      const projectRootDir = await mkdtemp(join(tmpdir(), "workflow-step-project-"));
+      const agentDir = await mkdtemp(join(tmpdir(), "workflow-step-agent-"));
+      tempDirs.push(projectRootDir, agentDir);
+      await mkdir(join(projectRootDir, ".fusion"), { recursive: true });
+      mockedExistsSync.mockImplementation((path) => String(path) === skillFile);
+
+      const pluginRunner = {
+        getPluginSkills: vi.fn().mockReturnValue([
+          { pluginId: "plugin-security", pluginRoot, skill: { name: "security-scan" } },
+        ]),
+      } as unknown as PluginRunner;
+      const store = createMockStore();
+      const { executor } = makeExecutor(store, pluginRunner);
+      const cap = captureSession();
+
+      await (executor as any).executeWorkflowStep(
+        baseStepTask(),
+        makeStep({ name: "Security scan", skillName: "security-scan" }),
+        "/tmp/wt",
+        {},
+        {},
+        undefined,
+      );
+
+      expect(skillLoadWarnings(store)).toEqual([]);
+      expect(cap.last?.skillSelection?.requestedSkillNames).toContain("security-scan");
+      expect(cap.last?.additionalSkillPaths).toEqual([skillDir, dirname(skillDir)]);
+      await expectCapturedSkillBody(cap, projectRootDir, agentDir, "security-scan", skillFile, distinctiveBody);
+    });
+
+    it("still warns when only an unrelated plugin skill body is discoverable", async () => {
+      const { pluginRoot, skillDir, skillFile } = await createPluginSkillFixture("other-skill", "Unrelated plugin skill.");
+      mockedExistsSync.mockImplementation((path) => String(path) === skillFile);
+      const pluginRunner = {
+        getPluginSkills: vi.fn().mockReturnValue([
+          { pluginId: "plugin-other", pluginRoot, skill: { name: "other-skill" } },
+        ]),
+      } as unknown as PluginRunner;
+      const store = createMockStore();
+      const { executor } = makeExecutor(store, pluginRunner);
+      const cap = captureSession();
+
+      await (executor as any).executeWorkflowStep(
+        baseStepTask(),
+        makeStep({ name: "Security scan", skillName: "security-scan" }),
+        "/tmp/wt",
+        {},
+        {},
+        undefined,
+      );
+
+      expect(cap.last?.additionalSkillPaths).toEqual([skillDir, dirname(skillDir)]);
+      expect(skillLoadWarnings(store)).toHaveLength(1);
+    });
+
+    it("does not warn when a CE-namespaced skill has a plugin-delivered body", async () => {
+      const distinctiveBody = "CE work methodology delivered from a plugin fixture.";
+      const { pluginRoot, skillDir, skillFile } = await createPluginSkillFixture("ce-work", distinctiveBody);
+      const projectRootDir = await mkdtemp(join(tmpdir(), "workflow-step-project-"));
+      const agentDir = await mkdtemp(join(tmpdir(), "workflow-step-agent-"));
+      tempDirs.push(projectRootDir, agentDir);
+      await mkdir(join(projectRootDir, ".fusion"), { recursive: true });
+      mockedExistsSync.mockImplementation((path) => String(path) === skillFile);
+      const pluginRunner = {
+        getPluginSkills: vi.fn().mockReturnValue([
+          { pluginId: "plugin-ce", pluginRoot, skill: { name: "ce-work" } },
+        ]),
+      } as unknown as PluginRunner;
+      const store = createMockStore();
+      const { executor } = makeExecutor(store, pluginRunner);
+      const cap = captureSession();
+
+      await (executor as any).executeWorkflowStep(
+        baseStepTask(),
+        makeStep({ name: "CE work", skillName: "compound-engineering:ce-work" }),
+        "/tmp/wt",
+        {},
+        {},
+        undefined,
+      );
+
+      expect(skillLoadWarnings(store)).toEqual([]);
+      expect(cap.last?.skillSelection?.requestedSkillNames).toEqual(expect.arrayContaining(["compound-engineering:ce-work", "ce-work"]));
+      expect(cap.last?.additionalSkillPaths).toEqual([skillDir, dirname(skillDir)]);
+      await expectCapturedSkillBody(cap, projectRootDir, agentDir, "ce-work", skillFile, distinctiveBody);
     });
 
     it("a skill-less step contributes no skillName merge, no additionalSkillPaths, and no skill-load warning", async () => {

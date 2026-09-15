@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -99,14 +99,16 @@ function Harness({
   initialWidth,
   isOpen = true,
   storageKey = STORAGE_KEY,
+  touchTargets = false,
 }: {
   initialHeight?: string;
   initialWidth?: string;
   isOpen?: boolean;
   storageKey?: string;
+  touchTargets?: boolean;
 }) {
   const modalRef = useRef<HTMLDivElement | null>(null);
-  useModalResizePersist(modalRef, isOpen, storageKey);
+  useModalResizePersist(modalRef, isOpen, storageKey, { touchTargets });
 
   return (
     <div
@@ -134,9 +136,9 @@ describe("useModalResizePersist", () => {
     document.body.style.userSelect = "";
   });
 
-  it("injects a touch-capable resize grip on tablet and persists dragged size", () => {
+  it("injects a tablet touch hit target and persists a touch drag", () => {
     setViewport(900);
-    render(<Harness />);
+    render(<Harness touchTargets />);
 
     const modal = screen.getByTestId("modal");
     installModalGeometry(modal);
@@ -146,6 +148,8 @@ describe("useModalResizePersist", () => {
 
     expect(grip).toHaveAttribute("role", "separator");
     expect(grip).toHaveAttribute("aria-label", "Resize modal from bottom-right corner");
+    expect(grip).toHaveAttribute("data-resize-hit-target", "true");
+    expect(grip).toHaveClass("modal-resize-grip--touch-target");
 
     dispatchPointerEvent(grip, "pointerdown", { clientX: 10, clientY: 20, pointerType: "touch" });
     dispatchPointerEvent(document, "pointermove", { clientX: 70, clientY: 65, pointerType: "touch" });
@@ -157,6 +161,57 @@ describe("useModalResizePersist", () => {
     vi.advanceTimersByTime(200);
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}"))
       .toEqual({ width: 560, height: 445 });
+  });
+
+  it("resizes from a focused grip with arrow keys and exposes synchronized geometry", () => {
+    setViewport(900);
+    render(<Harness />);
+
+    const modal = screen.getByTestId("modal");
+    installModalGeometry(modal);
+    triggerResizeObservers();
+    const grip = modal.querySelector(".modal-resize-grip") as HTMLElement;
+    grip.focus();
+
+    expect(grip).toHaveFocus();
+    expect(grip).toHaveAttribute("tabindex", "0");
+    expect(grip).toHaveAttribute("aria-valuenow", "500");
+    expect(grip).toHaveAttribute("aria-valuetext", "Width 500 pixels, height 400 pixels");
+
+    fireEvent.keyDown(grip, { key: "ArrowRight" });
+    fireEvent.keyDown(grip, { key: "ArrowDown" });
+
+    expect(modal.style.width).toBe("516px");
+    expect(modal.style.height).toBe("416px");
+    expect(grip).toHaveAttribute("aria-valuenow", "516");
+    expect(grip).toHaveAttribute("aria-valuetext", "Width 516 pixels, height 416 pixels");
+
+    vi.advanceTimersByTime(200);
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}"))
+      .toEqual({ width: 516, height: 416 });
+  });
+
+  it("keeps the grip active at the known touch-tablet 768px boundary", () => {
+    const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    setViewport(768, 1024);
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+
+    try {
+      render(<Harness />);
+      const modal = screen.getByTestId("modal");
+      installModalGeometry(modal);
+      const grip = modal.querySelector(".modal-resize-grip") as HTMLElement;
+
+      expect(grip).toBeTruthy();
+      dispatchPointerEvent(grip, "pointerdown", { clientX: 10, clientY: 10, pointerId: 7 });
+      dispatchPointerEvent(document, "pointermove", { clientX: 50, clientY: 30, pointerId: 7 });
+      dispatchPointerEvent(document, "pointerup", { clientX: 50, clientY: 30, pointerId: 7 });
+
+      expect(modal.style.width).toBe("540px");
+      expect(modal.style.height).toBe("420px");
+    } finally {
+      if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+    }
   });
 
   it("keeps desktop grip and native ResizeObserver persistence/restore behavior", () => {
@@ -181,7 +236,15 @@ describe("useModalResizePersist", () => {
   });
 
   it("clears inline size and does not inject a grip on mobile", () => {
-    setViewport(700);
+    /*
+    FNXC:ViewportMode 2026-07-24-02:25:
+    FN-8557 (973c978f9) classifies a narrow touch viewport with a tablet-class
+    physical screen (min edge > 480px) as tablet, which keeps the FN-6377 touch
+    grip. jsdom reports `"ontouchstart" in window === true`, so the old 700x800
+    fixture became a tablet. Use a phone-class screen (375px min edge) so this
+    test still exercises the true mobile contract: no grip, inline size cleared.
+    */
+    setViewport(375);
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ width: 610, height: 480 }));
 
     render(<Harness initialWidth="610px" initialHeight="480px" />);

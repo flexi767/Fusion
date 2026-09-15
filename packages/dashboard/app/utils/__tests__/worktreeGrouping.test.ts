@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { groupByWorktree, getWorktreeLabel } from "../worktreeGrouping";
-import type { Task } from "@fusion/core";
+import { resolveEffectiveConcurrency, type Task } from "@fusion/core";
 
 function makeTask(overrides: Partial<Task> & { id: string }): Task {
   return {
@@ -87,6 +87,16 @@ describe("groupByWorktree", () => {
     expect(groups.find((g) => g.label === "Up Next")).toBeUndefined();
   });
 
+  it("caps Up Next at maxWorktrees independently from maxConcurrent", () => {
+    const active = makeTask({ id: "FN-001", worktree: ".worktrees/swift-falcon" });
+    const queued = ["FN-010", "FN-011", "FN-012", "FN-013", "FN-014"].map((id) => makeTask({ id, column: "todo" }));
+    const capacity = resolveEffectiveConcurrency({ maxConcurrent: 8, maxWorktrees: 4, worktreeLimitEnabled: true });
+
+    const upNext = groupByWorktree([active], [active, ...queued], capacity.worktreeLimit!).find((group) => group.label === "Up Next");
+    expect(capacity).toEqual({ maxConcurrent: 8, worktreeLimit: 4 });
+    expect(upNext?.queuedTasks).toHaveLength(4);
+  });
+
   it("respects maxConcurrent limit on queued tasks shown", () => {
     const active = makeTask({ id: "FN-001", worktree: ".worktrees/swift-falcon" });
     const q1 = makeTask({ id: "FN-010", column: "todo" });
@@ -108,6 +118,92 @@ describe("groupByWorktree", () => {
     expect(groups).toHaveLength(1);
     expect(groups[0].label).toBe("Unassigned");
     expect(groups[0].activeTasks).toEqual([unassigned]);
+  });
+
+  it("groups workspace tasks by their acquired repo worktrees", () => {
+    const workspaceTask = makeTask({
+      id: "FN-9044",
+      workspaceWorktrees: {
+        "repo-c": { worktreePath: "/ws/repo-c/.worktrees/FN-9044", branch: "fusion/FN-9044" },
+        "repo-a": { worktreePath: "/ws/repo-a/.worktrees/FN-9044", branch: "fusion/FN-9044" },
+        "repo-b": { worktreePath: "/ws/repo-b/.worktrees/FN-9044", branch: "fusion/FN-9044" },
+      },
+    });
+
+    const groups = groupByWorktree([workspaceTask], [workspaceTask], 2);
+
+    expect(groups).toEqual([expect.objectContaining({
+      id: "workspace:FN-9044",
+      kind: "workspace",
+      label: "FN-9044",
+      repoCount: 3,
+      activeTasks: [workspaceTask],
+    })]);
+    expect(groups.find((group) => group.kind === "unassigned")).toBeUndefined();
+  });
+
+  it("uses a workspace group for a single acquired repo despite stale singular routing", () => {
+    const workspaceTask = makeTask({
+      id: "FN-9044",
+      worktree: "/ws/unrelated/.worktrees/stale-worktree",
+      workspaceWorktrees: {
+        "repo-a": { worktreePath: "/ws/repo-a/.worktrees/FN-9044", branch: "fusion/FN-9044" },
+      },
+    });
+
+    const groups = groupByWorktree([workspaceTask], [workspaceTask], 2);
+    expect(groups).toEqual([expect.objectContaining({
+      id: "workspace:FN-9044", kind: "workspace", repoCount: 1, label: "FN-9044",
+    })]);
+    expect(groups.some((group) => group.label === "stale-worktree" || group.kind === "unassigned")).toBe(false);
+  });
+
+  it("keeps tasks without acquired workspace worktrees unassigned", () => {
+    const emptyWorkspace = makeTask({ id: "FN-empty", workspaceWorktrees: {} });
+    const missingWorkspace = makeTask({ id: "FN-missing", workspaceWorktrees: undefined });
+
+    const groups = groupByWorktree([emptyWorkspace, missingWorkspace], [emptyWorkspace, missingWorkspace], 2);
+
+    expect(groups).toEqual([expect.objectContaining({
+      id: "unassigned", kind: "unassigned", activeTasks: [emptyWorkspace, missingWorkspace],
+    })]);
+  });
+
+  it("derives a multi-repository workspace label from the sorted acquired entries, never stale routing", () => {
+    const workspaceTask = makeTask({
+      id: "FN-transient",
+      worktree: "/ws/.worktrees/unrelated-stale-worktree",
+      workspaceWorktrees: {
+        "repo-z": { worktreePath: "/ws/repo-z/.worktrees/acquired-z", branch: "fusion/FN-transient" },
+        "repo-a": { worktreePath: "/ws/repo-a/.worktrees/acquired-a", branch: "fusion/FN-transient" },
+      },
+    });
+
+    expect(groupByWorktree([workspaceTask], [workspaceTask], 2)).toEqual([expect.objectContaining({
+      id: "workspace:FN-transient", kind: "workspace", label: "acquired-a", repoCount: 2,
+    })]);
+  });
+
+  it("keeps basename-colliding workspace and singular worktree groups distinct", () => {
+    const workspaceA = makeTask({ id: "FN-workspace-a", workspaceWorktrees: {
+      "repo-a": { worktreePath: "/ws/repo-a/.worktrees/FN-9044", branch: "fusion/a" },
+    } });
+    const workspaceB = makeTask({ id: "FN-workspace-b", workspaceWorktrees: {
+      "repo-b": { worktreePath: "/ws/repo-b/.worktrees/FN-9044", branch: "fusion/b" },
+    } });
+    const singleA = makeTask({ id: "FN-single-a", worktree: "/ws/repo-a/.worktrees/FN-9044" });
+    const singleB = makeTask({ id: "FN-single-b", worktree: "/ws/repo-b/.worktrees/FN-9044" });
+
+    const groups = groupByWorktree([workspaceA, workspaceB, singleA, singleB], [workspaceA, workspaceB, singleA, singleB], 2);
+
+    expect(groups).toHaveLength(4);
+    expect(groups.map((group) => group.id)).toEqual([
+      "/ws/repo-a/.worktrees/FN-9044",
+      "/ws/repo-b/.worktrees/FN-9044",
+      "workspace:FN-workspace-a",
+      "workspace:FN-workspace-b",
+    ]);
+    expect(new Set(groups.map((group) => group.id)).size).toBe(4);
   });
 
   it("excludes paused todo tasks from Up Next", () => {
@@ -145,5 +241,102 @@ describe("groupByWorktree", () => {
     const upNext = groups.find((g) => g.label === "Up Next");
     expect(upNext).toBeDefined();
     expect(upNext!.queuedTasks).toEqual([queued]);
+  });
+});
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (U12 — R8 drift conversion):
+The upcoming-work list must find the HOLD lane by trait, not by the id `todo`.
+
+WHY THIS ONE HID. On the default board the id and the role coincide — U11 gave `todo` the
+hold trait — so every existing case here passed and the site looked healthy. Rename the
+hold column and the filter matched nothing: the worktree view showed no upcoming work at
+all and read as idle. A whole panel silently empty, nothing thrown.
+
+Board resolves the hold ids across ALL workflows on the board (a card in another
+workflow's hold lane is still upcoming work); Lane passes nothing and keeps the legacy
+fallback, which is why the default case below omits the argument entirely.
+
+REVERT CHECK, measured: dropping the parameter back to `t.column === "todo"` fails the
+renamed case with an empty queue.
+*/
+describe("upcoming-work queue resolves the hold lane by trait", () => {
+  const mkTask = (id: string, column: string, extra: Record<string, unknown> = {}) =>
+    ({
+      id, title: id, description: "", column, dependencies: [], steps: [], currentStep: 0,
+      log: [], createdAt: "2026-07-01T00:00:00.000Z", updatedAt: "2026-07-01T00:00:00.000Z",
+      ...extra,
+    } as never);
+
+  it("finds waiting cards in a RENAMED hold column when the ids are supplied", () => {
+    const waiting = mkTask("FN-50", "backlog");
+    const groups = groupByWorktree([], [waiting], 3, new Set(["FN-50"]));
+    const queued = groups.flatMap((group) => group.queuedTasks ?? []);
+    expect(queued.map((task: { id: string }) => task.id)).toContain("FN-50");
+  });
+
+  it("finds nothing in a renamed hold column when the ids are NOT supplied", () => {
+    /*
+    Pins the fallback's real limit rather than pretending it covers custom boards: with no
+    resolved ids the legacy guess is all there is, and it cannot know about `backlog`. This
+    is the case that used to be the ONLY behaviour, on every board.
+    */
+    const groups = groupByWorktree([], [mkTask("FN-51", "backlog")], 3);
+    const queued = groups.flatMap((group) => group.queuedTasks ?? []);
+    expect(queued.map((task: { id: string }) => task.id)).not.toContain("FN-51");
+  });
+
+  it("still finds legacy `todo` cards with no ids supplied, so Lane is unaffected", () => {
+    const groups = groupByWorktree([], [mkTask("FN-52", "todo")], 3);
+    const queued = groups.flatMap((group) => group.queuedTasks ?? []);
+    expect(queued.map((task: { id: string }) => task.id)).toContain("FN-52");
+  });
+
+  it("does not treat a task outside the resolved set as waiting", () => {
+    /*
+    The narrowing guard: a lookup that ignored its set would pass the first case. It is keyed
+    on TASK id, so this also pins the per-workflow scoping — a card whose own workflow does
+    not mark its column `hold` is absent from the set even if another workflow reuses the id
+    (PR #2625 review).
+    */
+    const groups = groupByWorktree([], [mkTask("FN-53", "building")], 3, new Set(["FN-99"]));
+    const queued = groups.flatMap((group) => group.queuedTasks ?? []);
+    expect(queued.map((task: { id: string }) => task.id)).not.toContain("FN-53");
+  });
+});
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (PR #2625 review — greptile):
+TWO WORKFLOWS, ONE COLUMN NAME, DIFFERENT TRAITS — the case that killed the first design.
+
+My first version passed a board-wide set of hold COLUMN ids. Column ids are namespaced per
+workflow, so workflow A can declare `staging` as its hold lane while workflow B declares
+`staging` as executing. A unioned id set answers "is `staging` a hold column?" — a question
+with no single answer — and every executing card in workflow B would have been listed under
+Up Next as waiting work. Confidently wrong, which is worse than the renamed-board emptiness
+the change set out to fix.
+
+Keying on TASK id moves the decision to the only place that can make it: the caller, which
+knows each task's own workflow. This case is the regression test for that, expressed the way
+the helper now sees it — one card in the set, one not, both in a column called `staging`.
+*/
+describe("hold resolution is scoped per workflow, not per column name", () => {
+  const mkTask = (id: string, column: string) =>
+    ({
+      id, title: id, description: "", column, dependencies: [], steps: [], currentStep: 0,
+      log: [], createdAt: "2026-07-01T00:00:00.000Z", updatedAt: "2026-07-01T00:00:00.000Z",
+    } as never);
+
+  it("lists only the card whose OWN workflow marks `staging` as hold", () => {
+    const waitingInA = mkTask("FN-60", "staging");
+    const executingInB = mkTask("FN-61", "staging");
+
+    // What Board computes: FN-60's workflow declares `staging` hold; FN-61's does not.
+    const groups = groupByWorktree([], [waitingInA, executingInB], 3, new Set(["FN-60"]));
+    const queued = groups.flatMap((group) => group.queuedTasks ?? []).map((task: { id: string }) => task.id);
+
+    expect(queued).toContain("FN-60");
+    // The assertion the column-id design could not satisfy: same column name, opposite answer.
+    expect(queued).not.toContain("FN-61");
   });
 });

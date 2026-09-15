@@ -32,6 +32,20 @@ const DELETED_FILES = [
   "packages/core/src/workflow-cutover.ts",
   "packages/engine/src/workflow-authoritative-driver.ts",
   "packages/engine/src/workflow-parity-observer.ts",
+  "packages/engine/src/workflows/overlap-plan-revalidation.ts",
+  /*
+  FNXC:WorkflowColumns 2026-07-27-10:25 (U2 / R9 — workflow-owned lifecycle):
+  Two more pre-cutover modules. `workflow-columns-settings.ts` held
+  `isWorkflowColumnsEnabled`, a function whose body was `return true` — eight live
+  call sites still branched on it, so every flag-OFF arm was unreachable code that
+  read as a supported configuration. `workflow-parity.ts` asserted the default
+  workflow's adjacency EQUALS the legacy `VALID_TRANSITIONS`; U11 deliberately
+  breaks that equality by merging Todo into Planning, so re-introducing it would
+  re-encode the exact shape this program chose to break. Neither may come back:
+  the first as a fake kill switch, the second as a contract against the target state.
+  */
+  "packages/core/src/workflow-columns-settings.ts",
+  "packages/core/src/workflow-parity.ts",
 ];
 
 /**
@@ -54,12 +68,34 @@ const DELETED_SYMBOLS: Array<{ symbol: string; why: string }> = [
   { symbol: "graphCompletionInterceptors", why: "shared per-task mutable state replaced by an explicit graphCompletion callback" },
   // Out-of-graph Plan Review gate (R4) — the graph owns Plan Review exclusively.
   { symbol: "runPlanReviewBeforeExecution", why: "triage and the graph raced on Plan Review; the graph owns it" },
+  /*
+  FNXC:PlanReviewReplan 2026-08-10-18:32:
+  The deleted triage gate's replan ceiling. It outlived the gate as an unread constant whose companion
+  column (`planReviewReplanCount`) was persisted and reset but never incremented or compared — a
+  ceiling that enforced nothing while reading as live safety. The graph re-owns the cap in
+  `requestPreMergeOptionalStepFix` -> `parkPlanReviewReplanCapExhausted`, budgeted off persisted
+  workflow-step results. Re-adding this name would recreate the second, silent authority.
+  */
+  { symbol: "PLAN_REVIEW_GATE_REPLAN_CAP", why: "an unread ceiling for a deleted gate; the graph's parkPlanReviewReplanCapExhausted owns the cap" },
   // In-session step reviewer (U10 pt2) — a second review authority inside the implementation session.
   { symbol: "createReviewStepTool", why: "review gates are graph nodes; an in-session reviewer duplicated Plan Review" },
   { symbol: "fn_review_step", why: "the deleted in-session review tool's name must not be re-injected" },
   { symbol: "reviewStepParams", why: "parameter schema for the deleted review tool" },
   { symbol: "throwDeferredReviewerFatal", why: "deferred provider-error channel that only existed because a tool handler cannot throw" },
   { symbol: "MAX_CODE_REVIEW_UNAVAILABLE_RETRIES", why: "UNAVAILABLE budget for the deleted in-session code review" },
+  /*
+  FNXC:WorkflowAgentRouting 2026-08-07-23:50:
+  The hand-rolled continuation handover. A durable continuation write that reacts to a FAILED
+  write by terminalizing other rows is the shape being tombstoned, not any particular name: it
+  cannot tell an index conflict from a transient database error, so it destroys legitimate holds;
+  it runs read-then-write across separate transactions, so a concurrent engine can lose its claim;
+  and it leaves a window with zero active rows, which strands the task silently. The repository
+  already has the correct primitive — `replaceActiveTaskWorkflowContinuation` retires
+  non-matching active rows and installs the successor under the task advisory lock in ONE
+  transaction. Reintroducing the recovery-shaped version reads as "handle the conflict", which is
+  exactly how it arrived the first time.
+  */
+  { symbol: "supersedeStaleActiveWorkItems", why: "a non-atomic, ownership-blind handover; replaceActiveTaskWorkflowContinuation does it in one locked transaction" },
   /*
   FNXC:WorkflowCutover 2026-07-19-18:10 (U10b / R9):
   The legacy EXECUTE fallback. `maybeExecuteWorkflowGraph` returned a boolean meaning "did the
@@ -71,6 +107,32 @@ const DELETED_SYMBOLS: Array<{ symbol: string; why: string }> = [
   { symbol: "maybeExecuteWorkflowGraph", why: "renamed executeWorkflowGraph and returns void — the graph cannot decline a task, so there is no 'maybe'" },
   { symbol: "transferPreHeldToLegacy", why: "re-registered the pre-held global concurrency slot for a legacy execute path that no longer exists" },
   { symbol: "workflow-selection-api-unavailable: store lacks a workflow-selection reader so the workflow graph cannot run ", why: "the OLD fail-closed reason, emitted only when the task had enabled steps; failing closed is now unconditional and carries a different reason" },
+  /*
+  FNXC:WorkflowColumns 2026-07-27-10:26 (U2 / R9):
+  The permanently-true workflow-columns flag and the legacy transition-parity
+  harness. `isWorkflowColumnsEnabled` is the dangerous one: it LOOKS like a
+  runtime toggle, so a future reader adding a new lifecycle branch would naturally
+  gate it on the flag and ship a dead arm. The parity symbols are dangerous the
+  other way — they assert an equality with the legacy six-column transition graph
+  that the target lifecycle shape must violate.
+  */
+  { symbol: "isWorkflowColumnsEnabled", why: "returned a literal `true`; it advertised a kill switch that did not exist and every flag-OFF arm behind it was dead" },
+  { symbol: "checkTransitionParity", why: "asserted the default workflow's adjacency equals the legacy VALID_TRANSITIONS — an equality U11 deliberately breaks" },
+  { symbol: "compareWorkflowRunObservations", why: "compared a graph run against a legacy run that no longer exists" },
+  { symbol: "computeWorkflowColumnsGraduationReport", why: "graduation criteria for a flag flip that already happened" },
+  { symbol: "WORKFLOW_PARITY_OBSERVED_MUTATION", why: "run-audit mutation for the deleted dual-observe chain; nothing emits it" },
+  { symbol: "WORKFLOW_PARITY_DRIFT_MUTATION", why: "run-audit mutation for the deleted dual-observe chain; nothing emits it" },
+  { symbol: "getWorkflowParitySummary", why: "aggregated parity run-audit rows that no emitter writes" },
+  // FN-217 removes every healer that moves or terminalizes lifecycle state; only in-place stuck-session wakeup remains.
+  { symbol: "recoverGhostReviewTasks", why: "review liveness cannot move a card backward without REVISE" },
+  { symbol: "recoverStaleIncompleteReviewTasks", why: "incomplete review work cannot be bounced by a timeout sweep" },
+  { symbol: "autoRecoverTerminalFailures", why: "generic failure retries contradicted graph ownership and revision routing" },
+  { symbol: "recoverInProgressLimbo", why: "WIP liveness is owned only by the in-place stuck-session detector" },
+  { symbol: "recoverNoProgressNoTaskDoneFailures", why: "zero-progress recovery may wake in place but cannot requeue or terminalize" },
+  { symbol: "checkStuckBudget", why: "stuck-session recovery is unbounded and cannot park work for a human" },
+  { symbol: "revalidatePendingOverlapWaitsAtGraphNode", why: "plan freshness is checked statelessly at WIP release, never by a graph-owned overlap reviewer" },
+  { symbol: "OVERLAP_DELTA_TARGETED_PLAN_REPAIR", why: "the deleted synthetic repair prompt created a second plan authority inside execution" },
+  { symbol: "overlap-plan-revalidation-", why: "the deleted pre-node review gate cannot suspend graph execution" },
 ];
 
 /** Strip block and line comments so an explanatory tombstone note is not read as a live reference. */

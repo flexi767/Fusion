@@ -1,17 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { BUILTIN_CODING_WORKFLOW_IR } from "../builtin-coding-workflow-ir.js";
-import { BUILTIN_STEPWISE_CODING_WORKFLOW_IR } from "../builtin-stepwise-coding-workflow-ir.js";
-import { BUILTIN_STEPWISE_FINAL_REVIEW_CODING_WORKFLOW_IR } from "../builtin-stepwise-final-review-coding-workflow-ir.js";
+import { BUILTIN_CODING_WORKFLOW_IR } from "../workflows/builtin-coding-workflow-ir.js";
+import { BUILTIN_STEPWISE_CODING_WORKFLOW_IR } from "../workflows/builtin-stepwise-coding-workflow-ir.js";
+import { BUILTIN_STEPWISE_FINAL_REVIEW_CODING_WORKFLOW_IR } from "../workflows/builtin-stepwise-final-review-coding-workflow-ir.js";
 import {
   resolveDefaultOnOptionalGroupIds,
   resolveWorkflowOptionalSteps,
-} from "../workflow-optional-steps.js";
+} from "../workflows/workflow-optional-steps.js";
 import type {
   WorkflowIr,
   WorkflowIrNode,
   WorkflowIrV2,
   WorkflowOptionalGroupConfig,
-} from "../workflow-ir-types.js";
+} from "../workflows/workflow-ir-types.js";
 
 const v1: WorkflowIr = {
   version: "v1",
@@ -70,6 +70,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "pre-merge",
         defaultOn: false,
+        reportingOnly: false,
       },
       {
         templateId: "og-security",
@@ -77,6 +78,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "pre-merge",
         defaultOn: true,
+        reportingOnly: false,
       },
     ]);
   });
@@ -105,6 +107,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "pre-merge",
         defaultOn: false,
+        reportingOnly: false,
       },
     ]);
   });
@@ -120,6 +123,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "pre-merge" as const,
         defaultOn: true,
+        reportingOnly: false,
       },
       {
         templateId: "browser-verification",
@@ -127,6 +131,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "pre-merge" as const,
         defaultOn: false,
+        reportingOnly: false,
       },
       {
         templateId: "code-review",
@@ -134,6 +139,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "pre-merge" as const,
         defaultOn: true,
+        reportingOnly: false,
       },
       {
         templateId: "post-merge-verification",
@@ -141,6 +147,7 @@ describe("resolveWorkflowOptionalSteps (optional-group nodes)", () => {
         description: "",
         phase: "post-merge" as const,
         defaultOn: false,
+        reportingOnly: false,
       },
     ];
     expect(resolveWorkflowOptionalSteps(BUILTIN_CODING_WORKFLOW_IR)).toEqual(engineeringExpected);

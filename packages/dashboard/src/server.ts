@@ -1,3 +1,6 @@
+import { createLogger } from "@fusion/core";
+
+const severityAuditLog = createLogger("dashboard-server");
 import express, { type Router } from "express";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -16,7 +19,16 @@ import type {
   AgentLogEntry,
   RunAuditEvent,
 } from "@fusion/core";
-import { AgentStore, ChatStore, queryRunAuditEvents, setRunningAgentCountSource } from "@fusion/core";
+import {
+  AgentStore,
+  ChatStore,
+  cloudRedeemTicket,
+  loadCloudLinkState,
+  queryRunAuditEvents,
+  resolveGlobalDir,
+  resolveReboundTargetForTask,
+  setRunningAgentCountSource,
+} from "@fusion/core";
 import type { AuthStorageLike, ModelRegistryLike } from "./routes.js";
 import { createApiRoutes } from "./routes.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
@@ -29,6 +41,8 @@ import {
   setOnProjectFirstCreated,
 } from "./project-store-resolver.js";
 import { getOrCreateScopedChatStore } from "./chat-project-services.js";
+import { MAX_FILE_SIZE } from "./file-service.js";
+import { TerminalViewportRegistry } from "./terminal-viewport.js";
 import { getTerminalService, STALE_SESSION_THRESHOLD_MS } from "./terminal-service.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { terminalSessionManager } from "./terminal.js";
@@ -50,10 +64,6 @@ import {
   rehydrateFromStore as rehydratePlanningSessions,
 } from "./planning.js";
 import {
-  setAiSessionStore as setSubtaskAiSessionStore,
-  rehydrateFromStore as rehydrateSubtaskSessions,
-} from "./subtask-breakdown.js";
-import {
   setAiSessionStore as setMissionAiSessionStore,
   rehydrateFromStore as rehydrateMissionSessions,
 } from "./mission-interview.js";
@@ -61,17 +71,20 @@ import {
   setAiSessionStore as setMilestoneSliceAiSessionStore,
   rehydrateFromStore as rehydrateMilestoneSliceSessions,
 } from "./milestone-slice-interview.js";
-import { ChatManager, TASK_PLANNER_CHAT_AGENT_ID_PREFIX } from "./chat.js";
+import { ChatManager } from "./chat.js";
 import { CliChatSessionRunner } from "./cli-chat.js";
 import { stopAllDevServers } from "./dev-server-routes.js";
 import type { SkillsAdapter } from "./skills-adapter.js";
 import { createAuthMiddleware, authenticateUpgradeRequest, getDaemonToken } from "./auth-middleware.js";
+import { buildRemoteSessionCookie, createRemoteSessionStore, resolveRemoteSessionTtlMs } from "./remote-session.js";
 import { setupCliSessionWebSocket } from "./cli-session-ws.js";
 import { createCliSessionsRouter } from "./routes/cli-sessions.js";
 import { getProjectIdFromRequest, resolveStoreForProjectId } from "./routes/context.js";
 import type { CliRelaunchRegistry } from "./cli-session-transport.js";
 import { validateRemoteAuthToken } from "./remote-auth.js";
 import { getCliPackageVersion, isUnresolvedCliPackageVersion } from "./cli-package-version.js";
+import { performUpdateCheck } from "./update-check.js";
+import { buildAutoUpdateDeps, startAutoUpdateWatcher } from "./auto-update.js";
 import {
   dayHasSamples,
   fileScopeInvariantFailuresPerDay,
@@ -80,15 +93,20 @@ import {
   mergeAttemptsPerMergedTask,
   postMergeAuditFailuresPerDay,
   recoverAlreadyMergedReviewTasksRecoveriesPerDay,
+  countEntriesInto,
+  countBouncesOut,
+  resolveReliabilityLanes,
 } from "./reliability-metrics.js";
 import { loadViewChunkManifest, type ViewChunkManifestEntry } from "./view-chunk-manifest.js";
 import { maybeStartOtelExporter, type OtelExporterHandle } from "./otel-exporter.js";
+import { createMetricsSampler } from "./metrics/index.js";
 import { requireAsyncLayer } from "./require-async-layer.js";
 import {
   evaluateDashboardPostgresHealth,
   resolveDashboardPostgresLayer,
   type DashboardTaskIdIntegrityHealth,
 } from "./dashboard-postgres-health.js";
+import { ProviderHealthMonitor } from "./provider-health-monitor.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -99,14 +117,6 @@ export function buildViewPreloadInjection(chunkMap: Record<string, ViewChunkMani
   The served dashboard may open directly into a persisted lazy view before React's dynamic import runs. Inject both the modulepreload and stylesheet links from Vite's manifest so Command Center and every other co-located-CSS lazy view have their CSS requested on first paint, while in-app navigation remains owned by Vite's __vitePreload runtime.
   */
   return `<script>window.__FUSION_VIEW_CHUNKS__=${serializedChunkMap};(()=>{try{const chunkMap=window.__FUSION_VIEW_CHUNKS__||{};const projectId=localStorage.getItem("kb-dashboard-current-project");const scopedKey=projectId?"kb:"+projectId+":kb-dashboard-task-view":null;let taskView=(scopedKey&&localStorage.getItem(scopedKey))||localStorage.getItem("kb-dashboard-task-view");if(taskView==="devserver")taskView="dev-server";if(taskView==="roadmaps")taskView="board";if(typeof taskView!=="string"||taskView.startsWith("plugin:"))return;const chunkEntry=chunkMap[taskView];if(!chunkEntry)return;const chunkPath=typeof chunkEntry==="string"?chunkEntry:chunkEntry.file;const cssPaths=Array.isArray(chunkEntry.css)?chunkEntry.css:[];for(const cssPath of cssPaths){if(!cssPath)continue;const cssLink=document.createElement("link");cssLink.rel="stylesheet";cssLink.href=cssPath;document.head.appendChild(cssLink);}if(!chunkPath)return;const link=document.createElement("link");link.rel="modulepreload";link.href=chunkPath;link.crossOrigin="";document.head.appendChild(link);}catch{}})();</script>`;
-}
-
-function parseVersion(version: string): number[] {
-  return version
-    .split(".")
-    .slice(0, 3)
-    .map((part) => Number.parseInt(part, 10))
-    .map((value) => (Number.isFinite(value) ? value : 0));
 }
 
 function buildTaskIdIntegrityHealth(report: DashboardTaskIdIntegrityHealth) {
@@ -151,27 +161,6 @@ function buildHealthPayload(args: {
   };
 }
 
-function isRemoteVersionNewer(remoteVersion: string, currentVersion: string): boolean {
-  const remote = parseVersion(remoteVersion);
-  const current = parseVersion(currentVersion);
-  const maxLength = Math.max(remote.length, current.length, 3);
-
-  for (let i = 0; i < maxLength; i += 1) {
-    const remotePart = remote[i] ?? 0;
-    const currentPart = current[i] ?? 0;
-
-    if (remotePart > currentPart) {
-      return true;
-    }
-
-    if (remotePart < currentPart) {
-      return false;
-    }
-  }
-
-  return false;
-}
-
 const DEFAULT_AI_SESSION_TTL_MS = SESSION_CLEANUP_DEFAULT_MAX_AGE_MS;
 const MIN_AI_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_AI_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -181,6 +170,13 @@ const MIN_AI_SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const MAX_AI_SESSION_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 let aiSessionCleanupIntervalHandle: ReturnType<typeof setInterval> | undefined;
+
+/*
+FNXC:AutoUpdate 2026-07-25-10:05:
+Module-scoped so a second createServer() in the same process (tests, embedded
+desktop server) replaces the previous watcher instead of stacking npm installs.
+*/
+let stopAutoUpdateWatcher: (() => void) | undefined;
 
 function clearAiSessionCleanupInterval(): void {
   if (!aiSessionCleanupIntervalHandle) {
@@ -335,6 +331,7 @@ export interface ServerOptions {
   missionExecutionLoop?: {
     recoverActiveMissions(): Promise<{ recoveredCount: number }>;
     isRunning(): boolean;
+    executeManualValidatorRun?(run: { id: string; featureId: string }): Promise<void>;
   };
   /** Optional HeartbeatMonitor for triggering agent execution runs */
   heartbeatMonitor?: {
@@ -508,6 +505,14 @@ export interface ServerOptions {
    *  FUSION_DASHBOARD_TOKEN env vars. Used by `fn dashboard --no-auth` so a
    *  stale token in a project .env doesn't silently override the flag. */
   noAuth?: boolean;
+  /*
+  FNXC:ApprovalDecisionAuthority 2026-07-26-16:10:
+  Resolved auth-middleware state, wired by createServer once it has decided whether the
+  bearer-token middleware is actually installed. Routes that gate or log privileged
+  operator actions (approval decisions) read this instead of re-deriving token state, so
+  the route-visible answer can never disagree with the middleware that was mounted.
+  */
+  isDaemonAuthEnabled?: boolean;
   /** Optional runtime logger for server/routes diagnostics.
    *  Defaults to a console-backed logger scoped to `server` when omitted. */
   runtimeLogger?: RuntimeLogger;
@@ -766,10 +771,19 @@ type CliRelaunchSessionStore = ServerOptions["cliSessionTransport"] extends infe
     : never
   : never;
 
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-23:59:
+`column` WIDENED from the literal `"todo"` to `string`, because the target is now resolved.
+
+The narrow literal type was not a constraint anyone chose — it was inferred from the single call
+below, which passed `"todo"`. It then made the type system ENFORCE the bug: a resolved rebound target
+is a `string`, so the correct value could not be passed without this edit. A type that only admits the
+legacy id is a lint against fixing it.
+*/
 interface CliRelaunchTaskStoreLike {
   getTask(taskId: string): Promise<Task | null>;
   updateTask(taskId: string, patch: Record<string, unknown>): Promise<unknown>;
-  moveTask(taskId: string, column: "todo", options?: Record<string, unknown>): Promise<unknown>;
+  moveTask(taskId: string, column: string, options?: Record<string, unknown>): Promise<unknown>;
   logEntry(taskId: string, message: string, details?: string): Promise<unknown>;
 }
 
@@ -809,7 +823,7 @@ export function wireCliRelaunchListener(options: {
         `CLI session relaunch requested from ${info.sessionId} — clearing resume linkage and re-enqueueing for a fresh executor run`,
       );
       await taskStore.updateTask(info.taskId, { paused: false, status: null, error: null });
-      await taskStore.moveTask(info.taskId, "todo", {
+      await taskStore.moveTask(info.taskId, await resolveReboundTargetForTask(taskStore as never, info.taskId), {
         preserveProgress: true,
         moveSource: "engine",
         recoveryRehome: true,
@@ -854,7 +868,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     // Some unit tests mock @fusion/core with narrow export surfaces. Keep
     // server bootstrap resilient when hook registration is unavailable.
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[github-tracking-hook] registration skipped: ${message}`);
+    severityAuditLog.warn(`[github-tracking-hook] registration skipped: ${message}`);
   }
   const cliPackageVersion = getCliPackageVersion(import.meta.url);
   // ── Derive defaults from engine when provided (explicit options override) ──
@@ -971,6 +985,16 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
 
   const app = express();
   app.locals.hybridExecutor = options?.hybridExecutor;
+
+  /*
+  FNXC:MetricsEndpoint 2026-08-13-16:15:
+  RUFU-081: per-server /metrics observability. The orchestrator is created with
+  no side effects here; the spawn-count hook + tick timers start only on listen
+  and stop on close (co-located with the OTLP exporter). It runs in both
+  headless and non-headless servers. Its latency-recorder middleware is mounted
+  below, before route handlers, so it times the LIVE serving path.
+  */
+  const metricsSampler = createMetricsSampler();
   const runtimeLogger = options?.runtimeLogger ?? createRuntimeLogger("server");
   const mutationRateLimit = rateLimit(RATE_LIMITS.mutation);
   const setupRateLimit = rateLimit(RATE_LIMITS.api);
@@ -985,13 +1009,84 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // Preserve the raw payload buffer so signed endpoints (for example
   // /api/routines/:id/webhook and settings sync proxying) can verify HMAC
   // signatures and forward exact request bytes.
-  app.use(express.json({
-    verify: (req, _res, buf) => {
-      if (buf.length > 0) {
-        (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
-      }
-    },
-  }));
+  /*
+  FNXC:VoiceInput 2026-07-21-12:00:
+  Voice chunks have a route-only 2 MiB parser. The global 100 KiB parser must skip only this
+  endpoint (with or without Express's optional trailing slash) or it rejects before the voice
+  error mapper; rawBody/HMAC behavior remains unchanged elsewhere.
+
+  FNXC:GitHubPlanningSourceIssue 2026-08-09-15:18:
+  Planning's GitHub image capture legitimately transports up to 1,000,000 characters of
+  image-bearing issue/comment bodies before the route applies its server-side SSRF policy and
+  drops the bodies. Give only its start-streaming endpoint a 5 MiB JSON parser, which covers the
+  worst-case UTF-8 transport plus JSON framing without weakening the global 100 KiB budget.
+  */
+  const preserveRawBody = (req: express.Request, _res: express.Response, buf: Buffer) => {
+    if (buf.length > 0) {
+      (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+    }
+  };
+  const jsonParser = express.json({ verify: preserveRawBody });
+  const planningImageCaptureParser = express.json({ limit: "5mb", verify: preserveRawBody });
+  const chatMessageParser = express.json({ limit: 2 * 1024 * 1024, verify: preserveRawBody });
+  const fileSaveParser = express.json({ limit: 6 * MAX_FILE_SIZE + 1024, verify: preserveRawBody });
+
+  /*
+  FNXC:LargeTextPayloads 2026-08-21-04:35:
+  Large pasted logs must reach only production chat-message endpoints within a finite 2 MiB JSON
+  envelope, while generic workspace and task-file saves receive 6 * MAX_FILE_SIZE + 1 KiB. A
+  supported 1 MiB UTF-8 file can serialize each control byte as six JSON bytes; 1 KiB covers the
+  canonical object framing. Express warns that large bodies increase memory and latency, so the
+  approximately 6 MiB parser is limited to exact save routes: mkdir and literal copy/move/delete/
+  rename operations retain the 100 KiB default. Model context windows cannot define HTTP bytes:
+  parsing precedes model resolution, bytes are not tokens, and context is shared with history,
+  system/tool input, reasoning, and output.
+
+  FNXC:TaskMessageLength 2026-08-29-08:02:
+  Task-message routes use the same finite 2 MiB JSON envelope as chat because their application
+  limit is 100,000 characters. The default 100 KiB parser would otherwise return a bare 413 before
+  accented or newline-heavy operator text reaches route validation; exact task file-save paths keep
+  their dedicated parser and no broader task prefix is admitted.
+  */
+  const isChatMessagePath = (path: string): boolean =>
+    /^\/api\/chat\/(?:sessions|rooms)\/[^/]+\/messages\/?$/.test(path);
+  const isTaskMessagePath = (method: string, path: string): boolean =>
+    (method === "POST" && /^\/api\/tasks\/[^/]+\/(?:steer|comments|refine|spec\/revise)\/?$/.test(path))
+    || (method === "PATCH" && /^\/api\/tasks\/[^/]+\/comments\/[^/]+\/?$/.test(path));
+  const isTaskFileSavePath = (path: string): boolean =>
+    /^\/api\/tasks\/[^/]+\/files\/.+\/?$/.test(path);
+  const isWorkspaceFileSavePath = (path: string): boolean => {
+    if (!/^\/api\/files\/.+/.test(path) || /^\/api\/files\/mkdir\/?$/.test(path)) return false;
+    return !/^\/api\/files\/.+\/(?:copy|move|delete|rename)\/?$/.test(path);
+  };
+  app.use((req, res, next) => {
+    // Express treats trailing slashes as equivalent, so parser boundaries must do the same;
+    // no broader prefix is exempted from the global rawBody-preserving parser.
+    if (req.path === "/api/voice/transcribe" || req.path === "/api/voice/transcribe/") return next();
+    const parser = req.path === "/api/planning/start-streaming" || req.path === "/api/planning/start-streaming/"
+      ? planningImageCaptureParser
+      : ((req.method === "POST" && isChatMessagePath(req.path)) || isTaskMessagePath(req.method, req.path))
+        ? chatMessageParser
+        : req.method === "POST" && (isTaskFileSavePath(req.path) || isWorkspaceFileSavePath(req.path))
+          ? fileSaveParser
+          : jsonParser;
+    return parser(req, res, (error) => {
+      // Keep the established global and route-specific size rejections observable as 413 instead
+      // of allowing Express's parser error to fall through to the generic 500 handler.
+      if ((error as { type?: string } | undefined)?.type === "entity.too.large") return res.status(413).json({ error: "payload-too-large" });
+      return next(error);
+    });
+  });
+
+  /*
+  FNXC:MetricsEndpoint 2026-08-13-16:15:
+  RUFU-081: mount the request-latency recorder head on every request (inside
+  /api and the SPA shell, headless or not) so it measures the real HTTP serving
+  pipeline cost, including /api/health — the single best event-loop-starvation
+  indicator. It only attaches a `finish` listener and calls next(); it never
+  blocks or serializes the render path.
+  */
+  app.use(metricsSampler.middleware());
 
   // Daemon mode: bearer token authentication middleware
   // Auth is enabled when daemon option is provided OR FUSION_DAEMON_TOKEN env var is set.
@@ -1003,8 +1098,15 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   const daemonToken = options?.noAuth
     ? undefined
     : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
+  /*
+  FNXC:RemoteAuth 2026-08-19-00:40:
+  Remote-login sessions live for the lifetime of this server instance. In-memory is the deliberate
+  choice: a session is a browser convenience, and a restart invalidating it fails in the SAFE
+  direction, whereas persisting it would write a credential to disk for no benefit.
+  */
+  const remoteSessions = createRemoteSessionStore();
   if (daemonToken) {
-    app.use(createAuthMiddleware(daemonToken));
+    app.use(createAuthMiddleware(daemonToken, { validateRemoteSession: (id) => remoteSessions.validate(id) }));
   }
 
   // Initialize terminal service with project root
@@ -1080,7 +1182,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       res.setHeader("Cache-Control", "no-store, max-age=0");
       res.status(200).send(html);
     } catch (err) {
-      console.error("[dashboard] serveIndexHtml failed:", err);
+      severityAuditLog.error("[dashboard] serveIndexHtml failed:", err);
       // Drop the cached HTML so the next request retries from disk rather
       // than re-throwing the same failure until the server restarts.
       cachedIndexHtml = null;
@@ -1109,14 +1211,6 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Dashboard chat persistence is PostgreSQL-only and shares the scoped project layer.
   const chatLayer = requireAsyncLayer(store, "Dashboard ChatStore");
   const chatStore = options?.chatStore ?? new ChatStore(chatLayer);
-  store.on("task:moved", (data: { task: Task; from: string; to: string }) => {
-    if (data.to !== "archived") return;
-    /*
-    FNXC:TaskDetailPlannerChatRetention 2026-06-30-18:45:
-    Task-detail planner chats are retained after done when a user interacted, but task archival is the retention cutoff. Delete exact task-planner sessions on archive so normal chats and other tasks' planner chats remain intact while chat:session:deleted events clear dashboard caches.
-    */
-    void chatStore.deleteSessionsForAgentId(`${TASK_PLANNER_CHAT_AGENT_ID_PREFIX}${data.task.id}`);
-  });
   options?.engine?.attachChatStore?.(chatStore);
   if (typeof options?.engineManager?.getAllEngines === "function") {
     for (const engine of options.engineManager.getAllEngines().values()) {
@@ -1238,7 +1332,20 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
         automationStore,
       )(req, res);
     } catch (err: unknown) {
-      sendErrorResponse(res, 500, err instanceof Error ? err.message : "Failed to open project event stream");
+      /*
+      FNXC:ProjectScoping 2026-08-16-05:28:
+      An SSE subscription for a nonexistent project (e.g. a stale client tab or an
+      e2e fixture page using projectId "fixture") is a client addressing error, not a
+      server fault. Surfacing the startup-factory construction chain as a 500 filled
+      operator logs with alarming "failed to construct TaskStore" errors on every
+      poll; map project-not-found to 404 with a clean message instead.
+      */
+      const message = err instanceof Error ? err.message : "Failed to open project event stream";
+      if (/Project (?:"[^"]*" )?not found/.test(message)) {
+        sendErrorResponse(res, 404, `Project "${projectId}" not found`);
+        return;
+      }
+      sendErrorResponse(res, 500, message);
     }
   });
 
@@ -1468,19 +1575,16 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     // drains microtasks before I/O), and is best-effort regardless.
     void aiSessionStore.recoverStaleSessions();
     setPlanningAiSessionStore(aiSessionStore);
-    setSubtaskAiSessionStore(aiSessionStore);
     setMissionAiSessionStore(aiSessionStore);
     setMilestoneSliceAiSessionStore(aiSessionStore);
   }
 
   // Fire-and-forget rehydration; store references for logging.
   let planningRehydratedCount = 0;
-  let subtaskRehydratedCount = 0;
   let missionRehydratedCount = 0;
   let milestoneSliceRehydratedCount = 0;
   if (aiSessionStore) {
     void rehydratePlanningSessions(aiSessionStore).then((c) => { planningRehydratedCount = c; });
-    void rehydrateSubtaskSessions(aiSessionStore).then((c) => { subtaskRehydratedCount = c; });
     void rehydrateMissionSessions(aiSessionStore).then((c) => { missionRehydratedCount = c; });
     void rehydrateMilestoneSliceSessions(aiSessionStore).then((c) => { milestoneSliceRehydratedCount = c; });
   }
@@ -1494,7 +1598,6 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     runtimeLogger.info("AI session rehydrate summary", {
       message: "Rehydrated AI sessions from PostgreSQL",
       planningRehydratedCount,
-      subtaskRehydratedCount,
       missionRehydratedCount,
       milestoneSliceRehydratedCount,
       totalRehydrated,
@@ -1720,6 +1823,34 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   }
 
   /*
+  FNXC:AutoUpdate 2026-07-25-10:05:
+  Optional unattended update install + supervised restart (global setting
+  `autoUpdateAndRestart`, default OFF). Started only when the host CLI wired
+  systemControl — that injection is what makes an in-place restart possible at
+  all, and the watcher itself re-reads the setting every cycle, so toggling it in
+  Settings takes effect without a restart. Skipped under NODE_ENV=test for the
+  same reason as the AI-session sweep: unit servers must not schedule timers or
+  reach npm.
+  */
+  if (options?.systemControl && shouldScheduleAiSessionCleanup()) {
+    const systemControl = options.systemControl;
+    stopAutoUpdateWatcher?.();
+    stopAutoUpdateWatcher = startAutoUpdateWatcher(buildAutoUpdateDeps({
+      getSettings: async () => {
+        const globalStore = store.getGlobalSettingsStore?.();
+        return globalStore ? await globalStore.getSettings() : {};
+      },
+      currentVersion: cliPackageVersion,
+      systemControl,
+      log: {
+        info: (message, context) => runtimeLogger.info(message, context),
+        warn: (message, context) => runtimeLogger.warn(message, context),
+        error: (message, context) => runtimeLogger.error(message, context),
+      },
+    }));
+  }
+
+  /*
    * FNXC:PostgresHealth 2026-06-24-16:10:
    * The /api/health endpoint is async because PostgreSQL health checks
    * (connectivity probe, task-ID integrity via Drizzle) are inherently async.
@@ -1746,6 +1877,21 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       cliPackageVersion,
       engineAvailable: hasDashboardEngine(options),
     }));
+  });
+
+  /*
+  FNXC:MetricsEndpoint 2026-08-13-16:15:
+  RUFU-081: the /metrics route is mounted at the app level (NOT under /api) so
+  it is public and scrapable like the SPA shell — daemon bearer-token auth only
+  protects /api/*. This is intentional: the body is pre-read numeric gauges
+  only (no secrets, no prose), served synchronously from the sampler snapshot
+  with zero awaited I/O so a scrape can never starve the event loop or itself
+  be subject to on-demand DB/ps work. It must be mounted before the SPA
+  catch-all below so it returns Prometheus text rather than index.html.
+  */
+  app.get("/metrics", (_req, res) => {
+    res.type("text/plain; version=0.0.4; charset=utf-8");
+    res.send(metricsSampler.render());
   });
 
   app.get("/api/engine/status", (req, res) => {
@@ -1829,7 +1975,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     Backend-mode Reliability must use the authoritative async run-audit reader. The synchronous reader is a SQLite/test compatibility surface and intentionally degrades to an empty result under PostgreSQL.
     */
     const runAuditEventsPromise: Promise<RunAuditEvent[]> = asyncLayer
-      ? queryRunAuditEvents(asyncLayer.db, auditFilter).then((events) => events.map((event) => ({
+      ? queryRunAuditEvents(asyncLayer.db, auditFilter, asyncLayer.projectId).then((events) => events.map((event) => ({
           ...event,
           domain: event.domain as RunAuditEvent["domain"],
           mutationType: event.mutationType as RunAuditEvent["mutationType"],
@@ -1837,10 +1983,27 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
           metadata: event.metadata ?? undefined,
         })))
       : scopedStore.getRunAuditEventsAsync(auditFilter);
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-17:05:
+    The Reliability headline was computed from two queries that name `in-review` and `in-progress`.
+
+    On a board that renamed either lane both return {}, so `tasksEnteredInReview` and
+    `tasksBouncedToInProgress` are zero for every day — and `inReviewFailureRate7d` then divides one
+    zero by another and reports a healthy rate. That is the worst shape a lifecycle defect takes: it
+    produces a NUMBER, not an error, and the number says everything is fine. An operator reading a 0%
+    review-failure rate beside a populated audit list has no reason to suspect the metric is blind.
+
+    `getTaskMovedCountsByDay` takes ONE column per side, so the lanes are resolved to sets and the
+    query is issued per pair, then summed. Move events are keyed on a single (from, to) pair, so
+    summing across disjoint pairs cannot double-count. On the built-in board this is 1x1 — exactly
+    the two queries that were here before — and on a renamed board it is a handful.
+    */
+    const { review: reviewLanes, wip: wipLanes, complete: durationCompleteLanes } =
+      await resolveReliabilityLanes(scopedStore);
     const [runAuditEvents, enteredByDay, bouncedByDay, durationEvents, mergedTaskIds] = await Promise.all([
       runAuditEventsPromise,
-      scopedStore.getTaskMovedCountsByDay({ since: startIso, until: endIso, toColumn: "in-review" }),
-      scopedStore.getTaskMovedCountsByDay({ since: startIso, until: endIso, fromColumn: "in-review", toColumn: "in-progress" }),
+      countEntriesInto(scopedStore, { since: startIso, until: endIso }, reviewLanes),
+      countBouncesOut(scopedStore, { since: startIso, until: endIso }, reviewLanes, wipLanes),
       scopedStore.getInReviewDurationEvents({ since: startIso, until: endIso }),
       scopedStore.getTaskMergedTaskIds({ since: startIso, until: endIso }),
     ]);
@@ -1848,7 +2011,10 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     const postMergeByDay = postMergeAuditFailuresPerDay(runAuditEvents, effectiveStartMs, nowMs);
     const fileScopeByDay = fileScopeInvariantFailuresPerDay(runAuditEvents, effectiveStartMs, nowMs);
     const recoveriesByDay = recoverAlreadyMergedReviewTasksRecoveriesPerDay(runAuditEvents, effectiveStartMs, nowMs);
-    const duration = inReviewDurationMetrics(durationEvents, effectiveStartMs, nowMs);
+    const duration = inReviewDurationMetrics(durationEvents, effectiveStartMs, nowMs, {
+      review: reviewLanes,
+      complete: durationCompleteLanes,
+    });
     const mergeAttempts = mergeAttemptsPerMergedTask(runAuditEvents, mergedTaskIds, effectiveStartMs, nowMs);
     const headline = inReviewFailureRate7d(enteredByDay, bouncedByDay, nowMs);
 
@@ -1997,6 +2163,14 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     }
   });
 
+  /*
+   * FNXC:UpdateChannels 2026-07-21-20:33:
+   * Settings "Check for updates" hits GET /api/updates/check. The previous
+   * implementation always fetched npm dist-tag `latest` and compared only
+   * major.minor.patch, so beta-channel users never saw X.Y.Z-beta.N (and a
+   * beta install looked "up to date" against older stable). Route through the
+   * shared channel-aware performUpdateCheck (same as /update-check/refresh).
+   */
   app.get("/api/updates/check", async (_req, res) => {
     const currentVersion = cliPackageVersion;
     res.set("Cache-Control", "no-store");
@@ -2011,29 +2185,22 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       return;
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
-
     try {
-      const response = await fetch("https://registry.npmjs.org/@runfusion/fusion/latest", {
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        throw new Error(`registry request failed: ${response.status}`);
+      let channel: "stable" | "beta" = "stable";
+      try {
+        const globalSettings = await store.getGlobalSettingsStore().getSettings();
+        if (globalSettings.updateChannel === "beta") {
+          channel = "beta";
+        }
+      } catch {
+        // Fall back to stable if global settings are unreadable.
       }
 
-      const payload = (await response.json()) as { version?: unknown };
-      if (typeof payload.version !== "string" || payload.version.trim().length === 0) {
-        throw new Error("registry response missing version");
-      }
-
-      const latestVersion = payload.version;
-      res.json({
-        currentVersion,
-        latestVersion,
-        updateAvailable: isRemoteVersionNewer(latestVersion, currentVersion),
+      const result = await performUpdateCheck(resolveGlobalDir(), currentVersion, {
+        force: true,
+        channel,
       });
+      res.json(result);
     } catch {
       res.status(200).json({
         currentVersion,
@@ -2041,17 +2208,46 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
         updateAvailable: false,
         error: "Failed to check for updates",
       });
-    } finally {
-      clearTimeout(timeout);
     }
   });
 
-  app.get("/remote-login", async (req, res) => {
-    const remoteToken = typeof req.query.rt === "string" ? req.query.rt : undefined;
+  /*
+  FNXC:CloudLink 2026-08-21-22:30:
+  Unauthenticated cloudTicket redemption is not behind /api rate limits. Cap it so a
+  caller cannot fan out unbounded outbound redeem requests.
+  */
+  const cloudTicketRateLimit = rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    message: "Too many cloud-link login attempts, please try again later.",
+  });
 
-    let settings: Awaited<ReturnType<typeof store.getSettings>>;
+  app.get("/remote-login", (req, res, next) => {
+    if (typeof req.query.cloudTicket === "string") {
+      cloudTicketRateLimit(req, res, next);
+      return;
+    }
+    next();
+  }, async (req, res) => {
+    const remoteToken = typeof req.query.rt === "string" ? req.query.rt : undefined;
+    /*
+    FNXC:CloudLink 2026-08-21-22:30:
+    Mode A handoff uses cloudTicket=jti.secret. Redeem against FUSION_CLOUD_HTTP_URL
+    (or linked ~/.fusion/cloud-link.json), then mint an HttpOnly remote session cookie.
+    Never put the daemon token in the redirect URL.
+    */
+    const cloudTicket =
+      typeof req.query.cloudTicket === "string" ? req.query.cloudTicket : undefined;
+
+    let settings: Awaited<ReturnType<ReturnType<typeof store.getGlobalSettingsStore>["getSettings"]>>;
     try {
-      settings = await store.getSettings();
+      /*
+      FNXC:RemoteAccessAuth 2026-08-18-06:49:
+      Remote links are public handoffs, but their tokens must be resolved from
+      canonical global settings rather than a project-merged snapshot. A token
+      minted by any remote surface must work while daemon authentication is on.
+      */
+      settings = await store.getGlobalSettingsStore().getSettings();
     } catch {
       res.status(401).json({ error: "Unauthorized", code: "remote_token_invalid" });
       return;
@@ -2061,6 +2257,42 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     if (!remoteAccess) {
       res.status(401).json({ error: "Unauthorized", code: "remote_token_invalid" });
       return;
+    }
+
+    if (cloudTicket) {
+      try {
+        const linked = loadCloudLinkState();
+        const httpBase =
+          linked?.httpBaseUrl ||
+          process.env.FUSION_CLOUD_HTTP_URL?.trim() ||
+          "";
+        if (!httpBase) {
+          res.status(401).json({
+            error: "Unauthorized",
+            code: "cloud_ticket_cloud_url_missing",
+          });
+          return;
+        }
+        await cloudRedeemTicket(httpBase, {
+          ticket: cloudTicket,
+          engineId: linked?.engineId,
+        });
+        if (daemonToken) {
+          const ttlMs = resolveRemoteSessionTtlMs(remoteAccess, { tokenType: "short-lived" });
+          const session = remoteSessions.issue(ttlMs);
+          const secure = req.protocol === "https" || req.get("x-forwarded-proto") === "https";
+          res.setHeader("Set-Cookie", buildRemoteSessionCookie(session, { secure }));
+        }
+        res.redirect(302, "/");
+        return;
+      } catch (err) {
+        res.status(401).json({
+          error: "Unauthorized",
+          code: "cloud_ticket_invalid",
+          message: err instanceof Error ? err.message : "redeem failed",
+        });
+        return;
+      }
     }
 
     const result = validateRemoteAuthToken(remoteToken, remoteAccess);
@@ -2079,12 +2311,23 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       return;
     }
 
-    const daemonTokenForRedirect = getDaemonToken(options);
-    if (daemonTokenForRedirect) {
-      const redirectUrl = new URL("/", `${req.protocol}://${req.get("host")}`);
-      redirectUrl.searchParams.set("token", daemonTokenForRedirect);
-      res.redirect(302, redirectUrl.pathname + redirectUrl.search);
-      return;
+    /*
+    FNXC:RemoteAuth 2026-08-19-00:40:
+    NEVER REDIRECT WITH THE DAEMON TOKEN. This used to hand back `/?token=<daemonToken>`, so anyone
+    who opened a shared remote link ended up holding the dashboard's real, non-expiring credential —
+    in their URL bar, their history, and any log that records URLs. It also made the remote token
+    pointless: revoking it left the recipient fully authenticated forever.
+
+    A validated remote token now mints an expiring, revocable session delivered as an HttpOnly
+    cookie, and the redirect carries nothing sensitive. TTL is capped by the remote token's own
+    remaining life when it is short-lived, so a 15-minute link cannot yield a longer session than the
+    link itself.
+    */
+    if (daemonToken) {
+      const ttlMs = resolveRemoteSessionTtlMs(remoteAccess, result);
+      const session = remoteSessions.issue(ttlMs);
+      const secure = req.protocol === "https" || req.get("x-forwarded-proto") === "https";
+      res.setHeader("Set-Cookie", buildRemoteSessionCookie(session, { secure }));
     }
 
     res.redirect(302, "/");
@@ -2093,6 +2336,9 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // REST API
   const apiRouter = createApiRoutes(store, {
     ...options,
+    // FNXC:ApprovalDecisionAuthority 2026-07-26-16:10: routes must see the same answer
+    // as the middleware mounted above — auth is enabled iff a daemonToken was installed.
+    isDaemonAuthEnabled: Boolean(daemonToken),
     runtimeLogger,
     aiSessionStore: aiSessionStore as AiSessionStore,
     chatStore,
@@ -2206,6 +2452,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // FUSION_OTEL_METRICS_ENDPOINT is explicitly configured. Held here so the
   // server "close" handler can stop its timer.
   let otelExporter: OtelExporterHandle | null = null;
+  let providerHealthMonitor: ProviderHealthMonitor | null = null;
   dashboardApp.listen = ((...args: Parameters<typeof dashboardApp.listen>) => {
     const normalizedArgs = normalizeListenArgsForTests(args) as Parameters<typeof originalListen>;
 
@@ -2241,11 +2488,59 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       });
     }
 
+    // RUFU-081: start the /metrics samplers (spawn-count hook + unref'd tick
+    // timers). Synchronous and best-effort; a failure here must never break
+    // server startup or the request pipeline. The guard IS the failure
+    // isolation the comment promises — `runtime.installSpawnHook()` patches
+    // node:child_process members, and an unguarded throw would propagate out
+    // of listen() and abort startup (CodeRabbit Minor review fix 2026-08-18-11:53,
+    // matching the adjacent OTLP exporter pattern).
+    try {
+      metricsSampler.start();
+    } catch (error) {
+      runtimeLogger.warn("Metrics sampler failed to start", {
+        message: "Metrics sampler failed to start",
+        ...normalizeErrorForLog(error),
+      });
+    }
+
+    if (!providerHealthMonitor && (options?.engineManager || options?.engine)) {
+      const providerHealthLogger = runtimeLogger.child("provider-health");
+      providerHealthMonitor = new ProviderHealthMonitor({
+        authStorage: options?.authStorage,
+        logger: providerHealthLogger,
+        getStores: () => {
+          const stores = new Set<TaskStore>([store]);
+          const singleEngineStore = options?.engine?.getTaskStore?.();
+          if (singleEngineStore) stores.add(singleEngineStore);
+          for (const projectEngine of options?.engineManager?.getAllEngines?.().values() ?? []) {
+            stores.add(projectEngine.getTaskStore());
+          }
+          return stores;
+        },
+      });
+      providerHealthMonitor.start();
+    }
+
     server.once("close", () => {
       clearAiSessionCleanupInterval();
       aiSessionStore?.stopScheduledCleanup();
       otelExporter?.stop();
       otelExporter = null;
+      // RUFU-081: stop the /metrics samplers and remove the spawn hook so no
+      // timer or wrapper outlives the server on restart/test teardown. Guarded
+      // so a teardown throw cannot skip providerHealthMonitor?.stop() and the
+      // remaining close handlers (CodeRabbit Minor review fix 2026-08-18-11:53).
+      try {
+        metricsSampler.stop();
+      } catch (error) {
+        runtimeLogger.warn("Metrics sampler failed to stop", {
+          message: "Metrics sampler failed to stop",
+          ...normalizeErrorForLog(error),
+        });
+      }
+      providerHealthMonitor?.stop();
+      providerHealthMonitor = null;
       (apiRouter as Router & { dispose?: () => void }).dispose?.();
       void stopAllDevServers().catch((error) => {
         runtimeLogger.warn("Failed to shutdown dev-server managers", {
@@ -2292,6 +2587,13 @@ export function setupTerminalWebSocket(
   store: TaskStore,
   options?: ServerOptions,
 ): void {
+  /*
+  FNXC:TerminalSharing 2026-08-19-02:45:
+  Per-session viewer sizes for the shared-PTY min-sizing rule. Server-scoped, matching the terminal
+  session registry's lifetime.
+  */
+  const terminalViewports = new TerminalViewportRegistry();
+
   const wss = new WebSocketServer({ noServer: true });
 
   // Default terminal service for stale eviction (uses default store's root dir)
@@ -2397,10 +2699,25 @@ export function setupTerminalWebSocket(
       });
     }
 
-    // Send scrollback buffer first
-    const scrollback = terminalService.getScrollbackAndClearPending(sessionId);
-    if (scrollback) {
-      ws.send(JSON.stringify({ type: "scrollback", data: scrollback }));
+    /*
+    FNXC:TerminalSharing 2026-08-19-03:05:
+    Terminal sessions are shared: several browsers can watch and drive the same PTY, so an attach
+    must not clear the pending-output queue. Flush it to whoever is already attached FIRST (this
+    socket has not subscribed yet, so it cannot double-receive), then send the scrollback, which now
+    contains those bytes for the newcomer.
+
+    FNXC:TerminalSharing 2026-08-19-02:45:
+    `sinceSeq` lets a RE-attaching client (tab backgrounded, laptop asleep, heartbeat timeout) ask
+    for only what it missed. Replaying the whole buffer into a terminal that still shows it appended
+    a duplicate copy of history on every reconnect; `reset` tells the client when it must clear
+    first because the delta could not be served from the retained window.
+    */
+    terminalService.flushPendingOutput(sessionId);
+    const sinceSeqRaw = url.searchParams.get("sinceSeq");
+    const sinceSeq = sinceSeqRaw === null ? undefined : Number(sinceSeqRaw);
+    const resume = terminalService.getScrollbackSince(sessionId, sinceSeq);
+    if (resume && (resume.data || resume.reset)) {
+      ws.send(JSON.stringify({ type: "scrollback", data: resume.data, seq: resume.seq, reset: resume.reset }));
     }
 
     // Send connection info
@@ -2409,6 +2726,17 @@ export function setupTerminalWebSocket(
       shell: session.shell,
       cwd: session.cwd,
     }));
+
+    /*
+    FNXC:TerminalSharing 2026-08-19-02:45:
+    One PTY, one size, many viewers. Register this viewer so resizes agree on the SMALLEST attached
+    window instead of last-writer-wins, which left every other viewer rendering a stale column count.
+    */
+    const viewerId = `${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const applyEffectiveViewport = () => {
+      const effective = terminalViewports.effectiveSize(sessionId);
+      if (effective) terminalService.resize(sessionId, effective.cols, effective.rows);
+    };
 
     // Subscribe to data events
     dataUnsub = terminalService.onData((id, data) => {
@@ -2483,7 +2811,8 @@ export function setupTerminalWebSocket(
             break;
           case "resize":
             if (typeof msg.cols === "number" && typeof msg.rows === "number") {
-              terminalService.resize(sessionId, msg.cols, msg.rows);
+              terminalViewports.set(sessionId, viewerId, { cols: msg.cols, rows: msg.rows });
+              applyEffectiveViewport();
             }
             break;
           case "ping":
@@ -2504,6 +2833,10 @@ export function setupTerminalWebSocket(
       clearInterval(pingInterval);
       if (dataUnsub) dataUnsub();
       if (exitUnsub) exitUnsub();
+      // FNXC:TerminalSharing 2026-08-19-02:45: a departing viewer no longer constrains the size, so
+      // the remaining viewers get their room back.
+      terminalViewports.remove(sessionId, viewerId);
+      applyEffectiveViewport();
       // Do NOT kill the PTY session on WebSocket close — the session should
       // survive transient disconnects and modal close/reopen cycles.  Sessions
       // are cleaned up through explicit kill paths (tab close, restart, shell
@@ -2645,14 +2978,6 @@ export function setupBadgeWebSocket(
 
     const onTaskUpdated = (task: Task) => {
       const cacheKey = `${scopeKey}:${task.id}`;
-      // FNXC:BadgeSnapshotEviction 2026-07-10-15:00: evict (not re-cache) when a
-      // task is archived off the live board, and skip the publish so peers don't
-      // re-cache it. An unarchive re-emits task:updated with a live column and
-      // re-primes the entry. See isBadgeEligibleTask.
-      if (!isBadgeEligibleTask(task)) {
-        badgeSnapshots.delete(cacheKey);
-        return;
-      }
       const previousSnapshot = badgeSnapshots.get(cacheKey);
       const nextSnapshot: BadgeSnapshot = {
         prInfo: task.prInfo ?? null,
@@ -2688,13 +3013,6 @@ export function setupBadgeWebSocket(
 
     const onTaskCreated = (task: Task) => {
       const cacheKey = `${scopeKey}:${task.id}`;
-      // FNXC:BadgeSnapshotEviction 2026-07-10-15:00: an already-archived task
-      // (e.g. restored/imported into the archive) must not seed the live-board
-      // badge cache — same eligibility rule as the update listener.
-      if (!isBadgeEligibleTask(task)) {
-        badgeSnapshots.delete(cacheKey);
-        return;
-      }
       badgeSnapshots.set(cacheKey, {
         prInfo: task.prInfo ?? null,
         issueInfo: task.issueInfo ?? null,
@@ -2854,19 +3172,6 @@ export function setupBadgeWebSocket(
     dashboardApp.badgeWsManager = null;
     dashboardApp.__fnWebSocketsAttached = false;
   });
-}
-
-/*
-FNXC:BadgeSnapshotEviction 2026-07-10-15:00:
-The in-memory badge-snapshot cache is keyed by task id and only ever removed a task
-on hard-delete, so archived tasks accumulated for the daemon's whole lifetime — a slow
-memory leak on long-running servers with task churn. Badge snapshots are only needed for
-tasks visible on the live board; archived tasks leave it. This predicate is the single
-eligibility rule used by both the create and update listeners (and mirrored by the
-startup prime's `includeArchived:false`). Exported for unit coverage of the invariant.
-*/
-export function isBadgeEligibleTask(task: Pick<Task, "column">): boolean {
-  return task.column !== "archived";
 }
 
 /** Compare two badge snapshots for equality */

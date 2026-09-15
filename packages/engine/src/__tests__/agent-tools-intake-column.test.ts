@@ -27,6 +27,34 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
     await harness?.teardown();
   });
 
+/*
+FNXC:EngineTests 2026-07-20-23:55:
+FN-8307 requires every autonomous fn_task_create to prove an active Feature → Slice →
+Milestone → Mission chain. Seed an approved chain on the real PG store so intake-column
+assertions exercise landing behavior rather than the lineage admission gate.
+*/
+async function seedApprovedLineage(store: TaskStore): Promise<{ mission_id: string; slice_id: string; feature_id: string }> {
+  const missions = store.getMissionStore!() as {
+    createMission: (input: { title: string }) => Promise<{ id: string }>;
+    addMilestone: (missionId: string, input: { title: string }) => Promise<{ id: string }>;
+    addSlice: (milestoneId: string, input: { title: string }) => Promise<{ id: string }>;
+    addFeature: (sliceId: string, input: { title: string }) => Promise<{ id: string; status?: string }>;
+    updateFeatureStatus?: (id: string, status: string) => Promise<unknown>;
+  };
+  const mission = await missions.createMission({ title: "Intake lineage mission" });
+  const milestone = await missions.addMilestone(mission.id, { title: "MS" });
+  const slice = await missions.addSlice(milestone.id, { title: "SL" });
+  const feature = await missions.addFeature(slice.id, { title: "F" });
+  // New features start as "defined"; lineage admission requires triaged/in-progress.
+  if (typeof missions.updateFeatureStatus === "function") {
+    await missions.updateFeatureStatus(feature.id, "triaged");
+  } else {
+    await (missions as { updateFeature: (id: string, u: { status: string }) => Promise<unknown> })
+      .updateFeature(feature.id, { status: "triaged" });
+  }
+  return { mission_id: mission.id, slice_id: slice.id, feature_id: feature.id };
+}
+
   function inboxWorkflowIr(name: string): WorkflowIr {
     return {
       version: "v2",
@@ -62,7 +90,7 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
     const tool = createTaskCreateTool(store);
     const result = await tool.execute(
       "call-1",
-      { description: "Needs manual release", workflow_id: created.id } as never,
+      { description: "Needs manual release", workflow_id: created.id, mission_lineage: await seedApprovedLineage(store) } as never,
       undefined,
       undefined,
       {} as never,
@@ -73,11 +101,11 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
     expect(task.column).toBe("inbox");
   });
 
-  it("keeps a task with no workflow_id landing in triage (byte-identical default)", async () => {
+  it("keeps a task with no workflow_id landing in the merged Planning column (byte-identical default)", async () => {
     const tool = createTaskCreateTool(store);
     const result = await tool.execute(
       "call-2",
-      { description: "Default workflow task" } as never,
+      { description: "Default workflow task", mission_lineage: await seedApprovedLineage(store) } as never,
       undefined,
       undefined,
       {} as never,
@@ -85,10 +113,19 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
 
     expect((result as { isError?: boolean }).isError).toBeFalsy();
     const task = await store.getTask((result.details as { taskId: string }).taskId);
-    expect(task.column).toBe("triage");
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-01:20:
+    RE-PINNED, not deleted. These two guards exist to hold the DEFAULT workflow's landing column
+    stable, and they fired on an intended change: U11 merged the two pre-implementation columns, so
+    `builtin:coding`'s intake column is now `todo` (the merged Planning column, carrying
+    intake+hold+resetOnEntry) and no `triage` column is declared at all. Leaving them on `triage`
+    pinned a column the product no longer has; deleting them would drop the only check that the
+    landing column stays put.
+    */
+    expect(task.column).toBe("todo");
   });
 
-  it("lands a task explicitly selecting builtin:coding in triage even when the project default is the custom intake workflow", async () => {
+  it("lands a task explicitly selecting builtin:coding in the merged Planning column even when the project default is the custom intake workflow", async () => {
     const created = await store.createWorkflowDefinition({
       name: "Inbox-intake workflow 2",
       ir: inboxWorkflowIr("Inbox-intake workflow 2"),
@@ -98,7 +135,7 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
     const tool = createTaskCreateTool(store);
     const result = await tool.execute(
       "call-3",
-      { description: "Explicit default coding workflow task", workflow_id: "builtin:coding" } as never,
+      { description: "Explicit default coding workflow task", workflow_id: "builtin:coding", mission_lineage: await seedApprovedLineage(store) } as never,
       undefined,
       undefined,
       {} as never,
@@ -106,7 +143,8 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
 
     expect((result as { isError?: boolean }).isError).toBeFalsy();
     const task = await store.getTask((result.details as { taskId: string }).taskId);
-    expect(task.column).toBe("triage");
+    // Same U11 re-pin as above: `builtin:coding`'s intake column is the merged Planning column.
+    expect(task.column).toBe("todo");
   });
 
   it("writes a bootstrap PROMPT.md (unplanned) for the inbox-landed task, matching the store's intake gate", async () => {
@@ -118,7 +156,7 @@ pgDescribe("createTaskCreateTool intake-column wiring", () => {
     const tool = createTaskCreateTool(store);
     const result = await tool.execute(
       "call-4",
-      { description: "Inbox bootstrap prompt task", workflow_id: created.id } as never,
+      { description: "Inbox bootstrap prompt task", workflow_id: created.id, mission_lineage: await seedApprovedLineage(store) } as never,
       undefined,
       undefined,
       {} as never,

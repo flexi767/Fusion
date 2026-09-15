@@ -2,12 +2,14 @@
 
 import express from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createAuthMiddleware } from "../../auth-middleware.js";
 import {
   __resetCreateFnAgentForInsights,
   __setCreateFnAgentForInsights,
   registerSettingsMemoryRoutes,
 } from "../register-settings-memory-routes.js";
 import { request as performRequest } from "../../test-request.js";
+import * as sse from "../../sse.js";
 
 const {
   resolveWorktrunkBinaryMock,
@@ -58,7 +60,7 @@ vi.mock("@fusion/engine", async () => {
   };
 });
 
-function createApp(pluginRunner?: Record<string, unknown>) {
+function createApp(pluginRunner?: Record<string, unknown>, daemonToken?: string) {
   const router = express.Router();
   const scopedStore = {
     getSettings: vi.fn(async () => ({ worktrunk: { enabled: false }, memoryDreamsEnabled: true })),
@@ -93,6 +95,11 @@ function createApp(pluginRunner?: Record<string, unknown>) {
     {
       githubToken: undefined,
       validateModelPresets: vi.fn(() => undefined),
+      sanitizeBooleanSetting: vi.fn((name: string, value: unknown) => {
+        if (value === undefined || value === null) return undefined;
+        if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+        return value;
+      }),
       sanitizeOverlapIgnorePaths: vi.fn(() => undefined),
       discoverDashboardPiExtensions: vi.fn(async () => ({
         manifestPaths: [],
@@ -103,6 +110,7 @@ function createApp(pluginRunner?: Record<string, unknown>) {
 
   const app = express();
   app.use(express.json());
+  if (daemonToken) app.use(createAuthMiddleware(daemonToken));
   app.use("/api", router);
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err?.statusCode ?? 500).json({ error: err?.message ?? String(err) });
@@ -152,7 +160,10 @@ describe("register-settings-memory-routes worktrunk gate", () => {
 
     expect(res.status).toBe(200);
     expect(scopedStore.updateSettings).toHaveBeenCalledTimes(1);
-    expect(scopedStore.updateSettings).toHaveBeenCalledWith({ worktrunk: { enabled: true } });
+    expect(scopedStore.updateSettings).toHaveBeenCalledWith(
+      { worktrunk: { enabled: true } },
+      { kind: "api", id: "http:unverified" },
+    );
   });
 
   it("accepts worktrunk.enabled=false without verification", async () => {
@@ -177,49 +188,106 @@ describe("register-settings-memory-routes worktrunk gate", () => {
     expect(scopedStore.updateSettings).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects recycleWorktrees + worktreeNaming:task-id together (mutually exclusive) with 400", async () => {
+  it("sanitizes required recommendation policy as a project boolean", async () => {
+    const { app, scopedStore } = createApp();
+
+    expect((await patchSettings(app, { requireTaskRecommendations: true })).status).toBe(200);
+    expect(scopedStore.updateSettings).toHaveBeenCalledWith(
+      { requireTaskRecommendations: true },
+      expect.anything(),
+    );
+
+    scopedStore.updateSettings.mockClear();
+    expect((await patchSettings(app, { requireTaskRecommendations: false })).status).toBe(200);
+    expect(scopedStore.updateSettings).toHaveBeenCalledWith(
+      { requireTaskRecommendations: false },
+      expect.anything(),
+    );
+
+    scopedStore.updateSettings.mockClear();
+    const malformed = await patchSettings(app, { requireTaskRecommendations: "true" });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body.error).toContain("requireTaskRecommendations must be a boolean");
+    expect(scopedStore.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty built-in workflow set before persistence", async () => {
+    const { app, scopedStore } = createApp();
+
+    const res = await patchSettings(app, { enabledBuiltinWorkflowIds: [] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("at least one built-in workflow");
+    expect(scopedStore.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it("accepts a single valid built-in workflow", async () => {
+    const { app, scopedStore } = createApp();
+
+    const res = await patchSettings(app, { enabledBuiltinWorkflowIds: ["builtin:quick-fix"] });
+
+    expect(res.status).toBe(200);
+    expect(scopedStore.updateSettings).toHaveBeenCalledWith(
+      { enabledBuiltinWorkflowIds: ["builtin:quick-fix"] },
+      { kind: "api", id: "http:unverified" },
+    );
+  });
+
+  it("emits one workflow invalidation only after enablement persistence", async () => {
+    const { app } = createApp();
+    const emit = vi.spyOn(sse, "emitWorkflowSseEvent");
+
+    expect((await patchSettings(app, { autoMerge: true })).status).toBe(200);
+    expect(emit).not.toHaveBeenCalled();
+    const res = await patchSettings(app, { enabledBuiltinWorkflowIds: ["builtin:quick-fix"] });
+
+    expect(res.status).toBe(200);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith("workflow:updated", { reason: "enabledBuiltinWorkflowIds" }, "p1");
+    emit.mockRestore();
+  });
+
+  it("tolerates persisted legacy worktree naming and recycle values", async () => {
     const { app, scopedStore } = createApp();
 
     const res = await patchSettings(app, { recycleWorktrees: true, worktreeNaming: "task-id" });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("mutually exclusive");
-    expect(scopedStore.updateSettings).not.toHaveBeenCalled();
-  });
-
-  it("rejects worktreeNaming:task-id when recycleWorktrees is already enabled in stored settings", async () => {
-    const { app, scopedStore } = createApp();
-    // Current stored settings already have recycling on; a partial patch that only flips naming must still be rejected.
-    scopedStore.getSettings.mockResolvedValueOnce({ worktrunk: { enabled: false }, recycleWorktrees: true } as any);
-
-    const res = await patchSettings(app, { worktreeNaming: "task-id" });
-
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("mutually exclusive");
-    expect(scopedStore.updateSettings).not.toHaveBeenCalled();
-  });
-
-  it("accepts worktreeNaming:task-id when recycling is off", async () => {
-    const { app, scopedStore } = createApp();
-
-    const res = await patchSettings(app, { worktreeNaming: "task-id" });
-
     expect(res.status).toBe(200);
-    expect(scopedStore.updateSettings).toHaveBeenCalledWith({ worktreeNaming: "task-id" });
+    expect(scopedStore.updateSettings).toHaveBeenCalledWith(
+      { recycleWorktrees: true, worktreeNaming: "task-id" },
+      { kind: "api", id: "http:unverified" },
+    );
   });
 
-  it("maps the store backstop 'mutually exclusive' error to 400 (not 500)", async () => {
+  it("records unverified API provenance for populated and null-delete patches", async () => {
     const { app, scopedStore } = createApp();
-    // A patch that clears the pre-check's view (e.g. null-clear) but resolves to a conflict inside the store,
-    // where the mutual-exclusion backstop throws. The route must classify it as a 400 client error.
-    scopedStore.updateSettings.mockRejectedValueOnce(
-      new Error('recycleWorktrees and worktreeNaming:"task-id" are mutually exclusive: ...'),
+
+    await patchSettings(app, { autoMerge: true });
+    await patchSettings(app, { autoMerge: null, changedBy: { kind: "human", id: "forged" } });
+
+    expect(scopedStore.updateSettings).toHaveBeenNthCalledWith(
+      1,
+      { autoMerge: true },
+      { kind: "api", id: "http:unverified" },
     );
+    expect(scopedStore.updateSettings).toHaveBeenNthCalledWith(
+      2,
+      { autoMerge: null, changedBy: { kind: "human", id: "forged" } },
+      { kind: "api", id: "http:unverified" },
+    );
+  });
 
-    const res = await patchSettings(app, { autoMerge: true });
+  it("records verified API provenance only after daemon authentication", async () => {
+    const { app, scopedStore } = createApp(undefined, "shared-token");
+    const response = await performRequest(app, "PUT", "/api/settings", JSON.stringify({ autoMerge: true }), {
+      authorization: "Bearer shared-token", "Content-Type": "application/json",
+    });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toContain("mutually exclusive");
+    expect(response.status).toBe(200);
+    expect(scopedStore.updateSettings).toHaveBeenCalledWith(
+      { autoMerge: true },
+      { kind: "api", id: "http:verified-token" },
+    );
   });
 
   it("passes enabled plugin skills to memory dream processing", async () => {

@@ -2,7 +2,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { createFnAgentMock, resolveMcpServersForStoreMock } = vi.hoisted(() => ({
+const { createFnAgentMock, createResolvedAgentSessionMock, resolveMcpServersForStoreMock } = vi.hoisted(() => {
   /*
   FNXC:DashboardTests 2026-07-18-12:20:
   Planning defaults clarificationEnabled=false, so createSession forces a summary after the
@@ -10,7 +10,7 @@ const { createFnAgentMock, resolveMcpServersForStoreMock } = vi.hoisted(() => ({
   complete payload so MCP-forwarding assertions exercise the default product path instead of
   throwing Clarification-disabled follow-up did not produce a summary.
   */
-  createFnAgentMock: vi.fn(async () => ({
+  const makeScriptedAgent = () => ({
     session: {
       state: { messages: [] as Array<{ role: string; content: string }> },
       prompt: vi.fn(async function (this: { state: { messages: Array<{ role: string; content: string }> } }, _message: string) {
@@ -42,12 +42,25 @@ const { createFnAgentMock, resolveMcpServersForStoreMock } = vi.hoisted(() => ({
       }),
       dispose: vi.fn(),
     },
-  })),
-  resolveMcpServersForStoreMock: vi.fn(async () => ({
-    servers: [{ name: "docs", transport: "stdio", command: "node", env: { TOKEN: "materialized-secret" } }],
-    errors: [],
-  })),
-}));
+  });
+  return {
+    createFnAgentMock: vi.fn(makeScriptedAgent),
+    /*
+    FNXC:PlanningRuntimeResolution 2026-07-24-16:20:
+    Planning now builds its session through the shared runtime-resolving seam
+    (`createResolvedAgentSession`), not a bare `createFnAgent` call, so the MCP-forwarding
+    contract for the planning lanes is asserted on that seam.
+    FNXC:MissionInterviewRuntimeResolution 2026-08-16-14:37: the mission and milestone/slice
+    interview lanes now build through the same seam so CLI-runtime model selections
+    (cursor-cli etc.) route to their runtime plugins; their assertions target it too.
+    */
+    createResolvedAgentSessionMock: vi.fn(makeScriptedAgent),
+    resolveMcpServersForStoreMock: vi.fn(async () => ({
+      servers: [{ name: "docs", transport: "stdio", command: "node", env: { TOKEN: "materialized-secret" } }],
+      errors: [],
+    })),
+  };
+});
 
 vi.mock("@fusion/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@fusion/core")>();
@@ -68,6 +81,7 @@ vi.mock("@fusion/engine", async (importOriginal) => {
     createChatTaskDocumentTools: vi.fn(() => []),
     createWorkflowAuthoringTools: vi.fn(() => []),
     createFnAgent: createFnAgentMock,
+    createResolvedAgentSession: createResolvedAgentSessionMock,
     resolveMcpServersForStore: resolveMcpServersForStoreMock,
   };
 });
@@ -77,7 +91,21 @@ vi.mock("../planning-board-tools.js", () => ({
 }));
 
 import { __resetPlanningState, createSession, createSessionWithAgent, planningStreamManager } from "../planning.js";
-import { resolveManualAiPromptMcpServers } from "../routes.js";
+/*
+FNXC:DashboardTests 2026-07-24-01:25:
+resolveManualAiPromptMcpServers moved out of the routes.ts monolith into the
+automation-step-execution registrar module and is no longer re-exported from routes.js.
+*/
+import { resolveManualAiPromptMcpServers } from "../routes/automation-step-execution.js";
+
+/*
+FNXC:PlanningMode 2026-07-24-01:25:
+FN-8538 (3f976e3dc) gave Planning Mode a dedicated collaborative prompt:
+resolvePlanningModeSystemPrompt now reads store.getSettings() on every planning
+agent creation, so planning-session stores must expose it (bare {} throws and
+aborts agent init before the MCP forwarding under test happens).
+*/
+const makePlanningStore = () => ({ getSettings: vi.fn(async () => ({})) }) as never;
 import { createMissionInterviewAgent } from "../mission-interview.js";
 import { createTargetInterviewAgent } from "../milestone-slice-interview.js";
 
@@ -85,16 +113,17 @@ describe("dashboard MCP lane forwarding", () => {
   beforeEach(() => {
     __resetPlanningState();
     createFnAgentMock.mockClear();
+    createResolvedAgentSessionMock.mockClear();
     resolveMcpServersForStoreMock.mockClear();
   });
 
-  it("forwards the materialized MCP set to chat/planning createFnAgent sessions", async () => {
-    const store = {} as never;
+  it("forwards the materialized MCP set to chat/planning agent sessions", async () => {
+    const store = makePlanningStore();
 
     await createSession("127.0.0.1", "Build a feature", store, "/tmp/fusion-dashboard-test");
 
     expect(resolveMcpServersForStoreMock).toHaveBeenCalledWith(store);
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/fusion-dashboard-test",
       tools: "readonly",
       allowMcpToolsInReadonly: true,
@@ -105,9 +134,9 @@ describe("dashboard MCP lane forwarding", () => {
   it("defaults an undefined MCP resolver result to empty servers for non-streaming planning", async () => {
     resolveMcpServersForStoreMock.mockResolvedValueOnce(undefined as never);
 
-    await createSession("127.0.0.1", "Build without MCP", {} as never, "/tmp/fusion-dashboard-test");
+    await createSession("127.0.0.1", "Build without MCP", makePlanningStore(), "/tmp/fusion-dashboard-test");
 
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       tools: "readonly",
       allowMcpToolsInReadonly: true,
       mcpServers: [],
@@ -121,14 +150,14 @@ describe("dashboard MCP lane forwarding", () => {
       "127.0.0.1",
       "Stream without MCP",
       "/tmp/fusion-dashboard-test",
-      {} as never,
+      makePlanningStore(),
     );
 
     const startInitialTurn = planningStreamManager.consumeInitialTurn(sessionId);
     expect(startInitialTurn).toBeTypeOf("function");
     startInitialTurn?.();
 
-    await vi.waitFor(() => expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    await vi.waitFor(() => expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       tools: "readonly",
       allowMcpToolsInReadonly: true,
       mcpServers: [],
@@ -157,7 +186,7 @@ describe("dashboard MCP lane forwarding", () => {
     await createMissionInterviewAgent(session, "/tmp/fusion-dashboard-test", store);
 
     expect(resolveMcpServersForStoreMock).toHaveBeenCalledWith(store);
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/fusion-dashboard-test",
       tools: "readonly",
       allowMcpToolsInReadonly: true,
@@ -170,7 +199,7 @@ describe("dashboard MCP lane forwarding", () => {
 
     await createMissionInterviewAgent({ id: "mission-empty", thinkingOutput: "" } as never, "/tmp/fusion-dashboard-test", {} as never);
 
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
   });
 
   it("forwards materialized MCP servers to milestone and slice interview agents", async () => {
@@ -180,7 +209,7 @@ describe("dashboard MCP lane forwarding", () => {
     await createTargetInterviewAgent(session, "/tmp/fusion-dashboard-test", store);
 
     expect(resolveMcpServersForStoreMock).toHaveBeenCalledWith(store);
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/fusion-dashboard-test",
       tools: "readonly",
       allowMcpToolsInReadonly: true,
@@ -193,6 +222,6 @@ describe("dashboard MCP lane forwarding", () => {
 
     await createTargetInterviewAgent({ id: "target-empty", targetType: "slice", thinkingOutput: "" } as never, "/tmp/fusion-dashboard-test", {} as never);
 
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
   });
 });

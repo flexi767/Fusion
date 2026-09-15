@@ -10,15 +10,20 @@ import {
 } from "@fusion/core";
 import { AlertTriangle, Clock, Folder, MessageSquare, Pause, Play, Square, Zap } from "lucide-react";
 import { computeBlockerFanoutMap } from "../hooks/useBlockerFanout";
-import { useExecutorStats } from "../hooks/useExecutorStats";
+import { useExecutorStats, type ExecutorColumnFlags } from "../hooks/useExecutorStats";
 import { isLikelyTabSuspensionError } from "../hooks/visibilitySuspension";
 import { LoadingSpinner } from "./LoadingSpinner";
 import type { ExecutorState } from "../api";
 import { EngineControlMenu, type EngineControlMenuHandle } from "./EngineControlMenu";
 import { TerminalLauncher } from "./TerminalLauncher";
 import { useViewportMode } from "../hooks/useViewportMode";
+import type { ChatVisibilityToggleAction } from "../hooks/useChatVisibilityToggle";
 
-type FooterStatId = "queued" | "running" | "stuck" | "blocked" | "review" | "fanout";
+/*
+FNXC:StuckTagRemoval 2026-08-17-22:30: Operator removed stuck-task tagging from the dashboard; engine recovery sweeps still consume taskStuckTimeoutMs server-side.
+The footer no longer renders a Stuck segment or takes taskStuckTimeoutMs.
+*/
+type FooterStatId = "queued" | "running" | "blocked" | "fanout";
 
 interface OpenStatTooltip {
   id: FooterStatId;
@@ -61,11 +66,11 @@ interface ExecutorStatusBarProps {
   tasks: Task[];
   /** Project ID for fetching project-specific stats */
   projectId?: string;
-  /** Project-level stuck task timeout in milliseconds (undefined = disabled) */
-  taskStuckTimeoutMs?: number;
+  /** Optional task-scoped board trait index supplied by an embedding board. */
+  columnFlagsByTaskId?: ReadonlyMap<string, ExecutorColumnFlags>;
   /** Age threshold in milliseconds before high fan-out blockers escalate in dashboard surfaces. */
   staleHighFanoutBlockerAgeThresholdMs?: number;
-  /** Timestamp (ms) when task data was last confirmed fresh from the server. Used for freshness-aware stuck detection. */
+  /** Timestamp (ms) when task data was last confirmed fresh from the server. */
   lastFetchTimeMs?: number;
   /** Absolute path for the currently selected project directory. */
   currentProjectPath?: string;
@@ -85,8 +90,10 @@ interface ExecutorStatusBarProps {
   onRunScript?: (name: string, command: string) => void;
   /** Quick Chat launcher placement from Settings. */
   quickChatButtonMode?: "floating" | "footer" | "off";
-  /** Opens the full Chat modal from the footer launcher. */
-  onOpenQuickChat?: () => void;
+  /** Toggles the visibility of the complete floating chat set. */
+  onToggleQuickChat?: () => void;
+  /** The action that the next Quick Chat launcher activation will perform. */
+  quickChatToggleAction?: ChatVisibilityToggleAction;
 }
 
 /**
@@ -141,17 +148,31 @@ function getStateDisplay(state: ExecutorState, t: TFunction<"app">): { label: st
  * - Executor state badge (idle/running/paused/stopped)
  * - Last activity timestamp
  */
-export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleHighFanoutBlockerAgeThresholdMs, lastFetchTimeMs, currentProjectPath, onOpenProjectDirectory, keyboardOpen, hideWhenKeyboardOpen, onToggleTerminal, onOpenScripts, onRunScript, quickChatButtonMode = "off", onOpenQuickChat }: ExecutorStatusBarProps) {
+export function ExecutorStatusBar({ tasks, projectId, columnFlagsByTaskId: suppliedColumnFlagsByTaskId, staleHighFanoutBlockerAgeThresholdMs, currentProjectPath, onOpenProjectDirectory, keyboardOpen, hideWhenKeyboardOpen, onToggleTerminal, onOpenScripts, onRunScript, quickChatButtonMode = "off", onToggleQuickChat, quickChatToggleAction }: ExecutorStatusBarProps) {
   const { t } = useTranslation("app");
   const viewportMode = useViewportMode();
   const isMobile = viewportMode === "mobile";
   const showTerminalLauncher = !isMobile && Boolean(onToggleTerminal);
+  const columnFlagsByTaskId = suppliedColumnFlagsByTaskId;
+  /*
+  FNXC:ConcurrencyIndicators 2026-07-21-12:00:
+  FN-8453 receives a task-scoped board trait index from App before the shared
+  live-agent predicate runs. Literal column ids are only a loading/legacy fallback.
+  */
   /*
    * FNXC:ChatLauncher 2026-06-22-15:18:
    * Settings can route Quick Chat to a footer launcher beside Terminal, keep the draggable floating FAB, or hide the launcher entirely. Footer launch stays desktop/tablet-only like Terminal while mobile opens from the floating path as a full-screen modal.
+   *
+   * FNXC:ChatLauncher 2026-09-02-05:24:
+   * The footer launcher shares the whole-chat-set visibility toggle and announces whether its next action opens, minimizes, or restores chats.
    */
-  const showQuickChatFooterLauncher = !isMobile && quickChatButtonMode === "footer" && Boolean(onOpenQuickChat);
-  const { stats, loading, error } = useExecutorStats(tasks, projectId, taskStuckTimeoutMs, lastFetchTimeMs);
+  const showQuickChatFooterLauncher = !isMobile && quickChatButtonMode === "footer" && Boolean(onToggleQuickChat);
+  const quickChatToggleLabel = quickChatToggleAction === "minimize-all"
+    ? t("chat.minimizeAllChats", "Minimize all chats")
+    : quickChatToggleAction === "restore-all"
+      ? t("chat.restoreAllChats", "Restore all chats")
+      : t("chat.openQuickChat", "Open Quick Chat");
+  const { stats, loading, error } = useExecutorStats(tasks, projectId, columnFlagsByTaskId);
   const [isProjectPathVisible, setIsProjectPathVisible] = useState(false);
   const [openStatTooltip, setOpenStatTooltip] = useState<OpenStatTooltip | null>(null);
   const engineControlMenuRef = useRef<EngineControlMenuHandle>(null);
@@ -214,6 +235,13 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
     const fanoutMap = computeBlockerFanoutMap(tasks, {
       staleHighFanoutAgeThresholdMs:
         staleHighFanoutBlockerAgeThresholdMs ?? STALE_HIGH_FANOUT_BLOCKER_AGE_THRESHOLD_MS,
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-23:55:
+      The same per-task trait index this bar already takes for its running counts. Without it
+      the fan-out classified against `todo`/`in-review`/`done`, so on a renamed board the overlap
+      bottleneck this segment exists to surface was never detected at all.
+      */
+      columnFlagsByTaskId,
     });
     const candidates = Array.from(fanoutMap.entries())
       .map(([blockerId, entry]) => ({ blockerId, entry }))
@@ -227,7 +255,7 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
       });
 
     return candidates[0] ?? null;
-  }, [tasks, staleHighFanoutBlockerAgeThresholdMs]);
+  }, [tasks, staleHighFanoutBlockerAgeThresholdMs, columnFlagsByTaskId]);
 
   const StateIcon = stateDisplay.icon;
 
@@ -235,10 +263,18 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
   // hook count between renders (Rules of Hooks).
   if (hideWhenKeyboardOpen) return null;
 
+  /*
+  FNXC:ExecutorStatusBar 2026-09-01-05:36:
+  Keyboard-collapse and mobile modifiers must reach every render branch. An error,
+  loading, or connecting footer otherwise retains the nav-height reservation and
+  floats above the keyboard.
+  */
+  const baseClassName = `executor-status-bar${isMobile ? " executor-status-bar--mobile" : ""}${keyboardOpen ? " executor-status-bar--keyboard-open" : ""}`;
+
   if (error) {
     if (isLikelyTabSuspensionError(error)) {
       return (
-        <div className="executor-status-bar executor-status-bar--connecting" role="status" aria-label={t("executor.status", "Executor status")}>
+        <div className={`${baseClassName} executor-status-bar--connecting`} role="status" aria-label={t("executor.status", "Executor status")}>
           <span className="executor-status-bar__connecting">
             <span className="executor-status-bar__indicator executor-status-bar__indicator--connecting executor-status-bar__indicator--active" aria-hidden="true" />
             {t("executor.connecting", "Connecting…")}
@@ -248,7 +284,7 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
     }
 
     return (
-      <div className="executor-status-bar executor-status-bar--error" role="status" aria-label={t("executor.status", "Executor status")}>
+      <div className={`${baseClassName} executor-status-bar--error`} role="status" aria-label={t("executor.status", "Executor status")}>
         <span className="executor-status-bar__error">
           <AlertTriangle size={14} />
           {error}
@@ -263,7 +299,7 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
    */
   if (loading && stats.runningTaskCount === 0 && !hasRenderedPopulatedStatsRef.current) {
     return (
-      <div className="executor-status-bar executor-status-bar--loading" role="status" aria-label={t("executor.status", "Executor status")}>
+      <div className={`${baseClassName} executor-status-bar--loading`} role="status" aria-label={t("executor.status", "Executor status")}>
         <LoadingSpinner className="executor-status-bar__loading-text" label={t("executor.loading", "Loading...")} />
       </div>
     );
@@ -271,7 +307,7 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
 
   return (
     <div
-      className={`executor-status-bar${isMobile ? " executor-status-bar--mobile" : ""}${stats.executorState === "running" ? " executor-status-bar--running" : ""}${keyboardOpen ? " executor-status-bar--keyboard-open" : ""}`}
+      className={`${baseClassName}${stats.executorState === "running" ? " executor-status-bar--running" : ""}`}
       role="status"
       aria-label={t("executor.status", "Executor status")}
     >
@@ -282,16 +318,16 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
        * executor statistics and launch controls only.
        */}
 
-      {/* Queued tasks */}
+      {/* Waiting intake/hold tasks */}
       <MobileStatSegment
         id="queued"
         isMobile={isMobile}
         isOpen={openStatTooltip?.id === "queued"}
-        label={t("executor.queued", "Queued")}
+        label={t("executor.waiting", "Waiting")}
         onToggle={toggleStatTooltip}
       >
         <span className="executor-status-bar__indicator executor-status-bar__indicator--queued" aria-hidden="true" />
-        <span className="executor-status-bar__label">{t("executor.queued", "Queued")}</span>
+        <span className="executor-status-bar__label">{t("executor.waiting", "Waiting")}</span>
         <span className="executor-status-bar__count">{stats.queuedTaskCount}</span>
       </MobileStatSegment>
 
@@ -319,25 +355,6 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
       {/* Separator */}
       <span className="executor-status-bar__divider" aria-hidden="true" />
 
-      {/* Stuck tasks */}
-      {stats.stuckTaskCount > 0 && (
-        <>
-          <MobileStatSegment
-            className="executor-status-bar__segment--stuck"
-            id="stuck"
-            isMobile={isMobile}
-            isOpen={openStatTooltip?.id === "stuck"}
-            label={t("executor.stuck", "Stuck")}
-            onToggle={toggleStatTooltip}
-          >
-            <span className="executor-status-bar__indicator executor-status-bar__indicator--stuck executor-status-bar__indicator--active" aria-hidden="true" />
-            <span className="executor-status-bar__label">{t("executor.stuck", "Stuck")}</span>
-            <span className="executor-status-bar__count executor-status-bar__count--error">{stats.stuckTaskCount}</span>
-          </MobileStatSegment>
-          <span className="executor-status-bar__divider" aria-hidden="true" />
-        </>
-      )}
-
       {/* Blocked tasks */}
       <MobileStatSegment
         id="blocked"
@@ -354,22 +371,6 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
         <span className={`executor-status-bar__count ${stats.blockedTaskCount > 0 ? "executor-status-bar__count--warning" : ""}`}>
           {stats.blockedTaskCount}
         </span>
-      </MobileStatSegment>
-
-      {/* Separator */}
-      <span className="executor-status-bar__divider" aria-hidden="true" />
-
-      {/* In review count */}
-      <MobileStatSegment
-        id="review"
-        isMobile={isMobile}
-        isOpen={openStatTooltip?.id === "review"}
-        label={t("executor.inReview", "In Review")}
-        onToggle={toggleStatTooltip}
-      >
-        <span className="executor-status-bar__indicator executor-status-bar__indicator--review" aria-hidden="true" />
-        <span className="executor-status-bar__label">{t("executor.inReview", "In Review")}</span>
-        <span className="executor-status-bar__count">{stats.inReviewCount}</span>
       </MobileStatSegment>
 
       {highestOverlapBlocker && (
@@ -450,8 +451,9 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleH
             <button
               type="button"
               className="executor-status-bar__footer-launcher"
-              onClick={onOpenQuickChat}
-              aria-label={t("chat.openQuickChat", "Open Quick Chat")}
+              onClick={onToggleQuickChat}
+              aria-label={quickChatToggleLabel}
+              data-chat-toggle-action={quickChatToggleAction}
               data-testid="executor-quick-chat-launcher"
             >
               <MessageSquare size={12} aria-hidden="true" />

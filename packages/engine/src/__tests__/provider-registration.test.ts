@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { seedDashboardProviders } from "../provider-registration.js";
-import { registerCustomProviders } from "../custom-provider-registry.js";
+import { seedDashboardProviders } from "../auth/provider-registration.js";
+import { registerCustomProviders } from "../auth/custom-provider-registry.js";
+import { createInMemoryModelRegistry, warmSharedModelRuntime } from "./_model-runtime-fixture.js";
 
 /*
 FNXC:ProviderRegistration 2026-07-07-00:00:
@@ -34,15 +34,6 @@ function makeAuthStorage() {
     list: vi.fn(() => Object.keys(credentials)),
     getApiKey: vi.fn(async (provider: string) => credentials[provider]?.key),
   } as any;
-}
-
-async function createInMemoryModelRegistry(): Promise<ModelRegistry> {
-  const runtime = await ModelRuntime.create({
-    credentials: { read: async () => undefined, list: async () => [], modify: async (_id, fn) => fn(undefined), delete: async () => undefined },
-    modelsPath: null,
-    allowModelNetwork: false,
-  });
-  return new ModelRegistry(runtime);
 }
 
 function makeModelRegistry() {
@@ -94,6 +85,10 @@ function makeStore(initialCustomProviders?: CustomProvider[]) {
   };
 }
 
+beforeAll(async () => {
+  await warmSharedModelRuntime();
+});
+
 const customProvider = (overrides: Partial<CustomProvider> = {}): CustomProvider => ({
   id: "550e8400-e29b-41d4-a716-446655440000",
   name: "Acme AI",
@@ -128,8 +123,8 @@ describe("seedDashboardProviders", () => {
   });
 
   it("keeps native Kimi K3 available through the installed pi model registry", async () => {
-    // FNXC:ModelCatalog 2026-07-16-19:05: FN-8180 requires catalog coverage to
-    // exercise pi's real 0.80.10 built-in registry, not a hand-written Kimi fixture.
+    // FNXC:ModelCatalog 2026-08-12-20:46: FN-9007 keeps catalog coverage on Pi
+    // 0.84.4's real built-in registry, not a hand-written Kimi fixture.
     const modelRegistry = await createInMemoryModelRegistry();
     await modelRegistry.refresh();
 
@@ -142,6 +137,57 @@ describe("seedDashboardProviders", () => {
       contextWindow: 1_048_576,
       maxTokens: 131_072,
     });
+  });
+
+  it("keeps every Muse Spark surface selectable through the installed Pi registry", async () => {
+    const modelRegistry = await createInMemoryModelRegistry();
+    const surfaces = [
+      ["openrouter", "meta/muse-spark-1.1", "openai-completions"],
+      ["openrouter", "meta/muse-spark-1.2", "openai-completions"],
+      ["openrouter", "meta/muse-spark-1.2-contributor", "openai-completions"],
+      ["vercel-ai-gateway", "meta/muse-spark-1.1", "anthropic-messages"],
+      ["vercel-ai-gateway", "meta/muse-spark-1.2", "anthropic-messages"],
+      ["vercel-ai-gateway", "meta/muse-spark-1.2-contributor", "anthropic-messages"],
+      ["opencode-go", "muse-spark-1.2-contributor", "openai-responses"],
+      ["opencode", "muse-spark-1.2", "openai-responses"],
+      ["opencode", "muse-spark-1.2-contributor-free", "openai-responses"],
+    ] as const;
+
+    for (const [provider, id, api] of surfaces) {
+      expect(modelRegistry.find(provider, id)).toMatchObject({
+        provider,
+        id,
+        api,
+        reasoning: true,
+        contextWindow: 1_048_576,
+      });
+    }
+
+    expect(modelRegistry.find("openrouter", "meta/muse-spark-1.2")?.thinkingLevelMap).toMatchObject({
+      off: null,
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: null,
+    });
+    expect(modelRegistry.find("vercel-ai-gateway", "meta/muse-spark-1.2")?.thinkingLevelMap).toBeUndefined();
+  });
+
+  it("hands each real registry an isolated custom-provider catalog", async () => {
+    const provider = customProvider({ id: "isolation-provider-id", name: "Fixture Isolation Provider" });
+    const registryA = await createInMemoryModelRegistry();
+    registryA.registerProvider(customProviderRegistryKey(provider, [provider]), {
+      baseUrl: provider.baseUrl,
+      api: "openai-completions",
+      apiKey: provider.apiKey,
+      models: [{ id: "acme-1", name: "Acme Model 1", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
+    });
+
+    const registryB = await createInMemoryModelRegistry();
+
+    expect(registryB.find("fixture-isolation-provider", "acme-1")).toBeUndefined();
+    expect(registryB.find("kimi-coding", "k3")).toMatchObject({ provider: "kimi-coding", id: "k3" });
   });
 
   it("registers one custom provider alongside built-ins", async () => {
@@ -171,6 +217,24 @@ describe("seedDashboardProviders", () => {
 
     const providerIds = wrapped.getApiKeyProviders().map((p) => p.id);
     expect(providerIds).toEqual(expect.arrayContaining(["zai", "openrouter", "acme-one", "acme-two"]));
+  });
+
+  it("registers a google-generative-ai custom provider under the Google api key", async () => {
+    const modelRegistry = makeModelRegistry();
+    const provider = customProvider({ apiType: "google-generative-ai", baseUrl: "https://google.test" });
+
+    await registerCustomProviders(modelRegistry, [provider], vi.fn());
+
+    expect(modelRegistry.registerProvider).toHaveBeenCalledWith(
+      "acme-ai",
+      expect.objectContaining({
+        api: "google-generative-ai",
+        models: [expect.objectContaining({
+          reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+        })],
+      }),
+    );
   });
 
   it("registers an anthropic-compatible custom provider under the anthropic-messages api key (FN-7690)", async () => {

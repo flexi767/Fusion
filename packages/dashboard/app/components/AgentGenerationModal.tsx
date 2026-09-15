@@ -1,3 +1,5 @@
+import { Sparkles } from "lucide-react";
+import { ViewHeader } from "./ViewHeader";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { AgentGenerationSpec } from "../api";
@@ -8,6 +10,7 @@ import {
   cancelAgentGeneration,
 } from "../api";
 
+import { FloatingWindow } from "./FloatingWindow";
 interface AgentGenerationModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -158,32 +161,22 @@ export function AgentGenerationModal({
     roleDescription.trim().length <= MAX_ROLE_LENGTH;
 
   return (
-    <div
-      className="agent-dialog-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) handleCancel();
-      }}
-    >
-      <div
-        className="agent-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("agents.generateWithAiLabel", "Generate agent with AI")}
-      >
-        {/* Header */}
-        <div className="agent-dialog-header">
-          <span className="agent-dialog-header-title">
-            <span className="agent-dialog-header-sparkle">✨</span>
-            {t("agents.generation.title", "Generate Agent")}
-          </span>
-          <button
-            className="modal-close"
-            onClick={handleCancel}
-            aria-label={t("actions.close", "Close")}
-          >
-            &times;
-          </button>
-        </div>
+        <FloatingWindow windowKey="agent-generation" modal title={t("agents.generation.title", "Generate Agent")} ariaLabel={t("agents.generateWithAiLabel", "Generate agent with AI")} onClose={handleCancel} hideHeader dragHandleSelector=".agent-generation-modal .agent-dialog-header" className="floating-window--agent-generation" defaultSize={{ width: 640, height: 560 }} minSize={{ width: 400, height: 300 }} persistGeometryKey="floating-window:agent-generation" suspendGeometryPersistenceOnMobile suspendGeometryPersistenceOnShortViewport closeOnOutsidePointerDown>
+      {/* FNXC:ModalTouchGeometry 2026-07-26-16:07: Generation can dwell while AI responds; persist shared geometry and preserve overlay dismissal. */}
+      <div className="agent-dialog agent-generation-modal">
+        {/*
+        FNXC:StandardizedViewLayout 2026-09-13-22:40:
+        FN-379 remediation: the generation dialog builds its chrome with the shared header instead of a local
+        title row, so its title, close control, and geometry match every other standardized surface.
+        */}
+        <ViewHeader
+          className="agent-dialog-header"
+          headingLevel={3}
+          icon={Sparkles}
+          title={t("agents.generation.title", "Generate Agent")}
+          onClose={handleCancel}
+          closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+        />
 
         {/* Body */}
         <div className="agent-dialog-body">
@@ -329,6 +322,6 @@ export function AgentGenerationModal({
           )}
         </div>
       </div>
-    </div>
+    </FloatingWindow>
   );
 }

@@ -1,5 +1,317 @@
 # Changelog
 
+## 0.1.63-beta.4
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.78.0-beta.4
+
+## 0.1.63-beta.3
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.78.0-beta.3
+
+## 0.1.63-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.78.0-beta.2
+
+## 0.1.63-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.78.0-beta.1
+
+## 0.1.63-beta.0
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.78.0-beta.0
+
+## 0.1.62
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0
+
+## 0.1.62-beta.14
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.14
+
+## 0.1.62-beta.13
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.13
+
+## 0.1.62-beta.12
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.12
+
+## 0.1.62-beta.11
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.11
+
+## 0.1.62-beta.10
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.10
+
+## 0.1.62-beta.9
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.9
+
+## 0.1.62-beta.8
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.8
+
+## 0.1.62-beta.7
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.7
+
+## 0.1.62-beta.6
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.6
+
+## 0.1.62-beta.5
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.5
+
+## 0.1.62-beta.4
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.4
+
+## 0.1.62-beta.3
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.3
+
+## 0.1.62-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.2
+
+## 0.1.62-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.1
+
+## 0.1.62-beta.0
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.77.0-beta.0
+
+## 0.1.61
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.76.0
+
+## 0.1.61-beta.3
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.76.0-beta.3
+
+## 0.1.61-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.76.0-beta.2
+
+## 0.1.61-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.76.0-beta.1
+
+## 0.1.61-beta.0
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.76.0-beta.0
+
+## 0.1.60
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.1
+
+## 0.1.60-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.1-beta.2
+
+## 0.1.60-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.1-beta.1
+
+## 0.1.60-beta.0
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.1-beta.0
+
+## 0.1.59
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.0
+
+## 0.1.59-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.0-beta.2
+
+## 0.1.59-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.0-beta.1
+
+## 0.1.59-beta.0
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.75.0-beta.0
+
+## 0.1.58
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0
+
+## 0.1.58-beta.9
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.9
+
+## 0.1.58-beta.8
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.8
+
+## 0.1.58-beta.7
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.7
+
+## 0.1.58-beta.6
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.6
+
+## 0.1.58-beta.5
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.5
+
+## 0.1.58-beta.4
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.4
+
+## 0.1.58-beta.3
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.3
+
+## 0.1.58-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.2
+
+## 0.1.58-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.1
+
+## 0.1.58-beta.0
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.74.0-beta.0
+
+## 0.1.57
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0
+
+## 0.1.57-beta.6
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0-beta.6
+
+## 0.1.57-beta.5
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0-beta.5
+
+## 0.1.57-beta.4
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0-beta.4
+
+## 0.1.57-beta.3
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0-beta.3
+
+## 0.1.57-beta.2
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0-beta.2
+
+## 0.1.57-beta.1
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.73.0-beta.1
+
 ## 0.1.57-beta.0
 
 ### Patch Changes

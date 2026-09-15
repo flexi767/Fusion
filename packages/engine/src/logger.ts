@@ -92,6 +92,9 @@ export const schedulerLog = createLogger("scheduler");
 /** Logger for the task executor subsystem. */
 export const executorLog = createLogger("executor");
 
+/** Logger for best-effort run-audit emission failures. */
+export const runAuditLog = createLogger("run-audit");
+
 /** Logger for the plan processor subsystem. */
 export const planLog = createLogger("plan");
 
@@ -131,6 +134,9 @@ export const autopilotLog = createLogger("autopilot");
 
 /** Logger for the heartbeat execution subsystem. */
 export const heartbeatLog = createLogger("heartbeat");
+
+/** Logger for the interactive AI session seam (planning / CE stage sessions). */
+export const interactiveSessionLog = createLogger("interactive-session");
 
 /** Logger for remote node runtime/client subsystems. */
 export const remoteNodeLog = createLogger("remote-node");

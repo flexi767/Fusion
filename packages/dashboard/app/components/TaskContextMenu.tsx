@@ -1,9 +1,17 @@
 import "./TaskContextMenu.css";
+import { AlphaMenu, AlphaMenuItem, AlphaMenuSubmenu } from "./alpha-ui";
+import { useAlphaSurface } from "../context/AlphaContext";
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
-import { Fragment, useCallback, useEffect, useRef } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TFunction } from "i18next";
 import type { ColumnId, Task, TaskDetail, WorkflowStepResult } from "@fusion/core";
-import { COLUMNS, VALID_TRANSITIONS, isColumn } from "@fusion/core";
+import { isReviewColumnRole } from "../utils/columnRoles";
+
+/*
+FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
+FN-206 makes dashboard task recovery Retry, Reset, and Delete. Retry repeats the current stage
+in place; Reset abandons task state; Delete removes the card.
+*/
 
 /*
 FNXC:ReviewLaneBypass 2026-07-09-00:00:
@@ -16,9 +24,18 @@ getLatestFailedPreMergeReviewStep. Keep this in lockstep with that function
 and self-healing.ts's latestFailedPreMergeStep (FN-7720): most-recent
 phase!=="post-merge" result with status==="failed".
 */
+/*
+FNXC:ReviewLaneBypass 2026-09-06-00:47:
+Dashboard imports only core types, so this predicate mirrors the core selector. An archived failed
+carrier retains history yet must stay reachable by the audited operator bypass.
+*/
 function hasFailedPreMergeReviewStep(task: Pick<Task, "workflowStepResults">): boolean {
-  return (task.workflowStepResults ?? []).some(
-    (result: WorkflowStepResult) => (result.phase || "pre-merge") === "pre-merge" && result.status === "failed",
+  return (task.workflowStepResults ?? []).some((result: WorkflowStepResult) =>
+    (result.phase || "pre-merge") === "pre-merge"
+    && (result.status === "failed" || (result.remediationArchivedAt != null
+      && (result.remediationArchivedFromStatus === "failed" || result.remediationArchivedFromStatus === "advisory_failure")
+      && !result.bypassedBy
+      && !result.supersededAt)),
   );
 }
 
@@ -29,23 +46,43 @@ export interface TaskMenuActionDescriptor {
   label: string;
   tone?: TaskMenuActionTone;
   disabled?: boolean;
+  testId?: string;
+  pressed?: boolean;
   onSelect?: () => void;
 }
 
-export interface TaskMoveActionDescriptor {
-  column: ColumnId;
+/*
+FNXC:TaskDetailFooterActions 2026-09-05-23:27:
+Task Detail contributes its relocated quick actions as one flat descriptor list. Do not turn those groups into submenus: the desktop footer menu clips horizontal overflow and the mobile menu scrolls vertically, so a lateral flyout would be clipped and difficult to use by touch.
+*/
+
+/**
+ * A non-action menu parent whose children are the selectable menu items.
+ *
+ * FNXC:TaskContextMenu 2026-08-27-12:01:
+ * FN-198 removed the only in-repository producer, but this host-agnostic renderer stays because
+ * submenu support is generic menu infrastructure rather than a task-relocation capability.
+ */
+export interface TaskMenuSubmenuDescriptor {
+  id: string;
   label: string;
-  primaryLabel: string;
+  items: TaskMenuActionDescriptor[];
 }
+
+export type TaskMenuItemDescriptor = TaskMenuActionDescriptor | TaskMenuSubmenuDescriptor;
 
 export interface TaskContextMenuColumnFlags {
   complete?: boolean;
-  archived?: boolean;
   hiddenFromBoard?: boolean;
   hold?: boolean;
   intake?: boolean;
+  /** Intake WITHOUT auto-triage: the operator promotes the card by hand. */
+  manualIntake?: boolean;
   mergeBlocker?: boolean;
   humanReview?: boolean;
+  /* FNXC:WorkflowResolvedColumns 2026-07-27-15:30 (U10 / R8): surfaced so column-trait consumers
+     can tell an implementation lane from a pre-implementation one without naming `in-progress`. */
+  countsTowardWip?: boolean;
 }
 
 export interface TaskContextMenuColumnMetadata {
@@ -63,7 +100,6 @@ export interface TaskReviewActionDescriptor {
 
 export interface TaskActionMenuModel {
   actions: TaskMenuActionDescriptor[];
-  moveTransitions: TaskMoveActionDescriptor[];
   reviewAction?: TaskReviewActionDescriptor;
   shouldShowActionsMenu: boolean;
   isTaskPaused: boolean;
@@ -72,10 +108,7 @@ export interface TaskActionMenuModel {
 export interface BuildTaskActionMenuModelOptions {
   task: Task | TaskDetail;
   t: TFunction<"app">;
-  columnLabel: (column: ColumnId) => string;
   currentColumnFlags?: TaskContextMenuColumnFlags;
-  workflowMoveColumns?: readonly TaskContextMenuColumnMetadata[];
-  canRetryTask?: boolean;
   hasDuplicateHandler?: boolean;
   hasRetryHandler?: boolean;
   hasResetHandler?: boolean;
@@ -93,7 +126,6 @@ export interface BuildTaskActionMenuModelOptions {
   */
   onPlan?: () => void;
   onOpenRefine?: () => void;
-  onRespecify?: () => void;
   onRetry?: () => void;
   onReset?: () => void;
   onTogglePause?: () => void;
@@ -122,78 +154,83 @@ export function getTaskPrAutomationLabel(t: TFunction<"app">, status?: string): 
   return prAutomationStatusLabels[status];
 }
 
+/*
+FNXC:TaskContextMenu 2026-07-30-04:10 DELIBERATE-LITERAL: the no-metadata fallback only.
+Reached when the caller supplies no resolved flags — the pre-load window before the board's
+workflows fetch resolves, and a card stranded on an id its workflow no longer declares. Nothing to
+resolve from in either state, so deleting the id does not remove a decision, it answers "not a
+review column" for every card during first paint.
+
+NOTE, flagged not fixed: the id is currently an UNCONDITIONAL disjunct, so explicit
+`{ mergeBlocker: false, humanReview: false }` on a column named `in-review` is still classified as
+review. #2664 fixed exactly that shape in `isPreExecutionHoldColumn` (traits first, id as fallback).
+Same fix belongs here, but it is a BEHAVIOR CHANGE and out of scope for a conversion batch.
+*/
 function isReviewColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
   return column === "in-review" || flags?.mergeBlocker === true || flags?.humanReview === true;
 }
 
+/*
+FNXC:TaskContextMenu 2026-07-30-04:10 DELIBERATE-LITERAL: the no-metadata fallback only, same
+reasoning as `isReviewColumn` above — and the same flagged inversion: `column === "done"` is an
+unconditional disjunct ahead of the trait read.
+*/
 function isDoneOrReview(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  return column === "done" || isReviewColumn(column, flags) || (flags?.complete === true && flags?.archived !== true);
-}
-
-function isMutableLiveColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  if (flags) return flags.complete !== true && flags.archived !== true;
-  return column !== "done" && column !== "archived";
-}
-
-export function isPreExecutionHoldColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
-  if (flags?.complete === true || flags?.archived === true) return false;
-  return column === "triage" || flags?.intake === true || flags?.hold === true;
-}
-
-function isDefaultWorkflowColumnSet(columns: readonly TaskContextMenuColumnMetadata[]): boolean {
-  if (columns.length !== COLUMNS.length) return false;
-  const ids = new Set(columns.map((column) => column.id));
-  return COLUMNS.every((column) => ids.has(column));
+  return column === "done" || isReviewColumn(column, flags) || flags?.complete === true;
 }
 
 /*
-FNXC:TaskContextMenu 2026-06-30-12:42:
-Workflow-column Board/List menus derive move targets from the task's workflow metadata instead of legacy VALID_TRANSITIONS. Built-in/default workflows keep exact legacy parity; custom workflows use visible neighbor columns and trait flags so custom complete/archived lanes are not treated as mutable live work.
-
-FNXC:TaskContextMenu 2026-06-30-13:02:
-Manual pull-request review has two separate operator intents: Start PR Review opens PR creation, while Merge & Close calls the merge endpoint. Keep distinct callbacks so card/list context menus cannot merge a task when the user asked to create a PR.
+FNXC:TaskContextMenu 2026-07-30-04:10 DELIBERATE-LITERAL: the no-metadata fallback only.
+Same rule as `isReviewColumn` above: reached when no resolved flags arrive, where answering
+"mutable" for a Done card would offer live-work actions on a terminal row.
 */
-function getWorkflowMoveTargets(task: Task | TaskDetail, columns: readonly TaskContextMenuColumnMetadata[]): ColumnId[] {
-  const visibleColumns = columns.filter((column) => column.flags?.hiddenFromBoard !== true);
-  if (isDefaultWorkflowColumnSet(visibleColumns) && isColumn(task.column)) {
-    return task.column === "in-review" ? ["todo", "in-progress"] : [...VALID_TRANSITIONS[task.column]];
-  }
-
-  const currentIndex = visibleColumns.findIndex((column) => column.id === task.column);
-  if (currentIndex < 0) return [];
-  const targets: ColumnId[] = [];
-  const previous = visibleColumns[currentIndex - 1]?.id;
-  const next = visibleColumns[currentIndex + 1]?.id;
-  if (previous) targets.push(previous);
-  if (next) targets.push(next);
-  return targets;
+function isMutableLiveColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
+  if (flags) return flags.complete !== true;
+  return column !== "done";
 }
 
-export function getTaskMoveTransitions(
-  task: Task | TaskDetail,
-  t: TFunction<"app">,
-  columnLabel: (column: ColumnId) => string,
-  workflowMoveColumns?: readonly TaskContextMenuColumnMetadata[],
-): TaskMoveActionDescriptor[] {
-  const moveTransitions: ColumnId[] = workflowMoveColumns
-    ? getWorkflowMoveTargets(task, workflowMoveColumns)
-    : isColumn(task.column)
-      ? (task.column === "in-review" ? ["todo", "in-progress"] : [...VALID_TRANSITIONS[task.column]])
-      : [];
-  const workflowLabelById = new Map((workflowMoveColumns ?? []).map((column) => [column.id, column.label]));
+export function isPreExecutionHoldColumn(column: string, flags?: TaskContextMenuColumnFlags): boolean {
+  if (flags?.complete === true) return false;
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-18:35 (Phase B — AUDITED, deliberately NOT consolidated):
+  `isPreImplementationColumnRole` in `utils/columnRoles.ts` answers a near-identical question and I
+  routed this through it — then reverted, because its DEGRADED-MODE answer is wider than this one's.
 
-  return moveTransitions.map((column) => {
-    const label = workflowLabelById.get(column) ?? columnLabel(column);
-    return {
-      column,
-      label: column === "in-progress" && task.column === "in-review"
-        ? t("taskDetail.move.backToInProgress", "Back to In Progress")
-        : t("taskDetail.move.moveTo", "Move to {{column}}", { column: label }),
-      primaryLabel: t("taskDetail.move.moveTo", "Move to {{column}}", { column: label }),
-    };
-  });
+  Its legacy set is {todo, triage}; this predicate's was {triage} alone. They differ for a reason:
+  that helper drives the preserve-progress prompt, where a flagless `todo` should prompt (losing
+  steps is unrecoverable), while THIS drives the Plan affordance, where a flagless `todo` must not
+  offer to re-plan a card that may already be planned. Consolidating added `plan` to flagless `todo`
+  cards — caught by "exposes Plan only for pre-execution hold columns".
+
+  Same shape, different degraded answer: the trait path is identical and the fallbacks are not
+  interchangeable. Kept separate with the difference recorded, rather than made to look shared.
+  */
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-07-30-08:00 (U12 — the LAST `triage` column guard):
+  FLAGS-FIRST, id only as the degraded answer. It used to OR the legacy id with the traits
+  UNCONDITIONALLY, which is not a fallback: a resolved column that happens to be named `triage` but
+  whose traits say it is mid-flight answered true, offering Plan on a card that is already executing.
+
+  The degraded set stays {triage} ALONE — deliberately not the {todo, triage} used by
+  `isPreImplementationColumnRole`, for the reason recorded above: that helper drives the
+  preserve-progress prompt where a flagless `todo` should prompt, while this drives the Plan
+  affordance where a flagless `todo` must not offer to re-plan a possibly-planned card.
+
+  Behaviour delta is exactly the inversion. Flags absent: unchanged (`column === "triage"`). Flags
+  present and intake/hold: unchanged (true). Flags present, name `triage`, traits mid-flight: was
+  true, now false — which is the defect.
+
+  DELIBERATE-LITERAL: the surviving `triage` is the DEGRADED answer, not an unconverted guard, and it
+  is the last `triage` comparison in production source. Converting it is not available — there is no
+  trait to read when `flags` is undefined, which happens during first paint and for a card in a column
+  its workflow no longer declares. Deleting it would silently withdraw Plan from exactly the stranded
+  cards that need re-planning most.
+
+  So the census reaching zero for `triage` means "no unconverted guards remain", not "the string is
+  gone". Recorded here rather than achieved by deleting a fallback to move a number.
+  */
+  return flags ? (flags.intake === true || flags.hold === true) : column === "triage";
 }
-
 export function getTaskReviewAction(
   task: Task | TaskDetail,
   options: Pick<BuildTaskActionMenuModelOptions, "t" | "currentColumnFlags" | "mergeStrategy" | "autoMergeEnabled" | "prAutomationLabel" | "isCheckingPrStatus" | "onMerge" | "onStartPrReview" | "onCheckPrStatus">,
@@ -234,14 +271,10 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
   const {
     task,
     t,
-    columnLabel,
     currentColumnFlags,
-    workflowMoveColumns,
-    canRetryTask = false,
     hasDuplicateHandler = Boolean(options.onDuplicate),
     hasRetryHandler = Boolean(options.onRetry),
     hasResetHandler = Boolean(options.onReset),
-    hasAssignedAgent = Boolean(task.assignedAgentId),
     hasBypassReviewHandler = Boolean(options.onBypassReview),
   } = options;
   const isTaskPaused = Boolean(task.paused || task.userPaused);
@@ -265,16 +298,12 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
   }
 
   /*
-  FNXC:TaskContextMenu 2026-07-16-12:00:
-  Archived is an unsupported Respecify source: the rebuild route rejects it rather than
-  resurrecting intentionally archived work into a planner lane. Check both the semantic
-  workflow trait and legacy id so every menu host omits this dead affordance.
+  FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
+  Retry is not a failure-only escape hatch: a live intake, implementation, or review card can
+  always repeat its current stage. Terminal columns remain immutable through the shared trait/id
+  predicate, including first paint before workflow metadata is available.
   */
-  if (task.column !== "archived" && currentColumnFlags?.archived !== true) {
-    actions.push({ id: "respecify", label: t("taskDetail.respecify.btn", "Respecify"), onSelect: options.onRespecify });
-  }
-
-  if (canRetryTask && hasRetryHandler) {
+  if (hasRetryHandler && isMutableLiveColumn(task.column, currentColumnFlags)) {
     actions.push({ id: "retry", label: t("taskDetail.retry.btn", "Retry"), onSelect: options.onRetry });
   }
 
@@ -287,11 +316,18 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
   it never renders as an empty/dead affordance for tasks blocked by other
   reasons or already recovered.
   */
-  if (hasBypassReviewHandler && task.column === "in-review" && hasFailedPreMergeReviewStep(task)) {
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-23:50 (batch-dashboard-app):
+  REVIEW role, resolved from `currentColumnFlags` — which this function already receives and already
+  uses for other role checks. Keyed on the literal, the "Bypass failed review" action
+  never appeared on a renamed board, so an operator with a genuinely failed pre-merge review step had
+  no way to clear it from the menu and the card stayed merge-blocked with no affordance.
+  */
+  if (hasBypassReviewHandler && isReviewColumnRole(currentColumnFlags, task.column) && hasFailedPreMergeReviewStep(task)) {
     actions.push({
       id: "bypass-review",
       label: t("taskDetail.bypassReview.btn", "Bypass failed review"),
-      tone: "note",
+      // FNXC:TaskDetailAlpha 2026-09-11-04:19: Bypass is an audited operator action, not explanatory note copy; keep it keyboard- and pointer-selectable in both menu implementations.
       onSelect: options.onBypassReview,
     });
   }
@@ -312,7 +348,11 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
     destructiveActions.push({ id: "reset", label: t("taskDetail.reset.btn", "Reset"), tone: "danger", onSelect: options.onReset });
   }
 
-  if (isMutableLiveColumn(task.column, currentColumnFlags)) {
+  /*
+  FNXC:TaskDetailHeaderActions 2026-09-11-18:16:
+  A mutable task exposes Pause or Unpause only when its host wires the matching lifecycle operation. The shared model omits unwired actions rather than producing an interactive-looking no-op in Task Detail, Board, or List menus.
+  */
+  if (options.onTogglePause && isMutableLiveColumn(task.column, currentColumnFlags)) {
     actions.push({
       id: isTaskPaused ? "unpause" : "pause",
       label: isTaskPaused ? t("taskDetail.pause.unpauseBtn", "Unpause") : t("taskDetail.pause.pauseBtn", "Pause"),
@@ -338,21 +378,20 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
 
   return {
     actions,
-    moveTransitions: getTaskMoveTransitions(task, t, columnLabel, workflowMoveColumns),
     reviewAction: getTaskReviewAction(task, options),
-    shouldShowActionsMenu:
-      task.column !== "triage" ||
-      task.status === "awaiting-approval" ||
-      canRetryTask ||
-      isTaskPaused ||
-      hasAssignedAgent ||
-      Boolean(options.onEnableGithubTracking && task.githubTracking?.enabled !== true),
+    /*
+    FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
+    A pure intake lane is the planning form of Retry, not a reason to hide recovery. Deriving
+    visibility from the produced action list keeps every host reachable and prevents a live card
+    from showing neither a recovery action nor an explanation.
+    */
+    shouldShowActionsMenu: actions.length > 0,
     isTaskPaused,
   };
 }
 
 export interface TaskContextMenuProps {
-  actions: TaskMenuActionDescriptor[];
+  actions: TaskMenuItemDescriptor[];
   role?: "menu" | "list";
   className?: string;
   itemClassName?: string;
@@ -380,6 +419,10 @@ export function TaskContextMenu({
 }: TaskContextMenuProps) {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const touchSelectedActionRef = useRef<{ id: string; at: number } | null>(null);
+  const submenuRef = useRef<HTMLDivElement | null>(null);
+  const [openSubmenuId, setOpenSubmenuId] = useState<string | null>(null);
+  const alphaSurface = useAlphaSurface();
+  const [submenuOpensLeft, setSubmenuOpensLeft] = useState(false);
 
   const selectAction = useCallback((action: TaskMenuActionDescriptor) => {
     if (action.disabled || action.tone === "note" || !action.onSelect) return;
@@ -420,13 +463,46 @@ export function TaskContextMenu({
   */
   useEffect(() => {
     if (!autoFocusFirstItem) return;
-    const firstItem = menuRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)");
+    const firstItem = menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled):not([aria-disabled="true"])');
     firstItem?.focus({ preventScroll: true });
   }, [actions, autoFocusFirstItem]);
 
+  useEffect(() => {
+    if (!openSubmenuId) return;
+    menuRef.current?.querySelector<HTMLElement>(`[data-task-submenu="${openSubmenuId}"] [role="menuitem"]:not(:disabled):not([aria-disabled="true"])`)?.focus({ preventScroll: true });
+  }, [openSubmenuId]);
+
+  /*
+  FNXC:TaskCardMovement 2026-08-19-18:52:
+  The root menu is clamped to the viewport, but a nested Move to menu can still overflow from a
+  rightmost Board lane or dock. Measure its rendered edge before paint and flip it left so every
+  legal destination remains reachable with mouse, keyboard, and touch.
+  */
+  useLayoutEffect(() => {
+    if (!openSubmenuId) {
+      setSubmenuOpensLeft(false);
+      return;
+    }
+    setSubmenuOpensLeft((submenuRef.current?.getBoundingClientRect().right ?? 0) > window.innerWidth);
+  }, [openSubmenuId]);
+
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const activeSubmenu = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-task-submenu]");
+    if (event.key === "Escape" && activeSubmenu) {
+      event.preventDefault();
+      event.stopPropagation();
+      setOpenSubmenuId(null);
+      menuRef.current?.querySelector<HTMLButtonElement>(`[data-task-submenu-toggle="${activeSubmenu.dataset.taskSubmenu}"]`)?.focus();
+      return;
+    }
+    if (event.key === "ArrowLeft" && activeSubmenu) {
+      event.preventDefault();
+      setOpenSubmenuId(null);
+      menuRef.current?.querySelector<HTMLButtonElement>(`[data-task-submenu-toggle="${activeSubmenu.dataset.taskSubmenu}"]`)?.focus();
+      return;
+    }
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Home" && event.key !== "End") return;
-    const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []);
+    const items = Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled):not([aria-disabled="true"])') ?? []);
     if (items.length === 0) return;
     event.preventDefault();
     const activeIndex = items.indexOf(document.activeElement as HTMLButtonElement);
@@ -441,33 +517,108 @@ export function TaskContextMenu({
     items[nextIndex]?.focus();
   };
 
+  if (alphaSurface) {
+    return (
+      <div ref={menuRef} className={className} data-alpha-menu-layout="task-actions">
+        {/*
+        FNXC:AlphaCollections 2026-09-10-20:30:
+        Alpha task actions share one homemade Alpha menu, and nested groups use Fusion's SubmenuTrigger. React Aria therefore owns arrow traversal, focus entry, and submenu transitions instead of the historical button-query keyboard loop.
+
+        FNXC:TaskDetailFooterActions 2026-09-13-12:59:
+        Alpha menus preserve descriptor order even when non-actionable note rows label an action group. Rendering notes in place keeps Task Detail's Attach → GitHub → Oversight → Priority → Fast contract without making headings focusable or selectable.
+        */}
+        <AlphaMenu aria-label="Task actions">
+          {actions.map((item) => {
+            if ("items" in item) {
+              return (
+                <AlphaMenuSubmenu key={item.id} id={item.id} label={item.label} className={`${itemClassName} task-context-menu__submenu-toggle`} menuClassName="task-context-menu__submenu">
+                  {item.items.map((action) => {
+                    const classes = [itemClassName, "task-context-menu__submenu-item"];
+                    if (action.tone === "danger") classes.push(dangerItemClassName);
+                    return <AlphaMenuItem key={action.id} id={action.id} className={classes.join(" ")} disabled={action.disabled} data-testid={action.testId} aria-pressed={action.pressed} onPointerUp={(event) => handleActionPointerUp(event, action)} onClick={(event) => handleActionClick(event, action)}>{action.label}</AlphaMenuItem>;
+                  })}
+                </AlphaMenuSubmenu>
+              );
+            }
+            if (item.tone === "note") {
+              return <span key={item.id} className={`${itemClassName} ${noteItemClassName}`} role="note" data-testid={item.testId}>{item.label}</span>;
+            }
+            const classes = [itemClassName];
+            if (item.tone === "danger") classes.push(dangerItemClassName);
+            return <AlphaMenuItem key={item.id} id={item.id} className={classes.join(" ")} disabled={item.disabled} data-testid={item.testId} aria-pressed={item.pressed} onPointerUp={(event) => handleActionPointerUp(event, item)} onClick={(event) => handleActionClick(event, item)}>{item.label}</AlphaMenuItem>;
+          })}
+        </AlphaMenu>
+      </div>
+    );
+  }
+
   return (
-    <div ref={menuRef} className={className} role={role} onKeyDown={handleKeyDown}>
-      {actions.map((action) => {
+    <AlphaMenu ref={menuRef} className={className} aria-label="Task actions" role={role} onKeyDown={handleKeyDown}>
+      {actions.map((item) => {
+        if ("items" in item) {
+          const isOpen = openSubmenuId === item.id;
+          return (
+            <div className="task-context-menu__submenu-parent" key={item.id}>
+              <AlphaMenuItem
+                id={`${item.id}-submenu`}
+                type="button"
+                className={`${itemClassName} task-context-menu__submenu-toggle`}
+                role={role === "menu" ? "menuitem" : undefined}
+                aria-haspopup="menu"
+                aria-expanded={isOpen}
+                data-task-submenu-toggle={item.id}
+                onClick={() => setOpenSubmenuId((current) => current === item.id ? null : item.id)}
+                onKeyDown={(event) => {
+                  if (event.key !== "ArrowRight" && event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  setOpenSubmenuId(item.id);
+                }}
+              >
+                {item.label}
+              </AlphaMenuItem>
+              {isOpen && (
+                <AlphaMenu
+                  ref={submenuRef}
+                  className={`task-context-menu__submenu${submenuOpensLeft ? " task-context-menu__submenu--opens-left" : ""}`}
+                  aria-label={item.label}
+                  data-task-submenu={item.id}
+                >
+                  {item.items.map((action) => {
+                    const classes = [itemClassName, "task-context-menu__submenu-item"];
+                    if (action.tone === "danger") classes.push(dangerItemClassName);
+                    return (
+                      <AlphaMenuItem
+                        key={action.id}
+                        id={action.id}
+                        type="button"
+                        className={classes.join(" ")}
+                        role={role === "menu" ? "menuitem" : undefined}
+                        disabled={action.disabled}
+                        data-testid={action.testId}
+                        aria-pressed={action.pressed}
+                        onPointerUp={(event) => handleActionPointerUp(event, action)}
+                        onClick={(event) => handleActionClick(event, action)}
+                      >
+                        {action.label}
+                      </AlphaMenuItem>
+                    );
+                  })}
+                </AlphaMenu>
+              )}
+            </div>
+          );
+        }
+        const action = item;
         const classes = [itemClassName];
         if (action.tone === "danger") classes.push(dangerItemClassName);
         if (action.tone === "note") classes.push(noteItemClassName);
-
         const defaultNode = action.tone === "note" ? (
-          <span key={action.id} className={classes.join(" ")} role="note">
-            {action.label}
-          </span>
+          <span key={action.id} className={classes.join(" ")} role="note" data-testid={action.testId}>{action.label}</span>
         ) : (
-          <button
-            key={action.id}
-            type="button"
-            className={classes.join(" ")}
-            role={role === "menu" ? "menuitem" : undefined}
-            disabled={action.disabled}
-            onPointerUp={(event) => handleActionPointerUp(event, action)}
-            onClick={(event) => handleActionClick(event, action)}
-          >
-            {action.label}
-          </button>
+          <AlphaMenuItem key={action.id} id={action.id} type="button" className={classes.join(" ")} role={role === "menu" ? "menuitem" : undefined} disabled={action.disabled} data-testid={action.testId} aria-pressed={action.pressed} onPointerUp={(event) => handleActionPointerUp(event, action)} onClick={(event) => handleActionClick(event, action)}>{action.label}</AlphaMenuItem>
         );
-
         return <Fragment key={action.id}>{renderAction ? renderAction(action, defaultNode) : defaultNode}</Fragment>;
       })}
-    </div>
+    </AlphaMenu>
   );
 }

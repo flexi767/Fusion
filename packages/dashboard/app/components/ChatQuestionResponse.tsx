@@ -1,9 +1,14 @@
+import { AlphaButton, AlphaInput, AlphaTextArea } from "./alpha-ui";
 import "./ChatQuestionResponse.css";
 
 import { useCallback, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { useTranslation } from "react-i18next";
 import type { ChatQuestion, ChatQuestionAnswers, ChatQuestionAnswerValue, ParsedQuestionToolCall } from "../utils/parseQuestionToolCall";
 import { formatQuestionAnswer } from "../utils/parseQuestionToolCall";
+import {
+  createChatInputAutosizeController,
+  type ChatInputAutosizeController,
+} from "../utils/chatInputAutosize";
 
 export interface ChatQuestionResponseProps {
   parsed: ParsedQuestionToolCall;
@@ -29,17 +34,17 @@ export function ChatQuestionResponse({
 }: ChatQuestionResponseProps) {
   const { t } = useTranslation("app");
   const [answers, setAnswers] = useState<ChatQuestionAnswers>({});
-  const textareaRefs = useRef(new Map<string, HTMLTextAreaElement>());
+  const autosizeControllers = useRef(new Map<string, ChatInputAutosizeController>());
 
   const isValid = useMemo(
     () => parsed.questions.every((question) => isQuestionAnswerValid(question, answers[question.id])),
     [answers, parsed.questions],
   );
+  const hasOptionalQuestion = parsed.questions.some((question) => question.optional === true);
 
   useLayoutEffect(() => {
-    for (const textarea of textareaRefs.current.values()) {
-      textarea.style.height = "0";
-      textarea.style.height = `${textarea.scrollHeight}px`;
+    for (const controller of autosizeControllers.current.values()) {
+      controller.resize();
     }
   }, [answers]);
 
@@ -82,7 +87,14 @@ export function ChatQuestionResponse({
         {parsed.questions.map((question, questionIndex) => (
           <article className="chat-question-response__question" key={question.id}>
             {question.header && <p className="chat-question-response__question-header">{question.header}</p>}
-            <h4 className="chat-question-response__question-text">{question.question}</h4>
+            <h4 className="chat-question-response__question-text">
+              {question.question}
+              {!answered && question.optional === true && (
+                <span className="chat-question-response__optional" data-testid={`chat-question-response-optional-${question.id}`}>
+                  {t("chat.questionOptionalLabel", "Optional")}
+                </span>
+              )}
+            </h4>
             {question.description && <p className="chat-question-response__description">{question.description}</p>}
 
             {answered ? null : (
@@ -93,7 +105,7 @@ export function ChatQuestionResponse({
                 disabled={disabled}
                 setQuestionAnswer={setQuestionAnswer}
                 toggleMultiSelect={toggleMultiSelect}
-                textareaRefs={textareaRefs}
+                autosizeControllers={autosizeControllers}
               />
             )}
           </article>
@@ -107,8 +119,12 @@ export function ChatQuestionResponse({
         </div>
       ) : (
         <div className="chat-question-response__actions">
-          <p className="chat-question-response__hint">{t("chat.questionSelectHint", "Answer all questions to continue the chat.")}</p>
-          <button
+          <p className="chat-question-response__hint">
+            {hasOptionalQuestion
+              ? t("chat.questionSelectHintWithOptional", "Answer all required questions to continue the chat.")
+              : t("chat.questionSelectHint", "Answer all questions to continue the chat.")}
+          </p>
+          <AlphaButton
             type="button"
             className="btn btn-primary chat-question-response__submit"
             data-testid="chat-question-response-submit"
@@ -116,7 +132,7 @@ export function ChatQuestionResponse({
             onClick={handleSubmit}
           >
             {t("chat.questionSubmit", "Send answer")}
-          </button>
+          </AlphaButton>
         </div>
       )}
     </section>
@@ -130,7 +146,7 @@ interface QuestionControlsProps {
   disabled: boolean;
   setQuestionAnswer: (questionId: string, value: ChatQuestionAnswerValue) => void;
   toggleMultiSelect: (questionId: string, optionId: string, checked: boolean) => void;
-  textareaRefs: MutableRefObject<Map<string, HTMLTextAreaElement>>;
+  autosizeControllers: MutableRefObject<Map<string, ChatInputAutosizeController>>;
 }
 
 function QuestionControls({
@@ -140,13 +156,13 @@ function QuestionControls({
   disabled,
   setQuestionAnswer,
   toggleMultiSelect,
-  textareaRefs,
+  autosizeControllers,
 }: QuestionControlsProps) {
   const { t } = useTranslation("app");
 
   if (question.type === "text") {
     return (
-      <textarea
+      <AlphaTextArea
         className="input chat-question-response__textarea"
         data-testid={`chat-question-response-text-${question.id}`}
         placeholder={t("chat.questionTextPlaceholder", "Type your answer here…")}
@@ -154,10 +170,10 @@ function QuestionControls({
         disabled={disabled}
         rows={3}
         ref={(element) => {
+          autosizeControllers.current.get(question.id)?.destroy();
+          autosizeControllers.current.delete(question.id);
           if (element) {
-            textareaRefs.current.set(question.id, element);
-          } else {
-            textareaRefs.current.delete(question.id);
+            autosizeControllers.current.set(question.id, createChatInputAutosizeController(element));
           }
         }}
         onChange={(event) => setQuestionAnswer(question.id, event.target.value)}
@@ -174,7 +190,7 @@ function QuestionControls({
           screen reader users get the same clear selected/unselected signal
           the strengthened CSS now provides visually.
         */}
-        <button
+        <AlphaButton
           type="button"
           className={`btn chat-question-response__confirm${value === true ? " chat-question-response__confirm--selected" : ""}`}
           data-testid={`chat-question-response-option-${question.id}-yes`}
@@ -183,8 +199,8 @@ function QuestionControls({
           onClick={() => setQuestionAnswer(question.id, true)}
         >
           {t("chat.questionConfirmYes", "Yes")}
-        </button>
-        <button
+        </AlphaButton>
+        <AlphaButton
           type="button"
           className={`btn chat-question-response__confirm${value === false ? " chat-question-response__confirm--selected" : ""}`}
           data-testid={`chat-question-response-option-${question.id}-no`}
@@ -193,7 +209,7 @@ function QuestionControls({
           onClick={() => setQuestionAnswer(question.id, false)}
         >
           {t("chat.questionConfirmNo", "No")}
-        </button>
+        </AlphaButton>
       </div>
     );
   }
@@ -213,7 +229,7 @@ function QuestionControls({
             className={`chat-question-response__option${checked ? " chat-question-response__option--selected" : ""}`}
             data-testid={`chat-question-response-option-${question.id}-${option.id}`}
           >
-            <input
+            <AlphaInput
               type={isMulti ? "checkbox" : "radio"}
               name={isMulti ? undefined : radioName}
               value={option.id}
@@ -238,7 +254,15 @@ function QuestionControls({
   );
 }
 
+/*
+ * FNXC:ChatQuestionResponse 2026-09-09-02:42:
+ * Optional questions may be submitted blank; their badge makes that affordance discoverable, and only cards containing one use the relaxed hint.
+ */
 function isQuestionAnswerValid(question: ChatQuestion, value: ChatQuestionAnswerValue | undefined): boolean {
+  if (question.optional === true && isUnanswered(value)) {
+    return true;
+  }
+
   if (question.type === "text") {
     return typeof value === "string" && value.trim().length > 0;
   }
@@ -252,4 +276,10 @@ function isQuestionAnswerValid(question: ChatQuestion, value: ChatQuestionAnswer
   }
 
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function isUnanswered(value: ChatQuestionAnswerValue | undefined): boolean {
+  return value === undefined
+    || (typeof value === "string" && value.trim().length === 0)
+    || (Array.isArray(value) && value.length === 0);
 }

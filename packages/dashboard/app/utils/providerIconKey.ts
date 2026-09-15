@@ -8,6 +8,7 @@ Standalone GLM model ids such as glm-5.1, glm-4.5-air, and glm-5v-turbo are Z.ai
 const GLM_MODEL_SEGMENT_PATTERN = /(?:^|[/:_-])glm(?:$|[\d._:-]|-[\da-z])/;
 const OMP_PROVIDER_SEGMENT_PATTERN = /(?:^|[/:_\s-])omp(?:$|[/:_\s-])/;
 const OMP_PROVIDER_NAME_PATTERN = /oh[-\s]my[-\s]pi/;
+const XIAOMI_MIMO_MODEL_SEGMENT_PATTERN = /(?:^|[/:_-])mimo(?:$|[/:_.-])/;
 
 export function inferProviderIconKey(modelOrProviderName: string): string {
   const normalized = modelOrProviderName.toLowerCase();
@@ -27,6 +28,13 @@ export function inferProviderIconKey(modelOrProviderName: string): string {
   */
   if (OMP_PROVIDER_SEGMENT_PATTERN.test(normalized) || OMP_PROVIDER_NAME_PATTERN.test(normalized)) {
     return "omp-cli";
+  }
+  /*
+  FNXC:ProviderIcons 2026-07-22-17:04:
+  FN-8500 requires the Hermes Xiaomi provider and Xiaomi MiMo model IDs to resolve through the shared icon path. Restrict MiMo matching to model-id segment boundaries so unrelated custom names such as "mimosa" retain the fallback.
+  */
+  if (normalized === "xiaomi" || XIAOMI_MIMO_MODEL_SEGMENT_PATTERN.test(normalized)) {
+    return "xiaomi";
   }
   if (normalized.includes("claude") || normalized.includes("anthropic")) {
     return "anthropic";
@@ -57,6 +65,9 @@ export function inferProviderIconKey(modelOrProviderName: string): string {
   }
   if (normalized.includes("opencode")) {
     return "opencode";
+  }
+  if (normalized.includes("orcarouter")) {
+    return "orcarouter";
   }
   if (normalized.includes("copilot") || normalized === "github copilot") {
     return "github-copilot";

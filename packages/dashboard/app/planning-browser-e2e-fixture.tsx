@@ -35,6 +35,7 @@ const summary = {
 const fixtureParams = new URLSearchParams(window.location.search);
 if (fixtureParams.has("reset")) localStorage.clear();
 const showPlanReview = fixtureParams.get("surface") === "plan-review";
+const presentation = fixtureParams.get("presentation") === "modal" ? "modal" : "embedded";
 
 const questions = [
   {
@@ -141,7 +142,7 @@ void i18n.use(initReactI18next).init({ lng: "en", fallbackLng: "en", resources: 
 
 createRoot(document.getElementById("root")!).render(
   <I18nextProvider i18n={i18n}>
-    <NavigationHistoryProvider value={{ pushNav: () => undefined, replaceCurrent: () => undefined, removeNav: () => undefined }}>
+    <NavigationHistoryProvider value={{ pushNav: () => undefined, replaceCurrent: () => undefined, removeNav: () => undefined, promoteNav: () => undefined }}>
     <ToastProvider>
       <PlanningModeModal
         isOpen
@@ -149,7 +150,7 @@ createRoot(document.getElementById("root")!).render(
         onTaskCreated={(task) => { document.body.dataset.createdTask = task.id; }}
         onTasksCreated={() => undefined}
         tasks={[]}
-        presentation="embedded"
+        presentation={presentation}
         resumeSessionId={showPlanReview ? "planning-browser-e2e" : undefined}
       />
     </ToastProvider>

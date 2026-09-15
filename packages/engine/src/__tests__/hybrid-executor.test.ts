@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { CentralCore, RegisteredProject } from "@fusion/core";
-import { HybridExecutor } from "../hybrid-executor.js";
+import { HybridExecutor } from "../concurrency/hybrid-executor.js";
 import * as engine from "../index.js";
-import type { ProjectRuntimeConfig } from "../project-runtime.js";
+import type { ProjectRuntimeConfig } from "../project/project-runtime.js";
 
 // Mock the ProjectManager
 const mockRuntimes = new Map();
@@ -21,7 +21,7 @@ const mockProjectManagerInstances: Array<{
   on: ReturnType<typeof vi.fn>;
 }> = [];
 
-vi.mock("../project-manager.js", () => ({
+vi.mock("../project/project-manager.js", () => ({
   ProjectManager: vi.fn().mockImplementation(function () {
     const instance = {
       addProject: vi.fn().mockImplementation((config: ProjectRuntimeConfig) => {
@@ -92,7 +92,7 @@ const mockNodeHealthMonitorInstances: Array<{
   checkAllNodes: ReturnType<typeof vi.fn>;
 }> = [];
 
-vi.mock("../node-health-monitor.js", () => ({
+vi.mock("../project/node-health-monitor.js", () => ({
   NodeHealthMonitor: vi.fn().mockImplementation(function () {
     const instance = {
       start: vi.fn().mockResolvedValue(undefined),
@@ -329,21 +329,12 @@ describe("HybridExecutor", () => {
     });
   });
 
-  describe("concurrency slots", () => {
-    beforeEach(async () => {
-      await executor.initialize();
-    });
-
-    it("should acquire global slot", async () => {
-      const acquired = await executor.acquireGlobalSlot("proj_test123");
-      expect(acquired).toBe(true);
-    });
-
-    it("should release global slot", async () => {
-      await executor.releaseGlobalSlot("proj_test123");
-      // Should not throw
-    });
-  });
+  /*
+  FNXC:CapacityModel 2026-07-28-20:40 (drop the cross-project cap):
+  The "concurrency slots" block is DELETED with the acquireGlobalSlot /
+  releaseGlobalSlot passthroughs it covered. Those had NO production callers, so
+  the central-DB slot counter they maintained was never incremented by real work.
+  */
 
   describe("event forwarding", () => {
     beforeEach(async () => {

@@ -5,7 +5,10 @@ import type {
   MissionEvent as CoreMissionEvent,
   MissionEventType as CoreMissionEventType,
   MissionHealth as CoreMissionHealth,
+  ValidationDiagnostics as CoreValidationDiagnostics,
 } from "@fusion/core";
+
+export type ValidationDiagnostics = CoreValidationDiagnostics;
 
 export type MissionStatus = "planning" | "active" | "blocked" | "complete" | "archived";
 export type MilestoneStatus = "planning" | "active" | "blocked" | "complete";
@@ -59,6 +62,12 @@ export interface Mission {
   status: MissionStatus;
   interviewState: "not_started" | "in_progress" | "completed" | "needs_update";
   /**
+   * FNXC:MissionTaskPrefix 2026-07-26-12:00:
+   * Optional per-mission ticket id prefix for triaged tasks. Absent/null inherits project settings.taskPrefix.
+   * Keep in sync with app/api/missions.ts Mission.taskPrefix.
+   */
+  taskPrefix?: string | null;
+  /**
    * FNXC:MissionAutoMerge 2026-07-19-12:30:
    * Mission-level auto-merge override for linked task branches.
    * `null` clears an explicit override back to project default on PATCH.
@@ -81,6 +90,8 @@ export interface MissionFeature {
   description?: string;
   acceptanceCriteria?: string;
   status: FeatureStatus;
+  /** Deterministic plan/execution projection retained by mission reconciliation. */
+  specAlignment?: "on-plan" | "diverged-needs-review" | "diverged-relocked-approved" | "unavailable";
   createdAt: string;
   updatedAt: string;
   /** Current loop state for the execution loop (idle, implementing, validating, needs_fix, passed, blocked) */

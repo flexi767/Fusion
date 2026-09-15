@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Settings, TaskDetail, WorkflowIr, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
 
-import { WorkflowTaskRuntime, type WorkflowTaskRuntimeDeps } from "../workflow-task-runtime.js";
-import type { WorkflowNodeResult } from "../workflow-graph-executor.js";
-import type { PreparedWorktree, WorkflowRuntimePrimitives } from "../runtime-primitives.js";
+import { WorkflowTaskRuntime, type WorkflowTaskRuntimeDeps } from "../workflows/workflow-task-runtime.js";
+import { buildWorkflowCompletionSummary } from "../workflows/workflow-completion-summary.js";
+import type { WorkflowNodeResult } from "../workflows/workflow-graph-executor.js";
+import type { PreparedWorktree, WorkflowRuntimePrimitives } from "../execution/runtime-primitives.js";
 
 const task = { id: "FN-9002" } as TaskDetail;
 const flagOff = { experimentalFeatures: {} } as unknown as Pick<Settings, "experimentalFeatures">;
@@ -135,7 +136,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       runCustomNode: async () => ({ outcome: "success" }),
     };
@@ -225,6 +226,28 @@ describe("WorkflowTaskRuntime", () => {
     ]);
   });
 
+  it("localizes every deterministic fallback clause from the input snapshot", () => {
+    const summary = buildWorkflowCompletionSummary({
+      id: task.id,
+      title: "Titre généré",
+      description: "Necesito resumir este flujo.",
+      steps: [{ title: "Étape", status: "done" }],
+      workflowStepResults: [{ status: "passed" }],
+      modifiedFiles: ["src/flux.ts"],
+    } as TaskDetail, {
+      reason: "workflow-runtime-completed",
+      settings: { taskOutputLanguage: "interface", language: "fr" },
+      originalInput: "Necesito resumir este flujo.",
+    });
+
+    expect(summary).toContain("Flux de travail terminé");
+    expect(summary).toContain("Étapes de tâche terminées : 1/1.");
+    expect(summary).toContain("Contrôles du flux de travail réussis ou ignorés : 1/1.");
+    expect(summary).toContain("Fichiers modifiés : src/flux.ts.");
+    expect(summary).toContain("Source de fin : workflow-runtime-completed.");
+    expect(summary).not.toContain("Completion source");
+  });
+
   it("preserves an existing workflow completion summary", async () => {
     const updateTask = vi.fn();
     const summarizedTask = { ...task, summary: "Agent-authored completion summary." } as TaskDetail;
@@ -304,7 +327,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives(calls, undefined, observed),
       runCustomNode: async (node) => {
@@ -318,8 +341,8 @@ describe("WorkflowTaskRuntime", () => {
 
     expect(result.disposition).toBe("completed");
     // Default Coding is stepwise: planning writes PROMPT.md, parse projects steps,
-    // then foreach runs `runTaskStep` before merge. No legacy execute/review seam.
-    expect(calls).toEqual(["planning", "custom:plan-review-step", "step:0", "custom:code-review-step", "custom:completion-summary", "merge"]);
+    // then foreach runs `runTaskStep`; completion summary precedes the sealing Code Review.
+    expect(calls).toEqual(["planning", "custom:plan-review-step", "step:0", "custom:completion-summary", "custom:code-review-step", "merge"]);
     expect(observed.executedTasks).toHaveLength(1);
     expect(observed.executedTasks[0]?.attachments).toEqual(attachments);
   });
@@ -330,7 +353,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives([], undefined, observed),
       runCustomNode: async () => ({ outcome: "success" }),
@@ -374,7 +397,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives(calls),
       runCustomNode: async (node) => {
@@ -388,7 +411,7 @@ describe("WorkflowTaskRuntime", () => {
     const result = await runtime.run(defaultTask, flagOff);
 
     expect(result.disposition).toBe("completed");
-    expect(calls).toEqual(["planning", "custom:plan-review-step", "step:0", "custom:code-review-step", "custom:completion-summary", "merge"]);
+    expect(calls).toEqual(["planning", "custom:plan-review-step", "step:0", "custom:completion-summary", "custom:code-review-step", "merge"]);
     expect(result.visitedNodeIds).toContain("plan");
     expect(result.visitedNodeIds).toContain("plan-review");
     expect(result.visitedNodeIds).toContain("parse");
@@ -408,7 +431,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives(calls),
       runCustomNode: async (node) => {
@@ -427,8 +450,10 @@ describe("WorkflowTaskRuntime", () => {
       "custom:plan-review-step",
       "step:0",
       "custom:browser-verification-step",
-      "custom:code-review-step",
+      // FNXC:WorkspaceReviewSeal 2026-08-21-19:39: write-capable finalization completes
+      // before Code Review seals the branch consumed by merge.
       "custom:completion-summary",
+      "custom:code-review-step",
       "merge",
     ]);
     expect(result.visitedNodeIds).toContain("plan-review::plan-review-step");
@@ -576,6 +601,101 @@ describe("WorkflowTaskRuntime", () => {
     ]);
   });
 
+  it("fences a routed permanent principal before invoking a classified work-item handler", async () => {
+    const transitions: Array<{ id: string; state: WorkflowWorkItemState; patch?: Record<string, unknown> }> = [];
+    const workItem = {
+      id: "work-fenced",
+      runId: "run-1",
+      taskId: task.id,
+      nodeId: "execute",
+      kind: "task",
+      state: "running",
+      attempt: 0,
+      retryAfter: null,
+      leaseOwner: "scheduler-a",
+      leaseExpiresAt: "2026-06-09T00:01:00.000Z",
+      lastError: null,
+      blockedReason: null,
+      stableWorkflowRunId: null,
+      continuationSequence: null,
+      waitReason: null,
+      sourceColumn: null,
+      targetColumn: null,
+      irHash: null,
+      principalAgentId: null,
+      workflowRole: null,
+      authorityKind: null,
+      nodeInstanceId: null,
+      createdAt: "2026-06-09T00:00:00.000Z",
+      updatedAt: "2026-06-09T00:00:00.000Z",
+    } satisfies WorkflowWorkItem;
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTask: async () => task,
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        transitionWorkflowWorkItem: (id, state, patch) => {
+          transitions.push({ id, state, patch });
+          return { ...workItem, state, ...patch } as WorkflowWorkItem;
+        },
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      resolveWorkflowPrincipal: () => ({
+        status: "routed",
+        route: {
+          agent: { id: "executor-owner" },
+          role: "executor",
+          authority: "task-assignee",
+        },
+      } as any),
+    });
+
+    await runtime.runWorkItem(workItem, flagOff);
+
+    expect(transitions[0]).toEqual({
+      id: "work-fenced",
+      state: "running",
+      patch: {
+        principalAgentId: "executor-owner",
+        workflowRole: "executor",
+        authorityKind: "task-assignee",
+        nodeInstanceId: "execute",
+      },
+    });
+    expect(transitions[1]?.state).toBe("succeeded");
+  });
+
+  it("holds a claimed work item when the shared pre-handler fence is unavailable", async () => {
+    const workItem = {
+      id: "work-preflight", runId: "run-1", taskId: task.id, nodeId: "execute", kind: "task", state: "running",
+      attempt: 0, retryAfter: null, leaseOwner: "scheduler-a", leaseExpiresAt: null, lastError: null, blockedReason: null,
+      stableWorkflowRunId: null, continuationSequence: null, waitReason: null, sourceColumn: null, targetColumn: null, irHash: null,
+      principalAgentId: "executor-owner", workflowRole: "executor", authorityKind: "task-assignee", nodeInstanceId: "execute",
+      createdAt: "2026-06-09T00:00:00.000Z", updatedAt: "2026-06-09T00:00:00.000Z",
+    } satisfies WorkflowWorkItem;
+    const preflight = vi.fn(async () => ({ outcome: "failure" as const, value: "workflow-principal-agent-capacity:executor" }));
+    const transitions: string[] = [];
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTask: async () => task,
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        transitionWorkflowWorkItem: (_id, state) => { transitions.push(state); return { ...workItem, state } as WorkflowWorkItem; },
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      beforeNodeExecution: preflight,
+    });
+
+    await expect(runtime.runWorkItem(workItem, flagOff)).resolves.toMatchObject({
+      disposition: "manual-required",
+      reason: "workflow-principal-agent-capacity:executor",
+    });
+    expect(preflight).toHaveBeenCalledOnce();
+    expect(transitions).toEqual(["held"]);
+  });
+
   it("fails and releases a workflow work item when the addressed node fails", async () => {
     const transitions: Array<{ id: string; state: WorkflowWorkItemState; patch?: Record<string, unknown> }> = [];
     const workItem = {
@@ -621,7 +741,7 @@ describe("WorkflowTaskRuntime", () => {
     ]);
   });
 
-  it("routes merge-gate work items off when task auto-merge is disabled", async () => {
+  it("FN-8910 routes a project-Off shared member to manual merge hold", async () => {
     const transitions: Array<{ id: string; state: WorkflowWorkItemState; patch?: Record<string, unknown> }> = [];
     const workItem = {
       id: "work-merge-gate",
@@ -641,7 +761,11 @@ describe("WorkflowTaskRuntime", () => {
     } satisfies WorkflowWorkItem;
     const runtime = new WorkflowTaskRuntime({
       store: {
-        getTask: async () => ({ ...task, autoMerge: false } as TaskDetail),
+        getTask: async () => ({
+          ...task,
+          autoMerge: undefined,
+          branchContext: { assignmentMode: "shared", groupId: "BG-8910" },
+        } as TaskDetail),
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
         transitionWorkflowWorkItem: (id, state, patch) => {
@@ -653,7 +777,7 @@ describe("WorkflowTaskRuntime", () => {
       runCustomNode: async () => ({ outcome: "success" }),
     });
 
-    const result = await runtime.runWorkItem(workItem, { ...flagOff, autoMerge: true } as Settings);
+    const result = await runtime.runWorkItem(workItem, { ...flagOff, autoMerge: false } as Settings);
 
     expect(result.disposition).toBe("completed");
     expect(result.context["node:merge-gate:value"]).toBe("auto-off");

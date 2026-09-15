@@ -8,6 +8,7 @@ FN-6444 confirmed this ChatManager API-path suite is deterministic under dashboa
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { runWithFusionSessionIdentity, resolveFusionSessionPrincipal, type Settings } from "@fusion/core";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   __getChatDiagnostics,
   __setChatDiagnostics,
   CHAT_ASK_QUESTION_GUIDANCE,
+  CHAT_CODEBASE_ACCURACY_GUIDANCE,
 } from "../chat.js";
 
 // ── Mock Setup ──────────────────────────────────────────────────────────────
@@ -62,6 +64,7 @@ const { mockSessionManagerCreate, mockSessionManagerOpen } = vi.hoisted(() => {
     branch: () => {},
     resetLeaf: () => {},
     appendMessage: () => "entry-fake",
+    buildSessionContext: () => ({ messages: [] }),
     createBranchedSession: () => "/tmp/test/.pi-fake/session-branched.jsonl",
   };
   return {
@@ -108,16 +111,7 @@ function createChatManagerForRoot(rootDir: string): ChatManager {
   return new ChatManager(mockChatStore as any, rootDir, mockAgentStore as any);
 }
 
-function createChatManagerWithSettings(settings: {
-  fallbackProvider?: string;
-  fallbackModelId?: string;
-  defaultProvider?: string;
-  defaultModelId?: string;
-  defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  defaultThinkingLevelOverride?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  executionThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  executionGlobalThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-}): ChatManager {
+function createChatManagerWithSettings(settings: Partial<Settings>): ChatManager {
   return new ChatManager(
     mockChatStore as any,
     "/tmp/test",
@@ -168,6 +162,7 @@ describe("ChatManager.sendMessage", () => {
     });
     mockChatStore.getMessages.mockReturnValue([]);
     mockChatStore.getRoomMessages.mockReturnValue([]);
+    mockChatStore.setInFlightGeneration.mockResolvedValue(undefined);
 
     mockAgentStore.init.mockResolvedValue(undefined);
     mockAgentStore.getAgent.mockResolvedValue({
@@ -202,7 +197,121 @@ describe("ChatManager.sendMessage", () => {
   });
 
   afterEach(() => {
+    __setChatDiagnostics(null);
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("emits one content-free usage event after persisting a human chat turn", async () => {
+    const taskStore = { emitUsageEvent: vi.fn(), getSettings: vi.fn().mockResolvedValue({}) };
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(),
+        model: { provider: "anthropic", id: "claude-test" },
+        state: { messages: [{ role: "assistant", content: "done" }] },
+      },
+    }) as any);
+    mockChatStore.addMessage.mockImplementation((_sessionId, input) => ({
+      id: input.role === "user" ? "user-msg" : "assistant-msg", role: input.role,
+      sessionId: "chat-001", content: input.content, createdAt: "2026-08-09T00:00:00.000Z",
+    }));
+
+    const manager = new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any);
+    await manager.sendMessage("chat-001", "private chat text");
+
+    expect(taskStore.emitUsageEvent).toHaveBeenCalledTimes(1);
+    expect(taskStore.emitUsageEvent).toHaveBeenCalledWith({
+      kind: "user_message", agentId: "agent-001", taskId: null, category: "chat",
+    });
+    expect(JSON.stringify(taskStore.emitUsageEvent.mock.calls[0])).not.toContain("private chat text");
+  });
+
+  it("records task-planner chat against its task without inventing an agent id", async () => {
+    const taskStore = { emitUsageEvent: vi.fn(), getSettings: vi.fn().mockResolvedValue({}) };
+    mockChatStore.getSession.mockReturnValue({ id: "chat-001", agentId: "task-planner:FN-8868", status: "active" });
+    __setCreateResolvedAgentSession(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } },
+    }) as any);
+
+    const manager = new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any);
+    await manager.sendMessage("chat-001", "private task chat text");
+
+    expect(taskStore.emitUsageEvent).toHaveBeenCalledWith({
+      kind: "user_message", agentId: null, taskId: "FN-8868", category: "chat",
+    });
+  });
+
+  it("forwards the injected fusion-memory built-in through the dashboard chat resolver", async () => {
+    const previousEntry = process.env.FUSION_MEMORY_MCP_ENTRY;
+    process.env.FUSION_MEMORY_MCP_ENTRY = join(process.cwd(), "../..", "package.json");
+    let resolvedOptions: { mcpServers?: Array<{ name: string }> } | undefined;
+    __setCreateResolvedAgentSession(async (options: { mcpServers?: Array<{ name: string }> }) => {
+      resolvedOptions = options;
+      return { session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } } } as any;
+    });
+    const taskStore = {
+      getSettingsByScope: vi.fn(async () => ({ global: { mcpServers: { enabled: true } }, project: { mcpServers: { enabled: true } } })),
+      getSecretsStore: vi.fn(() => ({ revealSecret: async () => { throw new Error("unexpected secret"); } })),
+      getRootDir: () => "/fixture",
+      getSettings: vi.fn().mockResolvedValue({}),
+      emitUsageEvent: vi.fn(),
+    };
+    try {
+      await new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any).sendMessage("chat-001", "resolve memory tools");
+      expect(resolvedOptions?.mcpServers).toContainEqual(expect.objectContaining({ name: "fusion-memory" }));
+    } finally {
+      if (previousEntry === undefined) delete process.env.FUSION_MEMORY_MCP_ENTRY;
+      else process.env.FUSION_MEMORY_MCP_ENTRY = previousEntry;
+    }
+  });
+
+  it("does not require a TaskStore to persist a human chat turn", async () => {
+    __setCreateResolvedAgentSession(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } },
+    }) as any);
+
+    await expect(createChatManager().sendMessage("chat-001", "task-store-less turn")).resolves.toBeUndefined();
+  });
+
+  it("keeps a rejected telemetry event out of the chat save-error path", async () => {
+    const taskStore = { emitUsageEvent: vi.fn().mockRejectedValue(new Error("telemetry unavailable")), getSettings: vi.fn().mockResolvedValue({}) };
+    const broadcast = vi.spyOn(chatStreamManager, "broadcast");
+    __setCreateResolvedAgentSession(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } },
+    }) as any);
+
+    await expect(new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any)
+      .sendMessage("chat-001", "telemetry-failure turn")).resolves.toBeUndefined();
+    await Promise.resolve();
+
+    expect(taskStore.emitUsageEvent).toHaveBeenCalledTimes(1);
+    expect(broadcast).not.toHaveBeenCalledWith("chat-001", expect.objectContaining({ data: expect.stringContaining("Failed to save message") }), expect.anything());
+  });
+
+  it("emits no telemetry when the user-turn persistence fails", async () => {
+    const taskStore = { emitUsageEvent: vi.fn(), getSettings: vi.fn().mockResolvedValue({}) };
+    mockChatStore.addMessage.mockRejectedValueOnce(new Error("database unavailable"));
+
+    await expect(new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any)
+      .sendMessage("chat-001", "failed user turn")).resolves.toBeUndefined();
+
+    expect(taskStore.emitUsageEvent).not.toHaveBeenCalled();
+  });
+
+  it("emits only the persisted user turn, never generated assistant output", async () => {
+    const taskStore = { emitUsageEvent: vi.fn(), getSettings: vi.fn().mockResolvedValue({}) };
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(),
+        state: { messages: [{ role: "assistant", content: "generated response" }] },
+      },
+    }) as any);
+
+    await new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any)
+      .sendMessage("chat-001", "human turn");
+
+    expect(taskStore.emitUsageEvent).toHaveBeenCalledTimes(1);
+    expect(taskStore.emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "user_message", category: "chat" }));
   });
 
   it("routes model-less QuickChat through configured default grok-cli provider", async () => {
@@ -368,6 +477,95 @@ describe("ChatManager.sendMessage", () => {
 
     expect(runner.send).toHaveBeenCalledWith("chat-001", "Hello CLI");
     expect(createResolvedSpy).not.toHaveBeenCalled();
+  });
+
+  it("persists normalized pi context usage from session stats on assistant messages", async () => {
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        getSessionStats: () => ({
+          tokens: { input: 21, output: 13 },
+          contextUsage: { tokens: 61_234.9, contextWindow: 200_000, percent: 30.617 },
+        }),
+        state: { messages: [{ role: "assistant", content: "Measured response" }] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Hello");
+
+    expect(mockChatStore.addMessage).toHaveBeenLastCalledWith("chat-001", expect.objectContaining({
+      role: "assistant",
+      metadata: expect.objectContaining({
+        contextUsage: { tokens: 61_234, contextWindow: 200_000, percent: 30.617 },
+      }),
+    }));
+  });
+
+  it("falls back to pi getContextUsage and preserves post-compaction context usage", async () => {
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        getSessionStats: () => ({ tokens: { input: 4, output: 2 } }),
+        getContextUsage: () => ({ tokens: null, contextWindow: 200_000, percent: null }),
+        state: { messages: [{ role: "assistant", content: "Compacted response" }] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Hello");
+
+    expect(mockChatStore.addMessage).toHaveBeenLastCalledWith("chat-001", expect.objectContaining({
+      metadata: expect.objectContaining({
+        contextUsage: { tokens: null, contextWindow: 200_000, percent: null },
+      }),
+    }));
+    expect(mockChatStore.recordTokenUsage).toHaveBeenCalledWith(expect.objectContaining({ totalTokens: 6 }));
+  });
+
+  it("drops malformed pi context usage without changing token accounting", async () => {
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        getSessionStats: () => ({
+          tokens: { input: 7, output: 3 },
+          contextUsage: { tokens: "invalid", contextWindow: 0, percent: 10 },
+        }),
+        getContextUsage: () => ({ tokens: "also-invalid", contextWindow: 0, percent: null }),
+        state: { messages: [{ role: "assistant", content: "Malformed response" }] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Hello");
+
+    expect(mockChatStore.addMessage).toHaveBeenLastCalledWith("chat-001", expect.objectContaining({ metadata: undefined }));
+    expect(mockChatStore.recordTokenUsage).toHaveBeenCalledWith(expect.objectContaining({
+      inputTokens: 7,
+      outputTokens: 3,
+      totalTokens: 10,
+    }));
+  });
+
+  it("keeps token accounting when an optional context accessor fails", async () => {
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        getSessionStats: () => ({ tokens: { input: 7, output: 3 } }),
+        getContextUsage: () => { throw new Error("optional context unavailable"); },
+        state: { messages: [{ role: "assistant", content: "Fallback failure" }] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Hello");
+
+    expect(mockChatStore.addMessage).toHaveBeenLastCalledWith("chat-001", expect.objectContaining({ metadata: undefined }));
+    expect(mockChatStore.recordTokenUsage).toHaveBeenCalledWith(expect.objectContaining({
+      inputTokens: 7,
+      outputTokens: 3,
+      totalTokens: 10,
+    }));
   });
 
   it("records successful chat session token usage from provider stats", async () => {
@@ -681,6 +879,17 @@ describe("ChatManager.sendMessage", () => {
     expect(assistantCall?.[1].content).toBe("Hello world!");
   });
 
+  it("persists multi-section streamed thinking byte-for-byte", async () => {
+    const fixture = "Preamble.\n\n**Ensuring Docker build includes dev dependencies for tests**\n\nFirst rationale.\n\nSecond rationale.\n\n**Planning deployment commit structure**\n\nDeployment rationale.\n\nSecond deployment rationale.\n\n**Editing README content**\n\nDocumentation rationale.\n\nSecond documentation rationale.";
+    __setCreateFnAgent(async (options: any) => ({ session: { prompt: vi.fn().mockImplementation(async () => {
+      options.onText?.("Done");
+      for (const delta of [fixture.slice(0, 61), fixture.slice(61, 142), fixture.slice(142)]) options.onThinking?.(delta);
+    }), dispose: vi.fn(), state: { messages: [] } } }));
+    await createChatManager().sendMessage("chat-001", "Hello");
+    const assistantCall = mockChatStore.addMessage.mock.calls.find((call) => call[1].role === "assistant");
+    expect(assistantCall?.[1].thinkingOutput).toBe(fixture);
+  });
+
   it("persists streamed replies and broadcasts done for no-state plugin runtime sessions", async () => {
     const events: Array<{ type: string; data: any }> = [];
     const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => {
@@ -839,10 +1048,22 @@ describe("ChatManager.sendMessage", () => {
     );
   });
 
-  it("passes action and permanent-agent gates to bound Mission chat sessions", async () => {
+  it("binds the durable dashboard-chat principal across the resolved-session host-tool invocation", async () => {
     let createOptions: any;
+    let hostToolPrincipal: unknown;
     __setCreateResolvedAgentSession(async (options: any) => {
       createOptions = options;
+      const identity = options.actionGateContext;
+      /*
+      FNXC:SecretsAccessApproval 2026-08-05-22:53:
+      The pi bridge runs host tools inside this invocation-scoped identity while
+      their immediate ExtensionContext has only cwd (no agentId).
+      */
+      hostToolPrincipal = await runWithFusionSessionIdentity(
+        [options.cwd],
+        { agentId: identity.agentId, agentName: identity.agentName, purpose: options.sessionPurpose },
+        () => resolveFusionSessionPrincipal(options.cwd),
+      );
       return {
         session: {
           prompt: vi.fn().mockResolvedValue(undefined),
@@ -876,9 +1097,22 @@ describe("ChatManager.sendMessage", () => {
     receive the bound agent policy. The engine gating suites assert block and
     approval execution; this dashboard seam asserts chat cannot omit either context.
     */
+    /*
+    FNXC:SecretsAccessApproval 2026-08-05-21:59:
+    Production dashboard chat must forward its bound durable agent through the
+    real resolved-session boundary. Pi then registers this context for host
+    extension calls whose immediate tool context omits agentId; without this
+    handoff prompt-gated secret requests are incorrectly attributed to user.
+    */
     expect(createOptions.actionGateContext).toMatchObject({
       agentId: "agent-001",
+      agentName: "Avery",
+      isEphemeral: false,
       permissionPolicy: { rules: { task_agent_mutation: "block" } },
+    });
+    expect(hostToolPrincipal).toMatchObject({
+      kind: "agent",
+      identity: { agentId: "agent-001", agentName: "Avery", purpose: "executor" },
     });
     expect(createOptions.permanentAgentGating).toMatchObject({
       requester: { actorId: "agent-001" },
@@ -1018,6 +1252,93 @@ describe("ChatManager.sendMessage", () => {
     expect(mockChatStore.setInFlightGeneration).toHaveBeenLastCalledWith("chat-001", null);
   });
 
+  it("observes a debounced checkpoint rejection without an unhandled rejection", async () => {
+    vi.useFakeTimers();
+    const warn = vi.fn();
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    __setChatDiagnostics({ log: vi.fn(), warn, error: vi.fn() });
+
+    let resolvePrompt: (() => void) | undefined;
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(() => new Promise<void>((resolve) => {
+          options.onToolEnd("bash", false, {
+            content: [{ type: "text", text: "log \u0000fnlvl=info\u0000 line" }],
+          });
+          resolvePrompt = resolve;
+        })),
+        dispose: vi.fn(),
+        state: { messages: [{ role: "assistant", content: "done" }] },
+      },
+    }));
+    mockChatStore.setInFlightGeneration
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("jsonb rejected"))
+      .mockResolvedValue(undefined);
+
+    const sending = createChatManager().sendMessage("chat-001", "Read the log");
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+    expect(warn.mock.calls.filter(([message]) => message === "Failed to persist in-flight chat checkpoint for session chat-001")).toEqual([
+      ["Failed to persist in-flight chat checkpoint for session chat-001"],
+    ]);
+    expect(unhandled).not.toHaveBeenCalled();
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenCalledWith("chat-001", expect.objectContaining({
+      toolCalls: [expect.objectContaining({
+        result: { content: [{ type: "text", text: "log \u0000fnlvl=info\u0000 line" }] },
+      })],
+    }));
+
+    resolvePrompt?.();
+    await sending;
+    process.off("unhandledRejection", unhandled);
+    vi.useRealTimers();
+  });
+
+  it("observes an immediate flush rejection and preserves the final clear", async () => {
+    const warn = vi.fn();
+    __setChatDiagnostics({ log: vi.fn(), warn, error: vi.fn() });
+    mockChatStore.setInFlightGeneration
+      .mockRejectedValueOnce(new Error("checkpoint unavailable"))
+      .mockResolvedValue(undefined);
+    __setCreateFnAgent(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [{ role: "assistant", content: "done" }] },
+      },
+    }));
+
+    await expect(createChatManager().sendMessage("chat-001", "Hello")).resolves.toBeUndefined();
+    await Promise.resolve();
+    expect(warn.mock.calls.filter(([message]) => message === "Failed to persist in-flight chat checkpoint for session chat-001")).toEqual([
+      ["Failed to persist in-flight chat checkpoint for session chat-001"],
+    ]);
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenLastCalledWith("chat-001", null);
+  });
+
+  it("cancels a stale debounced snapshot before flushing the latest clear", async () => {
+    vi.useFakeTimers();
+    let onText: ((delta: string) => void) | undefined;
+    __setCreateFnAgent(async (options: any) => {
+      onText = options.onText;
+      return {
+        session: {
+          prompt: vi.fn().mockImplementation(async () => onText?.("queued")),
+          dispose: vi.fn(),
+          state: { messages: [{ role: "assistant", content: "done" }] },
+        },
+      };
+    });
+
+    await createChatManager().sendMessage("chat-001", "Hello");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenCalledTimes(2);
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenLastCalledWith("chat-001", null);
+    vi.useRealTimers();
+  });
+
   it("broadcasts done with persisted assistant message snapshot", async () => {
     const events: Array<{ type: string; data: unknown }> = [];
     const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => {
@@ -1069,6 +1390,100 @@ describe("ChatManager.sendMessage", () => {
     });
   });
 
+
+  it("reconciles a streamed trailer with all assistant messages in the current turn", async () => {
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+    mockChatStore.addMessage.mockImplementation((sessionId, input) => ({
+      id: input.role === "user" ? "msg-user" : "msg-assistant",
+      sessionId,
+      role: input.role,
+      content: input.content,
+      thinkingOutput: null,
+      metadata: null,
+      attachments: undefined,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    }));
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => options.onText?.("Waiting for your choice above.")),
+        dispose: vi.fn(),
+        state: { messages: [
+          { role: "user", content: "Check the results" },
+          { role: "assistant", content: "Lost answer paragraph with the complete results." },
+          { role: "assistant", content: "Waiting for your choice above." },
+        ] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Check the results");
+    unsubscribe();
+
+    const persisted = mockChatStore.addMessage.mock.calls.at(-1)?.[1];
+    expect(persisted.content).toBe("Lost answer paragraph with the complete results.\n\nWaiting for your choice above.");
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "done",
+      data: expect.objectContaining({ message: expect.objectContaining({ content: persisted.content }) }),
+    }));
+  });
+
+  it("keeps complete streaming output without duplicating authoritative turn text", async () => {
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => options.onText?.("Complete streamed answer.")),
+        dispose: vi.fn(),
+        state: { messages: [
+          { role: "user", content: "Question" },
+          { role: "assistant", content: "Complete streamed answer." },
+        ] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Question");
+
+    expect(mockChatStore.addMessage.mock.calls.at(-1)?.[1].content).toBe("Complete streamed answer.");
+  });
+
+  it("excludes assistant messages from prior turns during reconciliation", async () => {
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => options.onText?.("Current answer.")),
+        dispose: vi.fn(),
+        state: { messages: [
+          { role: "assistant", content: "Prior turn must not be persisted." },
+          { role: "user", content: "Current question" },
+          { role: "assistant", content: "Current answer." },
+        ] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Current question");
+
+    expect(mockChatStore.addMessage.mock.calls.at(-1)?.[1].content).toBe("Current answer.");
+  });
+
+  it("separates streamed text blocks exactly once through the boundary callback", async () => {
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => {
+          options.onText?.("First block.");
+          options.onTextBlockBoundary?.();
+          options.onTextBlockBoundary?.();
+          options.onText?.("Second block.");
+        }),
+        dispose: vi.fn(),
+        state: { messages: [] },
+      },
+    }));
+
+    await createChatManager().sendMessage("chat-001", "Question");
+    unsubscribe();
+
+    expect(mockChatStore.addMessage.mock.calls.at(-1)?.[1].content).toBe("First block.\n\nSecond block.");
+    expect(events.filter((event) => event.type === "text" && event.data === "\n\n")).toHaveLength(1);
+  });
 
   it("broadcasts tool_start and tool_end SSE events when agent calls tools", async () => {
     const events: Array<{ type: string; data: unknown }> = [];
@@ -1217,7 +1632,8 @@ describe("ChatManager.sendMessage", () => {
       projectRootDir: "/tmp/test",
       sessionPurpose: "executor",
     });
-    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["agent-debug", "ce-debug"]);
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion", "ce-debug"]);
+    expect(createOptions.skillSelection.forcedSkillNames).toEqual(["agent-debug", "ce-debug"]);
     expect(createOptions.skillSelection.requestedSkillNames).not.toContain("disabled-debug");
     expect(createOptions.additionalSkillPaths).toEqual([pluginSkillDir, dirname(pluginSkillDir)]);
   });
@@ -1311,7 +1727,10 @@ describe("ChatManager.sendMessage", () => {
     const chatManager = createChatManager();
     await chatManager.sendMessage("chat-001", "/skill:ce-debug please debug this");
 
-    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["agent-debug", "ce-debug"]);
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion", "ce-debug"]);
+    // FNXC:ChatSkills 2026-08-16-04:04: A typed `/skill:` command ensures
+    // availability but must not erase the bound agent's forced read-first intent.
+    expect(createOptions.skillSelection.forcedSkillNames).toEqual(["agent-debug"]);
     expect(promptSpy).toHaveBeenCalledTimes(1);
     const promptContent = promptSpy.mock.calls[0]?.[0] as string;
     expect(promptContent).toBe("please debug this");
@@ -1381,9 +1800,10 @@ describe("ChatManager.sendMessage", () => {
     const chatManager = createChatManager(pluginRunner);
     await chatManager.sendMessage("chat-001", "/skill:CE-DEBUG /skill:review/pr/SKILL.md use both");
 
-    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["ce-debug", "review/pr"]);
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion", "review/pr", "CE-DEBUG"]);
     const names = createOptions.skillSelection.requestedSkillNames.filter((name: string) => name.toLowerCase() === "ce-debug");
     expect(names).toHaveLength(1);
+    expect(createOptions.skillSelection.forcedSkillNames).toEqual(["ce-debug"]);
     expect(promptSpy.mock.calls[0]?.[0]).toBe("use both");
   });
 
@@ -1441,7 +1861,8 @@ describe("ChatManager.sendMessage", () => {
     const chatManager = createChatManager();
     await chatManager.sendMessage("chat-001", "plain hello");
 
-    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["agent-debug"]);
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion"]);
+    expect(createOptions.skillSelection.forcedSkillNames).toEqual(["agent-debug"]);
     expect(promptSpy.mock.calls[0]?.[0]).toBe("plain hello");
   });
 
@@ -1468,7 +1889,8 @@ describe("ChatManager.sendMessage", () => {
     const chatManager = createChatManager({ getRuntimeById: vi.fn() });
     await chatManager.sendMessage("chat-001", "Hello");
 
-    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["agent-debug"]);
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion"]);
+    expect(createOptions.skillSelection.forcedSkillNames).toEqual(["agent-debug"]);
   });
 
   it("accumulates thinking output separately from text", async () => {
@@ -1873,16 +2295,24 @@ describe("ChatManager.sendMessage", () => {
     expect(customTools.map((tool: { name: string }) => tool.name)).toContain("fn_ask_question");
     expect(customTools.map((tool: { name: string }) => tool.name)).not.toContain("fn_send_message");
     expect(customTools.map((tool: { name: string }) => tool.name)).not.toContain("fn_read_messages");
+    expect(createOptions?.systemPrompt).toContain(CHAT_CODEBASE_ACCURACY_GUIDANCE);
     expect(createOptions?.systemPrompt).toContain(CHAT_ASK_QUESTION_GUIDANCE);
   });
 
   it("adds rich task context and steering tools for synthetic task planner chat sessions", async () => {
     mockChatStore.getSession.mockReturnValue({
       id: "chat-001",
-      agentId: "task-planner:FN-7310",
+      agentId: "task-planner:TEST-002",
       status: "active",
-      modelProvider: "anthropic",
-      modelId: "claude-plan",
+      /*
+      FNXC:TaskChatProjectContext 2026-08-19-17:27:
+      The persisted synthetic task session carries the Direct Chat target into ChatManager. This
+      production send path must read TEST-002 only from its selected project store, never a
+      same-ID decoy held by the dashboard default store.
+      */
+      modelProvider: "openai",
+      modelId: "gpt-direct",
+      thinkingLevel: "high",
     });
 
     const createResolvedSession = vi.fn(async () => ({
@@ -1897,19 +2327,24 @@ describe("ChatManager.sendMessage", () => {
     __setCreateResolvedAgentSession(createResolvedSession as any);
 
     const taskStore = {
-      getTask: vi.fn().mockResolvedValue({
-        id: "FN-7310",
-        title: "Add planner chat",
-        description: "Short list description should not replace the task prompt",
-        prompt: "# PROMPT.md\n\nImplement the planner-model Chat tab from the detailed task plan.",
-        column: "todo",
-        status: "planning",
-        currentStep: 0,
-        dependencies: ["FN-7309"],
-        steps: [{ title: "Polish", status: "in-progress" }],
-        comments: [{ text: "User wants planner chat", author: "user" }],
-        steeringComments: [{ text: "Keep Activity intact", author: "user" }],
-        log: [{ level: "info", message: "Activity transcript loaded" }],
+      getTask: vi.fn(async (id: string) => {
+        if (id === "TEST-002") {
+          return {
+            id,
+            title: "Secondary project task",
+            description: "Selected-project description",
+            prompt: "# PROMPT.md\n\nUse the secondary project's authoritative task context.",
+            column: "todo",
+            status: "planning",
+            currentStep: 0,
+            dependencies: ["FN-7309"],
+            steps: [{ title: "Polish", status: "in-progress" }],
+            comments: [{ text: "User wants planner chat", author: "user" }],
+            steeringComments: [{ text: "Keep Activity intact", author: "user" }],
+            log: [{ level: "info", message: "Activity transcript loaded" }],
+          };
+        }
+        return { id, title: "Selected-project dependency", column: "done" };
       }),
       getSettings: vi.fn().mockResolvedValue({}),
     };
@@ -1926,13 +2361,16 @@ describe("ChatManager.sendMessage", () => {
     await chatManager.sendMessage("chat-001", "How should I plan this?");
 
     const createOptions = createResolvedSession.mock.calls[0]?.[0];
-    expect(createOptions.defaultProvider).toBe("anthropic");
-    expect(createOptions.defaultModelId).toBe("claude-plan");
+    expect(createOptions.defaultProvider).toBe("openai");
+    expect(createOptions.defaultModelId).toBe("gpt-direct");
+    expect(createOptions.defaultThinkingLevel).toBe("high");
     expect(createOptions.systemPrompt).toContain("## Task Planner Chat Context");
-    expect(createOptions.systemPrompt).toContain("Task ID: FN-7310");
-    expect(createOptions.systemPrompt).toContain("Title: Add planner chat");
+    expect(createOptions.systemPrompt).toContain("Task ID: TEST-002");
+    expect(createOptions.systemPrompt).toContain("Title: Secondary project task");
     expect(createOptions.systemPrompt).toContain("Prompt:\n# PROMPT.md");
-    expect(createOptions.systemPrompt).toContain("Implement the planner-model Chat tab from the detailed task plan.");
+    expect(createOptions.systemPrompt).toContain("Use the secondary project's authoritative task context.");
+    expect(createOptions.systemPrompt).not.toContain("Task context could not be loaded");
+    expect(createOptions.systemPrompt).not.toContain("Default-project decoy content");
     expect(createOptions.systemPrompt).toContain("Dependencies:\n- FN-7309:");
     expect(createOptions.systemPrompt).toContain("Progress: step 1 of 1");
     expect(createOptions.systemPrompt).toContain("Current step: Polish: in-progress");
@@ -1961,7 +2399,7 @@ describe("ChatManager.sendMessage", () => {
       role: "user",
       content: expect.stringContaining("Task Planner Chat Context"),
     }));
-    expect(taskStore.getTask).toHaveBeenNthCalledWith(1, "FN-7310", { activityLogLimit: 20 });
+    expect(taskStore.getTask).toHaveBeenNthCalledWith(1, "TEST-002", { activityLogLimit: 20 });
     expect(taskStore.getTask).toHaveBeenCalledWith("FN-7309");
   });
 
@@ -2144,6 +2582,59 @@ describe("ChatManager.sendMessage", () => {
       column: "triage",
       createdAt: "2026-07-01T21:45:00.000Z",
     });
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-05:25 (batch-core):
+
+  THE REFINEMENT PAIR MUST RESOLVE THE SAME WAY ON BOTH HALVES.
+
+  Two separate guards decide this feature: `createSession` REGISTERS the tool only for a finished
+  task, and the tool's own execute() REFUSES a source task that is not finished. Both compared
+  `column === "done"`, so on a renamed board the tool was never offered — and if only the
+  registration half had been converted, the tool would have been offered and then refused itself.
+  Half-converted pairs are the recurring failure in this program, so this asserts BOTH halves in one
+  case: the tool is present, and it actually creates the refinement.
+
+  `shipped` carries `complete`; this board declares no `done` column at all.
+  */
+  it("registers AND accepts the refinement tool for a task finished in a RENAMED complete lane", async () => {
+    mockChatStore.getSession.mockReturnValue({ id: "chat-001", agentId: "task-planner:FN-SHIPPED", status: "active" });
+    const createResolvedSession = vi.fn(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } },
+    }));
+    __setCreateResolvedAgentSession(createResolvedSession as any);
+
+    const renamedIr = {
+      version: "v2", id: "wf-renamed", name: "renamed", nodes: [], edges: [],
+      columns: [
+        { id: "building", name: "Building", traits: [{ trait: "wip" }] },
+        { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
+      ],
+    };
+    const selection = { workflowId: "wf-renamed", stepIds: [] };
+    const taskStore = {
+      getTask: vi.fn().mockResolvedValue({ id: "FN-SHIPPED", title: "Finished task", column: "shipped" }),
+      addSteeringComment: vi.fn(),
+      refineTask: vi.fn().mockResolvedValue({ id: "FN-REF2", description: "d", column: "triage", createdAt: "2026-07-30T00:00:00.000Z" }),
+      getSettings: vi.fn().mockResolvedValue({}),
+      getTaskWorkflowSelection: () => selection,
+      getTaskWorkflowSelectionAsync: async () => selection,
+      getWorkflowDefinition: async () => ({ id: "wf-renamed", ir: renamedIr }),
+    };
+    const chatManager = new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any);
+
+    await chatManager.sendMessage("chat-001", "Follow up on this");
+
+    const createOptions = createResolvedSession.mock.calls[0]?.[0];
+    const refinementTool = createOptions.customTools.find((tool: { name: string }) => tool.name === "fn_task_planner_create_refinement");
+    /* Half one: registered. Keyed on the literal, this was undefined on a renamed board. */
+    expect(refinementTool).toBeDefined();
+
+    const result = await refinementTool.execute("call-1", { feedback: "Add export support" });
+    /* Half two: accepted. A registration-only fix would return isError here instead. */
+    expect(result.isError).toBeUndefined();
+    expect(taskStore.refineTask).toHaveBeenCalledWith("FN-SHIPPED", "Add export support");
   });
 
   it("does not register the refinement tool for live task-planner sessions", async () => {
@@ -2590,7 +3081,7 @@ describe("ChatManager.sendMessage", () => {
     const assistantCall = mockChatStore.addMessage.mock.calls.find(
       (call) => call[1].role === "assistant"
     );
-    expect(assistantCall?.[1].content).toBe("Accumulated text");
+    expect(assistantCall?.[1].content).toBe("State messages text");
   });
 
   it("falls back to state.messages when accumulated text is empty", async () => {
@@ -2709,6 +3200,7 @@ describe("ChatManager.sendMessage", () => {
     expect(createOptions.systemPrompt).toContain("Be calm and precise.");
     expect(createOptions.systemPrompt).toContain("Your chat reply is the primary response to the user.");
     expect(createOptions.systemPrompt).toContain("Use `fn_send_message` only when either (a) the user explicitly asks");
+    expect(createOptions.systemPrompt).toContain(CHAT_CODEBASE_ACCURACY_GUIDANCE);
   });
 
   it("includes guidance to avoid double-sending mailbox copies by default", async () => {
@@ -2980,6 +3472,7 @@ describe("ChatManager.sendMessage", () => {
         "/tmp/test",
         undefined,
         undefined,
+        expect.objectContaining({ mode: "english", locale: "en" }),
       );
 
       // Assert - session was updated with the generated title
@@ -2987,6 +3480,82 @@ describe("ChatManager.sendMessage", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Chat title generation is a single server-side seam shared by every desktop and mobile chat host.
+  it("passes configured interface language to background title generation", async () => {
+    mockSummarizeTitle.mockResolvedValue("Titre court");
+    __setCreateFnAgent(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [] },
+      },
+    }));
+
+    const chatManager = createChatManagerWithSettings({ taskOutputLanguage: "interface", language: "fr" });
+    await chatManager.sendMessage("chat-001", "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.");
+    await vi.waitFor(() => expect(mockSummarizeTitle).toHaveBeenCalled());
+
+    expect(mockSummarizeTitle).toHaveBeenLastCalledWith(
+      "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.",
+      "/tmp/test",
+      undefined,
+      undefined,
+      expect.objectContaining({ mode: "interface", locale: "fr" }),
+    );
+  });
+
+  it("falls back to English titles when loading settings rejects", async () => {
+    mockSummarizeTitle.mockResolvedValue("Short Title");
+    __setCreateFnAgent(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [] },
+      },
+    }));
+    const chatManager = new ChatManager(
+      mockChatStore as any,
+      "/tmp/test",
+      mockAgentStore as any,
+      undefined,
+      async () => Promise.reject(new Error("settings unavailable")),
+    );
+
+    await chatManager.sendMessage("chat-001", "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.");
+    await vi.waitFor(() => expect(mockSummarizeTitle).toHaveBeenCalled());
+
+    expect(mockSummarizeTitle).toHaveBeenLastCalledWith(
+      "Compare v2 par default vs v3, plus check the est timezone handling in scheduling.",
+      "/tmp/test",
+      undefined,
+      undefined,
+      expect.objectContaining({ mode: "english", locale: "en" }),
+    );
+  });
+
+  it("does not wait for title settings before prompting the chat agent", async () => {
+    const prompt = vi.fn().mockResolvedValue(undefined);
+    __setCreateFnAgent(async () => ({
+      session: { prompt, dispose: vi.fn(), state: { messages: [] } },
+    }));
+    let settingsReadCount = 0;
+    const chatManager = new ChatManager(
+      mockChatStore as any,
+      "/tmp/test",
+      undefined,
+      undefined,
+      async () => {
+        settingsReadCount += 1;
+        return settingsReadCount === 1 ? new Promise<Partial<Settings>>(() => undefined) : {};
+      },
+    );
+
+    await chatManager.sendMessage("chat-001", "A message must still reach the chat agent.");
+
+    expect(prompt).toHaveBeenCalled();
+    expect(mockSummarizeTitle).not.toHaveBeenCalled();
   });
 
   it("uses truncated content when summarizeTitle returns null", async () => {
@@ -3058,13 +3627,191 @@ describe("ChatManager.sendMessage", () => {
     }
   });
 
-  it("cancelGeneration returns false when no active generation exists", () => {
-    const chatManager = createChatManager();
+  describe("native runtime interruption", () => {
+    it("interrupts a streaming runtime before disposal and durably persists its visible prefix", async () => {
+      let rejectPrompt: ((reason?: unknown) => void) | undefined;
+      const abort = vi.fn().mockImplementation(async () => {
+        rejectPrompt?.(new Error("Runtime interrupted"));
+      });
+      const dispose = vi.fn();
+      __setCreateFnAgent(async (options: any) => ({
+        session: {
+          prompt: vi.fn().mockImplementation(() => {
+            options.onText("Distinct interrupted prefix");
+            return new Promise<void>((_resolve, reject) => {
+              rejectPrompt = reject;
+            });
+          }),
+          abort,
+          dispose,
+          state: { messages: [] },
+        },
+      }));
+      mockChatStore.addMessage.mockImplementation(async (_sessionId: string, input: any) => ({
+        id: input.role === "assistant" ? "assistant-interrupted-1" : "user-1",
+        sessionId: "chat-001",
+        role: input.role,
+        content: input.content,
+        metadata: input.metadata ?? null,
+        createdAt: "2026-08-23T00:00:00.000Z",
+      }));
 
-    expect(chatManager.cancelGeneration("chat-001")).toBe(false);
+      const events: Array<{ type: string; data: any }> = [];
+      const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+      const chatManager = createChatManager();
+      const sendPromise = chatManager.sendMessage("chat-001", "Hello");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      let sentinel: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const cancellation = await Promise.race([
+          chatManager.cancelGeneration("chat-001"),
+          new Promise<never>((_resolve, reject) => {
+            sentinel = setTimeout(() => reject(new Error("Cancellation did not settle")), 250);
+          }),
+        ]);
+        await sendPromise;
+
+        expect(cancellation).toEqual({
+          success: true,
+          interrupted: true,
+          message: expect.objectContaining({ content: "Distinct interrupted prefix" }),
+        });
+        expect(abort).toHaveBeenCalledTimes(1);
+        expect(abort.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0]!);
+        const assistantCalls = mockChatStore.addMessage.mock.calls.filter((call) => call[1].role === "assistant");
+        expect(assistantCalls).toHaveLength(1);
+        expect(assistantCalls[0][1]).toEqual(expect.objectContaining({
+          content: "Distinct interrupted prefix",
+          metadata: expect.objectContaining({ interrupted: true }),
+        }));
+        const doneEvents = events.filter((event) => event.type === "done");
+        expect(doneEvents).toHaveLength(1);
+        expect(doneEvents[0].data).toEqual(expect.objectContaining({ interrupted: true }));
+      } finally {
+        if (sentinel !== undefined) clearTimeout(sentinel);
+        unsubscribe();
+      }
+    });
+
+    it("requests the native interrupt before disposing a pre-seeded generation", async () => {
+      const chatManager = createChatManager();
+      const abortController = new AbortController();
+      const abort = vi.fn().mockResolvedValue(undefined);
+      const dispose = vi.fn();
+      (chatManager as any).activeGenerations.set("chat-001", {
+        abortController,
+        agentResult: { session: { abort, dispose } },
+        generationId: 1,
+        cancellationRequested: false,
+      });
+
+      await expect(chatManager.cancelGeneration("chat-001")).resolves.toEqual({ success: true, interrupted: false });
+      expect(abortController.signal.aborted).toBe(true);
+      expect(abort).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(abort.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0]!);
+    });
+
+    it("keeps dispose-only cancellation for ACP/Grok-style sessions without abort", async () => {
+      // FNXC:ChatCancellation 2026-08-23-02:53: ACP/Grok adapters expose dispose but no abort, so Force send must retain this fail-soft path.
+      const chatManager = createChatManager();
+      const abortController = new AbortController();
+      const dispose = vi.fn().mockImplementation(() => {
+        throw new Error("dispose-only runtime");
+      });
+      (chatManager as any).activeGenerations.set("chat-001", {
+        abortController,
+        agentResult: { session: { dispose } },
+        generationId: 1,
+        cancellationRequested: false,
+      });
+
+      await expect(chatManager.cancelGeneration("chat-001")).resolves.toEqual({ success: true, interrupted: false });
+      expect(dispose).toHaveBeenCalledTimes(1);
+    });
+
+    it("bounds a hanging native interrupt before disposal", async () => {
+      vi.useFakeTimers();
+      const chatManager = createChatManager();
+      const dispose = vi.fn();
+      (chatManager as any).activeGenerations.set("chat-001", {
+        abortController: new AbortController(),
+        agentResult: { session: { abort: vi.fn(() => new Promise<void>(() => {})), dispose } },
+        generationId: 1,
+        cancellationRequested: false,
+      });
+
+      const cancellation = chatManager.cancelGeneration("chat-001");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(cancellation).resolves.toEqual({ success: true, interrupted: false });
+      expect(dispose).toHaveBeenCalledTimes(1);
+    });
+
+    it("logs a rejecting native interrupt and still disposes", async () => {
+      const error = vi.fn();
+      __setChatDiagnostics({ log: vi.fn(), warn: vi.fn(), error });
+      const chatManager = createChatManager();
+      const dispose = vi.fn();
+      (chatManager as any).activeGenerations.set("chat-001", {
+        abortController: new AbortController(),
+        agentResult: { session: { abort: vi.fn().mockRejectedValue(new Error("abort failed")), dispose } },
+        generationId: 1,
+        cancellationRequested: false,
+      });
+
+      await expect(chatManager.cancelGeneration("chat-001")).resolves.toEqual({ success: true, interrupted: false });
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(error).toHaveBeenCalledWith(
+        "Failed to request runtime session interrupt during chat cancellation:",
+        expect.any(Error),
+      );
+    });
+
+    it("requests the native interrupt at most once across duplicate cancellation", async () => {
+      const chatManager = createChatManager();
+      const abort = vi.fn().mockResolvedValue(undefined);
+      (chatManager as any).activeGenerations.set("chat-001", {
+        abortController: new AbortController(),
+        agentResult: { session: { abort, dispose: vi.fn() } },
+        generationId: 1,
+        cancellationRequested: false,
+      });
+
+      await chatManager.cancelGeneration("chat-001");
+      await chatManager.cancelGeneration("chat-001");
+      expect(abort).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not natively interrupt or dispose a pre-empted generation", () => {
+      const chatManager = createChatManager();
+      const previous = chatManager.beginGeneration("chat-001");
+      const abort = vi.fn();
+      const dispose = vi.fn();
+      (chatManager as any).activeGenerations.get("chat-001").agentResult = { session: { abort, dispose } };
+
+      chatManager.beginGeneration("chat-001");
+
+      expect(previous.abortController.signal.aborted).toBe(true);
+      expect(abort).not.toHaveBeenCalled();
+      expect(dispose).not.toHaveBeenCalled();
+    });
   });
 
-  it("cancelGeneration returns true and aborts an active generation", () => {
+  it("treats an idle cancellation as a successful no-op without durable side effects", async () => {
+    const chatManager = createChatManager();
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+
+    await expect(chatManager.cancelGeneration("chat-001")).resolves.toEqual({ success: true, interrupted: false });
+
+    expect(mockChatStore.addMessage).not.toHaveBeenCalled();
+    expect(mockChatStore.setInFlightGeneration).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+    unsubscribe();
+  });
+
+  it("cancelGeneration returns true and aborts an active generation", async () => {
     const chatManager = createChatManager();
     const abortController = new AbortController();
     const dispose = vi.fn();
@@ -3072,20 +3819,15 @@ describe("ChatManager.sendMessage", () => {
     (chatManager as any).activeGenerations.set("chat-001", {
       abortController,
       agentResult: { session: { dispose } },
+      generationId: 1,
+      cancellationRequested: false,
     });
 
-    const events: Array<{ type: string; data: unknown }> = [];
-    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => {
-      events.push(event);
-    });
+    const result = await chatManager.cancelGeneration("chat-001");
 
-    const result = chatManager.cancelGeneration("chat-001");
-    unsubscribe();
-
-    expect(result).toBe(true);
+    expect(result).toEqual({ success: true, interrupted: false });
     expect(abortController.signal.aborted).toBe(true);
     expect(dispose).toHaveBeenCalledTimes(1);
-    expect(events).toContainEqual({ type: "error", data: "Generation cancelled" });
   });
 
   it("cancelled generation does not persist assistant message", async () => {
@@ -3114,11 +3856,66 @@ describe("ChatManager.sendMessage", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(chatManager.cancelGeneration("chat-001")).toBe(true);
+    await expect(chatManager.cancelGeneration("chat-001")).resolves.toEqual({ success: true, interrupted: false });
     await sendPromise;
 
     const assistantCalls = mockChatStore.addMessage.mock.calls.filter((call) => call[1].role === "assistant");
     expect(assistantCalls).toHaveLength(0);
+  });
+
+  it("persists one interrupted assistant message before clearing the checkpoint", async () => {
+    let rejectPrompt: ((reason?: unknown) => void) | undefined;
+    const addMessageCalls: Array<{ role: string; content: string }> = [];
+    mockChatStore.addMessage.mockImplementation(async (_sessionId: string, input: { role: string; content: string; thinkingOutput?: string; metadata?: Record<string, unknown> }) => {
+      addMessageCalls.push({ role: input.role, content: input.content });
+      return {
+        id: input.role === "user" ? "user-1" : "assistant-interrupted-1",
+        sessionId: "chat-001",
+        role: input.role,
+        content: input.content,
+        thinkingOutput: input.thinkingOutput ?? null,
+        metadata: input.metadata ?? null,
+        createdAt: "2026-08-18T21:55:00.000Z",
+      };
+    });
+    __setCreateFnAgent(async (options: any) => ({
+      session: {
+        prompt: vi.fn().mockImplementation(() => {
+          options.onThinking("thinking prefix");
+          options.onText("Distinct interrupted prefix");
+          options.onToolStart("bash", { command: "echo partial" });
+          return new Promise<void>((_resolve, reject) => {
+            rejectPrompt = reject;
+          });
+        }),
+        dispose: vi.fn().mockImplementation(() => rejectPrompt?.(new Error("Disposed"))),
+        state: { messages: [] },
+      },
+    }));
+
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => events.push(event));
+    const chatManager = createChatManager();
+    const sendPromise = chatManager.sendMessage("chat-001", "Hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const cancellation = await chatManager.cancelGeneration("chat-001");
+    await sendPromise;
+    unsubscribe();
+
+    expect(cancellation).toEqual(expect.objectContaining({ success: true, interrupted: true }));
+    expect(addMessageCalls.filter((call) => call.role === "assistant")).toEqual([
+      { role: "assistant", content: "Distinct interrupted prefix" },
+    ]);
+    expect(mockChatStore.setInFlightGeneration.mock.invocationCallOrder.at(-1)).toBeGreaterThan(
+      mockChatStore.addMessage.mock.invocationCallOrder.at(-1)!,
+    );
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenLastCalledWith("chat-001", null);
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    expect(events.find((event) => event.type === "done")?.data).toEqual(expect.objectContaining({
+      interrupted: true,
+      messageId: "assistant-interrupted-1",
+    }));
   });
 
   it("cancelled generation broadcasts error event with cancellation message", async () => {
@@ -3149,11 +3946,11 @@ describe("ChatManager.sendMessage", () => {
     const sendPromise = chatManager.sendMessage("chat-001", "Hello");
 
     await new Promise((resolve) => setTimeout(resolve, 0));
-    chatManager.cancelGeneration("chat-001");
+    await chatManager.cancelGeneration("chat-001");
     await sendPromise;
     unsubscribe();
 
-    expect(events.some((event) => event.type === "error" && event.data === "Generation cancelled")).toBe(true);
+    expect(events.some((event) => event.type === "done" && (event.data as { interrupted?: boolean }).interrupted === true)).toBe(true);
   });
 
   it("cleans active generation state even when dispose fails", async () => {
@@ -3741,7 +4538,7 @@ describe("ChatManager generation isolation", () => {
       roomId: "room-1",
       ...input,
     }));
-    mockAgentStore.listAgents.mockResolvedValue([{ id: "agent-001", name: "Avery", role: "executor", state: "idle" }]);
+    mockAgentStore.listAgents.mockResolvedValue([{ id: "agent-001", name: "Avery", role: "executor", state: "idle", metadata: { skills: ["agent-debug"] } }]);
     mockAgentStore.getAgent.mockResolvedValue({
       id: "agent-001",
       name: "Avery",
@@ -3769,9 +4566,12 @@ describe("ChatManager generation isolation", () => {
       ]),
     };
 
-    await createChatManager(pluginRunner).sendRoomMessage("room-1", "hello @Avery");
+    await createChatManager(pluginRunner).sendRoomMessage("room-1", "/skill:review/pr hello @Avery");
 
-    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["ce-debug"]);
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["ce-debug", "review/pr"]);
+    // FNXC:ChatSkills 2026-08-16-04:04: Room responders use the same merge
+    // seam as direct chat, preserving metadata-forced skills beside `/skill:`.
+    expect(createOptions.skillSelection.forcedSkillNames).toEqual(["agent-debug"]);
     expect(createOptions.skillSelection.sessionPurpose).toBe("heartbeat");
     expect(createOptions.additionalSkillPaths).toEqual([pluginSkillDir, dirname(pluginSkillDir)]);
   });
@@ -3792,7 +4592,7 @@ describe("ChatManager generation isolation", () => {
     ]);
     mockAgentStore.getAgent.mockResolvedValue({ id: "agent-001", name: "Avery", role: "executor", state: "idle" });
 
-    __setCreateResolvedAgentSession(async () => ({
+    const createResolvedSession = vi.fn(async () => ({
       session: {
         prompt: vi.fn().mockResolvedValue(undefined),
         dispose: vi.fn(),
@@ -3802,6 +4602,7 @@ describe("ChatManager generation isolation", () => {
       model: "test",
       fallbackInfo: undefined,
     } as any));
+    __setCreateResolvedAgentSession(createResolvedSession);
 
     const chatManager = createChatManager();
     await chatManager.sendRoomMessage("room-1", "hello @Avery");
@@ -3815,6 +4616,11 @@ describe("ChatManager generation isolation", () => {
       senderAgentId: "agent-001",
       content: "Room answer",
     });
+    /*
+    FNXC:ChatCodebaseAccuracy 2026-07-23-05:20:
+    Room responder assembly must keep the investigate-first contract; capture the system prompt so the append site cannot regress unnoticed (PR #2416 review).
+    */
+    expect(createResolvedSession.mock.calls[0]?.[0]?.systemPrompt).toContain(CHAT_CODEBASE_ACCURACY_GUIDANCE);
   });
 
   it("sendRoomMessage still resolves room member responders when listAgents is unavailable", async () => {
@@ -3854,6 +4660,51 @@ describe("ChatManager generation isolation", () => {
       senderAgentId: "agent-001",
       content: "Recovered room answer",
     });
+  });
+
+  it("forwards inherited project model and thinking for direct role-agent chat", async () => {
+    mockAgentStore.getAgent.mockResolvedValue({
+      id: "agent-001", name: "Workflow Merger", role: "merger", roles: ["merger"],
+      metadata: { builtInWorkflowRole: true, workflowRole: "merger" }, runtimeConfig: { enabled: false },
+    });
+    const createResolvedSession = vi.fn(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [{ role: "assistant", content: "Done" }] } },
+    }));
+    __setCreateResolvedAgentSession(createResolvedSession as any);
+    const chatManager = createChatManagerWithSettings({
+      defaultProviderOverride: "anthropic", defaultModelIdOverride: "claude-project", defaultThinkingLevelOverride: "high",
+    } as any);
+
+    await chatManager.sendMessage("chat-001", "Hello");
+
+    expect(createResolvedSession).toHaveBeenCalledWith(expect.objectContaining({
+      defaultProvider: "anthropic", defaultModelId: "claude-project", defaultThinkingLevel: "high",
+    }));
+  });
+
+  it("forwards inherited role settings for room responders while room thinking wins", async () => {
+    (mockChatStore as any).getRoom = vi.fn().mockReturnValue({ id: "room-1", name: "team", thinkingLevel: "off" });
+    (mockChatStore as any).listRoomMembers = vi.fn().mockReturnValue([{ roomId: "room-1", agentId: "agent-001", role: "member" }]);
+    (mockChatStore as any).addRoomMessage = vi.fn().mockImplementation((_roomId: string, input: any) => ({ id: "room-message", ...input }));
+    const merger = {
+      id: "agent-001", name: "Workflow Merger", role: "merger", roles: ["merger"], state: "active",
+      metadata: { builtInWorkflowRole: true, workflowRole: "merger" }, runtimeConfig: { enabled: false },
+    };
+    mockAgentStore.listAgents.mockResolvedValue([merger]);
+    mockAgentStore.getAgent.mockResolvedValue(merger);
+    const createResolvedSession = vi.fn(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [{ role: "assistant", content: "Done" }] } },
+    }));
+    __setCreateResolvedAgentSession(createResolvedSession as any);
+    const chatManager = createChatManagerWithSettings({
+      defaultProviderOverride: "anthropic", defaultModelIdOverride: "claude-project", mergerThinkingLevel: "high",
+    } as any);
+
+    await chatManager.sendRoomMessage("room-1", "Hello @Workflow_Merger");
+
+    expect(createResolvedSession).toHaveBeenCalledWith(expect.objectContaining({
+      defaultProvider: "anthropic", defaultModelId: "claude-project", defaultThinkingLevel: "off",
+    }));
   });
 
 });

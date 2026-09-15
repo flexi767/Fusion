@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { ScriptsModal } from "../ScriptsModal";
+import { assertModalGeometryRecoveryAndSheetContracts, assertRenderedModalTouchGeometry } from "./floatingWindowMigration.test-helpers";
+import { expectStableTyping } from "./typingStability.test-helpers";
 import type { ScriptEntry } from "../../api";
 
 const mockScripts: Record<string, string> = {
@@ -11,6 +14,9 @@ const mockScripts: Record<string, string> = {
 
 vi.mock("../../api", () => ({
   fetchScripts: vi.fn(() => Promise.resolve({})),
+  normalizeScriptCatalog: (value: Record<string, string> | ScriptEntry[]) => Array.isArray(value)
+    ? value
+    : Object.entries(value).map(([name, command]) => ({ name, command })),
   addScript: vi.fn(() => Promise.resolve({ name: "new-script", command: "echo hello" })),
   removeScript: vi.fn(() => Promise.resolve()),
 }));
@@ -30,16 +36,30 @@ beforeEach(() => {
 });
 
 describe("ScriptsModal", () => {
-  it("has the 'open' class on the modal overlay when visible", async () => {
+  it("renders inside its FloatingWindow when visible", async () => {
     vi.mocked(fetchScripts).mockResolvedValueOnce(mockScripts);
 
     render(
       <ScriptsModal isOpen={true} onClose={onClose} addToast={addToast} onRunScript={onRunScript} />
     );
 
-    const overlay = screen.getByTestId("scripts-modal");
-    expect(overlay.classList.contains("modal-overlay")).toBe(true);
-    expect(overlay.classList.contains("open")).toBe(true);
+    expect(screen.getByTestId("floating-window-scripts")).toBeInTheDocument();
+  });
+
+
+  /*
+  FNXC:TypingStability 2026-07-26-22:15:
+  Per-character typing guard. The FN-8606 floating-window migration made Planning Mode and Settings
+  untypable and no test noticed, because field coverage here uses fireEvent.change, which never needs
+  the input to stay mounted. This asserts the field keeps its DOM node, value, and focus while typed.
+  */
+  it("keeps the script name field mounted and focused while typing", async () => {
+    vi.mocked(fetchScripts).mockResolvedValueOnce(mockScripts);
+    render(<ScriptsModal isOpen={true} onClose={onClose} addToast={addToast} onRunScript={onRunScript} />);
+
+    fireEvent.click(await screen.findByTestId("add-script-btn"));
+    const field = await screen.findByTestId("script-name-input") as HTMLInputElement;
+    await expectStableTyping(field, "lint", () => screen.getByTestId("script-name-input"));
   });
 
   it("does not render when closed", () => {
@@ -118,32 +138,41 @@ describe("ScriptsModal", () => {
     fireEvent.click(screen.getByTestId("script-save-btn"));
 
     await waitFor(() => {
-      expect(addScript).toHaveBeenCalledWith("new-script", "echo hello", undefined);
+      expect(addScript).toHaveBeenCalledWith("new-script", "echo hello", undefined, {});
       expect(addToast).toHaveBeenCalledWith("Script created", "success");
     });
   });
 
-  it("validates script name (alphanumeric, hyphens, underscores only)", async () => {
-    vi.mocked(fetchScripts).mockResolvedValueOnce({});
+  it("reproduces the edit symptom with a pencil, spaced rename, and description", async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchScripts)
+      .mockResolvedValueOnce({ build: "npm run build" })
+      .mockResolvedValueOnce([{ name: "Build production", command: "npm run build", description: "Bundle de production" }]);
 
-    render(
-      <ScriptsModal isOpen={true} onClose={onClose} addToast={addToast} onRunScript={onRunScript} />
-    );
+    render(<ScriptsModal isOpen onClose={onClose} addToast={addToast} onRunScript={onRunScript} />);
+    const editButton = await screen.findByTestId("edit-script-build");
+    expect(editButton.querySelector(".lucide-pencil")).toBeInTheDocument();
+    expect(editButton.querySelector(".lucide-plus")).not.toBeInTheDocument();
+    await user.click(editButton);
 
-    await waitFor(() => {
-      expect(screen.getByTestId("add-script-btn")).toBeInTheDocument();
-    });
+    const nameInput = screen.getByTestId("script-name-input") as HTMLInputElement;
+    const originalNode = nameInput;
+    await user.clear(nameInput);
+    await user.type(nameInput, "Build production");
+    expect(screen.getByTestId("script-name-input")).toBe(originalNode);
+    expect(nameInput).toHaveFocus();
+    await user.type(screen.getByTestId("script-description-input"), "Bundle de production");
+    await user.click(screen.getByTestId("script-save-btn"));
 
-    fireEvent.click(screen.getByTestId("add-script-btn"));
-
-    const nameInput = screen.getByTestId("script-name-input");
-    fireEvent.change(nameInput, { target: { value: "invalid name with spaces" } });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("script-name-error")).toBeInTheDocument();
-    });
-    // Verify the error message contains expected text
-    expect(screen.getByTestId("script-name-error").textContent).toContain("letters");
+    await waitFor(() => expect(addScript).toHaveBeenCalledWith(
+      "Build production", "npm run build", undefined,
+      { originalName: "build", description: "Bundle de production" },
+    ));
+    expect(await screen.findByText("Build production")).toBeInTheDocument();
+    expect(screen.getByText("Bundle de production")).toBeInTheDocument();
+    expect(screen.queryByText("build")).not.toBeInTheDocument();
+    await user.click(screen.getByTestId("run-script-Build production"));
+    expect(onRunScript).toHaveBeenCalledWith("Build production", "npm run build");
   });
 
   it("allows valid script names with hyphens and underscores", async () => {
@@ -170,7 +199,7 @@ describe("ScriptsModal", () => {
     fireEvent.click(screen.getByTestId("script-save-btn"));
 
     await waitFor(() => {
-      expect(addScript).toHaveBeenCalledWith("my-script_v2", "echo test", undefined);
+      expect(addScript).toHaveBeenCalledWith("my-script_v2", "echo test", undefined, {});
     });
   });
 
@@ -329,7 +358,7 @@ describe("ScriptsModal", () => {
     fireEvent.click(screen.getByTestId("script-save-btn"));
 
     await waitFor(() => {
-      expect(addScript).toHaveBeenCalledWith("build", "npm run build:prod", undefined);
+      expect(addScript).toHaveBeenCalledWith("build", "npm run build:prod", undefined, { originalName: "build" });
       expect(addToast).toHaveBeenCalledWith("Script updated", "success");
     });
   });
@@ -410,5 +439,13 @@ describe("ScriptsModal", () => {
     await waitFor(() => {
       expect(addToast).toHaveBeenCalledWith("A script with this name already exists", "error");
     });
+  });
+});
+
+describe("ScriptsModal floating geometry", () => {
+  it("uses its production header for touch drag and resize", () => {
+    render(<ScriptsModal isOpen onClose={onClose} addToast={addToast} onRunScript={onRunScript} />);
+    assertRenderedModalTouchGeometry("scripts", screen.getByText("Scripts").closest(".modal-header") as HTMLElement);
+    assertModalGeometryRecoveryAndSheetContracts("scripts", () => render(<ScriptsModal isOpen onClose={onClose} addToast={addToast} onRunScript={onRunScript} />));
   });
 });

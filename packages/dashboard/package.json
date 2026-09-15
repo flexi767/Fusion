@@ -1,6 +1,6 @@
 {
   "name": "@fusion/dashboard",
-  "version": "0.73.0-beta.0",
+  "version": "0.78.0-beta.4",
   "license": "MIT",
   "description": "Fusion dashboard: React UI and HTTP API server for monitoring and controlling the Fusion AI coding agent.",
   "homepage": "https://github.com/Runfusion/Fusion#readme",
@@ -31,9 +31,25 @@
       "types": "./app/components/ViewHeader.tsx",
       "import": "./app/components/ViewHeader.tsx"
     },
-    "./app/utils/taskStuck": {
-      "types": "./app/utils/taskStuck.ts",
-      "import": "./app/utils/taskStuck.ts"
+    "./app/components/ViewLayout": {
+      "types": "./app/components/ViewLayout.tsx",
+      "import": "./app/components/ViewLayout.tsx"
+    },
+    "./app/components/ViewSidebar": {
+      "types": "./app/components/ViewSidebar.tsx",
+      "import": "./app/components/ViewSidebar.tsx"
+    },
+    "./app/components/ViewActionButton": {
+      "types": "./app/components/ViewActionButton.tsx",
+      "import": "./app/components/ViewActionButton.tsx"
+    },
+    "./app/context/ViewLayoutContext": {
+      "types": "./app/context/ViewLayoutContext.tsx",
+      "import": "./app/context/ViewLayoutContext.tsx"
+    },
+    "./app/hooks/useViewSidebarWidth": {
+      "types": "./app/hooks/useViewSidebarWidth.ts",
+      "import": "./app/hooks/useViewSidebarWidth.ts"
     },
     "./app/utils/copyToClipboard": {
       "types": "./app/utils/copyToClipboard.ts",
@@ -42,6 +58,14 @@
     "./app/utils/projectStorage": {
       "types": "./app/utils/projectStorage.ts",
       "import": "./app/utils/projectStorage.ts"
+    },
+    "./app/plugins/PluginDashboardViewHeader": {
+      "types": "./app/plugins/PluginDashboardViewHeader.tsx",
+      "import": "./app/plugins/PluginDashboardViewHeader.tsx"
+    },
+    "./app/plugins/PluginDashboardViewHost": {
+      "types": "./app/plugins/PluginDashboardViewHost.tsx",
+      "import": "./app/plugins/PluginDashboardViewHost.tsx"
     },
     "./app/plugins/pluginViewRegistry": {
       "types": "./app/plugins/pluginViewRegistry.tsx",
@@ -92,21 +116,25 @@
     "test:api": "FUSION_DASHBOARD_DEEP=1 vitest run --project dashboard-api --silent=passed-only --reporter=dot",
     "test:deep": "FUSION_DASHBOARD_DEEP=1 vitest run --project dashboard-app --project dashboard-api --silent=passed-only --reporter=dot --exclude '**/build-output.test.ts'",
     "test:browser-smoke": "node scripts/browser-layout-smoke.mjs",
+    "test:touch-geometry": "vitest run --project dashboard-browser-touch --silent=passed-only --reporter=dot",
     "test:build": "pnpm build && FUSION_DASHBOARD_DEEP=1 vitest run --project dashboard-app --project dashboard-api --silent=passed-only --reporter=dot app/__tests__/build-output.test.ts src/__tests__/plugin-registry-dist.test.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.app.json",
     "test:quality:api:backfill-1": "node scripts/run-vitest-with-heap.mjs --heap=6144 run --project dashboard-api-quality-backfill --silent=passed-only --reporter=dot --shard=1/2",
     "test:quality:api:backfill-2": "node scripts/run-vitest-with-heap.mjs --heap=6144 run --project dashboard-api-quality-backfill --silent=passed-only --reporter=dot --shard=2/2"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.10.4",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-javascript": "^6.2.3",
     "@codemirror/lang-json": "^6.0.1",
     "@codemirror/lang-markdown": "^6.3.2",
-    "@codemirror/language": "^6.12.3",
-    "@codemirror/state": "^6.5.2",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.7.1",
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.36.4",
-    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@fontsource/pixelify-sans": "^5.3.0",
     "@fusion-plugin-examples/claude-runtime": "workspace:*",
     "@fusion-plugin-examples/cli-printing-press": "workspace:*",
     "@fusion-plugin-examples/compound-engineering": "workspace:*",
@@ -125,23 +153,23 @@
     "@fusion/i18n": "workspace:*",
     "@types/multer": "^2.1.0",
     "@xterm/addon-fit": "^0.10.0",
-    "@xterm/addon-search": "^0.15.0",
-    "@xterm/addon-unicode11": "^0.8.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/addon-webgl": "^0.18.0",
     "@xterm/xterm": "^5.5.0",
-    "@xyflow/react": "^12.11.0",
-    "archiver": "^7.0.1",
+    "@xyflow/react": "^12.11.2",
+    "archiver": "^8.0.0",
     "express": "^5.1.0",
     "html2canvas": "^1.4.1",
-    "i18next": "^26.3.1",
+    "i18next": "^26.3.6",
     "i18next-browser-languagedetector": "^8.2.1",
-    "i18next-resources-to-backend": "^1.2.1",
+    "i18next-resources-to-backend": "^1.2.2",
     "ioredis": "^5.6.0",
     "lucide-react": "^1.7.0",
     "mermaid": "^11.4.0",
     "multer": "^2.1.1",
-    "node-pty": "npm:@homebridge/node-pty-prebuilt-multiarch@^0.13.1",
+    "node-pty": "npm:@lydell/node-pty@1.2.0-beta.15",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -155,11 +183,14 @@
     "ws": "^8.18.0",
     "zod": "^3.25.76"
   },
+  "optionalDependencies": {
+    "sherpa-onnx-node": "1.13.4"
+  },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.5.0",
-    "@types/archiver": "^7.0.0",
+    "@types/archiver": "^8.0.0",
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
     "@types/qrcode": "^1.5.6",
@@ -167,12 +198,12 @@
     "@types/react-dom": "^19.0.0",
     "@types/ws": "^8.5.0",
     "@vitejs/plugin-react": "^4.3.0",
-    "@vitest/coverage-v8": "^4.1.0",
-    "jsdom": "^29.0.1",
-    "tinyrainbow": "^2.0.0",
+    "@vitest/coverage-v8": "^4.1.10",
+    "jsdom": "^29.1.1",
+    "tinyrainbow": "^3.1.1",
     "typescript": "^5.7.0",
     "vite": "^6.0.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.10"
   },
   "private": true
 }

@@ -1,3 +1,6 @@
+import { createLogger, createIngestedCheckResolver, resolveRequiredCheckNames, resolveWorkflowIrForTask, resolveReviewColumns, resolveReboundTarget, resolveTaskPrHeadBranch } from "@fusion/core";
+
+const severityAuditLog = createLogger("dashboard-register-git-github");
 import { type NextFunction, type Request, type Response } from "express";
 import { isAbsolute, resolve } from "node:path";
 import { realpathSync } from "node:fs";
@@ -17,7 +20,7 @@ import type {
   Task,
   TaskStore,
 } from "@fusion/core";
-import { classifyGhError, getCurrentRepo, isGhAuthenticated, loadWorkspaceConfig, resolveTaskGithubTracking } from "@fusion/core";
+import { addWorkspaceRepo, classifyGhError, detectWorkspaceRepos, getCurrentRepo, isGhAuthenticated, loadWorkspaceConfig, WorkspaceRepoValidationError } from "@fusion/core";
 import {
   dropAutostashHandle,
   generateSyntheticRunId,
@@ -37,10 +40,13 @@ import {
   rateLimited,
   unauthorized,
 } from "../api-error.js";
+// FNXC:TaskLookup404 2026-07-26-11:40: shared task-miss -> 404 mapping seam.
+import { isTaskLookupMiss, rethrowTaskApiError } from "./task-lookup-error.js";
 import { GitHubClient, buildGitHubIssueSource, isGitHubIssueAlreadyImported, type PrReviewSnapshot, parseBadgeUrl } from "../github.js";
 import { importIssueImageAttachments, githubImagePolicy } from "../issue-image-attachments.js";
 import { GitHubIssueCommentService } from "../github-issue-comment.js";
 import { GitHubTrackingCommentService } from "../github-tracking-comments.js";
+import { resolveImportedIssueGithubTracking } from "../github-tracking.js";
 import { GitHubTrackingStateService } from "../github-tracking-state.js";
 import { GitHubTrackingReconciler, RECONCILE_SCAN_LIMIT } from "../github-tracking-reconciler.js";
 import { GitHubSourceIssueCloseService } from "../github-source-issue-close.js";
@@ -48,6 +54,7 @@ import { GitLabIssueCommentService } from "../gitlab-issue-comment.js";
 import { GitLabTrackingCommentService } from "../gitlab-tracking-comments.js";
 import { GitLabTrackingStateService } from "../gitlab-tracking-state.js";
 import { GitLabSourceIssueCloseService } from "../gitlab-source-issue-close.js";
+import { GitLabDeleteCloseService } from "../gitlab-delete-close.js";
 import { KnowledgeIndexRefreshService } from "../knowledge-index-refresh.js";
 import { githubRateLimiter } from "../github-poll.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
@@ -92,6 +99,7 @@ function mapStructuredGhErrorToStatus(code: StructuredGhError["code"]): number {
       return 404;
     case "validation":
     case "merge-conflict":
+    case "merge-blocked-by-policy":
       return 422;
     default:
       return 502;
@@ -99,6 +107,16 @@ function mapStructuredGhErrorToStatus(code: StructuredGhError["code"]): number {
 }
 
 function toPrApiError(err: unknown, fallbackMessage: string): ApiError {
+  /*
+  FNXC:TaskLookup404 2026-07-26-11:50:
+  Every PR route pre-checks its task with getTask, so a task miss can reach the
+  GitHub-error classifier. classifyGhError knows nothing about task ids and would
+  label the miss a generic PR failure (500). Map it to 404 first so an unknown
+  task id is reported as gone rather than as a broken PR integration.
+  */
+  if (isTaskLookupMiss(err)) {
+    return notFound(err instanceof Error && err.message ? err.message : fallbackMessage);
+  }
   const githubError = classifyGhError(err);
   return new ApiError(mapStructuredGhErrorToStatus(githubError.code), githubError.message || fallbackMessage, {
     githubError,
@@ -209,6 +227,38 @@ function ensureSafeGitRef(value: string, fieldName = "branch"): string {
 function getExecErrorCode(error: unknown): number | undefined {
   const code = (error as { code?: unknown } | undefined)?.code;
   return typeof code === "number" ? code : undefined;
+}
+
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-30-22:40 (batch-core):
+"Is this card in a review lane?" for the PR routes below, resolved from the task's OWN workflow.
+
+MEMBERSHIP, so it takes the BROAD review set (`mergeOrchestration` u `mergeBlocker` u `humanReview`)
+rather than the single narrow lane: a board may declare a merge-orchestration lane AND a separate
+human sign-off lane, and a PR is legitimately opened from either. These guards only refuse or permit,
+never MOVE the card, so admitting one lane too many costs an operator nothing while admitting one too
+few refuses a request that should have worked.
+
+EMPTY MEANS UNEXPRESSED, NOT ABSENT — the v1 hazard, and the reason this is a shared helper rather
+than four inline resolutions. `synthesizeDefaultColumns` (workflow-ir.ts:158-159) upgrades a v1 graph
+by emitting every default column with `traits: []`, so a v1-upgraded workflow resolves to an EMPTY
+review set while its `in-review` column plainly exists and holds its cards. Treating empty as "this
+board has no review lane" would refuse these routes on every pre-v2 project. Empty therefore takes the
+same legacy fallback as an unresolvable workflow.
+
+The CLI twin of this guard is `fn pr create` (packages/cli/src/commands/pr.ts); the two must agree,
+which is why both resolve the same way.
+*/
+export async function reviewColumnsForTask(store: TaskStore, taskId: string): Promise<Set<string>> {
+  const ir = await resolveWorkflowIrForTask(store, taskId).catch(() => undefined);
+  const resolved = ir === undefined ? [] : resolveReviewColumns(ir);
+  return new Set(resolved.length > 0 ? resolved : ["in-review"]);
+}
+
+/** Renders a resolved review set for an operator-facing refusal, e.g. `'in-review'` or `'a' or 'b'`. */
+export function namedReviewColumns(columns: Set<string>): string {
+  return [...columns].map((c) => `'${c}'`).join(" or ");
 }
 
 async function runPrShellCommand(command: string, cwd: string, timeoutMs: number): Promise<string> {
@@ -363,7 +413,13 @@ async function computePrPreflight(task: Task, repoRoot: string, requestedBase?: 
   const defaultBaseBranch = requestedBase?.trim()
     ? ensureSafeGitRef(requestedBase, "base branch")
     : await resolveDefaultPrBaseBranch(task, repoRoot);
-  const head = `fusion/${task.id.toLowerCase()}`;
+  /*
+  FNXC:WorkspacePrHead 2026-08-20-03:38:
+  FN-9161 lets workspace tasks use one operator-supplied branch in every repository.
+  PR preflight must inspect that persisted working branch rather than inventing the
+  legacy task-derived ref, or a valid workspace branch appears absent.
+  */
+  const head = resolveTaskPrHeadBranch(task);
   const safeHead = ensureSafeGitRef(head, "head branch");
   const response: PrPreflightResponse = {
     branchOnRemote: false,
@@ -1466,7 +1522,7 @@ export async function pullGitBranch(cwd?: string, options?: PullGitBranchOptions
           // advanced, so downstream stash-pop and audit emission proceed.
           // The user's worktree just stays at its prior sha, matching today's
           // behavior. Logged loudly so the failure is visible.
-          console.warn(
+          severityAuditLog.warn(
             `[integration-pull] taskId=${taskId} worktree sync to ${localIntegrationTip.slice(0, 8)} failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
           );
         });
@@ -2136,34 +2192,6 @@ async function resolveImportedIssueTranslation(
   }
 }
 
-async function resolveImportedIssueGithubTracking(
-  store: TaskStore,
-  projectSettings: Awaited<ReturnType<TaskStore["getSettings"]>>,
-): Promise<{ enabled: true } | undefined> {
-  /*
-  FNXC:GithubImportTracking 2026-07-16-11:22:
-  FN-8115 shares the import request's project settings with translation and tracking, removing duplicate project-store reads after FN-8112 stabilized the prior test setup. The global settings read remains distinct because tracking precedence still requires it.
-  */
-  if (projectSettings.githubLinkImportedIssuesToTracking === true) {
-    /*
-    FNXC:GithubImportTracking 2026-07-01-00:00:
-    The imported-issue linking option is narrower than the general new-task default. Dashboard imports force githubTracking.enabled only for GitHub source issues so the post-create hook adopts sourceIssue instead of opening a separate Fusion tracking issue.
-    */
-    return { enabled: true };
-  }
-  const globalSettings = await store.getGlobalSettingsStore().getSettings();
-  const resolvedTracking = resolveTaskGithubTracking(
-    { githubTracking: undefined },
-    projectSettings,
-    globalSettings,
-  );
-  /*
-  FNXC:GithubImportTracking 2026-06-26-00:00:
-  Dashboard GitHub issue imports must mark tasks tracking-enabled only when project/global defaults resolve on. The post-create hook uses the GitHub sourceIssue to link source_issue_linked and prevents duplicate Fusion-created tracking issues.
-  */
-  return resolvedTracking.enabled ? { enabled: true } : undefined;
-}
-
 export function getDefaultGitHubRepo(store: TaskStore): { owner: string; repo: string } | null {
   const envRepo = process.env.GITHUB_REPOSITORY;
   if (envRepo) {
@@ -2216,14 +2244,14 @@ async function syncPrReviewsToTask(store: TaskStore, task: Task, snapshot: PrRev
   }
 }
 
-async function applyChangesRequestedTransition(
+export async function applyChangesRequestedTransition(
   store: TaskStore,
   task: Task,
   snapshot: PrReviewSnapshot,
   prInfo: PrInfo,
 ): Promise<void> {
   if (snapshot.decision !== "CHANGES_REQUESTED") return;
-  if (task.column !== "in-review") return;
+  if (!(await reviewColumnsForTask(store, task.id)).has(task.column)) return;
   if (task.prInfo?.lastReviewDecision === "CHANGES_REQUESTED") return;
 
   const reviewItems = snapshot.items.filter((item) => item.id.startsWith("gh-review-") && item.state === "CHANGES_REQUESTED");
@@ -2242,7 +2270,25 @@ async function applyChangesRequestedTransition(
     content: feedbackBody || "Reviewer requested changes.",
     author: "system",
   });
-  await store.moveTask(task.id, "todo", {
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-01:20 (#2780 review — greptile, and it caught my own half-conversion):
+  THE GUARD AND THE MOVE MUST RESOLVE THE SAME WAY.
+
+  Broadening the entry guard above to accept any resolved review lane, while leaving this move on the
+  literal `todo`, made the pair WORSE than before: on a board that renames its review lane but declares
+  no `todo`, the guard now admits the task and this move is then rejected. The card keeps its
+  review-feedback document, never re-enters rework, and sits in review looking handled. Before the
+  broadening it simply never got this far.
+
+  That is the half-converted-pair shape this program has hit repeatedly — a role-resolved guard in
+  front of a name-matched action. Whenever one half moves, the other has to move with it.
+
+  `resolveReboundTarget` is the shared answer for "where does a card go to be worked again": hold, else
+  intake, else the first declared column. `todo` stays only for a workflow that cannot be resolved.
+  */
+  const reboundIr = await resolveWorkflowIrForTask(store, task.id).catch(() => undefined);
+  const reworkColumn = (reboundIr === undefined ? undefined : resolveReboundTarget(reboundIr)) ?? "todo";
+  await store.moveTask(task.id, reworkColumn, {
     preserveProgress: true,
     preserveWorktree: true,
     moveSource: "engine",
@@ -2284,7 +2330,7 @@ export function resolvePrMergeMethod(
   }
 }
 
-async function mergeTaskPr(
+export async function mergeTaskPr(
   scopedStore: TaskStore,
   task: Task,
   token: string | undefined,
@@ -2307,9 +2353,29 @@ async function mergeTaskPr(
   const settings = await scopedStore.getSettings();
   const method = resolvePrMergeMethod(settings, task.prInfo, explicitMethod);
   const client = new GitHubClient(token);
+  const requiredCheckNames = resolveRequiredCheckNames(settings);
+/*
+  FNXC:DashboardPrMergeGate 2026-08-09-15:43:
+  The pre-flight getPrMergeStatus call runs before mergePr and fails closed with an unstructured 409 when readiness or the checked head SHA is absent. After mergePr fails, the catch block performs a distinct second refresh whose classifyGhError diagnosis owns the structured 422/502 and merged-reconciliation contract. Tests must sequence mockResolvedValueOnce calls for both stages: a blanket mock is consumed by pre-flight and hides post-failure diagnosis, the FN-8855 regression that left this suite red.
+  */
+  const resolveIngestedChecks = createIngestedCheckResolver(scopedStore.getAsyncLayer?.());
+  const mergeStatus = await client.getPrMergeStatus(repo.owner, repo.repo, task.prInfo.number, { requiredCheckNames, ...(resolveIngestedChecks ? { resolveIngestedChecks } : {}) });
+  const nativeAutoMerge = settings.githubNativeAutoMerge === true;
+  if (!nativeAutoMerge && !mergeStatus.mergeReady) {
+    throw conflict(`PR cannot merge: ${mergeStatus.blockingReasons.join("; ")}`);
+  }
+  if (!nativeAutoMerge && !mergeStatus.prInfo.headOid) {
+    throw conflict("PR cannot merge: GitHub did not provide a head commit ID for the checked PR");
+  }
 
   try {
-    const mergedPrInfo = await client.mergePr({ owner: repo.owner, repo: repo.repo, number: task.prInfo.number, method });
+    const mergedPrInfo = await client.mergePr({
+      owner: repo.owner,
+      repo: repo.repo,
+      number: task.prInfo.number,
+      method,
+      ...(nativeAutoMerge ? { auto: true } : { expectedHeadOid: mergeStatus.prInfo.headOid }),
+    });
     const updated = {
       ...task.prInfo,
       ...mergedPrInfo,
@@ -2321,24 +2387,66 @@ async function mergeTaskPr(
       draft: mergedPrInfo.draft ?? mergedPrInfo.isDraft,
     } satisfies PrInfo;
     await scopedStore.updatePrInfo(task.id, updated);
-    await scopedStore.applyPrMergedTransition(task.id, {
-      agentId: "dashboard",
-      runId: `${runIdPrefix}-${task.id}-${Date.now()}`,
-    });
+    // GitHub-native auto-merge is deferred; only a later refresh that observes merged may transition the task.
+    if (updated.status === "merged") {
+      await scopedStore.applyPrMergedTransition(task.id, {
+        agentId: "dashboard",
+        runId: `${runIdPrefix}-${task.id}-${Date.now()}`,
+      });
+    }
     return updated;
   } catch (error) {
-    const message = getCommandErrorMessage(error) || "Failed to merge pull request";
-    await scopedStore.updatePrInfo(task.id, {
+    let mergeStatus: Awaited<ReturnType<GitHubClient["getPrMergeStatus"]>> | undefined;
+    try {
+      mergeStatus = await client.getPrMergeStatus(repo.owner, repo.repo, task.prInfo.number, { requiredCheckNames, ...(resolveIngestedChecks ? { resolveIngestedChecks } : {}) });
+    } catch {
+      // A refresh failure cannot invent GitHub state; retain the original command diagnosis.
+    }
+
+    const refreshed = mergeStatus && {
       ...task.prInfo,
-      lastMergeError: message,
+      ...mergeStatus.prInfo,
+      autoMergeOnGreen: task.prInfo.autoMergeOnGreen,
+      autoMergeStrategy: task.prInfo.autoMergeStrategy,
+      manual: task.prInfo.manual,
+      draft: mergeStatus.prInfo.draft ?? mergeStatus.prInfo.isDraft,
+      lastCheckedAt: new Date().toISOString(),
+    } satisfies PrInfo;
+
+    if (refreshed?.status === "merged") {
+      await scopedStore.updatePrInfo(task.id, {
+        ...refreshed,
+        lastMergeError: undefined,
+        lastMergeErrorAt: undefined,
+      });
+      await scopedStore.applyPrMergedTransition(task.id, {
+        agentId: "dashboard",
+        runId: `${runIdPrefix}-${task.id}-${Date.now()}`,
+      });
+      return refreshed;
+    }
+
+    /*
+    FNXC:GitHubPrMerge 2026-08-09-01:02:
+    The direct route never reaches CLI lifecycle recovery, so it performs its
+    own single post-failure refresh before classifying ambiguous gh output.
+    Persist that state and structured policy diagnosis; only a confirmed merged
+    refresh may finalize the task, and a refresh failure retains the original error.
+    */
+    const diagnosis = classifyGhError(error, mergeStatus && {
+      mergeable: mergeStatus.mergeable,
+      reviewDecision: mergeStatus.reviewDecision,
+      blockingReasons: mergeStatus.blockingReasons,
+    });
+    const updated = {
+      ...(refreshed ?? task.prInfo),
+      lastMergeError: diagnosis.message,
       lastMergeErrorAt: new Date().toISOString(),
+    } satisfies PrInfo;
+    await scopedStore.updatePrInfo(task.id, updated);
+    throw new ApiError(mapStructuredGhErrorToStatus(diagnosis.code), diagnosis.message, {
+      githubError: diagnosis,
     });
-    const err = new ApiError(502, "Failed to merge pull request", {
-      code: "pr_merge_failed",
-      retryable: true,
-      error: message,
-    });
-    throw err;
   }
 }
 
@@ -2389,10 +2497,14 @@ export async function refreshPrInBackground(
     const client = new GitHubClient(token);
     const task = await store.getTask(taskId);
     const taskPrs = task ? getTaskPrList(task) : currentPrInfos;
+    const settings = await store.getSettings();
+    const requiredCheckNames = resolveRequiredCheckNames(settings);
+    const resolveIngestedChecks = createIngestedCheckResolver(store.getAsyncLayer?.());
+    const checkGateOptions = { requiredCheckNames, ...(resolveIngestedChecks ? { resolveIngestedChecks } : {}) };
 
     for (const currentPrInfo of taskPrs) {
-      const reviewSnapshot = await client.getPrReviewSnapshot(owner, repo, currentPrInfo.number);
-      const mergeStatus = await client.getPrMergeStatus(owner, repo, currentPrInfo.number);
+      const reviewSnapshot = await client.getPrReviewSnapshot(owner, repo, currentPrInfo.number, checkGateOptions);
+      const mergeStatus = await client.getPrMergeStatus(owner, repo, currentPrInfo.number, checkGateOptions);
       const prior = getTaskPrList(task).find((entry) => entry.number === currentPrInfo.number) ?? currentPrInfo;
       let conflictDiagnostics = mergeStatus.prInfo.conflictDiagnostics;
       if (mergeStatus.prInfo.mergeable === "conflicting" && mergeStatus.prInfo.headBranch && mergeStatus.prInfo.baseBranch) {
@@ -2404,7 +2516,7 @@ export async function refreshPrInBackground(
             directMergeCommitStrategy: options?.directMergeCommitStrategy,
           });
         } catch (err) {
-          console.error("[pr-conflict-diagnostics]", err);
+          severityAuditLog.error("[pr-conflict-diagnostics]", err);
         }
       } else {
         conflictDiagnostics = undefined;
@@ -2443,7 +2555,12 @@ export async function refreshPrInBackground(
 
       const lastMergeErrorAt = prior?.lastMergeErrorAt ? Date.parse(prior.lastMergeErrorAt) : Number.NaN;
       const recentlyFailed = Number.isFinite(lastMergeErrorAt) && Date.now() - lastMergeErrorAt < 5 * 60 * 1000;
-      if (prior?.autoMergeOnGreen && mergeStatus.mergeReady && !recentlyFailed) {
+      if (prior?.autoMergeOnGreen && (settings.githubNativeAutoMerge === true || mergeStatus.mergeReady) && !recentlyFailed) {
+        /*
+        FNXC:PrMergeAutoMerge 2026-08-09-11:47:
+        Native auto-merge must be armed while checks are pending so GitHub, rather
+        than Fusion polling, owns the wait-for-green transition and retries remain safe.
+        */
         await mergeTaskPr(store, task, token, undefined, "pr-refresh");
       }
     }
@@ -2560,16 +2677,43 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
 
   /**
    * GET /api/git/workspace-repos
-   * Returns the list of sub-repos for a workspace-mode project.
-   * Non-workspace projects return an empty array.
+   * Returns registered workspace repos, with candidates only when explicitly requested.
    */
   router.get("/git/workspace-repos", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const rootDir = resolveGitDir(req, scopedStore.getRootDir());
       const config = await loadWorkspaceConfig(rootDir);
-      res.json({ repos: config?.repos ?? [] });
+      if (!config) throw conflict("This project is not a workspace");
+      if (req.query.includeAvailable === "1") {
+        const available = (await detectWorkspaceRepos(rootDir)).filter((repo) => !config.repos.includes(repo));
+        res.json({ repos: config.repos, available });
+      } else {
+        res.json({ repos: config.repos });
+      }
     } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      rethrowAsApiError(err);
+    }
+  });
+
+  /*
+  FNXC:Workspace 2026-08-20-02:03:
+  workspace.json is the membership authority. Core serializes this idempotent write with mode
+  toggles, and executor acquisition refreshes disk membership without a process restart.
+  */
+  router.post("/git/workspace-repos", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const rootDir = resolveGitDir(req, scopedStore.getRootDir());
+      const repo = (req.body as { repo?: unknown } | undefined)?.repo;
+      if (typeof repo !== "string") throw badRequest("repo must be a string");
+      res.json(await addWorkspaceRepo(rootDir, repo));
+    } catch (err: unknown) {
+      if (err instanceof WorkspaceRepoValidationError) {
+        if (err.reason === "not-a-workspace") throw conflict("This project is not a workspace");
+        throw badRequest(`Invalid workspace repository: ${err.reason}`);
+      }
       if (err instanceof ApiError) throw err;
       rethrowAsApiError(err);
     }
@@ -2604,6 +2748,10 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
     const gitlabSourceIssueCloseService = new GitLabSourceIssueCloseService(store);
     gitlabSourceIssueCloseService.start();
     ctx.registerDispose(() => gitlabSourceIssueCloseService.stop());
+
+    const gitlabDeleteCloseService = new GitLabDeleteCloseService(store);
+    gitlabDeleteCloseService.start();
+    ctx.registerDispose(() => gitlabDeleteCloseService.stop());
 
     // U14 — incremental knowledge-index refresh on task completion. Listens for
     // task:moved → done and re-indexes just that task as a knowledge page.
@@ -2647,7 +2795,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
         reconcileSweepOffsetByStore.set(projectStore, nextOffset);
       } catch (err) {
         // runSweep isolates per-pass failures internally; this guards only unexpected orchestration errors.
-        console.warn(
+        severityAuditLog.warn(
           `[github-tracking-reconcile] sweep orchestration error: ${err instanceof Error ? err.message : String(err)}`,
         );
       } finally {
@@ -2665,6 +2813,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       githubSourceIssueCloseService.attach(projectStore);
       gitlabTrackingStateService.attach(projectStore);
       gitlabSourceIssueCloseService.attach(projectStore);
+      gitlabDeleteCloseService.attach(projectStore);
       // FNXC:Knowledge 2026-06-16-14:32:
       // Knowledge index refresh on task:moved→done must run for every registered project store, not just the primary.
       // Mirror the GitHubTrackingStateService/GitHubSourceIssueCloseService attach/detach lifecycle so non-primary
@@ -2729,6 +2878,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
         githubSourceIssueCloseService.detach(projectStore);
         gitlabTrackingStateService.detach(projectStore);
         gitlabSourceIssueCloseService.detach(projectStore);
+        gitlabDeleteCloseService.detach(projectStore);
         knowledgeIndexRefreshService.detach(projectStore);
       }
       githubTrackingStateService.stop();
@@ -2985,7 +3135,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
         res.json({ ...status, ...extended });
       } catch (extErr: unknown) {
         const message = extErr instanceof Error ? extErr.message : String(extErr);
-        console.warn(`[git-status] extended computation failed; returning basic status: ${message}`);
+        severityAuditLog.warn(`[git-status] extended computation failed; returning basic status: ${message}`);
         res.json(status);
       }
     } catch (err: unknown) {
@@ -4147,7 +4297,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
         const detail = await client.getIssueDetail(owner, repo, issueNumber);
         issueImageBodies.push(...detail.comments.map((comment) => comment.body));
       } catch (err) {
-        console.warn(
+        severityAuditLog.warn(
           `[fusion:github-import] Could not fetch comments for ${owner}/${repo}#${issueNumber}; importing body images only: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
@@ -4168,7 +4318,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
         } catch (error) {
           // FNXC:IssueImportAttachments 2026-07-15-14:10: Post-create audit
           // telemetry is best-effort; never turn a stored task into a failed import.
-          console.warn(`[fusion:github-import] Could not log image attachments for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+          severityAuditLog.warn(`[fusion:github-import] Could not log image attachments for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 
@@ -4453,7 +4603,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
               const detail = await githubClient.getIssueDetail(owner, repo, issueNumber);
               batchImageBodies.push(...detail.comments.map((comment) => comment.body));
             } catch (err) {
-              console.warn(
+              severityAuditLog.warn(
                 `[fusion:github-import] Could not fetch comments for ${owner}/${repo}#${issueNumber}; importing body images only: ${err instanceof Error ? err.message : String(err)}`,
               );
             }
@@ -4477,7 +4627,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
                 sourceUrl,
               );
             } catch (error) {
-              console.warn(`[fusion:github-import] Could not log image attachments for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+              severityAuditLog.warn(`[fusion:github-import] Could not log image attachments for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
 
@@ -5168,7 +5318,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-          if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          if (isTaskLookupMiss(err)) {
             appendBatchStatusError(results, taskId, `Task ${taskId} not found`);
           } else {
             appendBatchStatusError(results, taskId, err instanceof Error ? err.message : String(err) || `Failed to load task ${taskId}`);
@@ -5311,8 +5461,9 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
 
       // Get task and validate
       const task = await scopedStore.getTask(req.params.id);
-      if (task.column !== "in-review") {
-        throw badRequest("Task must be in 'in-review' column to create a PR");
+      const prReviewColumns = await reviewColumnsForTask(scopedStore, task.id);
+      if (!prReviewColumns.has(task.column)) {
+        throw badRequest(`Task must be in ${namedReviewColumns(prReviewColumns)} column to create a PR`);
       }
 
       if (!title || typeof title !== "string") {
@@ -5326,8 +5477,8 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
 
       const existingPrs = getTaskPrList(task);
 
-      // Determine branch name from task
-      const branchName = `fusion/${task.id.toLowerCase()}`;
+      // FNXC:WorkspacePrHead 2026-08-20-03:38: PR creation follows the task's persisted working branch, including an operator-supplied workspace branch.
+      const branchName = resolveTaskPrHeadBranch(task);
 
       // Get owner/repo from git remote or GITHUB_REPOSITORY env
       let owner: string;
@@ -5396,7 +5547,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       } else if ((err instanceof Error ? err.message : String(err)).includes("already exists")) {
         throw conflict(err instanceof Error ? err.message : String(err));
@@ -5416,8 +5567,9 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const task = await scopedStore.getTask(req.params.id);
-      if (task.column !== "in-review") {
-        throw badRequest("Task must be in 'in-review' column to push PR branch");
+      const pushReviewColumns = await reviewColumnsForTask(scopedStore, task.id);
+      if (!pushReviewColumns.has(task.column)) {
+        throw badRequest(`Task must be in ${namedReviewColumns(pushReviewColumns)} column to push PR branch`);
       }
 
       if (req.body?.base !== undefined && typeof req.body.base !== "string") {
@@ -5428,7 +5580,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const requestedBase = typeof req.body?.base === "string" ? req.body.base.trim() : "";
       const defaultBaseBranch = requestedBase || await resolveDefaultPrBaseBranch(task, repoRoot);
       const baseBranch = ensureSafeGitRef(defaultBaseBranch, "base branch");
-      const head = ensureSafeGitRef(`fusion/${task.id.toLowerCase()}`, "head branch");
+      const head = ensureSafeGitRef(resolveTaskPrHeadBranch(task), "head branch");
       const headRef = `refs/heads/${head}`;
       const baseRef = await resolvePrBaseRef(repoRoot, baseBranch).catch(() => baseBranch);
 
@@ -5466,7 +5618,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       if ((err instanceof Error ? err.message : String(err)).includes("already exists")) {
@@ -5485,8 +5637,9 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
     try {
       const { store: scopedStore, engine } = await getProjectContext(req);
       const task = await scopedStore.getTask(req.params.id);
-      if (task.column !== "in-review") {
-        throw badRequest("Task must be in 'in-review' column to resolve PR conflicts");
+      const conflictReviewColumns = await reviewColumnsForTask(scopedStore, task.id);
+      if (!conflictReviewColumns.has(task.column)) {
+        throw badRequest(`Task must be in ${namedReviewColumns(conflictReviewColumns)} column to resolve PR conflicts`);
       }
 
       if (req.body?.base !== undefined && typeof req.body.base !== "string") {
@@ -5508,7 +5661,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const requestedBase = typeof req.body?.base === "string" ? req.body.base.trim() : "";
       const defaultBaseBranch = requestedBase || await resolveDefaultPrBaseBranch(task, repoRoot);
       const baseBranch = ensureSafeGitRef(defaultBaseBranch, "base branch");
-      const head = ensureSafeGitRef(`fusion/${task.id.toLowerCase()}`, "head branch");
+      const head = ensureSafeGitRef(resolveTaskPrHeadBranch(task), "head branch");
       const baseRef = await resolvePrBaseRef(repoRoot, baseBranch).catch(() => baseBranch);
 
       /*
@@ -5551,7 +5704,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       throw toPrApiError(err, "Failed to resolve PR conflicts");
@@ -5620,7 +5773,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Failed to generate PR metadata");
@@ -5646,7 +5799,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Failed to load PR preflight");
@@ -5737,7 +5890,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Failed to load PR options");
@@ -5787,7 +5940,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       } else {
         rethrowAsApiError(err);
@@ -5841,6 +5994,8 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       }
 
       const settings = await scopedStore.getSettings();
+      const resolveIngestedChecks = createIngestedCheckResolver(scopedStore.getAsyncLayer?.());
+      const checkGateOptions = { requiredCheckNames: resolveRequiredCheckNames(settings), ...(resolveIngestedChecks ? { resolveIngestedChecks } : {}) };
       const client = new GitHubClient();
       const refreshedEntries: Array<{
         prInfo: PrInfo;
@@ -5857,8 +6012,8 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       for (let i = 0; i < prList.length; i += batchSize) {
         const batch = prList.slice(i, i + batchSize);
         const results = await Promise.all(batch.map(async (priorPr) => {
-          const reviewSnapshot = await client.getPrReviewSnapshot(owner, repo, priorPr.number);
-          const mergeStatus = await client.getPrMergeStatus(owner, repo, priorPr.number);
+          const reviewSnapshot = await client.getPrReviewSnapshot(owner, repo, priorPr.number, checkGateOptions);
+          const mergeStatus = await client.getPrMergeStatus(owner, repo, priorPr.number, checkGateOptions);
           let conflictDiagnostics = mergeStatus.prInfo.conflictDiagnostics;
           if (mergeStatus.prInfo.mergeable === "conflicting" && mergeStatus.prInfo.headBranch && mergeStatus.prInfo.baseBranch) {
             try {
@@ -5869,7 +6024,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
                 directMergeCommitStrategy: settings.directMergeCommitStrategy,
               });
             } catch (err) {
-              console.error("[pr-conflict-diagnostics]", err);
+              severityAuditLog.error("[pr-conflict-diagnostics]", err);
             }
           } else {
             conflictDiagnostics = undefined;
@@ -5942,7 +6097,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       throw toPrApiError(err, "Failed to refresh PR status");
@@ -5971,7 +6126,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       res.json({ task: updatedTask, prInfos: getTaskPrList(updatedTask) });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       rethrowAsApiError(err, "Failed to unlink pull request");
@@ -6002,7 +6157,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       res.json({ queued: true });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
-      rethrowAsApiError(err, "Failed to queue PR conflict reclaim");
+      rethrowTaskApiError(err, req.params.id, "Failed to queue PR conflict reclaim");
     }
   });
 
@@ -6070,7 +6225,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       res.json({ prInfo });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
-      rethrowAsApiError(err, "Failed to set PR auto-merge");
+      rethrowTaskApiError(err, req.params.id, "Failed to set PR auto-merge");
     }
   });
 
@@ -6127,7 +6282,9 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       }
 
       const client = new GitHubClient();
-      const snapshot = await client.getPrReviewSnapshot(owner, repo, primaryPr.number);
+      const requiredCheckNames = resolveRequiredCheckNames(await scopedStore.getSettings());
+      const resolveIngestedChecks = createIngestedCheckResolver(scopedStore.getAsyncLayer?.());
+      const snapshot = await client.getPrReviewSnapshot(owner, repo, primaryPr.number, { requiredCheckNames, ...(resolveIngestedChecks ? { resolveIngestedChecks } : {}) });
       const fusionThread = (task.comments ?? []).filter((comment) =>
         comment.source === "github-review" || comment.source === "github-review-comment"
       );
@@ -6141,7 +6298,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       }
       throw toPrApiError(err, "Failed to fetch PR reviews");
@@ -6201,7 +6358,9 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       }
 
       const client = new GitHubClient();
-      const checksResult = await client.getAllPrChecks(owner, repo, primaryPr.number);
+      const requiredCheckNames = resolveRequiredCheckNames(await scopedStore.getSettings());
+      const resolveIngestedChecks = createIngestedCheckResolver(scopedStore.getAsyncLayer?.());
+      const checksResult = await client.getAllPrChecks(owner, repo, primaryPr.number, { requiredCheckNames, ...(resolveIngestedChecks ? { resolveIngestedChecks } : {}) });
 
       res.json({
         checks: checksResult.checks,
@@ -6213,7 +6372,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       } else {
         throw toPrApiError(err, "Failed to fetch PR checks");
@@ -6252,7 +6411,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       } else {
         rethrowAsApiError(err);
@@ -6328,7 +6487,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isTaskLookupMiss(err)) {
         throw notFound(`Task ${req.params.id} not found`);
       } else if ((err instanceof Error ? err.message : String(err)).includes("not found")) {
         throw notFound(err instanceof Error ? err.message : String(err));

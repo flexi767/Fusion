@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CONSECUTIVE_TOOL_FAILURE_RETRY_THRESHOLD, DEFAULT_CONSECUTIVE_TOOL_FAILURE_RETRY_BACKOFF_MS, DEFAULT_MAX_CONSECUTIVE_TOOL_FAILURE_RETRIES, DEFAULT_MAX_AUTO_MERGE_RETRIES, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries } from "../in-review-stall.js";
-import { isExperimentalFeatureEnabled } from "../experimental-features.js";
-import { DEFAULT_GLOBAL_SETTINGS, DEFAULT_PROJECT_SETTINGS, GLOBAL_SETTINGS_KEYS, PROJECT_SETTINGS_KEYS, isGlobalOnlySettingsKey } from "../settings-schema.js";
-import { isWorkflowColumnsEnabled } from "../workflow-columns-settings.js";
+import { CONSECUTIVE_TOOL_FAILURE_RETRY_THRESHOLD, DEFAULT_CONSECUTIVE_TOOL_FAILURE_RETRY_BACKOFF_MS, DEFAULT_IN_REVIEW_STALL_DEADLOCK_THRESHOLD, DEFAULT_MAX_CONSECUTIVE_TOOL_FAILURE_RETRIES, DEFAULT_MAX_AUTO_MERGE_RETRIES, resolveConsecutiveToolFailureRetryBackoffMs, resolveInReviewStallDeadlockThreshold, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries } from "../tasks/in-review-stall.js";
+import { CHAT_FOCUS_FLAG, WHITEBOARD_VIEW_FLAG, isExperimentalFeatureEnabled } from "../config/experimental-features.js";
+import { DEFAULT_GLOBAL_SETTINGS, DEFAULT_PROJECT_SETTINGS, GLOBAL_SETTINGS_KEYS, PROJECT_SETTINGS_KEYS, isGlobalOnlySettingsKey, isGlobalSettingsKey, isProjectSettingsKey } from "../config/settings-schema.js";
 import {
   __resetLegacyCwdMainWarningForTests,
   normalizeMergeIntegrationWorktreeMode,
@@ -11,7 +10,7 @@ import {
   resolveWorktrunkSettings,
   requiresWorktrunkInstallVerification,
   validateWorktrunkSettings,
-} from "../worktrunk-settings.js";
+} from "../config/worktrunk-settings.js";
 
 describe("settings defaults invariants", () => {
   afterEach(() => {
@@ -28,6 +27,15 @@ describe("settings defaults invariants", () => {
     expect(DEFAULT_PROJECT_SETTINGS.worktreesDir).toBeUndefined();
   });
 
+  it("defaults unchanged in-review stall disposal to ten observations", () => {
+    expect(DEFAULT_IN_REVIEW_STALL_DEADLOCK_THRESHOLD).toBe(10);
+    expect(DEFAULT_PROJECT_SETTINGS.inReviewStallDeadlockThreshold).toBe(DEFAULT_IN_REVIEW_STALL_DEADLOCK_THRESHOLD);
+    expect(resolveInReviewStallDeadlockThreshold(undefined)).toBe(10);
+    expect(resolveInReviewStallDeadlockThreshold({ inReviewStallDeadlockThreshold: "unknown" })).toBe(10);
+    expect(resolveInReviewStallDeadlockThreshold({ inReviewStallDeadlockThreshold: 3 })).toBe(3);
+    expect(resolveInReviewStallDeadlockThreshold({ inReviewStallDeadlockThreshold: 0 })).toBe(0);
+  });
+
   it("defaults local network discovery on and keeps its opt-out global-only", () => {
     expect(DEFAULT_GLOBAL_SETTINGS.localNetworkDiscoveryEnabled).toBe(true);
     expect(GLOBAL_SETTINGS_KEYS).toContain("localNetworkDiscoveryEnabled");
@@ -36,10 +44,30 @@ describe("settings defaults invariants", () => {
     expect(isGlobalOnlySettingsKey("localNetworkDiscoveryEnabled")).toBe(true);
   });
 
-  it("keeps the embedded PostgreSQL connection cap global and high by default", () => {
-    expect(DEFAULT_GLOBAL_SETTINGS.embeddedPostgresMaxConnections).toBe(500);
+  it("keeps the embedded PostgreSQL connection cap global and schema-unset so the server resolves a platform-aware default", () => {
+    /*
+    FNXC:PostgresEmbedded 2026-07-22-23:55:
+    Issue #2411: the schema default must stay undefined. getSettings() merges
+    DEFAULT_GLOBAL_SETTINGS, so a concrete value here would look operator-set and
+    defeat resolveEmbeddedMaxConnections' win32-lowered default (150 vs 500).
+    */
+    expect(DEFAULT_GLOBAL_SETTINGS.embeddedPostgresMaxConnections).toBeUndefined();
     expect(GLOBAL_SETTINGS_KEYS).toContain("embeddedPostgresMaxConnections");
     expect(PROJECT_SETTINGS_KEYS).not.toContain("embeddedPostgresMaxConnections");
+  });
+
+  it("rejects the retired auto-reload opt-out key", () => {
+    // FNXC:VersionAutoReload 2026-08-23-04:03: FN-171 makes version-change reload mandatory, so re-adding this key would resurrect an opt-out.
+    expect(isGlobalSettingsKey("autoReloadOnVersionChange")).toBe(false);
+    expect(GLOBAL_SETTINGS_KEYS).not.toContain("autoReloadOnVersionChange");
+    expect(Object.hasOwn(DEFAULT_GLOBAL_SETTINGS, "autoReloadOnVersionChange")).toBe(false);
+  });
+
+  it("keeps global chat snippets schema-present but unset to avoid a shared mutable array", () => {
+    expect(DEFAULT_GLOBAL_SETTINGS.chatSnippets).toBeUndefined();
+    expect(Object.hasOwn(DEFAULT_GLOBAL_SETTINGS, "chatSnippets")).toBe(true);
+    expect(GLOBAL_SETTINGS_KEYS).toContain("chatSnippets");
+    expect(PROJECT_SETTINGS_KEYS).not.toContain("chatSnippets");
   });
 
   it("defaults dashboard keyboard shortcuts globally", () => {
@@ -64,7 +92,20 @@ describe("settings defaults invariants", () => {
     expect(isExperimentalFeatureEnabled(undefined, "workflowGraphExecutor")).toBe(false);
     expect(isExperimentalFeatureEnabled(undefined, "workflowInterpreterDualObserve")).toBe(false);
     expect(isExperimentalFeatureEnabled({ experimentalFeatures: { workflowInterpreterDualObserve: true } }, "workflowInterpreterDualObserve")).toBe(false);
-    expect(isWorkflowColumnsEnabled({ experimentalFeatures: { workflowColumns: false } })).toBe(true);
+  });
+
+  it("keeps Whiteboard Alpha experimental and default off", () => {
+    expect(isExperimentalFeatureEnabled(undefined, WHITEBOARD_VIEW_FLAG)).toBe(false);
+    expect(isExperimentalFeatureEnabled({ experimentalFeatures: {} }, WHITEBOARD_VIEW_FLAG)).toBe(false);
+    expect(isExperimentalFeatureEnabled({ experimentalFeatures: { whiteboardView: false } }, WHITEBOARD_VIEW_FLAG)).toBe(false);
+    expect(isExperimentalFeatureEnabled({ experimentalFeatures: { whiteboardView: true } }, WHITEBOARD_VIEW_FLAG)).toBe(true);
+  });
+
+  it("keeps chat focus experimental and default off", () => {
+    expect(isExperimentalFeatureEnabled(undefined, CHAT_FOCUS_FLAG)).toBe(false);
+    expect(isExperimentalFeatureEnabled({ experimentalFeatures: {} }, CHAT_FOCUS_FLAG)).toBe(false);
+    expect(isExperimentalFeatureEnabled({ experimentalFeatures: { chatFocus: false } }, CHAT_FOCUS_FLAG)).toBe(false);
+    expect(isExperimentalFeatureEnabled({ experimentalFeatures: { chatFocus: true } }, CHAT_FOCUS_FLAG)).toBe(true);
   });
 
   it("defaults maxAutoMergeRetries to the historical project-scoped cap", () => {
@@ -162,16 +203,8 @@ describe("settings defaults invariants", () => {
     expect(DEFAULT_PROJECT_SETTINGS.useAiMergeCommitSummary).toBe(true);
   });
 
-  describe("recycleWorktrees default", () => {
-    it("keeps recycleWorktrees explicitly false in project defaults", () => {
-      expect(DEFAULT_PROJECT_SETTINGS.recycleWorktrees).toBe(false);
-      expect("recycleWorktrees" in DEFAULT_PROJECT_SETTINGS).toBe(true);
-    });
-
-    it("keeps recycleWorktrees project-scoped only", () => {
-      // recycleWorktrees intentionally has no DEFAULT_GLOBAL_SETTINGS counterpart.
-      expect("recycleWorktrees" in DEFAULT_GLOBAL_SETTINGS).toBe(false);
-    });
+  it("keeps GitHub native PR auto-merge opt-in", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.githubNativeAutoMerge).toBe(false);
   });
 
   describe("showWorktreeGrouping default", () => {
@@ -238,6 +271,18 @@ describe("settings defaults invariants", () => {
     });
   });
 
+  describe("chatMessageLayout default", () => {
+    it("defaults to bubbles and keeps the setting project-scoped", () => {
+      expect(DEFAULT_PROJECT_SETTINGS.chatMessageLayout).toBe("bubbles");
+      expect("chatMessageLayout" in DEFAULT_PROJECT_SETTINGS).toBe(true);
+      expect(PROJECT_SETTINGS_KEYS).toContain("chatMessageLayout");
+      expect(isProjectSettingsKey("chatMessageLayout")).toBe(true);
+      expect("chatMessageLayout" in DEFAULT_GLOBAL_SETTINGS).toBe(false);
+      expect(GLOBAL_SETTINGS_KEYS).not.toContain("chatMessageLayout");
+      expect(isGlobalOnlySettingsKey("chatMessageLayout")).toBe(false);
+    });
+  });
+
   describe("taskDetailChatFirst default", () => {
     it("keeps taskDetailChatFirst explicitly false in project defaults", () => {
       expect(DEFAULT_PROJECT_SETTINGS.taskDetailChatFirst).toBe(false);
@@ -283,6 +328,26 @@ describe("settings defaults invariants", () => {
     });
   });
 
+  describe("quickAddSubmitOnEnter default", () => {
+    it("defaults Quick Add Enter submission on and global-scoped only", () => {
+      expect(DEFAULT_GLOBAL_SETTINGS.quickAddSubmitOnEnter).toBe(true);
+      expect(GLOBAL_SETTINGS_KEYS).toContain("quickAddSubmitOnEnter");
+      expect("quickAddSubmitOnEnter" in DEFAULT_PROJECT_SETTINGS).toBe(false);
+      expect(PROJECT_SETTINGS_KEYS).not.toContain("quickAddSubmitOnEnter");
+      expect(isGlobalOnlySettingsKey("quickAddSubmitOnEnter")).toBe(true);
+    });
+  });
+
+  describe("chatSubmitOnEnter default", () => {
+    it("defaults chat Enter submission to automatic and global-scoped only", () => {
+      expect(DEFAULT_GLOBAL_SETTINGS.chatSubmitOnEnter).toBe("auto");
+      expect(GLOBAL_SETTINGS_KEYS).toContain("chatSubmitOnEnter");
+      expect("chatSubmitOnEnter" in DEFAULT_PROJECT_SETTINGS).toBe(false);
+      expect(PROJECT_SETTINGS_KEYS).not.toContain("chatSubmitOnEnter");
+      expect(isGlobalOnlySettingsKey("chatSubmitOnEnter")).toBe(true);
+    });
+  });
+
   describe("mergeIntegrationWorktree default", () => {
     it("defaults project settings to reuse-task-worktree", () => {
       expect(DEFAULT_PROJECT_SETTINGS.mergeIntegrationWorktree).toBe("reuse-task-worktree");
@@ -300,8 +365,23 @@ describe("settings defaults invariants", () => {
       expect(normalizeMergeIntegrationWorktreeMode("cwd-main")).toBe("cwd-integration-branch");
       expect(normalizeMergeIntegrationWorktreeMode("cwd-main")).toBe("cwd-integration-branch");
 
+      /*
+      FNXC:EngineDiagnostics 2026-07-30-18:00:
+      Asserted with a CONTAINS check, because the logger deliberately wraps every message in a
+      machine-readable severity marker — `withSeverityMarker` (logger.ts:31) prepends an
+      `fnlvl=<level>` marker plus a `[core-merge-policy]` subsystem tag. Pinning the raw string
+      coupled this case to log FORMATTING rather than to the behaviour it exists to check, so it
+      broke when that convention landed.
+
+      Same defect and same fix as the audit-emitter assertion in central-archive-secrets (PR #2675).
+      Two instances is a pattern: `toHaveBeenCalledWith` on a logger is brittle by construction here,
+      because the logger's job is to decorate the message.
+
+      What this case actually cares about — warn-once semantics, and that the warning names the legacy
+      value and its replacement — is unchanged and still fully asserted.
+      */
       expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(warnSpy).toHaveBeenCalledWith(
+      expect(String(warnSpy.mock.calls[0]![0])).toContain(
         "[merger] settings.mergeIntegrationWorktree=cwd-main is legacy; normalized to cwd-integration-branch",
       );
     });
@@ -328,8 +408,12 @@ describe("settings defaults invariants", () => {
     expect(resolveMaxConsecutiveToolFailureRetries({ executorToolFailureRetryCount: -1 })).toBe(2);
     expect(resolveConsecutiveToolFailureRetryBackoffMs({ executorToolFailureRetryBackoffMs: 2500.9 })).toBe(2500);
     expect(resolveConsecutiveToolFailureRetryBackoffMs({ executorToolFailureRetryBackoffMs: Infinity })).toBe(2000);
+    expect(resolveConsecutiveToolFailureThreshold(undefined)).toBe(1);
+    expect(resolveConsecutiveToolFailureThreshold({})).toBe(1);
+    expect(resolveConsecutiveToolFailureThreshold({ executorToolFailureThreshold: Number.NaN })).toBe(1);
+    expect(resolveConsecutiveToolFailureThreshold({ executorToolFailureThreshold: 0.5 })).toBe(1);
     expect(resolveConsecutiveToolFailureThreshold({ executorToolFailureThreshold: 3.9 })).toBe(3);
-    expect(resolveConsecutiveToolFailureThreshold({ executorToolFailureThreshold: 0.5 })).toBe(3);
+    expect(resolveConsecutiveToolFailureThreshold({ executorToolFailureThreshold: 4 })).toBe(4);
   });
 
 });

@@ -1,9 +1,11 @@
+import { ViewHeader } from "./ViewHeader";
+import { ViewLayoutContent } from "./ViewLayout";
 // Base ActivityLogModal styles (.activity-log-*, .activity-icon, etc.) currently live
 // in ScriptsModal.css. Until fully extracted, import that file so this eager modal is styled.
 import "./ScriptsModal.css";
 // Embedded (right-dock) activity-log styles were extracted to their own file next to this component.
 import "./ActivityLogModal.css";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, type Ref } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { X, History, Trash2, Filter, RefreshCw, CheckCircle, XCircle, ArrowRight, Plus, Settings, AlertCircle, Loader2, Folder } from "lucide-react";
@@ -13,6 +15,8 @@ import { useEmbeddedPresentation, type ModalPresentation } from "../hooks/useEmb
 import type { Task, ProjectInfo } from "@fusion/core";
 import { linkifyFilePaths } from "../utils/filePathLinkify";
 import { getRelativeTimeBucket } from "../utils/relativeTimeAgo";
+import { FloatingWindow } from "./FloatingWindow";
+import { useAutoPaginationSentinel } from "../hooks/useAutoPaginationSentinel";
 
 interface ActivityLogModalProps {
   isOpen: boolean;
@@ -131,17 +135,24 @@ export function ActivityLogModal({
   const EVENT_TYPE_LABELS = getEventTypeLabels(t);
   const [filteredType, setFilteredType] = useState<ActivityEventType | "all">("all");
   const [filteredProjectId, setFilteredProjectId] = useState<string | "all">(projectId || "all");
+  const [taskIdSearch, setTaskIdSearch] = useState("");
   const [showConfirmClear, setShowConfirmClear] = useState(false);
-  
+
   // Sync with external projectId prop
   useEffect(() => {
     setFilteredProjectId(projectId || "all");
   }, [projectId]);
-  
+
   // Convert filters to the format expected by useActivityLog
   const activityType = filteredType === "all" ? undefined : filteredType;
   const activeProjectId = filteredProjectId === "all" ? undefined : filteredProjectId;
-  
+  /*
+  FNXC:ActivityLogTaskSearch 2026-08-20-04:17:
+  The shared modal and embedded dock pass one canonical task ID to durable read boundaries. Blank input stays
+  undefined so it restores unfiltered history; normalization makes operator casing irrelevant without broad search.
+  */
+  const taskId = taskIdSearch.trim().toUpperCase() || undefined;
+
   // Determine data source:
   // - In project view (currentProject set): use per-project activity log (/api/activity)
   //   which is always populated with task lifecycle events for the current project.
@@ -152,15 +163,17 @@ export function ActivityLogModal({
   const useCentralFeed = !currentProject && projects.length > 0;
 
   // Use the hook for data fetching
-  const { 
-    entries, 
-    loading: isLoading, 
-    error, 
-    refresh, 
-    hasMore 
-  } = useActivityLog({ 
-    projectId: activeProjectId, 
-    type: activityType, 
+  const {
+    entries,
+    loading: isLoading,
+    error,
+    refresh,
+    hasMore,
+    loadMore,
+  } = useActivityLog({
+    projectId: activeProjectId,
+    type: activityType,
+    taskId,
     limit: 100,
     autoRefresh: isOpen,
     useCentralFeed,
@@ -219,7 +232,24 @@ export function ActivityLogModal({
   }, [isOpen, escapeEnabled, onClose, showConfirmClear]);
 
   // Determine if any filter is active
-  const isFilterActive = filteredType !== "all" || filteredProjectId !== "all";
+  const isFilterActive = filteredType !== "all" || filteredProjectId !== "all" || taskId !== undefined;
+
+  const clearFilters = () => {
+    setFilteredType("all");
+    setFilteredProjectId("all");
+    setTaskIdSearch("");
+    onProjectFilterChange?.(undefined);
+  };
+
+  const activityScrollRef = useRef<HTMLDivElement | null>(null);
+  const activityPagination = useAutoPaginationSentinel({
+    rootRef: activityScrollRef,
+    hasMore,
+    loading: isLoading,
+    onLoadMore: loadMore,
+    direction: "end",
+    enabled: isOpen,
+  });
 
   if (!isOpen) return null;
 
@@ -232,12 +262,27 @@ export function ActivityLogModal({
         className={isEmbedded ? "modal modal-lg activity-log-modal activity-log-modal--embedded" : "modal modal-lg activity-log-modal"}
         data-testid="activity-log-modal"
       >
-        {/* Header — uses shared modal-header pattern for consistent close control */}
-        <div className="modal-header activity-log-header">
-          <div className="activity-log-title">
-            <History size={18} />
-            <span>{t("activityLog.title", "Activity Log")}</span>
-          </div>
+        {/*
+        FNXC:StandardizedViewLayout 2026-09-13-22:40:
+        FN-379 makes History a classified destination: its title, filters, and exit are built by the shared
+        ViewHeader inside the canonical header zone instead of a local modal-header row, so the embedded dock,
+        the floating window, and the phone drawer all frame the same single chrome owner.
+        */}
+        <ViewHeader
+          className="modal-header activity-log-header"
+          title={
+            <span className="activity-log-title">
+              <History size={18} />
+              <span>{t("activityLog.title", "Activity Log")}</span>
+            </span>
+          }
+          onClose={isEmbedded ? undefined : onClose}
+          closeButtonProps={{
+            "aria-label": t("actions.close", "Close"),
+            title: t("actions.close", "Close"),
+            "data-testid": "activity-close",
+          }}
+          actions={
           <div className="activity-log-actions">
             {/* Project filter dropdown (when projects provided) */}
             {projects.length > 0 && (
@@ -299,25 +344,25 @@ export function ActivityLogModal({
               </button>
             )}
           </div>
-          {/* Close button — uses shared modal-close for consistent sizing and alignment.
-              FNXC:RightDockEmbedded 2026-06-22-00:00: Dropped in embedded mode; the dock provides its own close. */}
-          {!isEmbedded && (
-            <button
-              className="modal-close"
-              onClick={onClose}
-              aria-label={t("actions.close", "Close")}
-              title={t("actions.close", "Close")}
-              data-testid="activity-close"
-            >
-              ×
-            </button>
-          )}
-        </div>
+          }
+        />
 
-        {/* Active filters display */}
-        {isFilterActive && (
-          <div className="activity-log-active-filters">
-            <span className="activity-log-filter-label">{t("activityLog.activeFilters", "Active filters:")}</span>
+        {/* Task search remains inline in every presentation; the active badges compose beside it. */}
+        <div className="activity-log-active-filters">
+          <label className="activity-log-task-search-label" htmlFor="activity-log-task-search">
+            {t("activityLog.taskId", "Task ID")}
+          </label>
+          <input
+            id="activity-log-task-search"
+            className="input activity-log-task-search"
+            data-testid="activity-task-search"
+            type="search"
+            value={taskIdSearch}
+            onChange={(event) => setTaskIdSearch(event.target.value)}
+            placeholder={t("activityLog.taskIdSearchPlaceholder", "Search task ID (e.g. FN-066)")}
+            aria-label={t("activityLog.taskIdSearchPlaceholder", "Search task ID (e.g. FN-066)")}
+          />
+          {isFilterActive && <span className="activity-log-filter-label">{t("activityLog.activeFilters", "Active filters:")}</span>}
             {filteredProjectId !== "all" && (
               <span className="activity-log-filter-badge">
                 {t("activityLog.projectFilterBadge", "Project: {{project}}", { project: projects.find(p => p.id === filteredProjectId)?.name || filteredProjectId })}
@@ -328,21 +373,21 @@ export function ActivityLogModal({
                 {t("activityLog.typeFilterBadge", "Type: {{type}}", { type: EVENT_TYPE_LABELS[filteredType] })}
               </span>
             )}
-            <button
+            {taskId && (
+              <span className="activity-log-filter-badge">
+                {t("activityLog.taskIdFilterBadge", "Task: {{taskId}}", { taskId })}
+              </span>
+            )}
+            {isFilterActive && <button
               className="activity-log-clear-filters"
-              onClick={() => {
-                setFilteredType("all");
-                setFilteredProjectId("all");
-                onProjectFilterChange?.(undefined);
-              }}
+              onClick={clearFilters}
             >
               {t("activityLog.clearFilters", "Clear all")}
-            </button>
+            </button>}
           </div>
-        )}
 
         {/* Content */}
-        <div className="activity-log-content" data-testid="activity-log-content">
+        <ViewLayoutContent className="activity-log-content" data-testid="activity-log-content" ref={activityScrollRef as Ref<HTMLElement>}>
           {error && (
             <div className="activity-log-error" data-testid="activity-error">
               <AlertCircle size={16} />
@@ -361,11 +406,7 @@ export function ActivityLogModal({
               {isFilterActive && (
                 <button
                   className="btn btn-secondary"
-                  onClick={() => {
-                    setFilteredType("all");
-                    setFilteredProjectId("all");
-                    onProjectFilterChange?.(undefined);
-                  }}
+                  onClick={clearFilters}
                 >
                   {t("activityLog.clearFiltersBtnLabel", "Clear Filters")}
                 </button>
@@ -428,22 +469,16 @@ export function ActivityLogModal({
             ))}
           </div>
 
-          {hasMore && !isLoading && (
-            <button
-              className="activity-log-load-more"
-              onClick={refresh}
-              data-testid="activity-load-more"
-            >
-              {t("activityLog.loadMore", "Load More")}
-            </button>
-          )}
+          {hasMore ? (
+            <div ref={activityPagination.sentinelRef} className="activity-log-load-more" data-testid="activity-auto-pagination-sentinel" role="status" aria-live="polite" />
+          ) : null}
 
           {isLoading && convertedEntries.length > 0 && (
             <div className="activity-log-loading">
               <Loader2 size={20} className="spin" />
             </div>
           )}
-        </div>
+        </ViewLayoutContent>
 
         {/* Confirmation dialog for clear */}
         {showConfirmClear && (
@@ -477,16 +512,27 @@ export function ActivityLogModal({
   }
 
   return (
-    <div
-      className="modal-overlay open"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-      role="dialog"
-      aria-modal="true"
-      data-testid="activity-log-modal-overlay"
+    /*
+    FNXC:ModalTouchGeometry 2026-07-26-13:20:
+    Activity Log keeps its embedded return above this branch. The modal branch delegates backdrop
+    dismissal, drag, resize, clamping, and persistence to the shared FloatingWindow contract.
+    */
+    <FloatingWindow
+      windowKey="activity-log"
+      title={t("activityLog.title", "Activity Log")}
+      ariaLabel={t("activityLog.title", "Activity Log")}
+      onClose={onClose}
+      hideHeader
+      dragHandleSelector=".activity-log-header"
+      className="floating-window--activity-log"
+      defaultSize={{ width: 720, height: 560 }}
+      minSize={{ width: 360, height: 280 }}
+      persistGeometryKey="floating-window:activity-log"
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+      closeOnOutsidePointerDown
     >
       {body}
-    </div>
+    </FloatingWindow>
   );
 }

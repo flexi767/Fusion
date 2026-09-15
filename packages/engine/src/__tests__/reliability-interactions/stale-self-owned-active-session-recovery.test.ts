@@ -4,9 +4,9 @@ import "../executor-test-helpers.js";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 import { TaskExecutor } from "../../executor.js";
 import { SelfHealingManager } from "../../self-healing.js";
-import { activeSessionRegistry } from "../../active-session-registry.js";
-import { ActiveSessionWorktreeRemovalError, RemovalReason } from "../../worktree-backend.js";
-import * as worktreePoolModule from "../../worktree-pool.js";
+import { activeSessionRegistry } from "../../agents/active-session-registry.js";
+import { ActiveSessionWorktreeRemovalError, RemovalReason } from "../../worktree/worktree-backend.js";
+import * as worktreePoolModule from "../../worktree/worktree-pool.js";
 import { createMockStore, resetExecutorMocks } from "../executor-test-helpers.js";
 
 const TASK_ID = "FN-4973";
@@ -37,7 +37,6 @@ function makeStore(task: Task): TaskStore & EventEmitter {
     clearStaleExecutionStartBranchReferences: vi.fn(() => []),
     recordRunAuditEvent: vi.fn(async () => undefined),
     walCheckpoint: vi.fn(() => ({ busy: 0, log: 0, checkpointed: 0 })),
-    archiveTaskAndCleanup: vi.fn(async () => ({})),
     mergeTask: vi.fn(async () => undefined),
     getRootDir: vi.fn(() => "/tmp/test"),
   }) as unknown as TaskStore & EventEmitter;

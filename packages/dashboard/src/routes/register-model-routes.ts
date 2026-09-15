@@ -1,7 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { customProviderRegistryKey, mergeSupplementalAnthropicModels, mergeSupplementalOpenAiCodexModels, resolvePlanningSettingsModel } from "@fusion/core";
+import { customProviderRegistryKey, mergeSupplementalAnthropicModels, mergeSupplementalOpenAiCodexModels, resolvePlanningSettingsModel, toExecutionModelProviderId, ANTHROPIC_API_KEY_PROVIDER_ID, ANTHROPIC_PROVIDER_ID, ANTHROPIC_SUBSCRIPTION_PROVIDER_ID, THINKING_LEVELS, type ThinkingLevel } from "@fusion/core";
 import type { CustomProvider } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import { getCursorPickerModels, CURSOR_PICKER_PROVIDER_ID } from "../cursor-model-cache.js";
@@ -9,12 +9,13 @@ import { getGrokPickerModels, GROK_PICKER_PROVIDER_ID } from "../grok-model-cach
 import { getClaudePickerModels, CLAUDE_PICKER_PROVIDER_ID } from "../claude-model-cache.js";
 import { getOmpPickerModels, OMP_PICKER_PROVIDER_ID } from "../omp-model-cache.js";
 import { getHermesPickerModels, HERMES_PICKER_PROVIDER_ID } from "../hermes-model-cache.js";
-import type { AuthStorageLike } from "../routes.js";
+import {
+  invalidateModelRegistryRefreshCache,
+  refreshModelRegistryForRequest,
+} from "../model-registry-refresh-cache.js";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import type { AuthStorageLike, ModelRegistryModelLike } from "../routes.js";
 import type { ApiRouteRegistrar } from "./types.js";
-
-const ANTHROPIC_PROVIDER_ID = "anthropic";
-const ANTHROPIC_API_KEY_PROVIDER_ID = "anthropic-api-key";
-const ANTHROPIC_SUBSCRIPTION_PROVIDER_ID = "anthropic-subscription";
 
 /**
  * Read provider names from Fusion's own auth stores (primary + legacy .pi).
@@ -33,7 +34,7 @@ function isRawAnthropicApiKeyCredential(credential: unknown): boolean {
 }
 
 function toModelProviderId(providerId: string): string {
-  return providerId === ANTHROPIC_API_KEY_PROVIDER_ID ? ANTHROPIC_PROVIDER_ID : providerId;
+  return toExecutionModelProviderId(providerId);
 }
 
 function addAuthStorageConfiguredProviders(authStorage: AuthStorageLike | undefined, providers: Set<string>): void {
@@ -152,8 +153,127 @@ async function getConfiguredProviderNames(authStorage?: AuthStorageLike): Promis
   return providers;
 }
 
+type ProviderCredential = { type?: unknown } | null | undefined;
+
+/**
+ * Return the models which today's configured-provider gate would advertise for a
+ * concrete credential kind. `undefined` means that the existing gate has no
+ * per-instance distinction for this provider, so callers must not invent one.
+ */
+function getAdvertisedModelIdsForCredential(
+  providerId: string,
+  credential: ProviderCredential,
+  models: Array<{ provider: string; id: string }>,
+  apiKeyProviderIds: Set<string>,
+  oauthProviderIds: Set<string>,
+): Set<string> | undefined {
+  const modelProviderId = toModelProviderId(providerId);
+  const providerModels = new Set(models.filter(model => model.provider === modelProviderId).map(model => model.id));
+  if (providerModels.size === 0) return new Set();
+
+  // Direct Anthropic intentionally accepts both of its existing auth kinds.
+  if (modelProviderId === ANTHROPIC_PROVIDER_ID) {
+    return credential?.type === "api_key" || credential?.type === "oauth" ? providerModels : new Set();
+  }
+  if (apiKeyProviderIds.has(providerId)) {
+    return credential?.type === "api_key" ? providerModels : new Set();
+  }
+  if (oauthProviderIds.has(providerId)) {
+    return credential?.type === "oauth" ? providerModels : new Set();
+  }
+  return undefined;
+}
+
+/*
+FNXC:ProviderAuth 2026-08-01-08:39:
+Expose instance availability beside the catalog rather than copying every model per credential. Reuse the existing API-key/OAuth configured-provider gate to derive only real default-versus-instance deltas; an arbitrary stored field or a network probe would fabricate availability data.
+*/
+/*
+FNXC:ModelThinkingCapabilities 2026-08-18-23:38:
+Pi's model registry is the source of truth for model-bound thinking controls. The pinned SDK helper implements the documented reasoning=false and thinkingLevelMap tristate rules; the structural fallback keeps this route compatible with registry facades and older SDKs without inferring capabilities from provider or model names.
+*/
+function deriveSupportedThinkingLevels(model: ModelRegistryModelLike): ThinkingLevel[] {
+  if (!model.reasoning) return ["off"];
+  /*
+  FNXC:ModelCatalog 2026-09-02-22:06:
+  Pi 0.84.4 catalogs Muse Spark on vercel-ai-gateway without a thinking-level map. Preserve
+  the model row and expose an empty capability list so picker consumers never have to infer
+  support from an omitted field or provider-specific fallback.
+  */
+  if (!model.thinkingLevelMap || typeof model.thinkingLevelMap !== "object") return [];
+
+  try {
+    const supported = getSupportedThinkingLevels(model as Parameters<typeof getSupportedThinkingLevels>[0]);
+    return supported.filter((level): level is ThinkingLevel => (THINKING_LEVELS as readonly string[]).includes(level));
+  } catch {
+    return THINKING_LEVELS.filter((level) => {
+      const mapped = model.thinkingLevelMap?.[level];
+      if (mapped === null) return false;
+      return level !== "xhigh" && level !== "max" ? true : typeof mapped === "string";
+    });
+  }
+}
+
+function getProviderInstances(
+  authStorage: AuthStorageLike | undefined,
+  advertisedProviders: Iterable<string>,
+  models: Array<{ provider: string; id: string }>,
+): Record<string, { instances: Array<{ id: string; isDefault: boolean; unavailableModelIds?: string[] }> }> | undefined {
+  if (!authStorage?.listInstances) return undefined;
+  const result: Record<string, { instances: Array<{ id: string; isDefault: boolean; unavailableModelIds?: string[] }> }> = {};
+  const apiKeyProviderIds = new Set((authStorage.getApiKeyProviders?.() ?? []).map(provider => provider.id));
+  const oauthProviderIds = new Set((authStorage.getOAuthProviders?.() ?? []).map(provider => provider.id));
+  const providerIds = new Set([...advertisedProviders, ...models.map(model => model.provider)]);
+  for (const modelProviderId of providerIds) {
+    const providerId = modelProviderId === ANTHROPIC_PROVIDER_ID ? ANTHROPIC_PROVIDER_ID : modelProviderId;
+    try {
+      const defaultRef = authStorage.getDefaultInstance?.(providerId);
+      const refs = authStorage.listInstances(providerId);
+      if (refs.length === 0) continue;
+      const defaultCredential = defaultRef && authStorage.getInstance?.(defaultRef);
+      const defaultModelIds = getAdvertisedModelIdsForCredential(
+        providerId, defaultCredential, models, apiKeyProviderIds, oauthProviderIds,
+      );
+      const instances = refs.map(ref => {
+        const instanceModelIds = getAdvertisedModelIdsForCredential(
+          providerId, authStorage.getInstance?.(ref), models, apiKeyProviderIds, oauthProviderIds,
+        );
+        const unavailableModelIds = defaultModelIds && instanceModelIds
+          ? [...defaultModelIds].filter(modelId => !instanceModelIds.has(modelId))
+          : [];
+        return {
+          id: ref.instanceId,
+          isDefault: defaultRef?.instanceId === ref.instanceId,
+          ...(unavailableModelIds.length > 0 ? { unavailableModelIds } : {}),
+        };
+      });
+      result[modelProviderId] = { instances };
+    } catch {
+      // A corrupt provider entry must not make the shared model catalog unavailable.
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
   const { router, options, store, runtimeLogger } = ctx;
+
+  /*
+  FNXC:BuiltInModelRefresh 2026-08-18-23:05:
+  The Authentication action is an explicit operator refresh for the shared built-in catalog. Invalidate only this registry generation, then reuse the existing bounded single-flight seam so a hung or stale refresh retains its last good rows and cannot overlap provider reloads.
+  */
+  router.post("/models/refresh", async (_req, res) => {
+    if (!options?.modelRegistry) {
+      res.json({ outcome: "failed", error: "Model registry unavailable" });
+      return;
+    }
+
+    invalidateModelRegistryRefreshCache(options.modelRegistry);
+    const outcome = await refreshModelRegistryForRequest(options.modelRegistry);
+    res.json(outcome === "failed"
+      ? { outcome, error: "Model catalog refresh failed; showing the last available models." }
+      : { outcome });
+  });
 
   router.get("/models", async (_req, res) => {
     // Get favoriteProviders/favoriteModels and default model from global settings.
@@ -254,7 +374,16 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     }
 
     try {
-      await options.modelRegistry.refresh();
+      const refreshOutcome = await refreshModelRegistryForRequest(options.modelRegistry);
+      if (["timed_out", "failed", "stale_in_flight", "negative_cached"].includes(refreshOutcome)) {
+        runtimeLogger.child("models").warn(`Model registry refresh outcome: ${refreshOutcome}; serving retained catalog`);
+      }
+      /*
+      FNXC:ModelCatalog 2026-08-12-01:00:
+      FN-8902 bounds and caches only the refresh operation. Supplemental merges and
+      dedupe remain unconditional per request because refresh can replace provider
+      rows; cached, failed, or timed-out paths must return the same live catalog shape.
+      */
       if (options.modelRegistry.registerProvider) {
         mergeSupplementalAnthropicModels(options.modelRegistry as Parameters<typeof mergeSupplementalAnthropicModels>[0], (message) => runtimeLogger.child("models").warn(message));
         /*
@@ -266,13 +395,30 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
          */
         mergeSupplementalOpenAiCodexModels(options.modelRegistry as unknown as Parameters<typeof mergeSupplementalOpenAiCodexModels>[0], (message) => runtimeLogger.child("models").warn(message));
       }
-      let models = options.modelRegistry.getAvailable().map((m) => ({
-        provider: m.provider,
-        id: m.id,
-        name: m.name,
-        reasoning: m.reasoning,
-        contextWindow: m.contextWindow,
-      }));
+      let models: Array<{
+        provider: string;
+        id: string;
+        name: string;
+        reasoning: boolean;
+        contextWindow: number;
+        supportedThinkingLevels?: ThinkingLevel[];
+      }> = options.modelRegistry.getAvailable().map((m) => {
+        const supportedThinkingLevels = deriveSupportedThinkingLevels(m);
+        return {
+          provider: m.provider,
+          id: m.id,
+          name: m.name,
+          reasoning: m.reasoning,
+          contextWindow: m.contextWindow,
+          supportedThinkingLevels,
+        };
+      });
+
+      /*
+      FNXC:ProviderAuth 2026-08-15-20:57:
+      A registry/plugin may emit a credential-card row despite Fusion never registering it as an execution provider. Drop Anthropic auth ids rather than normalizing catalog rows: only the built-in `anthropic` row is selectable and can safely reach pi-ai.
+      */
+      models = models.filter((model) => model.provider !== ANTHROPIC_SUBSCRIPTION_PROVIDER_ID && model.provider !== ANTHROPIC_API_KEY_PROVIDER_ID);
 
       /*
        * FNXC:ModelCatalog 2026-07-01-12:02:
@@ -490,6 +636,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         configuredProviders.add(customProviderRegistryKey(provider, customProviders));
       }
       models = models.filter((m) => configuredProviders.has(m.provider));
+      const providerInstances = getProviderInstances(options?.authStorage, configuredProviders, models);
 
       res.json({
         models,
@@ -497,6 +644,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         favoriteModels,
         ...defaultModelResponse,
         ...resolvedPlanningModelResponse,
+        ...(providerInstances ? { providerInstances } : {}),
       });
     } catch (err: unknown) {
       if (err instanceof ApiError) {

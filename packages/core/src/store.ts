@@ -1,11 +1,39 @@
 import { EventEmitter } from "node:events";
+import type { TaskMoveLanes } from "./workflows/workflow-lifecycle-traits.js";
+import { TaskLaneCache } from "./task-lane-cache.js";
 import { randomUUID } from "node:crypto";
+import { WEDGE_RENOTIFY_COOLDOWN_MS } from "./types/task/task-core.js";
+import { clearTerminalFailureAutoRecoveryBudget } from "./tasks/terminal-failure-auto-recovery.js";
 import { join } from "node:path";
-import { and, eq, isNull, ne, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, ne, sql } from "drizzle-orm";
+import { createCurrentPlanEvidence, diffSpecLocks, isSpecLockActive, UnavailablePlanLockError, type CurrentPlanEvidence, type PlanEvidenceBindings, type SpecLock } from "./planner/spec-lock.js";
+import { evaluateSpecDrift, hasPriorLockDivergence, type DriftReport } from "./planner/drift-report.js";
 import * as schema from "./postgres/schema/index.js";
 import { type FSWatcher } from "node:fs";
-import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, ColumnId, CheckoutClaimPrecondition, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, Artifact, ArtifactCreateInput, ArtifactType, ArtifactWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, WorkflowStepTemplate, Agent, AutostashOrphanRecord, TaskCommitAssociation, CommitAssociationDiffBackfillReport, GithubIssueAction, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, HandoffToReviewOptions, GoalCitation, GoalCitationFilter, GoalCitationInput, GoalCitationSurface, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, TaskBranchAssignmentMode, MergeRequestRecord, MergeRequestState, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, PrEntity, PrEntityCreateInput, PrEntityUpdate, PrThreadState, PrThreadOutcome, PluginActivation, PluginActivationInput } from "./types.js";
+import { readFile } from "node:fs/promises";
+import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, ColumnId, CheckoutClaimPrecondition, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, Artifact, ArtifactCreateInput, ArtifactType, ArtifactWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, WorkflowStepTemplate, Agent, AutostashOrphanRecord, TaskCommitAssociation, CommitAssociationDiffBackfillReport, GithubIssueAction, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, HandoffToReviewOptions, GoalCitation, GoalCitationFilter, GoalCitationInput, GoalCitationSurface, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, TaskBranchAssignmentMode, MergeRequestRecord, MergeRequestState, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, PrEntity, PrEntityCreateInput, PrEntityUpdate, PrThreadState, PrThreadOutcome, PluginActivation, PluginActivationInput, TaskStep } from "./types.js";
+import {
+  fileScopeLeaseBlocksCandidate,
+  normalizeOverlapScopeForTask,
+  taskHoldsUnmergedCheckout,
+  type FileScopeLeaseKind,
+} from "./tasks/file-scope-lease.js";
+import { compareTasksByPriorityThenAgeAndId } from "./tasks/task-priority.js";
 
+/*
+FNXC:SpecLock 2026-08-09-21:01:
+Current-plan evidence includes durable scope relations that can mutate independently of PROMPT.md.
+Keep this projection small and structural; it captures IDs only and never copies prompt prose into
+telemetry or a mutable task field.
+*/
+function specLockBindings(task: Pick<Task, "dependencies" | "missionId" | "sliceId" | "sourceParentTaskId">): PlanEvidenceBindings {
+  return {
+    dependencies: task.dependencies ?? [],
+    missionId: task.missionId,
+    sliceId: task.sliceId,
+    sourceParentTaskId: task.sourceParentTaskId,
+  };
+}
 
 export type OverlapBlockerRepairReason =
   | "task-not-found"
@@ -36,120 +64,205 @@ export interface RepairOverlapBlockerResult {
 }
 
 /** @internal Extracted modules use this compatibility flag */
-export function isWorkflowColumnsCompatibilityFlagEnabled(settings: Pick<Settings, "experimentalFeatures"> | undefined): boolean {
-  /*
-  FNXC:WorkflowColumns 2026-06-22-00:00:
-  TaskStore still needs the raw compatibility flag for legacy movement characterization, v1 workflow-IR rollback persistence, and ON→OFF custom-column evacuation tests. This is narrower than the public runtime helper, which treats stale false values as enabled after workflow-column cutover.
-  */
-  return settings?.experimentalFeatures?.workflowColumns === true;
-}
-import { type PluginGateVerdict } from "./plugin-gate-verdict.js";
-import type { PluginOnSchemaInit, PluginPostgresSchemaDefinition } from "./plugin-types.js";
+import { type PluginGateVerdict } from "./plugins/plugin-gate-verdict.js";
+import type { PluginOnSchemaInit, PluginPostgresSchemaDefinition } from "./plugins/plugin-types.js";
 import { assertLoadedPluginSchemaInitHooksSupported, type LoadedPluginSchemaContract } from "./postgres/plugin-schema-hook.js";
-import { DEFAULT_WORKFLOW_POOL_ID } from "./workflow-capacity.js";
-import type { WorkflowIr, WorkflowFieldDefinition, WorkflowSettingDefinition } from "./workflow-ir-types.js";
-import type { WorkflowMovePolicyInput } from "./workflow-extension-types.js";
-import { type CustomFieldRejection } from "./task-fields.js";
+import { DEFAULT_WORKFLOW_POOL_ID } from "./workflows/workflow-capacity.js";
+import type { WorkflowIr, WorkflowFieldDefinition, WorkflowSettingDefinition } from "./workflows/workflow-ir-types.js";
+import type { WorkflowMovePolicyInput } from "./workflows/workflow-extension-types.js";
+import { type CustomFieldRejection } from "./tasks/task-fields.js";
 // Side-effect import: registers the 14 built-in trait DEFINITIONS into the
 // shared trait registry on load (the flag-ON path resolves traits by id).
 import "./builtin-traits.js";
 // Step-inversion U12 (KTD-12): the legacy `parseStepsFromPrompt` path resolves
 // the `step-headings` parser through the registry (proving the registry path),
 // staying byte-identical with the direct extracted function.
-import type { StoredWorkflowRow, WorkflowDefinition, WorkflowDefinitionInput, WorkflowDefinitionUpdate, WorkflowNodeLayout } from "./workflow-definition-types.js";
-import { type WorkflowParitySummary, type WorkflowColumnsGraduationReport } from "./workflow-parity.js";
+import type { StoredWorkflowRow, WorkflowDefinition, WorkflowDefinitionInput, WorkflowDefinitionUpdate, WorkflowNodeLayout } from "./workflows/workflow-definition-types.js";
 
 /** Tags WorkflowStep rows materialized by compiling a workflow so they can be
  *  filtered out of the user-facing step manager and cleaned up on re-selection. */
 export const WORKFLOW_COMPILED_STEP_TEMPLATE_PREFIX = "workflow:";
-import { GlobalSettingsStore } from "./global-settings.js";
-import { Database } from "./db.js";
-import { ArchiveDatabase } from "./archive-db.js";
-import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
-import { MissionStore } from "./mission-store.js";
-import { AsyncMissionStore } from "./async-mission-store.js";
-import { AsyncIdeationStore } from "./async-ideation-store.js";
-import { reconcileSoftDeletedColumnDriftAsync } from "./task-store/async-self-healing.js";
-import { PluginStore } from "./plugin-store.js";
-import { InsightStore } from "./insight-store.js";
-import { ResearchStore } from "./research-store.js";
-import { ExperimentSessionStore } from "./experiment-session-store.js";
-import { TodoStore } from "./todo-store.js";
-import { AsyncTodoStore } from "./async-todo-store.js";
-import { AsyncInsightStore } from "./async-insight-store.js";
-import { AsyncResearchStore } from "./async-research-store.js";
-import { GoalStore } from "./goal-store.js";
-import { AsyncGoalStore } from "./async-goal-store.js";
-import { EvalStore } from "./eval-store.js";
-import { AsyncEvalStore } from "./async-eval-store.js";
-import { CentralCore } from "./central-core.js";
-import { SecretsStore } from "./secrets-store.js";
-import { getLatestFailedPreMergeReviewStep } from "./task-merge.js";
-import { createLogger } from "./logger.js";
-import { type UsageEventInput } from "./usage-events.js";
-import { assertNotLinkedWorktreeOfExistingProject, assertProjectRootDir } from "./project-root-guard.js";
-import { type DistributedTaskIdAllocator } from "./distributed-task-id.js";
-import { type TaskIdIntegrityReport } from "./task-id-integrity.js";
+import { GlobalSettingsStore } from "./config/global-settings.js";
+import { Database } from "./db/db.js";
+import { projectScopeFor, type AsyncDataLayer, type DbTransaction } from "./postgres/data-layer.js";
+import { appendPlanEvidenceInTransaction } from "./task-store/plan-evidence.js";
+import { planningLifecycleLockTransportAvailability, withPlanningLifecycleAdvisoryLock, withPlanningLifecycleAdvisoryLocks } from "./postgres/advisory-locks.js";
+import { MissionStore } from "./missions/mission-store.js";
+import { AsyncMissionStore } from "./async-stores/async-mission-store.js";
+import { AsyncIdeationStore } from "./async-stores/async-ideation-store.js";
+import { reconcileSoftDeletedColumnDriftAsync } from "./task-store/async/async-self-healing.js";
+import { PluginStore } from "./stores/plugin-store.js";
+import { InsightStore } from "./insights/insight-store.js";
+import { ResearchStore } from "./research/research-store.js";
+import { ExperimentSessionStore } from "./eval/experiment-session-store.js";
+import { TodoStore } from "./stores/todo-store.js";
+import { AsyncTodoStore } from "./async-stores/async-todo-store.js";
+import { AsyncInsightStore } from "./async-stores/async-insight-store.js";
+import { AsyncResearchStore } from "./async-stores/async-research-store.js";
+import { GoalStore } from "./goals/goal-store.js";
+import { AsyncGoalStore } from "./async-stores/async-goal-store.js";
+import { AsyncNoteStore } from "./async-stores/async-note-store.js";
+import { AsyncWhiteboardStore } from "./async-stores/async-whiteboard-store.js";
+import { EvalStore } from "./eval/eval-store.js";
+import { AsyncEvalStore } from "./async-stores/async-eval-store.js";
+import { CentralCore } from "./central/central-core.js";
+import { SecretsStore } from "./secrets/secrets-store.js";
+import { getLatestFailedPreMergeReviewStep, findPendingPreMergeStep } from "./merge/task-merge.js";
+import { resolveRequiredPreMergeStepIds } from "./merge/required-pre-merge-steps.js";
+import { evaluatePreMergeApprovals } from "./merge/pre-merge-approval.js";
+import { createLogger } from "./process/logger.js";
+import { type UsageEventInput } from "./tasks/usage-events.js";
+import { assertNotLinkedWorktreeOfExistingProject, assertProjectRootDir } from "./central/project-root-guard.js";
+import { type DistributedTaskIdAllocator } from "./tasks/distributed-task-id.js";
+import { type TaskIdIntegrityReport } from "./tasks/task-id-integrity.js";
+import { AgentStore } from "./agents/agent-store.js";
+import type { IntakeOwnershipExemption } from "./tasks/task-intake-owner-resolver.js";
 
 // file. These are pure behavior-invariant moves — the extracted symbols are
 // byte-identical to their pre-extraction form. store.ts remains the facade and
 // the single import source for all consumers (re-exports preserved below).
 import { TASK_JSONB_COLUMNS, type TaskRow, type TaskPersistSerializationContext, type TaskColumnDescriptor } from "./task-store/persistence.js";
 import { pgRowToTaskRow as pgRowToTaskRowExternal, rowToTask as rowToTaskExternal, rowToBranchGroup as rowToBranchGroupExternal, generateBranchGroupId as generateBranchGroupIdExternal, computeTimedExecutionMs as computeTimedExecutionMsExternal, archiveEntryToTask as archiveEntryToTaskExternal, summarizeAgentLog as summarizeAgentLogExternal, rowToTaskDocument as rowToTaskDocumentExternal, rowToArtifact as rowToArtifactExternal, rowToTaskDocumentRevision as rowToTaskDocumentRevisionExternal, rowToGoalCitation as rowToGoalCitationExternal } from "./task-store/serialization.js";
-import { moveTaskImpl, moveTaskIfImpl, handoffToReviewImpl, moveTaskInternalImpl, type MoveTaskIfResult } from "./task-store/moves.js";
-import { recordGoalCitationsImpl, insertTaskWithFtsRecoveryImpl2, assertTaskIdAvailableImpl, atomicWriteTaskJsonImpl2, createTaskWithDistributedReservationImpl, toStoredWorkflowStepImpl, ensureWorkflowStepForTemplateImpl, resolveEnabledWorkflowStepsImpl, setTaskBranchGroupImpl, getTaskColumnsImpl, prepareWorkflowMovePolicyPreflightImpl, updateTaskCustomFieldsImpl, listWorkflowPromptOverridesForProjectImpl, listWorkflowWorkItemsForTaskImpl, listDueWorkflowWorkItemsImpl, rewriteBlockedByResidueDependentsForRemovalImpl, getAllDocumentsImpl, deleteWorkflowStepImpl, toWorkflowDefinitionImpl, materializeDefaultWorkflowStepsImpl, reconcileTaskCustomFieldsForSchemaImpl, getTaskMovedCountsByDayImpl, getGoalStoreImpl, upsertTaskCommitAssociationImpl } from "./task-store/remaining-ops-4.js";
-import { applyLegacyWorkflowStepOverridesImpl, archiveDbImpl, assertNoDependencyCycleImpl, atomicCreateTaskJsonImpl, buildActiveTaskDependencyLookupImpl, buildArchivedAgentLogFieldsImpl, buildTaskIdIntegrityFallbackReportImpl, createBranchGroupImpl, dbImpl, detectAndCacheTaskIdIntegrityReportImpl, findLiveDependentsImpl, findLiveLineageChildrenImpl, getLegacyWorkflowStepSnapshotImpl, getMalformedTaskMetadataReasonImpl, getMergeQueuedTaskIdsAsyncImpl, insertRunAuditEventRowImpl, insertTaskImpl, invokeTaskCreatedHookImpl, isTaskArchivedImpl, isTaskIdPresentInArchivedTasksTableImpl, logTaskCreateConflictImpl, maybeResolveTombstonedTaskIdImpl, mergeTaskIdIntegrityReportsImpl, optionalGroupIdSetImpl, patchTaskRowInTransactionImpl, readConfigFastImpl, readConfigImpl, readPromptForArchiveImpl, readTaskFromDbImpl, reconcileDistributedTaskIdStateOnOpenImpl, recordActivityFromListenerImpl, recordDependencyCycleRejectedAuditImpl, refreshTaskIdIntegrityReportImpl, resolveLocalNodeIdForTaskAllocationImpl, runTaskFtsWriteWithRecoveryImpl, scanAndRecordCitationsImpl, taskIdExistsAnywhereImpl, throwSoftDeletedWriteBlockedImpl, toBuiltInWorkflowStepImpl, trackDeferredTaskCreatedWorkImpl, upsertTaskImpl, withConfigLockImpl, withTaskLockImpl, withWorktreeAllocationLockImpl } from "./task-store/remaining-ops-5.js";
-import { claimNextToolFailureRetryImpl, createTaskVerificationRequestImpl, claimTaskVerificationRequestImpl, finishTaskVerificationRequestImpl, clearNearDuplicateReferencesToFailSoftImpl, clearWorkflowRunStepInstancesAsyncImpl, clearWorkflowRunStepInstancesImpl, computeMovedSettingsTargetWorkflowIdsImpl, ensureBranchGroupForSourceImpl, ensurePrEntityForSourceImpl, findRecentTasksByContentFingerprintImpl, getActiveMergingTaskImpl, getActivePrEntityBySourceImpl, getBranchGroupByBranchNameImpl, getBranchGroupBySourceImpl, getBranchGroupImpl, getBranchProgressByTaskImpl, getMutationsForRunImpl, getPrEntityByNumberImpl, getPrEntityImpl, getPrThreadStateImpl, getTasksByAssignedAgentImpl, getWorkflowPromptOverridesAsyncImpl, getWorkflowSettingValuesAsyncImpl, getWorkflowSettingValuesImpl, getWorkflowSettingsProjectIdImpl, getWorkflowWorkItemImpl, insertCompletionHandoffWorkflowWorkAuditImpl, listActivePrEntitiesImpl, listBranchGroupsImpl, listPrThreadStatesImpl, listTasksByBranchGroupImpl, listWorkflowSettingValuesForProjectImpl, loadWorkflowRunBranchesImpl, loadWorkflowRunStepInstancesAsyncImpl, loadWorkflowRunStepInstancesImpl, markToolFailureRetryExhaustedAuditImpl, mergeCustomFieldPatchImpl, normalizeMergeRequestStateImpl, normalizeWorkflowWorkItemKindImpl, normalizeWorkflowWorkItemStateImpl, parseWorkflowPromptOverrideJsonImpl, recordPrThreadOutcomeImpl, resetAllStepsToPendingImpl, resetPromptCheckboxesImpl, resolveWorkflowMoveActorImpl, resolveWorkflowSettingDeclarationsImpl, saveWorkflowRunStepInstanceAsyncImpl, saveWorkflowRunStepInstanceImpl, transitionMergeRequestStateImpl, transitionWorkflowWorkItemSyncImpl, updateTaskImpl, updateWorkflowPromptOverridesImpl, upsertMergeRequestRecordImpl, workflowStateForMergeRequestStateImpl } from "./task-store/branch-and-pr-entities.js";
-import { addPrInfoImpl, addSteeringCommentImpl, archiveAllDoneImpl, cleanupStaleMergeQueueRowsImpl, clearCompletionHandoffAcceptedMarkerImpl, clearDoneTransientFieldsImpl, clearStaleExecutionStartBranchReferencesImpl, computeWorkflowColumnsGraduationReportImpl, deleteTaskCommentImpl, deleteTaskDocumentImpl, emitUsageEventImpl, enqueueMergeQueueImpl, getAgentLogCountImpl, getAgentLogsImpl, getArtifactImpl, getArtifactsImpl, getAttachmentImpl, getCompletionHandoffAcceptedMarkerImpl, getTaskDocumentImpl, getTaskDocumentRevisionsImpl, getTaskDocumentsImpl, insertArtifactRowImpl, linkGithubIssueImpl, listWorkflowWorkItemsForTaskSyncImpl, moveToDoneImpl, parseDependenciesFromPromptImpl, parseFileScopeFromPromptImpl, parseStepsFromPromptImpl, peekMergeQueueHeadImpl, peekMergeQueueImpl, readPreArchiveColumnFromTaskFileImpl, recordPluginActivationImpl, recordRunAuditEventBackendImpl, removePrInfoByNumberImpl, resolvePrimaryPrInfoImpl, resolveUnarchiveTargetColumnImpl, rewriteLineageChildrenForRemovalImpl, runGitCommandImpl, stopWatchingImpl, syncAgentTaskLinkOnReassignmentImpl, updateArtifactImpl, updateGithubTrackingImpl, updatePrInfoByNumberImpl, updateTaskCommentImpl, upsertPrInfoByNumberImpl, writeArtifactDataImpl } from "./task-store/remaining-ops-7.js";
-import { approveCliAutonomyImpl, approveWorkflowCliCommandImpl, cleanupOrphanedMaterializedStepsImpl, consumePluginGateVerdictsImpl, getAgentLogsByTimeRangeImpl, getDatabaseHealthImpl, getDistributedTaskIdAllocatorImpl, getExperimentSessionStoreImpl, getInReviewDurationEventsImpl, getMissionStoreImpl, getIdeationStoreImpl, getPluginStoreImpl, getSecretsStoreImpl, getSettingsSyncImpl, getTaskMergedTaskIdsImpl, getTaskWorkflowSelectionImpl, getImportTranslationImpl, recordImportTranslationImpl, pruneImportTranslationsImpl, type ImportTranslationCacheKey, type ImportTranslationCacheEntry, getVerificationCacheHitImpl, getWorkflowDefinitionImpl, healthCheckImpl, importLegacyAgentLogsOnceImpl, insertWorkflowDefinitionSyncImpl, isCliAutonomyApprovedImpl, isPluginInstalledImpl, isWorkflowCliCommandApprovedImpl, listWorkflowDefinitionsImpl, materializeExplicitWorkflowStepsImpl, materializeWorkflowStepsImpl, migrateActiveArchivedTasksToArchiveDbImpl, migrateLegacyArchiveEntriesToArchiveDbImpl, nextWorkflowDefinitionIdImpl, occupantsByColumnForWorkflowImpl, parseWorkflowLayoutImpl, pruneAgentLogFilesImpl, purgeTaskWorkflowSelectionRowsImpl, readAllWorkflowDefinitionsImpl, readRawProjectSettingsImpl, recordPluginGateVerdictImpl, recordVerificationCachePassImpl, removeMaterializedSelectionImpl, resolvePluginWorkflowStepImpl, resolveTaskWorkflowIrSyncImpl, revokeCliAutonomyImpl, selectTaskWorkflowAndReconcileImpl, writeTaskWorkflowSelectionImpl, getTaskWorkflowSelectionAsyncImpl,  } from "./task-store/workflow-definitions.js";
+import { moveTaskImpl, moveTaskIfImpl, handoffToReviewImpl, moveTaskInternalImpl, TerminalFailureApplyRejected, type MoveTaskIfResult } from "./task-store/moves.js";
+import { resetTaskPublicationImpl } from "./task-store/reset-lifecycle.js";
+import { recordGoalCitationsImpl, insertTaskWithFtsRecoveryImpl2, assertTaskIdAvailableImpl, atomicWriteTaskJsonImpl2, createTaskWithDistributedReservationImpl, toStoredWorkflowStepImpl, ensureWorkflowStepForTemplateImpl, resolveEnabledWorkflowStepsImpl, setTaskBranchGroupImpl, getTaskColumnsImpl, prepareWorkflowMovePolicyPreflightImpl, updateTaskCustomFieldsImpl, listWorkflowPromptOverridesForProjectImpl, listWorkflowWorkItemsForTaskImpl, listWorkflowWorkItemsForTasksImpl, listDueWorkflowWorkItemsImpl, rewriteBlockedByResidueDependentsForRemovalImpl, getAllDocumentsImpl, deleteWorkflowStepImpl, toWorkflowDefinitionImpl, materializeDefaultWorkflowStepsImpl, reconcileTaskCustomFieldsForSchemaImpl, getTaskMovedCountsByDayImpl, getGoalStoreImpl, getNoteStoreImpl, getWhiteboardStoreImpl, upsertTaskCommitAssociationImpl } from "./task-store/workflow-task-create-ops.js";
+import { applyLegacyWorkflowStepOverridesImpl, assertNoDependencyCycleImpl, atomicCreateTaskJsonImpl, buildActiveTaskDependencyLookupImpl, buildArchivedAgentLogFieldsImpl, buildTaskIdIntegrityFallbackReportImpl, createBranchGroupImpl, dbImpl, detectAndCacheTaskIdIntegrityReportImpl, findLiveDependentsImpl, findLiveLineageChildrenImpl, getLegacyWorkflowStepSnapshotImpl, getMalformedTaskMetadataReasonImpl, getMergeQueuedTaskIdsAsyncImpl, insertRunAuditEventRowImpl, insertTaskImpl, invokeTaskCreatedHookImpl, isTaskIdPresentInArchivedTasksTableAsyncImpl, isTaskIdPresentInArchivedTasksTableImpl, logTaskCreateConflictImpl, maybeResolveTombstonedTaskIdImpl, mergeTaskIdIntegrityReportsImpl, optionalGroupIdSetImpl, patchTaskRowInTransactionImpl, readConfigFastImpl, readConfigImpl, readPromptForArchiveImpl, readTaskFromDbImpl, reconcileDistributedTaskIdStateOnOpenImpl, recordActivityFromListenerImpl, recordDependencyCycleRejectedAuditImpl, refreshTaskIdIntegrityReportImpl, resolveLocalNodeIdForTaskAllocationImpl, runTaskFtsWriteWithRecoveryImpl, scanAndRecordCitationsImpl, taskIdExistsAnywhereImpl, throwSoftDeletedWriteBlockedImpl, toBuiltInWorkflowStepImpl, trackDeferredTaskCreatedWorkImpl, upsertTaskImpl, withConfigLockImpl, withTaskLockImpl, withWorktreeAllocationLockImpl } from "./task-store/task-id-integrity.js";
+import { claimNextToolFailureRetryImpl, createTaskVerificationRequestImpl, claimTaskVerificationRequestImpl, finishTaskVerificationRequestImpl, clearNearDuplicateReferencesToFailSoftImpl, clearWorkflowRunStepInstancesAsyncImpl, clearWorkflowRunStepInstancesImpl, computeMovedSettingsTargetWorkflowIdsImpl, ensureBranchGroupForSourceImpl, ensurePrEntityForSourceImpl, findRecentTasksByContentFingerprintImpl, getActiveMergingTaskImpl, getActivePrEntityBySourceImpl, getBranchGroupByBranchNameImpl, getBranchGroupBySourceImpl, getBranchGroupImpl, getBranchProgressByTaskImpl, getMutationsForRunImpl, getPrEntityByNumberImpl, getPrEntityImpl, getPrThreadStateImpl, getTasksByAssignedAgentImpl, getWorkflowPromptOverridesAsyncImpl, getWorkflowSettingValuesAsyncImpl, getWorkflowSettingValuesImpl, getWorkflowSettingsProjectIdImpl, getWorkflowWorkItemImpl, insertCompletionHandoffWorkflowWorkAuditImpl, listActivePrEntitiesImpl, listBranchGroupsImpl, listPrThreadStatesImpl, listTasksByBranchGroupImpl, listWorkflowSettingValuesForProjectImpl, loadWorkflowRunBranchesImpl, hasWorkflowRunStepInstancesForTaskImpl, loadWorkflowRunStepInstancesAsyncImpl, loadWorkflowRunStepInstancesImpl, markToolFailureRetryExhaustedAuditImpl, mergeCustomFieldPatchImpl, normalizeMergeRequestStateImpl, normalizeWorkflowWorkItemKindImpl, normalizeWorkflowWorkItemStateImpl, parseWorkflowPromptOverrideJsonImpl, recordPrThreadOutcomeImpl, resetAllStepsToPendingImpl, resetPromptCheckboxesImpl, resolveWorkflowMoveActorImpl, resolveWorkflowSettingDeclarationsImpl, saveWorkflowRunStepInstanceAsyncImpl, saveWorkflowRunStepInstanceImpl, transitionMergeRequestStateImpl, transitionWorkflowWorkItemSyncImpl, updateTaskImpl, updateWorkflowPromptOverridesImpl, upsertMergeRequestRecordImpl, workflowStateForMergeRequestStateImpl } from "./task-store/branch-and-pr-entities.js";
+import { addPrInfoImpl, addSteeringCommentImpl, cleanupStaleMergeQueueRowsImpl, clearCompletionHandoffAcceptedMarkerImpl, clearDoneTransientFieldsImpl, clearStaleExecutionStartBranchReferencesImpl, deleteTaskCommentImpl, deleteTaskDocumentImpl, emitUsageEventImpl, enqueueMergeQueueImpl, getAgentLogCountImpl, getAgentLogsImpl, getArtifactImpl, getArtifactsImpl, getAttachmentImpl, getCompletionHandoffAcceptedMarkerImpl, getTaskDocumentImpl, getTaskDocumentRevisionsImpl, getTaskDocumentsImpl, insertArtifactRowImpl, linkGithubIssueImpl, listWorkflowWorkItemsForTaskSyncImpl, moveToDoneImpl, parseDependenciesFromPromptImpl, parseFileScopeFromPromptImpl, parseStepsFromPromptImpl, peekMergeQueueHeadImpl, peekMergeQueueImpl, recordPluginActivationImpl, recordRunAuditEventBackendImpl, removePrInfoByNumberImpl, resolvePrimaryPrInfoImpl, rewriteLineageChildrenForRemovalImpl, runGitCommandImpl, stopWatchingImpl, syncAgentTaskLinkOnReassignmentImpl, updateArtifactImpl, updateGithubTrackingImpl, updatePrInfoByNumberImpl, updateTaskCommentImpl, upsertPrInfoByNumberImpl, writeArtifactDataImpl } from "./task-store/task-artifacts-ops.js";
+import { approveCliAutonomyImpl, approveWorkflowCliCommandImpl, cleanupOrphanedMaterializedStepsImpl, consumePluginGateVerdictsImpl, getAgentLogsByTimeRangeImpl, getDatabaseHealthImpl, getDistributedTaskIdAllocatorImpl, getExperimentSessionStoreImpl, getInReviewDurationEventsImpl, getMissionStoreImpl, getIdeationStoreImpl, getPluginStoreImpl, getSecretsStoreImpl, getSettingsSyncImpl, getTaskMergedTaskIdsImpl, getTaskWorkflowSelectionImpl, getImportTranslationImpl, recordImportTranslationImpl, pruneImportTranslationsImpl, type ImportTranslationCacheKey, type ImportTranslationCacheEntry, getVerificationCacheHitImpl, getWorkflowDefinitionImpl, healthCheckImpl, importLegacyAgentLogsOnceImpl, insertWorkflowDefinitionSyncImpl, isCliAutonomyApprovedImpl, isPluginInstalledImpl, isWorkflowCliCommandApprovedImpl, listWorkflowDefinitionsImpl, materializeExplicitWorkflowStepsImpl, materializeWorkflowStepsImpl, nextWorkflowDefinitionIdImpl, occupantsByColumnForWorkflowImpl, parseWorkflowLayoutImpl, pruneAgentLogFilesImpl, purgeTaskWorkflowSelectionRowsImpl, readAllWorkflowDefinitionsImpl, readRawProjectSettingsImpl, recordPluginGateVerdictImpl, recordVerificationCachePassImpl, removeMaterializedSelectionImpl, resolvePluginWorkflowStepImpl, resolveTaskWorkflowIrSyncImpl, revokeCliAutonomyImpl, selectTaskWorkflowAndReconcileImpl, writeTaskWorkflowSelectionImpl, getTaskWorkflowSelectionAsyncImpl, getTaskWorkflowSelectionsAsyncImpl,  } from "./task-store/workflow-definitions.js";
 import { getTaskCommitAssociationsByLineageIdImpl, replaceLegacyTaskCommitAssociationsImpl } from "./task-store/task-commit-associations.js";
 import { findRecentTasksBySourceParentTaskIdImpl } from "./task-store/branch-and-pr-entities.js";
-import { addTaskCommentImpl, applyBuiltInPromptOverridesSyncImpl, areAllDependenciesDoneImpl, artifactStoredNameImpl, assertWorkflowIrTraitsValidImpl, clearActivityLogImpl, clearTaskWorkflowSelectionImpl, deleteTaskByIdImpl, getDefaultWorkflowIdImpl, getInsightStoreImpl, getMergeQueuedTaskIdsImpl, getMergeRequestRecordImpl, getMergeRequestRecordAsyncImpl, getResearchStoreImpl, getTaskIdFromDirImpl, getTodoStoreImpl, getWorkflowWorkItemByIdentityImpl, hasActiveTaskImpl, invalidateConfigCacheAfterMigrationImpl, isTaskIdConflictErrorImpl, listLegacyAutoMergeStampCandidatesImpl, readTaskRowFromDbImpl, recordBranchGroupMemberLandedImpl, refreshDatabaseHealthImpl, resolveEffectiveWorkflowIdSyncImpl, resolveTaskCustomFieldDefsSyncImpl, resolveWorkflowBypassGuardsImpl, serializeConfigForDiskImpl, setPluginWorkflowStepTemplatesImpl, shouldSkipWorkflowMovePoliciesImpl, suppressWatcherImpl, upsertTaskWithFtsRecoveryImpl } from "./task-store/task-store-helpers.js";
+import { addTaskCommentImpl, applyBuiltInPromptOverridesAsyncImpl, applyBuiltInPromptOverridesSyncImpl, areAllDependenciesDoneImpl, artifactStoredNameImpl, assertWorkflowIrTraitsValidImpl, clearActivityLogImpl, clearTaskWorkflowSelectionImpl, deleteTaskByIdImpl, getDefaultWorkflowIdImpl, resolveOriginWorkflowOverrideIdImpl, type TaskOriginWorkflowKind, getInsightStoreImpl, getMergeQueuedTaskIdsImpl, getMergeRequestRecordImpl, getMergeRequestRecordAsyncImpl, getMergeRequestRecordsAsyncImpl, getResearchStoreImpl, getTaskIdFromDirImpl, getTodoStoreImpl, getWorkflowWorkItemByIdentityImpl, hasActiveTaskImpl, invalidateConfigCacheAfterMigrationImpl, isTaskIdConflictErrorImpl, listLegacyAutoMergeStampCandidatesImpl, readTaskRowFromDbImpl, recordBranchGroupMemberLandedImpl, refreshDatabaseHealthAsyncImpl, refreshDatabaseHealthImpl, resolveTaskCustomFieldDefsSyncImpl, resolveWorkflowBypassGuardsImpl, serializeConfigForDiskImpl, setPluginWorkflowStepTemplatesImpl, shouldSkipWorkflowMovePoliciesImpl, suppressWatcherImpl, upsertTaskWithFtsRecoveryImpl } from "./task-store/task-store-helpers.js";
 import { getTaskSelectClauseImpl2, createTaskPersistSerializationContextImpl, getTaskPersistValuesImpl, getTaskPatchDescriptorsImpl, normalizeTaskFromDiskImpl, writeTaskJsonFileImpl, rowToPrEntityImpl, generatePrEntityIdImpl, readTaskForMoveImpl, rowToMergeQueueEntryImpl, rowToMergeRequestRecordImpl, rowToCompletionHandoffMarkerImpl, rowToWorkflowWorkItemImpl, rowToRunAuditEventImpl } from "./task-store/task-row-mappers.js";
-import { getTaskSelectClauseWithActivityLogLimitImpl, getChangedTaskColumnsImpl, getSoftDeletedWriteConflictImpl, readTaskJsonImpl, writeConfigImpl, _maybeAutoArchiveSameAgentDuplicateBackendImpl, updateBranchGroupImpl, updatePrEntityImpl, listTasksForGithubTrackingReconcileImpl, listTasksForGitlabTrackingReconcileImpl, renewCheckoutLeaseImpl, updateTaskAtomicImpl, getWorkflowPromptOverridesImpl, updateWorkflowSettingValuesImpl, rollbackConfigurationImpl, cancelActiveWorkflowWorkItemsForTaskImpl, setCompletionHandoffAcceptedMarkerImpl, reconcileLegacyAutoMergeStampsImpl, recoverExpiredMergeQueueLeasesImpl, rewriteDependentsForRemovalImpl, cleanupBranchForTaskImpl, addAttachmentImpl, deleteAttachmentImpl, registerArtifactImpl, updatePrInfoImpl, unlinkGithubIssueImpl, cleanupArchivedTasksImpl, generatePromptFromArchiveEntryImpl, listWorkflowOccupantTaskIdsImpl, evacuateCustomColumnsToLegacyImpl, listApprovedCliAutonomyAdaptersImpl, closeImpl, getActivityLogImpl } from "./task-store/remaining-ops-2.js";
-import { getOrCreateForProjectImpl, listGoalCitationsImpl, atomicWriteTaskJsonWithAuditImpl, duplicateTaskImpl, listStrandedRefinementsImpl, tryClaimCheckoutImpl, evaluateWorkflowMovePoliciesImpl, recordRunAuditEventImpl, getRunAuditEventsImpl, getWorkflowParitySummaryImpl, dequeueMergeQueueOnColumnExitImpl, updateIssueInfoImpl, listWorkflowStepsImpl, getWorkflowStepImpl, createWorkflowDefinitionImpl, countActiveInCapacitySlotSyncImpl, countActiveInCapacitySlotAsyncImpl, generateSpecifiedPromptImpl, recordActivityImpl, getEvalStoreImpl } from "./task-store/remaining-ops-1.js";
-import { markLegacyAutoMergeStampsOnceImpl, appendAgentLogImpl, importLegacyAgentLogsImpl, cleanupNoOpTaskMovedActivityRowsOnceImpl, runWorkflowColumnsIntegrityPassImpl, backfillCommitAssociationDiffStatsImpl } from "./task-store/workflow-integrity.js";
-import { saveWorkflowRunBranchImpl, clearNearDuplicateReferencesToImpl, selectNextTaskForAgentImpl, pauseTaskImpl, clearLinkedAgentTaskIdsImpl, listArtifactsImpl, rehomeOccupantImpl } from "./task-store/branch-group-ops.js";
-import { taskToArchiveEntryImpl, deleteTaskBackendImpl, deleteTaskIfBackendImpl, archiveTaskBackendImpl, unarchiveTaskImpl, restoreFromArchiveImpl, listArchivedTasksImpl } from "./task-store/archive-lifecycle-2.js";
-import { pruneOperationalLogsAsync, pruneAgentLogFilesAsync, type OperationalLogPruneResult } from "./task-store/async-maintenance.js";
-import { reconcilePhantomCommittedReservationsAsync } from "./task-store/async-phantom-reservations.js";
-import { resolveTaskSymbolsForTask, type TaskSymbolResolution } from "./task-symbol-resolution.js";
+import { getTaskSelectClauseWithActivityLogLimitImpl, getChangedTaskColumnsImpl, getSoftDeletedWriteConflictImpl, readTaskJsonImpl, writeConfigImpl, _resolveSameAgentDuplicateIntakeBackendImpl, updateBranchGroupImpl, updatePrEntityImpl, listTasksForGithubTrackingReconcileImpl, listTasksForGitlabTrackingReconcileImpl, renewCheckoutLeaseImpl, updateTaskAtomicImpl, applyInReviewStallObservationFencedImpl, updateWorkflowStepResultsFencedImpl, updateWorkflowStepResultsWithLogFencedImpl, publishReviewRemediationFencedImpl, linkTaskRecommendationImpl, normalizeWorkspaceTaskWorktreeMetadataImpl, mergeWorkspaceWorktreeEntryImpl, updateTaskRepositoryScopeImpl, updateWorkspaceReviewStateImpl, publishWorkspaceCodeReviewEvidenceImpl, resolveTaskWedgeNotificationEpisodeImpl, getWorkflowPromptOverridesImpl, updateWorkflowSettingValuesImpl, rollbackConfigurationImpl, cancelActiveWorkflowWorkItemsForTaskImpl, setCompletionHandoffAcceptedMarkerImpl, reconcileLegacyAutoMergeStampsImpl, recoverExpiredMergeQueueLeasesImpl, rewriteDependentsForRemovalImpl, cleanupBranchForTaskImpl, addAttachmentImpl, deleteAttachmentImpl, registerArtifactImpl, updatePrInfoImpl, unlinkGithubIssueImpl, generatePromptFromArchiveEntryImpl, listWorkflowOccupantTaskIdsImpl, listApprovedCliAutonomyAdaptersImpl, closeImpl, getActivityLogImpl } from "./task-store/task-mutation-ops.js";
+import { getOrCreateForProjectImpl, listGoalCitationsImpl, atomicWriteTaskJsonWithAuditImpl, type PlanningDependencyInvalidation, duplicateTaskImpl, listStrandedRefinementsImpl, tryClaimCheckoutImpl, evaluateWorkflowMovePoliciesImpl, recordRunAuditEventImpl, getRunAuditEventsImpl, dequeueMergeQueueOnColumnExitImpl, updateIssueInfoImpl, listWorkflowStepsImpl, getWorkflowStepImpl, createWorkflowDefinitionImpl, countActiveInCapacitySlotSyncImpl, countActiveInCapacitySlotAsyncImpl, generateSpecifiedPromptImpl, recordActivityImpl, getEvalStoreImpl } from "./task-store/project-store-ops.js";
+import { markLegacyAutoMergeStampsOnceImpl, appendAgentLogImpl, importLegacyAgentLogsImpl, cleanupNoOpTaskMovedActivityRowsOnceImpl, backfillCommitAssociationDiffStatsImpl } from "./task-store/workflow-integrity.js";
+import { saveWorkflowRunBranchImpl, clearNearDuplicateReferencesToImpl, selectNextTaskForAgentImpl, pauseTaskImpl, clearLinkedAgentTaskIdsImpl, listArtifactsImpl, rehomeOccupantImpl, type RehomeOccupantResult } from "./task-store/branch-group-ops.js";
+import { taskToArchiveEntryImpl, deleteTaskBackendImpl, deleteTaskIfBackendImpl, restoreFromArchiveImpl } from "./task-store/archive-lifecycle-2.js";
+import { pruneOperationalLogsAsync, pruneAgentLogFilesAsync, type OperationalLogPruneResult } from "./task-store/async/async-maintenance.js";
+import { reconcilePhantomCommittedReservationsAsync } from "./task-store/async/async-phantom-reservations.js";
+import { resolveTaskSymbolsForTask, type TaskSymbolResolution } from "./tasks/task-symbol-resolution.js";
 import { acquireSymbolLocksAsync, inspectSymbolLockConflictsAsync, reconcileStaleSymbolLocksAsync, releaseSymbolLocksAsync, renewSymbolLocksAsync } from "./task-store/symbol-locks.js";
-import type { AcquireSymbolLocksResult, ReconcileStaleSymbolLocksResult, ReleaseSymbolLocksResult, RenewSymbolLocksResult, SymbolLockConflict, SymbolLockOwner } from "./symbol-lock-types.js";
-import { queryRunAuditEvents } from "./task-store/async-audit.js";
-import { isValidMergeRequestTransitionImpl, enqueueMergeQueueSyncInternalImpl, releaseMergeQueueLeaseImpl, collectMergeDetailsImpl, applyPrMergedTransitionImpl } from "./task-store/merge-queue-ops-2.js";
-import { upsertWorkflowWorkItemImpl, transitionWorkflowWorkItemImpl, acquireWorkflowWorkItemLeaseImpl } from "./task-store/workflow-workitems-ops-2.js";
+import type { AcquireSymbolLocksResult, ReconcileStaleSymbolLocksResult, ReleaseSymbolLocksResult, RenewSymbolLocksResult, SymbolLockConflict, SymbolLockOwner } from "./tasks/symbol-lock-types.js";
+import { acquireWorkspaceLeaseAsync, inspectWorkspaceLeasesAsync, listPendingWorkspaceLandIntentsAsync, reclaimWorkspaceLeaseAsync, recordWorkspaceLandIntentAsync, recordWorkspaceLeaseFenceRefAsync, reconcileExpiredWorkspaceLeasesAsync, releaseStaleWorkspaceLeasesForNodeAsync, releaseWorkspaceLeaseAsync, renewWorkspaceLeaseAsync, resolveOrphanedWorkspaceLandIntentAsync, resolveWorkspaceLandIntentAsync, validateWorkspaceLeaseFenceAsync, withValidWorkspaceLeaseAsync } from "./task-store/workspace-leases.js";
+import type { WorkspaceLeaseHandle, WorkspaceLeaseKind, WorkspaceLeaseOwner } from "./tasks/workspace-lease-types.js";
+import { queryRunAuditEvents } from "./task-store/async/async-audit.js";
+import { isValidMergeRequestTransitionImpl, releaseMergeQueueLeaseImpl, collectMergeDetailsImpl, applyPrMergedTransitionImpl } from "./task-store/merge-queue-ops-2.js";
+import { upsertWorkflowWorkItemImpl, replaceActiveTaskWorkflowContinuationImpl, seedStrandedPlanReviewContinuationImpl, seedWorkspaceCodeReviewContinuationIfIdleImpl, transitionWorkflowWorkItemImpl, acquireWorkflowWorkItemLeaseImpl } from "./task-store/workflow-workitems-ops-2.js";
 import { getSettingsImpl, getSettingsFastImpl, getSettingsByScopeImpl, getSettingsByScopeFastImpl } from "./task-store/settings-ops-2.js";
-import { runPluginColumnTransitionHooksImpl, logEntryImpl } from "./task-store/audit-ops.js";
+import { runPluginColumnTransitionHooksImpl, checkAndRecordUnplannedExecutionBlockImpl, logEntryImpl, logEntryOnceImpl, transitionQueuedEpisodeImpl, type QueuedEpisodeTransition } from "./task-store/audit-ops.js";
+import { claimTaskOverlapWaitImpl, completeTaskOverlapWaitImpl, listTaskOverlapWaitsImpl, publishTaskOverlapDeliveriesImpl } from "./task-store/overlap-wait-ops.js";
+import type { OverlapWaitClaim, OverlapWaitDeliverySnapshot, OverlapWaitExecutionIdentity, OverlapWaitReceipt } from "./types/task/task-overlap-wait.js";
 import { clearWorkflowRunBranchesImpl, projectMergeRequestToWorkflowWorkItemImpl, createCompletionHandoffWorkflowWorkImpl } from "./task-store/workflow-workitems-ops.js";
 import { flushAgentLogBufferImpl, appendAgentLogBatchImpl } from "./task-store/agent-logs.js";
 import { refineTaskImpl, updateTaskDependenciesImpl } from "./task-store/update-task-deps.js";
 import { createWorkflowStepImpl, updateWorkflowStepImpl, updateWorkflowDefinitionImpl, deleteWorkflowDefinitionImpl, setDefaultWorkflowIdImpl, selectTaskWorkflowImpl } from "./task-store/workflow-ops.js";
-import { initImpl, setupActivityLogListenersImpl, reconcileOrphanedTaskDirsImpl, watchImpl, checkForChangesImpl, migrateAgentLogEntriesImpl, migrateMovedSettingsImpl, recoverStaleTransitionPendingImpl, migrateLegacyWorkflowStepsImpl, emitTaskLifecycleEventSafelyImpl } from "./task-store/lifecycle-ops.js";
-import { updateStepImpl, acquireMergeQueueLeaseImpl, mergeTaskImpl } from "./task-store/merge-queue-ops.js";
+import { initImpl, setupActivityLogListenersImpl, reconcileOrphanedTaskDirsImpl, watchImpl, migrateAgentLogEntriesImpl, migrateMovedSettingsImpl, recoverStaleTransitionPendingImpl, migrateLegacyWorkflowStepsImpl, emitTaskLifecycleEventSafelyImpl } from "./task-store/lifecycle-ops.js";
+import { TaskDeletedOutboxConsumer } from "./task-store/task-deleted-outbox-consumer.js";
+import { updateStepImpl, startStepImpl, acquireMergeQueueLeaseImpl, mergeTaskImpl } from "./task-store/merge-queue-ops.js";
+import { appendRemediationStepsImpl, type AppendRemediationStepsOptions, type AppendRemediationStepsResult } from "./task-store/remediation-step-ops.js";
 import { addCommentImpl, upsertTaskDocumentImpl } from "./task-store/comments-ops.js";
-import { deleteTaskImpl, deleteTaskIfImpl, archiveTaskImpl, type DeleteTaskIfResult } from "./task-store/archive-lifecycle.js";
+import { deleteTaskImpl, type DeleteTaskIfResult } from "./task-store/archive-lifecycle.js";
+import type { TaskDeleteAuditContext } from "./task-delete-attribution.js";
 import { updateSettingsImpl, updateGlobalSettingsImpl } from "./task-store/settings-ops.js";
-import { createTaskBackendImpl, _createTaskInternalBackendImpl, createTaskImpl, createTaskWithReservedIdImpl, _createTaskInternalImpl, _maybeAutoArchiveSameAgentDuplicateImpl } from "./task-store/task-creation.js";
-import { getTaskImpl, listTasksImpl, searchTasksImpl, listTasksModifiedSinceImpl, getTaskVerificationRequestAsyncImpl } from "./task-store/reads.js";
+import { mutateScriptImpl, type MutateScriptInput, type ScriptCatalogEntry } from "./task-store/script-ops.js";
+import { createTaskBackendImpl, _createTaskInternalBackendImpl, createTaskImpl, createTaskWithReservedIdImpl, _createTaskInternalImpl, _resolveSameAgentDuplicateIntakeImpl } from "./task-store/task-creation.js";
+import { getTaskImpl, listCompletedTasksImpl, listCurrentTasksPageImpl, listTasksImpl, searchTasksImpl, listTasksModifiedSinceImpl, getTaskVerificationRequestAsyncImpl, listTaskRecommendationsImpl, findTaskByProposalClaimIdImpl, listTasksBySourceLineageImpl, type CompletedTaskPage, type ListTasksOptions, type TaskListPage } from "./task-store/reads.js";
+import { drainArchivedTasksIntoDone, inspectArchivedTaskHistory, type ArchivedTaskHistoryInspection, type ArchivedTaskReintegrationResult } from "./task-store/archive-reintegration.js";
+import { supplementTaskHistoryFromEvidence, type SupplementTaskHistoryResult } from "./task-store/async/async-archive-lineage.js";
+import type { TaskColumnSortMode } from "./tasks/task-priority.js";
 import { updateTaskUnlockedImpl } from "./task-store/task-update.js";
 import { __setTaskActivityLogLimitsForTesting } from "./task-store/comments.js";
+import { columnsWithFlag, declaresAnyLifecycleTrait, resolveLifecycleColumns, resolveReviewColumns, type LifecycleColumns } from "./workflows/workflow-lifecycle-traits.js";
+import { isReviewColumnRole, isWipColumnRole } from "./column-roles.js";
+import { resolveProjectColumnsForRoles } from "./project-lane-vocabulary.js";
+import {
+  appendPatchnodeEntry,
+  appendPatchnodeEntryInTransaction,
+  findLatestPatchnodeCompletionInTransaction,
+  markPatchnodeEntryRevertedInTransaction,
+  queryPatchnodeEntries,
+  reconcilePatchnodeFromLiveTasks,
+  type PatchnodeReconcileResult,
+} from "./task-store/async/async-patchnode.js";
+import { buildPatchnodeEntryId, buildPatchnodeEntryInput } from "./board/patchnode.js";
+import type { PatchnodeEntry, PatchnodeQuery } from "./types/task/patchnode.js";
+import { resolveWorkflowIrForTask } from "./workflows/workflow-ir-resolver.js";
 // FNXC:RuntimeBackendAsync 2026-06-24-10:15:
 // Async helper imports for backend-mode (AsyncDataLayer/PostgreSQL) delegation.
 // persistence/allocator/settings/search/lifecycle/merge/archive helpers preserve
 // the handoff-to-review invariant (VAL-DATA-013), merge-queue lease semantics
 // (VAL-DATA-014), lineage-integrity gate (VAL-DATA-010/012), and archive
 // snapshot atomicity (VAL-CROSS-014/015). Drizzle queries target the PG schema.
+import type { AgentActivityEvent, AgentActivityEventInput } from "./types/agents/agents.js";
+import { appendAgentActivityEvent, pruneAgentActivityEvents } from "./task-store/async/async-agent-activity.js";
 import type { BranchGroupRow, PrEntityRow, TaskDocumentRow, ArtifactRow, TaskDocumentRevisionRow, GoalCitationRow, RunAuditEventRow, MergeQueueRow, MergeRequestRow, CompletionHandoffMarkerRow, WorkflowWorkItemRow } from "./task-store/row-types.js";
 
 /** Database row shape for the tasks table (all columns). */
 
-
 export interface TaskStoreEvents {
-  "task:created": [task: Task];
-  "task:moved": [data: { task: Task; from: ColumnId; to: ColumnId; source: "user" | "engine" | "scheduler" }];
-  "task:updated": [task: Task];
-  "task:deleted": [task: Task, meta?: { githubIssueAction?: GithubIssueAction }];
+  "agent:activity": [event: AgentActivityEvent];
+  /*
+  FNXC:PlanningModeScheduling 2026-08-03-09:44:
+  Task creation can select a custom workflow whose planning lanes do not use legacy names.
+  Creation emits its resolved lanes after the selection is durable, so synchronous triage wake
+  listeners observe the same authoritative lifecycle vocabulary as task:moved listeners.
+  */
+  "task:created": [task: Task, meta?: { lanes?: TaskMoveLanes }];
+  /*
+  FNXC:WorkflowEvents 2026-07-31-21:00 (fleet — the emitter carries the lanes):
+  `lanes` is the moving task's RESOLVED lifecycle columns, attached by the emitter.
+
+  Listeners on this event run synchronously, so any that needed a lane answer had to resolve one
+  synchronously too — and the only sync resolver (`resolveTaskWorkflowIrSync`) returns the DEFAULT
+  workflow in production, making every such guard inert. Resolving asynchronously in the listener is
+  not available either: the scheduler's snapshot invalidation is asserted to run in the listener's
+  synchronous prologue.
+
+  Carrying the answer on the payload removes the dilemma rather than trading one horn for the other:
+  the emitter is already async and already resolves this task's IR, and the listener gets a correct
+  lane set with no await at all.
+
+  OPTIONAL because not every emit path can resolve (some fire from sync contexts or from a cached row
+  mid-teardown). A listener must therefore keep its existing fallback; absent `lanes` is "unknown",
+  never "legacy".
+  */
+  "task:moved": [data: {
+    task: Task;
+    from: ColumnId;
+    to: ColumnId;
+    source: "user" | "engine" | "scheduler";
+    lanes?: TaskMoveLanes;
+    /** Raw source option; absent remains an unattributed legacy move. */
+    requestedSource?: "user" | "engine" | "scheduler";
+    /** Registered cause for an explicit engine/scheduler backward move. */
+    lifecycleReason?: string;
+    /*
+    FNXC:LifecycleContainment 2026-08-28-04:47:
+    FN-207 requires EVERY automatic move to name its cause. `lifecycleReason` only exists for
+    explicit engine/scheduler BACKWARD moves, so routine forward graph transitions reached the
+    operator log with no cause at all and rendered as "unattributed automatic move" — the exact
+    illegible wander the task was filed against. The mover's own provenance is already on
+    `MoveTaskOptions.workflowMoveSource`; forwarding it here lets the log fall back to it instead
+    of claiming the move was unattributed. Optional: emit paths that cannot supply provenance keep
+    the unattributed rendering rather than inventing one.
+    */
+    workflowMoveSource?: string;
+  }];
+  /*
+  FNXC:WorkflowEvents 2026-08-01-06:11:
+  `task:updated` listeners are synchronous and may receive cache-warmed resolved lanes as an optional
+  second argument. The first argument remains the Task so existing one-argument subscribers are
+  unchanged; absent metadata is unknown, never a legacy-lane claim.
+  */
+  "task:updated": [task: Task, meta?: { lanes?: TaskMoveLanes; failedTransition?: boolean }];
+  /*
+  FNXC:CrossProcessDeleteObservation 2026-08-01-11:39:
+  Observed outbox delivery is at-least-once, including a crash-window duplicate. The explicit
+  marker lets listener paths suppress writer-owned accumulating effects while bridge/cache work
+  remains idempotent; event identity makes duplicate provenance inspectable without payload prose.
+  */
+  "task:deleted": [task: Task, meta?: { githubIssueAction?: GithubIssueAction; observed?: boolean; outboxEventId?: string }];
   "task:merged": [result: MergeResult];
   "settings:updated": [data: { settings: Settings; previous: Settings }];
   "workflow:setting-values-updated": [data: {
@@ -176,6 +289,9 @@ export const storeLog = createLogger("task-store");
 export const coreLog = createLogger("core");
 export const TASK_BRANCH_CONTEXT_METADATA_KEY = "fusionBranchContext";
 
+/** Per-project/task FIFO tails used only where an in-memory store has no PostgreSQL session lock. */
+const planningLifecycleLocks = new Map<string, Promise<void>>();
+
 export type TaskDependencyMutation =
   | { operation: "add"; dependency: string }
   | { operation: "remove"; dependency: string }
@@ -187,19 +303,23 @@ export type TaskDependencyMutation =
 // re-imported at the top of this file and re-exported below for back-compat.
 
 // `parseStepHeadings` re-exported here for back-compat; extracted to step-parsers.ts (KTD-12).
-export { parseStepHeadings } from "./step-parsers.js";
+export { parseStepHeadings } from "./tasks/step-parsers.js";
 
 // Re-export extracted symbols (VAL-DECOMPOSE-002: facade preserves every public method signature).
 export {
   TaskHasDependentsError,
   TaskSelfDeleteError,
   TaskDeletedError,
+  TaskNotFoundError,
+  isTaskNotFoundError,
   TombstonedTaskResurrectionError,
   TaskHasLineageChildrenError,
   InvalidFileScopeError,
   SELF_DEFEATING_OPERATION_VERBS,
   SelfDefeatingDependencyError,
+  SelfSpawnedDependencyError,
   detectSelfDefeatingDependency,
+  detectSelfSpawnedDependency,
   DependencyCycleError,
   detectDependencyCycle,
   MergeQueueTaskNotFoundError,
@@ -229,6 +349,8 @@ export interface MoveTaskOptions {
   preservePause?: boolean;
   allocateWorktree?: (reservedNames: Set<string>) => string | null;
   moveSource?: "user" | "engine" | "scheduler";
+  /** Registered reason from ENGINE_BACKWARD_MOVE_REASONS for a backward engine move. */
+  lifecycleReason?: string;
   workflowMoveActor?: WorkflowMovePolicyInput["actor"];
   workflowMoveSource?: string;
   workflowMoveMetadata?: Record<string, unknown>;
@@ -243,6 +365,12 @@ export interface MoveTaskOptions {
 /** @internal Extracted to task-store/moves.ts */
 export interface MoveTaskInternalOptions {
   fromHandoff: boolean;
+  /** @internal Fence-validated inside moveTaskInternal's transaction for terminal-failure recovery. */
+  terminalFailureApply?: {
+    applyToken: string;
+    patch: Parameters<TaskStore["updateTask"]>[1];
+    expectedColumn: ColumnId;
+  };
   runContext?: Pick<RunMutationContext, "runId" | "agentId"> | { runId?: string; agentId?: string };
   ownerAgentId?: string | null;
   evidence?: HandoffToReviewOptions["evidence"];
@@ -314,6 +442,89 @@ function filterRepairOverlapIgnoredPaths(paths: string[], ignorePaths: string[])
   return paths.filter((path) => !ignorePaths.some((ignorePath) => repairIgnoredOverlapPath(path, ignorePath)));
 }
 
+export interface RepairFileScopeLeaseLanes {
+  /** A single legacy lane or every selected-workflow lane carrying the WIP role. */
+  wip: string | ReadonlySet<string> | undefined;
+  /** A single legacy lane or every selected-workflow lane carrying a review role. */
+  review: string | ReadonlySet<string> | undefined;
+  terminal?: ReadonlySet<string>;
+}
+
+type RepairTaskLifecycleLanes = {
+  lifecycle: LifecycleColumns | undefined;
+  lease: RepairFileScopeLeaseLanes | undefined;
+};
+
+function repairLeaseLaneIncludes(
+  lanes: string | ReadonlySet<string> | undefined,
+  column: string,
+): boolean {
+  return typeof lanes === "string" ? lanes === column : lanes?.has(column) === true;
+}
+
+/*
+FNXC:OverlapScheduling 2026-08-29-06:04:
+Operator overlap repair must use the same lease lifetime as scheduler admission: terminal or deleted
+cards release immediately; WIP stays active before checkout acquisition; review stays active only
+while a singular or per-repository checkout exists; other retained checkouts are dormant and resolve contention
+by priority, age, then task id. The explicit archive/delete/checkout-clear escape hatch remains the only way to
+release unfinished work early.
+
+FNXC:OverlapScheduling 2026-09-01-14:49:
+Checkout-free planning has no repair lease, so a stale blocker pointing at another planner is cleared.
+A hold-lane card with a retained execution checkout remains a dormant holder; checkout evidence, not
+planning-column membership, is the shared scheduler/repair contract.
+
+FNXC:OverlapScheduling 2026-08-29-06:34:
+An unresolvable workflow retains the shared legacy role answer through core column-role helpers. Do
+not reintroduce local lifecycle literals here: that would make a compatibility fallback a new
+unclassified lifecycle guard and let this repair path drift from the common role policy.
+
+FNXC:OverlapScheduling 2026-08-29-07:04:
+`LifecycleColumns` intentionally chooses one destination per role and cannot classify membership.
+Overlap repair therefore receives complete role sets from the blocker's own selected workflow: a
+second WIP or review lane retains unfinished work, while every Complete lane releases it; soft deletion
+is classified separately by `deletedAt`.
+*/
+export function classifyRepairFileScopeLease(
+  candidate: Pick<Task, "column" | "worktree" | "workspaceWorktrees" | "deletedAt">,
+  lanes: RepairFileScopeLeaseLanes | undefined,
+): FileScopeLeaseKind {
+  if (candidate.deletedAt) return "none";
+  if (!lanes) {
+    if (isWipColumnRole(undefined, candidate.column)) return "active";
+    return isReviewColumnRole(undefined, candidate.column) && taskHoldsUnmergedCheckout(candidate) ? "active" : "none";
+  }
+  if (lanes.terminal?.has(candidate.column)) return "none";
+  if (repairLeaseLaneIncludes(lanes.wip, candidate.column)) return "active";
+  if (repairLeaseLaneIncludes(lanes.review, candidate.column)) {
+    return taskHoldsUnmergedCheckout(candidate) ? "active" : "none";
+  }
+  return taskHoldsUnmergedCheckout(candidate) ? "dormant" : "none";
+}
+
+/** Compatibility wrapper retained for callers that only need a boolean lease answer. */
+export function holdsRepairFileScopeLease(
+  candidate: Pick<Task, "column" | "worktree" | "workspaceWorktrees" | "deletedAt">,
+  lanes: RepairFileScopeLeaseLanes | undefined,
+): boolean {
+  return classifyRepairFileScopeLease(candidate, lanes) !== "none";
+}
+
+function repairLeaseLanesForWorkflow(
+  ir: WorkflowIr,
+  lifecycle: LifecycleColumns | undefined = resolveLifecycleColumns(ir),
+): RepairFileScopeLeaseLanes | undefined {
+  if (!lifecycle) return undefined;
+  return {
+    wip: new Set(columnsWithFlag(ir, "countsTowardWip")),
+    review: new Set(resolveReviewColumns(ir)),
+    terminal: new Set(columnsWithFlag(ir, "complete")),
+  };
+}
+
+export const PATCHNODE_RECONCILE_TTL_MS = 15 * 60_000;
+
 export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public static readonly ACTIVE_TASKS_WHERE = '"deletedAt" IS NULL';
   /**
@@ -326,8 +537,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public static readonly DEFAULT_WORKFLOW_POOL_ID = DEFAULT_WORKFLOW_POOL_ID;
 
   /** FNXC:RuntimeBackendInjection 2026-06-24-14:20: Backend-mode factory. */
-  static async getOrCreateForProject( projectId?: string, centralCore?: CentralCore, globalSettingsDir?: string, asyncLayer?: AsyncDataLayer, ): Promise<TaskStore> {
-    return getOrCreateForProjectImpl(this, projectId, centralCore, globalSettingsDir, asyncLayer);
+  static async getOrCreateForProject( projectId?: string, centralCore?: CentralCore, globalSettingsDir?: string, asyncLayer?: AsyncDataLayer, consumerId?: string, ): Promise<TaskStore> {
+    return getOrCreateForProjectImpl(this, projectId, centralCore, globalSettingsDir, asyncLayer, consumerId);
   }
 
   /** FNXC:PostgresRuntimeStorage 2026-07-14-18:47: Task metadata is authoritative in PostgreSQL; task document/blob files remain on disk. */
@@ -336,20 +547,21 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public configPath: string;
   public _db: Database | null = null;
   public activityListenersWired = false;
-  /** When true, activity-log listeners skip recording (set by checkForChanges polling so re-emitted events don't double-log). In-process emit path remains sole source of truth. */
-  public suppressActivityLogForPollingEmit = false;
-  public _archiveDb: ArchiveDatabase | null = null;
 
   /**
    * FNXC:PostgresRuntimeStorage 2026-07-14-18:47: Production TaskStores receive an AsyncDataLayer and delegate all persistence to PostgreSQL. A missing layer is a construction error; retained sync members exist only until compatibility tests and types are removed.
    */
   public readonly asyncLayer: AsyncDataLayer | null = null;
+  /** Explicitly absent means cross-process lifecycle observation is disabled. */
+  public readonly consumerId: string | null;
+  private taskDeletedOutboxConsumer: TaskDeletedOutboxConsumer | null = null;
   private pluginPostgresSchemaExecutor: ((contracts: readonly LoadedPluginSchemaContract[]) => Promise<void>) | null = null;
 
   /*
   FNXC:HandoffFailureInjection 2026-07-15-12:00:
-  PostgreSQL handoffs call enqueueMergeQueueInTransaction directly, bypassing the
-  legacy enqueueMergeQueueSyncInternal spy. Keep this test-only hook dormant in
+  PostgreSQL handoffs call enqueueMergeQueueInTransaction directly. The legacy sync
+  SQLite enqueue arm this once bypassed was deleted 2026-07-31 (it had no callers);
+  this hook is unrelated to it and stays. Keep this test-only hook dormant in
   production so VAL-DATA-013 can inject a late transaction failure and prove every
   handoff sub-write rolls back without adding queries or runtime behavior.
   */
@@ -361,8 +573,43 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return this.asyncLayer !== null;
   }
 
+  /**
+   * FNXC:RUFU121ProjectIdentity 2026-08-18-19:53:
+   * RUFU-121: the store's project id (injected via the AsyncDataLayer), or
+   * null when the store has no project scope (legacy/non-backend mode).
+   * Consumers: the engine task-memory-capture seam (task_completion
+   * attribution) and the dashboard chat-delete Stash sync route — both need
+   * project identity WITHOUT a central-core lookup (the dashboard route must
+   * not import @fusion/engine; the capture seam must not block on I/O).
+   */
+  public getProjectId(): string | null {
+    return this.asyncLayer?.projectId ?? null;
+  }
+
   public watcher: FSWatcher | null = null;
   public taskCache: Map<string, Task> = new Map();
+  /** Per-store, bounded answer cache used only to decorate synchronous task:updated events. */
+  public readonly laneCache = new TaskLaneCache();
+  /*
+  FNXC:IncompletePgPorts 2026-07-26-20:35:
+  Sync getDatabaseHealth/healthCheck cannot await PostgreSQL. Cache the last
+  AsyncDataLayer ping result so self-healing and CLI health probes observe real
+  connectivity rather than the always-healthy cutover sentinel.
+  */
+  public postgresHealthSnapshot: {
+    healthy: boolean;
+    corruptionDetected: boolean;
+    corruptionErrors: string[];
+    lastCheckedAt: Date | null;
+    isRunning: boolean;
+  } | null = null;
+  /*
+  FNXC:IncompletePgPorts 2026-07-26-20:35:
+  Sync getSettingsSync (generateSpecifiedPrompt ntfy section) uses the last
+  merged settings from getSettings/getSettingsFast so PG mode is not stuck on
+  DEFAULT_SETTINGS after a successful async load.
+  */
+  public settingsSyncCache: Settings | null = null;
 /** U8 (KTD-2): pre-evaluated plugin gate verdicts, keyed `taskId` → `toColumn` */
   public pluginGateVerdicts: Map<string, Map<string, PluginGateVerdict[]>> = new Map();
   public recentlyWritten: Set<string> = new Set();
@@ -385,19 +632,15 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public taskIdIntegrityReport: TaskIdIntegrityReport = { status: "ok", checkedAt: new Date().toISOString(), anomalies: [] };
   public lastTaskIdIntegrityLogSignature: string | null = null;
   public workflowStepsCache: import("./types.js").WorkflowStep[] | null = null;
-  public workflowDefinitionsCache: WorkflowDefinition[] | null = null;
   public _pluginWorkflowStepTemplates: Array<{ pluginId: string; template: WorkflowStepTemplate }> = [];
   public globalSettingsStore: GlobalSettingsStore;
-  public pollInterval: ReturnType<typeof setInterval> | null = null;
-  public pollingInProgress = false;
-  public lastKnownModified: number = 0;
-  public lastPollTime: string | null = null;
   public donePauseBackfillDone = false;
+  private patchnodeReconcileMemo: { promise: Promise<PatchnodeReconcileResult>; startedAt: number } | null = null;
   public startupSlimListMemo = new Map<string, { expiresAt: number; promise: Promise<Task[]> }>();
   public static readonly STARTUP_SLIM_LIST_MEMO_TTL_MS = 2_500;
 
   public get isWatching(): boolean {
-    return this.watcher !== null || this.pollInterval !== null;
+    return this.watcher !== null;
   }
   public missionStore: MissionStore | AsyncMissionStore | null = null;
   public ideationStore: AsyncIdeationStore | null = null;
@@ -407,6 +650,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public experimentSessionStore: ExperimentSessionStore | null = null;
   public todoStore: TodoStore | AsyncTodoStore | null = null;
   public goalStore: GoalStore | AsyncGoalStore | null = null;
+  public noteStore: AsyncNoteStore | null = null;
+  public whiteboardStore: AsyncWhiteboardStore | null = null;
   public evalStore: EvalStore | AsyncEvalStore | null = null;
   public secretsStore: SecretsStore | null = null;
   public secretsCentralCore: CentralCore | null = null;
@@ -417,6 +662,23 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    * This is the PostgreSQL-backed allocator that handles task ID reservation/commit/abort against the distributed_task_id tables.
    */
   public asyncDistributedTaskIdAllocator: DistributedTaskIdAllocator | null = null;
+
+  /*
+  FNXC:IntakeOwnership 2026-08-09-18:04:
+  Every task create must read the same project-scoped durable-agent snapshot without
+  constructing a disposable AgentStore per row. Reuse this store-owned seam so normal
+  Dashboard, API, CLI, and reserved-ID intake share agent-backend lifecycle ownership.
+  */
+  private intakeOwnerAgentStore: AgentStore | null = null;
+
+  public getIntakeOwnerAgentStore(): AgentStore {
+    if (!this.asyncLayer) throw new Error("Task intake ownership requires an async agent backend");
+    return this.intakeOwnerAgentStore ??= new AgentStore({
+      rootDir: this.rootDir,
+      asyncLayer: this.asyncLayer,
+      projectId: this.asyncLayer.projectId,
+    });
+  }
 
   public agentLogBuffer: Array<{
     taskId: string;
@@ -453,7 +715,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
 
   /** FNXC:RuntimeBackendInjection 2026-06-24-14:05: asyncLayer → backend mode (PostgreSQL, no SQLite); absent → legacy SQLite. */
-  constructor( public rootDir: string, globalSettingsDir?: string, options?: { asyncLayer?: AsyncDataLayer }, ) {
+  constructor( public rootDir: string, globalSettingsDir?: string, options?: { asyncLayer?: AsyncDataLayer; consumerId?: string }, ) {
     super();
     this.setMaxListeners(100);
     assertProjectRootDir(rootDir, "TaskStore");
@@ -462,13 +724,64 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     this.tasksDir = join(this.fusionDir, "tasks");
     this.configPath = join(this.fusionDir, "config.json");
     this.asyncLayer = options?.asyncLayer ?? null;
+    this.consumerId = options?.consumerId ?? null;
     const resolvedGlobalSettingsDir = globalSettingsDir
       ?? (process.env.VITEST === "true" ? join(rootDir, ".fusion-global-settings") : undefined);
     this.globalSettingsDir = resolvedGlobalSettingsDir;
     this.globalSettingsStore = new GlobalSettingsStore(resolvedGlobalSettingsDir, this.asyncLayer ?? undefined);
   }
-  public emitTaskLifecycleEventSafely( event: "task:created" | "task:updated", args: TaskStoreEvents["task:created"] | TaskStoreEvents["task:updated"], ): boolean {
+  /*
+  FNXC:WorkflowEvents 2026-08-01-06:28:
+  Safe lifecycle emission invokes listeners directly to isolate listener failures, so it bypasses
+  EventEmitter.emit. Decorate this path too; otherwise the hot update surfaces silently miss lanes.
+
+  FNXC:ActivityLogFailureDedup 2026-08-19-20:03:
+  Update metadata now carries the failure-transition marker, but warm-cache updates must retain the
+  existing resolved lanes decoration and cold-cache updates must preserve absent metadata.
+  */
+  public emitTaskLifecycleEventSafely( event: "task:created" | "task:updated" | "task:deleted", args: TaskStoreEvents["task:created"] | TaskStoreEvents["task:updated"] | TaskStoreEvents["task:deleted"], ): boolean {
+    if (event === "task:updated") {
+      const task = args[0] as Task;
+      const metadata = args[1] as TaskStoreEvents["task:updated"][1] | undefined;
+      const lanes = this.laneCache.get(task.id);
+      if (lanes !== undefined && metadata?.lanes === undefined) {
+        return emitTaskLifecycleEventSafelyImpl(this, event, [task, { ...metadata, lanes }]);
+      }
+    }
     return emitTaskLifecycleEventSafelyImpl(this, event, args);
+  }
+
+  /** Dispatch a committed outbox row without replaying delete-writer side effects. */
+  public emitObservedTaskDeleted(
+    task: Task,
+    outboxEventId: string,
+    metadata: Pick<NonNullable<TaskStoreEvents["task:deleted"][1]>, "githubIssueAction"> = {},
+  ): boolean {
+    /*
+    FNXC:CrossProcessDeleteObservation 2026-08-01-13:03:
+    Observed delivery must retain the delete's integration intent while marking it replay-safe.
+    Bridges can report the original split handoff/action, but listener-owned GitHub/GitLab mutation
+    paths must not repeat a committed writer's effects during at-least-once crash-window delivery.
+    */
+    this.taskCache.delete(task.id);
+    return emitTaskLifecycleEventSafelyImpl(this, "task:deleted", [task, {
+      ...metadata,
+      observed: true,
+      outboxEventId,
+    }]);
+  }
+
+  /** Start durable task:deleted observation only for explicitly named backend consumers. */
+  async startTaskDeletedOutboxConsumer(): Promise<void> {
+    if (!this.asyncLayer || !this.consumerId || this.taskDeletedOutboxConsumer) return;
+    this.taskDeletedOutboxConsumer = new TaskDeletedOutboxConsumer(this);
+    await this.taskDeletedOutboxConsumer.start();
+  }
+
+  async stopTaskDeletedOutboxConsumer(): Promise<void> {
+    const consumer = this.taskDeletedOutboxConsumer;
+    this.taskDeletedOutboxConsumer = null;
+    await consumer?.stop();
   }
 
   /**
@@ -480,11 +793,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return dbImpl(this);
   }
 
-  /** @internal In backend mode, archive DB lives in PostgreSQL; reaching this throws. */
-  /** @internal TaskStore decomposition */
-  public get archiveDb(): ArchiveDatabase {
-    return archiveDbImpl(this);
-  }
   public buildTaskIdIntegrityFallbackReport(): TaskIdIntegrityReport {
     return buildTaskIdIntegrityFallbackReportImpl(this);
   }
@@ -503,8 +811,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public reconcileDistributedTaskIdStateOnOpen(): void {
     return reconcileDistributedTaskIdStateOnOpenImpl(this);
   }
-  async init(): Promise<void> {
-    return initImpl(this);
+  async init(options?: { skipArchiveReintegration?: boolean }): Promise<void> {
+    return initImpl(this, options);
   }
 
   // ── Row <-> Task Conversion ────────────────────────────────────────
@@ -640,6 +948,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public isTaskIdPresentInArchivedTasksTable(id: string): boolean {
     return isTaskIdPresentInArchivedTasksTableImpl(this, id);
   }
+  /** PostgreSQL-authoritative archive presence check (warm + cold archive tables). */
+  public async isTaskIdPresentInArchivedTasksTableAsync(id: string): Promise<boolean> {
+    return isTaskIdPresentInArchivedTasksTableAsyncImpl(this, id);
+  }
   public async taskIdExistsAnywhere(id: string): Promise<boolean> {
     return taskIdExistsAnywhereImpl(this, id);
   }
@@ -648,9 +960,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
   public async maybeResolveTombstonedTaskId( id: string, input: Pick<TaskCreateInput, "forceResurrect">, operation: "createTask" | "duplicateTask" | "refineTask", ): Promise<void> {
     return maybeResolveTombstonedTaskIdImpl(this, id, input, operation);
-  }
-  public isTaskArchived(id: string): boolean {
-    return isTaskArchivedImpl(this, id);
   }
   public findLiveDependents(id: string): string[] {
     return findLiveDependentsImpl(this, id);
@@ -680,6 +989,64 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public withTaskLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
     return withTaskLockImpl(this, id, fn);
   }
+
+  /**
+   * FNXC:PlanningDependencyReseed 2026-08-04-00:30:
+   * Dependency re-specification must serialize ahead of its task lock so the
+   * planner finalization and mutation cannot both publish contradictory
+   * handoffs. PostgreSQL persistence already makes the inner writes atomic;
+   * this FIFO is the compatibility fallback used by in-process/test stores.
+   */
+  public async withPlanningLifecycleLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+    const backend = this.asyncLayer?.backend;
+    if (this.asyncLayer && backend) {
+      return await withPlanningLifecycleAdvisoryLock({
+        projectId: this.asyncLayer.projectId ?? this.rootDir,
+        taskId: id,
+        directSessionUrl: backend.directSessionUrl ?? null,
+        provenance: backend.directSessionProvenance ?? null,
+        runtimeUrl: backend.runtimeUrl,
+        migrationUrl: backend.migrationUrl,
+      }, fn);
+    }
+    const projectId = this.asyncLayer?.projectId ?? this.rootDir;
+    const key = `${projectId}:${id}`;
+    const prior = planningLifecycleLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    planningLifecycleLocks.set(key, current);
+    await prior;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (planningLifecycleLocks.get(key) === current) planningLifecycleLocks.delete(key);
+    }
+  }
+  /** Acquire all child planning keys in deterministic order without a fan-out connection cost. */
+  public async withPlanningLifecycleLocks<T>(ids: readonly string[], fn: () => Promise<T>): Promise<T> {
+    const sorted = [...new Set(ids)].sort();
+    if (sorted.length === 0) return fn();
+    const backend = this.asyncLayer?.backend;
+    if (this.asyncLayer && backend) {
+      return withPlanningLifecycleAdvisoryLocks({
+        projectId: this.asyncLayer.projectId ?? this.rootDir,
+        taskIds: sorted,
+        directSessionUrl: backend.directSessionUrl ?? null,
+        provenance: backend.directSessionProvenance ?? null,
+        runtimeUrl: backend.runtimeUrl,
+        migrationUrl: backend.migrationUrl,
+      }, fn);
+    }
+    const acquire = async (index: number): Promise<T> => index === sorted.length ? fn() : this.withPlanningLifecycleLock(sorted[index]!, () => acquire(index + 1));
+    return acquire(0);
+  }
+  public planningLifecycleLockTransportAvailability(): { available: true } | { available: false; reason: string } {
+    const backend = this.asyncLayer?.backend;
+    if (!this.asyncLayer || !backend) return { available: true };
+    return planningLifecycleLockTransportAvailability({ directSessionUrl: backend.directSessionUrl ?? null, provenance: backend.directSessionProvenance ?? null, runtimeUrl: backend.runtimeUrl, migrationUrl: backend.migrationUrl });
+  }
+
   public getTaskIdFromDir(dir: string): string {
     return getTaskIdFromDirImpl(this, dir);
   }
@@ -728,7 +1095,23 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return reconcileStaleSymbolLocksAsync(this);
   }
 
-  /** FNXC:SymbolLock 2026-07-31-10:00: FN-8306 resolves only durable task declarations; PROMPT is never re-read here. */
+  /** FNXC:Workspace 2026-08-15-08:23: Facade methods preserve the project-bound durable coordination seam. */
+  acquireWorkspaceLease(input: { leaseKey: string; kind: WorkspaceLeaseKind; owner: WorkspaceLeaseOwner; leaseMs: number }) { return acquireWorkspaceLeaseAsync(this, input); }
+  renewWorkspaceLease(handle: WorkspaceLeaseHandle, leaseMs: number) { return renewWorkspaceLeaseAsync(this, handle, leaseMs); }
+  releaseWorkspaceLease(handle: WorkspaceLeaseHandle) { return releaseWorkspaceLeaseAsync(this, handle); }
+  withValidWorkspaceLease<T>(handle: WorkspaceLeaseHandle, fn: (tx: import("./postgres/data-layer.js").DbTransaction) => Promise<T>) { return withValidWorkspaceLeaseAsync(this, handle, fn); }
+  validateWorkspaceLeaseFence(input: { leaseKey: string; owner: WorkspaceLeaseOwner; fenceToken: bigint }) { return validateWorkspaceLeaseFenceAsync(this, input); }
+  recordWorkspaceLeaseFenceRef(input: { handle: WorkspaceLeaseHandle; fenceRefName: string; fenceRefSha: string }) { return recordWorkspaceLeaseFenceRefAsync(this, input); }
+  inspectWorkspaceLeases(filter: { taskId?: string; leaseKeys?: string[] } = {}) { return inspectWorkspaceLeasesAsync(this, filter); }
+  reclaimWorkspaceLease(input: Parameters<typeof reclaimWorkspaceLeaseAsync>[1]) { return reclaimWorkspaceLeaseAsync(this, input); }
+  reconcileExpiredWorkspaceLeases() { return reconcileExpiredWorkspaceLeasesAsync(this); }
+  releaseStaleWorkspaceLeasesForNode(nodeId: string, options: { currentIncarnationId: string }) { return releaseStaleWorkspaceLeasesForNodeAsync(this, nodeId, options); }
+  recordWorkspaceLandIntent(input: Parameters<typeof recordWorkspaceLandIntentAsync>[1]) { return recordWorkspaceLandIntentAsync(this, input); }
+  listPendingWorkspaceLandIntents(filter: Parameters<typeof listPendingWorkspaceLandIntentsAsync>[1] = {}) { return listPendingWorkspaceLandIntentsAsync(this, filter); }
+  resolveWorkspaceLandIntent(input: Parameters<typeof resolveWorkspaceLandIntentAsync>[1]) { return resolveWorkspaceLandIntentAsync(this, input); }
+  resolveOrphanedWorkspaceLandIntent(input: Parameters<typeof resolveOrphanedWorkspaceLandIntentAsync>[1]) { return resolveOrphanedWorkspaceLandIntentAsync(this, input); }
+
+  /** FNXC:SymbolLock 2026-07-30-10:00: FN-8306 resolves only durable task declarations; PROMPT is never re-read here. */
   async resolveTaskSymbols(taskId: string): Promise<TaskSymbolResolution> {
     try {
       return resolveTaskSymbolsForTask(await this.getTask(taskId));
@@ -740,7 +1123,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     }
   }
   /** Work items own no symbol column; their taskId is the sole declaration source. */
-  async resolveTaskSymbolsForWorkItem(workItem: Pick<import("./types/merge-queue.js").WorkflowWorkItem, "taskId">): Promise<TaskSymbolResolution> {
+  async resolveTaskSymbolsForWorkItem(workItem: Pick<import("./types/merge/merge-queue.js").WorkflowWorkItem, "taskId">): Promise<TaskSymbolResolution> {
     return this.resolveTaskSymbols(workItem.taskId);
   }
   async setTaskDeclaredSymbols(taskId: string, symbols: readonly string[]): Promise<Task> {
@@ -763,11 +1146,88 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public async atomicCreateTaskJson(dir: string, task: Task, operation: string): Promise<void> {
     return atomicCreateTaskJsonImpl(this, dir, task, operation);
   }
-  public async atomicWriteTaskJson(dir: string, task: Task): Promise<void> {
-    return atomicWriteTaskJsonImpl2(this, dir, task);
+  public async atomicWriteTaskJson(
+    dir: string,
+    task: Task,
+    options?: { withinTransaction?: (tx: DbTransaction) => Promise<void> },
+  ): Promise<void> {
+    return atomicWriteTaskJsonImpl2(this, dir, task, options);
   }
-  public async atomicWriteTaskJsonWithAudit( dir: string, task: Task, auditInput?: RunAuditEventInput, ): Promise<void> {
-    return atomicWriteTaskJsonWithAuditImpl(this, dir, task, auditInput);
+
+  async recordPatchnodeCompletion(task: Task, occurredAt: string): Promise<PatchnodeEntry | null> {
+    if (!this.asyncLayer) throw new Error("Patchnode requires an async data layer");
+    return appendPatchnodeEntry(this.asyncLayer, buildPatchnodeEntryInput(task, "completed", occurredAt));
+  }
+
+  /*
+  FNXC:PatchnodeRevertReconciliation 2026-08-28-22:17:
+  `pairWithDeliveryAtOrBefore` records a cancellation against the delivery that was in effect at `occurredAt` instead of the latest one. The revert route sets it when git reports the task is ALREADY reverted at HEAD: that retry cancelled nothing new, so pairing it with the newest delivery would mark a later re-delivery reverted and silently remove shipped work from the day it shipped on. A genuine new revert keeps latest-delivery pairing.
+  */
+  async recordPatchnodeRevert(
+    taskId: string,
+    input: { occurredAt: string; revertCommitSha?: string; pairWithDeliveryAtOrBefore?: boolean },
+  ): Promise<PatchnodeEntry | null> {
+    if (!this.asyncLayer?.projectId) throw new Error("Patchnode requires a project-scoped async data layer");
+    const layer = this.asyncLayer;
+    const task = await this.getTask(taskId);
+    return layer.transactionImmediate(async (tx) => {
+      const completion = await findLatestPatchnodeCompletionInTransaction(
+        tx,
+        layer.projectId!,
+        taskId,
+        input.pairWithDeliveryAtOrBefore ? { noLaterThan: input.occurredAt } : {},
+      );
+      const occurrenceKey = completion?.occurrenceKey ?? "none";
+      const base = buildPatchnodeEntryInput(task, "reverted", input.occurredAt);
+      const reverted = await appendPatchnodeEntryInTransaction(tx, layer.projectId!, {
+        ...base,
+        entryId: buildPatchnodeEntryId("reverted", taskId, occurrenceKey),
+        occurrenceKey,
+        revertsEntryId: completion?.entryId ?? null,
+        revertedCommitSha: input.revertCommitSha ?? null,
+      });
+      if (completion) {
+        await markPatchnodeEntryRevertedInTransaction(tx, layer.projectId!, completion.entryId, {
+          revertedAt: input.occurredAt,
+          revertedCommitSha: input.revertCommitSha,
+        });
+      }
+      return reverted;
+    });
+  }
+
+  async reconcilePatchnodeLedger(options: { force?: boolean } = {}): Promise<PatchnodeReconcileResult> {
+    if (!this.asyncLayer) throw new Error("Patchnode requires an async data layer");
+    const now = Date.now();
+    if (!options.force && this.patchnodeReconcileMemo && now - this.patchnodeReconcileMemo.startedAt < PATCHNODE_RECONCILE_TTL_MS) {
+      return this.patchnodeReconcileMemo.promise;
+    }
+    const promise = (async () => {
+      const completeColumns = await resolveProjectColumnsForRoles(this, ["complete"]);
+      return reconcilePatchnodeFromLiveTasks(this.asyncLayer!, completeColumns ?? new Set<string>());
+    })();
+    this.patchnodeReconcileMemo = { promise, startedAt: now };
+    try {
+      return await promise;
+    } catch (error) {
+      if (this.patchnodeReconcileMemo?.promise === promise) this.patchnodeReconcileMemo = null;
+      throw error;
+    }
+  }
+
+  async listPatchnodeEntries(query: PatchnodeQuery = {}): Promise<{ entries: PatchnodeEntry[]; totalEntries: number; hasMore: boolean }> {
+    if (!this.asyncLayer) throw new Error("Patchnode requires an async data layer");
+    try {
+      await this.reconcilePatchnodeLedger();
+    } catch (error) {
+      storeLog.warn("Patchnode reconciliation failed before feed read", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return queryPatchnodeEntries(this.asyncLayer, query);
+  }
+  public async atomicWriteTaskJsonWithAudit( dir: string, task: Task, auditInput?: RunAuditEventInput, planningInvalidation?: PlanningDependencyInvalidation, specPlanPrompt?: string, ): Promise<void> {
+    return atomicWriteTaskJsonWithAuditImpl(this, dir, task, auditInput, planningInvalidation, specPlanPrompt);
   }
   /*
   FNXC:TaskTiming 2026-07-15-00:00:
@@ -796,7 +1256,18 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     }
 
     const shiftedTaskIds: string[] = [];
-    const tasks = await this.listTasks({ column: "in-progress", includeArchived: false, slim: true });
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-08-01-05:00:
+    The engine-downtime timing shift read the wip lane by name, so on a renamed board it found NO
+    tasks and no active-timing anchor was ever shifted — every card's active time then silently
+    absorbed the stopped-engine wall-clock this sweep exists to exclude.
+    */
+    const wipColumns = await resolveProjectColumnsForRoles(this, ["countsTowardWip"]);
+    const byId = new Map<string, Task>();
+    for (const column of wipColumns) {
+      for (const task of await this.listTasks({ column, includeArchived: false, slim: true })) byId.set(task.id, task);
+    }
+    const tasks = [...byId.values()];
     for (const task of tasks) {
       const startedMs = Date.parse(task.executionStartedAt ?? "");
       if (!Number.isFinite(startedMs) || startedMs > heartbeatMs) continue;
@@ -824,6 +1295,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   /* FNXC:ConfigVersioning 2026-07-18-14:10: callers without an established request/agent identity are system changes, never falsely attributed to a local human. */
   async updateSettings(patch: Partial<Settings>, changedBy?: import("./types.js").ConfigChangedBy): Promise<Settings> {
     return updateSettingsImpl(this, patch, changedBy);
+  }
+  async mutateScript(input: MutateScriptInput): Promise<ScriptCatalogEntry[]> {
+    return mutateScriptImpl(this, input);
   }
   async updateGlobalSettings(patch: Partial<GlobalSettings>, changedBy?: import("./types.js").ConfigChangedBy): Promise<Settings> {
     return updateGlobalSettingsImpl(this, patch, changedBy);
@@ -908,50 +1382,260 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   /**
    * FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-13:25:
    */
-  public async _createTaskInternalBackend( input: TaskCreateInput, title: string | undefined, resolvedWorkflowSteps: string[] | undefined, id: string, options?: { createdAt?: string; updatedAt?: string; promptOverride?: string; invokeTaskCreatedHook?: boolean; resolvedEntryColumn?: string; onProposalClaimConflict?: (task: Task) => void; }, ): Promise<Task> {
+  public async _createTaskInternalBackend( input: TaskCreateInput, title: string | undefined, resolvedWorkflowSteps: string[] | undefined, id: string, options?: { createdAt?: string; updatedAt?: string; promptOverride?: string; invokeTaskCreatedHook?: boolean; resolvedEntryColumn?: string; resolvedWorkflowIdForOwnership?: string; onProposalClaimConflict?: (task: Task) => void; deferTaskCreatedEvent?: boolean; onTaskInserted?: (task: Task) => void; ownershipExemption?: IntakeOwnershipExemption; }, ): Promise<Task> {
     return _createTaskInternalBackendImpl(this, input, title, resolvedWorkflowSteps, id, options);
   }
 
   /**
    * FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-13:35:
    */
-  public async _maybeAutoArchiveSameAgentDuplicateBackend( task: Task, input: TaskCreateInput, ): Promise<void> {
-    return _maybeAutoArchiveSameAgentDuplicateBackendImpl(this, task, input);
+  public async _resolveSameAgentDuplicateIntakeBackend( task: Task, input: TaskCreateInput, ): Promise<void> {
+    return _resolveSameAgentDuplicateIntakeBackendImpl(this, task, input);
   }
-  async createTask( input: TaskCreateInput, options?: { onSummarize?: (description: string) => Promise<string | null>; settings?: { autoSummarizeTitles?: boolean }; invokeTaskCreatedHook?: boolean; onProposalClaimConflict?: (task: Task) => void; } ): Promise<Task> {
+  async createTask( input: TaskCreateInput, options?: { onSummarize?: (description: string) => Promise<string | null>; settings?: { autoSummarizeTitles?: boolean }; invokeTaskCreatedHook?: boolean; onProposalClaimConflict?: (task: Task) => void; ownershipExemption?: IntakeOwnershipExemption; } ): Promise<Task> {
     return createTaskImpl(this, input, options);
   }
-  async createTaskWithReservedId( input: TaskCreateInput, options: { taskId: string; createdAt?: string; updatedAt?: string; prompt?: string; applyDefaultWorkflowSteps?: boolean; invokeTaskCreatedHook?: boolean; }, ): Promise<Task> {
+  async createTaskWithReservedId( input: TaskCreateInput, options: { taskId: string; createdAt?: string; updatedAt?: string; prompt?: string; applyDefaultWorkflowSteps?: boolean; invokeTaskCreatedHook?: boolean; ownershipExemption?: IntakeOwnershipExemption; }, ): Promise<Task> {
     return createTaskWithReservedIdImpl(this, input, options);
   }
-  public async _createTaskInternal( input: TaskCreateInput, title: string | undefined, resolvedWorkflowSteps: string[] | undefined, id: string, options?: { createdAt?: string; updatedAt?: string; promptOverride?: string; invokeTaskCreatedHook?: boolean; resolvedEntryColumn?: string; onProposalClaimConflict?: (task: Task) => void; }, ): Promise<Task> {
+  public async _createTaskInternal( input: TaskCreateInput, title: string | undefined, resolvedWorkflowSteps: string[] | undefined, id: string, options?: { createdAt?: string; updatedAt?: string; promptOverride?: string; invokeTaskCreatedHook?: boolean; resolvedEntryColumn?: string; resolvedWorkflowIdForOwnership?: string; onProposalClaimConflict?: (task: Task) => void; deferTaskCreatedEvent?: boolean; onTaskInserted?: (task: Task) => void; ownershipExemption?: IntakeOwnershipExemption; }, ): Promise<Task> {
     /*
-    FNXC:SqliteFinalRemoval 2026-06-25-10:35:
-    Route to the async backend variant when the store is in backend mode so
-    callers like createTaskWithReservedId (which go through this internal
-    create path with an explicit reserved id) work against PostgreSQL. The
-    sync path uses atomicCreateTaskJson -> store.db.transactionImmediate(),
-    which throws "SQLite Database is not available in backend mode". The
-    backend variant uses layer.transactionImmediate + insertTaskRowInTransaction
-    against PostgreSQL, preserving create-class non-destructive insert
-    semantics (see docs/storage.md invariants).
+    FNXC:SqliteDualPathCleanup 2026-07-26-14:05:
+    Task create is PostgreSQL-only (layer.transactionImmediate + insertTaskRowInTransaction). The former sync SQLite _createTaskInternalImpl arm is deleted; production always injects AsyncDataLayer.
     */
-    if (this.backendMode) {
-      return _createTaskInternalBackendImpl(this, input, title, resolvedWorkflowSteps, id, options);
-    }
-    return _createTaskInternalImpl(this, input, title, resolvedWorkflowSteps, id, options);
+    return _createTaskInternalBackendImpl(this, input, title, resolvedWorkflowSteps, id, options);
   }
-  public async _maybeAutoArchiveSameAgentDuplicate(task: Task, input: TaskCreateInput): Promise<void> {
-    return _maybeAutoArchiveSameAgentDuplicateImpl(this, task, input);
+  public async _resolveSameAgentDuplicateIntake(task: Task, input: TaskCreateInput): Promise<void> {
+    return _resolveSameAgentDuplicateIntakeImpl(this, task, input);
   }
   public async invokeTaskCreatedHook(task: Task): Promise<void> {
     return invokeTaskCreatedHookImpl(this, task);
   }
-  async duplicateTask(id: string): Promise<Task> {
-    return duplicateTaskImpl(this, id);
+  async duplicateTask(id: string, options?: { workflowId?: string | null }): Promise<Task> {
+    return duplicateTaskImpl(this, id, options);
   }
   async refineTask(id: string, feedback: string): Promise<Task> {
     return refineTaskImpl(this, id, feedback);
+  }
+  /**
+   * FNXC:SpecLock 2026-08-11-02:04:
+   * Evidence append uses the shared column-versioned, conflict-tolerant path. sourceHash remains
+   * the idempotence key, so callers receive the durable matching snapshot rather than a fabricated
+   * candidate after a concurrent insert.
+   */
+  async appendCurrentPlanEvidence(taskId: string, evidence: import("./planner/spec-lock.js").CurrentPlanEvidence): Promise<import("./planner/spec-lock.js").CurrentPlanEvidence> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const result = await appendPlanEvidenceInTransaction(this.asyncLayer.db, {
+      projectId: this.asyncLayer.projectId,
+      taskId,
+      buildEvidence: (version) => ({ ...evidence, version: Math.max(version, evidence.version) }),
+    });
+    return result.evidence;
+  }
+  async getLatestCurrentPlanEvidence(taskId: string): Promise<CurrentPlanEvidence | undefined> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const rows = await this.asyncLayer.db.select().from(schema.project.currentPlanEvidence).where(and(projectScopeFor(schema.project.currentPlanEvidence.projectId, this.asyncLayer.projectId), eq(schema.project.currentPlanEvidence.taskId, taskId))).orderBy(desc(schema.project.currentPlanEvidence.version)).limit(1);
+    return rows[0]?.snapshot as CurrentPlanEvidence | undefined;
+  }
+  /**
+   * FNXC:SpecLock 2026-08-09-12:34:
+   * FN-8845 records every authoritative full PROMPT write before it can be released. Content-hash
+   * dedupe makes retries idempotent while monotonically assigning versions to material rewrites.
+   */
+  async captureCurrentPlanEvidence(taskId: string, prompt: string, sourceRevision = Date.now()): Promise<CurrentPlanEvidence> {
+    return this.withPlanningLifecycleLock(taskId, () => this.captureCurrentPlanEvidenceWhilePlanningLocked(taskId, prompt, sourceRevision));
+  }
+  /**
+   * FNXC:SpecLock 2026-08-09-19:01:
+   * An authoritative prompt update already owns the planning lifecycle lock before taking the
+   * task lock. Reuse that lock here so its current-plan revision cannot race acceptance or be
+   * published after a later re-lock.
+   */
+  async captureCurrentPlanEvidenceWhilePlanningLocked(
+    taskId: string,
+    prompt: string,
+    sourceRevision = Date.now(),
+    liveTask?: Pick<Task, "dependencies" | "missionId" | "sliceId" | "sourceParentTaskId">,
+  ): Promise<CurrentPlanEvidence> {
+    return this.captureCurrentPlanEvidenceLocked(taskId, prompt, sourceRevision, liveTask);
+  }
+  private async captureCurrentPlanEvidenceLocked(
+    taskId: string,
+    prompt: string,
+    sourceRevision: number,
+    liveTask?: Pick<Task, "dependencies" | "missionId" | "sliceId" | "sourceParentTaskId">,
+  ): Promise<CurrentPlanEvidence> {
+    const task = liveTask ?? await this.getTask(taskId);
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const result = await appendPlanEvidenceInTransaction(this.asyncLayer.db, {
+      projectId: this.asyncLayer.projectId,
+      taskId,
+      buildEvidence: (version) => createCurrentPlanEvidence({
+        version,
+        sourceRevision,
+        capturedAt: new Date().toISOString(),
+        prompt,
+        bindings: specLockBindings(task),
+      }),
+    });
+    return result.evidence;
+  }
+  async appendSpecLock(taskId: string, lock: import("./planner/spec-lock.js").SpecLock): Promise<import("./planner/spec-lock.js").SpecLock> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const projectId = this.asyncLayer.projectId ?? "";
+    await this.asyncLayer.db.insert(schema.project.specLocks).values({ projectId, taskId, version: lock.version, acceptedAt: lock.acceptedAt, approvalFingerprint: lock.approvalFingerprint, currentPlanVersion: lock.currentPlanVersion, currentPlanHash: lock.currentPlanHash, snapshot: lock.plan, priorVersion: lock.priorVersion, diff: lock.diff }).onConflictDoNothing();
+    const rows = await this.asyncLayer.db.select().from(schema.project.specLocks).where(and(projectScopeFor(schema.project.specLocks.projectId, this.asyncLayer.projectId), eq(schema.project.specLocks.taskId, taskId), eq(schema.project.specLocks.version, lock.version))).limit(1);
+    const row = rows[0]!;
+    return { version: row.version, acceptedAt: row.acceptedAt, approvalFingerprint: row.approvalFingerprint, currentPlanVersion: row.currentPlanVersion, currentPlanHash: row.currentPlanHash, plan: row.snapshot as import("./planner/spec-lock.js").CanonicalPlan, priorVersion: row.priorVersion ?? undefined, diff: row.diff as import("./planner/spec-lock.js").SpecLockDiff | undefined };
+  }
+  async getLatestSpecLock(taskId: string): Promise<SpecLock | undefined> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const rows = await this.asyncLayer.db.select().from(schema.project.specLocks).where(and(projectScopeFor(schema.project.specLocks.projectId, this.asyncLayer.projectId), eq(schema.project.specLocks.taskId, taskId))).orderBy(desc(schema.project.specLocks.version)).limit(1);
+    const row = rows[0];
+    return row ? { version: row.version, acceptedAt: row.acceptedAt, approvalFingerprint: row.approvalFingerprint, currentPlanVersion: row.currentPlanVersion, currentPlanHash: row.currentPlanHash, plan: row.snapshot as import("./planner/spec-lock.js").CanonicalPlan, priorVersion: row.priorVersion ?? undefined, diff: row.diff as import("./planner/spec-lock.js").SpecLockDiff | undefined } : undefined;
+  }
+  /**
+   * FNXC:SpecLock 2026-08-09-19:19:
+   * The active lock is a derived live view, not a mutable column. Retained history stays append-only
+   * while API readers receive no active lock after a stale approval or current-plan rewrite.
+   */
+  async getActiveSpecLock(taskId: string): Promise<SpecLock | undefined> {
+    const [task, latestLock, currentPlan] = await Promise.all([
+      this.getTask(taskId),
+      this.getLatestSpecLock(taskId),
+      this.getLatestCurrentPlanEvidence(taskId),
+    ]);
+    return isSpecLockActive(latestLock, currentPlan, task.approvedPlanFingerprint) ? latestLock : undefined;
+  }
+  /** Create or reuse the immutable lock for an already-persisted current-plan revision. */
+  async lockCurrentPlan(taskId: string, approvalFingerprint: string, prompt: string): Promise<SpecLock> {
+    return this.withPlanningLifecycleLock(taskId, () => this.lockCurrentPlanWhilePlanningLocked(taskId, approvalFingerprint, prompt));
+  }
+  /**
+   * FNXC:SpecLockLifecycleLock 2026-08-09-17:37:
+   * Approval finalization already owns the non-reentrant PostgreSQL planning advisory lock. This
+   * companion avoids reacquiring it while preserving one serialized lock/current-plan append.
+   */
+  async lockCurrentPlanWhilePlanningLocked(taskId: string, approvalFingerprint: string, prompt: string): Promise<SpecLock> {
+    const currentPlan = await this.captureCurrentPlanEvidenceLocked(taskId, prompt, Date.now());
+    if (currentPlan.plan.status !== "available" || !currentPlan.plan.contentHash) {
+      const unavailableSections = (Object.entries(currentPlan.plan.sections) as Array<[import("./planner/spec-lock.js").SpecLockSection, import("./planner/spec-lock.js").CanonicalPlanSection]>)
+        .filter(([, section]) => section.status === "unavailable")
+        .map(([key]) => key);
+      throw new UnavailablePlanLockError(currentPlan.plan.reason ?? "unknown", unavailableSections, currentPlan.sourceHash);
+    }
+    const prior = await this.getLatestSpecLock(taskId);
+    if (prior?.approvalFingerprint === approvalFingerprint && prior.currentPlanHash === currentPlan.plan.contentHash) return prior;
+    const lock: SpecLock = { version: (prior?.version ?? 0) + 1, acceptedAt: new Date().toISOString(), approvalFingerprint, currentPlanVersion: currentPlan.version, currentPlanHash: currentPlan.plan.contentHash, plan: currentPlan.plan, ...(prior ? { priorVersion: prior.version, diff: diffSpecLocks(prior.plan, currentPlan.plan) } : {}) };
+    return this.appendSpecLock(taskId, lock);
+  }
+  async appendSpecDriftReport(taskId: string, report: DriftReport): Promise<DriftReport> {
+    return this.withPlanningLifecycleLock(taskId, () => this.appendSpecDriftReportWhilePlanningLocked(taskId, report));
+  }
+  /**
+   * FNXC:SpecDriftFence 2026-08-09-18:45:
+   * Report insertion shares the planning advisory lock with prompt writes, re-locks, and dependency
+   * invalidation. Re-check all snapshot identities while holding that lock; otherwise a stale worker
+   * can insert an on-plan result after the newer plan has already become authoritative.
+   */
+  async appendSpecDriftReportWhilePlanningLocked(taskId: string, report: DriftReport): Promise<DriftReport> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const [task, latestLock, currentPlan] = await Promise.all([
+      this.getTask(taskId),
+      this.getLatestSpecLock(taskId),
+      this.getLatestCurrentPlanEvidence(taskId),
+    ]);
+    const executionFence = evaluateSpecDrift({ latestLock, currentPlan, modifiedFiles: task.modifiedFiles }).executionHash;
+    if (
+      report.lockVersion !== latestLock?.version
+      || report.currentPlanVersion !== currentPlan?.version
+      || report.currentPlanHash !== currentPlan?.plan.contentHash
+      || report.approvedPlanFingerprint !== (task.approvedPlanFingerprint?.trim() || undefined)
+      || report.executionHash !== executionFence
+    ) {
+      return this.reconcileSpecDriftWhilePlanningLocked(task);
+    }
+    return this.persistSpecDriftReport(taskId, report);
+  }
+  async listSpecLocks(taskId: string): Promise<SpecLock[]> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const rows = await this.asyncLayer.db.select().from(schema.project.specLocks).where(and(projectScopeFor(schema.project.specLocks.projectId, this.asyncLayer.projectId), eq(schema.project.specLocks.taskId, taskId))).orderBy(schema.project.specLocks.version);
+    return rows.map((row) => ({ version: row.version, acceptedAt: row.acceptedAt, approvalFingerprint: row.approvalFingerprint, currentPlanVersion: row.currentPlanVersion, currentPlanHash: row.currentPlanHash, plan: row.snapshot as import("./planner/spec-lock.js").CanonicalPlan, priorVersion: row.priorVersion ?? undefined, diff: row.diff as import("./planner/spec-lock.js").SpecLockDiff | undefined }));
+  }
+  async listCurrentPlanEvidence(taskId: string): Promise<CurrentPlanEvidence[]> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const rows = await this.asyncLayer.db.select().from(schema.project.currentPlanEvidence).where(and(projectScopeFor(schema.project.currentPlanEvidence.projectId, this.asyncLayer.projectId), eq(schema.project.currentPlanEvidence.taskId, taskId))).orderBy(schema.project.currentPlanEvidence.version);
+    return rows.map((row) => row.snapshot as CurrentPlanEvidence);
+  }
+  async listSpecDriftReports(taskId: string): Promise<DriftReport[]> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const rows = await this.asyncLayer.db.select().from(schema.project.specDriftReports).where(and(projectScopeFor(schema.project.specDriftReports.projectId, this.asyncLayer.projectId), eq(schema.project.specDriftReports.taskId, taskId))).orderBy(schema.project.specDriftReports.createdAt);
+    return rows.map((row) => row.report as DriftReport);
+  }
+  async getLatestSpecDriftReport(taskId: string): Promise<DriftReport | undefined> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const rows = await this.asyncLayer.db.select().from(schema.project.specDriftReports).where(and(projectScopeFor(schema.project.specDriftReports.projectId, this.asyncLayer.projectId), eq(schema.project.specDriftReports.taskId, taskId))).orderBy(desc(schema.project.specDriftReports.createdAt)).limit(1);
+    return rows[0]?.report as DriftReport | undefined;
+  }
+  /** Evaluate retained evidence from one store snapshot; reporting never changes task lifecycle. */
+  async reconcileSpecDrift(task: Pick<Task, "id" | "approvedPlanFingerprint" | "modifiedFiles">): Promise<DriftReport> {
+    return this.withPlanningLifecycleLock(task.id, () => this.reconcileSpecDriftWhilePlanningLocked(task));
+  }
+  /**
+   * FNXC:SpecLockLifecycleLock 2026-08-09-17:37:
+   * Reconciliation is part of approval's serialized handoff. Do not call the public wrapper from
+   * that handoff: PostgreSQL advisory locks are intentionally non-reentrant and would deadlock.
+   */
+  async reconcileSpecDriftWhilePlanningLocked(task: Pick<Task, "id" | "approvedPlanFingerprint" | "modifiedFiles">): Promise<DriftReport> {
+    const live = await this.getTask(task.id);
+    let currentPlan = await this.getLatestCurrentPlanEvidence(task.id);
+    /*
+    FNXC:SpecLock 2026-08-09-19:01:
+    A prompt write can reach disk and invalidate approval before a transient database failure
+    appends its evidence. During later event/startup reconciliation, repair only that inactive
+    source mismatch from PROMPT.md; active plans and cosmetic title synchronization never create a
+    surprise revision. An unreadable file remains an honest unavailable report.
+    */
+    if (!live.approvedPlanFingerprint) {
+      try {
+        const prompt = await readFile(join(this.taskDir(task.id), "PROMPT.md"), "utf8");
+        const candidate = createCurrentPlanEvidence({
+          version: (currentPlan?.version ?? 0) + 1,
+          sourceRevision: Date.now(),
+          capturedAt: new Date().toISOString(),
+          prompt,
+          bindings: specLockBindings(live),
+        });
+        if (currentPlan?.sourceHash !== candidate.sourceHash) {
+          currentPlan = await this.captureCurrentPlanEvidenceLocked(task.id, prompt, candidate.sourceRevision, live);
+        }
+      } catch {
+        /* FNXC:SpecLock 2026-08-09-19:01: Retain history and let the evaluator report unavailable
+           rather than inventing evidence when PROMPT.md is unavailable (including archive cleanup). */
+      }
+    }
+    const [latestLock, reports] = await Promise.all([this.getLatestSpecLock(task.id), this.listSpecDriftReports(task.id)]);
+    /*
+    FNXC:SpecDrift 2026-08-09-21:01:
+    Re-lock approval retains the fact that an earlier immutable version diverged. Looking only at
+    the latest report loses that fact after the first clean v2 reconciliation and falsely returns
+    on-plan; use the shared history predicate so store and engine cannot drift apart.
+    */
+    const priorDivergence = hasPriorLockDivergence(reports, latestLock?.version);
+    const report = evaluateSpecDrift({ latestLock, currentPlan, approvedPlanFingerprint: live.approvedPlanFingerprint, modifiedFiles: live.modifiedFiles, priorDivergence });
+    const [fencedTask, fencedLock, fencedPlan] = await Promise.all([this.getTask(task.id), this.getLatestSpecLock(task.id), this.getLatestCurrentPlanEvidence(task.id)]);
+    const fenced = fencedLock?.version !== latestLock?.version || fencedPlan?.version !== currentPlan?.version || fencedPlan?.plan.contentHash !== currentPlan?.plan.contentHash || fencedTask.approvedPlanFingerprint !== live.approvedPlanFingerprint || JSON.stringify(fencedTask.modifiedFiles ?? []) !== JSON.stringify(live.modifiedFiles ?? []);
+    const persisted = fenced
+      ? evaluateSpecDrift({ latestLock: fencedLock, currentPlan: fencedPlan, approvedPlanFingerprint: fencedTask.approvedPlanFingerprint, modifiedFiles: fencedTask.modifiedFiles, priorDivergence: hasPriorLockDivergence(reports, fencedLock?.version) })
+      : report;
+    return this.persistSpecDriftReport(task.id, persisted);
+  }
+  private async persistSpecDriftReport(taskId: string, report: DriftReport): Promise<DriftReport> {
+    if (!this.asyncLayer) throw new Error("Spec-lock history requires PostgreSQL backend storage");
+    const projectId = this.asyncLayer.projectId ?? "";
+    await this.asyncLayer.db.insert(schema.project.specDriftReports).values({ projectId, taskId, reportHash: report.reportHash, lockVersion: report.lockVersion, currentPlanVersion: report.currentPlanVersion, currentPlanHash: report.currentPlanHash, executionHash: report.executionHash, report, createdAt: new Date().toISOString() }).onConflictDoNothing();
+    const rows = await this.asyncLayer.db.select().from(schema.project.specDriftReports).where(and(projectScopeFor(schema.project.specDriftReports.projectId, this.asyncLayer.projectId), eq(schema.project.specDriftReports.taskId, taskId), eq(schema.project.specDriftReports.reportHash, report.reportHash))).limit(1);
+    return rows[0]!.report as DriftReport;
   }
   async getTask(id: string, options?: { activityLogLimit?: number; includeDeleted?: boolean }): Promise<TaskDetail> {
     return getTaskImpl(this, id, options);
@@ -1034,8 +1718,46 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async getTaskColumns(ids: string[]): Promise<Map<string, Column>> {
     return getTaskColumnsImpl(this, ids);
   }
-  async listTasks(options?: { limit?: number; offset?: number; /** When false, exclude tasks in the `archived` column. Default: true (backward compatible). */ includeArchived?: boolean; /** When true, omit heavy fields (log, comments, steps, workflowStepResults, steeringComments) * from each row to make list responses cheap for board-style consumers. Detail fields default * to empty arrays in the returned Task objects; use `getTask(id)` to load full data. */ slim?: boolean; /** Restrict to a single column (e.g. 'in-review' for the auto-merge sweep). * Widened to {@link ColumnId} (#1403) so custom-column filters are accepted. */ column?: ColumnId; /** Opt-in startup-only memo for repeated slim reads during boot choreography. */ startupMemo?: boolean; /** Forensic read: surface soft-deleted tasks (deletedAt IS NOT NULL). * VAL-DATA-006 — only admin/forensic surfaces should set this. */ includeDeleted?: boolean; }): Promise<Task[]> {
+  async findTaskByProposalClaimId(proposalClaimId: string, options?: { includeDeleted?: boolean }): Promise<Task | null> {
+    return findTaskByProposalClaimIdImpl(this, proposalClaimId, options);
+  }
+  async listTasksBySourceLineage(input: { sourceAgentId?: string | null; sourceParentTaskId?: string | null }): Promise<Task[]> {
+    return listTasksBySourceLineageImpl(this, input);
+  }
+  async listTasks(options?: ListTasksOptions): Promise<Task[]> {
     return listTasksImpl(this, options);
+  }
+  async listCurrentTasksPage(options?: { limit?: number; cursor?: string; query?: string }): Promise<TaskListPage> {
+    return listCurrentTasksPageImpl(this, options);
+  }
+  async listCompletedTasks(options?: { limit?: number; cursor?: string; slim?: boolean; sort?: TaskColumnSortMode }): Promise<CompletedTaskPage> {
+    return listCompletedTasksImpl(this, options);
+  }
+  /** Read-only archive inventory for project-scoped operational reconciliation. */
+  async inspectArchivedTaskHistory(): Promise<ArchivedTaskHistoryInspection> {
+    return inspectArchivedTaskHistory(this);
+  }
+  /** Read a retained compatibility artifact without allowing it to supersede PostgreSQL. */
+  async readTaskHistoryArtifact(id: string): Promise<Task | undefined> {
+    try {
+      const raw = await readFile(join(this.taskDir(id), "task.json"), "utf8");
+      return this.normalizeTaskFromDisk(JSON.parse(raw) as Task);
+    } catch {
+      return undefined;
+    }
+  }
+  /** Fill only absent historical columns from exact structured repair evidence. */
+  async supplementTaskHistoryFromEvidence(
+    id: string,
+    evidence: Partial<Task>,
+    options?: { dryRun?: boolean },
+  ): Promise<SupplementTaskHistoryResult> {
+    if (!this.asyncLayer?.projectId?.trim()) throw new Error("Task history repair requires an exact project identity");
+    return supplementTaskHistoryFromEvidence(this.asyncLayer, id, evidence, options);
+  }
+  /** @internal Cooperative full drain consumed by engine startup and maintenance recovery. */
+  async reconcileArchivedTasksIntoDone(options?: { limit?: number; maxFailureAttempts?: number }): Promise<ArchivedTaskReintegrationResult> {
+    return drainArchivedTasksIntoDone(this, options);
   }
 
 /** Residual B (U13/U9): per-branch progress snapshots for the given tasks, */
@@ -1046,34 +1768,46 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async findOpenRevertTaskForSource(sourceTaskId: string): Promise<Task | null> {
     const trimmedId = sourceTaskId.trim();
     if (trimmedId.length === 0) return null;
-    if (this.backendMode) {
-      const layer = this.asyncLayer!;
-      const rows = await layer.db.select()
-        .from(schema.project.tasks)
-        .where(and(
-          isNull(schema.project.tasks.deletedAt),
-          ne(schema.project.tasks.column, "archived"),
-          ne(schema.project.tasks.column, "done"),
-          eq(sql`json_extract(${schema.project.tasks.sourceMetadata}->>'revertOf')`, trimmedId),
-        ))
-        .orderBy(schema.project.tasks.createdAt)
-        .limit(1);
-      if (rows.length === 0) return null;
-      return this.rowToTask(this.pgRowToTaskRow(rows[0] as Record<string, unknown>));
+    /*
+    FNXC:SqliteDualPathCleanup 2026-07-26-15:00:
+    PostgreSQL jsonb uses `->>` for text extraction; the former SQLite json_extract wrapper was invalid on PG.
+    Scope by asyncLayer.projectId so a revert task from another project cannot match.
+    */
+    const layer = this.asyncLayer!;
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-23:59:
+    "Is there an OPEN undo task for this source?" is a LANE question — a finished one must not render
+    as an active affordance. Against the literals a renamed board matched neither lane, so a
+    completed prior undo attempt kept surfacing as open. Same defect the dashboard-side twin had
+    (`taskRevert.ts`, #3129); this is the store-side query behind it.
+
+    Additive: the resolved sets are legacy-seeded and fall back to the literals, so an unconverted
+    board builds byte-identical SQL and the parity gate's encodings stay in step.
+    */
+    const resolvedRevertFinishedLanes = await resolveProjectColumnsForRoles(this, ["complete"])
+      .catch(() => undefined);
+    const revertFinishedLanes = resolvedRevertFinishedLanes
+      ? new Set(resolvedRevertFinishedLanes)
+      : undefined;
+    const revertFinishedExclusions = revertFinishedLanes && revertFinishedLanes.size > 0
+      ? [...revertFinishedLanes].map((lane) => ne(schema.project.tasks.column, lane))
+      : [ne(schema.project.tasks.column, "done")];
+    const conditions = [
+      isNull(schema.project.tasks.deletedAt),
+      ...revertFinishedExclusions,
+      sql`${schema.project.tasks.sourceMetadata}->>'revertOf' = ${trimmedId}`,
+    ];
+    if (layer.projectId) {
+      conditions.push(eq(schema.project.tasks.projectId, layer.projectId));
     }
-    const selectClause = this.getTaskSelectClause(false, "t");
-    const row = this.db.prepare(`
-      SELECT ${selectClause}
-      FROM tasks t
-      WHERE t."deletedAt" IS NULL
-        AND t."column" != 'archived'
-        AND t."column" != 'done'
-        AND json_extract(t.sourceMetadata, '$.revertOf') = ?
-      ORDER BY t.createdAt DESC
-      LIMIT 1
-    `).get(trimmedId) as TaskRow | undefined;
-    return row ? this.rowToTask(row) : null;
-  }
+    const rows = await layer.db.select()
+      .from(schema.project.tasks)
+      .where(and(...conditions))
+      .orderBy(schema.project.tasks.createdAt)
+      .limit(1);
+    if (rows.length === 0) return null;
+    return this.rowToTask(this.pgRowToTaskRow(rows[0] as Record<string, unknown>));
+}
 
 /** Persist (idempotent upsert) one branch's progress for a fan-out run (#1407). */
    async saveWorkflowRunBranch(state: { taskId: string; runId: string; branchId: string; currentNodeId: string; status: string; }): Promise<void> {
@@ -1101,6 +1835,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return saveWorkflowRunStepInstanceImpl(this, state);
   }
 
+/** True when any graph run has persisted step-instance evidence for this task. */
+  async hasWorkflowRunStepInstancesForTask(taskId: string): Promise<boolean> {
+    return hasWorkflowRunStepInstancesForTaskImpl(this, taskId);
+  }
+
 /** Load persisted step-instance run-state for a run (crash-resume; KTD-6). */
   async loadWorkflowRunStepInstances( taskId: string, runId: string, ): Promise<import("./types.js").WorkflowRunStepInstance[]> {
     return loadWorkflowRunStepInstancesImpl(this, taskId, runId);
@@ -1120,6 +1859,23 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async clearWorkflowRunStepInstancesAsync(taskId: string, keepRunId?: string): Promise<void> {
     return clearWorkflowRunStepInstancesAsyncImpl(this, taskId, keepRunId);
   }
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-08-14-04:30:
+  Deliberately forwards `options` without resolving a lane here, and is recorded in
+  scripts/lib/lane-wiring-baseline.json for that reason.
+
+  The guard exists to catch a callee silently falling back to a LEGACY COLUMN LITERAL when a caller
+  omits the lane. This callee does not: `listTaskRecommendationsImpl` falls back to
+  `resolveProjectColumnsForRoles(store, ["complete"])`, which reads the board's own lanes. Resolving
+  again in this wrapper would duplicate that query on every call and give the pass-through no
+  behavioural difference from the fallback.
+
+  Real callers already supply it — the dashboard route resolves `completeColumns` and passes it — so
+  the fallback serves the pass-through wrapper, not production paths.
+  */
+  async listTaskRecommendations(options?: { completeColumns?: ReadonlySet<string>; limit?: number; offset?: number }): Promise<import("./types.js").TaskRecommendationListPage> {
+    return listTaskRecommendationsImpl(this, options);
+  }
   async listTasksForGithubTrackingReconcile(options?: { offset?: number; limit?: number }): Promise<{ tasks: Task[]; hasMore: boolean }> {
     return listTasksForGithubTrackingReconcileImpl(this, options);
   }
@@ -1137,7 +1893,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     FNXC:SqliteFinalRemoval 2026-06-25-10:45:
     Route to the real implementation in reads.ts. The previous wiring called
     listTasksModifiedSinceImpl2 (a leftover modularization stub in
-    remaining-ops-2.ts) which delegated straight back to this facade method,
+    task-mutation-ops.ts) which delegated straight back to this facade method,
     causing infinite recursion in BOTH SQLite and backend modes. The real
     query logic lives in listTasksModifiedSinceImpl (reads.ts).
     */
@@ -1163,7 +1919,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public async clearNearDuplicateReferencesToFailSoft( canonicalId: string, inactiveState: { column?: ColumnId | null; deletedAt?: string | null; reason: string }, ): Promise<void> {
     return clearNearDuplicateReferencesToFailSoftImpl(this, canonicalId, inactiveState);
   }
-  async getTasksByAssignedAgent( agentId: string, options?: { pausedOnly?: boolean; excludeArchived?: boolean }, ): Promise<Task[]> {
+  async getTasksByAssignedAgent( agentId: string, options?: { pausedOnly?: boolean }, ): Promise<Task[]> {
     return getTasksByAssignedAgentImpl(this, agentId, options);
   }
   async tryClaimCheckout( taskId: string, claim: { agentId: string; nodeId: string; runId: string | null; leaseEpoch: number; renewedAt: string; }, precondition: CheckoutClaimPrecondition, ): Promise<{ ok: true; task: Task } | { ok: false; reason: "row_not_found" | "precondition_failed"; current: Task | null }> {
@@ -1175,14 +1931,19 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async selectNextTaskForAgent( agentId: string, agent?: Pick<Agent, "id" | "role"> & Partial<Pick<Agent, "runtimeConfig">>, ): Promise<InboxTask | null> {
     return selectNextTaskForAgentImpl(this, agentId, agent);
   }
-  public areAllDependenciesDone(dependencies: string[], tasksById: Map<string, Task>): boolean {
-    return areAllDependenciesDoneImpl(this, dependencies, tasksById);
+  public areAllDependenciesDone(dependencies: string[], tasksById: Map<string, Task>, satisfiedColumns?: ReadonlySet<string>): boolean {
+    return areAllDependenciesDoneImpl(this, dependencies, tasksById, satisfiedColumns);
   }
   public async readTaskForMove(id: string): Promise<Task> {
     return readTaskForMoveImpl(this, id);
   }
   async moveTask( id: string, toColumn: ColumnId, options?: MoveTaskOptions, ): Promise<Task> {
     return moveTaskImpl(this, id, toColumn, options);
+  }
+
+  /** Publish the post-cleanup fresh-planning reset as one project-scoped transaction. */
+  async resetTaskPublication( id: string, intakeColumn: ColumnId, options?: { description?: string }, ): Promise<Task> {
+    return resetTaskPublicationImpl(this, id, intakeColumn, options);
   }
   async moveTaskIf(
     id: string,
@@ -1240,9 +2001,265 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
   async updateTask(
     id: string,
-    updates: { title?: string; description?: string; priority?: TaskPriority | null; prompt?: string; worktree?: string | null; workspaceWorktrees?: import("./types.js").Task["workspaceWorktrees"]; status?: string | null; dependencies?: string[]; steps?: import("./types.js").TaskStep[]; customFields?: Record<string, unknown>; currentStep?: number; blockedBy?: string | null; overlapBlockedBy?: string | null; assignedAgentId?: string | null; pausedByAgentId?: string | null; pausedReason?: string | null; tokenBudgetSoftAlertedAt?: string | null; worktrunkFallbackAlertedAt?: string | null; worktrunkFailure?: import("./types.js").Task["worktrunkFailure"] | null; tokenBudgetHardAlertedAt?: string | null; tokenBudgetOverride?: import("./types.js").TaskTokenBudgetOverride | null; dispatchStormCount?: number | null; lastDispatchAt?: string | null; assigneeUserId?: string | null; scopeOverride?: boolean | null; scopeOverrideReason?: string | null; scopeAutoWiden?: string[] | null; nodeId?: string | null; effectiveNodeId?: string | null; effectiveNodeSource?: string | null; checkedOutBy?: string | null; checkedOutAt?: string | null; checkoutNodeId?: string | null; checkoutRunId?: string | null; checkoutLeaseRenewedAt?: string | null; checkoutLeaseEpoch?: number | null; paused?: boolean; baseBranch?: string | null; autoMerge?: boolean | null; branch?: string | null; executionStartBranch?: string | null; baseCommitSha?: string | null; size?: "S" | "M" | "L"; reviewLevel?: number; executionMode?: import("./types.js").ExecutionMode | null; mergeRetries?: number; workflowStepRetries?: number; stuckKillCount?: number | null; resumeLimboCount?: number | null; executeRequeueLoopCount?: number | null; graphResumeRetryCount?: number | null; consecutiveToolFailureRetryCount?: number | null; executorEscalationAttempted?: boolean | null; toolFailureDetectorLogCursor?: number | null; toolFailureRetryExhaustedAuditEmitted?: boolean | null; resumeLimboTipSha?: string | null; resumeLimboStepSignature?: string | null; executeRequeueLoopSignature?: string | null; postReviewFixCount?: number | null; planReviewReplanCount?: number | null; recoveryRetryCount?: number | null; taskDoneRetryCount?: number | null; bulkCompletionRefusalAt?: string | null; workflowIrPin?: string | null; workflowIrPinNodeId?: string | null; workflowIrPinColumnId?: string | null; legacyAdoptedAt?: string | null; worktreeSessionRetryCount?: number | null; completionHandoffLimboRecoveryCount?: number | null; verificationFailureCount?: number | null; mergeConflictBounceCount?: number | null; mergeAuditBounceCount?: number | null; mergeTransientRetryCount?: number | null; branchConflictRecoveryCount?: number | null; reviewerContextRetryCount?: number | null; reviewerFallbackRetryCount?: number | null; nextRecoveryAt?: string | null; enabledWorkflowSteps?: string[]; noCommitsExpected?: boolean | null; modelProvider?: string | null; modelId?: string | null; validatorModelProvider?: string | null; validatorModelId?: string | null; planningModelProvider?: string | null; planningModelId?: string | null; mergerModelProvider?: string | null; mergerModelId?: string | null; thinkingLevel?: string | null; validatorThinkingLevel?: string | null; planningThinkingLevel?: string | null; mergerThinkingLevel?: string | null; error?: string | null; summary?: string | null; sessionFile?: string | null; firstExecutionAt?: string | null; cumulativeActiveMs?: number | null; cumulativePlanningMs?: number | null; planningStartedAt?: string | null; executionStartedAt?: string | null; executionCompletedAt?: string | null; review?: import("./types.js").TaskReview | null; reviewState?: import("./types.js").TaskReviewState | null; workflowStepResults?: import("./types.js").WorkflowStepResult[] | null; mergeDetails?: import("./types.js").MergeDetails | null; sourceIssue?: import("./types.js").TaskSourceIssue | null; sourceMetadataPatch?: Record<string, unknown> | null; githubTracking?: import("./types.js").TaskGithubTracking | null; tokenUsage?: import("./types.js").TaskTokenUsage | null; modifiedFiles?: string[] | null; declaredSymbols?: string[] | null | undefined; missionId?: string | null; sliceId?: string | null; workflowTransitionNotification?: import("./types.js").WorkflowTransitionNotificationMarker | undefined; plannerOversightLevel?: string | null; sessionAdvisorEnabled?: boolean | null; approvedPlanFingerprint?: string | null },    runContext?: RunMutationContext,
+    updates: { title?: string; description?: string; priority?: TaskPriority | null; prompt?: string; worktree?: string | null; workspaceWorktrees?: import("./types.js").Task["workspaceWorktrees"]; externalBlock?: import("./types.js").Task["externalBlock"] | null; planningFailure?: import("./types.js").Task["planningFailure"] | null; status?: string | null; awaitingApprovalReason?: import("./types.js").Task["awaitingApprovalReason"] | null; dependencies?: string[]; steps?: import("./types.js").TaskStep[]; customFields?: Record<string, unknown>; currentStep?: number; blockedBy?: string | null; overlapBlockedBy?: string | null; assignedAgentId?: string | null; pausedByAgentId?: string | null; pausedReason?: string | null; wedgeNotification?: import("./types.js").TaskWedgeNotificationState | null; tokenBudgetSoftAlertedAt?: string | null; worktrunkFallbackAlertedAt?: string | null; worktrunkFailure?: import("./types.js").Task["worktrunkFailure"] | null; tokenBudgetHardAlertedAt?: string | null; tokenBudgetOverride?: import("./types.js").TaskTokenBudgetOverride | null; dispatchStormCount?: number | null; lastDispatchAt?: string | null; assigneeUserId?: string | null; scopeOverride?: boolean | null; scopeOverrideReason?: string | null; scopeAutoWiden?: string[] | null; nodeId?: string | null; effectiveNodeId?: string | null; effectiveNodeSource?: string | null; checkedOutBy?: string | null; checkedOutAt?: string | null; checkoutNodeId?: string | null; checkoutRunId?: string | null; checkoutLeaseRenewedAt?: string | null; checkoutLeaseEpoch?: number | null; paused?: boolean; baseBranch?: string | null; autoMerge?: boolean | null; branch?: string | null; branchWriteOrigin?: "operator" | "engine"; branchContext?: import("./types.js").TaskBranchContext | null; executionStartBranch?: string | null; baseCommitSha?: string | null; size?: "S" | "M" | "L"; reviewLevel?: number; executionMode?: import("./types.js").ExecutionMode | null; mergeRetries?: number; aiMergeReviewReconciliation?: import("./types.js").Task["aiMergeReviewReconciliation"] | null; log?: import("./types.js").TaskLogEntry[]; workflowStepRetries?: number; stuckKillCount?: number | null; resumeLimboCount?: number | null; executeRequeueLoopCount?: number | null; graphResumeRetryCount?: number | null; consecutiveToolFailureRetryCount?: number | null; executorEscalationAttempted?: boolean | null; toolFailureDetectorLogCursor?: number | null; toolFailureRetryExhaustedAuditEmitted?: boolean | null; resumeLimboTipSha?: string | null; resumeLimboStepSignature?: string | null; executeRequeueLoopSignature?: string | null; postReviewFixCount?: number | null; planReviewReplanCount?: number | null; recoveryRetryCount?: number | null; sessionContentionHoldCount?: number | null; sessionContentionWaitReason?: string | null; taskDoneRetryCount?: number | null; bulkCompletionRefusalAt?: string | null; workflowIrPin?: string | null; workflowIrPinNodeId?: string | null; workflowIrPinColumnId?: string | null; legacyAdoptedAt?: string | null; worktreeSessionRetryCount?: number | null; completionHandoffLimboRecoveryCount?: number | null; verificationFailureCount?: number | null; mergeConflictBounceCount?: number | null; mergeAuditBounceCount?: number | null; mergeTransientRetryCount?: number | null; branchConflictRecoveryCount?: number | null; reviewerContextRetryCount?: number | null; reviewerFallbackRetryCount?: number | null; reviewConvergenceStage?: number | null; reviewConvergenceEscalationCount?: number | null; nextRecoveryAt?: string | null; enabledWorkflowSteps?: string[]; noCommitsExpected?: boolean | null; modelProvider?: string | null; credentialInstanceId?: string | null; modelId?: string | null; validatorModelProvider?: string | null; validatorCredentialInstanceId?: string | null; validatorModelId?: string | null; planningModelProvider?: string | null; planningCredentialInstanceId?: string | null; planningModelId?: string | null; mergerModelProvider?: string | null; mergerCredentialInstanceId?: string | null; mergerModelId?: string | null; thinkingLevel?: string | null; validatorThinkingLevel?: string | null; planningThinkingLevel?: string | null; mergerThinkingLevel?: string | null; error?: string | null; summary?: string | null; recommendations?: import("./types.js").TaskRecommendation[]; sessionFile?: string | null; firstExecutionAt?: string | null; cumulativeActiveMs?: number | null; cumulativePlanningMs?: number | null; planningStartedAt?: string | null; executionStartedAt?: string | null; executionCompletedAt?: string | null; review?: import("./types.js").TaskReview | null; reviewState?: import("./types.js").TaskReviewState | null; workflowStepResults?: import("./types.js").WorkflowStepResult[] | null; mergeDetails?: import("./types.js").MergeDetails | null; sourceIssue?: import("./types.js").TaskSourceIssue | null; sourceMetadataPatch?: Record<string, unknown> | null; githubTracking?: import("./types.js").TaskGithubTracking | null; tokenUsage?: import("./types.js").TaskTokenUsage | null; modifiedFiles?: string[] | null; declaredSymbols?: string[] | null | undefined; missionId?: string | null; sliceId?: string | null; workflowTransitionNotification?: import("./types.js").WorkflowTransitionNotificationMarker | undefined; plannerOversightLevel?: string | null; sessionAdvisorEnabled?: boolean | null; approvedPlanFingerprint?: string | null },    runContext?: RunMutationContext,
   ): Promise<Task> {
+    /*
+    FNXC:SpecLock 2026-08-09-20:34:
+    updateTaskImpl owns the planning lifecycle fence for every authoritative plan mutation. Keep
+    this public entry unwrapped so its post-task-lock reconciliation can use the lock-held variant
+    without attempting a non-reentrant nested advisory lock.
+    */
     return updateTaskImpl(this, id, updates, runContext);
+  }
+  /**
+   * Atomically opens or resolves the durable task-wedge episode. The task lock is
+   * shared by SQLite and PostgreSQL persistence writes, so concurrent engine
+   * observers cannot allocate two episodes for one active normalized reason.
+   */
+  async claimTaskWedgeNotificationEpisode(taskId: string, reasonKey: string | null): Promise<{ episodeId?: string; claimed: boolean }> {
+    let result: { episodeId?: string; claimed: boolean } = { claimed: false };
+    await this.updateTaskAtomic(taskId, (current) => {
+      const prior = current.wedgeNotification;
+      if (reasonKey === null) {
+        if (!prior || prior.status === "resolved") return null;
+        return { wedgeNotification: { ...prior, status: "resolved", transitionedAt: new Date().toISOString() } };
+      }
+      if (prior?.status === "active" && prior.reasonKey === reasonKey) return null;
+
+      const now = Date.now();
+      const lastNotifiedAtByReason = Object.fromEntries(Object.entries(prior?.lastNotifiedAtByReason ?? {}).filter(([, timestamp]) => {
+        const notifiedAt = Date.parse(timestamp);
+        return Number.isFinite(notifiedAt) && notifiedAt <= now && now - notifiedAt < WEDGE_RENOTIFY_COOLDOWN_MS;
+      }));
+      const episodeId = randomUUID();
+      const suppressed = reasonKey in lastNotifiedAtByReason;
+      if (!suppressed) lastNotifiedAtByReason[reasonKey] = new Date(now).toISOString();
+      result = suppressed ? { claimed: false } : { episodeId, claimed: true };
+      return {
+        wedgeNotification: {
+          reasonKey,
+          episodeId,
+          status: "active",
+          transitionedAt: new Date(now).toISOString(),
+          ...(Object.keys(lastNotifiedAtByReason).length > 0 ? { lastNotifiedAtByReason } : {}),
+          ...(prior?.autoRecovery ? { autoRecovery: prior.autoRecovery } : {}),
+          ...(prior?.budgetRevision !== undefined ? { budgetRevision: prior.budgetRevision } : {}),
+        },
+      };
+    });
+    return result;
+  }
+  /** Atomically records the durable evidence needed to complete a deferred wedge notification. */
+  async markTaskWedgeNotificationPending(
+    taskId: string,
+    descriptor: { reasonKey: string; source: "auto" | "supplied"; reason: string; action: string; gate?: string },
+    options?: { staleAfterMs?: number },
+  ): Promise<{ since: string; armed: boolean; restamped: boolean }> {
+    const now = new Date().toISOString();
+    let result = { since: now, armed: false, restamped: false };
+    await this.updateTaskAtomic(taskId, (current) => {
+      const prior = current.wedgeNotification;
+      const pending = prior?.pending;
+      if (prior?.status === "active" && prior.reasonKey === descriptor.reasonKey) {
+        return null;
+      }
+      const pendingSince = pending ? Date.parse(pending.since) : Number.NaN;
+      const stale = pending?.reasonKey === descriptor.reasonKey
+        && typeof options?.staleAfterMs === "number"
+        && Number.isFinite(options.staleAfterMs)
+        && Number.isFinite(pendingSince)
+        && Date.now() - pendingSince > options.staleAfterMs;
+      if (pending?.reasonKey === descriptor.reasonKey && !stale) {
+        result = { since: pending.since, armed: false, restamped: false };
+        return null;
+      }
+      const nextPending = { since: now, ...descriptor };
+      result = { since: now, armed: true, restamped: pending != null };
+      return {
+        wedgeNotification: prior
+          ? { ...prior, pending: nextPending }
+          : { reasonKey: descriptor.reasonKey, episodeId: "", status: "resolved", transitionedAt: now, pending: nextPending },
+      };
+    });
+    return result;
+  }
+  /** Removes deferred wedge evidence without changing the active episode or cooldown history. */
+  async clearTaskWedgeNotificationPending(taskId: string, reasonKey?: string): Promise<boolean> {
+    let cleared = false;
+    await this.updateTaskAtomic(taskId, (current) => {
+      const prior = current.wedgeNotification;
+      if (!prior?.pending || (reasonKey !== undefined && prior.pending.reasonKey !== reasonKey)) return null;
+      const { pending: _pending, ...withoutPending } = prior;
+      cleared = true;
+      return { wedgeNotification: withoutPending };
+    });
+    return cleared;
+  }
+  /*
+  FNXC:TaskWedgeNotifications 2026-08-10-18:54:
+  Generic terminal parks use a dedicated durable budget because transient recovery
+  writers clear `recoveryRetryCount`. The apply token is only minted here; a later
+  fenced move consumes it, so a clock-based abandonment check never authorizes a move.
+  */
+  async claimTerminalFailureAutoRecoveryAttempt(
+    taskId: string,
+    options: { maxAttempts: number; maxResumes: number; minAttemptSpacingMs: number; claimApplyGraceMs: number },
+  ): Promise<{ outcome: "resume" | "claimed"; attempt: number; applyToken: string } | { outcome: "already-claimed"; attempt: number } | { outcome: "exhausted"; attempts: number }> {
+    let result: { outcome: "resume" | "claimed"; attempt: number; applyToken: string } | { outcome: "already-claimed"; attempt: number } | { outcome: "exhausted"; attempts: number } = { outcome: "already-claimed", attempt: 0 };
+    await this.updateTaskAtomic(taskId, (current) => {
+      const now = Date.now();
+      const prior = current.wedgeNotification?.autoRecovery;
+      const attempts = typeof prior?.attempts === "number" && Number.isFinite(prior.attempts) && prior.attempts >= 0 ? Math.trunc(prior.attempts) : 0;
+      // FNXC:TaskWedgeNotifications 2026-08-10-20:11: The sweep's pre-claim read can race
+      // a real forward move or deletion. A claim is a park charge, so only a live failed row
+      // may spend it; the fenced apply rechecks this again when it performs the lifecycle move.
+      if (current.status !== "failed" || current.deletedAt != null) {
+        result = { outcome: "already-claimed", attempt: attempts };
+        return null;
+      }
+      const resumes = typeof prior?.resumeCount === "number" && Number.isFinite(prior.resumeCount) && prior.resumeCount >= 0 ? Math.trunc(prior.resumeCount) : 0;
+      const lastAttempt = Date.parse(prior?.lastAttemptAt ?? "");
+      const retryApplied = Date.parse(prior?.retryAppliedAt ?? "");
+      const unapplied = !Number.isFinite(retryApplied) || !Number.isFinite(lastAttempt) || retryApplied < lastAttempt;
+      const started = Date.parse(prior?.lastApplyStartedAt ?? prior?.lastAttemptAt ?? "");
+      if (attempts > 0 && unapplied && Number.isFinite(started) && now - started < options.claimApplyGraceMs) {
+        result = { outcome: "already-claimed", attempt: attempts };
+        return null;
+      }
+      if (attempts > 0 && attempts <= options.maxAttempts && unapplied && resumes < options.maxResumes) {
+        const applyToken = randomUUID();
+        result = { outcome: "resume", attempt: attempts, applyToken };
+        return { wedgeNotification: {
+          ...(current.wedgeNotification ?? { reasonKey: "terminal-failed", episodeId: randomUUID(), status: "resolved" as const, transitionedAt: new Date(now).toISOString() }),
+          budgetRevision: (current.wedgeNotification?.budgetRevision ?? 0) + 1,
+          autoRecovery: { ...prior!, resumeCount: resumes + 1, lastApplyStartedAt: new Date(now).toISOString(), applyToken, lastBudgetWriteAt: new Date(now).toISOString() },
+        } };
+      }
+      if (attempts >= options.maxAttempts) {
+        result = { outcome: "exhausted", attempts };
+        if (Number.isFinite(Date.parse(prior?.exhaustedAt ?? ""))) return null;
+        return { wedgeNotification: {
+          ...(current.wedgeNotification ?? { reasonKey: "terminal-failed", episodeId: randomUUID(), status: "resolved" as const, transitionedAt: new Date(now).toISOString() }),
+          budgetRevision: (current.wedgeNotification?.budgetRevision ?? 0) + 1,
+          autoRecovery: { ...prior!, exhaustedAt: new Date(now).toISOString(), lastBudgetWriteAt: new Date(now).toISOString() },
+        } };
+      }
+      if (Number.isFinite(lastAttempt) && now - lastAttempt < options.minAttemptSpacingMs) {
+        result = { outcome: "already-claimed", attempt: attempts };
+        return null;
+      }
+      const applyToken = randomUUID();
+      const startedAt = new Date(now).toISOString();
+      result = { outcome: "claimed", attempt: attempts + 1, applyToken };
+      return { wedgeNotification: {
+        ...(current.wedgeNotification ?? { reasonKey: "terminal-failed", episodeId: randomUUID(), status: "resolved" as const, transitionedAt: startedAt }),
+        budgetRevision: (current.wedgeNotification?.budgetRevision ?? 0) + 1,
+        autoRecovery: {
+          ...prior, attempts: attempts + 1, lastAttemptAt: startedAt, retryAppliedAt: undefined,
+          resumeCount: 0, lastApplyStartedAt: startedAt, applyToken, lastBudgetWriteAt: startedAt,
+          ...(attempts === 0 ? { budgetStartedAt: startedAt } : {}),
+          ...(prior?.escalationReason === "auto-recovery-disabled" ? { escalationNotifiedAt: undefined, escalationReason: undefined } : {}),
+        },
+      } };
+    });
+    return result;
+  }
+  async markTerminalFailureAutoRecoveryBudgetExhausted(taskId: string, options: { maxAttempts: number }): Promise<"stamped" | "already-stamped" | "not-exhausted" | "no-budget"> {
+    let result: "stamped" | "already-stamped" | "not-exhausted" | "no-budget" = "no-budget";
+    await this.updateTaskAtomic(taskId, (current) => {
+      const budget = current.wedgeNotification?.autoRecovery;
+      if (!budget) { result = "no-budget"; return null; }
+      const attempts = typeof budget.attempts === "number" && Number.isFinite(budget.attempts) && budget.attempts >= 0 ? Math.trunc(budget.attempts) : 0;
+      if (attempts < options.maxAttempts) { result = "not-exhausted"; return null; }
+      if (Number.isFinite(Date.parse(budget.exhaustedAt ?? ""))) { result = "already-stamped"; return null; }
+      const now = new Date().toISOString(); result = "stamped";
+      return { wedgeNotification: { ...current.wedgeNotification!, budgetRevision: (current.wedgeNotification!.budgetRevision ?? 0) + 1, autoRecovery: { ...budget, exhaustedAt: now, lastBudgetWriteAt: now } } };
+    });
+    return result;
+  }
+  async markTerminalFailureAutoRecoveryEscalationDelivered(
+    taskId: string,
+    input: { dispatchOutcome: "delivered" | "suppressed"; escalationReason: "budget-exhausted" | "auto-recovery-disabled" },
+  ): Promise<"stamped" | "already-stamped" | "not-stamped-stale-suppression" | "no-budget"> {
+    let result: "stamped" | "already-stamped" | "not-stamped-stale-suppression" | "no-budget" = "no-budget";
+    await this.updateTaskAtomic(taskId, (current) => {
+      const wedge = current.wedgeNotification;
+      const budget = wedge?.autoRecovery;
+      if (!wedge || !budget) { result = "no-budget"; return null; }
+      if (
+        (budget.escalationNotifiedAt && budget.escalationReason === input.escalationReason)
+        || (budget.escalationReason === "budget-exhausted" && input.escalationReason === "auto-recovery-disabled")
+      ) { result = "already-stamped"; return null; }
+      if (input.dispatchOutcome === "suppressed") {
+        const notifiedAt = Date.parse(wedge.lastNotifiedAtByReason?.["terminal-failed"] ?? "");
+        const floor = Date.parse(input.escalationReason === "budget-exhausted" ? budget.exhaustedAt ?? "" : budget.budgetStartedAt ?? "");
+        if (!Number.isFinite(notifiedAt) || !Number.isFinite(floor) || notifiedAt < floor) {
+          result = "not-stamped-stale-suppression";
+          return null;
+        }
+      }
+      const now = new Date().toISOString(); result = "stamped";
+      return { wedgeNotification: {
+        ...wedge, budgetRevision: (wedge.budgetRevision ?? 0) + 1,
+        autoRecovery: { ...budget, escalationNotifiedAt: now, escalationReason: input.escalationReason, lastBudgetWriteAt: now },
+      } };
+    });
+    return result;
+  }
+  async resetTerminalFailureAutoRecoveryBudget(taskId: string): Promise<void> {
+    await this.updateTaskAtomic(taskId, (current) => {
+      const wedge = current.wedgeNotification;
+      if (!wedge?.autoRecovery) return null;
+      return { wedgeNotification: clearTerminalFailureAutoRecoveryBudget(wedge, new Date().toISOString()) };
+    });
+  }
+  /*
+  FNXC:TaskWedgeNotifications 2026-08-10-18:54:
+  R38c is used because the current move implementation owns its transaction and cannot accept
+  a companion task patch. Consume the fence before the internal move under the task lock: exactly
+  one observer is authorized to move, while a crash leaves a cleared, non-failed row that no
+  automatic recovery path re-moves. A wall-clock window is never a move authorization.
+  */
+  async applyTerminalFailureAutoRecoveryRetry(
+    taskId: string,
+    input: { applyToken: string; patch: Parameters<TaskStore["updateTask"]>[1]; targetColumn: ColumnId; moveOptions: MoveTaskOptions },
+  ): Promise<{ outcome: "applied"; task: Task } | { outcome: "superseded" | "not-failed" | "deleted" | "no-budget" }> {
+    return this.withTaskLock(taskId, async () => {
+      const live = await this.readTaskForMove(taskId);
+      const budget = live.wedgeNotification?.autoRecovery;
+      if (!budget) return { outcome: "no-budget" };
+      if (live.deletedAt != null) return { outcome: "deleted" };
+      if (live.status !== "failed") return { outcome: "not-failed" };
+      if (!budget.applyToken || budget.applyToken !== input.applyToken) return { outcome: "superseded" };
+      /*
+      FNXC:TaskWedgeNotifications 2026-08-10-20:40:
+      The apply fence is validated only inside `moveTaskInternal`'s advisory-locked transaction,
+      which consumes it while persisting the failure clear and column move. An in-process task lock
+      is merely a local belt: separate engine processes must not be able to carry the same token
+      into two moves, and a failed move must roll back all three changes together.
+      */
+      const expectedColumn = live.column;
+      try {
+        const moved = await this.moveTaskInternal(
+          taskId,
+          input.targetColumn,
+          input.moveOptions,
+          {
+            fromHandoff: false,
+            terminalFailureApply: {
+              applyToken: input.applyToken,
+              patch: input.patch,
+              expectedColumn,
+            },
+          },
+          live,
+        );
+        return { outcome: "applied", task: moved };
+      } catch (error) {
+        if (error instanceof TerminalFailureApplyRejected) return { outcome: error.outcome };
+        throw error;
+      }
+    });
   }
   async claimNextToolFailureRetry(taskId: string, expectedCursor: number, maxRetries: number): Promise<import("./task-store/branch-and-pr-entities.js").ToolFailureRetryClaim> {
     return claimNextToolFailureRetryImpl(this, taskId, expectedCursor, maxRetries);
@@ -1252,6 +2269,113 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
   async updateTaskAtomic( id: string, updater: ( current: Task, ) => Parameters<TaskStore["updateTask"]>[1] | null | undefined | Promise<Parameters<TaskStore["updateTask"]>[1] | null | undefined>, runContext?: RunMutationContext, ): Promise<Task> {
     return updateTaskAtomicImpl(this, id, updater, runContext);
+  }
+  async appendRemediationSteps(taskId: string, steps: readonly TaskStep[], options?: AppendRemediationStepsOptions): Promise<AppendRemediationStepsResult> {
+    return appendRemediationStepsImpl(this, taskId, steps, options);
+  }
+  async applyInReviewStallObservationFenced(
+    id: string,
+    compute: import("./task-store/task-mutation-ops.js").InReviewStallObservationCompute,
+  ): Promise<import("./task-store/task-mutation-ops.js").InReviewStallObservationResult> {
+    return applyInReviewStallObservationFencedImpl(this, id, compute);
+  }
+  async updateWorkflowStepResultsFenced(
+    id: string,
+    compute: import("./task-store/task-mutation-ops.js").WorkflowStepResultsFencedCompute,
+  ): Promise<import("./task-store/task-mutation-ops.js").WorkflowStepResultsFencedUpdateResult> {
+    return updateWorkflowStepResultsFencedImpl(this, id, compute);
+  }
+  async publishReviewRemediationFenced(
+    id: string,
+    compute: import("./task-store/task-mutation-ops.js").ReviewRemediationPublicationCompute,
+  ): Promise<import("./task-store/task-mutation-ops.js").ReviewRemediationPublicationResult> {
+    return publishReviewRemediationFencedImpl(this, id, compute);
+  }
+  /**
+   * FNXC:LifecycleContainment 2026-08-30-13:36:
+   * FN-267: writes a step-result patch AND one task-log entry inside the SAME advisory-locked
+   * transaction, so a refusal marker and the entry explaining it to an operator cannot be
+   * separated by a cross-process supersession. Deliberately distinct from
+   * updateWorkflowStepResultsFenced so the workflow graph's durable step-result path is unchanged.
+   */
+  async updateWorkflowStepResultsWithLogFenced(
+    id: string,
+    compute: (current: Task) => { workflowStepResults: Task["workflowStepResults"]; logEntry: TaskLogEntry } | null,
+  ): Promise<import("./task-store/task-mutation-ops.js").WorkflowStepResultsFencedUpdateResult> {
+    return updateWorkflowStepResultsWithLogFencedImpl(this, id, compute);
+  }
+  /** Dismisses one active AI merge finding with an operator-provided audit reason. */
+  async dismissAiMergeReviewFinding(taskId: string, findingId: string, reason: string, actor = "operator"): Promise<Task> {
+    const trimmed = reason.trim();
+    if (!trimmed) throw new Error("AI merge finding dismissal requires a nonblank reason");
+    return this.updateTaskAtomic(taskId, (current) => {
+      const state = current.aiMergeReviewReconciliation;
+      const finding = state?.findings.find((entry) => entry.id === findingId && (entry.disposition === "pending" || entry.disposition === "still-present"));
+      if (!state || !finding) throw new Error("AI merge finding is not active");
+      /*
+      FNXC:AIMergeReviewReconciliation 2026-08-20-22:38:
+      The dismissal log is part of the same locked task mutation as the state clear. A post-commit
+      log write could fail after clearing the only active finding, making the required actor/reason
+      audit unrecoverable and preventing an operator retry.
+      */
+      const log = [...(current.log ?? []), {
+        timestamp: new Date().toISOString(),
+        action: `AI merge review finding ${findingId} dismissed by ${actor}: ${trimmed}`,
+        outcome: "AiMergeReview",
+      }];
+      return { aiMergeReviewReconciliation: null, mergeRetries: undefined, log };
+    });
+  }
+  async linkTaskRecommendation(
+    id: string,
+    recommendationId: string,
+    createdTaskId: string,
+    completeColumns?: ReadonlySet<string>,
+  ): Promise<Task> {
+    return linkTaskRecommendationImpl(this, id, recommendationId, createdTaskId, completeColumns);
+  }
+  /**
+   * FNXC:WorkspaceRootRouting 2026-08-19-12:15:
+   * Atomically removes stale singular checkout routing from a configured workspace task. The
+   * per-repository workspaceWorktrees map is deliberately not part of the update.
+   */
+  async normalizeWorkspaceTaskWorktreeMetadata(id: string): Promise<Task> {
+    return normalizeWorkspaceTaskWorktreeMetadataImpl(this, id);
+  }
+  async mergeWorkspaceWorktreeEntry(
+    id: string,
+    repoRelPath: string,
+    patch: Partial<import("./types.js").WorkspaceWorktreeEntry>
+      | ((current: Task) => Promise<Partial<import("./types.js").WorkspaceWorktreeEntry>>),
+    options?: {
+      requireExistingEntry?: boolean;
+      clearSingularWorktree?: boolean;
+      validateBeforePersist?: (current: Task) => Promise<void>;
+    },
+  ): Promise<Task> {
+    return mergeWorkspaceWorktreeEntryImpl(this, id, repoRelPath, patch, options);
+  }
+  async updateTaskRepositoryScope(
+    id: string,
+    repositoryScope: import("./types.js").TaskRepositoryScope | undefined,
+  ): Promise<Task> {
+    return updateTaskRepositoryScopeImpl(this, id, repositoryScope);
+  }
+  async updateWorkspaceReviewState(
+    id: string,
+    expectedScopeRevision: number,
+    reviewRemediation: import("./types.js").TaskRepositoryScope["reviewRemediation"] | null,
+  ): Promise<{ task: Task; updated: boolean }> {
+    return updateWorkspaceReviewStateImpl(this, id, expectedScopeRevision, reviewRemediation);
+  }
+  async publishWorkspaceCodeReviewEvidence(
+    id: string,
+    input: import("./task-store/task-mutation-ops.js").PublishWorkspaceCodeReviewEvidenceInput,
+  ): Promise<import("./task-store/task-mutation-ops.js").PublishWorkspaceCodeReviewEvidenceResult> {
+    return publishWorkspaceCodeReviewEvidenceImpl(this, id, input);
+  }
+  async resolveTaskWedgeNotificationEpisode(id: string, episodeId: string): Promise<{ task: Task; resolved: boolean }> {
+    return resolveTaskWedgeNotificationEpisodeImpl(this, id, episodeId);
   }
   public mergeCustomFieldPatch( current: Record<string, unknown> | undefined, patch: Record<string, unknown>, ): Record<string, unknown> {
     return mergeCustomFieldPatchImpl(this, current, patch);
@@ -1320,7 +2444,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public async updateTaskUnlocked( id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext, ): Promise<Task> {
     return updateTaskUnlockedImpl(this, id, updates, runContext);
   }
-  async pauseTask( id: string, paused: boolean, runContext?: RunMutationContext, agentOptions?: { pausedByAgentId?: string; pausedReason?: string }, ): Promise<Task> {
+  async pauseTask( id: string, paused: boolean, runContext?: RunMutationContext, agentOptions?: { pausedByAgentId?: string; pausedReason?: string; userPaused?: boolean }, ): Promise<Task> {
     return pauseTaskImpl(this, id, paused, runContext, agentOptions);
   }
 
@@ -1354,39 +2478,124 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       const dir = this.taskDir(id);
       const task = await this.readTaskJson(dir);
 
-      if (task.column !== "in-review") {
-        throw new Error(`Cannot bypass review lane for ${id}: task is in '${task.column}', must be in 'in-review'`);
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-30-01:10 (PR #2709 review — greptile):
+      THE MESSAGE MUST NAME THE COLUMN THE CHECK ACTUALLY USED. The guard was converted to the
+      resolved review lane while the rejection still said `in-review`, so on a custom board an
+      operator was told to move the card to a column their board does not have — through both the
+      CLI and the dashboard, with no way to discover the real answer from the error.
+
+      Wrong guidance is worse than an unconverted guard: an inert guard fails visibly, while this
+      one refuses correctly and then sends the operator somewhere that does not exist. Resolved once
+      into a local so the check and the message cannot drift apart again.
+      */
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-30-16:05 (PR #2718 review — greptile, on the guard I
+      converted in #2709):
+      EVERY REVIEW LANE, because `.review` is the single `mergeOrchestration` column. A board hosting
+      review on a `humanReview`- or `mergeBlocker`-only lane failed this check, so `TaskContextMenu`
+      offered "Bypass failed review" (it asks by ROLE) and the store refused it — the operator's only
+      escape from a stranded failed pre-merge step returned a conflict.
+
+      THE BROAD SET IS RIGHT HERE, and that is a decision rather than a default: this guard REFUSES or
+      PERMITS an operator action and moves nothing, so admitting every lane where review happens cannot
+      send a card anywhere the engine disagrees with. #2750 documents the split — a caller that admits
+      and then MOVES wants the narrow single lane instead.
+
+      The message names the lanes the check actually used, keeping #2709's fix: telling an operator to
+      move to a column their board does not have is worse than refusing.
+      */
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-15:20 (#2819 review — the same empty-set hole, found by
+      sweeping every `resolveReviewColumns` call site rather than only the one the reviewer named):
+      A v1-upgraded board resolves to an EMPTY review set while its `in-review` column plainly exists,
+      so this guard would refuse the operator's bypass on every pre-v2 project with the unhelpful
+      message "must be in a review lane".
+      */
+      const reviewIr = await resolveWorkflowIrForTask(this, task.id).catch(() => undefined);
+      const reviewColumns = reviewIr === undefined || !declaresAnyLifecycleTrait(reviewIr)
+        ? ["in-review"]
+        : resolveReviewColumns(reviewIr);
+      if (!reviewColumns.includes(task.column)) {
+        const named = reviewColumns.length > 0 ? reviewColumns.map((c: string) => `'${c}'`).join(" or ") : "a review lane";
+        throw new Error(`Cannot bypass review lane for ${id}: task is in '${task.column}', must be in ${named}`);
       }
       if (task.paused) {
         throw new Error(`Cannot bypass review lane for ${id}: task is paused`);
       }
 
-      const target = getLatestFailedPreMergeReviewStep(task);
-      if (!target) {
+      const results = task.workflowStepResults ?? [];
+      const failedTarget = getLatestFailedPreMergeReviewStep(task);
+      const reviewIrForBypass = failedTarget
+        ? undefined
+        : await resolveWorkflowIrForTask(this, task.id);
+      const requiredForBypass = reviewIrForBypass
+        ? [...resolveRequiredPreMergeStepIds(reviewIrForBypass, task.enabledWorkflowSteps, task)]
+        : [];
+      const absentStepId = requiredForBypass
+        .find((workflowStepId) => !results.some((result) => result.workflowStepId === workflowStepId));
+      /*
+      FNXC:ReviewLaneBypass 2026-09-05-23:08:
+      FN-295: the operator escape must reach EVERY row that holds the merge door shut, not only
+      `status:"failed"`. A required gate can block while `skipped` (archived by another gate's
+      remediation), `advisory_failure`, or `passed` with a non-approving verdict — and in that state the
+      card had no exit at all: the reseed handles only a missing result, the stale-content reroute only
+      a moved fingerprint, and this bypass only a failed row. Measured on FN-295: three review restarts
+      re-ran Code Review and Documentation to APPROVE and the card still could not merge or be waived.
+      A failed row stays the preferred target so the established selection is unchanged where it applied.
+      */
+      const unapprovedTarget = !failedTarget && !absentStepId && requiredForBypass.length > 0
+        ? (() => {
+          const blocked = evaluatePreMergeApprovals(task, { requiredPreMergeStepIds: new Set(requiredForBypass) })
+            .find((approval) => approval.state !== "approved");
+          return blocked ? results.find((result) => result.workflowStepId === blocked.workflowStepId) : undefined;
+        })()
+        : undefined;
+      if (!failedTarget && !absentStepId && !unapprovedTarget) {
+        // Preserve the established refusal for cards with no escape target at all.
         throw new Error(`Cannot bypass review lane for ${id}: no failed pre-merge review step found`);
       }
 
-      const results = task.workflowStepResults ?? [];
-      const targetIndex = results.indexOf(target);
-      if (targetIndex === -1) {
+      const target = failedTarget ?? unapprovedTarget ?? {
+        workflowStepId: absentStepId!,
+        workflowStepName: absentStepId!,
+        phase: "pre-merge" as const,
+        status: "absent" as const,
+      };
+      const rowTarget = failedTarget ?? unapprovedTarget;
+      const targetIndex = rowTarget ? results.indexOf(rowTarget) : -1;
+      if (rowTarget && targetIndex === -1) {
         throw new Error(`Cannot bypass review lane for ${id}: failed step result not found`);
       }
 
       const now = new Date().toISOString();
-      const bypassed: import("./types.js").WorkflowStepResult = {
-        ...target,
-        status: "skipped",
-        bypassedBy: actor,
-        bypassedAt: now,
-        bypassReason: reason,
-        bypassedFromStatus: target.status,
-        bypassedFromVerdict: target.verdict,
-      };
+      const bypassed: import("./types.js").WorkflowStepResult = rowTarget
+        ? {
+          ...rowTarget,
+          status: "skipped",
+          bypassedBy: actor,
+          bypassedAt: now,
+          bypassReason: reason,
+          bypassedFromStatus: rowTarget.remediationArchivedFromStatus ?? rowTarget.status,
+          bypassedFromVerdict: rowTarget.verdict ?? rowTarget.priorAttempts?.[0]?.verdict,
+        }
+        : {
+          workflowStepId: absentStepId!,
+          workflowStepName: absentStepId!,
+          phase: "pre-merge",
+          status: "skipped",
+          bypassedBy: actor,
+          bypassedAt: now,
+          bypassReason: reason,
+          bypassedFromStatus: "absent",
+        };
       // A bypass never fabricates a reviewer verdict.
       delete bypassed.verdict;
+      // Preserve archive provenance: the merge gate recognizes only the audited waiver as its exception.
 
       const nextResults = [...results];
-      nextResults[targetIndex] = bypassed;
+      if (targetIndex === -1) nextResults.push(bypassed);
+      else nextResults[targetIndex] = bypassed;
       task.workflowStepResults = nextResults;
 
       if (!task.log) {
@@ -1410,8 +2619,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         metadata: {
           workflowStepId: target.workflowStepId,
           workflowStepName: target.workflowStepName,
-          bypassedFromStatus: target.status,
-          bypassedFromVerdict: target.verdict ?? null,
+          bypassedFromStatus: bypassed.bypassedFromStatus,
+          bypassedFromVerdict: bypassed.bypassedFromVerdict ?? null,
           reason,
         },
       });
@@ -1423,11 +2632,195 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       return task;
     });
   }
-  async updateStep( id: string, stepIndex: number, status: import("./types.js").StepStatus, options?: { source?: "graph" }, ): Promise<Task> {
+  /*
+   * FNXC:StepResume 2026-08-06-02:12:
+   * STAS-032: Operator/privileged-only escape hatch for a card stranded in
+   * `in-review` or `in-progress` with a workflow step permanently in `pending`
+   * status (leading real-world cause: the Runfusion/Fusion#1946 dispatched
+   * prompt node verdict callback never received). Transitions the stuck
+   * `pending` pre-merge step to `status: "failed"` with resume audit metadata
+   * (who/when/why/prior status) so the existing `fn_task_bypass_review` escape
+   * hatch can then clear the merge blocker (FN-7720). Requires a mandatory
+   * `reason` and `stepId`; audit-logged via the `task:resume-step` run-audit
+   * event. A resumed result is a terminal `failed` result and does NOT clear,
+   * create, or alter any other merge-blocker condition. NOT exposed to
+   * executor/reviewer/triage agent tool surfaces — see `fn_workflow_step_resume`
+   * registration comments for the same rule.
+   */
+  async resumeWorkflowStep(
+    id: string,
+    options: { stepId: string; reason: string; actor: string },
+  ): Promise<Task> {
+    const reason = options.reason?.trim();
+    if (!reason) {
+      throw new Error("resumeWorkflowStep requires a non-empty reason");
+    }
+    const stepId = options.stepId?.trim();
+    if (!stepId) {
+      throw new Error("resumeWorkflowStep requires a non-empty stepId");
+    }
+    const actor = options.actor?.trim() || "operator";
+
+    return this.withTaskLock(id, async () => {
+      const dir = this.taskDir(id);
+      const task = await this.readTaskJson(dir);
+
+      if (task.paused) {
+        throw new Error(`Cannot resume workflow step for ${id}: task is paused`);
+      }
+
+      // FNXC:StepResume 2026-08-06-17:42:
+      // Resolve the review and WIP lanes against the task's actual workflow IR instead of
+      // hardcoded 'in-review'/'in-progress' literals. A board whose review lane is named
+      // differently (or carries review on a humanReview/mergeBlocker-only lane) would
+      // otherwise reject a legitimately stuck task. This mirrors bypassFailedPreMergeReviewStep's
+      // lane resolution; the WIP side uses the workflow's countsTowardWip columns.
+      const resumeIr = await resolveWorkflowIrForTask(this, task.id).catch(() => undefined);
+      const reviewColumns: ReadonlySet<string> =
+        resumeIr === undefined || !declaresAnyLifecycleTrait(resumeIr)
+          ? new Set(["in-review"])
+          : new Set(resolveReviewColumns(resumeIr));
+      const wipColumns = await resolveProjectColumnsForRoles(this, ["countsTowardWip"]);
+      const resumeInReview = reviewColumns.has(task.column);
+      const resumeInProgress = wipColumns.has(task.column);
+      if (!resumeInReview && !resumeInProgress) {
+        const named = reviewColumns.size > 0 ? [...reviewColumns].map((c) => `'${c}'`).join(" or ") : "a review lane";
+        throw new Error(
+          `Cannot resume workflow step for ${id}: task is in '${task.column}', must be in ${named} or a WIP (in-progress) lane`,
+        );
+      }
+
+      const results = task.workflowStepResults ?? [];
+      // Only a pending PRE-MERGE step may be resumed: post-merge steps are never the stuck prompt
+      // verdict target, and resuming one would fabricate a terminal 'failed' result the merge gate
+      // does not own. findPendingPreMergeStep (used to name the candidate below) enforces the same
+      // pre-merge boundary as the operator-only resume surface.
+      const target = results.find((r) => r.workflowStepId === stepId && r.phase !== "post-merge");
+      if (!target) {
+        const pendingPreMerge = findPendingPreMergeStep(task);
+        const candidateName = pendingPreMerge ? pendingPreMerge.workflowStepName : undefined;
+        throw new Error(
+          `Cannot resume workflow step for ${id}: step '${stepId}' not found as a pending pre-merge step` +
+            (candidateName ? ` (pending pre-merge step found: '${candidateName}')` : ""),
+        );
+      }
+      if (target.status !== "pending") {
+        const archivedFailure = target.remediationArchivedAt != null
+          && (target.remediationArchivedFromStatus === "failed" || target.remediationArchivedFromStatus === "advisory_failure")
+          && !target.bypassedBy
+          && !target.supersededAt;
+        /*
+        FNXC:StepResume 2026-09-06-00:47:
+        Resume must remain pending-only, but an archived failed carrier now has a supported audited
+        bypass path. Name it so the documented recovery chain does not dead-end after a crash archive.
+        */
+        throw new Error(`Cannot resume workflow step for ${id}: only pending steps can be resumed${archivedFailure ? ` (step '${stepId}' is an archived remediation carrier — use fn_task_bypass_review / POST /tasks/:id/bypass-review to clear it)` : ""}`);
+      }
+
+      const now = new Date().toISOString();
+      const resumed: import("./types.js").WorkflowStepResult = {
+        ...target,
+        status: "failed",
+        completedAt: now,
+        resumedAt: now,
+        resumedBy: actor,
+        resumeReason: reason,
+        resumedFromStatus: target.status,
+      };
+      // A resumed result is terminal 'failed' — never carry lease ownership forward onto a
+      // completed step result. The lease was held by the (never-completed) dispatched prompt node;
+      // preserving leaseOwner/leaseNodeId on the failed record would strand successor lease logic.
+      delete resumed.leaseOwner;
+      delete resumed.leaseNodeId;
+
+      const nextResults = [...results];
+      const targetIndex = nextResults.indexOf(target);
+      nextResults[targetIndex] = resumed;
+      task.workflowStepResults = nextResults;
+
+      if (!task.log) {
+        task.log = [];
+      }
+      task.updatedAt = now;
+      task.log.push({
+        timestamp: now,
+        action: `Workflow step resumed: ${target.workflowStepName} (${target.workflowStepId}) by ${actor} — ${reason}`,
+      });
+
+      await this.recordRunAuditEvent({
+        taskId: task.id,
+        agentId: actor,
+        runId: this.makeSyntheticDeleteRunId(task.id),
+        domain: "database",
+        mutationType: "task:resume-step",
+        target: task.id,
+        metadata: {
+          workflowStepId: target.workflowStepId,
+          workflowStepName: target.workflowStepName,
+          resumedFromStatus: target.status,
+          reason,
+        },
+      });
+
+      await this.atomicWriteTaskJson(dir, task);
+      if (this.isWatching) this.taskCache.set(id, { ...task });
+
+      this.emit("task:updated", task);
+      return task;
+    });
+  }
+  /*
+  FNXC:WorkflowEvents 2026-08-01-06:11:
+  One seam decorates every TaskStore `task:updated` emission, including hot synchronous paths, with a
+  cached answer only. Explicit metadata wins; runtime and process bridge EventEmitters do not call this
+  method and deliberately DROP lanes because absent metadata safely preserves their listener fallback.
+  */
+  override emit(event: unknown, ...args: any[]): boolean {
+    // event: unknown keeps the decorator assignable to EventEmitter<TaskStoreEvents>'s
+    // generic `emit<E extends string|symbol>(name: K|E, ...)` signature while still
+    // forwarding arbitrary non-typed keys (agent:log, settings:updated, …).
+    if (event === "task:updated" && args.length === 1) {
+      const task = args[0] as Task;
+      const lanes = this.laneCache.get(task.id);
+      if (lanes !== undefined) return EventEmitter.prototype.emit.call(this, event as string, task, { lanes });
+    }
+    return EventEmitter.prototype.emit.call(this, event as string, ...args);
+  }
+
+  async updateStep( id: string, stepIndex: number, status: import("./types.js").StepStatus, options?: { source?: "graph"; summary?: string; operatorOverride?: boolean }, ): Promise<Task> {
     return updateStepImpl(this, id, stepIndex, status, options);
+  }
+  // FNXC:StepLifecycle 2026-07-22-10:30: Execution callers need the locked start verdict; updateStep retains its legacy Task-only contract.
+  async startStep( id: string, stepIndex: number, options?: { source?: "graph" }, ): Promise<import("./task-store/merge-queue-ops.js").StepStartResult> {
+    return startStepImpl(this, id, stepIndex, options);
+  }
+  async checkAndRecordUnplannedExecutionBlock(id: string, episode: string): Promise<boolean> {
+    return checkAndRecordUnplannedExecutionBlockImpl(this, id, episode);
+  }
+  async transitionQueuedEpisode(id: string, transition: QueuedEpisodeTransition): Promise<import("./task-store/audit-ops.js").QueuedEpisodeTransitionResult> {
+    return transitionQueuedEpisodeImpl(this, id, transition);
+  }
+
+  async listTaskOverlapWaits(taskId: string, options: { pendingOnly?: boolean } = {}) {
+    return listTaskOverlapWaitsImpl(this, taskId, options);
+  }
+
+  async claimTaskOverlapWait(claim: OverlapWaitClaim) {
+    return claimTaskOverlapWaitImpl(this, claim);
+  }
+
+  async publishTaskOverlapDeliveries(blockerTaskId: string, deliveries: OverlapWaitDeliverySnapshot[]) {
+    return publishTaskOverlapDeliveriesImpl(this, blockerTaskId, deliveries);
+  }
+
+  async completeTaskOverlapWait(input: { taskId: string; episodeId: string; expectedRevision: number; owner: string; phase?: "ready" | "delivered" | "freshness-pending"; receipt: OverlapWaitReceipt; executionIdentity?: OverlapWaitExecutionIdentity }) {
+    return completeTaskOverlapWaitImpl(this, input);
   }
   async logEntry(id: string, action: string, outcome?: string, runContext?: RunMutationContext): Promise<Task> {
     return logEntryImpl(this, id, action, outcome, runContext);
+  }
+  async logEntryOnce(id: string, input: { action: string; outcome?: string; dedupeKey: string; windowMs: number }): Promise<boolean> {
+    return logEntryOnceImpl(this, id, input);
   }
   async getMutationsForRun(runId: string): Promise<TaskLogEntry[]> {
     return getMutationsForRunImpl(this, runId);
@@ -1492,6 +2885,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async getMergeRequestRecordAsync(taskId: string): Promise<MergeRequestRecord | null> {
     return getMergeRequestRecordAsyncImpl(this, taskId);
   }
+
+  /** Batched `getMergeRequestRecordAsync` — one query for many tasks (FNXC:MergeAuthority 2026-08-23-20:05). */
+  async getMergeRequestRecordsAsync(taskIds: readonly string[]): Promise<Map<string, MergeRequestRecord>> {
+    return getMergeRequestRecordsAsyncImpl(this, taskIds);
+  }
   async projectMergeRequestToWorkflowWorkItem( taskId: string, opts: MergeRequestWorkflowProjectionOptions = {}, ): Promise<WorkflowWorkItem | null> {
     return projectMergeRequestToWorkflowWorkItemImpl(this, taskId, opts);
   }
@@ -1511,6 +2909,15 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async upsertWorkflowWorkItem(input: WorkflowWorkItemUpsertInput, tx?: import("./postgres/data-layer.js").DbTransaction): Promise<WorkflowWorkItem> {
     return upsertWorkflowWorkItemImpl(this, input, tx);
   }
+  async replaceActiveTaskWorkflowContinuation(input: WorkflowWorkItemUpsertInput & { kind: "task" }): Promise<WorkflowWorkItem> {
+    return replaceActiveTaskWorkflowContinuationImpl(this, input);
+  }
+  async seedWorkspaceCodeReviewContinuationIfIdle(input: WorkflowWorkItemUpsertInput & { kind: "task" }): Promise<{ seeded: boolean; reason?: "active-continuation"; workItemId?: string }> {
+    return seedWorkspaceCodeReviewContinuationIfIdleImpl(this, input);
+  }
+  async seedStrandedPlanReviewContinuation(input: WorkflowWorkItemUpsertInput & { kind: "task" }, options: { retirePredecessorId?: string } = {}): Promise<{ seeded: boolean; reason?: "active-continuation" | "plan-review-passed"; workItemId?: string }> {
+    return seedStrandedPlanReviewContinuationImpl(this, input, options);
+  }
   async transitionWorkflowWorkItem( id: string, state: WorkflowWorkItemState, patch: WorkflowWorkItemTransitionPatch = {}, tx?: import("./postgres/data-layer.js").DbTransaction, ): Promise<WorkflowWorkItem> {
     return transitionWorkflowWorkItemImpl(this, id, state, patch, tx);
   }
@@ -1528,6 +2935,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return listWorkflowWorkItemsForTaskImpl(this, taskId, opts);
   }
 
+  /** Batched `listWorkflowWorkItemsForTask` — one query for many tasks (FNXC:MergeAuthority 2026-08-23-20:05). */
+  async listWorkflowWorkItemsForTasks(
+    taskIds: readonly string[],
+    opts: { kinds?: WorkflowWorkItemKind[] } = {},
+  ): Promise<Map<string, WorkflowWorkItem[]>> {
+    return listWorkflowWorkItemsForTasksImpl(this, taskIds, opts);
+  }
+
   /**
    * FNXC:RuntimeWorkflowAsync 2026-06-24-17:12:
    */
@@ -1538,7 +2953,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return cancelActiveWorkflowWorkItemsForTaskImpl(this, taskId, opts, tx);
   }
   async listDueWorkflowWorkItems(filter: WorkflowWorkItemDueFilter = {}): Promise<WorkflowWorkItem[]> {
-    return listDueWorkflowWorkItemsImpl(this, filter);
+    return listDueWorkflowWorkItemsImpl(this, { ...filter, projectId: this.asyncLayer?.projectId });
   }
   async acquireWorkflowWorkItemLease( id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string }, ): Promise<WorkflowWorkItem | null> {
     return acquireWorkflowWorkItemLeaseImpl(this, id, leaseOwner, opts);
@@ -1567,8 +2982,22 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async recordRunAuditEvent(input: RunAuditEventInput): Promise<RunAuditEvent> {
     return recordRunAuditEventImpl(this, input);
   }
-  public isLegacyAutoMergeStampCandidate(task: Pick<Task, "column" | "autoMerge" | "autoMergeProvenance">): boolean {
-    return task.column === "in-review" && task.autoMerge === true && task.autoMergeProvenance !== "user";
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-07-31-01:10 (batch-core feed):
+  `reviewColumns` is an optional RESOLVED answer; omitted, this is exactly today's behaviour.
+
+  Synchronous by necessity — it is a pure row predicate used to filter an already-loaded list — so it
+  takes the answer rather than resolving one. Keyed on the literal it selected NOTHING on a renamed
+  board, so the legacy auto-merge stamp backfill silently reconciled zero rows and reported success.
+
+  DELIBERATE-LITERAL — the unconverted-caller default, reviewed 2026-07-31-01:10.
+  */
+  public isLegacyAutoMergeStampCandidate(
+    task: Pick<Task, "column" | "autoMerge" | "autoMergeProvenance">,
+    reviewColumns?: ReadonlySet<string>,
+  ): boolean {
+    const inReviewLane = reviewColumns ? reviewColumns.has(task.column) : task.column === "in-review";
+    return inReviewLane && task.autoMerge === true && task.autoMergeProvenance !== "user";
   }
   public async listLegacyAutoMergeStampCandidates(): Promise<Task[]> {
     return listLegacyAutoMergeStampCandidatesImpl(this);
@@ -1585,7 +3014,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   /** PostgreSQL-authoritative audit reader; sync fallback remains for test doubles. */
   async getRunAuditEventsAsync(options: RunAuditEventFilter = {}): Promise<RunAuditEvent[]> {
     if (this.asyncLayer) {
-      const events = await queryRunAuditEvents(this.asyncLayer.db, options);
+      const events = await queryRunAuditEvents(
+        this.asyncLayer.db,
+        options,
+        this.asyncLayer.projectId,
+      );
       return events.map((event) => ({
         ...event,
         taskId: event.taskId ?? undefined,
@@ -1603,14 +3036,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     if (!this.asyncLayer) return { reconciled: 0 };
     return reconcileSoftDeletedColumnDriftAsync(this.asyncLayer, recordAudit);
   }
-   async getWorkflowParitySummary(options: { since?: string; limit?: number } = {}): Promise<WorkflowParitySummary> {
-    return getWorkflowParitySummaryImpl(this, options);
-  }
-
-/** Aggregate the `workflowColumns` flag default-flip criteria (U12, KTD-8) into */
-  async computeWorkflowColumnsGraduationReport( options: { since?: string; limit?: number } = {}, ): Promise<WorkflowColumnsGraduationReport> {
-    return computeWorkflowColumnsGraduationReportImpl(this, options);
-  }
+  /*
+  FNXC:WorkflowColumns 2026-07-27-10:05 (U2 / R9):
+  `getWorkflowParitySummary` and `computeWorkflowColumnsGraduationReport` are
+  DELETED with `workflow-parity.ts`. They aggregated the pre-cutover dual-observe
+  contract, whose emitter (`workflow-parity-observer.ts`) is already a tombstone —
+  so both always returned an empty report over run-audit rows nothing writes, and
+  neither had a caller outside this class.
+  */
 
   /**
    * FNXC:RuntimeLifecycleAsync 2026-06-24-11:10:
@@ -1619,12 +3052,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return enqueueMergeQueueImpl(this, taskId, opts);
   }
 
-  /**
-   * FNXC:RuntimeLifecycleAsync 2026-06-24-11:15:
-   */
-  public enqueueMergeQueueSyncInternal(taskId: string, opts: MergeQueueEnqueueOptions): MergeQueueEntry {
-    return enqueueMergeQueueSyncInternalImpl(this, taskId, opts);
-  }
   public cleanupStaleMergeQueueRows(now: string): void {
     return cleanupStaleMergeQueueRowsImpl(this, now);
   }
@@ -1636,7 +3063,26 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    * FNXC:RuntimeLifecycleAsync 2026-06-24-11:20:
    */
   async acquireMergeQueueLease(workerId: string, opts: MergeQueueAcquireOptions): Promise<MergeQueueEntry | null> {
-    return acquireMergeQueueLeaseImpl(this, workerId, opts);
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-01:25 (#2819 review — greptile):
+    Supplies the per-task review-lane resolver for the stale-row sweep. This is the production path,
+    so wiring it here is what makes the option live rather than one only tests fill.
+    */
+    const withResolver: MergeQueueAcquireOptions = {
+      ...opts,
+      resolveReviewColumnsFor: opts.resolveReviewColumnsFor ?? (async (taskId: string) => {
+        /*
+        Three states, not two. `undefined` is "could not read"; an IR whose columns carry NO
+        lifecycle trait at all is a v1 graph upgraded by `synthesizeDefaultColumns`, whose
+        `in-review` column plainly exists and holds cards. Both take the legacy answer. Only a
+        board that expresses traits and still has no review lane is answering the question.
+        */
+        const ir = await resolveWorkflowIrForTask(this, taskId).catch(() => undefined);
+        if (!ir || !declaresAnyLifecycleTrait(ir)) return new Set(["in-review"]);
+        return new Set(resolveReviewColumns(ir));
+      }),
+    };
+    return acquireMergeQueueLeaseImpl(this, workerId, withResolver);
   }
 
   /**
@@ -1697,7 +3143,45 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       return { taskId: id, dryRun, repaired: false, statusCleared: false, reason: "no-overlap-blocker", message: `Task ${id} has no overlap blocker`, task };
     }
 
-    if (task.column !== "todo") {
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-01:10 (batch-core feed):
+    ONE lane resolution for the whole repair, shared by every question below.
+
+    The overlap-blocker repair was inert end to end on a renamed board. It refused here first
+    ("not a repairable todo state") for a card sitting in the board's own hold lane; past that it
+    would have found no active lease holders and no queued reroute candidates either, because the
+    same three literals appear at each step. A repair that declines everything looks identical in the
+    logs to a board with nothing to repair.
+
+    `repairIrCache` is caller-owned per the task workflow resolver contract: this pass resolves
+    lanes for the task, its blocker, and every reroute candidate, so a board spanning three workflows
+    must read three IRs — not one per card.
+    */
+    const repairIrCache = new Map<string, WorkflowIr>();
+    const repairLanesByTaskId = new Map<string, Promise<RepairTaskLifecycleLanes>>();
+    const repairLanesFor = (taskId: string): Promise<RepairTaskLifecycleLanes> => {
+      const cached = repairLanesByTaskId.get(taskId);
+      if (cached) return cached;
+      const resolving = (async (): Promise<RepairTaskLifecycleLanes> => {
+        try {
+          const ir = await resolveWorkflowIrForTask(this, taskId, repairIrCache);
+          const lifecycle = resolveLifecycleColumns(ir);
+          return { lifecycle, lease: repairLeaseLanesForWorkflow(ir, lifecycle) };
+        } catch {
+          return { lifecycle: undefined, lease: undefined };
+        }
+      })();
+      repairLanesByTaskId.set(taskId, resolving);
+      return resolving;
+    };
+    const taskLanes = (await repairLanesFor(task.id)).lifecycle;
+    /*
+    The hold lane is resolved, NOT defaulted per field: `taskLanes === undefined` means the workflow
+    could not be read (keep the literal), while a resolved workflow with no hold lane is an ANSWER —
+    the board has nowhere repairable, so the repair declines and says so rather than inventing "todo".
+    */
+    const repairableHoldColumn = taskLanes === undefined ? "todo" : taskLanes.hold;
+    if (repairableHoldColumn === undefined || task.column !== repairableHoldColumn) {
       return {
         taskId: id,
         dryRun,
@@ -1705,12 +3189,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         statusCleared: false,
         previousOverlapBlockedBy,
         reason: "not-repairable-state",
-        message: `Task ${id} is in ${task.column}, not a repairable todo state`,
+        message: repairableHoldColumn === undefined
+          ? `Task ${id} is in ${task.column}; its workflow declares no hold lane, so there is no repairable state`
+          : `Task ${id} is in ${task.column}, not a repairable ${repairableHoldColumn} state`,
         task,
       };
     }
 
-    const tasks = await this.listTasks({ includeArchived: true, slim: true });
+    const tasks = await this.listTasks({ includeArchived: false, slim: true });
     const taskById = new Map(tasks.map((candidate) => [candidate.id, candidate]));
     const blocker = taskById.get(previousOverlapBlockedBy);
 
@@ -1720,19 +3206,30 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     const getScope = async (taskId: string): Promise<string[]> => {
       const cached = scopeCache.get(taskId);
       if (cached !== undefined) return cached;
-      const scope = filterRepairOverlapIgnoredPaths(await this.parseFileScopeFromPrompt(taskId), ignorePaths);
+      const filteredScope = filterRepairOverlapIgnoredPaths(await this.parseFileScopeFromPrompt(taskId), ignorePaths);
+      const scope = taskById.has(taskId)
+        ? normalizeOverlapScopeForTask(taskById.get(taskId)!, filteredScope)
+        : filteredScope;
       scopeCache.set(taskId, scope);
       return scope;
     };
 
     const taskScope = await getScope(task.id);
     if (blocker) {
-      const blockerHoldsActiveLease = !blocker.paused
-        && !blocker.userPaused
-        && blocker.status !== "failed"
-        && (blocker.column === "in-progress" || (blocker.column === "in-review" && Boolean(blocker.worktree)));
+      /*
+      FNXC:OverlapScheduling 2026-08-29-06:04:
+      The blocker's own resolved lanes decide whether it still owns overlapping files. Classification
+      is shared with the scheduler-facing helper, so a failed or paused review card with a retained
+      worktree cannot be cleared through the operator repair path before its work lands.
+      */
+      const blockerLanes = await repairLanesFor(blocker.id);
+      const blockerLeaseKind = classifyRepairFileScopeLease(blocker, blockerLanes.lease);
+      const blockerHoldsLease = fileScopeLeaseBlocksCandidate(blocker, task, {
+        kind: blockerLeaseKind,
+        waivedForTaskIds: [],
+      });
       const blockerScope = await getScope(blocker.id);
-      if (blockerHoldsActiveLease && repairScopesOverlap(taskScope, blockerScope)) {
+      if (blockerHoldsLease && repairScopesOverlap(taskScope, blockerScope)) {
         return {
           taskId: id,
           dryRun,
@@ -1747,12 +3244,27 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       }
     }
 
-    const unresolvedDeps = (task.dependencies ?? []).filter((depId) => {
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-01:10 (batch-core feed):
+    Each dependency's terminal columns come from ITS OWN workflow. Keyed on the literals, a finished
+    dependency on a renamed board never counted as resolved, so the repair kept re-blocking the card
+    it had just unblocked.
+    */
+    const dependencyLanesByTaskId = new Map<string, LifecycleColumns | undefined>();
+    for (const depId of task.dependencies ?? []) {
+      dependencyLanesByTaskId.set(depId, (await repairLanesFor(depId)).lifecycle);
+    }
+    const isUnresolvedDependency = (depId: string): boolean => {
       const dep = taskById.get(depId);
-      return dep && !dep.deletedAt && dep.column !== "done" && dep.column !== "archived";
-    });
+      if (!dep || dep.deletedAt) return false;
+      const lanes = dependencyLanesByTaskId.get(depId);
+      /* DELIBERATE-LITERAL — the unresolvable-workflow default, reviewed 2026-07-31-01:10. */
+      if (!lanes) return dep.column !== "done";
+      return dep.column !== lanes.complete;
+    };
+    const unresolvedDeps = (task.dependencies ?? []).filter(isUnresolvedDependency);
 
-    const currentOverlapBlocker = await this.findCurrentOverlapBlockerForRepair(task, taskScope, tasks, getScope, previousOverlapBlockedBy);
+    const currentOverlapBlocker = await this.findCurrentOverlapBlockerForRepair(task, taskScope, tasks, getScope, previousOverlapBlockedBy, repairLanesFor);
     const statusCleared = unresolvedDeps.length === 0 && !currentOverlapBlocker && task.status === "queued";
 
     /*
@@ -1830,10 +3342,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         skipped = overlapBlockerChangedResult(current);
         return null;
       }
-      const currentUnresolvedDeps = (current.dependencies ?? []).filter((depId) => {
-        const dep = taskById.get(depId);
-        return dep && !dep.deletedAt && dep.column !== "done" && dep.column !== "archived";
-      });
+      /* Same resolved answer as the pre-check above — a second copy here is how the two halves of
+         this repair end up disagreeing about whether a dependency is finished. */
+      const currentUnresolvedDeps = (current.dependencies ?? []).filter(isUnresolvedDependency);
       const currentStatusCleared = currentUnresolvedDeps.length === 0 && current.status === "queued";
       return {
         overlapBlockedBy: null,
@@ -1867,22 +3378,42 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     tasks: Task[],
     getScope: (taskId: string) => Promise<string[]>,
     previousOverlapBlockedBy: string,
+    /* The CALLER's resolver, so this search shares the repair's single IR cache rather than opening a
+       second one — and so both halves of the repair resolve a given card's lane membership identically. */
+    resolveLanes: (taskId: string) => Promise<RepairTaskLifecycleLanes>,
   ): Promise<string | null> {
     /*
-    FNXC:OverlapRepair 2026-06-25-05:49:
-    Stale-overlap repair must reroute only to tasks that the scheduler would still treat as active file-scope lease holders. Operator-paused or failed active rows are parked work, not live blockers, so the repair should clear stale state instead of creating a fresh blocker edge to them.
+    FNXC:OverlapScheduling 2026-08-29-06:04:
+    Reroute only to a holder that the shared lifetime classification says blocks this task. Paused and
+    failed rows with retained worktrees still own unfinished files; dormant holders use the same
+    priority → age → id ordering as scheduler admission before repair records a fresh blocker edge.
     */
-    const holdsRepairFileScopeLease = (candidate: Task) => {
-      if (candidate.paused || candidate.userPaused || candidate.status === "failed") return false;
-      if (candidate.column === "in-progress") return true;
-      return candidate.column === "in-review" && Boolean(candidate.worktree);
-    };
-    const activeCandidates = tasks
-      .filter((candidate) => candidate.id !== task.id && candidate.id !== previousOverlapBlockedBy)
-      .filter(holdsRepairFileScopeLease)
+    const candidatePool = tasks.filter(
+      (candidate) => candidate.id !== task.id && candidate.id !== previousOverlapBlockedBy,
+    );
+    const candidateLanesByTaskId = new Map<string, LifecycleColumns | undefined>();
+    const candidateLeaseKinds = new Map<string, FileScopeLeaseKind>();
+    for (const candidate of candidatePool) {
+      const lanes = await resolveLanes(candidate.id);
+      candidateLanesByTaskId.set(candidate.id, lanes.lifecycle);
+      candidateLeaseKinds.set(candidate.id, classifyRepairFileScopeLease(candidate, lanes.lease));
+    }
+    const activeCandidates = candidatePool
+      .filter((candidate) => candidateLeaseKinds.get(candidate.id) === "active")
+      .filter((candidate) => fileScopeLeaseBlocksCandidate(candidate, task, {
+        kind: "active",
+        waivedForTaskIds: [],
+      }))
       .sort((a, b) => a.id.localeCompare(b.id));
+    const dormantCandidates = candidatePool
+      .filter((candidate) => candidateLeaseKinds.get(candidate.id) === "dormant")
+      .filter((candidate) => fileScopeLeaseBlocksCandidate(candidate, task, {
+        kind: "dormant",
+        waivedForTaskIds: [],
+      }))
+      .sort(compareTasksByPriorityThenAgeAndId);
 
-    for (const candidate of activeCandidates) {
+    for (const candidate of [...activeCandidates, ...dormantCandidates]) {
       const candidateScope = await getScope(candidate.id);
       if (repairScopesOverlap(taskScope, candidateScope)) return candidate.id;
     }
@@ -1890,8 +3421,13 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     const priorityRank: Record<TaskPriority, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
     const taskRank = priorityRank[task.priority ?? "normal"] ?? 2;
     const taskCreatedAt = Date.parse(task.createdAt);
-    const queuedCandidates = tasks
-      .filter((candidate) => candidate.id !== task.id && candidate.id !== previousOverlapBlockedBy && candidate.column === "todo")
+    const queuedCandidates = candidatePool
+      .filter((candidate) => {
+        const lanes = candidateLanesByTaskId.get(candidate.id);
+        /* DELIBERATE-LITERAL — the unresolvable-workflow default, reviewed 2026-07-31-01:10. */
+        if (!lanes) return candidate.column === "todo";
+        return lanes.hold !== undefined && candidate.column === lanes.hold;
+      })
       .filter((candidate) => {
         const candidateRank = priorityRank[candidate.priority ?? "normal"] ?? 2;
         if (candidateRank < taskRank) return true;
@@ -1925,7 +3461,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   /**
    * FNXC:RuntimeLifecycleAsync 2026-06-24-12:05:
    */
-  public async deleteTaskBackend( id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: { agentId: string; runId: string; sessionId?: string; taskId?: string }; }, ): Promise<Task> {
+  public async deleteTaskBackend( id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: TaskDeleteAuditContext; }, ): Promise<Task> {
     return deleteTaskBackendImpl(this, id, options);
   }
 
@@ -1936,16 +3472,21 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    */
   public async recordRunAuditEventBackend( tx: DbTransaction, event: { domain: string; mutationType: string; target: string; taskId: string; agentId: string; runId: string; metadata: Record<string, unknown>; }, ): Promise<void> {    return recordRunAuditEventBackendImpl(this, tx, event);
   }
-  async deleteTask( id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: { agentId: string; runId: string; sessionId?: string; taskId?: string }; }, ): Promise<Task> {
+  async deleteTask( id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: TaskDeleteAuditContext; }, ): Promise<Task> {
+    // FNXC:TaskWedgeNotifications 2026-08-10-20:30: The backend delete transaction clears
+    // a terminal-failure budget only after it wins the soft-delete claim; never pre-clear here.
     return deleteTaskImpl(this, id, options);
   }
   async deleteTaskIf(
     id: string,
     predicate: (live: Task) => boolean | Promise<boolean>,
-    options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: { agentId: string; runId: string; sessionId?: string; taskId?: string } },
+    options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: TaskDeleteAuditContext },
   ): Promise<DeleteTaskIfResult> {
-    if (this.backendMode) return deleteTaskIfBackendImpl(this, id, predicate, options);
-    return deleteTaskIfImpl(this, id, predicate, options);
+    /*
+    FNXC:SqliteDualPathCleanup 2026-07-26-14:05:
+    Conditional delete is PostgreSQL-only; the SQLite deleteTaskIfImpl arm is deleted.
+    */
+    return deleteTaskIfBackendImpl(this, id, predicate, options);
   }
   public deleteTaskById(taskId: string): void {
     return deleteTaskByIdImpl(this, taskId);
@@ -1980,33 +3521,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async mergeTask(id: string): Promise<MergeResult> {
     return mergeTaskImpl(this, id);
   }
-  async archiveAllDone(options?: { removeLineageReferences?: boolean }): Promise<Task[]> {
-    return archiveAllDoneImpl(this, options);
-  }
-  async archiveTask( id: string, optionsOrCleanup: boolean | { cleanup?: boolean; removeLineageReferences?: boolean } = true, ): Promise<Task> {
-    return archiveTaskImpl(this, id, optionsOrCleanup);
-  }
-
-  /**
-   * FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-14:55:
-   */
-  public async archiveTaskBackend( id: string, optionsOrCleanup: boolean | { cleanup?: boolean; removeLineageReferences?: boolean }, ): Promise<Task> {
-    return archiveTaskBackendImpl(this, id, optionsOrCleanup);
-  }
-
-/** Archive a task and immediately clean up its directory. */
-  async archiveTaskAndCleanup(id: string): Promise<Task> {
-    return this.archiveTask(id, true);
-  }
-  public resolveUnarchiveTargetColumn(preArchiveColumn: unknown): Column {
-    return resolveUnarchiveTargetColumnImpl(this, preArchiveColumn);
-  }
-  public async readPreArchiveColumnFromTaskFile(dir: string): Promise<Column | undefined> {
-    return readPreArchiveColumnFromTaskFileImpl(this, dir);
-  }
-  async unarchiveTask(id: string): Promise<Task> {
-    return unarchiveTaskImpl(this, id);
-  }
   public async moveToDone(task: Task, dir: string): Promise<void> {
     return moveToDoneImpl(this, task, dir);
   }
@@ -2018,9 +3532,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
   async watch(): Promise<void> {
     return watchImpl(this);
-  }
-  public async checkForChanges(): Promise<void> {
-    return checkForChangesImpl(this);
   }
   stopWatching(): void {
     return stopWatchingImpl(this);
@@ -2074,7 +3585,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public flushAgentLogBuffer(): void {
     flushAgentLogBufferImpl(this);
   }
-  async appendAgentLogBatch( entries: Array<{ taskId: string; text: string; type: AgentLogEntry["type"]; detail?: string; agent?: AgentLogEntry["agent"]; }>, ): Promise<void> {
+  async appendAgentLogBatch( entries: Array<{ taskId: string; text: string; type: AgentLogEntry["type"]; detail?: string; agent?: AgentLogEntry["agent"]; durationMs?: number; timeToFirstTokenMs?: number }>, ): Promise<void> {
     return appendAgentLogBatchImpl(this, entries);
   }
 
@@ -2149,7 +3660,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async upsertTaskDocument(taskId: string, input: TaskDocumentCreateInput): Promise<TaskDocument> {
     return upsertTaskDocumentImpl(this, taskId, input);
   }
-
 /** List archived revisions for a task document, newest first. */
   async getTaskDocumentRevisions( taskId: string, key: string, options?: { limit?: number }, ): Promise<TaskDocumentRevision[]> {
     return getTaskDocumentRevisionsImpl(this, taskId, key, options);
@@ -2180,7 +3690,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
 
 /** Update or clear Issue information for a task. */
-  async applyPrMergedTransition( taskId: string, ctx?: { agentId?: string; runId?: string }, ): Promise<{ moved: boolean; skipped?: "already-done" | "not-merged" | "wrong-column" | "paused" }> {
+  async applyPrMergedTransition( taskId: string, ctx?: { agentId?: string; runId?: string }, ): Promise<{ moved: boolean; skipped?: "already-done" | "not-merged" | "wrong-column" | "paused" | "no-complete-column" }> {
     return applyPrMergedTransitionImpl(this, taskId, ctx);
   }
   async updateIssueInfo( id: string, issueInfo: import("./types.js").IssueInfo | null, ): Promise<Task> {
@@ -2233,38 +3743,14 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
     return invalidateConfigCacheAfterMigrationImpl(this);
   }
 
-  // ── Archive Cleanup Methods ─────────────────────────────────────────
-
-/** Read all archived task entries from SQLite. */
-  async readArchiveLog(): Promise<import("./types.js").ArchivedTaskEntry[]> {
-    return this.archiveDb.list();
+  /** @internal Legacy cold-storage reader used only by startup archive reintegration. */
+  public async restoreFromArchive(
+    entry: import("./types.js").ArchivedTaskEntry,
+    options?: { targetColumn?: string; now?: string; authoritativeTask?: Task },
+  ): Promise<Task> {
+    return restoreFromArchiveImpl(this, entry, options);
   }
-
-  /**
-   * FNXC:ArchivePagination 2026-07-08-00:00:
-   * Paged newest-first read for the Archived board column (FN-7659). See
-   * listArchivedTasksImpl for the ordering/bounding contract.
-   */
-  async listArchivedTasks(options?: { limit?: number; offset?: number; slim?: boolean }): Promise<{ tasks: Task[]; total: number; hasMore: boolean }> {
-    return listArchivedTasksImpl(this, options);
-  }
-
-/** Find a specific task in the archive by ID. */
-  async findInArchive(id: string): Promise<import("./types.js").ArchivedTaskEntry | undefined> {
-    return this.archiveDb.get(id);
-  }
-  public migrateLegacyArchiveEntriesToArchiveDb(): void {
-    return migrateLegacyArchiveEntriesToArchiveDbImpl(this);
-  }
-  public async migrateActiveArchivedTasksToArchiveDb(): Promise<void> {
-    return migrateActiveArchivedTasksToArchiveDbImpl(this);
-  }
-  async cleanupArchivedTasks(): Promise<string[]> {
-    return cleanupArchivedTasksImpl(this);
-  }
-  public async restoreFromArchive(entry: import("./types.js").ArchivedTaskEntry): Promise<Task> {
-    return restoreFromArchiveImpl(this, entry);
-  }
+  /** @internal Legacy prompt reconstruction used only by startup archive reintegration. */
   public generatePromptFromArchiveEntry(entry: import("./types.js").ArchivedTaskEntry): string {
     return generatePromptFromArchiveEntryImpl(this, entry);
   }
@@ -2323,6 +3809,10 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   public applyBuiltInPromptOverridesSync(workflowId: string, ir: WorkflowIr): WorkflowIr {
     return applyBuiltInPromptOverridesSyncImpl(this, workflowId, ir);
   }
+  /** PostgreSQL-aware prompt override application (loads overrides via Drizzle). */
+  public async applyBuiltInPromptOverridesAsync(workflowId: string, ir: WorkflowIr): Promise<WorkflowIr> {
+    return applyBuiltInPromptOverridesAsyncImpl(this, workflowId, ir);
+  }
 
   /** Get a single workflow definition by id, or undefined when absent. */
   async getWorkflowDefinition( id: string, ): Promise<WorkflowDefinition | undefined> {
@@ -2341,9 +3831,21 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   // never a raw column write, so capacity (KTD-10) and single transition authority
   // (KTD-3) are honored. Only consulted when `workflowColumns` flag is ON.
 
-  public async workflowColumnsFlagOn(): Promise<boolean> {
-    return isWorkflowColumnsCompatibilityFlagEnabled(await this.getSettingsFast());
-  }
+  /*
+  FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R9):
+  `workflowColumnsFlagOn()` is DELETED — it has no callers left. Its six readers were
+  the three U5 reconciliation guards (now unconditional) and the three v1-IR
+  rollback-compat persistence sites (now unconditional, same stored bytes).
+
+  FNXC:WorkflowColumns 2026-07-30-04:00 (U12): `isWorkflowColumnsCompatibilityFlagEnabled` is now
+  DELETED TOO. Its last two readers were the move path — `moves.ts` and the preflight in
+  `workflow-task-create-ops.ts` — and both were un-gated in one commit because the preflight computes
+  what `moves.ts` consumes.
+
+  The equivalence-proof obligation that held this back is discharged, not waived:
+  `moves-flag-equivalence.test.ts` diffs the persisted row after the same journey under both flag
+  states against live PostgreSQL and finds them identical, mutation-verified in both directions.
+  */
   public async listWorkflowOccupantTaskIds(workflowId: string, includeNullSelection: boolean): Promise<string[]> {
     return listWorkflowOccupantTaskIdsImpl(this, workflowId, includeNullSelection);
   }
@@ -2353,20 +3855,20 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   public async occupantsByColumnForWorkflow( workflowId: string, includeNullSelection: boolean, ): Promise<Map<string, number>> {
     return occupantsByColumnForWorkflowImpl(this, workflowId, includeNullSelection);
   }
-  public async rehomeOccupant( taskId: string, targetColumn: string, reason: "workflow-switch" | "workflow-delete" | "workflow-edit-rehome", metadata: Record<string, unknown>, ): Promise<void> {
+  public async rehomeOccupant( taskId: string, targetColumn: string, reason: "workflow-switch" | "workflow-delete" | "workflow-edit-rehome", metadata: Record<string, unknown>, ): Promise<RehomeOccupantResult> {
     return rehomeOccupantImpl(this, taskId, targetColumn, reason, metadata);
   }
 
-  // ── U12: workflow-columns integrity pass ──────────────────────────────────
-  // FNXC:WorkflowColumns 2026-06-20-00:00:
-  // Migration rewrites ZERO task rows (KTD-1): null selection resolves to built-in
-  // default workflow at read time with byte-identical column IDs. The integrity
-  // pass audits tasks whose stored column is not valid in their RESOLVED workflow
-  // and re-homes via recoveryRehome (guard-bypassing, capacity-honoring). Terminal
-  // cards (done/archived) are never disturbed. Idempotent. Flag-ON only.
-  async runWorkflowColumnsIntegrityPass(): Promise<{ scanned: number; rehomed: number; skippedTerminal: number }> {
-    return runWorkflowColumnsIntegrityPassImpl(this);
-  }
+  /*
+  FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R7, R9):
+  `runWorkflowColumnsIntegrityPass` is DELETED. It was the SUPERSEDED predecessor of
+  the shipped R7 sweep: `SelfHealingManager.reconcileUndeclaredTaskColumns`, which is
+  registered in startup recovery (`self-healing.ts`) and re-homes a card whose stored
+  column its workflow no longer declares. The old pass had NO caller anywhere — not
+  production, not tests — and read tasks through the synchronous SQLite handle, which
+  no longer resolves under the PostgreSQL runtime, so invoking it would have thrown
+  rather than reconciled. Deleted rather than wired up: its successor already runs.
+  */
 
   // ── #1401: transitionPending recovery sweep ───────────────────────────────
   // FNXC:WorkflowColumns 2026-06-20-00:00:
@@ -2379,16 +3881,23 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
     return recoverStaleTransitionPendingImpl(this);
   }
 
-  // ── #1409: flag ON→OFF evacuation ─────────────────────────────────────────
-  // FNXC:WorkflowColumns 2026-06-20-00:00:
-  // When `workflowColumns` is disabled, the board reverts to the legacy enum path
-  // where only COLUMNS are valid. Cards in CUSTOM (non-legacy) columns would be
-  // stuck. This pass re-homes each to the nearest legacy column (default workflow
-  // entry column `todo`) via recoveryRehome. Terminal cards (done/archived) left
-  // put. Idempotent.
-  async evacuateCustomColumnsToLegacy( trigger: "flag-off-init" | "flag-toggled-off", ): Promise<{ scanned: number; evacuated: number }> {
-    return evacuateCustomColumnsToLegacyImpl(this, trigger);
-  }
+  /*
+  FNXC:WorkflowColumns 2026-07-28-00:00 (U12 — R9):
+  `evacuateCustomColumnsToLegacy` (#1409) is DELETED. It re-homed cards out of custom
+  columns when `workflowColumns` flipped OFF, so the legacy enum board would not strand
+  them.
+
+  CORRECTED (PR #2500 review — greptile P1): the ON→OFF transition IS reachable — stale
+  persisted `true` values are tolerated by design, so an import or configuration
+  rollback can flip one to false. The deletion rests on the evacuation being wrong, not
+  the trigger being dead: it moved cards out of columns their workflow legitimately
+  declares into legacy `triage`, to protect a legacy enum board that this same change
+  deletes. See `settings-ops.ts` for the full reasoning and the covering tests.
+
+  Custom columns are no longer an opt-in that can be revoked; they are the runtime, and
+  a card in a column its workflow does NOT declare is the self-healing sweep
+  `reconcileUndeclaredTaskColumns`'s job (R7).
+  */
 
   // ── Workflow selection (resolves a workflow to enabledWorkflowSteps) ────
   // Selection compiles a workflow into WorkflowStep rows and writes their ids into
@@ -2400,10 +3909,19 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   async setDefaultWorkflowId(workflowId: string | null): Promise<void> {
     return setDefaultWorkflowIdImpl(this, workflowId);
   }
+  /**
+   * FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+   * Workflow override for a programmatic task origin (`fn task create` / refinement).
+   * `undefined` means "inherit" — the caller keeps its existing default-workflow path.
+   * See `resolveOriginWorkflowOverrideIdImpl` for precedence and fallback tolerance.
+   */
+  async resolveOriginWorkflowOverrideId(origin: TaskOriginWorkflowKind): Promise<string | undefined> {
+    return resolveOriginWorkflowOverrideIdImpl(this, origin);
+  }
 
 /** Synchronous workflow-definition insert used by migration (U2/KTD-3). */
-  public insertWorkflowDefinitionSync( input: WorkflowDefinitionInput, flagOn: boolean, ): WorkflowDefinition {
-    return insertWorkflowDefinitionSyncImpl(this, input, flagOn);
+  public insertWorkflowDefinitionSync( input: WorkflowDefinitionInput ): WorkflowDefinition {
+    return insertWorkflowDefinitionSyncImpl(this, input);
   }
   async migrateLegacyWorkflowSteps(): Promise<{ migrated: number; skipped: number; combinedWorkflowId?: string; }> {
     return migrateLegacyWorkflowStepsImpl(this);
@@ -2448,9 +3966,6 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   public resolveTaskWorkflowIrSync(taskId: string): WorkflowIr {
     return resolveTaskWorkflowIrSyncImpl(this, taskId);
   }
-  public resolveEffectiveWorkflowIdSync(taskId: string): string {
-    return resolveEffectiveWorkflowIdSyncImpl(this, taskId);
-  }
   public countActiveInCapacitySlotSync(params: { targetColumn: string; workflowId: string; countPending: boolean; excludeTaskId: string; }): number {
     return countActiveInCapacitySlotSyncImpl(this, params);
   }
@@ -2467,6 +3982,10 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   /** FNXC:PostgresCutover 2026-07-04-00:00: authoritative backend-mode read (async Drizzle); SQLite delegates to the sync getter. */
   public async getTaskWorkflowSelectionAsync(taskId: string): Promise<{ workflowId: string; stepIds: string[] } | undefined> {
     return getTaskWorkflowSelectionAsyncImpl(this, taskId);
+  }
+
+  public async getTaskWorkflowSelectionsAsync(taskIds: string[]): Promise<Map<string, { workflowId: string; stepIds: string[] }>> {
+    return getTaskWorkflowSelectionsAsyncImpl(this, taskIds);
   }
   public async writeTaskWorkflowSelection(taskId: string, workflowId: string, stepIds: string[]): Promise<void> {
     return writeTaskWorkflowSelectionImpl(this, taskId, workflowId, stepIds);
@@ -2513,34 +4032,21 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
     return clearTaskWorkflowSelectionImpl(this, taskId);
   }
   async close(): Promise<void> {
+    this.intakeOwnerAgentStore?.close();
+    this.intakeOwnerAgentStore = null;
     return closeImpl(this);
   }
   get fts5Available(): boolean {
     return this.db.fts5Available;
   }
-  get archiveFts5Available(): boolean {
-    return this.archiveDb.fts5Available;
-  }
   optimizeFts5(mode?: "optimize" | "merge"): boolean {
     return this.db.optimizeFts5(mode);
-  }
-  optimizeArchiveFts5(mode?: "optimize" | "merge"): boolean {
-    return this.archiveDb.optimizeFts5(mode);
   }
   getFtsIndexBytes(): number | null {
     return this.db.getFtsIndexBytes();
   }
-  getArchiveFtsIndexBytes(): number | null {
-    return this.archiveDb.getFtsIndexBytes();
-  }
   getTaskRowCount(): number {
     return this.db.getTaskRowCount();
-  }
-  getArchivedRowCount(): number {
-    return this.archiveDb.getArchivedRowCount();
-  }
-  rebuildArchiveFts5Index(): boolean {
-    return this.archiveDb.rebuildFts5Index();
   }
 
   /**
@@ -2636,6 +4142,13 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   refreshDatabaseHealth(): ReturnType<TaskStore["getDatabaseHealth"]> {
     return refreshDatabaseHealthImpl(this);
   }
+  /**
+   * FNXC:IncompletePgPorts 2026-07-26-20:35:
+   * Refresh PostgreSQL connectivity into postgresHealthSnapshot, then return it.
+   */
+  async refreshDatabaseHealthAsync(): Promise<ReturnType<TaskStore["getDatabaseHealth"]>> {
+    return refreshDatabaseHealthAsyncImpl(this);
+  }
   getDistributedTaskIdAllocator(): DistributedTaskIdAllocator {
     return getDistributedTaskIdAllocatorImpl(this);
   }
@@ -2658,11 +4171,25 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
     return recordActivityImpl(this, entry);
   }
 
+  /** FNXC:AgentActivityStream 2026-08-09-09:09: durable append precedes this event; listeners are latency nudges, never the cross-process guarantee. */
+  async recordAgentActivity(input: AgentActivityEventInput): Promise<AgentActivityEvent | null> {
+    const layer = this.getAsyncLayer(); if (!layer) throw new Error("agent activity requires AsyncDataLayer");
+    const event = await appendAgentActivityEvent(layer, input);
+    if (event) { try { this.emit("agent:activity", event); } catch { /* listener failures cannot undo persistence */ } }
+    return event;
+  }
+
+  /** Pruning is deliberately separate from append so an activity observation never delays work. */
+  async pruneAgentActivityEventsAsync(): Promise<void> {
+    const layer = this.getAsyncLayer();
+    if (layer) await pruneAgentActivityEvents(layer);
+  }
+
 /** Get activity log entries from SQLite. */
   /**
    * FNXC:RuntimeWorkflowAsync 2026-06-24-16:02:
    */
-  async getActivityLog(options?: { limit?: number; since?: string; type?: ActivityEventType }): Promise<ActivityLogEntry[]> {
+  async getActivityLog(options?: { limit?: number; since?: string; type?: ActivityEventType; taskId?: string }): Promise<ActivityLogEntry[]> {
     return getActivityLogImpl(this, options);
   }
 
@@ -2741,6 +4268,12 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   }
    getGoalStore(): GoalStore | AsyncGoalStore {
     return getGoalStoreImpl(this);
+  }
+  getNoteStore(): AsyncNoteStore {
+    return getNoteStoreImpl(this);
+  }
+  getWhiteboardStore(): AsyncWhiteboardStore {
+    return getWhiteboardStoreImpl(this);
   }
    getEvalStore(): EvalStore | AsyncEvalStore {
     return getEvalStoreImpl(this);

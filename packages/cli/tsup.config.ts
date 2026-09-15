@@ -33,6 +33,9 @@ const RUNTIME_PLUGINS_WITH_MCP_SCHEMA_SERVER = new Set([
   "fusion-plugin-claude-runtime",
   // FNXC:OmpAcp 2026-07-14-00:05: OMP ACP ships the same bridge asset for fn_* tools.
   "fusion-plugin-omp-runtime",
+  // FNXC:AcpCustomTools 2026-08-16-00:30: generic ACP runtime ships the same
+  // bridge asset for Hermes ACP / Prime fn_* tool forwarding.
+  "fusion-plugin-acp-runtime",
 ]);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -60,6 +63,8 @@ const whatsappChatPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plu
 const whatsappChatPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-whatsapp-chat");
 const roadmapPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-roadmap");
 const roadmapPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-roadmap");
+const todosPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-todos");
+const todosPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-todos");
 const reportsPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-reports");
 const reportsPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-reports");
 const cliPrintingPressPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-cli-printing-press");
@@ -166,7 +171,7 @@ function writeSanitizedCopiedManifest(srcPkgPath: string, destPkgPath: string) {
   writeFileSync(destPkgPath, JSON.stringify(destPkg, null, 2));
 }
 
-async function bundlePluginEntry({ pluginId, srcDir, destDir, withMcpAsset = false, external = [] }: BundlePluginEntryOptions) {
+export async function bundlePluginEntry({ pluginId, srcDir, destDir, withMcpAsset = false, external = [] }: BundlePluginEntryOptions) {
   if (existsSync(destDir)) {
     rmSync(destDir, { recursive: true, force: true });
   }
@@ -204,7 +209,14 @@ async function bundlePluginEntry({ pluginId, srcDir, destDir, withMcpAsset = fal
     platform: "node",
     target: "node22",
     outfile: join(destDir, "bundled.js"),
-    external: ["@fusion/engine", ...external],
+    /*
+     * FNXC:CliPackaging 2026-08-24-02:16:
+     * sharp 0.35 (desktop generate-icons, plus optional Baileys media helpers) ships
+     * platform img-sharp native .node addons and glob Release sharp-*-*.node requires.
+     * esbuild cannot load .node files, so keep the whole family external for every
+     * plugin bundle — the same native-module policy as node-pty / cpu-features on the CLI bin.
+     */
+    external: ["@fusion/engine", "sharp", "@img/sharp-*", ...external],
     /*
      * FNXC:BundledPlugins 2026-07-17-09:20:
      * CJS dependencies bundled into ESM output (e.g. Baileys in the WhatsApp plugin) compile to esbuild's __require helper, which throws "Dynamic require of \"crypto\" is not supported" at load time in an ESM module. Inject the same createRequire shim dist/bin.js uses so every bundled.js can require node builtins.
@@ -348,7 +360,15 @@ async function ensureDesktopRuntimeAssetsBuilt() {
    * The published CLI package must contain the desktop runtime it launches. Build the private desktop package during CLI packaging when dist is absent, but keep this strictly in the repository build path — the installed `fusion desktop` command itself must never run pnpm from an operator's cwd.
    */
   console.log("Desktop runtime assets missing; building @fusion/desktop before staging CLI package assets...");
-  await runWorkspaceCommand("pnpm", ["--filter", "@fusion/desktop", "build"], workspaceRoot);
+  /*
+   * FNXC:DesktopPackaging 2026-07-23-23:05:
+   * The desktop build's `pnpm deploy` production-closure staging resolves and installs ~1300+
+   * packages; on cold-store macOS release runners this alone exceeded the default 10-minute
+   * runWorkspaceCommand timeout and killed every v0.73.0-beta.* bun-darwin-arm64 release leg
+   * (exit 143). Give the desktop sub-build a 30-minute budget; release.yml's job timeout was
+   * widened to match.
+   */
+  await runWorkspaceCommand("pnpm", ["--filter", "@fusion/desktop", "build"], workspaceRoot, 1_800_000);
 
   if (!existsSync(desktopRuntimeSrc)) {
     throw new Error(`[tsup] Desktop runtime build did not create expected assets at ${desktopRuntimeSrc}`);
@@ -403,7 +423,7 @@ const cliBuildConfig = {
     options.conditions = [...(options.conditions || []), "source"];
   },
   noExternal: [/^@fusion\//, /^@fusion-plugin-examples\//],
-  // Native module: leave node-pty (aliased to @homebridge fork) out of the
+  // Native module: leave node-pty (aliased to @lydell/node-pty) out of the
   // bundle. esbuild can't statically resolve its conditional native require()s
   // (build/Release/pty.node, build/Debug/conpty.node, ...).
   //
@@ -417,12 +437,21 @@ const cliBuildConfig = {
   // resolved at runtime from node_modules, exactly like node-pty above.
   external: [
     "node-pty",
-    "@homebridge/node-pty-prebuilt-multiarch",
+    "@lydell/node-pty",
     "dockerode",
     "ssh2",
     "cpu-features",
     "embedded-postgres",
     /^@embedded-postgres\//,
+    /*
+     * FNXC:CliPackaging 2026-08-24-02:16:
+     * sharp 0.35 changed its package layout to img-sharp platform optional native
+     * addons. esbuild follows those requires and fails with no .node loader plus
+     * unresolved sharp-*-*.node globs. Leave sharp external the same way as
+     * cpu-features; it is a desktop/Baileys native helper, not a published CLI dep.
+     */
+    "sharp",
+    "@img/sharp-*",
     /*
     FNXC:ReviewArtifacts 2026-07-19-10:00:
     The engine lazy-loads playwright-core only for a gated local feature-video.
@@ -430,6 +459,14 @@ const cliBuildConfig = {
     esbuild cannot resolve, while the published CLI installs this direct runtime dep.
     */
     "playwright-core",
+    // FNXC:KnowledgeGraph 2026-08-10-10:00: TypeScript 5.9.3 (sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==) stays runtime external.
+    /*
+    FNXC:KnowledgeGraph 2026-08-11-05:52:
+    FN-8978 requires TypeScript to remain a runtime dependency only, never a
+    devDependency or TRANSITIVE_EXTERNALS entry: bundled @fusion/core knowledge-
+    graph extractors import it from dist/bin.js at runtime.
+    */
+    "typescript",
   ],
   splitting: false,
   // Keep clean disabled so the dedicated plugin-sdk tsup config can emit into
@@ -584,14 +621,23 @@ const cliBuildConfig = {
       /*
        * FNXC:BundledPlugins 2026-07-15-09:12:
        * Baileys contains optional dynamic require() paths for QR/link-preview/media helpers that are not needed for plugin module load. Keep those optional packages external so the published WhatsApp Chat bundled.js can be produced and loaded without reintroducing a raw TypeScript src/ entry under node_modules.
+       * FNXC:CliPackaging 2026-08-24-02:16: sharp 0.35 is the media-helper native that actually
+       * breaks CI (esbuild cannot resolve @img/sharp-* .node addons). Keep it listed here
+       * with jimp even though bundlePluginEntry also default-externalizes the sharp family.
        */
-      external: ["jimp", "link-preview-js", "qrcode-terminal"],
+      external: ["jimp", "link-preview-js", "qrcode-terminal", "sharp"],
     });
 
     await bundlePluginEntry({
       pluginId: "fusion-plugin-roadmap",
       srcDir: roadmapPluginSrc,
       destDir: roadmapPluginDest,
+    });
+
+    await bundlePluginEntry({
+      pluginId: "fusion-plugin-todos",
+      srcDir: todosPluginSrc,
+      destDir: todosPluginDest,
     });
 
     await bundlePluginEntry({

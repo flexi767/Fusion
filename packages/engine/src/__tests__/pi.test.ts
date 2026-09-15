@@ -3,8 +3,12 @@ import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACT
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
 
+const { resourceLoaderOptions } = vi.hoisted(() => ({
+  resourceLoaderOptions: { current: undefined as Record<string, unknown> | undefined },
+}));
+
 // Mock skill resolver functions - define inside factory to avoid hoisting issues
-vi.mock("../skill-resolver.js", () => {
+vi.mock("../cli-runtime/skill-resolver.js", () => {
   const resolveSessionSkillsMock = vi.fn();
   const createSkillsOverrideFromSelectionMock = vi.fn();
   return {
@@ -43,7 +47,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   createFindTool: vi.fn(() => ({ name: "find" })),
   createLsTool: vi.fn(() => ({ name: "ls" })),
   createExtensionRuntime: vi.fn(),
-  DefaultResourceLoader: vi.fn().mockImplementation(function () {
+  DefaultResourceLoader: vi.fn().mockImplementation(function (options: Record<string, unknown>) {
+    resourceLoaderOptions.current = options;
     return {
       reload: vi.fn().mockResolvedValue(undefined),
       skillsOverride: undefined,
@@ -71,7 +76,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   },
 }));
 // FNXC:McpConfig 2026-07-13: Mock connectMcpSessionTools so createFnAgent doesn't attempt real MCP server bootstrap (the configured test binary doesn't exist). The clean toolset keeps MCP forwarding tests deterministic without a live server.
-vi.mock("../mcp-session-tools.js", () => ({
+vi.mock("../mcp/mcp-session-tools.js", () => ({
   connectMcpSessionTools: vi.fn().mockResolvedValue({
     tools: [],
     connected: [],
@@ -351,7 +356,7 @@ describe("createFnAgent skills parameter", () => {
     piErrorSpy = vi.spyOn(piLog, "error").mockImplementation(() => {});
 
     // Access the mocked module to get/set mocks
-    const skillResolver = await import("../skill-resolver.js");
+    const skillResolver = await import("../cli-runtime/skill-resolver.js");
     mockResolveSessionSkills = vi.mocked(skillResolver.resolveSessionSkills);
     mockCreateSkillsOverride = vi.mocked(skillResolver.createSkillsOverrideFromSelection);
 
@@ -361,9 +366,12 @@ describe("createFnAgent skills parameter", () => {
       diagnostics: [],
       filterActive: true,
     });
+    resourceLoaderOptions.current = undefined;
     mockCreateSkillsOverride.mockReturnValue(() => ({
       skills: [],
       diagnostics: [],
+      resolvedForcedSkills: [],
+      unresolvedForcedSkills: [],
     }));
   });
 
@@ -372,6 +380,31 @@ describe("createFnAgent skills parameter", () => {
     piWarnSpy.mockRestore();
     piErrorSpy.mockRestore();
     vi.clearAllMocks();
+  });
+
+  it("injects only resolved forced skills through the shared resource-loader prompt seam (FN-9114)", async () => {
+    mockCreateSkillsOverride.mockReturnValue(() => ({
+      skills: [], diagnostics: [],
+      resolvedForcedSkills: [{ requestedName: "alpha", skillName: "alpha" }],
+      unresolvedForcedSkills: [
+        { requestedName: "delta", reason: "disabled-by-settings" },
+        { requestedName: "missing", reason: "not-found" },
+      ],
+    }));
+    await createFnAgent({
+      cwd: "/test/project", systemPrompt: "Test",
+      systemPromptLayers: { stable: "Stable", dynamic: "Executor context" },
+      skillSelection: {
+        projectRootDir: "/test/project", sessionPurpose: "executor",
+        forcedSkillNames: ["alpha", "delta", "missing"],
+      },
+    });
+    const override = resourceLoaderOptions.current?.skillsOverride as ((base: { skills: []; diagnostics: [] }) => unknown) | undefined;
+    override?.({ skills: [], diagnostics: [] });
+    const append = resourceLoaderOptions.current?.appendSystemPromptOverride as (() => string[]) | undefined;
+    expect(append?.().join("\n")).toContain("REQUIRED to read these available skills: alpha");
+    expect(append?.().join("\n")).not.toContain("delta");
+    expect(append?.().join("\n")).not.toContain("missing");
   });
 
   it("skills parameter auto-derives SkillSelectionContext", async () => {
@@ -433,6 +466,7 @@ describe("createFnAgent skills parameter", () => {
   });
 
   it("skills auto-derivation logs the convenience parameter", async () => {
+    const piDebugSpy = vi.spyOn(piLog, "debug").mockImplementation(() => {});
     const options: AgentOptions = {
       cwd: "/test/project",
       systemPrompt: "Test",
@@ -441,10 +475,14 @@ describe("createFnAgent skills parameter", () => {
 
     await createFnAgent(options);
 
-    // Verify the log message includes the skill names
-    expect(piLogSpy).toHaveBeenCalledWith(
+    // Steady-state skill-request chatter is debug-gated so it does not fill the TUI.
+    expect(piDebugSpy).toHaveBeenCalledWith(
       expect.stringContaining("Using skills from convenience parameter: [review, fusion]")
     );
+    expect(piLogSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("Using skills from convenience parameter: [review, fusion]")
+    );
+    piDebugSpy.mockRestore();
   });
 
   it("resolves project root via resolvePiExtensionProjectRoot for non-worktree paths", async () => {
@@ -468,6 +506,7 @@ describe("createFnAgent skills parameter", () => {
   });
 
   it("skills without corresponding discovered skills produces diagnostics", async () => {
+    const piDebugSpy = vi.spyOn(piLog, "debug").mockImplementation(() => {});
     // Mock to return diagnostics for missing skill
     mockResolveSessionSkills.mockReturnValue({
       allowedSkillPaths: new Set(),
@@ -486,11 +525,15 @@ describe("createFnAgent skills parameter", () => {
 
     await createFnAgent(options);
 
-    // The diagnostics should be logged
+    // type=info skill diagnostics are debug-gated (not info/log)
     expect(mockResolveSessionSkills).toHaveBeenCalled();
-    expect(piLogSpy).toHaveBeenCalledWith(
+    expect(piDebugSpy).toHaveBeenCalledWith(
       expect.stringContaining("info")
     );
+    expect(piLogSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("Requested skill")
+    );
+    piDebugSpy.mockRestore();
   });
 });
 
@@ -882,9 +925,12 @@ describe("session failure diagnostics", () => {
 
   it("forwards materialized MCP servers into session creation and prompt options for supported providers", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
+    // FNXC:SessionIdentity 2026-08-12-20:46: createFnAgent wraps session.prompt to bind the
+    // request principal, so retain the original spy when asserting the prompt reaches Pi.
+    const prompt = vi.fn();
     const session = {
       model: { provider: "test", id: "primary-model" },
-      prompt: vi.fn(),
+      prompt,
       subscribe: vi.fn(),
       dispose: vi.fn(),
       sessionFile: undefined,
@@ -906,42 +952,1160 @@ describe("session failure diagnostics", () => {
     await (created.session as any).promptWithFallback("Use docs");
 
     expect(createAgentSessionMock.mock.calls[0]?.[0]).not.toHaveProperty("mcpServers");
-    expect(session.prompt).toHaveBeenCalledWith("Use docs", expect.objectContaining({ mcpServers }));
+    expect(prompt).toHaveBeenCalledWith("Use docs", expect.objectContaining({ mcpServers }));
   });
 
-  it("skips MCP forwarding for unsupported mock provider and emits a content-free skip log", async () => {
+  /*
+  FNXC:McpConfig 2026-08-23-18:36:
+  The mock provider never reaches pi's MCP forwarding seam. `createFnAgent` routes through the
+  registered agent-session factory, whose `useMockRuntime` short-circuit resolves the mock runtime
+  singleton directly and never re-enters pi session construction — so no pi session, and therefore
+  no MCP server definition (or its materialized secrets), can be built for a mock lane at all.
+  That is a strictly stronger guarantee than the pi-lane `mcp.forwarding.skipped` log this case used
+  to assert, and the log itself is unreachable from here. The pi-lane skip decision and its
+  content-free log stay directly covered by `mcp-runtime-support.test.ts`
+  (`runtimeSupportsMcp("pi", "mock") === false`, plus the log's field/redaction contract).
+  */
+  it("never builds a pi session for the mock provider, so MCP definitions cannot reach it", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
-    const session = {
+    createAgentSessionMock.mockReset();
+
+    const created = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test MCP skip",
+      defaultProvider: "mock",
+      defaultModelId: "scripted",
+      mcpServers: [{ name: "docs", transport: "stdio", command: "node", env: { TOKEN: "SECRET" } }],
+    });
+
+    expect(created.session).toBeDefined();
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-25-00:00: when the provider rejects the
+  // requested thinking effort value (400 naming the parameter, or codex
+  // [1210] Invalid API parameter envelope), drop exactly one rung and retry on
+  // a fresh session of the SAME model. The retry should NOT touch the
+  // configured fallback model.
+  it("degrades thinking effort by one step when the provider rejects the requested effort", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstSetThinkingLevel = vi.fn();
+    const retrySetThinkingLevel = vi.fn();
+    // FNXC:ThinkingEffortFallback 2026-08-26-16:30 (review fix): attachSessionIdentity
+    // wraps session.prompt (ALS principal binding) and replaces the property, so
+    // assertions must target the captured spy, not session.prompt.
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 Invalid API parameter: reasoning_effort must be one of: low, high"),
+    );
+    const retryPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
       model: { provider: "test", id: "primary-model" },
-      prompt: vi.fn(),
+      prompt: firstPrompt,
       subscribe: vi.fn(),
       dispose: vi.fn(),
+      setThinkingLevel: firstSetThinkingLevel,
       sessionFile: undefined,
     } as unknown as AgentSession;
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const retrySession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: retryPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: retrySetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: retrySession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test effort degradation",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    // First attempt: max. Second attempt: degraded one step to xhigh
+    // (canonical order: max > xhigh > high — Devin BUG-0001 fix).
+    expect(firstSetThinkingLevel).toHaveBeenCalledWith("max");
+    expect(retrySetThinkingLevel).toHaveBeenCalledWith("xhigh");
+    // Same model retried on a fresh session — the configured fallback was NOT used.
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    for (const call of createAgentSessionMock.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({
+        model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+      }));
+    }
+    expect(retryPrompt).toHaveBeenCalledTimes(1);
+    expect(firstPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-26-19:30 (review fix P1): with NO
+  // configured fallback, a primary that rejects BOTH the pinned effort and the
+  // degraded rung must surface the terminal ModelFallbackExhaustedError (triage
+  // parks the task) instead of the raw provider rejection that triage's
+  // generic catch-all would re-admit into an endless degradation cycle.
+  // FNXC:ThinkingEffortFallback 2026-08-29-06:54 (review fix J): the walk-down
+  // ladder may traverse MORE than one rung on the same model — here max → xhigh
+  // are both rejected, the ladder continues to high which is ALSO rejected, and
+  // the path terminates with the same exhausted contract.
+  it("terminates with fallback-exhausted when effort degrades twice with no fallback configured", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const rejection = () => new Error("400 invalid_request_error: reasoning_effort is not supported");
+    const firstPrompt = vi.fn().mockRejectedValue(rejection());
+    const degradedPrompt = vi.fn().mockRejectedValue(rejection());
+    const thirdPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const thirdSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: thirdPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: thirdSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test effort degradation no fallback",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      defaultThinkingLevel: "max",
+    });
+    // Ladder walked max → xhigh → high, the high attempt succeeded. No
+    // configured fallback, no endless loop. The prompt resolves normally.
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    expect(firstPrompt).toHaveBeenCalledTimes(1);
+    expect(degradedPrompt).toHaveBeenCalledTimes(1);
+    expect(thirdPrompt).toHaveBeenCalledTimes(1);
+    // Every retry reuses the same model — no fallback was configured.
+    for (const call of createAgentSessionMock.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({
+        model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+      }));
+    }
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-29-10:40 (Greptile P1-A): a bottom-rung
+  // effort rejection on the primary is now FALLBACK-ELIGIBLE. When the pinned
+  // level is already the last ladder rung (off) the walk-down loop has nothing
+  // to degrade, so degradedRetryError stays null — but a configured distinct
+  // fallback may accept the pinned effort. The classification treats the
+  // bottom rung as exhaustion of same-model retries and consults the fallback
+  // exactly once.
+  it("routes a bottom-rung effort rejection to the configured fallback when no degraded retry exists", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const fallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: fallbackSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test bottom-rung effort rejection routes to fallback",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "off",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    // Primary (off rejected — no rung below it) then the configured fallback.
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(createAgentSessionMock.mock.calls[0][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+    }));
+    expect(createAgentSessionMock.mock.calls[1][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "fallback-model" }),
+    }));
+    expect(firstPrompt).toHaveBeenCalledTimes(1);
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-29-10:40 (Greptile P1-A): with NO
+  // configured fallback the bottom-rung bare rejection is still terminal —
+  // there is nowhere to route, so the same ModelFallbackExhaustedError
+  // contract surfaces after exactly one same-model attempt.
+  it("terminates with fallback-exhausted on a bottom-rung effort rejection when no fallback is configured", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session: firstSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test bottom-rung terminal without fallback",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      defaultThinkingLevel: "off",
+    });
+    await expect((session as any).promptWithFallback("Run task")).rejects.toMatchObject({
+      name: "ModelFallbackExhaustedError",
+      attempts: 1,
+      triggerPoint: "prompt-time",
+    });
+    // Exactly one same-model attempt — no fallback exists to consult.
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(firstPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-29-06:54 (review fix K): the
+  // per-session degradation latch must NOT survive across prompt calls. A
+  // LATER prompt rejected for effort on a session that previously degraded
+  // successfully must be able to walk the ladder DOWN one more rung on the
+  // primary, instead of being stuck between a blocked degradation branch
+  // and a null degradedRetryError. Here prompt 1 degrades max → xhigh
+  // successfully, prompt 2 rejects again, the latch has been reset so the
+  // ladder walks xhigh → high and the high attempt succeeds on the primary.
+  it("resets the degradation latch between prompts so a later rejection can walk down further", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 Invalid API parameter: reasoning_effort must be one of: low, high"),
+    );
+    // Prompt 1: degraded session's prompt succeeds (xhigh accepted).
+    // Prompt 2: the SAME degraded session's prompt rejects (effort again).
+    const degradedPrompt = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("400 invalid_request_error: reasoning_effort is not supported"));
+    const thirdPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const thirdSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: thirdPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: thirdSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test latch reset between prompts",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    // Prompt 1: original rejection -> degraded same-model retry succeeds.
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    // Prompt 2: effort rejection on the already-degraded session. The latch
+    // has been reset, so the ladder walks xhigh → high on the primary and
+    // the high attempt succeeds. No fallback hop.
+    await expect((session as any).promptWithFallback("Run task again")).resolves.toBeUndefined();
+    expect(thirdPrompt).toHaveBeenCalledTimes(1);
+    expect(degradedPrompt).toHaveBeenCalledTimes(2);
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    // Every session was the primary model — no fallback hop.
+    for (const call of createAgentSessionMock.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({
+        model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+      }));
+    }
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-29-10:40 (Greptile P1-C): the
+  // !usingFallback guard blocked the effort walk-down once the session was on
+  // the configured fallback model, so an effort rejection on the fallback was
+  // terminal even though the fallback may support a LOWER effort. The walk-down
+  // now runs on the CURRENT model — when usingFallback is true, the degraded
+  // retry stays on the fallback model instead of hopping back to the primary.
+  it("walks the effort ladder down on the fallback model when already using the fallback", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const fallbackPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const walkDownFallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const walkDownFallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: walkDownFallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      // Session creation: primary model selection fails → fallback session.
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      // Prompt-time effort walk-down: stays on the fallback model.
+      .mockResolvedValueOnce({ session: walkDownFallbackSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test fallback effort walk-down",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    // Calls 2 and 3 (fallback session + degraded retry) are BOTH fallback-model —
+    // the walk-down runs on the fallback, never hopping back to the primary.
+    expect(createAgentSessionMock.mock.calls[1][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "fallback-model" }),
+    }));
+    expect(createAgentSessionMock.mock.calls[2][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "fallback-model" }),
+    }));
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+    expect(walkDownFallbackPrompt).toHaveBeenCalledTimes(1);
+    // FNXC:ThinkingEffortFallback 2026-08-29-11:30 (Greptile Issue 1): the
+    // replacement session must inherit the DEGRADED rung (max -> xhigh), not
+    // the original configured effort — otherwise the walk-down re-sends the
+    // rejected effort on every retry.
+    expect(walkDownFallbackSession.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-29-11:45 (Greptile round-6 Issue 1): a
+  // fallback with its OWN configured thinking level must walk down from THAT
+  // level, not from the primary's. primary low + fallback max: rejecting max
+  // must try xhigh → high, never minimal/off (which only makes sense below
+  // the primary's low). Starting from primaryThinkingLevel would skip valid
+  // fallback rungs and throw ModelFallbackExhaustedError despite support.
+  it("walks the fallback ladder down from the fallback's own thinking level", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const fallbackPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const walkDownFallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const walkDownFallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: walkDownFallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      // Session creation: primary model selection fails → fallback session.
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      // Prompt-time effort walk-down: stays on the fallback model.
+      .mockResolvedValueOnce({ session: walkDownFallbackSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test fallback own-level walk-down",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "low",
+      fallbackThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    // The degraded replacement walks down FROM the fallback's max (max →
+    // xhigh), never from the primary's low (which would try minimal/off).
+    // (The initial fallback session's own setThinkingLevel("max") is not
+    // observable here: the swap's Object.assign overwrites the facade's
+    // methods with the replacement session's spies.)
+    expect(walkDownFallbackSession.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    expect(walkDownFallbackSession.setThinkingLevel).not.toHaveBeenCalledWith("minimal");
+    expect(walkDownFallbackSession.setThinkingLevel).not.toHaveBeenCalledWith("off");
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+    expect(walkDownFallbackPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-29-11:52 (Greptile round-7 Issue 1): a
+  // fallback-only effort (fallbackThinkingLevel set, NO defaultThinkingLevel)
+  // leaves primaryThinkingLevel undefined. The degradation entry guard must use
+  // the ACTIVE session's level, or the fallback's rejected effort skips the
+  // ladder and dies with ModelFallbackExhaustedError despite a supported rung.
+  it("degrades a fallback-only effort with no default thinking level configured", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const fallbackPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const walkDownFallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const walkDownFallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: walkDownFallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      // Session creation: primary model selection fails → fallback session.
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      // Prompt-time effort walk-down: stays on the fallback model.
+      .mockResolvedValueOnce({ session: walkDownFallbackSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test fallback-only effort walk-down",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      // NO defaultThinkingLevel — fallback-only effort:
+      fallbackThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    // max rejected → xhigh on the fallback model (fallback-only config).
+    expect(walkDownFallbackSession.setThinkingLevel).toHaveBeenCalledWith("xhigh");
+    expect(walkDownFallbackSession.setThinkingLevel).not.toHaveBeenCalledWith("minimal");
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+    expect(walkDownFallbackPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-25-00:00: codex `[1210] Invalid API
+  // parameter` rejection on the same model is the same problem in a different
+  // envelope. Same fix path applies.
+  // FNXC:ThinkingEffortFallback 2026-08-26-05:30 (review fix): when the
+  // degraded same-model retry ALSO fails with a retryable model-selection
+  // error (e.g. 429), the failure must fall through to the CONFIGURED FALLBACK
+  // model instead of escaping promptWithFallback into triage's generic retry.
+  it("routes a failed degraded retry through the configured fallback model", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstSetThinkingLevel = vi.fn();
+    const degradedSetThinkingLevel = vi.fn();
+    const fallbackSetThinkingLevel = vi.fn();
+
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 Invalid API parameter: reasoning_effort must be one of: low, high"),
+    );
+    const degradedPrompt = vi.fn().mockRejectedValue(new Error("429 Too Many Requests"));
+    const fallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: firstSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: degradedSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: fallbackSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
 
     createAgentSessionMock.mockReset();
-    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: fallbackSession } as any);
 
-    try {
-      const created = await createFnAgent({
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test degraded-retry fallback",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+      fallbackThinkingLevel: "high",
+    });
+
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+
+    // Ladder ran once (max → xhigh), then the 429 from the degraded attempt
+    // routed to the fallback model at ITS OWN configured level.
+    expect(degradedSetThinkingLevel).toHaveBeenCalledWith("xhigh");
+    expect(fallbackSetThinkingLevel).toHaveBeenCalledWith("high");
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    expect(createAgentSessionMock.mock.calls[2]?.[0]).toEqual(
+      expect.objectContaining({
+        model: expect.objectContaining({ provider: "test", id: "fallback-model" }),
+      }),
+    );
+  });
+  // FNXC:ThinkingEffortFallback 2026-08-26-07:50 (review fix): when the degraded
+  // retry is ALSO rejected for reasoning effort (the model supports neither the
+  // pinned nor the next-lower level), the fallback classification must treat the
+  // effort rejection as retryable — otherwise the original rejection is rethrown
+  // without ever trying the configured fallback model.
+  // FNXC:ThinkingEffortFallback 2026-08-29-06:54 (review fix J): the walk-down
+  // ladder keeps stepping until a rung is accepted or the ladder bottom is
+  // reached. Here max → xhigh are both rejected for effort; the ladder
+  // continues to high, which is accepted — no fallback hop is needed.
+  it("walks the ladder down and succeeds on the first accepted rung", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstSetThinkingLevel = vi.fn();
+    const degradedSetThinkingLevel = vi.fn();
+    const thirdSetThinkingLevel = vi.fn();
+
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 Invalid API parameter: reasoning_effort must be one of: low"),
+    );
+    const degradedPrompt = vi.fn().mockRejectedValue(
+      new Error("400 Invalid API parameter: reasoning_effort must be one of: low"),
+    );
+    const thirdPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: firstSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: degradedSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const thirdSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: thirdPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: thirdSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: thirdSession } as any);
+
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test walk-down ladder success",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+
+    // Ladder walked max → xhigh → high, the high attempt succeeded on the
+    // same primary model. No fallback hop.
+    expect(degradedSetThinkingLevel).toHaveBeenCalledWith("xhigh");
+    expect(thirdSetThinkingLevel).toHaveBeenCalledWith("high");
+    expect(thirdPrompt).toHaveBeenCalledTimes(1);
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    for (const call of createAgentSessionMock.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({
+        model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+      }));
+    }
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-09-04-04:55:
+  // Sparse support: the model rejects max AND the adjacent xhigh rung but
+  // accepts high. The walk must not stop after latching the first drop.
+  it("walks past an unsupported adjacent fallback rung to a lower supported effort", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const rejection = () => new Error("400 invalid_request_error: reasoning_effort is not supported");
+    const fallbackPrompt = vi.fn().mockRejectedValue(rejection());
+    const xhighPrompt = vi.fn().mockRejectedValue(rejection());
+    const highSetThinkingLevel = vi.fn();
+    const highPrompt = vi.fn().mockResolvedValue(undefined);
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const xhighSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: xhighPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const highSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: highPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: highSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      .mockResolvedValueOnce({ session: xhighSession } as any)
+      .mockResolvedValueOnce({ session: highSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test sparse fallback effort rungs",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(highSetThinkingLevel).toHaveBeenCalledWith("high");
+    expect(highPrompt).toHaveBeenCalledTimes(1);
+    expect(createAgentSessionMock.mock.calls[3][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "fallback-model" }),
+    }));
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-09-04-04:55:
+  // After a fallback session successfully degrades max → xhigh, a later prompt
+  // must walk from the APPLIED xhigh rung. Reconstructing max retries xhigh;
+  // a 429 on that redundant attempt used to exit before high ran.
+  it("starts a later fallback prompt from the applied effort instead of the original fallback config", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const rejection = () => new Error("400 invalid_request_error: reasoning_effort is not supported");
+    const fallbackPrompt = vi.fn().mockRejectedValue(rejection());
+    const xhighPrompt = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(rejection());
+    let laterLevel: string | undefined;
+    const laterSetThinkingLevel = vi.fn((level: string) => {
+      laterLevel = level;
+    });
+    const laterPrompt = vi.fn(async () => {
+      if (laterLevel === "high") return;
+      throw new Error("429 Too Many Requests");
+    });
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const xhighSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: xhighPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const laterSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: laterPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: laterSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      .mockResolvedValueOnce({ session: xhighSession } as any)
+      .mockResolvedValueOnce({ session: laterSession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test fallback applied-effort persistence",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      fallbackThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    await expect((session as any).promptWithFallback("Run task again")).resolves.toBeUndefined();
+    expect(laterSetThinkingLevel).toHaveBeenCalledWith("high");
+    expect(laterPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-09-04-04:55:
+  // Already on the fallback, an effort rejection whose lower-rung replacement
+  // session fails to create with a retryable 429 must still receive the
+  // bounded final-primary retry instead of throwing the raw 429.
+  it("retries the primary when fallback effort-degrade session creation fails with 429", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const fallbackPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const primaryRetrySetThinkingLevel = vi.fn();
+    const primaryRetryPrompt = vi.fn().mockResolvedValue(undefined);
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const primaryRetrySession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: primaryRetryPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: primaryRetrySetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: primaryRetrySession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test fallback degrade 429 final primary retry",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(primaryRetryPrompt).toHaveBeenCalledTimes(1);
+    expect(primaryRetrySetThinkingLevel).toHaveBeenCalledWith("max");
+    expect(createAgentSessionMock.mock.calls[3][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+    }));
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-09-04-05:12:
+  // Already on the fallback, a lower-effort replacement that fails with a
+  // NON-retryable non-effort error (500) must still get FN-8098's bounded
+  // final-primary retry. Gating that path on isRetryableModelSelectionError
+  // threw the raw 500 and skipped the established primary → fallback → primary
+  // sequence.
+  it("retries the primary when fallback effort-degrade session creation fails with a non-retryable 500", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const fallbackPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const primaryRetrySetThinkingLevel = vi.fn();
+    const primaryRetryPrompt = vi.fn().mockResolvedValue(undefined);
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const primaryRetrySession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: primaryRetryPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: primaryRetrySetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      .mockRejectedValueOnce(new Error("500 Internal Server Error"))
+      .mockResolvedValueOnce({ session: primaryRetrySession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test fallback degrade 500 final primary retry",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(primaryRetryPrompt).toHaveBeenCalledTimes(1);
+    expect(primaryRetrySetThinkingLevel).toHaveBeenCalledWith("max");
+    expect(createAgentSessionMock.mock.calls[3][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+    }));
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-09-04-05:44:
+  // Primary rejects configured max, the xhigh retry 429s, fallback also fails.
+  // The bounded final-primary retry must apply xhigh (the last primary rung),
+  // not restore max. Re-sending the rejected effort exhausted the sequence
+  // even when the primary supports the degraded level.
+  it("retries the primary at the last degraded effort instead of the rejected configured level", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 invalid_request_error: reasoning_effort is not supported"),
+    );
+    const degradedPrompt = vi.fn().mockRejectedValue(new Error("429 Too Many Requests"));
+    const fallbackPrompt = vi.fn().mockRejectedValue(new Error("500 Internal Server Error"));
+    const primaryRetrySetThinkingLevel = vi.fn();
+    const primaryRetryPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const primaryRetrySession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: primaryRetryPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: primaryRetrySetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: fallbackSession } as any)
+      .mockResolvedValueOnce({ session: primaryRetrySession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test final primary retry keeps degraded effort",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    expect(primaryRetryPrompt).toHaveBeenCalledTimes(1);
+    expect(primaryRetrySetThinkingLevel).toHaveBeenCalledWith("xhigh");
+    expect(primaryRetrySetThinkingLevel).not.toHaveBeenCalledWith("max");
+    expect(createAgentSessionMock.mock.calls[3][0]).toEqual(expect.objectContaining({
+      model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+    }));
+  });
+
+
+  // FNXC:ThinkingEffortFallback 2026-08-26-15:20 (review fix): the degraded
+  // retry's error is the CURRENT failure. When it is not fallback-eligible the
+  // branch must throw it (not the superseded original rejection), and when the
+  // next promptWithFallback call on the same session hits a retryable error the
+  // stale degraded error must not shadow its fallback classification.
+  it("throws the degraded attempt's own failure and does not let it go stale across prompts", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+
+    // Degraded attempt fails first with a non-fallback-eligible error (call 1),
+    // then the SAME session hits a retryable 429 on the next prompt (call 2).
+    const degradedPrompt = vi.fn()
+      .mockRejectedValueOnce(new Error("500 Internal Server Error"))
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"));
+    const fallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: vi.fn().mockRejectedValue(
+        new Error("400 Invalid API parameter: reasoning_effort must be one of: low, high"),
+      ),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: fallbackSession } as any);
+
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test degraded failure currency",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+      fallbackThinkingLevel: "high",
+    });
+
+    // Call 1: degraded retry failed with a non-eligible error → that CURRENT
+    // failure escapes, not the superseded original effort rejection.
+    await expect((session as any).promptWithFallback("Run task")).rejects.toThrow(/500/);
+
+    // Call 2: the same session's retryable 429 must route to the fallback —
+    // a stale degraded error from call 1 must not suppress it.
+    await expect((session as any).promptWithFallback("Run task again")).resolves.toBeUndefined();
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+  });
+
+
+  it("degrades thinking effort on codex [1210] Invalid API parameter rejection", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstSetThinkingLevel = vi.fn();
+    const retrySetThinkingLevel = vi.fn();
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: vi.fn().mockRejectedValue(
+        new Error('{"type":"server_error","message":"[1210] Invalid API parameter: reasoning_effort"}'),
+      ),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: firstSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const retrySession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: vi.fn().mockResolvedValue(undefined),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: retrySetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: retrySession } as any);
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test codex rejection",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      defaultThinkingLevel: "xhigh",
+    });
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+    // Codex rejected xhigh; the one-step-down rung is high (max is ABOVE xhigh).
+    expect(retrySetThinkingLevel).toHaveBeenCalledWith("high");
+    // Same model retried on a fresh session — no fallback hop happened.
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    for (const call of createAgentSessionMock.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({
+        model: expect.objectContaining({ provider: "test", id: "primary-model" }),
+      }));
+    }
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-26-18:45 (review fix): the degraded effort
+  // must stay session-local. With NO explicit fallbackThinkingLevel, the fallback
+  // model inherits the lane's ORIGINAL configured level — not the level the
+  // primary was degraded to after its rejection.
+  it("keeps the degraded effort out of the fallback's inherited thinking level", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const firstSetThinkingLevel = vi.fn();
+    const degradedSetThinkingLevel = vi.fn();
+    const fallbackSetThinkingLevel = vi.fn();
+
+    const firstPrompt = vi.fn().mockRejectedValue(
+      new Error("400 Invalid API parameter: reasoning_effort must be one of: low, high"),
+    );
+    const degradedPrompt = vi.fn().mockRejectedValue(new Error("429 Too Many Requests"));
+    const fallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const firstSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: firstPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: firstSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const degradedSession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: degradedPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: degradedSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: fallbackPrompt,
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: fallbackSetThinkingLevel,
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: firstSession } as any)
+      .mockResolvedValueOnce({ session: degradedSession } as any)
+      .mockResolvedValueOnce({ session: fallbackSession } as any);
+
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test degraded level locality",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      defaultThinkingLevel: "max",
+      // no fallbackThinkingLevel on purpose
+    });
+
+    await expect((session as any).promptWithFallback("Run task")).resolves.toBeUndefined();
+
+    expect(degradedSetThinkingLevel).toHaveBeenCalledWith("xhigh");
+    // The fallback inherits the ORIGINAL configured level, not the degraded one.
+    expect(fallbackSetThinkingLevel).toHaveBeenCalledWith("max");
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // FNXC:ThinkingEffortFallback 2026-08-25-00:00: "Model is unavailable" and
+  // "Internal server error" envelopes are deliberately NOT treated as effort
+  // rejections — the former is a model-availability problem (fallback-model
+  // path) and the latter is ambiguous (generic retry). Verifying both stay on
+  // the existing path prevents a regression.
+  it("does NOT degrade effort on Model-unavailable or generic Internal server error", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    for (const errorMessage of [
+      "Upstream request failed: Model is unavailable.",
+      "Internal server error",
+    ]) {
+      const session = {
+        model: { provider: "test", id: "primary-model" },
+        prompt: vi.fn().mockRejectedValue(new Error(errorMessage)),
+        subscribe: vi.fn(),
+        dispose: vi.fn(),
+        setThinkingLevel: vi.fn(),
+        sessionFile: undefined,
+      } as unknown as AgentSession;
+      createAgentSessionMock.mockReset();
+      createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+      const { session: created } = await createFnAgent({
         cwd: "/test/project",
-        systemPrompt: "Test MCP skip",
-        defaultProvider: "mock",
-        defaultModelId: "scripted",
-        mcpServers: [{ name: "docs", transport: "stdio", command: "node", env: { TOKEN: "SECRET" } }],
+        systemPrompt: "Test non-effort rejection",
+        defaultProvider: "test",
+        defaultModelId: "primary-model",
+        defaultThinkingLevel: "max",
       });
-      await (created.session as any).promptWithFallback("Use docs");
-
-      expect(createAgentSessionMock.mock.calls[0]?.[0]).not.toHaveProperty("mcpServers");
-      expect(session.prompt).toHaveBeenCalledWith("Use docs");
-      const skipLog = consoleErrorSpy.mock.calls.find(([message]) => String(message).includes("mcp.forwarding.skipped"));
-      expect(skipLog?.[0]).toContain('"skippedCount":1');
-      expect(skipLog?.[0]).toContain('"provider":"mock"');
-      expect(skipLog?.[0]).not.toContain("SECRET");
-      expect(skipLog?.[0]).not.toContain("docs");
-    } finally {
-      consoleErrorSpy.mockRestore();
+      await expect((created as any).promptWithFallback("Run task")).rejects.toThrow();
+      // No second session swap — the rejection must NOT be retried via the
+      // effort-degradation ladder.
+      expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
     }
   });
 
@@ -990,18 +2154,21 @@ describe("session failure diagnostics", () => {
 
 describe("piLog structured diagnostics", () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
+  let debugSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     logSpy = vi.spyOn(piLog, "log").mockImplementation(() => {});
+    debugSpy = vi.spyOn(piLog, "debug").mockImplementation(() => {});
     warnSpy = vi.spyOn(piLog, "warn").mockImplementation(() => {});
     errorSpy = vi.spyOn(piLog, "error").mockImplementation(() => {});
   });
 
   afterEach(() => {
     logSpy.mockRestore();
+    debugSpy.mockRestore();
     warnSpy.mockRestore();
     errorSpy.mockRestore();
   });
@@ -1014,10 +2181,14 @@ describe("piLog structured diagnostics", () => {
       defaultModelId: "test-model",
     });
 
-    const hasModelLog = logSpy.mock.calls.some(([message]) =>
+    // FNXC:EngineDiagnostics 2026-07-26-10:00: session-created bookkeeping is debug-gated.
+    const hasModelLog = debugSpy.mock.calls.some(([message]) =>
       String(message).includes("Session created successfully (model=test/test-model)"),
     );
     expect(hasModelLog).toBe(true);
+    expect(logSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("Session created successfully"),
+    );
   });
 
   it("fires fallback hook on session-creation fallback", async () => {
@@ -1152,10 +2323,13 @@ describe("piLog structured diagnostics", () => {
   it("throws a bounded fallback exhaustion error when prompt-time fallback also fails", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
     const onFallbackModelUsed = vi.fn();
+    const primaryPrompt = vi.fn().mockRejectedValue(new Error("429 Too Many Requests"));
+    const fallbackPrompt = vi.fn().mockRejectedValue(new Error("401 invalid api key for fallback"));
+    const primaryRetryPrompt = vi.fn().mockRejectedValue(new Error("429 Too Many Requests"));
 
     const primarySession = {
       model: { provider: "openai", id: "gpt-4o" },
-      prompt: vi.fn().mockRejectedValue(new Error("429 Too Many Requests")),
+      prompt: primaryPrompt,
       subscribe: vi.fn(),
       dispose: vi.fn(),
       setThinkingLevel: vi.fn(),
@@ -1164,7 +2338,7 @@ describe("piLog structured diagnostics", () => {
 
     const fallbackSession = {
       model: { provider: "anthropic", id: "claude-3-5-haiku-20241022" },
-      prompt: vi.fn().mockRejectedValue(new Error("401 invalid api key for fallback")),
+      prompt: fallbackPrompt,
       state: { errorMessage: "", messages: [] },
       subscribe: vi.fn(),
       dispose: vi.fn(),
@@ -1175,7 +2349,7 @@ describe("piLog structured diagnostics", () => {
     createAgentSessionMock.mockReset();
     const primaryRetrySession = {
       model: { provider: "openai", id: "gpt-4o" },
-      prompt: vi.fn().mockRejectedValue(new Error("429 Too Many Requests")),
+      prompt: primaryRetryPrompt,
       subscribe: vi.fn(), dispose: vi.fn(), setThinkingLevel: vi.fn(), sessionFile: undefined,
     } as unknown as AgentSession;
     createAgentSessionMock
@@ -1203,9 +2377,9 @@ describe("piLog structured diagnostics", () => {
     });
 
     expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
-    expect(primarySession.prompt).toHaveBeenCalledTimes(1);
-    expect(fallbackSession.prompt).toHaveBeenCalledTimes(1);
-    expect(primaryRetrySession.prompt).toHaveBeenCalledTimes(1);
+    expect(primaryPrompt).toHaveBeenCalledTimes(1);
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+    expect(primaryRetryPrompt).toHaveBeenCalledTimes(1);
     expect((createAgentSessionMock.mock.calls[2]?.[0] as any).model.id).toBe("gpt-4o");
     expect(onFallbackModelUsed).toHaveBeenCalledTimes(1);
     expect(onFallbackModelUsed).toHaveBeenCalledWith(expect.objectContaining({
@@ -1255,6 +2429,7 @@ describe("piLog structured diagnostics", () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
     const onFallbackModelUsed = vi.fn();
     const primaryState = { errorMessage: "", messages: [] };
+    const fallbackPrompt = vi.fn().mockResolvedValue(undefined);
     const modelAuthTierError =
       "Codex error: 400 invalid_request_error — \"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.\"";
 
@@ -1272,7 +2447,7 @@ describe("piLog structured diagnostics", () => {
 
     const fallbackSession = {
       model: { provider: "test", id: "fallback-model" },
-      prompt: vi.fn().mockResolvedValue(undefined),
+      prompt: fallbackPrompt,
       state: { errorMessage: "", messages: [] },
       subscribe: vi.fn(),
       dispose: vi.fn(),
@@ -1298,7 +2473,7 @@ describe("piLog structured diagnostics", () => {
 
     await (session as any).promptWithFallback("prompt text");
 
-    expect(fallbackSession.prompt).toHaveBeenCalledWith("prompt text");
+    expect(fallbackPrompt).toHaveBeenCalledWith("prompt text");
     expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
     expect(onFallbackModelUsed).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1313,6 +2488,10 @@ describe("piLog structured diagnostics", () => {
     const onFallbackModelUsed = vi.fn();
     const sonnet5NotFoundError =
       'Error: 404 {"type":"error","error":{"type":"not_found_error","message":"Not found"},"request_id":"req_011CcawcZ3Ra9CennJXM8oWC"}';
+    const sonnetPrompt = vi.fn(async () => {
+      throw new Error(sonnet5NotFoundError);
+    });
+    const fallbackPrompt = vi.fn(async (_prompt: string, _options?: unknown) => undefined);
 
     createAgentSessionMock.mockReset();
     createAgentSessionMock.mockImplementation(async (options: any) => {
@@ -1320,9 +2499,7 @@ describe("piLog structured diagnostics", () => {
         return {
           session: {
             model: { provider: "anthropic", id: "claude-sonnet-5" },
-            prompt: vi.fn(async () => {
-              throw new Error(sonnet5NotFoundError);
-            }),
+            prompt: sonnetPrompt,
             state: { errorMessage: "", messages: [] },
             subscribe: vi.fn(),
             dispose: vi.fn(),
@@ -1334,7 +2511,7 @@ describe("piLog structured diagnostics", () => {
       return {
         session: {
           model: { provider: "zai", id: "glm-5.1" },
-          prompt: vi.fn(async (_prompt: string, _options?: unknown) => undefined),
+          prompt: fallbackPrompt,
           state: { errorMessage: "", messages: [{ role: "assistant", content: "Fallback reply" }] },
           subscribe: vi.fn(),
           dispose: vi.fn(),
@@ -1357,9 +2534,8 @@ describe("piLog structured diagnostics", () => {
 
     await expect((session as any).promptWithFallback("prompt text", { temperature: 0 })).resolves.toBeUndefined();
 
-    const fallbackPrompt = vi.mocked((session as any).prompt).mock;
     expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
-    expect(fallbackPrompt.calls).toEqual([["prompt text", { temperature: 0 }]]);
+    expect(fallbackPrompt).toHaveBeenCalledWith("prompt text", { temperature: 0 });
     expect((session as any).state.errorMessage ?? "").toBe("");
     expect(onFallbackModelUsed).toHaveBeenCalledWith(expect.objectContaining({
       triggerPoint: "prompt-time",
@@ -1397,7 +2573,8 @@ describe("piLog structured diagnostics", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       "Primary model failed (429 Too Many Requests), trying fallback",
     );
-    expect(logSpy).toHaveBeenCalledWith("Fallback session created successfully");
+    expect(debugSpy).toHaveBeenCalledWith("Fallback session created successfully");
+    expect(logSpy).not.toHaveBeenCalledWith("Fallback session created successfully");
   });
 
   it("logs error when session creation fails with non-retryable error", async () => {

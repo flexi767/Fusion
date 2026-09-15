@@ -8,10 +8,12 @@ import { usePoppedOutTasks } from "../../../hooks/usePoppedOutTasks";
 import type { PluginDashboardViewContext } from "../../../plugins/types";
 
 const hostContexts: PluginDashboardViewContext[] = [];
+const hostLayouts: Array<{ title?: unknown }> = [];
 
 vi.mock("../../../plugins/PluginDashboardViewHost", () => ({
-  PluginDashboardViewHost: ({ taskView, context }: { taskView: string; context?: PluginDashboardViewContext }) => {
+  PluginDashboardViewHost: ({ taskView, context, layout }: { taskView: string; context?: PluginDashboardViewContext; layout?: { title?: unknown } }) => {
     if (context) hostContexts.push(context);
+    if (layout) hostLayouts.push(layout);
     const task = context?.tasks[0];
     return (
       <div data-testid="plugin-host" data-task-view={taskView}>
@@ -23,8 +25,19 @@ vi.mock("../../../plugins/PluginDashboardViewHost", () => ({
 }));
 
 vi.mock("../../TaskCard", () => ({
-  TaskCard: ({ task, onOpenDetail }: { task: Task | TaskDetail; onOpenDetail: (task: Task | TaskDetail) => void }) => (
-    <button type="button" onClick={() => onOpenDetail(task)}>Open rendered task card</button>
+  TaskCard: ({ task, onOpenDetail, taskColumnFlags }: {
+    task: Task | TaskDetail;
+    onOpenDetail: (task: Task | TaskDetail) => void;
+    taskColumnFlags?: Record<string, boolean | undefined>;
+  }) => (
+    <button
+      type="button"
+      /* The probe for the trait hand-off: absent means the card resolved nothing. */
+      data-column-flags={taskColumnFlags ? JSON.stringify(taskColumnFlags) : "none"}
+      onClick={() => onOpenDetail(task)}
+    >
+      Open rendered task card
+    </button>
   ),
 }));
 
@@ -53,6 +66,13 @@ const otherTask = {
 const LazyStub = lazy(async () => ({ default: () => null }));
 const LazySettingsCloseStub = lazy(async () => ({
   default: ({ onClose }: { onClose: () => void }) => <button type="button" onClick={onClose}>Close settings view</button>,
+}));
+let embeddedSettingsProps: Record<string, unknown> | undefined;
+const LazySettingsBridgeStub = lazy(async () => ({
+  default: (props: Record<string, unknown>) => {
+    embeddedSettingsProps = props;
+    return <div>Embedded settings bridge</div>;
+  },
 }));
 
 function mainContentProps(overrides: Partial<MainContentProps> = {}): MainContentProps {
@@ -83,6 +103,12 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     setShadcnCustomColors: vi.fn(),
     resolvedThemeMode: "light",
     setQuickChatButtonModeImmediate: vi.fn(),
+    setChatMessageLayoutImmediate: vi.fn(),
+    setOpenTasksInRightSidebarImmediate: vi.fn(),
+    setOpenMobileTasksInPopupImmediate: vi.fn(),
+    setTaskPopupsBoardListOnlyImmediate: vi.fn(),
+    setShowCostBadgeOnCardsImmediate: vi.fn(),
+    setTaskDetailChatFirstImmediate: vi.fn(),
     reopenOnboardingWithNav: vi.fn(),
     viewMode: "project",
     projects: [],
@@ -93,6 +119,23 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     handleResumeProject: vi.fn(),
     handleRemoveProject: vi.fn(),
     nodes: [],
+    /*
+    FNXC:TodoPluginEnablement 2026-08-15-22:20:
+    FN-8762 (5b2b31d2c9) gated plugin task views on the project-scoped
+    `pluginDashboardViews` roster (MainContent.isEnabledPluginTaskView), so this
+    harness must enroll the plugin views it renders or MainContent treats them as
+    disabled. The same commit removed the host `todosEnabled`/`TodoView` props.
+    */
+    pluginDashboardViews: [
+      {
+        pluginId: "fusion-plugin-dependency-graph",
+        view: { viewId: "graph", label: "Graph", componentPath: "./dashboard-view", icon: "Workflow", placement: "primary", order: 1 },
+      },
+      {
+        pluginId: "example",
+        view: { viewId: "dashboard", label: "Example", componentPath: "./dashboard-view", icon: "Workflow", placement: "overflow", order: 2 },
+      },
+    ] as MainContentProps["pluginDashboardViews"],
     graphPluginTaskView: "plugin:fusion-plugin-dependency-graph:graph",
     graphWorkflowSelection: null,
     setGraphWorkflowSelection: vi.fn(),
@@ -108,6 +151,12 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     autoMerge: true,
     mergeStrategy: "direct",
     settingsLoaded: true,
+    openTasksInRightSidebar: false,
+    openMobileTasksInPopup: false,
+    taskPopupsBoardListOnly: true,
+    showCostBadgeOnCards: false,
+    taskDetailChatFirst: false,
+    chatMessageLayout: "bubbles",
     skillsEnabled: true,
     experimentalFeatures: {},
     setQuickChatOpen: vi.fn(),
@@ -134,7 +183,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     memoryEnabled: true,
     goalsEnabled: true,
     handleOpenMission: vi.fn(),
-    todosEnabled: true,
     openPlanningWithInitialPlanWithNav: vi.fn(),
     ingestCreatedTasks: vi.fn(),
     nodesEnabled: true,
@@ -153,16 +201,11 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     handleBoardQuickCreate: vi.fn(),
     openNewTaskWithNav: vi.fn(),
     subtaskBreakdownEnabled: true,
-    openSubtaskBreakdownWithNav: vi.fn(),
     toggleAutoMerge: vi.fn(),
     globalPaused: false,
     updateTask: vi.fn(),
     retryTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     deleteTask: vi.fn(),
-    archiveAllDone: vi.fn(),
-    loadArchivedTasks: vi.fn(),
     searchQuery: "",
     availableModels: [],
     favoriteProviders: [],
@@ -170,7 +213,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     handleOpenDetailWithTab: vi.fn(),
     handleToggleFavorite: vi.fn(),
     handleToggleModelFavorite: vi.fn(),
-    taskStuckTimeoutMs: undefined,
     staleHighFanoutBlockerAgeThresholdMs: 0,
     lastFetchTimeMs: undefined,
     openCreateWorkflowWithNav: vi.fn(),
@@ -191,7 +233,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     ChatView: LazyStub as MainContentProps["ChatView"],
     CommandCenter: LazyStub as MainContentProps["CommandCenter"],
     DevServerView: LazyStub as MainContentProps["DevServerView"],
-    DocumentsView: LazyStub as MainContentProps["DocumentsView"],
     EvalsView: LazyStub as MainContentProps["EvalsView"],
     GoalsView: LazyStub as MainContentProps["GoalsView"],
     InsightsView: LazyStub as MainContentProps["InsightsView"],
@@ -200,7 +241,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     ResearchView: LazyStub as MainContentProps["ResearchView"],
     SecretsView: LazyStub as MainContentProps["SecretsView"],
     SkillsView: LazyStub as MainContentProps["SkillsView"],
-    TodoView: LazyStub as MainContentProps["TodoView"],
     _AutomationsView: LazyStub as MainContentProps["_AutomationsView"],
     _ImportTasksView: LazyStub as MainContentProps["_ImportTasksView"],
     _SettingsView: LazyStub as MainContentProps["_SettingsView"],
@@ -233,6 +273,61 @@ describe("MainContent graph task pop-out wiring", () => {
     expect(closeSettings).toHaveBeenCalledTimes(1);
     expect(handleChangeTaskView).toHaveBeenCalledWith("board");
     expect(refreshAppSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards every live Appearance value and callback to embedded Settings", async () => {
+    embeddedSettingsProps = undefined;
+    const setters = {
+      setChatMessageLayoutImmediate: vi.fn(),
+      setOpenTasksInRightSidebarImmediate: vi.fn(),
+      setOpenMobileTasksInPopupImmediate: vi.fn(),
+      setTaskPopupsBoardListOnlyImmediate: vi.fn(),
+      setShowCostBadgeOnCardsImmediate: vi.fn(),
+      setTaskDetailChatFirstImmediate: vi.fn(),
+    };
+
+    render(<MainContent {...mainContentProps({
+      taskView: "settings",
+      chatMessageLayout: "full-width",
+      openTasksInRightSidebar: true,
+      openMobileTasksInPopup: true,
+      taskPopupsBoardListOnly: false,
+      showCostBadgeOnCards: true,
+      taskDetailChatFirst: true,
+      ...setters,
+      _SettingsView: LazySettingsBridgeStub as MainContentProps["_SettingsView"],
+    })} />);
+
+    await screen.findByText("Embedded settings bridge");
+    expect(embeddedSettingsProps).toMatchObject({
+      chatMessageLayout: "full-width",
+      openTasksInRightSidebar: true,
+      openMobileTasksInPopup: true,
+      taskPopupsBoardListOnly: false,
+      showCostBadgeOnCards: true,
+      taskDetailChatFirst: true,
+    });
+
+    (embeddedSettingsProps?.onChatMessageLayoutChange as (value: "bubbles" | "full-width") => void)("bubbles");
+    (embeddedSettingsProps?.onOpenTasksInRightSidebarChange as (value: boolean) => void)(false);
+    (embeddedSettingsProps?.onOpenMobileTasksInPopupChange as (value: boolean) => void)(false);
+    (embeddedSettingsProps?.onTaskPopupsBoardListOnlyChange as (value: boolean) => void)(true);
+    (embeddedSettingsProps?.onShowCostBadgeOnCardsChange as (value: boolean) => void)(false);
+    (embeddedSettingsProps?.onTaskDetailChatFirstChange as (value: boolean) => void)(false);
+
+    expect(setters.setChatMessageLayoutImmediate).toHaveBeenCalledWith("bubbles");
+    expect(setters.setOpenTasksInRightSidebarImmediate).toHaveBeenCalledWith(false);
+    expect(setters.setOpenMobileTasksInPopupImmediate).toHaveBeenCalledWith(false);
+    expect(setters.setTaskPopupsBoardListOnlyImmediate).toHaveBeenCalledWith(true);
+    expect(setters.setShowCostBadgeOnCardsImmediate).toHaveBeenCalledWith(false);
+    expect(setters.setTaskDetailChatFirstImmediate).toHaveBeenCalledWith(false);
+  });
+
+  it("gives each enabled plugin destination host-owned canonical chrome", () => {
+    hostLayouts.length = 0;
+    render(<MainContent {...mainContentProps()} />);
+    expect(hostLayouts.length).toBeGreaterThan(0);
+    expect(hostLayouts.every((layout) => layout.title === "Graph")).toBe(true);
   });
 
   it("routes dependency-graph bridge and rendered task-card opens to the shared pop-out", () => {
@@ -300,5 +395,35 @@ describe("MainContent graph task pop-out wiring", () => {
 
     act(() => result.current.popOut(otherTask));
     expect(result.current.tasks.map((task) => task.id)).toEqual(["FN-GRAPH", "FN-OTHER"]);
+  });
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-05:20:
+  A PLUGIN-RENDERED CARD RESOLVED NO COLUMN TRAITS AT ALL.
+
+  `renderTaskCard` is how a plugin view draws a real task card. It built a `TaskCard` without
+  `taskColumnFlags`, so every role helper inside that card fell back to the legacy id — Revert
+  affordances, progress, the elapsed-time indicator, and the planning badge — for every plugin
+  view on every board. The map was already in this component's scope; the card was simply never
+  given it.
+
+  The same omission existed in `useRightDockController`'s `renderTaskCard`, which also had the map in
+  scope. Both are fixed together: this is one affordance with two producers, which is the shape the
+  Surface Enumeration rule exists for.
+
+  REVERT CHECK: drop `taskColumnFlags` from either `renderTaskCard` and this reads "none".
+  */
+  it("hands a plugin-rendered card its own resolved column traits", () => {
+    hostContexts.length = 0;
+    render(
+      <MainContent
+        {...mainContentProps({
+          taskView: "graph",
+          columnFlagsByTaskId: new Map([[graphTask.id, { complete: true }]]),
+        })}
+      />,
+    );
+
+    const card = screen.getByTestId("rendered-task-card").querySelector("button");
+    expect(card?.getAttribute("data-column-flags")).toBe(JSON.stringify({ complete: true }));
   });
 });

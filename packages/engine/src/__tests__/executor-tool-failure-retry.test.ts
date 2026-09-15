@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TaskDetail } from "@fusion/core";
+import { resolveConsecutiveToolFailureRetryBackoffMs, resolveMaxConsecutiveToolFailureRetries, type TaskDetail } from "@fusion/core";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import { createMockStore, resetExecutorMocks } from "./executor-test-helpers.js";
@@ -32,12 +32,12 @@ function makeTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
   } as TaskDetail;
 }
 
-function graphFailure() {
+function graphFailure(nodeId = "steps#0:step-execute") {
   return {
     disposition: "failed" as const,
     outcome: "failure" as const,
-    visitedNodeIds: ["steps#0:step-execute"],
-    context: { "node:steps#0:step-execute:value": "failure" },
+    visitedNodeIds: [nodeId],
+    context: { [`node:${nodeId}:value`]: "failure" },
   };
 }
 
@@ -52,7 +52,6 @@ function makeHarness(options: { retries: number; entries: Array<{ type: string }
     autoMerge: true,
     executorToolFailureRetryCount: options.retries,
     executorToolFailureRetryBackoffMs: 0,
-    executorToolFailureThreshold: 3,
     ...options.settings,
   });
   store.getAgentLogCount = vi.fn().mockResolvedValue(options.entries.length);
@@ -79,19 +78,20 @@ describe("executor consecutive tool-failure retry (FN-7996)", () => {
 
   afterEach(() => vi.useRealTimers());
 
-  it("retries a qualifying terminal step failure and records metadata-only audit evidence", async () => {
+  it("retries one post-cursor tool_error by default instead of terminal parking", async () => {
     const { executor, store, task } = makeHarness({
       retries: 2,
-      entries: [{ type: "tool_error" }, { type: "tool_error" }, { type: "tool_error" }],
+      entries: [{ type: "tool_error" }],
     });
     const execute = vi.spyOn(executor as any, "execute").mockResolvedValue(undefined);
 
     await (executor as any).handleGraphFailure(task, graphFailure());
     await vi.advanceTimersByTimeAsync(0);
 
+    expect(store.claimNextToolFailureRetry).toHaveBeenCalledWith(task.id, 0, 2);
+    expect(task).toMatchObject({ status: null, error: null });
     expect(execute).toHaveBeenCalledWith(task);
     expect(store.updateTask).not.toHaveBeenCalledWith(task.id, expect.objectContaining({ status: "failed" }), expect.anything());
-    expect(store.updateTask).not.toHaveBeenCalledWith(task.id, expect.objectContaining({ graphResumeRetryCount: expect.anything() }), expect.anything());
     expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
       mutationType: "task:execution-tool-failure-retry",
       metadata: {
@@ -99,10 +99,85 @@ describe("executor consecutive tool-failure retry (FN-7996)", () => {
         nodeId: "steps#0:step-execute",
         attempt: 1,
         maxAttempts: 2,
-        consecutiveToolFailures: 3,
+        consecutiveToolFailures: 1,
         mode: "same-model",
       },
     }));
+  });
+
+  it.each(["execute", "step-execute", "steps#0:step-execute"])("recognizes trailing errors at execute-family node %s", async (nodeId) => {
+    const { executor, store, task } = makeHarness({ retries: 2, entries: [{ type: "tool_error" }] });
+
+    await (executor as any).handleGraphFailure(task, graphFailure(nodeId));
+
+    expect(store.claimNextToolFailureRetry).toHaveBeenCalledWith(task.id, 0, 2);
+  });
+
+  it("honors an explicit threshold above the first-error default", async () => {
+    const belowThreshold = makeHarness({
+      retries: 2,
+      entries: [{ type: "tool_error" }],
+      settings: { executorToolFailureThreshold: 2 },
+    });
+    await (belowThreshold.executor as any).handleGraphFailure(belowThreshold.task, graphFailure());
+    expect(belowThreshold.store.claimNextToolFailureRetry).not.toHaveBeenCalled();
+    expect(belowThreshold.task).toMatchObject({ status: "failed" });
+
+    const qualifying = makeHarness({
+      retries: 2,
+      entries: [{ type: "tool_error" }, { type: "tool_error" }],
+      settings: { executorToolFailureThreshold: 2 },
+    });
+    await (qualifying.executor as any).handleGraphFailure(qualifying.task, graphFailure());
+    expect(qualifying.store.claimNextToolFailureRetry).toHaveBeenCalledWith(qualifying.task.id, 0, 2);
+  });
+
+  it("ignores invocation/text markers but a later tool result resets the trailing error streak", async () => {
+    const qualifying = makeHarness({
+      retries: 2,
+      entries: [{ type: "tool_error" }, { type: "tool" }, { type: "text" }, { type: "thinking" }],
+    });
+    await (qualifying.executor as any).handleGraphFailure(qualifying.task, graphFailure());
+    expect(qualifying.store.claimNextToolFailureRetry).toHaveBeenCalled();
+
+    const reset = makeHarness({ retries: 2, entries: [{ type: "tool_error" }, { type: "tool_result" }] });
+    await (reset.executor as any).handleGraphFailure(reset.task, graphFailure());
+    expect(reset.store.claimNextToolFailureRetry).not.toHaveBeenCalled();
+    expect(reset.task).toMatchObject({ status: "failed" });
+  });
+
+  it("fails closed to the ordinary terminal path when logs cannot prove a post-cursor failure", async () => {
+    const noError = makeHarness({ retries: 2, entries: [] });
+    await (noError.executor as any).handleGraphFailure(noError.task, graphFailure());
+    expect(noError.store.claimNextToolFailureRetry).not.toHaveBeenCalled();
+    expect(noError.task).toMatchObject({ status: "failed" });
+
+    const missingLogApis = makeHarness({ retries: 2, entries: [{ type: "tool_error" }] });
+    delete (missingLogApis.store as any).getAgentLogCount;
+    delete (missingLogApis.store as any).getAgentLogs;
+    await (missingLogApis.executor as any).handleGraphFailure(missingLogApis.task, graphFailure());
+    expect(missingLogApis.store.claimNextToolFailureRetry).not.toHaveBeenCalled();
+    expect(missingLogApis.task).toMatchObject({ status: "failed" });
+  });
+
+  it("normalizes the configured backoff and waits before retrying", async () => {
+    const { executor, task } = makeHarness({
+      retries: 2.9,
+      entries: [{ type: "tool_error" }, { type: "tool_error" }, { type: "tool_error" }],
+      settings: { executorToolFailureRetryBackoffMs: 2500.9 },
+    });
+    const execute = vi.spyOn(executor as any, "execute").mockResolvedValue(undefined);
+
+    expect(resolveMaxConsecutiveToolFailureRetries({ executorToolFailureRetryCount: 2.9 })).toBe(2);
+    expect(resolveMaxConsecutiveToolFailureRetries({ executorToolFailureRetryCount: -1 })).toBe(2);
+    expect(resolveConsecutiveToolFailureRetryBackoffMs({ executorToolFailureRetryBackoffMs: 2500.9 })).toBe(2500);
+    expect(resolveConsecutiveToolFailureRetryBackoffMs({ executorToolFailureRetryBackoffMs: -1 })).toBe(2000);
+
+    await (executor as any).handleGraphFailure(task, graphFailure());
+    await vi.advanceTimersByTimeAsync(2499);
+    expect(execute).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(execute).toHaveBeenCalledWith(task);
   });
 
   it("parks unchanged after a spent retry budget and emits one exhaustion audit", async () => {
@@ -121,7 +196,7 @@ describe("executor consecutive tool-failure retry (FN-7996)", () => {
     expect(store.updateTaskAtomic).toHaveBeenCalledWith(task.id, expect.any(Function), undefined);
     expect(task).toMatchObject({
       status: "failed",
-      error: "Workflow graph terminated with failure at node 'steps#0:step-execute'",
+      error: "Workflow graph terminated with failure at node 'steps#0:step-execute' (failure)",
     });
   });
 
@@ -233,15 +308,22 @@ describe("executor consecutive tool-failure retry (FN-7996)", () => {
     expect(store.updateTask).not.toHaveBeenCalledWith(task.id, expect.objectContaining({ status: "failed" }), expect.anything());
   });
 
+  /*
+  FNXC:ExecutorToolFailureRetry 2026-09-04-04:35:
+  Terminal graph-failure parking is guarded by updateTaskAtomic so a stale handler cannot overwrite
+  a newer executor run. Assert the durable parked state rather than the retired non-atomic writer.
+  */
   it("preserves the immediate legacy park when disabled or errors are not consecutive", async () => {
     const disabled = makeHarness({ retries: 0, entries: [{ type: "tool_error" }, { type: "tool_error" }, { type: "tool_error" }] });
     await (disabled.executor as any).handleGraphFailure(disabled.task, graphFailure());
     expect(disabled.store.claimNextToolFailureRetry).not.toHaveBeenCalled();
-    expect(disabled.store.updateTask).toHaveBeenCalledWith(disabled.task.id, expect.objectContaining({ status: "failed" }), undefined);
+    expect(disabled.store.updateTaskAtomic).toHaveBeenCalled();
+    expect(disabled.task).toMatchObject({ status: "failed", error: "Workflow graph terminated with failure at node 'steps#0:step-execute' (failure)" });
 
-    const interleaved = makeHarness({ retries: 2, entries: [{ type: "tool_error" }, { type: "tool_result" }, { type: "tool_error" }, { type: "tool_error" }] });
+    const interleaved = makeHarness({ retries: 2, entries: [{ type: "tool_error" }, { type: "tool_result" }] });
     await (interleaved.executor as any).handleGraphFailure(interleaved.task, graphFailure());
     expect(interleaved.store.claimNextToolFailureRetry).not.toHaveBeenCalled();
-    expect(interleaved.store.updateTask).toHaveBeenCalledWith(interleaved.task.id, expect.objectContaining({ status: "failed" }), undefined);
+    expect(interleaved.store.updateTaskAtomic).toHaveBeenCalled();
+    expect(interleaved.task).toMatchObject({ status: "failed", error: "Workflow graph terminated with failure at node 'steps#0:step-execute' (failure)" });
   });
 });

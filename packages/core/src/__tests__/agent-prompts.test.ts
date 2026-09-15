@@ -9,19 +9,36 @@ import {
   getTemplatesForRole,
   FUSION_RUNTIME_SELF_AWARENESS,
   TRIAGE_HEARTBEAT_PATROL_DISABLED_INSTRUCTION,
-} from "../agent-prompts.js";
-import { BUILTIN_CODING_WORKFLOW_IR } from "../builtin-coding-workflow-ir.js";
-import { BUILTIN_SEAM_PROMPTS, builtinSeamPrompt } from "../builtin-workflow-prompts.js";
-import { renderTriagePolicyPlaceholders } from "../builtin-workflow-settings.js";
-import { resolvePlanningPromptFromIr, resolveSeamPromptFromIr } from "../workflow-ir-resolver.js";
+  buildPlanningDuplicatePolicyInstruction,
+} from "../agents/agent-prompts.js";
+import { BUILTIN_CODING_WORKFLOW_IR } from "../workflows/builtin-coding-workflow-ir.js";
+import { BUILTIN_SEAM_PROMPTS, builtinSeamPrompt } from "../workflows/builtin-workflow-prompts.js";
+import { renderTriagePolicyPlaceholders } from "../workflows/builtin-workflow-settings.js";
+import { resolvePlanningPromptFromIr, resolveSeamPromptFromIr } from "../workflows/workflow-ir-resolver.js";
 import type { AgentPromptsConfig, AgentPromptTemplate } from "../types.js";
-import type { WorkflowIr } from "../workflow-ir-types.js";
+import type { WorkflowIr } from "../workflows/workflow-ir-types.js";
 
 // ---------------------------------------------------------------------------
 // resolveAgentPrompt
 // ---------------------------------------------------------------------------
 
 describe("resolveAgentPrompt", () => {
+  it("treats completed matches as history for user-authored tasks", () => {
+    const instruction = buildPlanningDuplicatePolicyInstruction();
+
+    expect(instruction).toContain("Only active tasks can be duplicate blockers");
+    expect(instruction).toContain("workflow Complete column");
+    expect(instruction).toContain("write a new plan");
+  });
+
+  it("treats completed matches as history for programmatic tasks too", () => {
+    const instruction = buildPlanningDuplicatePolicyInstruction();
+
+    expect(instruction).toContain("Only active tasks can be duplicate blockers");
+    expect(instruction).toContain("workflow Complete column");
+    expect(instruction).toContain("write a new plan");
+  });
+
   it("returns the correct built-in prompt for executor when no config provided", () => {
     const result = resolveAgentPrompt("executor");
     expect(result).toBeTruthy();
@@ -62,28 +79,40 @@ describe("resolveAgentPrompt", () => {
     expect(result).not.toContain("turn it into short, actionable task specs or follow-up tickets");
   });
 
+  /*
+  FNXC:ReviewPromptBoundaries 2026-08-04-06:35:
+  The base reviewer remains role-neutral. Planning and code-review completeness
+  policies are injected only at their workflow seams, avoiding mixed contracts.
+  */
   it("returns the correct built-in prompt for reviewer when no config provided", () => {
     const result = resolveAgentPrompt("reviewer");
     expect(result).toBeTruthy();
     expect(result).toContain("independent code and plan reviewer");
-    // FNXC:PlanReviewReplan 2026-07-15-11:15: convergence guidance for Plan Review REVISE thrash.
-    expect(result).toContain("Spec / Plan Review Convergence");
-    expect(result).toContain("concrete PROMPT.md edit");
+    expect(result).not.toContain("## Mandatory Plan Review Procedure");
+    expect(result).not.toContain("Mandatory Code Review Procedure");
   });
 
-  // FNXC:TriagePlanReviewConvergence 2026-07-16-19:40: lock the new triage-side planner sections.
   it("includes the front-loaded File Scope and Storage architecture sections in the triage prompt", () => {
     const result = resolveAgentPrompt("triage");
+    expect(result).toContain("## Mandatory Planning Completeness Procedure");
+    expect(result).toContain("planning ledger");
+    expect(result).toContain("participant graph and both relevant orderings");
+    expect(result).toContain("fresh holistic completeness pass");
     expect(result).toContain("## File Scope — front-load surface enumeration");
     expect(result).toContain("## Storage architecture");
   });
 
-  // FNXC:TriagePlanReviewConvergence 2026-07-16-19:40: lock the new reviewer-side spec convergence sections.
+  it("keeps the fast planning seam lean while preserving completeness invariants", () => {
+    const result = builtinSeamPrompt("planning-fast");
+    expect(result).toContain("## Fast Planning Completeness Check");
+    expect(result).toContain("both relevant orderings and failure cleanup");
+    expect(result).toContain("complete cumulative ledger");
+  });
+
   it("includes Spec Altitude and re-review convergence sections in the reviewer prompt", () => {
     const result = resolveAgentPrompt("reviewer");
     expect(result).toContain("## Spec Altitude");
-    expect(result).toContain("Converging on re-review");
-    expect(result).toContain("Severity ratchet at attempt 3+");
+    expect(result).not.toContain("prior-review ledger as a decision primer");
   });
 
   it("returns the correct built-in prompt for merger when no config provided", () => {
@@ -200,8 +229,34 @@ describe("resolveAgentPrompt", () => {
     for (const result of [defaultExecutor, seniorEngineer]) {
       expect(result).toContain("Do not call `fn_workflow_select` to change the workflow of the task you are executing");
       expect(result).toContain("The only exception is when the user explicitly requested a specific workflow for this task");
-      expect(result).toContain("You may still set the workflow on tasks you create via `fn_task_create` or `fn_delegate_task`");
+      expect(result).toContain(
+        "You may still set the workflow on tasks you create via `fn_task_create` or `fn_delegate_task`.",
+      );
     }
+  });
+
+  it("renders created-task workflow guidance only for creation tools on the resolved surface", () => {
+    const unavailable = resolveAgentPrompt("executor", undefined, {
+      taskCreateToolAvailable: false,
+      delegateTaskToolAvailable: false,
+    });
+    expect(unavailable).not.toContain("set the workflow on tasks you create");
+
+    const taskCreateOnly = resolveAgentPrompt("executor", undefined, {
+      taskCreateToolAvailable: true,
+      delegateTaskToolAvailable: false,
+    });
+    expect(taskCreateOnly).toContain("set the workflow on tasks you create via `fn_task_create`");
+    expect(taskCreateOnly).not.toContain("set the workflow on tasks you create via `fn_delegate_task`");
+
+    const seniorDelegateOnly = resolveAgentPrompt("executor", {
+      roleAssignments: { executor: "senior-engineer" },
+    }, {
+      taskCreateToolAvailable: false,
+      delegateTaskToolAvailable: true,
+    });
+    expect(seniorDelegateOnly).toContain("set the workflow on tasks you create via `fn_delegate_task`");
+    expect(seniorDelegateOnly).not.toContain("set the workflow on tasks you create via `fn_task_create`");
   });
 
   it("senior-engineer prompt limits fixes to impacted failures and follow-ups unrelated broad-suite failures", () => {
@@ -297,6 +352,22 @@ describe("resolveAgentPrompt", () => {
     expect(result).toContain("Task Documents");
   });
 
+  it("qualifies external blocked exits in both executor prompt variants", () => {
+    const standard = resolveAgentPrompt("executor");
+    const senior = resolveAgentPrompt("executor", {
+      roleAssignments: { executor: "senior-engineer" },
+    });
+
+    for (const prompt of [standard, senior]) {
+      expect(prompt).toContain("host-resource, network, model-provider, and credential failures");
+      expect(prompt).toContain("resolve missing tooling or optional services");
+      expect(prompt).toContain("substitute a runnable check");
+      expect(prompt).toContain("recommend the deferred verification");
+      expect(prompt).toContain("plain prose without backticked command names");
+      expect(prompt).not.toContain("honest blocked exit only for a real external blocker");
+    }
+  });
+
   it("senior-engineer prompt includes task_document_read guidance", () => {
     const config: AgentPromptsConfig = {
       roleAssignments: {
@@ -312,6 +383,21 @@ describe("resolveAgentPrompt", () => {
     const result = resolveAgentPrompt("triage");
     expect(result).toContain("task_document_write");
     expect(result).toContain("planning");
+  });
+
+  it("adds environment feasibility only to standard triage planning", () => {
+    const standardPrompt = resolveAgentPrompt("triage");
+    const fastPrompt = builtinSeamPrompt("planning-fast");
+    const concisePrompt = resolveAgentPrompt("triage", {
+      roleAssignments: { triage: "concise-triage" },
+    });
+
+    expect(standardPrompt).toContain("## Environment feasibility");
+    expect(standardPrompt).toContain("## Environment Capabilities");
+    expect(standardPrompt).toContain("## Environment Constraints");
+    expect(standardPrompt).toContain("Never state that a plan is blocked because a runtime is missing");
+    expect(fastPrompt).not.toContain("## Environment feasibility");
+    expect(concisePrompt).not.toContain("## Environment feasibility");
   });
 
   it("concise-triage prompt includes task_document_write guidance", () => {
@@ -336,12 +422,18 @@ describe("resolveAgentPrompt", () => {
     expect(fastPrompt).toBe(fastTemplate?.prompt);
     expect(fastPrompt).toContain("This task is running in **fast mode**");
     expect(fastPrompt).toContain("### Step N: <name>");
+    expect(fastPrompt).toContain("### Step 0: Preflight");
+    expect(fastPrompt).not.toContain("### Step 1: Preflight");
+    expect(fastPrompt).toContain("through `### Step N-1:` with no gaps");
     expect(fastPrompt).toContain("Do not write bare `### Preflight` / `### Implementation` headings");
     expect(fastPrompt).not.toContain("## Review Level");
     expect(fastPrompt.length).toBeLessThan(standardPrompt.length / 3);
-    // FNXC:OriginalDescriptionInPrompt 2026-07-14-23:35: Original Description contract
-    // adds a few lines to fast planning; keep lean but allow the new mandatory section.
-    expect(fastPrompt.length).toBeLessThan(6500);
+    /*
+     * FNXC:FastPlanningPrompt 2026-08-04-06:35:
+     * The compact ledger may add one bounded paragraph, while both relative and
+     * absolute caps keep fast planning materially smaller than the full prompt.
+     */
+    expect(fastPrompt.length).toBeLessThan(7500);
     expect(fastPrompt.split("\n").length).toBeLessThan(120);
   });
 
@@ -368,7 +460,7 @@ describe("resolveAgentPrompt", () => {
 
     const standardTransformationIdx = standardPrompt.indexOf("## Before → After Transformation");
     const standardReviewLevelIdx = standardPrompt.indexOf("## Review Level");
-    const standardMissionIdx = standardPrompt.indexOf("## Mission");
+    const standardMissionIdx = standardPrompt.indexOf("\n## Mission");
     expect(standardTransformationIdx).toBeGreaterThan(-1);
     expect(standardReviewLevelIdx).toBeGreaterThan(-1);
     expect(standardMissionIdx).toBeGreaterThan(-1);
@@ -399,13 +491,43 @@ describe("resolveAgentPrompt", () => {
       expect(prompt.toLowerCase()).toMatch(/verbatim/);
     }
 
-    // Template order: Original Description before Before → After and Mission
+    const implementationOnly = builtinSeamPrompt("planning-implementation-only");
+    for (const prompt of [standardPrompt, fastPrompt, implementationOnly, concise]) {
+      expect(prompt).toContain("## What This Delivers");
+    }
+
+    // Template order: Original Description, product summary, transformation, then Mission.
     const originalIdx = standardPrompt.indexOf("## Original Description");
+    const summaryIdx = standardPrompt.indexOf("## What This Delivers");
     const transformIdx = standardPrompt.indexOf("## Before → After Transformation");
-    const missionIdx = standardPrompt.indexOf("## Mission");
+    const missionIdx = standardPrompt.indexOf("\n## Mission");
     expect(originalIdx).toBeGreaterThan(-1);
-    expect(originalIdx).toBeLessThan(transformIdx);
-    expect(originalIdx).toBeLessThan(missionIdx);
+    expect(originalIdx).toBeLessThan(summaryIdx);
+    expect(summaryIdx).toBeLessThan(transformIdx);
+    expect(transformIdx).toBeLessThan(missionIdx);
+
+    const fastOriginalIdx = fastPrompt.indexOf("## Original Description");
+    const fastSummaryIdx = fastPrompt.indexOf("## What This Delivers");
+    const fastTransformIdx = fastPrompt.indexOf("## Before → After Transformation");
+    expect(fastOriginalIdx).toBeLessThan(fastSummaryIdx);
+    expect(fastSummaryIdx).toBeLessThan(fastTransformIdx);
+    expect(standardPrompt).toContain("plain product language");
+    expect(standardPrompt).toContain("verify at a glance");
+    expect(fastPrompt).toContain("plain product language");
+    expect(fastPrompt).toContain("verify at a glance");
+  });
+
+  it("requires reviewers to block missing or jargon-only product summaries", () => {
+    const defaultReviewer = resolveAgentPrompt("reviewer");
+    const strictReviewer = resolveAgentPrompt("reviewer", {
+      roleAssignments: { reviewer: "strict-reviewer" },
+    });
+
+    for (const prompt of [defaultReviewer, strictReviewer]) {
+      expect(prompt).toContain("**Product summary:**");
+      expect(prompt).toContain("`## What This Delivers`");
+      expect(prompt).toContain("blocking REVISE");
+    }
   });
 
   it("triage planning prompt is sourced from workflow IR without an engine duplicate", () => {
@@ -419,25 +541,12 @@ describe("resolveAgentPrompt", () => {
     expect(triageSource).not.toContain(["FAST", "TRIAGE", "SYSTEM", "PROMPT"].join("_"));
     expect(triageSource).not.toMatch(/export const [A-Z_]*TRIAGE[A-Z_]*SYSTEM_PROMPT\s*=/);
     expect(planningPrompt).toBe(corePrompt);
-    expect(corePrompt).toContain("{{triageProactiveSubtaskSplittingEnabled}}");
-    expect(corePrompt).toContain("Explicit user-requested `breakIntoSubtasks: true` remains governed");
+    expect(corePrompt).toContain("Complexity never authorizes replacing a requested task with child tasks");
 
     const renderedPrompt = renderTriagePolicyPlaceholders(corePrompt, {});
-    expect(renderedPrompt).toContain("**Broad-scope decomposition signals:**");
-    expect(renderedPrompt).toContain("step count would reach 9 or more");
-    expect(renderedPrompt).toContain("would reach 12 or more");
-    expect(renderedPrompt).toContain("20 or more entries");
-    expect(renderedPrompt).toContain("at or above 30 items");
-    expect(renderedPrompt).toContain("Even when `breakIntoSubtasks` is not set to `true`, apply these thresholds proactively");
+    expect(renderedPrompt).toContain("Keep every requested task as one detailed plan regardless of size");
+    expect(renderedPrompt).not.toContain("breakIntoSubtasks");
     expect(renderedPrompt).not.toContain("{{");
-
-    const disabledPrompt = renderTriagePolicyPlaceholders(corePrompt, {
-      triageProactiveSubtaskSplittingEnabled: false,
-    } as never);
-    expect(disabledPrompt).toContain("Proactive oversized-task splitting is DISABLED");
-    expect(disabledPrompt).toContain("Only create child tasks when `breakIntoSubtasks: true` is explicitly present");
-    expect(disabledPrompt).not.toContain("Even when `breakIntoSubtasks` is not set to `true`, apply these thresholds proactively");
-    expect(disabledPrompt).not.toContain("{{");
   });
 
   it("resolves custom seam prompts and ignores IRs without matching prompts", () => {

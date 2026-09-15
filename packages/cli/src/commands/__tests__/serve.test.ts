@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { installShippedSkillsIntoProject, SHIPPED_SKILL_NAMES, type ShippedSkillName } from "../claude-skills.js";
 
 function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) {
   const mock = vi.fn(function () {});
@@ -772,11 +773,6 @@ vi.mock("@fusion/engine", async (importOriginal) => {
   TaskExecutor: mocks.executorCtor,
   Scheduler: mocks.schedulerCtor,
   AgentSemaphore: mocks.agentSemaphoreCtor,
-  WorktreePool: vi.fn().mockImplementation(function () {
-    return {
-      rehydrate: vi.fn(),
-    };
-  }),
   aiMergeTask: vi.fn().mockResolvedValue({ merged: true }),
   UsageLimitPauser: vi.fn().mockImplementation(function () {
     return {};
@@ -843,6 +839,16 @@ vi.mock("../task-lifecycle.js", () => ({
   createPrReconcileGithubOps: vi.fn(() => ({})),
 }));
 
+const { mockInstallSkillsForProject, mockEnsureSkillsOnStartup } = vi.hoisted(() => ({
+  mockInstallSkillsForProject: vi.fn(() => []),
+  mockEnsureSkillsOnStartup: vi.fn(() => []),
+}));
+
+vi.mock("../claude-skills-runner.js", () => ({
+  maybeInstallClaudeSkillForNewProject: mockInstallSkillsForProject,
+  ensureClaudeSkillsForAllProjectsOnStartup: mockEnsureSkillsOnStartup,
+}));
+
 vi.mock("../project-context.js", () => ({
   resolveProject: vi.fn().mockRejectedValue(new Error("project not initialized")),
 }));
@@ -851,10 +857,47 @@ const { runServe } = await import("../serve.js");
 const ensureProjectRegisteredModule = await import("../ensure-project-registered.js");
 
 describe("runServe", () => {
+  it("C4/C7a: fn serve drives project registration and startup multi-skill paths", async () => {
+    /* FNXC:ComputerUseSkill 2026-08-11-07:43: This drives serve's actual server options and
+     * startup body; the second startup site remains pinned by C7d because it is a restart path. */
+    mockInstallSkillsForProject.mockClear();
+    mockEnsureSkillsOnStartup.mockClear();
+    const projectPath = mkdtempSync(join(tmpdir(), "fusion-serve-skills-"));
+    const sources = Object.fromEntries(SHIPPED_SKILL_NAMES.map((skillName) => {
+      const source = join(projectPath, "sources", skillName);
+      mkdirSync(source, { recursive: true });
+      writeFileSync(join(source, "SKILL.md"), `name: ${skillName}`);
+      return [skillName, source];
+    })) as Record<ShippedSkillName, string>;
+    mockInstallSkillsForProject.mockImplementationOnce((path: string) => installShippedSkillsIntoProject(path, { enabled: true, sources }));
+    mockEnsureSkillsOnStartup.mockImplementationOnce(() => SHIPPED_SKILL_NAMES.map((skillName) => ({ outcome: "already-installed", target: skillName })));
+    await runServe(0, {});
+    const options = mocks.createServerMock.mock.calls.at(-1)?.[1] as { onProjectRegistered?: (project: { path: string }) => void };
+    options.onProjectRegistered?.({ path: projectPath });
+    expect(mockInstallSkillsForProject).toHaveBeenCalledWith(projectPath);
+    expect(mockInstallSkillsForProject.mock.results[0]?.value.map((result: { outcome: string }) => result.outcome)).toEqual(["installed", "installed"]);
+    expect(mockEnsureSkillsOnStartup.mock.results[0]?.value.map((result: { outcome: string }) => result.outcome)).toEqual(["already-installed", "already-installed"]);
+    await triggerSignal("SIGINT");
+  });
+
   it("invokes shared startup model sync", async () => {
     const { runServe } = await import("../serve.js");
     await runServe(4040, {});
     expect(mockSyncStartupModels).toHaveBeenCalledTimes(1);
+  });
+
+  it("binds native auto-merge to the executing engine's store", async () => {
+    const lifecycle = await import("../task-lifecycle.js");
+    const { ProjectEngineManager } = await import("@fusion/engine");
+    await runServe(0, {});
+
+    const factory = vi.mocked(ProjectEngineManager).mock.calls.at(-1)?.[1]?.createPrNodeGithubOps;
+    const otherProjectStore = { getSettings: vi.fn().mockResolvedValue({ githubNativeAutoMerge: true }) };
+    factory?.(otherProjectStore as never);
+    const resolver = vi.mocked(lifecycle.createPrNodeGithubOps).mock.calls.at(-1)?.[1]?.isNativeAutoMergeEnabled;
+
+    await expect(resolver?.({ id: "FN-shared" } as never)).resolves.toBe(true);
+    expect(otherProjectStore.getSettings).toHaveBeenCalledOnce();
   });
 
   // FNXC:DaemonSignalExit 2026-07-10-16:00: `fn serve` must honor the same POSIX
@@ -981,7 +1024,16 @@ describe("runServe", () => {
   it("initializes stores, starts engine services, and creates a headless server", async () => {
     await runServe(4040, {});
 
-    expect(mocks.createTaskStoreForBackendMock).toHaveBeenCalledWith({ rootDir: "/repo" });
+    // FN-8399: serve now passes an onMigrationProgress callback so the holding
+    // server can expose incomplete migration status on the dashboard.
+    // FN-8685: serve also tags the shared store with the durable engine consumer
+    // identity (buildConsumerId("engine") === "engine") so its deletion cursor
+    // survives restart and cross-process deletes reach runtime observers.
+    expect(mocks.createTaskStoreForBackendMock).toHaveBeenCalledWith({
+      rootDir: "/repo",
+      consumerId: "engine",
+      onMigrationProgress: expect.any(Function),
+    });
     expect(mocks.taskStoreCtor).toHaveBeenCalledTimes(1);
     expect(mocks.taskStores[0].init).toHaveBeenCalledTimes(1);
     expect(mocks.taskStores[0].watch).toHaveBeenCalledTimes(1);
@@ -2004,22 +2056,32 @@ describe("runServe --daemon flag", () => {
     await triggerSignal("SIGINT");
   });
 
-  it("does not pass daemon to createServer when daemon: false", async () => {
+  /*
+  FNXC:ServeSecureByDefault 2026-07-30-14:15:
+  INVERTED DELIBERATELY. These two cases asserted that `fn serve` passes no daemon token unless
+  `--daemon` was given — the pre-hardening contract, where a plain `fn serve` listened unauthenticated.
+  Token resolution is now UNCONDITIONAL (mirroring the existing `fn dashboard` precedent), so the old
+  assertions were pinning the vulnerability rather than the behaviour.
+
+  The pair is kept rather than deleted, because the opt-out is the part worth guarding: if `--no-auth`
+  ever stops disabling auth, or the default ever stops minting, one of these fails.
+  */
+  it("mints a daemon token by default, with no --daemon flag", async () => {
     const { createServer } = await import("@fusion/dashboard");
 
-    await runServe(4040, { daemon: false });
+    await runServe(4040, {});
 
     expect(createServer).toHaveBeenCalledTimes(1);
     const serverOpts = createServer.mock.calls[0][1];
-    expect(serverOpts.daemon).toBeUndefined();
+    expect(serverOpts.daemon?.token).toEqual(expect.any(String));
 
     await triggerSignal("SIGINT");
   });
 
-  it("does not pass daemon to createServer when daemon option is omitted", async () => {
+  it("passes no daemon token when --no-auth opts out", async () => {
     const { createServer } = await import("@fusion/dashboard");
 
-    await runServe(4040, {});
+    await runServe(4040, { noAuth: true });
 
     expect(createServer).toHaveBeenCalledTimes(1);
     const serverOpts = createServer.mock.calls[0][1];

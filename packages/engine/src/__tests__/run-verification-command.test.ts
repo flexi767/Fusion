@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { tmpdir } from "node:os";
+import { mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { SandboxBackend } from "../sandbox/types.js";
 import { fileURLToPath } from "node:url";
 import {
   BOUNDED_VERIFICATION_GUIDANCE,
@@ -9,9 +12,10 @@ import {
   detectMarathonVerification,
   normalizeVerificationCommand,
   runVerificationCommand,
+  summarizeVerificationFailureOutput,
   __testOnlyReapVerificationProcessGroup,
   type RunVerificationOptions,
-} from "../run-verification-tool.js";
+} from "../execution/run-verification-tool.js";
 
 // Some tests use platform-appropriate shell syntax. On Windows, sh-style
 // quoting and pipes through `printf` are different — these tests are skipped
@@ -23,6 +27,17 @@ const itPosix = onPosix ? it : it.skip;
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
+    /*
+    FNXC:Verification 2026-08-22-22:35:
+    Reaping asserts that no executable child survives. Linux can retain a killed
+    child as a zombie until its external init reaps it; kill(pid, 0) still succeeds
+    for that inert process and must not turn a successful process-group reap into a
+    false failure.
+    */
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return /^\d+\s+\(.+\)\s+Z\b/.test(stat) === false;
+    }
     return true;
   } catch {
     return false;
@@ -47,6 +62,77 @@ function sleep(ms: number): Promise<void> {
 // so we fall back to os.tmpdir() which is always C:\Users\…\Temp there.
 describe("runVerificationCommand", { timeout: 30000 }, () => {
   const tempDir = onPosix ? "/tmp" : tmpdir();
+
+  it("fans workspace verification out over each modified repository", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fusion-verify-"));
+    const repoA = join(root, "repo-a");
+    const repoB = join(root, "repo-b");
+    mkdirSync(repoA);
+    mkdirSync(repoB);
+    const tool = createRunVerificationTool({
+      worktreePath: root,
+      rootDir: root,
+      workspaceRepos: [
+        { repo: "repo-a", worktreePath: repoA, modified: true },
+        { repo: "repo-b", worktreePath: repoB, modified: true },
+        { repo: "repo-clean", worktreePath: root, modified: false },
+      ],
+      taskId: "FN-158",
+      recordActivity: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+    const result = await tool.execute!("call", { command: "pwd", scope: "package" });
+    expect(result.details).toMatchObject({ success: true, repositories: [{ repo: "repo-a" }, { repo: "repo-b" }] });
+    expect(result.content.map((entry) => entry.text).join("\n")).toContain(`Repository: repo-a`);
+    expect(result.content.map((entry) => entry.text).join("\n")).toContain(`Repository: repo-b`);
+  });
+
+  it("uses invocation-time workspace diffs instead of the pre-session modifiedFiles snapshot", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fusion-verify-fresh-"));
+    const repo = join(root, "repo-edited-during-session");
+    mkdirSync(repo);
+    const resolveWorkspaceRepos = vi.fn(async () => [
+      { repo: "repo-edited-during-session", worktreePath: repo, modified: true },
+    ]);
+    const tool = createRunVerificationTool({
+      worktreePath: root,
+      rootDir: root,
+      // This stale snapshot models task.modifiedFiles before the agent session ends.
+      workspaceRepos: [{ repo: "repo-edited-during-session", worktreePath: repo, modified: false }],
+      resolveWorkspaceRepos,
+      taskId: "FN-158",
+      recordActivity: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+
+    const result = await tool.execute!("call-fresh", { command: "pwd", scope: "package" });
+
+    // The fan-out and its repository-targeted invocation each resolve live diffs.
+    expect(resolveWorkspaceRepos).toHaveBeenCalledTimes(2);
+    expect(result.details).toMatchObject({ success: true, repositories: [{ repo: "repo-edited-during-session" }] });
+    expect(result.content.map((entry) => entry.text).join("\n")).toContain("Repository: repo-edited-during-session");
+  });
+
+  it("routes task-tool verification through the selected streaming sandbox", async () => {
+    const backend: SandboxBackend = {
+      capabilities: () => ({ id: "bubblewrap", supportsNetworkPolicy: true, supportsFilesystemPolicy: true, supportsStreaming: true, platform: "any" }),
+      prepare: vi.fn(async () => {}),
+      run: vi.fn(),
+      runStreaming: vi.fn(async () => ({ outcome: "success" as const, stdout: "sandboxed", stderr: "", bufferOverflow: false })),
+      dispose: vi.fn(async () => {}),
+    };
+    const result = await runVerificationCommand({
+      command: "echo sandboxed",
+      cwd: tempDir,
+      timeoutMs: 1_000,
+      onHeartbeat: vi.fn(),
+      sandboxBackend: backend,
+      sandboxPolicy: { allowNetwork: false, allowedWritePaths: [] },
+    });
+    expect(backend.prepare).toHaveBeenCalledWith(expect.objectContaining({ allowedWritePaths: [] }));
+    expect(backend.runStreaming).toHaveBeenCalledWith("echo sandboxed", expect.objectContaining({ cwd: tempDir }));
+    expect(result).toMatchObject({ success: true, stdout: "sandboxed" });
+  });
   const workspaceRoot = fileURLToPath(new URL("../../../../", import.meta.url));
 
   describe("command normalization", () => {
@@ -474,6 +560,210 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
+  describe("tool response output", () => {
+    const createCompactTool = () =>
+      createRunVerificationTool({
+        worktreePath: tempDir,
+        rootDir: workspaceRoot,
+        taskId: "FN-COMPACT",
+        recordActivity: vi.fn(),
+        onVerificationStart: vi.fn(),
+        onVerificationEnd: vi.fn(),
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      });
+
+    it("reduces noisy test failures to counts, failing tests, errors, and source locations", () => {
+      const stdout = [
+        "\u001b[41m FAIL \u001b[0m app/components/Widget.test.tsx > Widget > preserves focus",
+        "AssertionError: expected false to be true",
+        "Ignored nodes: comments, script, style",
+        "<html>",
+        "  <body>",
+        "    <div class=\"entire-rendered-application\">",
+        "      <input />",
+        "      DOM-NOISE-THAT-MUST-NOT-REACH-THE-AGENT",
+        "    </div>",
+        "  </body>",
+        "</html>",
+        " ❯ app/components/Widget.test.tsx:42:7",
+        " Test Files  1 failed | 12 passed (13)",
+        "      Tests  1 failed | 650 passed (651)",
+      ].join("\n");
+
+      const summary = summarizeVerificationFailureOutput(stdout, "");
+
+      expect(summary).toContain("FAIL app/components/Widget.test.tsx > Widget > preserves focus");
+      expect(summary).toContain("AssertionError: expected false to be true");
+      expect(summary).toContain("app/components/Widget.test.tsx:42:7");
+      expect(summary).toContain("Test Files 1 failed | 12 passed (13)");
+      expect(summary).toContain("Tests 1 failed | 650 passed (651)");
+      expect(summary).not.toContain("DOM-NOISE-THAT-MUST-NOT-REACH-THE-AGENT");
+      expect(summary).not.toContain("\u001b[");
+    });
+
+    it("keeps compiler diagnostics and caps generic failure output", () => {
+      const diagnostic = "src/example.ts(12,4): error TS2322: Type 'number' is not assignable to type 'string'.";
+      const stderr = [
+        diagnostic,
+        ...Array.from(
+          { length: 200 },
+          (_, index) =>
+            `src/example-${index}.ts(12,4): error TS2322: ${"x".repeat(200)}`,
+        ),
+      ].join("\n");
+
+      const summary = summarizeVerificationFailureOutput("", stderr);
+
+      expect(summary).toContain(diagnostic);
+      expect(summary.length).toBeLessThanOrEqual(8_000);
+      expect(summary).toContain("output compacted");
+    });
+
+    it("retains actionable lint context ahead of a generic package-manager failure", () => {
+      const stderr = [
+        "/workspace/src/widget.ts",
+        "  12:3  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any",
+        "✖ 1 problem (1 error, 0 warnings)",
+        "ELIFECYCLE Command failed with exit code 1.",
+      ].join("\n");
+
+      const summary = summarizeVerificationFailureOutput("", stderr);
+
+      expect(summary).toContain("/workspace/src/widget.ts");
+      expect(summary).toContain("12:3 error Unexpected any");
+      expect(summary).toContain("@typescript-eslint/no-explicit-any");
+      expect(summary).toContain("ELIFECYCLE Command failed with exit code 1.");
+    });
+
+    it("preserves failure details from both streams when one stream exceeds the cap", () => {
+      const stderr = Array.from(
+        { length: 100 },
+        (_, index) => `src/error-${index}.ts(1,1): error TS2322: diagnostic ${index}`,
+      ).join("\n");
+      const stdout = [
+        "[vite]: Rollup failed to resolve import \"missing-package\" from \"src/main.ts\".",
+        "Command failed with exit code 1.",
+      ].join("\n");
+
+      const summary = summarizeVerificationFailureOutput(stdout, stderr);
+
+      expect(summary).toContain("Rollup failed to resolve import");
+      expect(summary).toContain("src/error-0.ts");
+      expect(summary.length).toBeLessThanOrEqual(8_000);
+    });
+
+    it("preserves terminal totals when one stream has more high-signal lines than the cap", () => {
+      const stdout = [
+        ...Array.from(
+          { length: 100 },
+          (_, index) => `src/error-${index}.ts(1,1): error TS2322: diagnostic ${index}`,
+        ),
+        "Test Files  20 failed | 2 passed (22)",
+        "Tests  100 failed | 10 passed (110)",
+        "ELIFECYCLE Command failed with exit code 1.",
+      ].join("\n");
+
+      const summary = summarizeVerificationFailureOutput(stdout, "");
+
+      expect(summary).toContain("src/error-0.ts");
+      expect(summary).toContain("Test Files 20 failed | 2 passed (22)");
+      expect(summary).toContain("Tests 100 failed | 10 passed (110)");
+      expect(summary).toContain("ELIFECYCLE Command failed with exit code 1.");
+      expect(summary.length).toBeLessThanOrEqual(8_000);
+    });
+
+    it("keeps a bounded assertion diff with an elided assertion headline", () => {
+      const stdout = [
+        "AssertionError: expected { …(5) } to deeply equal { …(5) }",
+        "- Expected",
+        "+ Received",
+        "  Object {",
+        "-   \"status\": \"ready\",",
+        "+   \"status\": \"failed\",",
+        "  }",
+        " ❯ src/widget.test.ts:18:4",
+      ].join("\n");
+
+      const summary = summarizeVerificationFailureOutput(stdout, "");
+
+      expect(summary).toContain("- Expected");
+      expect(summary).toContain("+ Received");
+      expect(summary).toContain("\"status\": \"failed\"");
+      expect(summary).toContain("src/widget.test.ts:18:4");
+    });
+
+    itPosix("omits routine stdout from successful tool responses", async () => {
+      const tool = createCompactTool();
+
+      const result = await tool.execute("call-compact-success", {
+        command:
+          "printf 'routine build chatter\\nTests  0 failed | 20 passed (20)\\n100%% tests passed, 0 tests failed out of 5\\n'",
+        scope: "package",
+      });
+
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(text).toContain("Success: true");
+      expect(text).not.toContain("routine build chatter");
+      expect(text).not.toContain("Verification warning:");
+      expect(text).not.toContain("--- stdout ---");
+    });
+
+    itPosix("retains zero-work warnings from commands that exit successfully", async () => {
+      const tool = createCompactTool();
+
+      const result = await tool.execute("call-compact-no-work", {
+        command: "printf 'No projects matched the filters\\nroutine chatter\\n'",
+        scope: "package",
+      });
+
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(text).toContain("Success: true");
+      expect(text).toContain("Verification warning:");
+      expect(text).toContain("No projects matched the filters");
+      expect(text).not.toContain("routine chatter");
+    });
+
+    itPosix("warns when an exit-zero command reports failed tests", async () => {
+      const tool = createCompactTool();
+
+      const result = await tool.execute("call-compact-green-while-red", {
+        command: "printf 'Test Files  1 failed | 2 passed (3)\\nroutine chatter\\n'",
+        scope: "package",
+      });
+
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(text).toContain("Success: true");
+      expect(text).toContain("Verification warning:");
+      expect(text).toContain("Test Files 1 failed | 2 passed (3)");
+      expect(text).not.toContain("routine chatter");
+    });
+
+    itPosix("returns only the compact summary for failed tool responses", async () => {
+      const tool = createCompactTool();
+      const script = [
+        "console.log('FAIL src/widget.test.ts > Widget > reports the failure');",
+        "console.log('Test Files  1 failed | 2 passed (3)');",
+        "console.error('AssertionError: expected 1 to be 2');",
+        "console.error('<div>DOM-NOISE-THAT-MUST-NOT-REACH-THE-AGENT</div>');",
+        "process.exit(1);",
+      ].join("");
+
+      const result = await tool.execute("call-compact-failure", {
+        command: `${process.execPath} -e ${JSON.stringify(script)}`,
+        scope: "package",
+      });
+
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(text).toContain("Failure summary:");
+      expect(text).toContain("Widget > reports the failure");
+      expect(text).toContain("AssertionError: expected 1 to be 2");
+      expect(text).toContain("Test Files 1 failed | 2 passed (3)");
+      expect(text).not.toContain("DOM-NOISE-THAT-MUST-NOT-REACH-THE-AGENT");
+      expect(text).not.toContain("--- stdout ---");
+      expect(text).not.toContain("--- stderr ---");
+    });
+  });
+
   describe("heartbeat callbacks", () => {
     itPosix("fires onHeartbeat for each output line (POSIX shell)", async () => {
       const onHeartbeat = vi.fn();
@@ -593,7 +883,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       // POSIX shell expansion ($USER) differs from Windows (%USERNAME%).
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
-        command: "echo $USER",
+        command: "FUSION_VERIFY_ENV=present; echo $FUSION_VERIFY_ENV",
         cwd: tempDir,
         timeoutMs: 30000,
         onHeartbeat,
@@ -602,8 +892,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       const result = await runVerificationCommand(opts);
 
       expect(result.success).toBe(true);
-      // Should have output (USER is typically set)
-      expect(result.stdout.trim().length).toBeGreaterThan(0);
+      expect(result.stdout.trim()).toBe("present");
     });
   });
 });

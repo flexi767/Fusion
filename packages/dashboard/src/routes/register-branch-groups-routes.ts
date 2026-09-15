@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
 import type { BranchGroup, Task, TaskStore } from "@fusion/core";
-import { isBranchGroupComplete, isBranchGroupMemberLanded, filterTasksByBranchGroup } from "@fusion/core";
+import { collectLandedMemberReviewAdvisories, isBranchGroupComplete, isBranchGroupMemberLanded, filterTasksByBranchGroup } from "@fusion/core";
 import { badRequest, notFound } from "../api-error.js";
 import { getProjectIdFromRequest, getScopedStore } from "./context.js";
 
@@ -74,9 +74,11 @@ async function serializeGroup(store: TaskStore, group: BranchGroup, allTasks?: T
     landed: isBranchGroupMemberLanded(task, group),
   }));
   const landedCount = memberRows.filter((member) => member.landed).length;
+  const advisories = collectLandedMemberReviewAdvisories(members, group);
   return {
     ...group,
     members: memberRows,
+    advisories,
     completion: {
       landed: landedCount,
       total: memberRows.length,
@@ -97,10 +99,11 @@ export function createBranchGroupsRouter(store: TaskStore, options?: BranchGroup
     }
 
     const groups = await requestStore.listBranchGroups(status ? { status: status as BranchGroup["status"] } : undefined);
-    // Fix #8/#9: fetch tasks ONCE and filter per group in memory rather than one
-    // full scan per group (the old N+1). Membership semantics (incl. legacy
-    // synthetic-groupId fallback) come from the shared `filterTasksByBranchGroup`.
-    const allTasks = await requestStore.listTasks({ includeArchived: false, slim: true });
+    /*
+    FNXC:SharedBranchPromotionAdvisories 2026-09-04-14:51:
+    Fetch live tasks once and filter every group in memory so completed Done members and their review advisories remain visible without an N+1 scan. Soft-deleted task snapshots are not branch-group members and must stay excluded.
+    */
+    const allTasks = await requestStore.listTasks({ slim: false });
     const data = await Promise.all(groups.map((group) => serializeGroup(requestStore, group, allTasks)));
     res.json({ groups: data });
   });

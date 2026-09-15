@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useState } from "react";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { TaskForm } from "../TaskForm";
+import { AlphaProvider, AlphaBoundary } from "../../context/AlphaContext";
 import type { Task, Column } from "@fusion/core";
 
 // Mock lucide-react
@@ -21,6 +23,11 @@ vi.mock("lucide-react", () => ({
   Brain: () => null,
   Server: () => null,
   Cpu: () => null,
+}));
+
+// FNXC:VoiceInput 2026-07-26-05:05: Keep legacy form tests focused on form settings; voice behavior has dedicated hook and composer-invariant suites.
+vi.mock("../../hooks/useComposerDictation", () => ({
+  useComposerDictation: () => ({ micProps: { enabled: false, supported: false, state: "idle", start: vi.fn(), stop: vi.fn() } }),
 }));
 
 // Mock the api module
@@ -60,34 +67,96 @@ function makeTask(id: string): Task {
   };
 }
 
+const renderTaskFormDefaults: React.ComponentProps<typeof TaskForm> = {
+  mode: "create",
+  description: "",
+  onDescriptionChange: vi.fn(),
+  dependencies: [],
+  onDependenciesChange: vi.fn(),
+  executorModel: "",
+  onExecutorModelChange: vi.fn(),
+  validatorModel: "",
+  onValidatorModelChange: vi.fn(),
+  presetMode: "default" as const,
+  onPresetModeChange: vi.fn(),
+  selectedPresetId: "",
+  onSelectedPresetIdChange: vi.fn(),
+  selectedWorkflowId: undefined,
+  onWorkflowIdChange: vi.fn(),
+  pendingImages: [],
+  onImagesChange: vi.fn(),
+  tasks: [],
+  addToast: vi.fn(),
+  isActive: true,
+  reviewLevel: undefined,
+  onReviewLevelChange: vi.fn(),
+};
+
 function renderTaskForm(props: Partial<React.ComponentProps<typeof TaskForm>> = {}) {
-  const defaultProps: React.ComponentProps<typeof TaskForm> = {
-    mode: "create",
-    description: "",
-    onDescriptionChange: vi.fn(),
-    dependencies: [],
-    onDependenciesChange: vi.fn(),
-    executorModel: "",
-    onExecutorModelChange: vi.fn(),
-    validatorModel: "",
-    onValidatorModelChange: vi.fn(),
-    presetMode: "default" as const,
-    onPresetModeChange: vi.fn(),
-    selectedPresetId: "",
-    onSelectedPresetIdChange: vi.fn(),
-    selectedWorkflowId: undefined,
-    onWorkflowIdChange: vi.fn(),
-    pendingImages: [],
-    onImagesChange: vi.fn(),
-    tasks: [],
-    addToast: vi.fn(),
-    isActive: true,
-    reviewLevel: undefined,
-    onReviewLevelChange: vi.fn(),
-  };
-  const mergedProps = { ...defaultProps, ...props };
+  const mergedProps = { ...renderTaskFormDefaults, ...props };
   const result = render(<TaskForm {...mergedProps} />);
   return { ...result, props: mergedProps };
+}
+
+const FAST_OPTIONAL_STEPS = [
+  { templateId: "code-review", name: "Code Review", phase: "pre-merge" as const, defaultOn: true },
+  { templateId: "manual-smoke", name: "Manual smoke", phase: "pre-merge" as const, defaultOn: false },
+];
+const TASK_FORM_TEST_NOOP = () => {};
+
+interface FastModeTaskFormHarnessProps {
+  initialExecutionMode?: "standard" | "fast";
+  initialEnabledWorkflowSteps?: string[];
+  onExecutionModeChange?: (mode: "standard" | "fast") => void;
+  onEnabledWorkflowStepsChange?: NonNullable<React.ComponentProps<typeof TaskForm>["onEnabledWorkflowStepsChange"]>;
+}
+
+/** Holds create-form values in state so Fast transitions use the same controlled flow as New Task. */
+function FastModeTaskFormHarness({
+  initialExecutionMode = "standard",
+  initialEnabledWorkflowSteps = ["code-review"],
+  onExecutionModeChange = TASK_FORM_TEST_NOOP,
+  onEnabledWorkflowStepsChange = TASK_FORM_TEST_NOOP,
+}: FastModeTaskFormHarnessProps) {
+  const [executionMode, setExecutionMode] = useState(initialExecutionMode);
+  const [enabledWorkflowSteps, setEnabledWorkflowSteps] = useState(initialEnabledWorkflowSteps);
+
+  return (
+    <TaskForm
+      mode="create"
+      description=""
+      onDescriptionChange={TASK_FORM_TEST_NOOP}
+      dependencies={[]}
+      onDependenciesChange={TASK_FORM_TEST_NOOP}
+      executorModel=""
+      onExecutorModelChange={TASK_FORM_TEST_NOOP}
+      validatorModel=""
+      onValidatorModelChange={TASK_FORM_TEST_NOOP}
+      presetMode="default"
+      onPresetModeChange={TASK_FORM_TEST_NOOP}
+      selectedPresetId=""
+      onSelectedPresetIdChange={TASK_FORM_TEST_NOOP}
+      selectedWorkflowId="wf-explicit"
+      onWorkflowIdChange={TASK_FORM_TEST_NOOP}
+      pendingImages={[]}
+      onImagesChange={TASK_FORM_TEST_NOOP}
+      tasks={[]}
+      addToast={TASK_FORM_TEST_NOOP}
+      isActive
+      reviewLevel={undefined}
+      onReviewLevelChange={TASK_FORM_TEST_NOOP}
+      executionMode={executionMode}
+      onExecutionModeChange={(nextMode) => {
+        onExecutionModeChange(nextMode);
+        setExecutionMode(nextMode);
+      }}
+      enabledWorkflowSteps={enabledWorkflowSteps}
+      onEnabledWorkflowStepsChange={(nextIds, meta) => {
+        onEnabledWorkflowStepsChange(nextIds, meta);
+        setEnabledWorkflowSteps(nextIds);
+      }}
+    />
+  );
 }
 
 async function openWorkflowDropdown() {
@@ -296,6 +365,130 @@ describe("TaskForm", () => {
     expect(onEnabledWorkflowStepsChange).toHaveBeenCalledWith([], expect.objectContaining({ optionalStepsAvailable: true }));
   });
 
+  it("restores optional steps through the inline Fast control", async () => {
+    const { fetchWorkflowOptionalSteps } = await import("../../api");
+    vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue(FAST_OPTIONAL_STEPS as any);
+    const onExecutionModeChange = vi.fn();
+    const onEnabledWorkflowStepsChange = vi.fn();
+    render(
+      <FastModeTaskFormHarness
+        onExecutionModeChange={onExecutionModeChange}
+        onEnabledWorkflowStepsChange={onEnabledWorkflowStepsChange}
+      />,
+    );
+
+    const trigger = await screen.findByTestId("task-form-inline-optional-steps");
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    onEnabledWorkflowStepsChange.mockClear();
+
+    fireEvent.click(screen.getByTestId("task-form-inline-fast"));
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+    fireEvent.click(screen.getByTestId("task-form-inline-fast"));
+
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    expect(onExecutionModeChange).toHaveBeenNthCalledWith(1, "fast");
+    expect(onExecutionModeChange).toHaveBeenNthCalledWith(2, "standard");
+    expect(onEnabledWorkflowStepsChange).toHaveBeenLastCalledWith(
+      ["code-review"],
+      { optionalStepsAvailable: true, source: "user" },
+    );
+  });
+
+  it("restores optional steps through the Advanced execution-mode select", async () => {
+    const { fetchWorkflowOptionalSteps } = await import("../../api");
+    vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue(FAST_OPTIONAL_STEPS as any);
+    const onEnabledWorkflowStepsChange = vi.fn();
+    render(<FastModeTaskFormHarness onEnabledWorkflowStepsChange={onEnabledWorkflowStepsChange} />);
+
+    const trigger = await screen.findByTestId("task-form-inline-optional-steps");
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    onEnabledWorkflowStepsChange.mockClear();
+    fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
+
+    const executionModeSelect = await screen.findByTestId("task-form-execution-mode-select");
+    fireEvent.change(executionModeSelect, { target: { value: "fast" } });
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+    fireEvent.change(executionModeSelect, { target: { value: "standard" } });
+
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    expect(onEnabledWorkflowStepsChange).toHaveBeenLastCalledWith(
+      ["code-review"],
+      { optionalStepsAvailable: true, source: "user" },
+    );
+  });
+
+  it("merges a step selected while Fast is active after the pre-Fast selection", async () => {
+    const { fetchWorkflowOptionalSteps } = await import("../../api");
+    vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue(FAST_OPTIONAL_STEPS as any);
+    const onEnabledWorkflowStepsChange = vi.fn();
+    render(<FastModeTaskFormHarness onEnabledWorkflowStepsChange={onEnabledWorkflowStepsChange} />);
+
+    const trigger = await screen.findByTestId("task-form-inline-optional-steps");
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    fireEvent.click(screen.getByTestId("task-form-inline-fast"));
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByTestId("wf-optional-steps-dropdown-option-manual-smoke"));
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    fireEvent.click(screen.getByTestId("task-form-inline-fast"));
+
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 2 selected"));
+    expect(onEnabledWorkflowStepsChange).toHaveBeenLastCalledWith(
+      ["code-review", "manual-smoke"],
+      { optionalStepsAvailable: true, source: "user" },
+    );
+  });
+
+  it("falls back to default-on optional steps when metadata resolves during Fast", async () => {
+    const { fetchWorkflowOptionalSteps } = await import("../../api");
+    let resolveOptionalSteps: (steps: typeof FAST_OPTIONAL_STEPS) => void = () => {};
+    vi.mocked(fetchWorkflowOptionalSteps).mockReturnValue(new Promise((resolve) => {
+      resolveOptionalSteps = resolve;
+    }) as any);
+    const onEnabledWorkflowStepsChange = vi.fn();
+    render(<FastModeTaskFormHarness onEnabledWorkflowStepsChange={onEnabledWorkflowStepsChange} />);
+
+    await waitFor(() => expect(fetchWorkflowOptionalSteps).toHaveBeenCalledWith("wf-explicit", undefined));
+    fireEvent.click(screen.getByTestId("task-form-inline-fast"));
+    await act(async () => {
+      resolveOptionalSteps(FAST_OPTIONAL_STEPS);
+    });
+
+    const trigger = await screen.findByTestId("task-form-inline-optional-steps");
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+    fireEvent.click(screen.getByTestId("task-form-inline-fast"));
+
+    await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+    expect(onEnabledWorkflowStepsChange).toHaveBeenLastCalledWith(
+      ["code-review"],
+      { optionalStepsAvailable: true, source: "user" },
+    );
+  });
+
+  it("leaves edit-mode optional workflow steps untouched when switching to Standard", async () => {
+    const { fetchWorkflowOptionalSteps } = await import("../../api");
+    vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue(FAST_OPTIONAL_STEPS as any);
+    const onExecutionModeChange = vi.fn();
+    const onEnabledWorkflowStepsChange = vi.fn();
+    renderTaskForm({
+      mode: "edit",
+      onWorkflowIdChange: undefined,
+      executionMode: "fast",
+      onExecutionModeChange,
+      optionalStepsWorkflowId: "wf-edit",
+      enabledWorkflowSteps: ["manual-smoke"],
+      onEnabledWorkflowStepsChange,
+    });
+
+    await screen.findByTestId("task-form-edit-optional-steps");
+    fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
+    fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "standard" } });
+
+    expect(onExecutionModeChange).toHaveBeenCalledTimes(1);
+    expect(onExecutionModeChange).toHaveBeenCalledWith("standard");
+    expect(onEnabledWorkflowStepsChange).not.toHaveBeenCalled();
+  });
+
   it("seeds no optional steps when loading resolves after Fast is selected", async () => {
     const { fetchWorkflowOptionalSteps } = await import("../../api");
     let resolveOptionalSteps: (steps: Array<{ templateId: string; name: string; phase: string; defaultOn: boolean }>) => void = () => {};
@@ -415,6 +608,76 @@ describe("TaskForm", () => {
     fireEvent.change(screen.getByTestId("task-priority-select"), { target: { value: "urgent" } });
 
     expect(onPriorityChange).toHaveBeenCalledWith("urgent");
+  });
+
+  it.each([false, true])("keeps every adaptive TaskForm select labelled and actionable with Alpha=%s", async (enabled) => {
+    const user = userEvent.setup();
+    const onNodeIdChange = vi.fn();
+    const onBranchModeChange = vi.fn();
+    const onBaseBranchChange = vi.fn();
+    const onPriorityChange = vi.fn();
+    const onExecutionModeChange = vi.fn();
+    const onPresetModeChange = vi.fn();
+    const onPlannerOversightLevelChange = vi.fn();
+    const onReviewLevelChange = vi.fn();
+    const onAutoMergeChange = vi.fn();
+    const { fetchGitBranches } = await import("../../api");
+    vi.mocked(fetchGitBranches).mockResolvedValue([{ name: "main" }] as never);
+
+    render(
+      <AlphaProvider enabled={enabled}>
+        <AlphaBoundary preserveDisabledDom>
+          <TaskForm
+            {...renderTaskFormDefaults}
+            forceMoreOptionsOpen
+            onNodeIdChange={onNodeIdChange}
+            nodeOptions={[{ id: "node-remote", name: "Remote", status: "online" } as never]}
+            branchMode="project-default"
+            onBranchModeChange={onBranchModeChange}
+            baseBranch=""
+            onBaseBranchChange={onBaseBranchChange}
+            priority="normal"
+            onPriorityChange={onPriorityChange}
+            executionMode="standard"
+            onExecutionModeChange={onExecutionModeChange}
+            onPresetModeChange={onPresetModeChange}
+            plannerOversightLevel=""
+            onPlannerOversightLevelChange={onPlannerOversightLevelChange}
+            onReviewLevelChange={onReviewLevelChange}
+            autoMerge={undefined}
+            onAutoMergeChange={onAutoMergeChange}
+          />
+        </AlphaBoundary>
+      </AlphaProvider>,
+    );
+
+    const choose = async (label: string, option: string) => {
+      const control = await screen.findByLabelText<HTMLSelectElement>(label);
+      expect(control.tagName).toBe("SELECT");
+      if (enabled) expect(control).toHaveAttribute("data-alpha-ui", "select");
+      else expect(control).not.toHaveAttribute("data-alpha-ui");
+      await user.selectOptions(control, option);
+    };
+
+    await choose("Execution Node Override", "Remote (Online)");
+    await choose("Branch strategy", "Use existing branch");
+    await choose("Merge target / base branch", "main");
+    await choose("Priority", "Urgent");
+    await choose("Execution mode", "Fast");
+    await choose("Preset", "Custom");
+    await choose("Planner oversight", "Autonomous recovery");
+    await choose("Review", "2 — Plan + Code");
+    await choose("Auto-merge", "Enabled");
+
+    expect(onNodeIdChange).toHaveBeenCalledWith("node-remote");
+    expect(onBranchModeChange).toHaveBeenCalledWith("existing");
+    expect(onBaseBranchChange).toHaveBeenCalledWith("main");
+    expect(onPriorityChange).toHaveBeenCalledWith("urgent");
+    expect(onExecutionModeChange).toHaveBeenCalledWith("fast");
+    expect(onPresetModeChange).toHaveBeenCalledWith("custom");
+    expect(onPlannerOversightLevelChange).toHaveBeenCalledWith("autonomous");
+    expect(onReviewLevelChange).toHaveBeenCalledWith(2);
+    expect(onAutoMergeChange).toHaveBeenCalledWith(true);
   });
 
   it("renders working branch input and base branch custom input when no branch options are available", () => {
@@ -543,31 +806,6 @@ describe("TaskForm", () => {
 
     expect(screen.queryByTestId("browser-verification-checkbox")).toBeNull();
     expect(screen.queryByText("Browser Verification")).toBeNull();
-  });
-
-  it("in create mode: shows Plan and Subtask buttons", () => {
-    renderTaskForm({
-      mode: "create",
-      onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
-    });
-
-    expect(screen.getByRole("button", { name: "Plan" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Subtask" })).toBeTruthy();
-  });
-
-  it("in edit mode: hides Plan/Subtask buttons, shows title field", () => {
-    renderTaskForm({
-      mode: "edit",
-      title: "My task",
-      onTitleChange: vi.fn(),
-      onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
-    });
-
-    expect(screen.queryByRole("button", { name: "Plan" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Subtask" })).toBeNull();
-    expect(screen.getByLabelText(/Title/i)).toBeTruthy();
   });
 
   it("renders description expand button in edit mode and toggles fullscreen", () => {
@@ -898,59 +1136,52 @@ describe("TaskForm", () => {
 });
 
 describe("TaskForm description-adjacent actions layout (FN-781)", () => {
-  it("renders Plan and Subtask in description-actions area in create mode", () => {
-    renderTaskForm({
-      mode: "create",
-      description: "Some task",
-      onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
+
+  it("renders Start only for create hosts that supply a callback", () => {
+    const { unmount } = renderTaskForm({
+      onStartSubmit: vi.fn(),
+      startSubmitLabel: "Starting...",
+      startSubmitDisabled: true,
     });
 
-    // The description-actions container should exist
-    expect(screen.getByTestId("task-form-description-actions")).toBeTruthy();
+    expect(screen.getByTestId("task-form-inline-start")).toBeDisabled();
+    expect(screen.getByTestId("task-form-inline-start")).toHaveAccessibleName("Starting...");
 
-    // Plan and Subtask buttons should be inside it
-    const actionsContainer = screen.getByTestId("task-form-description-actions");
-    expect(actionsContainer.contains(screen.getByTestId("task-form-plan-button"))).toBe(true);
-    expect(actionsContainer.contains(screen.getByTestId("task-form-subtask-button"))).toBe(true);
+    unmount();
+    renderTaskForm({});
+    expect(screen.queryByTestId("task-form-inline-start")).toBeNull();
+    expect(screen.getByTestId("task-form-description-actions").querySelector("button:empty")).toBeNull();
   });
 
-  it("does not render description-actions in edit mode", () => {
+  it("marks only icon-only create actions with the compact sizing class", () => {
+    renderTaskForm({
+      onExecutionModeChange: vi.fn(),
+      executionMode: "standard",
+      onPriorityChange: vi.fn(),
+      onPlanningMode: vi.fn(),
+    });
+
+    expect(screen.getByTestId("task-form-inline-fast")).toHaveClass("task-form-inline-icon-btn");
+    expect(screen.getByTestId("task-form-inline-priority")).toHaveClass("task-form-inline-icon-btn");
+    expect(screen.getByTestId("task-form-inline-attach")).not.toHaveClass("task-form-inline-icon-btn");
+    expect(screen.getByTestId("task-form-inline-models")).not.toHaveClass("task-form-inline-icon-btn");
+    expect(screen.getByTestId("task-form-plan-button")).not.toHaveClass("task-form-inline-icon-btn");
+  });
+
+  it("does not render description-actions or Start in edit mode", () => {
     renderTaskForm({
       mode: "edit",
       title: "My task",
       onTitleChange: vi.fn(),
       description: "Some task",
       onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
+      onStartSubmit: vi.fn(),
+      startSubmitLabel: "Start",
     });
 
     expect(screen.queryByTestId("task-form-description-actions")).toBeNull();
+    expect(screen.queryByTestId("task-form-inline-start")).toBeNull();
     expect(screen.queryByTestId("task-form-inline-optional-steps")).toBeNull();
-  });
-
-  it("Plan and Subtask buttons are disabled when description is empty", () => {
-    renderTaskForm({
-      mode: "create",
-      description: "",
-      onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
-    });
-
-    expect((screen.getByTestId("task-form-plan-button") as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByTestId("task-form-subtask-button") as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it("Plan and Subtask buttons are enabled when description has content", () => {
-    renderTaskForm({
-      mode: "create",
-      description: "A real task",
-      onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
-    });
-
-    expect((screen.getByTestId("task-form-plan-button") as HTMLButtonElement).disabled).toBe(false);
-    expect((screen.getByTestId("task-form-subtask-button") as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("Refine button remains near the description textarea", () => {
@@ -958,7 +1189,6 @@ describe("TaskForm description-adjacent actions layout (FN-781)", () => {
       mode: "create",
       description: "Some text",
       onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
     });
 
     // Refine button should be rendered (it's inside the description-with-refine wrapper)
@@ -1038,8 +1268,9 @@ describe("TaskForm preset selection (FN-819)", () => {
 
     expect(onPresetModeChange).toHaveBeenCalledWith("preset");
     expect(onSelectedPresetIdChange).toHaveBeenCalledWith("fast");
-    expect(onExecutorModelChange).toHaveBeenCalledWith("anthropic/claude-sonnet-4-5");
-    expect(onValidatorModelChange).toHaveBeenCalledWith("openai/gpt-4o");
+    // FNXC:TaskForm 2026-07-24-23:05: model/preset handlers pass TaskFormValueChangeMeta so NewTaskModal can ignore initialization seeds vs user picks.
+    expect(onExecutorModelChange).toHaveBeenCalledWith("anthropic/claude-sonnet-4-5", { source: "user" });
+    expect(onValidatorModelChange).toHaveBeenCalledWith("openai/gpt-4o", { source: "user" });
   });
 
   it("switching to default clears preset and model overrides", async () => {
@@ -1080,8 +1311,8 @@ describe("TaskForm preset selection (FN-819)", () => {
 
     expect(onPresetModeChange).toHaveBeenCalledWith("default");
     expect(onSelectedPresetIdChange).toHaveBeenCalledWith("");
-    expect(onExecutorModelChange).toHaveBeenCalledWith("");
-    expect(onValidatorModelChange).toHaveBeenCalledWith("");
+    expect(onExecutorModelChange).toHaveBeenCalledWith("", { source: "user" });
+    expect(onValidatorModelChange).toHaveBeenCalledWith("", { source: "user" });
   });
 
   it("switching to custom clears preset ID", async () => {
@@ -1564,7 +1795,8 @@ describe("TaskForm focus behavior (FN-1459)", () => {
       });
 
       await waitFor(() => {
-        expect(onGithubTrackingEnabledChange).toHaveBeenCalledWith(true);
+        // FNXC:TaskForm 2026-07-24-23:05: settings-default seed marks source initialization so create flow can avoid treating it as a user edit.
+        expect(onGithubTrackingEnabledChange).toHaveBeenCalledWith(true, { source: "initialization" });
       });
     });
 
@@ -1598,5 +1830,36 @@ describe("TaskForm focus behavior (FN-1459)", () => {
 
       expect(screen.getByText("Repository must be in owner/repo format.")).toBeInTheDocument();
     });
+  });
+});
+
+describe("JIRA branch derivation", () => {
+  beforeEach(async () => {
+    const { fetchSettings } = await import("../../api");
+    vi.mocked(fetchSettings).mockResolvedValue({ modelPresets: [], autoSelectModelPreset: false, defaultPresetBySize: {}, jiraEnabled: true } as never);
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("fills the editable branch field only after an explicit successful derive", async () => {
+    const onBranchChange = vi.fn();
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(JSON.stringify({ ok: true, branchName: "feature/PRD-1234-my-slug" }), { status: 200 }));
+    renderTaskForm({ branch: "feature/manual", onBranchChange });
+    fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
+    await screen.findByTestId("jira-derive-branch");
+    fireEvent.change(screen.getByLabelText("JIRA issue key"), { target: { value: "PRD-1234" } });
+    fireEvent.click(screen.getByTestId("jira-derive-branch").querySelector("button")!);
+    await waitFor(() => expect(onBranchChange).toHaveBeenCalledWith("feature/PRD-1234-my-slug"));
+  });
+
+  it("keeps a manual branch and renders a recoverable derivation error", async () => {
+    const onBranchChange = vi.fn();
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(JSON.stringify({ ok: false, message: "JIRA issue was not found." }), { status: 200 }));
+    renderTaskForm({ branch: "feature/manual", onBranchChange });
+    fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
+    await screen.findByTestId("jira-derive-branch");
+    fireEvent.change(screen.getByLabelText("JIRA issue key"), { target: { value: "PRD-404" } });
+    fireEvent.click(screen.getByTestId("jira-derive-branch").querySelector("button")!);
+    expect(await screen.findByText("JIRA issue was not found.")).toBeInTheDocument();
+    expect(onBranchChange).not.toHaveBeenCalled();
   });
 });

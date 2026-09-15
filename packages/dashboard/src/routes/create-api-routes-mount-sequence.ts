@@ -8,17 +8,17 @@ precedence while residual inline routes are reduced by a separate ratchet.
 export const CREATE_API_ROUTES_REGISTRAR_MOUNT_SEQUENCE = [
   "registerSettingsMemoryRoutes", "registerSecretsRoutes", "registerTaskWorkflowRoutes", "registerWorkflowRoutes",
   "registerPlanningSubtaskRoutes", "registerChatRoutes", "registerChatRoomRoutes", "registerMessagingScriptRoutes",
-  "registerGitGitHubRoutes", "registerGitLabRoutes", "registerFilesTerminalWorkspaceRoutes", "registerAgentsProjectsNodesRoutes",
+  "registerGitGitHubRoutes", "registerGitLabRoutes", "registerJiraRoutes", "registerFilesTerminalWorkspaceRoutes", "registerAgentsProjectsNodesRoutes",
   "registerPluginsAutomationRoutes", "registerApprovalRoutes", "registerWorktrunkRoutes", "registerConfigMcpPiSettingsRoutes", "registerSystemMaintenanceRoutes", "registerModelRoutes",
   "registerCustomProviderRoutes", "registerAuthRoutes", "registerRuntimeProviderRoutes", "registerFnBinaryRoutes",
   "registerAiTextAssistantRoutes", "registerUsageRoutes", "registerCommandCenterRoutes", "registerKnowledgeRoutes", "registerReportRoutes",
-  "registerSignalRoutes", "registerMonitorRoutes", "registerUpdateCheckRoutes", "registerDiagnosticsRoutes",
+  "registerSignalRoutes", "registerMonitorRoutes", "registerUpdateCheckRoutes", "registerVoiceRoutes", "registerDiagnosticsRoutes",
   "registerCliAgentHooksRoute", "registerCliAgentSettingsRoutes", "registerActivityLogRoutes", "registerAgentCoreListCreateRoutes", "registerAgentImportExportRoutes",
   "registerOrgPortabilityRoutes", "registerAgentCoreRoutes", "registerAgentRuntimeRoutes", "registerSystemRoutes",
   "registerAgentReflectionRatingRoutes", "registerAgentGenerationRoutes", "registerIntegratedRouters", "registerProjectRoutes",
   "registerNodeRoutes", "registerDockerNodeRoutes", "registerDockerProvisioningRoutes", "registerSettingsSyncRoutes",
-  "registerSecretsSyncRoutes", "registerMeshRoutes", "registerDiscoveryRoutes", "registerSettingsSyncInboundRoutes",
-  "registerSecretsSyncInboundRoutes", "registerSetupActivityRoutes", "registerIntegratedDevServerRouter", "registerAgentSkillsRoutes", "registerProxyRoutes",
+  "registerSecretsSyncRoutes", "registerMeshRoutes", "registerDiscoveryRoutes", "registerUiMetadataRoutes", "registerSettingsSyncInboundRoutes",
+  "registerSecretsSyncInboundRoutes", "registerSetupActivityRoutes", "registerIntegratedDevServerRouter", "registerAgentSkillsRoutes", "registerPatchnodeRoutes", "registerProxyRoutes",
 ] as const;
 
 export type CreateApiRoutesRegistrarId = (typeof CREATE_API_ROUTES_REGISTRAR_MOUNT_SEQUENCE)[number];

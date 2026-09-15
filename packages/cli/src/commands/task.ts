@@ -1,8 +1,8 @@
-import { TaskStore, COLUMNS, COLUMN_LABELS, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
-import { isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, installBaselineArchiveWorktreeDisposer } from "@fusion/engine";
+import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, workflowHasColumn, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
+import { admitTaskToWip, isFirstPlanningToWipAdmission, isInReviewMissingWorktreeSessionStartFailure, planTaskWorktreePath, runAiMerge, landWorkspaceTask, withWorkspaceMergeDispatchLease, clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp } from "@fusion/engine";
 import { createInterface } from "node:readline/promises";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
-import { createSession, submitResponse, validateSession, RateLimitError, SessionNotFoundError, InvalidSessionStateError } from "@fusion/dashboard/planning";
+import { createSession, createTaskFromPlanSession, ensureDurablePlanningSessionStore, getSession as getPlanningSession, submitResponse, validateSession, RateLimitError, SessionNotFoundError, InvalidSessionStateError } from "@fusion/dashboard/planning";
 import { watchFile, unwatchFile, statSync, existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import * as dashboard from "@fusion/dashboard";
@@ -13,15 +13,50 @@ import {
   runGhJsonAsync,
 } from "@fusion/core/gh-cli";
 import { resolveProject, createLocalStore, closeProjectStore, type ProjectContext } from "../project-context.js";
+import { promptOutputStream, result as outputResult } from "../output.js";
 import { findNodeByNameOrId } from "./node.js";
 import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
 
 const STEP_STATUSES: StepStatus[] = ["pending", "in-progress", "done", "skipped"];
 
+/*
+FNXC:TaskMessageLength 2026-08-29-08:02:
+CLI refine, comment, and steer commands must use the same shared upper bound as dashboard routes and
+composers, so pasted operator instructions are admitted consistently on every task-text surface.
+*/
+
 /** #1403: display a column's label, falling back to the raw id for
  *  workflow-defined custom columns that have no legacy label. */
 function columnLabel(column: ColumnId): string {
   return (COLUMN_LABELS as Record<string, string>)[column] ?? column;
+}
+
+/*
+FNXC:CliBoardVocabulary 2026-07-30-23:40:
+The lanes `fn task list` prints, derived from the CARDS rather than from the legacy enum.
+
+`runTaskList` iterated the six-id `COLUMNS` constant and filtered `t.column === col`, so a task in a
+workflow-defined column matched no iteration and was NOT PRINTED. Not a wrong label — the card is
+absent, and the output reads as a shorter, healthy board rather than as a bug. A fully renamed board
+prints nothing but the header.
+
+Derived from the tasks, not from a resolved IR, deliberately: a board can span several workflows and
+therefore has no single column list, and a card must never depend on a resolution succeeding in order
+to be VISIBLE. Legacy ids keep their familiar order; anything else follows alphabetically, so output
+is deterministic.
+
+Exported for test: `runTaskList` itself resolves a real project context and ends in `process.exit`,
+so covering it end-to-end would need a mock-the-world shell — the shape `docs/testing.md` tells us to
+avoid when a narrower seam exists. This IS the seam: it is the whole decision about which lanes appear.
+*/
+export function boardColumnsForDisplay(tasks: ReadonlyArray<{ column: ColumnId }>): ColumnId[] {
+  const legacyOrder = (id: string) => {
+    const index = (COLUMNS as readonly string[]).indexOf(id);
+    return index === -1 ? COLUMNS.length : index;
+  };
+  return [...new Set(tasks.map((t) => t.column))].sort((a, b) =>
+    legacyOrder(a) === legacyOrder(b) ? String(a).localeCompare(String(b)) : legacyOrder(a) - legacyOrder(b),
+  );
 }
 
 // Register GitHub tracking hook so CLI task creation paths (add, duplicate,
@@ -50,20 +85,9 @@ function getResearchSourceContext(sourceMetadata: unknown): string | undefined {
   return typeof runId === "string" && runId.length > 0 ? runId : undefined;
 }
 
-async function formatTaskDuplicateLineage(task: Awaited<ReturnType<TaskStore["getTask"]>>, store: TaskStore): Promise<string | null> {
+function formatTaskDuplicateLineage(task: Awaited<ReturnType<TaskStore["getTask"]>>): string | null {
   const lineage = getTaskDuplicateLineage(task);
-  if (lineage.length === 0) return null;
-
-  const labels = await Promise.all(lineage.map(async (id) => {
-    try {
-      const linked = await store.getTask(id);
-      return linked.column === "archived" ? `${id} (archived)` : id;
-    } catch {
-      return id;
-    }
-  }));
-
-  return labels.join(", ");
+  return lineage.length > 0 ? lineage.join(", ") : null;
 }
 
 function formatTaskSource(task: {
@@ -152,7 +176,6 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     if (!context) {
       throw new Error(`Project ${projectName} not found`);
     }
-    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings()});
     return context;
   }
 
@@ -161,7 +184,6 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     if (!context) {
       throw new Error("No project context");
     }
-    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings()});
     return context;
   } catch {
     // FNXC:PostgresCutover 2026-07-05-12:00: the cwd fallback must boot through
@@ -169,7 +191,6 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     // resolves to the removed SQLite runtime, which throws on first DB access.
     const store = await createLocalStore(process.cwd());
     const context = asLocalProjectContext(store);
-    installBaselineArchiveWorktreeDisposer(store, {rootDir: context.projectPath, getSettings: () => store.getSettings()});
     return context;
   }
 }
@@ -334,8 +355,22 @@ async function runCliNearDuplicateCheck(args: {
     }
     if (!args.bypass) {
       const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-      const taskCandidates = (await args.store.listTasks({ slim: false, includeArchived: false }))
-        .filter((task) => task.column !== "done")
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-08-02-08:15 (fleet: CLI surface):
+      Duplicate detection compares against UNFINISHED work, and "finished" is the board's complete column.
+      With the literal, a renamed board kept every completed card in the candidate set: the guard then
+      reported a new task as a duplicate of work that had already landed, which is the opposite of useful.
+      Resolved per candidate through one shared cache, because candidates can span workflows.
+      */
+      const candidateIrCache = new Map<string, never>();
+      const allCandidates = await args.store.listTasks({ slim: false, includeArchived: false });
+      const completeByTaskId = new Map<string, string>();
+      for (const task of allCandidates) {
+        const lifecycle = await resolveTaskLifecycleColumns(args.store, task.id, candidateIrCache as never);
+        completeByTaskId.set(task.id, lifecycle?.complete ?? "done");
+      }
+      const taskCandidates = allCandidates
+        .filter((task) => task.column !== completeByTaskId.get(task.id))
         .filter((task) => {
           const createdAtMs = Date.parse(task.createdAt);
           return Number.isFinite(createdAtMs) && createdAtMs >= cutoff;
@@ -382,7 +417,8 @@ async function runCliNearDuplicateCheck(args: {
     process.exit(1);
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
   try {
     const answer = (await rl.question("Create anyway? [y/N]: ")).trim().toLowerCase();
     if (answer === "y" || answer === "yes") {
@@ -396,11 +432,25 @@ async function runCliNearDuplicateCheck(args: {
   process.exit(0);
 }
 
-export async function runTaskCreate(descriptionArg?: string, attachFiles?: string[], depends?: string[], projectName?: string, nodeName?: string, noDedup = false) {
+export async function runTaskCreate(descriptionArg?: string, attachFiles?: string[], depends?: string[], projectName?: string, nodeName?: string, noDedup = false, githubOpts?: { github?: boolean; githubRepo?: string }) {
   let description = descriptionArg;
 
+  /*
+  FNXC:GithubTracking 2026-08-15-03:50:
+  `fn task create --github [--github-repo owner/repo]` decides tracking at CREATE time,
+  because the tracking lifecycle keys off the persisted `task.githubTracking.enabled === true`
+  flag and never re-resolves project/global defaults for existing tasks. Before this flag,
+  CLI-created tasks could not opt in at all (only the dashboard and fn_task_create could).
+  Explicit `--no-github` persists `enabled:false` so a later default flip cannot re-enable it.
+  */
+  const githubRepoOverride = githubOpts?.githubRepo?.trim() || undefined;
+  if (githubRepoOverride && !isValidRepoSlug(githubRepoOverride)) {
+    console.error(`Invalid --github-repo "${githubRepoOverride}" — expected "owner/repo".`);
+    process.exit(1);
+  }
+
   if (!description) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     description = await rl.question("Task description: ");
     rl.close();
   }
@@ -454,21 +504,75 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
             ...(guard.fingerprint ? { contentFingerprint: guard.fingerprint } : {}),
             ...(hasIntentSignal(nearDuplicate.signature) ? { intentSignature: nearDuplicate.signature } : {}),
           };
+          /*
+          FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+          `fn task create` honors the project `taskCreateWorkflowId` setting: a pinned
+          workflow, else the operator's mirrored Board lane ("Selected workflow"), else
+          `undefined` — which leaves createTask on its existing project-default path, so
+          an unconfigured project behaves exactly as before. The resolver validates the
+          id, so a stale value can never make CLI create throw.
+          */
+          const originWorkflowId = await store.resolveOriginWorkflowOverrideId("task-create");
+          /*
+          FNXC:GithubTracking 2026-08-15-03:50:
+          Same create-time resolution as fn_task_create: CLI flag > project default >
+          global default. Also fixes CLI creates silently ignoring a project's
+          "GitHub tracking enabled by default" setting (the persisted flag is the only
+          thing the tracking lifecycle reads).
+          */
+          const globalSettingsForTracking = await store.getGlobalSettingsStore().getSettings();
+          const resolvedTracking = resolveTaskGithubTracking(
+            {
+              githubTracking:
+                githubOpts?.github !== undefined || githubRepoOverride
+                  ? {
+                      ...(githubOpts?.github !== undefined ? { enabled: githubOpts.github } : {}),
+                      ...(githubRepoOverride ? { repoOverride: githubRepoOverride } : {}),
+                    }
+                  : undefined,
+            },
+            await store.getSettings(),
+            globalSettingsForTracking,
+          );
+          const githubTracking = resolvedTracking.enabled
+            ? {
+                enabled: true as const,
+                ...(resolvedTracking.repo
+                  ? { repoOverride: `${resolvedTracking.repo.owner}/${resolvedTracking.repo.repo}` }
+                  : {}),
+              }
+            : githubOpts?.github === false
+              ? { enabled: false as const }
+              : undefined;
+          /*
+          FNXC:GithubTracking 2026-08-15-04:50:
+          Suppress the task-created hook here and invoke tracking-issue creation
+          DIRECTLY after the create block instead. With autoSummarizeTitles on, a
+          long, title-less description routes the hook onto the deferred
+          fire-and-forget summarize chain, and the short-lived CLI process closes
+          the store and exits before it runs — the task ends up with
+          githubTracking.enabled=true but no issue ever created (observed:
+          FN-9045..FN-9061). A synchronous post-create call is exactly-once and
+          deterministic; maybeCreateTrackingIssue does its own title summarization
+          when the task has none.
+          */
           const created = await store.createTask({
             description: trimmedDescription,
             dependencies: depends,
+            ...(originWorkflowId ? { workflowId: originWorkflowId } : {}),
+            ...(githubTracking ? { githubTracking } : {}),
             source: {
               sourceType: "cli",
               sourceMetadata: Object.keys(sourceMetadata).length > 0 ? sourceMetadata : undefined,
             },
-          });
+          }, { invokeTaskCreatedHook: false });
 
           const reconcileResult = await reconcileDeterministicDuplicate(store, {
             createdTask: created,
             fingerprint: guard.fingerprint,
           });
           createdOrLinked = reconcileResult.canonical;
-          didLinkExisting = reconcileResult.outcome === "archived";
+          didLinkExisting = reconcileResult.outcome === "removed";
         }
       } finally {
         guard.releaseLock();
@@ -506,9 +610,9 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
       console.log(`  Project: ${context.projectName}`);
     }
     if (linkedExisting) {
-      console.log(`  ✓ Linked existing ${resolvedTask.id}: ${label}`);
+      outputResult(`  ✓ Linked existing ${resolvedTask.id}: ${label}\n`);
     } else {
-      console.log(`  ✓ Created ${resolvedTask.id}: ${label}`);
+      outputResult(`  ✓ Created ${resolvedTask.id}: ${label}\n`);
     }
     console.log(`    Column: ${resolvedTask.column}`);
     if (resolvedTask.dependencies.length > 0) {
@@ -518,6 +622,26 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
       console.log(`    Node: ${resolvedNode.name || resolvedNode.id}`);
     }
     console.log(`    Path:   .fusion/tasks/${resolvedTask.id}/`);
+
+    /*
+    FNXC:GithubTracking 2026-08-15-04:50:
+    Create the tracking issue synchronously before the CLI exits (the create
+    call above suppressed the task-created hook; see the create-site note).
+    Runs only for fresh creates: a linked-existing canonical already had its
+    own create-time pass.
+    */
+    if (!linkedExisting && resolvedTask.githubTracking?.enabled === true && !resolvedTask.githubTracking?.issue) {
+      try {
+        await dashboard.createTrackingIssueForTask?.(store, resolvedTask);
+        const refreshed = await store.getTask(resolvedTask.id).catch(() => undefined);
+        const issue = refreshed?.githubTracking?.issue;
+        if (issue) {
+          console.log(`    GitHub: ${issue.owner}/${issue.repo}#${issue.number}`);
+        }
+      } catch (error) {
+        console.error(`    ✗ GitHub tracking issue not created: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
 
     if (attachFiles && attachFiles.length > 0) {
       const { readFile } = await import("node:fs/promises");
@@ -574,27 +698,118 @@ export async function runTaskList(projectName?: string) {
     console.log();
   }
 
-  for (const col of COLUMNS) {
-    const colTasks = tasks.filter((t) => t.column === col);
-    if (colTasks.length === 0) continue;
+  /*
+  FNXC:CliBoardVocabulary 2026-07-30-23:40:
+  Iterate the columns the BOARD has, not the legacy six — a renamed card was not printed AT ALL.
 
-    const label = COLUMN_LABELS[col];
-    const dot =
-      col === "triage" ? "●" :
-      col === "todo" ? "●" :
-      col === "in-progress" ? "●" :
-      col === "in-review" ? "●" : "○";
+  This loop ran `for (const col of COLUMNS)` and filtered `t.column === col`, so any task in a
+  workflow-defined column matched no iteration and `fn task list` silently omitted it. Not a wrong
+  label or a wrong glyph: the card is absent, and the output looks like a shorter, healthy board.
+  On a fully renamed board the command prints nothing but the header.
 
-    console.log(`  ${dot} ${label} (${colTasks.length})`);
-    for (const t of colTasks) {
-      const deps = t.dependencies.length ? ` [deps: ${t.dependencies.join(", ")}]` : "";
-      const label = t.title || t.description.slice(0, 60) + (t.description.length > 60 ? "…" : "");
-      console.log(`    ${t.id}  ${label}${deps}`);
-    }
-    console.log();
+  The glyph note directly above predicted exactly this ("If this ever iterates workflow-resolved
+  columns, that difference becomes live and the right answer is a trait lookup, not this") and left
+  the deeper bug named as R8/U10 surface work. It is fixed here because the two cannot be separated:
+  once the loop can yield a custom id, the terminal test below MUST stop being an id comparison.
+
+  Columns come from the TASKS rather than from a resolved IR, so every card is rendered whatever its
+  workflow — a board spanning several workflows has no single column list, and a card must never
+  depend on resolution succeeding to be visible. Legacy ids keep their familiar order and labels;
+  anything else follows, alphabetically, so the output is deterministic.
+
+  Terminal lanes ARE resolved, because that is a display question with a real answer and this
+  function is async with a store in hand. Best-effort: a failed resolve falls back to the legacy
+  pair rather than failing the command, and an unresolved custom lane renders as active — the same
+  fail-open direction used elsewhere, since showing a finished card with the wrong glyph is a far
+  smaller error than the blank board this replaces.
+  */
+  for (const line of await buildTaskListBoardLines(
+    context.store as Parameters<typeof resolveProjectColumnsForRoles>[0],
+    tasks,
+  )) {
+    console.log(line);
   }
 
   await closeBoardContextAndExit(context, 0);
+}
+
+/** A card as the board renderer reads it. */
+export interface BoardLineTask {
+  id: string;
+  column: string;
+  title?: string | null;
+  description: string;
+  dependencies: string[];
+}
+
+/**
+ * FNXC:CliBoardGlyph 2026-07-31-20:23:
+ * The board renderer, INCLUDING its terminal-lane resolve, behind one seam.
+ *
+ * WHY THIS EXISTS. The resolve below was unreachable by any test: it sat inline in `runTaskList`,
+ * which resolves a real project context and ends in `process.exit`, so driving it needs the
+ * mock-the-world shell `docs/testing.md` forbids. Blinding it left the whole CLI suite green.
+ *
+ * Extracting a helper that RECEIVES the lane set would not have helped — such a test passes with the
+ * resolve blinded, because the resolve is the uncovered thing, not the decision it feeds. This
+ * function RESOLVES, so blinding the resolve fails a test of it. Same seam shape as
+ * `resolveReliabilityLanes` in the dashboard.
+ *
+ * Returns the lines rather than printing them, so a test can read the glyph without capturing
+ * stdout. `runTaskList` prints them unchanged.
+ */
+export async function buildTaskListBoardLines(
+  store: Parameters<typeof resolveProjectColumnsForRoles>[0],
+  tasks: BoardLineTask[],
+): Promise<string[]> {
+  /*
+  Best-effort: a failed resolve falls back to the legacy pair rather than failing the command, and an
+  unresolved custom lane renders as active — showing a finished card with the wrong glyph is a far
+  smaller error than failing the whole board.
+  */
+  const terminalColumns = await resolveProjectColumnsForRoles(store, TERMINAL_ROLES).catch(() => undefined);
+
+  const lines: string[] = [];
+  for (const col of boardColumnsForDisplay(tasks)) {
+    const colTasks = tasks.filter((t) => t.column === col);
+    if (colTasks.length === 0) continue;
+
+    const label = columnLabel(col);
+    /*
+    FNXC:CliBoardGlyph 2026-07-29-22:40 (lifecycle-column vocabulary):
+    All four non-terminal columns rendered the SAME glyph, so the four id comparisons
+    were only ever asking "is this column terminal?". Naming `triage` here made it a
+    lifecycle-vocabulary site for no behavioural reason — the merged Planning column
+    dropped that id, and this comparison silently stopped matching while the output
+    stayed correct by accident (the fallthrough gave it `●` anyway).
+
+    Asking the terminal question directly removes the vocabulary dependency. It is
+    behaviour-identical ONLY because this loop iterates the legacy `COLUMNS` constant
+    (types/board.ts:27 — exactly the six ids), so `col` can never be a custom id. Worth
+    stating because the two forms DIVERGE outside that set: the old chain fell through
+    to `○` for an unrecognised id, this returns `●`. If this ever iterates
+    workflow-resolved columns, that difference becomes live and the right answer is a
+    trait lookup, not this.
+
+    NOT claimed as trait-resolved, and the deeper bug is left alone: because the loop
+    iterates the legacy enum, a card in a workflow-renamed column is not rendered AT
+    ALL. That is the R8/U10 surface change (no surface derives its column set from the
+    legacy enum) and a far bigger fix than this glyph.
+    */
+    /* The "retires with the loop" condition above is now met: `col` can be a custom id, so the terminal
+       test is a resolved-lane membership check. DELIBERATE-LITERAL only as the degraded fallback when the
+       resolve failed, which is the documented unconverted-caller default. */
+    const dot = (terminalColumns ? terminalColumns.has(col) : col === "done") ? "○" : "●";
+
+    lines.push(`  ${dot} ${label} (${colTasks.length})`);
+    for (const t of colTasks) {
+      const deps = t.dependencies.length ? ` [deps: ${t.dependencies.join(", ")}]` : "";
+      const label = t.title || t.description.slice(0, 60) + (t.description.length > 60 ? "…" : "");
+      lines.push(`    ${t.id}  ${label}${deps}`);
+    }
+    lines.push("");
+  }
+  return lines;
 }
 
 export async function runTaskUpdate(id: string, stepStr: string, status: string, projectName?: string) {
@@ -613,7 +828,7 @@ export async function runTaskUpdate(id: string, stepStr: string, status: string,
   // wrap resolution+write in one retryable unit via `withBoardWrite`, closing
   // the resolved store on every attempt.
   await withBoardWrite(projectName, { id, action: "update step" }, async (context) => {
-    const task = await context.store.updateStep(id, stepIndex, status as StepStatus);
+    const task = await context.store.updateStep(id, stepIndex, status as StepStatus, { operatorOverride: true });
 
     const step = task.steps[stepIndex];
     console.log();
@@ -688,6 +903,9 @@ const ANSI = {
   gray: "\x1b[90m",
 };
 
+/** Maximum single-line tool detail length that stays compact beside its header. */
+const CLI_INLINE_DETAIL_MAX = 120;
+
 /**
  * Format a timestamp for display (locale time string)
  */
@@ -695,9 +913,21 @@ function formatTimestamp(timestamp: string): string {
   return new Date(timestamp).toLocaleTimeString();
 }
 
-/**
- * Format a single agent log entry for display
- */
+function formatToolDetail(detail: string | undefined): string {
+  if (!detail) return "";
+  if (!detail.includes("\n") && detail.length <= CLI_INLINE_DETAIL_MAX) {
+    return ` (${detail})`;
+  }
+  const block = detail.split(/\r?\n/).map((line) => `    ${line}`).join("\n");
+  return `\n${ANSI.dim}${ANSI.gray}${block}${ANSI.reset}`;
+}
+
+/*
+FNXC:CliTaskLogs 2026-08-29-04:55:
+FN-253 makes tool arguments and results default-persisted. Keep short single-line details inline,
+but render longer or multiline payloads as one indented, dimmed block so each log entry remains one
+console.log call while terminal readers can scan the complete bounded durable payload.
+*/
 function formatLogEntry(entry: AgentLogEntry): string {
   const ts = formatTimestamp(entry.timestamp);
   const agent = entry.agent ? `[${entry.agent.toUpperCase()}] ` : "";
@@ -708,11 +938,11 @@ function formatLogEntry(entry: AgentLogEntry): string {
     case "thinking":
       return `${ANSI.dim}${ANSI.gray}  ${ts} ${agent}[THINK] ${entry.text}${ANSI.reset}`;
     case "tool":
-      return `  ${ts} ${agent}[TOOL] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}`;
+      return `  ${ts} ${agent}[TOOL] ${entry.text}${formatToolDetail(entry.detail)}`;
     case "tool_result":
-      return `  ${ts} ${agent}[RESULT] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}`;
+      return `  ${ts} ${agent}[RESULT] ${entry.text}${formatToolDetail(entry.detail)}`;
     case "tool_error":
-      return `${ANSI.red}  ${ts} ${agent}[ERROR] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}${ANSI.reset}`;
+      return `${ANSI.red}  ${ts} ${agent}[ERROR] ${entry.text}${formatToolDetail(entry.detail)}${ANSI.reset}`;
     default:
       return `  ${ts} ${agent}${entry.text}`;
   }
@@ -889,7 +1119,11 @@ export async function runTaskSetNode(id: string, nodeNameOrId: string, projectNa
   await withBoardWrite(projectName, { id, action: "set node override" }, async (context) => {
     const task = await context.store.getTask(id);
 
-    if (task.column === "in-progress") {
+    /* FNXC:WorkflowLifecycleColumns 2026-08-02-08:20 (fleet: CLI surface): the board's wip lane. With the
+       literal these guards never fired on a renamed board, so `fn task set-node` / `clear-node` rewrote the
+       node override of a card that was actively executing — the guard exists because that races the run. */
+    const nodeGuardLifecycle = await resolveTaskLifecycleColumns(context.store, id);
+    if (task.column === (nodeGuardLifecycle?.wip ?? "in-progress")) {
       console.error(`Cannot change node override: task ${id} is in progress`);
       await closeBoardContextAndExit(context, 1);
       return;
@@ -915,7 +1149,11 @@ export async function runTaskClearNode(id: string, projectName?: string) {
   await withBoardWrite(projectName, { id, action: "clear node override" }, async (context) => {
     const task = await context.store.getTask(id);
 
-    if (task.column === "in-progress") {
+    /* FNXC:WorkflowLifecycleColumns 2026-08-02-08:20 (fleet: CLI surface): the board's wip lane. With the
+       literal these guards never fired on a renamed board, so `fn task set-node` / `clear-node` rewrote the
+       node override of a card that was actively executing — the guard exists because that races the run. */
+    const nodeGuardLifecycle = await resolveTaskLifecycleColumns(context.store, id);
+    if (task.column === (nodeGuardLifecycle?.wip ?? "in-progress")) {
       console.error(`Cannot change node override: task ${id} is in progress`);
       await closeBoardContextAndExit(context, 1);
       return;
@@ -976,7 +1214,7 @@ async function runTaskShowWithStore(id: string, store: TaskStore) {
   if (sourceSummary) {
     console.log(`  Source: ${sourceSummary}`);
   }
-  const duplicateLineage = await formatTaskDuplicateLineage(task, store);
+  const duplicateLineage = formatTaskDuplicateLineage(task);
   if (duplicateLineage) {
     console.log(`  Duplicate of: ${duplicateLineage}`);
   }
@@ -1010,80 +1248,147 @@ async function runTaskShowWithStore(id: string, store: TaskStore) {
 }
 
 export async function runTaskMerge(id: string, projectName?: string) {
-  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): resolve context ONCE
-  // (retried — replaces the previous double resolution via `getStore` +
-  // `getProjectPath`, each of which independently called `getCommandContext`)
-  // and close it in a `finally` covering EVERY exit path, including the
-  // `process.exit(1)` calls below. The AI merge (`runAiMerge`) and
-  // workspace-land (`landWorkspaceTask`) subflows are deliberately NOT
-  // retry-wrapped — they drive non-idempotent external git/AI operations,
-  // so retrying the whole flow on a lock blip could double-drive a merge or
-  // land (Step 1 audit decision).
+  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): resolve context ONCE.
   const context = await resolveBoardContext(projectName, id, "resolve project");
   const store = context.store;
   const projectPath = context.projectPath;
+  const abortController = new AbortController();
+  let wroteLocalMergeStamp = false;
+  let handlingSignal = false;
+  let handlersInstalled = false;
+  let storeClosed = false;
+  let signalShutdown: Promise<void> | undefined;
+
+  const closeStoreOnce = async () => {
+    if (storeClosed) return;
+    storeClosed = true;
+    await closeProjectStore(context).catch(() => undefined);
+  };
+
+  /*
+  FNXC:MergeReliability 2026-08-20-02:41:
+  Authorization B requires proof that this one-shot process wrote the stamp; a signal can arrive
+  after handlers install but before a merge body claims anything. Observe a successful local
+  `merging` write instead of inferring ownership from an indistinguishable row status, so cleanup
+  cannot clear another process's fresh generation. A write whose database outcome is unknown stays
+  unowned and is recoverable later only through authorization C's age evidence.
+  */
+  const mergeStore = new Proxy(store, {
+    get(target, property) {
+      if (property === "updateTask") {
+        return async (...args: Parameters<TaskStore["updateTask"]>) => {
+          const result = await target.updateTask(...args);
+          const patch = args[1];
+          if (args[0] === id && patch?.status === "merging") wroteLocalMergeStamp = true;
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as TaskStore;
+
+  const removeSignalHandlers = () => {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, onSignal);
+    handlersInstalled = false;
+  };
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (handlingSignal) return;
+    handlingSignal = true;
+    const exitCode = signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129;
+    // FNXC:MergeReliability 2026-08-20-02:00: A signal can make the merge body reject
+    // before its owner-clear settles. Share this promise with catch so only the signal
+    // path exits and it cannot terminate before authorization-B cleanup commits.
+    signalShutdown = (async () => {
+      abortController.abort();
+      if (wroteLocalMergeStamp) {
+        await clearOwnedMergeStamp(store, id, "MergeAborted").catch(() => undefined);
+      }
+      await closeStoreOnce();
+      removeSignalHandlers();
+      process.exit(exitCode);
+    })();
+  };
 
   console.log(`\n  Merging ${id} with AI...\n`);
 
   try {
     /*
-    FNXC:GrokCliRouting 2026-07-15-10:17:
-    `fn task merge` is a bare CLI door: ProjectContext only has store/path, not a live ProjectEngine, so no engine.getPluginRunner() is available. Do not invent a full PluginRunner bootstrap here (that belongs to InProcessRuntime / ProjectEngineManager). Omitting pluginRunner is intentional — grok-cli/no-key merge selections surface the dual-remediation error. Engine-backed merge already forwards this.getPluginRunner().
+    FNXC:MergeReliability 2026-08-20-02:00:
+    Authorization C applies before this one-shot CLI claims a merge: residue may belong to a hard-
+    killed process, so age evidence (not an indistinguishable `merging` compare) is required.
     */
+    if (await reconcileUnownedStaleMergeStamp(store, id)) {
+      console.log("  Cleared an age-proven stale merge status before claiming the task.");
+    }
 
-    // FNXC:Workspace 2026-06-21-23:40 (Phase C U1, KTD2):
-    // User-triggered `fn task merge`. A workspace-mode task routes through the
-    // ENGINE per-repo merge loop `landWorkspaceTask` (each sub-repo lands on its own
-    // LOCAL integration ref, no push) instead of throwing — manual merge works in
-    // Phase C (user decision). U0's R7 throw is replaced here by routing; the
-    // engine chokepoint + store.mergeTask/aiMergeTask keep throwing.
+    /*
+    FNXC:MergeReliability 2026-08-20-02:00:
+    Terminal closure is a named interruption. Unlike long-lived serve/dashboard/daemon processes,
+    this foreground command handles SIGHUP by aborting, owner-clearing (authorization B), closing,
+    and exiting 129; ignoring it would leave an invisible detached merge and Node otherwise exits.
+    */
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, onSignal);
+    handlersInstalled = true;
+
     const mergeTaskRecord = await store.getTask(id).catch(() => null);
-    // FNXC:Workspace 2026-06-22-09:30 (Phase C review B10): use the exported `isWorkspaceTask`
-    // (the engine/CLI canonical predicate) instead of re-inlining the workspaceWorktrees check.
     const isWorkspaceMerge = !!mergeTaskRecord && isWorkspaceTask(mergeTaskRecord);
     if (isWorkspaceMerge) {
-      const workspaceResult = await landWorkspaceTask(store, mergeTaskRecord!, projectPath, {
-        onAgentText: (delta) => process.stdout.write(delta),
-      });
+      const workspaceResult = await withWorkspaceMergeDispatchLease(mergeStore, id, (workspaceDispatchFence) =>
+        landWorkspaceTask(mergeStore, mergeTaskRecord!, projectPath, {
+          onAgentText: (delta) => process.stdout.write(delta),
+          signal: abortController.signal,
+          workspaceDispatchFence,
+          manual: true,
+        }),
+      );
       console.log();
       for (const repo of workspaceResult.repos) {
-        const label =
-          repo.status === "landed" ? `landed ${repo.landedSha?.slice(0, 8) ?? ""} → ${repo.integrationBranch}`
-          : repo.status === "empty" ? "no net changes"
-          : `failed: ${repo.error ?? "unknown"}`;
+        const label = repo.status === "landed" ? `landed ${repo.landedSha?.slice(0, 8) ?? ""} → ${repo.integrationBranch}` : repo.status === "empty" ? "no net changes" : `failed: ${repo.error ?? "unknown"}`;
         console.log(`  ${repo.status === "failed" ? "✗" : "✓"} ${repo.repo}: ${label}`);
       }
-      // FNXC:Workspace 2026-06-22-05:10 (Phase C review B3):
-      // landWorkspaceTask now finalizes the workspace task to done on allLanded (Phase C U2),
-      // so report it as merged rather than "remains in review until U2". A partial land leaves
-      // the task in review (landed repos stay landed locally) and exits non-zero.
-      console.log(
-        `\n  ${workspaceResult.allLanded ? "✓ All sub-repos landed — task finalized to done" : "✗ Partial land — see failures above (task remains in review; landed repos stay landed locally)"}\n`,
-      );
-      if (!workspaceResult.allLanded) await closeBoardContextAndExit(context, 1);
+      const workspaceMerged = workspaceResult.allLanded && workspaceResult.finalized;
+      console.log(`\n  ${workspaceMerged ? "✓ All sub-repos landed — task finalized to done" : workspaceResult.allLanded ? `✗ Merge blocked — ${workspaceResult.finalizeBlockedReason ?? "workspace finalize was blocked"} (task moved back with progress preserved)` : "✗ Partial land — see failures above (task remains in review; landed repos stay landed locally)"}\n`);
+      if (!workspaceMerged) await closeBoardContextAndExit(context, 1);
       return;
     }
 
-    const result = await runAiMerge(store, projectPath, id, {
-      onAgentText: (delta) => process.stdout.write(delta),
-    });
+    /*
+    FNXC:GrokCliRouting 2026-07-15-10:17:
+    `fn task merge` is a bare CLI door: ProjectContext only has store/path, not a live ProjectEngine, so no engine.getPluginRunner() is available. Do not invent a full PluginRunner bootstrap here (that belongs to InProcessRuntime / ProjectEngineManager). Omitting pluginRunner is intentional — grok-cli/no-key merge selections surface the dual-remediation error. Engine-backed merge already forwards this.getPluginRunner().
 
+    FNXC:GrokCliRouting 2026-08-23-16:30:
+    RESTORED, NOT REWRITTEN. FN-9167's merge-stamp work replaced this comment block wholesale while
+    leaving the behavior it documents untouched (no `pluginRunner` is forwarded below), so the
+    routing decision lost its only record. `grok-runtime-bootstrap.test.ts` pins it here for exactly
+    that reason.
+    */
+    const result = await runAiMerge(mergeStore, projectPath, id, {
+      onAgentText: (delta) => process.stdout.write(delta),
+      signal: abortController.signal,
+    });
     console.log();
     if (result.merged) {
       console.log(`  ✓ Merged ${result.task.id}`);
       console.log(`    Branch:   ${result.branch}`);
       console.log(`    Worktree: ${result.worktreeRemoved ? "removed" : "not found"}`);
       console.log(`    Branch:   ${result.branchDeleted ? "deleted" : "kept"}`);
-    } else {
-      console.log(`  ✓ Closed ${result.task.id} (${result.error})`);
-    }
-    console.log(`    Status:   done`);
-    console.log();
+    } else console.log(`  ✓ Closed ${result.task.id} (${result.error})`);
+    console.log("    Status:   done\n");
   } catch (err) {
+    // FNXC:MergeReliability 2026-08-20-02:27: A signal owns shutdown once installed;
+    // await its cleanup promise rather than racing a generic exit(1) against its clear.
+    if (signalShutdown) {
+      await signalShutdown;
+      return;
+    }
+    abortController.abort();
+    if (wroteLocalMergeStamp) await clearOwnedMergeStamp(store, id, "MergeAborted");
     console.error(`\n  ✗ ${err instanceof Error ? err.message : String(err)}\n`);
     await closeBoardContextAndExit(context, 1);
   } finally {
-    await closeProjectStore(context).catch(() => {});
+    if (handlersInstalled) removeSignalHandlers();
+    await closeStoreOnce();
   }
 }
 
@@ -1145,7 +1450,7 @@ export async function runTaskAttach(id: string, filePath: string, projectName?: 
 export async function runTaskPause(id: string, projectName?: string) {
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
   await withBoardWrite(projectName, { id, action: "pause task" }, async (context) => {
-    const task = await context.store.pauseTask(id, true);
+    const task = await context.store.pauseTask(id, true, undefined, { userPaused: true });
 
     console.log();
     console.log(`  ✓ Paused ${task.id}`);
@@ -1165,12 +1470,6 @@ export async function runTaskUnpause(id: string, projectName?: string) {
 }
 
 export async function runTaskMove(id: string, column: string, projectName?: string) {
-  if (!COLUMNS.includes(column as Column)) {
-    console.error(`Invalid column: ${column}`);
-    console.error(`Valid columns: ${COLUMNS.join(", ")}`);
-    process.exit(1);
-  }
-
   // FNXC:CliBoardMutation 2026-07-09-00:00 (generalized by FN-7734's
   // `withBoardWrite`): same rationale as runTaskShow above — wrap project/
   // store resolution (`getBoardCommandContext`, which can itself hit
@@ -1179,8 +1478,60 @@ export async function runTaskMove(id: string, column: string, projectName?: stri
   // every attempt. Only `database is locked`/SQLITE_BUSY|LOCKED errors are
   // retried; a genuinely invalid move (bad column, missing task) propagates
   // immediately without looping.
+  /*
+  FNXC:TaskMovement 2026-07-26-12:35:
+  `fn task move` is a human board action and must carry `moveSource: "user"` like
+  the dashboard's move route. Without it, moveTask defaulted the source to
+  "engine", so an in-progress → todo move from the CLI skipped the
+  disposeTaskBeforeMove hard-cancel seam — the board showed Todo while the
+  agent session kept running (Move-Task contract violation).
+  */
   await withBoardWrite(projectName, { id, action: "move task" }, async (context) => {
-    const task = await context.store.moveTask(id, column as Column);
+    /*
+    FNXC:PlanPremises 2026-09-13-05:28:
+    Column ids do not imply lifecycle roles: a custom workflow may assign countsTowardWip to a
+    legacy-looking id such as todo or review. Resolve the task and workflow before any raw move so
+    every first planning-to-WIP admission reaches the canonical premise gate.
+    */
+    const current = await context.store.getTask(id);
+    if (!current) throw new Error(`Task not found: ${id}`);
+    const workflowResolution = await resolveWorkflowIrForTaskWithProvenance(context.store, id);
+    /*
+    FNXC:PlanPremises 2026-09-13-05:43:
+    A named workflow that cannot be read must fail closed. Treating its default-workflow fallback as
+    authoritative can misclassify a custom WIP column as a harmless raw move and bypass premise admission.
+    A genuinely absent selection may still use the configured default workflow.
+    */
+    if (workflowResolution.source === "default" && workflowResolution.selectionAbsent !== true) {
+      throw new Error("The task workflow is temporarily unavailable. Retry this move.");
+    }
+    const ir = workflowResolution.ir;
+    if (!workflowHasColumn(ir, column)) {
+      console.error(`Invalid column: ${column}`);
+      console.error(`Valid columns: ${ir.version === "v2" ? ir.columns.map((candidate) => candidate.id).join(", ") : COLUMNS.join(", ")}`);
+      process.exit(1);
+    }
+    let task;
+    if (isFirstPlanningToWipAdmission(ir, current.column, column)) {
+      const settings = await context.store.getSettings();
+      const rootDir = context.store.getRootDir();
+      const allocateWorktree = (reservedNames: Set<string>) =>
+        current.repositoryScope?.confirmedBy === "workspace"
+          ? null
+          : planTaskWorktreePath(current, rootDir, reservedNames, settings);
+      const admission = await admitTaskToWip(
+        context.store,
+        { now: () => Date.now(), allocateWorktree: (_task, reservedNames) => allocateWorktree(reservedNames) },
+        current,
+        column,
+        ir,
+        { expectedColumn: current.column, moveSource: "user", workflowMoveSource: "cli-plan-premise-release" },
+      );
+      if (!admission.released) throw new Error(admission.detail ?? `Execution admission refused: ${admission.rejection ?? "release-gate"}`);
+      task = admission.task;
+    } else {
+      task = await context.store.moveTask(id, column as Column, { moveSource: "user" });
+    }
     console.log();
     console.log(`  ✓ Moved ${task.id} → ${columnLabel(task.column)}`);
     console.log();
@@ -1204,7 +1555,7 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
   // store resolution, since this is not a board call.
   let feedback = feedbackArg;
   if (feedback === undefined) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     feedback = await rl.question("What needs to be refined? ");
     rl.close();
   }
@@ -1214,13 +1565,11 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
     process.exit(1);
   }
 
-  // Validate length (matches API validation)
-  if (feedback.length > 2000) {
-    console.error("Feedback must be 2000 characters or less");
+  const trimmedFeedback = feedback.trim();
+  if (trimmedFeedback.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Feedback must be ${MAX_TASK_MESSAGE_LENGTH} characters or less`);
     process.exit(1);
   }
-
-  const trimmedFeedback = feedback.trim();
 
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
   await withBoardWrite(projectName, { id, action: "refine task" }, async (context) => {
@@ -1228,34 +1577,13 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
 
     console.log();
     console.log(`  ✓ Created refinement ${newTask.id} for ${id}`);
-    console.log(`    Column: triage`);
+    console.log(`    Column: ${newTask.column}`);
     console.log(`    Dependency: ${id}`);
     console.log(`    Path: .fusion/tasks/${newTask.id}/`);
     console.log();
   });
 }
 
-export async function runTaskArchive(id: string, projectName?: string) {
-  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
-  await withBoardWrite(projectName, { id, action: "archive task" }, async (context) => {
-    const task = await context.store.archiveTask(id);
-
-    console.log();
-    console.log(`  ✓ Archived ${task.id} → ${columnLabel(task.column)}`);
-    console.log();
-  });
-}
-
-export async function runTaskUnarchive(id: string, projectName?: string) {
-  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
-  await withBoardWrite(projectName, { id, action: "unarchive task" }, async (context) => {
-    const task = await context.store.unarchiveTask(id);
-
-    console.log();
-    console.log(`  ✓ Unarchived ${task.id} → ${columnLabel(task.column)}`);
-    console.log();
-  });
-}
 
 export async function runTaskRetry(id: string, projectName?: string) {
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): MULTI-STEP mutation
@@ -1276,8 +1604,39 @@ export async function runTaskRetry(id: string, projectName?: string) {
       throw new Error(`Task ${id} not found`);
     }
 
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-08-02-08:30 (fleet: CLI surface — the retry gate exists TWICE):
+    This is the CLI's copy of the dashboard route's retry classifier, and #2713 converted only the route. So
+    after that PR `POST /tasks/:id/retry` accepted a renamed board's stalled review card while
+    `fn task retry` still refused it with "not in a retryable state" — the same operator action answering
+    differently depending on which surface they used.
+    Worth stating as a rule: when a gate is duplicated across surfaces, converting one of them creates a
+    DISAGREEMENT that is harder to diagnose than the original inert guard. Grep for the classifier by name
+    before claiming a lane is converted.
+    */
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-08-02-22:10 (consolidation onto #2730's core resolver):
+    ONE DEFINITION, IN CORE. `resolveReviewColumns` is now the authoritative answer to "which columns are
+    review", and this inline union was one of THREE in-tree copies that disagreed with each other:
+
+      core (#2730):         mergeOrchestration u mergeBlocker u humanReview — ALL columns
+      dashboard routes:     mergeBlocker u humanReview u FIRST mergeOrchestration
+      cli/src/extension.ts: mergeBlocker u humanReview u FIRST mergeOrchestration
+      this copy:            all three, full union
+
+    The two `.slice(0, 1)` variants were MINE, from #2723's review round: I narrowed to core's then-single
+    `.review` because the reviewer was right that a superset let the dashboard act on a lane the engine did not
+    own. #2730 answered that question authoritatively in the other direction, so the narrowing is obsolete — and
+    keeping any local copy means re-litigating arity per call site forever, which is what produced three answers.
+
+    The legacy fallback stays: an unresolvable or column-less IR keeps `in-review`, so boards that never declared
+    traits are unchanged.
+    */
+    const retryIr = await resolveWorkflowIrForTask(context.store, id).catch(() => undefined);
+    const resolvedReviewColumns = retryIr === undefined ? [] : resolveReviewColumns(retryIr);
+    const retryReviewColumns = new Set(resolvedReviewColumns.length > 0 ? resolvedReviewColumns : ["in-review"]);
     const isInReviewStatusNone =
-      task.column === "in-review" && (task.status === null || task.status === undefined);
+      retryReviewColumns.has(task.column) && (task.status === null || task.status === undefined);
     const hasIncompleteSteps = task.steps.some(
       (s: { status: string }) => s.status === "pending" || s.status === "in-progress",
     );
@@ -1288,7 +1647,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
     const isInReviewExecutionStall = isInReviewStatusNone && isExecutionFailureInReview;
     const isInReviewMergeRetryStall = isInReviewStatusNone && (task.mergeRetries ?? 0) > 0;
     const isInReviewRetry =
-      task.column === "in-review" &&
+      retryReviewColumns.has(task.column) &&
       (task.status === "failed" ||
         task.status === "stuck-killed" ||
         isInReviewExecutionStall ||
@@ -1297,24 +1656,47 @@ export async function runTaskRetry(id: string, projectName?: string) {
     FNXC:MissingWorktreeRetry 2026-07-10-18:28:
     Upstream #1992 requires operator retry to recover an in-review task whose session start refused a missing/incomplete/unregistered worktree even when the row is stuck in an invalid merge-active status. This signature-only bypass clears stale session metadata instead of requiring a valid `merging` transition.
     */
-    const isMissingWorktreeSessionRetry = isInReviewMissingWorktreeSessionStartFailure(task);
+    const isMissingWorktreeSessionRetry = isInReviewMissingWorktreeSessionStartFailure(task, retryReviewColumns.has(task.column));
 
     // Validate task is in a retryable state
     if (task.status !== 'failed' && task.status !== 'stuck-killed' && !isInReviewRetry && !isMissingWorktreeSessionRetry) {
       throw new Error(`Task ${id} is not in a retryable state (status: ${task.status || 'none'})`);
     }
 
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-11:20 (fleet — the retry TARGET, live regression on main):
+    Retry re-queues the card to its board's HOLD column, resolved from the task's own workflow.
+
+    #2728 converted the retry CLASSIFIER above (`retryReviewColumns.has(task.column)`) and left all
+    three re-queue targets below on the literal `"todo"`. That combination is strictly worse than the
+    bug it fixed: before, `fn task retry` silently did nothing on a renamed board; after, it
+    correctly decides to retry and then THROWS
+
+        TransitionRejectionError: Invalid transition: 'checking' -> 'todo'. Unknown column for this workflow.
+
+    because `todo` is not a column that board declares.
+
+    The census cannot see this: it counts COMPARISONS, and a move target contains none. So the file
+    reads 0 guards while the crash is live — which is exactly why the classifier and the target must
+    move together.
+
+    Fail-soft to `"todo"` when the workflow cannot be resolved, matching every other fallback here.
+    */
+    const retryHoldColumn = (await resolveTaskLifecycleColumns(context.store, id))?.hold ?? "todo";
+
     const autoPauseClearPatch = buildAutoPauseClearPatch(task);
     const clearedDeadlockAutoPause = Object.keys(autoPauseClearPatch).length > 0;
     const retryLogSuffix = clearedDeadlockAutoPause ? ", cleared deadlock auto-pause" : "";
+    // FNXC:TaskWedgeNotifications 2026-08-10-20:15: a human Retry proves intervention and mints a fresh bounded terminal-failure budget.
+    await context.store.resetTerminalFailureAutoRecoveryBudget(id);
 
     if (isMissingWorktreeSessionRetry) {
-      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, "todo", { preserveProgress: true }));
+      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true }));
       await retryBoardCall(context, id, "update task", () => context.store.updateTask(id, {
         status: null,
         error: null,
         worktree: null,
-        branch: null,
+        branch: null, branchWriteOrigin: "engine" as const,
         sessionFile: null,
         ...autoPauseClearPatch,
         ...buildManualRetryResetPatch({ resetMergeRetries: true }),
@@ -1331,7 +1713,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
     // and merge failures (all steps done).
     if (isInReviewRetry) {
       if (isExecutionFailureInReview) {
-        await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, "todo", { preserveProgress: true }));
+        await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true }));
         await retryBoardCall(context, id, "update task", () => context.store.updateTask(id, {
           status: null,
           error: null,
@@ -1351,7 +1733,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
         return;
       }
 
-      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, "todo"));
+      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never));
       await retryBoardCall(context, id, "update task", () => context.store.updateTask(id, {
         status: null,
         error: null,
@@ -1366,17 +1748,27 @@ export async function runTaskRetry(id: string, projectName?: string) {
       return;
     }
 
-    // Move to todo column before applying retry resets. `moveTask` reads from the
+    // Move to the hold column before applying retry resets. `moveTask` reads from the
     // store's durable index and may overwrite task.json-only updates, so apply the
     // manual retry reset patch after the move to make the cleared counters stick.
-    await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, 'todo'));
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-12:30 (PR #2752 review — greptile P1):
+    THE FOURTH TARGET, and the one that matters most.
+
+    This is the GENERIC retry fallthrough — a plainly `failed` or `stuck-killed` card, which is the
+    ordinary case, not the in-review stall paths above. It was written with SINGLE quotes while its
+    three siblings used double, so my first pass converted three of four and left the common path
+    crashing. Found by review, not by me, and not by any tool: the census counts comparisons and sees
+    none of these, and a same-file grep for the double-quoted form reports clean.
+    */
+    await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never));
 
     // Clear failure state and stale branch refs so retry can choose a fresh base.
     await retryBoardCall(context, id, "update task", () => context.store.updateTask(id, {
       status: null,
       error: null,
       worktree: null,
-      branch: null,
+      branch: null, branchWriteOrigin: "engine" as const,
       baseBranch: null,
       baseCommitSha: null,
       ...autoPauseClearPatch,
@@ -1420,7 +1812,7 @@ export async function runTaskDelete(id: string, force?: boolean, allowResurrecti
 
   // Prompt for confirmation unless force is used
   if (!force) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     const answer = await rl.question(`Are you sure you want to delete ${id}? [y/N] `);
     rl.close();
 
@@ -1436,8 +1828,11 @@ export async function runTaskDelete(id: string, force?: boolean, allowResurrecti
     await retryBoardCall(context, id, "delete task", () => context.store.deleteTask(id, {
       allowResurrection: allowResurrection === true,
       auditContext: {
+        // FNXC:TaskDeleteAttribution 2026-07-26-14:30: `fn task delete` prompts a human for
+        // confirmation at a terminal, so it is an operator surface, not unattributed automation.
         agentId: "cli",
         runId: `synthetic-cli-delete-${id}-${Date.now()}`,
+        callerKind: "operator-cli",
       },
     }));
     console.log();
@@ -1495,8 +1890,13 @@ export async function runTaskImportGitHubInteractive(
       return;
     }
 
-    // Display issues with numbers
-    console.log(`  Found ${issues.length} issues:\n`);
+    /*
+     * FNXC:CliQuietMode 2026-07-16-00:00:
+     * Issue choices and validation feedback are required context for this
+     * selection prompt. Preserve them through the output seam when quiet mode
+     * gates informational stdout.
+     */
+    outputResult(`  Found ${issues.length} issues:\n\n`);
     for (let i = 0; i < issues.length; i++) {
       const issue = issues[i];
       const importedTask = existingTasks.find((task) => dashboard.isGitHubIssueAlreadyImported(task, {
@@ -1506,13 +1906,13 @@ export async function runTaskImportGitHubInteractive(
         sourceUrl: issue.html_url,
       }));
       const status = importedTask ? ` [Imported as ${importedTask.id}]` : "";
-      console.log(`  ${i + 1}. #${issue.number} ${issue.title.slice(0, 80)}${issue.title.length > 80 ? "…" : ""}${status}`);
+      outputResult(`  ${i + 1}. #${issue.number} ${issue.title.slice(0, 80)}${issue.title.length > 80 ? "…" : ""}${status}\n`);
     }
 
-    console.log();
+    outputResult("\n");
 
     // Create readline interface for interactive selection
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
 
     let selectedIndices: number[] = [];
     let validInput = false;
@@ -1531,13 +1931,13 @@ export async function runTaskImportGitHubInteractive(
           .filter((n) => !isNaN(n));
 
         if (nums.length === 0) {
-          console.log("  Please enter at least one number or 'all'");
+          outputResult("  Please enter at least one number or 'all'\n");
           continue;
         }
 
         const outOfRange = nums.filter((n) => n < 1 || n > issues.length);
         if (outOfRange.length > 0) {
-          console.log(`  Invalid selection: ${outOfRange.join(", ")} (range: 1-${issues.length})`);
+          outputResult(`  Invalid selection: ${outOfRange.join(", ")} (range: 1-${issues.length})\n`);
           continue;
         }
 
@@ -1584,7 +1984,10 @@ export async function runTaskImportGitHubInteractive(
       const task = await retryBoardCall(context, "import", "create task", () => store.createTask({
         title: title || undefined,
         description,
-        column: "triage",
+        /* FNXC:WorkflowLifecycleColumns 2026-07-29-20:15 (U11): no explicit column —
+           `createTaskImpl` resolves the WORKFLOW'S intake column, and `input.column` would
+           override it. Hard-coding `"triage"` created the card in a column the default
+           lineage no longer declares (#2515), i.e. straight into the stranded state. */
         dependencies: [],
         sourceIssue: source.sourceIssue,
         source: {
@@ -1595,7 +1998,7 @@ export async function runTaskImportGitHubInteractive(
       }));
 
       const label = task.title || task.description.slice(0, 60) + (task.description.length > 60 ? "…" : "");
-      console.log(`  ✓ Created ${task.id}: ${label}`);
+      outputResult(`  ✓ Created ${task.id}: ${label}\n`);
       existingTasks.push(task);
       created++;
     }
@@ -1757,7 +2160,10 @@ export async function runTaskImportFromGitHub(
       const task = await retryBoardCall(context, "import", "create task", () => store.createTask({
         title: title || undefined,
         description,
-        column: "triage",
+        /* FNXC:WorkflowLifecycleColumns 2026-07-29-20:15 (U11): no explicit column —
+           `createTaskImpl` resolves the WORKFLOW'S intake column, and `input.column` would
+           override it. Hard-coding `"triage"` created the card in a column the default
+           lineage no longer declares (#2515), i.e. straight into the stranded state. */
         dependencies: [],
         sourceIssue: source.sourceIssue,
         source: {
@@ -1768,7 +2174,7 @@ export async function runTaskImportFromGitHub(
       }));
 
       const label = task.title || task.description.slice(0, 60) + (task.description.length > 60 ? "…" : "");
-      console.log(`  ✓ Created ${task.id}: ${label}`);
+      outputResult(`  ✓ Created ${task.id}: ${label}\n`);
       existingTasks.push(task);
       created++;
     }
@@ -1832,7 +2238,10 @@ export async function runTaskImportFromGitLab(
       const task = await retryBoardCall(context, "import", "create task", () => store.createTask({
         title: title || undefined,
         description: dashboard.buildGitLabTaskDescription(item),
-        column: "triage",
+        /* FNXC:WorkflowLifecycleColumns 2026-07-29-20:15 (U11): no explicit column —
+           `createTaskImpl` resolves the WORKFLOW'S intake column, and `input.column` would
+           override it. Hard-coding `"triage"` created the card in a column the default
+           lineage no longer declares (#2515), i.e. straight into the stranded state. */
         dependencies: [],
         sourceIssue: provenance.sourceIssue,
         gitlabTracking: provenance.gitlabTracking,
@@ -1841,7 +2250,7 @@ export async function runTaskImportFromGitLab(
       await retryBoardCall(context, task.id, "log entry", () => store.logEntry(task.id, resource === "merge-requests" ? "Imported merge request from GitLab" : "Imported from GitLab", item.webUrl));
       existingTasks.push(task);
       created += 1;
-      console.log(`  ✓ Created ${task.id}: ${task.title}`);
+      outputResult(`  ✓ Created ${task.id}: ${task.title}\n`);
     }
     console.log(`\n  ✓ Imported ${created} GitLab tasks${skipped > 0 ? ` (${skipped} skipped)` : ""}\n`);
   } finally {
@@ -1853,7 +2262,7 @@ export async function runTaskComment(id: string, message?: string, author = "use
   // Interactive prompt runs BEFORE store resolution (not a board call).
   let text = message;
   if (text === undefined) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     text = await rl.question("Comment: ");
     rl.close();
   }
@@ -1864,8 +2273,8 @@ export async function runTaskComment(id: string, message?: string, author = "use
   }
 
   const trimmed = text.trim();
-  if (trimmed.length > 2000) {
-    console.error("Error: Comment must be between 1 and 2000 characters");
+  if (trimmed.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Error: Comment must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters`);
     process.exit(1);
   }
 
@@ -1910,7 +2319,7 @@ export async function runTaskSteer(id: string, message?: string, projectName?: s
   // resolution (not a board call).
   let text = message;
   if (text === undefined) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     text = await rl.question("Message: ");
     rl.close();
   }
@@ -1922,8 +2331,8 @@ export async function runTaskSteer(id: string, message?: string, projectName?: s
   }
 
   const trimmed = text.trim();
-  if (trimmed.length > 2000) {
-    console.error("Error: Message must be between 1 and 2000 characters");
+  if (trimmed.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Error: Message must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters`);
     process.exit(1);
   }
 
@@ -1975,14 +2384,20 @@ function clearThinking(): void {
 }
 
 /** Prompt for text (multi-line) question */
-async function promptText(question: PlanningQuestion): Promise<string> {
-  console.log(`\n  ${question.question}`);
-  if (question.description) {
-    console.log(`  ${question.description}`);
-  }
-  console.log("  (Enter your response. Type DONE on its own line when finished):\n");
+// FNXC:CliQuietMode 2026-07-16-01:00: Planning questions, choices, and
+// validation are required prompt UI and must bypass the global stdout gate.
+function writePromptUi(text: string): void {
+  outputResult(text);
+}
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+async function promptText(question: PlanningQuestion): Promise<string> {
+  writePromptUi(`\n  ${question.question}\n`);
+  if (question.description) {
+    writePromptUi(`  ${question.description}\n`);
+  }
+  writePromptUi("  (Enter your response. Type DONE on its own line when finished):\n\n");
+
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
   const lines: string[] = [];
 
   return new Promise((resolve) => {
@@ -2003,11 +2418,11 @@ async function promptText(question: PlanningQuestion): Promise<string> {
 
 /** Prompt for single_select question */
 async function promptSingleSelect(question: PlanningQuestion): Promise<string> {
-  console.log(`\n  ${question.question}`);
+  writePromptUi(`\n  ${question.question}\n`);
   if (question.description) {
-    console.log(`  ${question.description}`);
+    writePromptUi(`  ${question.description}\n`);
   }
-  console.log();
+  writePromptUi("\n");
 
   if (!question.options || question.options.length === 0) {
     throw new Error("Single select question has no options");
@@ -2015,13 +2430,13 @@ async function promptSingleSelect(question: PlanningQuestion): Promise<string> {
 
   for (let i = 0; i < question.options.length; i++) {
     const opt = question.options[i];
-    console.log(`  ${i + 1}. ${opt.label}`);
+    writePromptUi(`  ${i + 1}. ${opt.label}\n`);
     if (opt.description) {
-      console.log(`     ${opt.description}`);
+      writePromptUi(`     ${opt.description}\n`);
     }
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
 
   while (true) {
     const answer = await rl.question("\n  Select (1-" + question.options.length + "): ");
@@ -2032,17 +2447,17 @@ async function promptSingleSelect(question: PlanningQuestion): Promise<string> {
       return question.options[num - 1].id;
     }
 
-    console.log(`  Invalid selection. Please enter a number between 1 and ${question.options.length}`);
+    writePromptUi(`  Invalid selection. Please enter a number between 1 and ${question.options.length}\n`);
   }
 }
 
 /** Prompt for multi_select question */
 async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> {
-  console.log(`\n  ${question.question}`);
+  writePromptUi(`\n  ${question.question}\n`);
   if (question.description) {
-    console.log(`  ${question.description}`);
+    writePromptUi(`  ${question.description}\n`);
   }
-  console.log("  (Enter comma-separated numbers, e.g., 1,3,4):\n");
+  writePromptUi("  (Enter comma-separated numbers, e.g., 1,3,4):\n\n");
 
   if (!question.options || question.options.length === 0) {
     throw new Error("Multi select question has no options");
@@ -2050,13 +2465,13 @@ async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> 
 
   for (let i = 0; i < question.options.length; i++) {
     const opt = question.options[i];
-    console.log(`  ${i + 1}. ${opt.label}`);
+    writePromptUi(`  ${i + 1}. ${opt.label}\n`);
     if (opt.description) {
-      console.log(`     ${opt.description}`);
+      writePromptUi(`     ${opt.description}\n`);
     }
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
 
   while (true) {
     const answer = await rl.question("\n  Select (comma-separated): ");
@@ -2066,13 +2481,13 @@ async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> 
       .filter((n) => !isNaN(n));
 
     if (nums.length === 0) {
-      console.log("  Please select at least one option");
+      writePromptUi("  Please select at least one option\n");
       continue;
     }
 
     const invalid = nums.filter((n) => n < 1 || n > question.options!.length);
     if (invalid.length > 0) {
-      console.log(`  Invalid selection: ${invalid.join(", ")}. Range: 1-${question.options.length}`);
+      writePromptUi(`  Invalid selection: ${invalid.join(", ")}. Range: 1-${question.options.length}\n`);
       continue;
     }
 
@@ -2083,12 +2498,12 @@ async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> 
 
 /** Prompt for confirm question */
 async function promptConfirm(question: PlanningQuestion): Promise<boolean> {
-  console.log(`\n  ${question.question}`);
+  writePromptUi(`\n  ${question.question}\n`);
   if (question.description) {
-    console.log(`  ${question.description}`);
+    writePromptUi(`  ${question.description}\n`);
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
   const answer = await rl.question("\n  [Y/n]: ");
   rl.close();
 
@@ -2174,12 +2589,13 @@ export async function runTaskPlan(
   yesFlag = false,
   projectName?: string,
   baseBranch?: string,
+  resumeSessionId?: string,
 ): Promise<string | undefined> {
   let initialPlan = initialPlanArg;
 
   // If no initial plan, prompt interactively
-  if (!initialPlan) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+  if (!initialPlan && !resumeSessionId) {
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     console.log("\n  Let's plan your task. What would you like to accomplish?\n");
     initialPlan = await rl.question("  Describe your idea: ");
     rl.close();
@@ -2202,20 +2618,82 @@ export async function runTaskPlan(
   const context = await resolveBoardContext(projectName, "plan", "resolve project");
   const store = context.store;
 
-  // Create planning session
+  // Create (or resume) the planning session
   let sessionId: string;
   let firstQuestion: PlanningQuestion;
+
+  /*
+  FNXC:PlanningMultiTask 2026-07-24-03:40:
+  Review P1: CLI planning sessions were memory-only (setAiSessionStore only ran in the
+  dashboard server), so `--resume` could never find a session across invocations and CLI
+  claim/linkage state was invisible to the dashboard. Wire the durable AiSessionStore over
+  the resolved board store before any session work; legacy stores without an async layer
+  stay in-memory and resume is honestly reported as unavailable.
+  */
+  const durablePlanningStore = await ensureDurablePlanningSessionStore(store).catch(() => false);
 
   try {
     showThinking();
     const projectPath = context.projectPath;
-    const result = await createSession("127.0.0.1", initialPlan.trim(), store, projectPath);
-    clearThinking();
-    sessionId = result.sessionId;
-    firstQuestion = result.firstQuestion;
+    if (resumeSessionId) {
+      /*
+      FNXC:PlanningMultiTask 2026-07-24-02:30:
+      Agent/CLI parity with the dashboard's reopen loop: resuming an existing session (even a
+      validated one that already created a task) continues the interview. When no question is
+      awaiting input, a refine turn regenerates one — the server reopens the session and
+      rotates the creation epoch when its current epoch already produced a task, so a later
+      /validate creates a NEW task instead of replaying the old one.
+
+      FNXC:PlanningMultiTask 2026-07-24-03:40:
+      Review findings: resume failures THROW instead of process.exit (fn_task_plan runs inside
+      the pi host process — an exit killed the whole agent session), and the regenerating
+      refine turn only fires WITH expressed intent (the provided description becomes the
+      refine focus) so merely resuming never rotates the epoch or un-validates the plan.
+      */
+      const existing = await getPlanningSession(resumeSessionId);
+      if (!existing) {
+        clearThinking();
+        await closeProjectStore(context).catch(() => {});
+        throw new SessionNotFoundError(
+          durablePlanningStore
+            ? `Planning session ${resumeSessionId} not found or expired.`
+            : `Planning session ${resumeSessionId} not found — this store does not persist planning sessions, so resume only works within the process that created the session.`,
+        );
+      }
+      sessionId = resumeSessionId;
+      if (existing.currentQuestion) {
+        firstQuestion = existing.currentQuestion;
+      } else {
+        const focus = initialPlan?.trim();
+        if (!focus) {
+          clearThinking();
+          await closeProjectStore(context).catch(() => {});
+          throw new InvalidSessionStateError(
+            "This plan has no question awaiting input. Provide a description of what to refine next (it becomes the refine focus) to continue the interview.",
+          );
+        }
+        const regenerated = await submitResponse(sessionId, { refine: true, focus }, projectPath, undefined, store);
+        if (regenerated.type !== "question") {
+          clearThinking();
+          await closeProjectStore(context).catch(() => {});
+          throw new InvalidSessionStateError("Could not resume the interview for this session.");
+        }
+        firstQuestion = regenerated.data;
+      }
+      clearThinking();
+    } else {
+      const result = await createSession("127.0.0.1", initialPlan!.trim(), store, projectPath);
+      clearThinking();
+      sessionId = result.sessionId;
+      firstQuestion = result.firstQuestion;
+    }
   } catch (err) {
     clearThinking();
 
+    if (err instanceof SessionNotFoundError || err instanceof InvalidSessionStateError) {
+      // Resume-branch failures propagate to the caller (bin prints; fn_task_plan returns a tool error).
+      throw err;
+    }
     if (err instanceof RateLimitError) {
       console.error("\n  Rate limit exceeded. Maximum 1000 planning sessions per hour.\n");
       await closeBoardContextAndExit(context, 1);
@@ -2226,6 +2704,9 @@ export async function runTaskPlan(
     await closeBoardContextAndExit(context, 1);
     return undefined;
   }
+
+  // FNXC:PlanningMultiTask 2026-07-24-02:30: surface the session id so agents/operators can resume this plan later (`fn task plan --resume <id>` / fn_task_plan resumeSessionId) to create further tasks.
+  console.log(`\n  Planning session: ${sessionId}`);
 
   // Interactive Q&A loop
   let currentQuestion = firstQuestion;
@@ -2326,7 +2807,7 @@ export async function runTaskPlan(
         // Ask for confirmation (unless --yes flag)
         let confirmed = yesFlag;
         if (!yesFlag) {
-          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
           const answer = await rl.question("  Create this task? [Y/n]: ");
           rl.close();
           const trimmed = answer.trim().toLowerCase();
@@ -2334,26 +2815,71 @@ export async function runTaskPlan(
         }
 
         if (confirmed) {
-          // Create the task — the ONE discrete board write in this flow,
-          // retried independently (FN-7734).
-          // FN-5060: intentional same-content sibling; deterministic guard skipped here.
-          const task = await retryBoardCall(context, "plan", "create task", () => store.createTask({
-            title: result.data.title,
-            description: result.data.description,
-            column: "triage",
-            dependencies: result.data.suggestedDependencies,
-            baseBranch: baseBranch?.trim() || undefined,
-            source: { sourceType: "cli" },
-          }));
+          /*
+          FNXC:PlanningMultiTask 2026-07-24-02:30:
+          Review finding (P1 agent-native parity): the CLI/agent surface used to call
+          store.createTask directly with no proposalClaimId — no idempotency, no session
+          linkage, tasks outside the epoch sequence. It now creates through the same
+          claim-aware path as the dashboard (epoch-derived key, claim CAS lifecycle,
+          validate-on-create), which also makes the retryBoardCall wrapper safe: a retried
+          call reconciles the already-inserted task instead of duplicating it (FN-7734).
+          */
+          const { task, alreadyCreated } = await retryBoardCall(context, "plan", "create task", () =>
+            createTaskFromPlanSession(sessionId, store, { baseBranch: baseBranch?.trim() || undefined }));
 
           console.log();
-          console.log(`  ✓ Created ${task.id}: ${task.title || task.description.slice(0, 60)}${task.description.length > 60 ? "…" : ""}`);
-          console.log(`    Column: triage`);
+          outputResult(`  ${alreadyCreated ? "✓ Task already created from this plan:" : "✓ Created"} ${task.id}: ${task.title || task.description.slice(0, 60)}${task.description.length > 60 ? "…" : ""}\n`);
+          console.log(`    Column: ${task.column ?? "triage"}`);
           if (task.dependencies.length > 0) {
             console.log(`    Dependencies: ${task.dependencies.join(", ")}`);
           }
           console.log(`    Path:   .fusion/tasks/${task.id}/`);
           console.log();
+
+          /*
+          FNXC:PlanningMultiTask 2026-07-24-02:30:
+          Task creation is not the end of the plan (dashboard parity): the operator can keep
+          refining and create another task — the refine turn reopens the session and rotates
+          the creation epoch server-side. Non-interactive callers (--yes / fn_task_plan) stop
+          after one task and can continue later via `fn task plan --resume <sessionId>`.
+          */
+          if (!yesFlag) {
+            // FNXC:PlanningMultiTask 2026-07-24-03:20: close the interface on every path, including thrown prompts (review finding — a leaked readline keeps the process alive).
+            const rlContinue = createInterface({ input: process.stdin, output: promptOutputStream() });
+            let wantsMore = false;
+            let focus = "";
+            try {
+              const continueAnswer = await rlContinue.question("  Keep refining this plan to create another task? [y/N]: ");
+              wantsMore = ["y", "yes"].includes(continueAnswer.trim().toLowerCase());
+              if (wantsMore) {
+                focus = (await rlContinue.question("  What should the next refinement focus on? ")).trim();
+              }
+            } finally {
+              rlContinue.close();
+            }
+            if (!wantsMore) {
+              return task.id;
+            }
+            /*
+            FNXC:PlanningMultiTask 2026-07-24-03:40:
+            Review finding: a provider error on this refine turn used to escape the loop's
+            error handling AFTER the task was created, discarding the task id. The task
+            exists — report the refine failure and return it.
+            */
+            try {
+              showThinking();
+              const refined = await submitResponse(sessionId, { refine: true, ...(focus ? { focus } : {}) }, context.projectPath, undefined, store);
+              clearThinking();
+              if (refined.type === "question") {
+                currentQuestion = refined.data;
+                continue;
+              }
+              console.log("\n  Could not continue the interview; the created task is ready.\n");
+            } catch (refineErr) {
+              clearThinking();
+              console.error(`\n  Refine failed (${refineErr instanceof Error ? refineErr.message : String(refineErr)}); the created task is ready. Resume later with: fn task plan --resume ${sessionId}\n`);
+            }
+          }
 
           return task.id;
         }

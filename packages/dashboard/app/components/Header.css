@@ -51,38 +51,6 @@ non-notched devices, so this is a no-op there. Pair with viewport-fit=cover (ind
   max-width: none;
 }
 
-.header-branch-filters {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-2xl) * 5), 100%), 1fr));
-  gap: var(--space-sm);
-  margin-top: var(--space-sm);
-}
-
-.header-branch-filter-label {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-xs);
-  color: var(--text-muted);
-  font-size: calc(var(--space-sm) + var(--space-xs));
-}
-
-.header-branch-filter-select {
-  width: 100%;
-  min-height: calc(var(--space-xl) + var(--space-sm) / 2);
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 0 var(--space-sm);
-  font-size: calc(var(--space-sm) + var(--space-xs) + var(--space-xs) / 4);
-}
-
-.header-branch-filter-select:focus-visible {
-  border-color: var(--todo);
-  box-shadow: var(--focus-ring);
-  outline: none;
-}
-
 .header-left {
   display: flex;
   align-items: center;
@@ -107,21 +75,32 @@ non-notched devices, so this is a no-op there. Pair with viewport-fit=cover (ind
 .header-actions {
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: var(--space-sm);
   position: relative;
-  /* FNXC:DashboardHeader 2026-07-08-00:00: keep the compact action cluster at
-     its intrinsic size (never grow, never shrink below content) so it cannot
-     be squeezed off-row while the shrinking `.header-left` truncates instead. */
-  flex: 0 0 auto;
+  /*
+  FNXC:DashboardHeader 2026-09-12-05:41:
+  Desktop Board/List keeps the portaled workflow selector and following Search action in one row. Let the action cluster and workflow slot shrink while fixed-size buttons retain their width, so long workflow names and populated counts ellipsize before any control can wrap.
+  */
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: 100%;
 }
 
 .header-workflow-slot {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
   gap: var(--space-xs);
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.header-actions > .btn-icon {
+  flex: 0 0 auto;
 }
 
 .header-workflow-slot:empty {
@@ -133,15 +112,32 @@ non-notched devices, so this is a no-op there. Pair with viewport-fit=cover (ind
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
   gap: var(--space-xs);
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
   padding: 0;
   border-bottom: 0;
   background: transparent;
 }
 
+.header-workflow-slot .board-workflow-selector,
+.header-workflow-slot .workflow-switcher {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
 .header-workflow-slot .board-workflow-selector {
   margin-left: 0;
+}
+
+.header-workflow-slot .workflow-switcher-trigger {
+  width: 100%;
+  max-width: 100%;
 }
 
 @media (max-width: 768px) {
@@ -804,6 +800,13 @@ non-notched devices, so this is a no-op there. Pair with viewport-fit=cover (ind
   transition: border-color var(--transition-fast);
 }
 
+/* FNXC:AlphaTaskSearch 2026-09-12-21:52: Alpha desktop expands Search inline only while requested, in the magnifier's action slot after the workflow selector. The shared dropdown anchors below this token-sized field; compact and non-Alpha surfaces retain their existing floating search layout. */
+.header-search--alpha-inline {
+  flex: 0 1 calc(var(--space-2xl) * 8);
+  min-width: calc(var(--space-2xl) * 5);
+  max-width: calc(var(--space-2xl) * 10);
+}
+
 .header-search:focus-within {
   border-color: var(--todo);
 }
@@ -1035,14 +1038,6 @@ non-notched devices, so this is a no-op there. Pair with viewport-fit=cover (ind
   /* Mobile search expanded — inside header-floating-search container */
   .mobile-search-expanded {
     width: 100%;
-  }
-
-  .header-branch-filters {
-    grid-template-columns: 1fr;
-  }
-
-  .header-branch-filter-select {
-    min-height: calc(var(--space-xl) + var(--space-md));
   }
 
   /* Mobile: compact node label, no dropdown */

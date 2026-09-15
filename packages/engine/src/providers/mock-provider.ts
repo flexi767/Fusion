@@ -2,8 +2,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as fusionCore from "@fusion/core";
 import type { MockSessionPurpose } from "@fusion/core";
-import type { AgentRuntime, AgentRuntimeOptions, AgentSessionResult } from "../agent-runtime.js";
-import type { SessionPurpose } from "../runtime-resolution.js";
+import type { AgentRuntime, AgentRuntimeOptions, AgentSessionResult } from "../agents/agent-runtime.js";
+import type { SessionPurpose } from "../execution/runtime-resolution.js";
 import type { AgentSession, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 function resolveProjectRootFromWorktree(cwd: string): string | undefined {
@@ -226,7 +226,16 @@ const DEFAULT_SCRIPTS: Record<MockSessionPurpose, MockScript> = {
       }
       for (const [index, step] of steps.entries()) {
         if (step.status !== "done" && step.status !== "skipped") {
-          await ctx.invokeTool("fn_task_update", { step: index + 1, status: "done" });
+          /*
+          FNXC:MockProvider 2026-07-31-13:00:
+          fn_task_update.step is 0-BASED since FN-6607 (see executor.ts FNXC:StepNumbering) — the same
+          number agents see in PROMPT.md, where Step 0 is Preflight. This call kept the pre-FN-6607
+          1-based convention, so under test mode the mock marked steps 1..N instead of 0..N-1: Step 0
+          was never marked done and step N threw "Step N out of range", failing the graph at
+          steps#0:step-execute on every scripted full-task run. Found by a live browser E2E of the
+          coding workflow in test mode.
+          */
+          await ctx.invokeTool("fn_task_update", { step: index, status: "done" });
         }
       }
       ctx.options.onText?.("Mock executor completed scripted step updates.");
@@ -250,7 +259,7 @@ const DEFAULT_SCRIPTS: Record<MockSessionPurpose, MockScript> = {
   },
   reviewer: {
     async run(ctx) {
-      ctx.options.onText?.("Verdict: APPROVE\n\nSummary: Mock reviewer approved scripted output.\n");
+      ctx.options.onText?.("### Verdict: APPROVE\n\n### Summary\nMock reviewer approved scripted output.\n\n{\"verdict\":\"APPROVE\",\"notes\":\"Mock reviewer approved scripted output.\"}");
     },
   },
   merger: {

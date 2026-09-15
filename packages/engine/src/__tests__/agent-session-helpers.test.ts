@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_TOOL_OUTPUT_MAX_CHARS } from "@fusion/core";
 import {
   extractRuntimeHint,
   extractRuntimeModel,
@@ -18,15 +19,16 @@ import {
   resolveValidatorSessionModel,
   resolveValidatorThinkingLevel,
   resolveValidatorFallbackThinkingLevel,
+  createResolvedAgentSession,
   wrapCustomToolsForPluginRuntime,
-} from "../agent-session-helpers.js";
+} from "../agents/agent-session-helpers.js";
 
 const { resolveRuntimeMock } = vi.hoisted(() => ({
   resolveRuntimeMock: vi.fn(),
 }));
 
-vi.mock("../runtime-resolution.js", async () => {
-  const actual = await vi.importActual<typeof import("../runtime-resolution.js")>("../runtime-resolution.js");
+vi.mock("../execution/runtime-resolution.js", async () => {
+  const actual = await vi.importActual<typeof import("../execution/runtime-resolution.js")>("../execution/runtime-resolution.js");
   return {
     ...actual,
     resolveRuntime: resolveRuntimeMock,
@@ -49,7 +51,7 @@ describe("non-pi custom tool wrapping", () => {
 });
 
 describe("resolve model-lane thinking levels", () => {
-  it("applies node/task > workflow execution lane > global lane > project default lane > global default precedence", () => {
+  it("applies node/task > project execution lane > global lane > selected-workflow lane > project default > global default precedence", () => {
     const settings = {
       defaultThinkingLevel: "low",
       defaultThinkingLevelOverride: "medium",
@@ -62,6 +64,18 @@ describe("resolve model-lane thinking levels", () => {
     expect(resolveExecutorThinkingLevel(undefined, { executionGlobalThinkingLevel: "high", defaultThinkingLevel: "low" })).toBe("high");
     expect(resolveExecutorThinkingLevel(undefined, { defaultThinkingLevelOverride: "medium", defaultThinkingLevel: "low" })).toBe("medium");
     expect(resolveExecutorThinkingLevel(undefined, { defaultThinkingLevel: "low" })).toBe("low");
+  });
+
+  it("resolves Fast thinking as task override → Fast lane → execution fallback", () => {
+    const settings = {
+      fastCheapThinkingLevel: "low",
+      fastCheapGlobalThinkingLevel: "medium",
+      executionThinkingLevel: "high",
+    } as const;
+    expect(resolveExecutorThinkingLevel("xhigh", settings, "fast")).toBe("xhigh");
+    expect(resolveExecutorThinkingLevel(undefined, settings, "fast")).toBe("low");
+    expect(resolveExecutorThinkingLevel(undefined, { fastCheapGlobalThinkingLevel: "medium", executionThinkingLevel: "high" }, "fast")).toBe("medium");
+    expect(resolveExecutorThinkingLevel(undefined, { executionThinkingLevel: "high" }, "fast")).toBe("high");
   });
 
   it("resolves planning, reviewer, and summarization lane overrides before the global default", () => {
@@ -96,6 +110,31 @@ describe("resolve model-lane thinking levels", () => {
     expect(resolveValidatorThinkingLevel(nodeThinkingLevel ?? task.validatorThinkingLevel ?? task.thinkingLevel, settings)).toBe("minimal");
   });
 
+  it("resolves primary thinking as task → project → global → selected workflow", () => {
+    const settings = {
+      executionThinkingLevel: "minimal",
+      executionGlobalThinkingLevel: "low",
+      planningThinkingLevel: "minimal",
+      planningGlobalThinkingLevel: "low",
+      validatorThinkingLevel: "minimal",
+      validatorGlobalThinkingLevel: "low",
+      selectedWorkflowModelLanes: {
+        executionThinkingLevel: "high",
+        planningThinkingLevel: "high",
+        validatorThinkingLevel: "high",
+      },
+    } as const;
+
+    expect(resolveExecutorThinkingLevel("xhigh", settings)).toBe("xhigh");
+    expect(resolveExecutorThinkingLevel(undefined, settings)).toBe("minimal");
+    expect(resolvePlanningThinkingLevel({ ...settings, planningThinkingLevel: undefined })).toBe("low");
+    expect(resolveValidatorThinkingLevel(undefined, {
+      ...settings,
+      validatorThinkingLevel: undefined,
+      validatorGlobalThinkingLevel: undefined,
+    })).toBe("high");
+  });
+
   it("resolves fallback thinking through fallback key then executor lane then defaults", () => {
     expect(resolveExecutorFallbackThinkingLevel("task", { fallbackThinkingLevel: "high", executionThinkingLevel: "low" })).toBe("high");
     expect(resolveExecutorFallbackThinkingLevel(undefined, { executionThinkingLevel: "minimal", defaultThinkingLevel: "low" })).toBe("minimal");
@@ -103,7 +142,7 @@ describe("resolve model-lane thinking levels", () => {
     expect(resolveExecutorFallbackThinkingLevel(undefined, { defaultThinkingLevel: "low" })).toBe("low");
   });
 
-  it("resolves workflow fallback thinking before global fallback then lane defaults", () => {
+  it("resolves project fallback thinking before global fallback then selected-workflow and lane defaults", () => {
     expect(resolvePlanningFallbackThinkingLevel({ planningFallbackThinkingLevel: "xhigh", fallbackThinkingLevel: "high", planningThinkingLevel: "low" })).toBe("xhigh");
     expect(resolvePlanningFallbackThinkingLevel({ fallbackThinkingLevel: "high", planningThinkingLevel: "low" })).toBe("high");
     expect(resolvePlanningFallbackThinkingLevel({ planningThinkingLevel: "low", defaultThinkingLevel: "minimal" })).toBe("low");
@@ -115,6 +154,18 @@ describe("resolve model-lane thinking levels", () => {
     expect(resolveValidatorFallbackThinkingLevel(undefined, { validatorThinkingLevel: "low", defaultThinkingLevel: "minimal" })).toBe("low");
     expect(resolveValidatorFallbackThinkingLevel(undefined, { defaultThinkingLevelOverride: "medium", defaultThinkingLevel: "minimal" })).toBe("medium");
     expect(resolveValidatorFallbackThinkingLevel(undefined, { defaultThinkingLevel: "minimal" })).toBe("minimal");
+
+    const selectedWorkflowFallbacks = {
+      fallbackThinkingLevel: "high",
+      selectedWorkflowModelLanes: {
+        planningFallbackThinkingLevel: "low",
+        validatorFallbackThinkingLevel: "low",
+      },
+    } as const;
+    expect(resolvePlanningFallbackThinkingLevel(selectedWorkflowFallbacks)).toBe("high");
+    expect(resolvePlanningFallbackThinkingLevel({ ...selectedWorkflowFallbacks, fallbackThinkingLevel: undefined })).toBe("low");
+    expect(resolveValidatorFallbackThinkingLevel(undefined, selectedWorkflowFallbacks)).toBe("high");
+    expect(resolveValidatorFallbackThinkingLevel(undefined, { ...selectedWorkflowFallbacks, fallbackThinkingLevel: undefined })).toBe("low");
   });
 
   it("resolves title summarizer and merger fallback thinking through fallback and default chains", () => {
@@ -204,6 +255,45 @@ describe("resolve session model parity", () => {
     defaultProvider: "zai",
     defaultModelId: "glm-5.1",
   };
+
+  it("carries the winning selection credential instance alongside its provider and model", () => {
+    expect(resolveExecutorSessionModel("task-provider", "task-model", settings, undefined, "personal")).toEqual({
+      provider: "task-provider",
+      modelId: "task-model",
+      credentialInstanceId: "personal",
+    });
+    expect(resolvePlanningSessionModel(undefined, undefined, {
+      ...settings,
+      planningCredentialInstanceId: "work",
+    })).toEqual({
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-5",
+      credentialInstanceId: "work",
+    });
+  });
+
+  it("uses the Fast & Cheap lane only when Fast lacks an explicit task model", () => {
+    const fastSettings = {
+      ...settings,
+      fastCheapProvider: "openai",
+      fastCheapCredentialInstanceId: "cheap-credential",
+      fastCheapModelId: "gpt-4.1-mini",
+    };
+    expect(resolveExecutorSessionModel(undefined, undefined, fastSettings, undefined, undefined, "fast")).toEqual({
+      provider: "openai",
+      modelId: "gpt-4.1-mini",
+      credentialInstanceId: "cheap-credential",
+    });
+    expect(resolveExecutorSessionModel("task-provider", "task-model", fastSettings, undefined, "task-credential", "fast")).toEqual({
+      provider: "task-provider",
+      modelId: "task-model",
+      credentialInstanceId: "task-credential",
+    });
+    expect(resolveExecutorSessionModel(undefined, undefined, settings, undefined, undefined, "fast")).toEqual({
+      provider: "openai",
+      modelId: "gpt-4.1",
+    });
+  });
 
   it("uses the same fresh settings model for executor and heartbeat when runtimeConfig is absent", () => {
     const executor = resolveExecutorSessionModel(undefined, undefined, settings);
@@ -584,6 +674,24 @@ describe("createResolvedAgentSession", () => {
     resolveRuntimeMock.mockReset();
   });
 
+  it("resolves the merged tool-output setting once before forwarding to runtime sessions", async () => {
+    const createSessionMock = vi.fn().mockResolvedValue({ session: { prompt: vi.fn() }, sessionFile: "session.json" });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: { id: "pi", name: "Default PI Runtime", createSession: createSessionMock, promptWithFallback: vi.fn(), describeModel: vi.fn(() => "mock/model") },
+      runtimeId: "pi",
+      wasConfigured: false,
+    });
+
+    for (const [settings, expected] of [
+      [{ agentToolOutputMaxChars: 500 }, 500],
+      [{ agentToolOutputMaxChars: 0 }, null],
+      [{}, DEFAULT_TOOL_OUTPUT_MAX_CHARS],
+    ] as const) {
+      await createResolvedAgentSession({ sessionPurpose: "executor", cwd: "/tmp/project", systemPrompt: "system", settings });
+      expect(createSessionMock).toHaveBeenLastCalledWith(expect.objectContaining({ toolOutputMaxChars: expected }));
+    }
+  });
+
   it("forwards taskEnv unchanged to runtime session factory", async () => {
     const mockSession = { prompt: vi.fn() } as any;
     const createSessionMock = vi.fn().mockResolvedValue({
@@ -602,7 +710,7 @@ describe("createResolvedAgentSession", () => {
       wasConfigured: false,
     });
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
 
     const taskEnv = { PATH: "/tmp/bin", FUSION_TEST_VAR: "value" };
     await createResolvedAgentSession({
@@ -618,6 +726,111 @@ describe("createResolvedAgentSession", () => {
         taskEnv,
       }),
     );
+  });
+
+  /*
+  FNXC:RuntimeSubscribeCompat 2026-08-22-02:36:
+  Workflow steps subscribe unconditionally, so the shared runtime boundary must
+  adapt callback-only plugin sessions instead of requiring every bundled and
+  vendored runtime to duplicate the same event bridge.
+  */
+  it("adds isolated subscribe delivery to callback-only plugin sessions", async () => {
+    const callbackSession = { dispose: vi.fn() } as any;
+    const createSessionMock = vi.fn().mockResolvedValue({ session: callbackSession });
+    const runtimePrompt = vi.fn(async () => {
+      const runtimeOptions = createSessionMock.mock.calls[0][0];
+      runtimeOptions.onText?.("answer");
+      runtimeOptions.onThinking?.("reasoning");
+      runtimeOptions.onToolStart?.("read_file", { path: "README.md" });
+      runtimeOptions.onToolEnd?.("read_file", false, { text: "ok" });
+    });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "hermes",
+        name: "Hermes Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: runtimePrompt,
+        describeModel: vi.fn(() => "hermes/test"),
+      },
+      runtimeId: "hermes",
+      wasConfigured: true,
+    });
+    const onText = vi.fn();
+    const onThinking = vi.fn();
+    const onToolStart = vi.fn();
+    const onToolEnd = vi.fn();
+
+    const { session } = await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      onText,
+      onThinking,
+      onToolStart,
+      onToolEnd,
+    });
+    const events: unknown[] = [];
+    const unsubscribeThrowing = session.subscribe(() => {
+      throw new Error("broken subscriber");
+    });
+    const unsubscribe = session.subscribe((event) => events.push(event));
+
+    await (session as any).promptWithFallback("review");
+
+    expect(onText).toHaveBeenCalledWith("answer");
+    expect(onThinking).toHaveBeenCalledWith("reasoning");
+    expect(onToolStart).toHaveBeenCalledWith("read_file", { path: "README.md" });
+    expect(onToolEnd).toHaveBeenCalledWith("read_file", false, { text: "ok" });
+    expect(events).toEqual([
+      {
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "answer" },
+      },
+      {
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: "reasoning" },
+      },
+      { type: "tool_execution_start", toolName: "read_file", args: { path: "README.md" } },
+      { type: "tool_execution_end", toolName: "read_file", isError: false, result: { text: "ok" } },
+    ]);
+
+    unsubscribeThrowing();
+    unsubscribe();
+    await (session as any).promptWithFallback("second review");
+    expect(events).toHaveLength(4);
+  });
+
+  it("preserves native subscription delivery on non-pi plugin sessions", async () => {
+    const nativeUnsubscribe = vi.fn();
+    const nativeSubscribe = vi.fn(() => nativeUnsubscribe);
+    const nativeSession = { subscribe: nativeSubscribe, dispose: vi.fn() } as any;
+    const createSessionMock = vi.fn().mockResolvedValue({ session: nativeSession });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "acp",
+        name: "ACP Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "acp/test"),
+      },
+      runtimeId: "acp",
+      wasConfigured: true,
+    });
+    const onText = vi.fn();
+
+    const { session } = await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      onText,
+    });
+    const handler = vi.fn();
+
+    expect(session.subscribe).toBe(nativeSubscribe);
+    expect(session.subscribe(handler)).toBe(nativeUnsubscribe);
+    createSessionMock.mock.calls[0][0].onText?.("native answer");
+    expect(onText).toHaveBeenCalledWith("native answer");
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("forwards plugin skill names and body paths to runtime session factory", async () => {
@@ -637,7 +850,7 @@ describe("createResolvedAgentSession", () => {
       wasConfigured: false,
     });
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
     const additionalSkillPaths = ["/tmp/plugin-skills/foo", "/tmp/plugin-skills"];
     await createResolvedAgentSession({
       sessionPurpose: "executor",
@@ -679,7 +892,7 @@ describe("createResolvedAgentSession", () => {
       wasConfigured: false,
     });
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
 
     await createResolvedAgentSession({
       sessionPurpose: "merger",
@@ -700,7 +913,7 @@ describe("createResolvedAgentSession", () => {
     const createSessionMock = vi.fn().mockResolvedValue({ session: mockSession });
     const auditDatabaseMock = vi.fn().mockResolvedValue(undefined);
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
 
     await createResolvedAgentSession({
       sessionPurpose: "executor",
@@ -744,7 +957,7 @@ describe("createResolvedAgentSession", () => {
       runtimeId: "grok",
       wasConfigured: true,
     });
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
 
     await createResolvedAgentSession({
       sessionPurpose: "triage",
@@ -784,7 +997,7 @@ describe("createResolvedAgentSession", () => {
       wasConfigured: false,
     });
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
 
     await expect(createResolvedAgentSession({
       sessionPurpose: "executor",
@@ -809,7 +1022,7 @@ describe("createResolvedAgentSession", () => {
     });
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
 
     await expect(createResolvedAgentSession({
       sessionPurpose: "executor",
@@ -864,7 +1077,7 @@ describe("createResolvedAgentSession", () => {
       },
     };
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
     await createResolvedAgentSession({
       sessionPurpose: "executor",
       cwd: "/tmp/project",
@@ -899,6 +1112,30 @@ describe("createResolvedAgentSession", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it("preserves an identity-scoped Fusion subset without trusting injected fn_* names", async () => {
+    const createSessionMock = vi.fn().mockResolvedValue({ session: { prompt: vi.fn() } });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: { id: "cursor", name: "Cursor", createSession: createSessionMock, promptWithFallback: vi.fn(), describeModel: vi.fn(() => "cursor/auto") },
+      runtimeId: "cursor",
+      wasConfigured: true,
+    });
+    const trusted = { name: "fn_task_list", description: "", parameters: {}, execute: vi.fn() } as any;
+    const injected = { name: "fn_evil", description: "", parameters: {}, execute: vi.fn() } as any;
+
+    await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      customTools: [injected, trusted],
+      fusionTools: [trusted],
+    });
+
+    const passed = createSessionMock.mock.calls[0][0];
+    expect(passed.customTools.map((tool: { name: string }) => tool.name)).toEqual(["fn_evil", "fn_task_list"]);
+    expect(passed.fusionTools.map((tool: { name: string }) => tool.name)).toEqual(["fn_task_list"]);
+    expect(passed.fusionTools[0]).toBe(passed.customTools[1]);
+  });
+
   it("does not pre-wrap customTools for the pi runtime (createFnAgent owns the chain)", async () => {
     const mockSession = { prompt: vi.fn() } as any;
     const createSessionMock = vi.fn().mockResolvedValue({ session: mockSession });
@@ -923,7 +1160,7 @@ describe("createResolvedAgentSession", () => {
       execute,
     };
 
-    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
     await createResolvedAgentSession({
       sessionPurpose: "executor",
       cwd: "/tmp/project",
@@ -942,6 +1179,73 @@ describe("createResolvedAgentSession", () => {
 
     const passedTools = createSessionMock.mock.calls[0][0].customTools;
     expect(passedTools[0]).toBe(rawTool);
+  });
+
+  /*
+  FNXC:ProviderAuth 2026-08-03-17:35:
+  Executor used to synthesize credentialInstanceId "default" and hard-fail when auth.json
+  had no default instance for a custom provider. Chat omits the field and works via
+  customProviders.apiKey. Session create must self-heal: continue without a scoped ref.
+  */
+  it("self-heals missing credential instances instead of failing the session", async () => {
+    const createSessionMock = vi.fn().mockResolvedValue({
+      session: { prompt: vi.fn() },
+      sessionFile: "session.json",
+    });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "pi",
+        name: "Default PI Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "umansapi/model"),
+      },
+      runtimeId: "pi",
+      wasConfigured: false,
+    });
+
+    const emptyAuth = {
+      reload() {},
+      get: () => undefined,
+      getAll: () => ({}),
+      list: () => [],
+      has: () => false,
+      hasAuth: () => false,
+      listInstances: () => [],
+      getInstance: () => undefined,
+      setInstance: async () => {},
+      removeInstance: async () => {},
+      getDefaultInstance: () => undefined,
+      setDefaultInstance: async () => {},
+      set: async () => {},
+      remove: async () => {},
+      logout: async () => {},
+      getApiKey: async () => undefined,
+      getOAuthProviders: () => [],
+      login: async () => {},
+      modify: async () => undefined,
+      setModelRuntime: () => {},
+    };
+
+    const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
+    await expect(createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      defaultProvider: "umansapi",
+      defaultModelId: "model",
+      credentialInstanceId: "default",
+      authStorage: emptyAuth as any,
+    })).resolves.toMatchObject({ runtimeId: "pi" });
+
+    expect(createSessionMock).toHaveBeenCalledWith(expect.not.objectContaining({
+      credentialInstanceId: expect.anything(),
+      resolvedCredentialInstance: expect.anything(),
+    }));
+    // Unscoped legacy path: neither scoped field is set.
+    const passed = createSessionMock.mock.calls[0][0];
+    expect(passed.credentialInstanceId).toBeUndefined();
+    expect(passed.resolvedCredentialInstance).toBeUndefined();
   });
 });
 
@@ -1117,6 +1421,60 @@ describe("resolveImplicitPlanningFallbackModel (FN-7719)", () => {
     ).toEqual({
       provider: "anthropic",
       modelId: "claude-3-5-sonnet-20241022",
+    });
+  });
+});
+
+describe("role-aware heartbeat model inheritance", () => {
+  const projectOverride = {
+    defaultProviderOverride: "project-provider",
+    defaultModelIdOverride: "project-model",
+    defaultProvider: "global-provider",
+    defaultModelId: "global-model",
+  };
+
+  it("uses each supplied workflow role lane and leaves no-role calls on execution", () => {
+    const settings = {
+      ...projectOverride,
+      planningProvider: "planning-provider",
+      planningModelId: "planning-model",
+      executionProvider: "execution-provider",
+      executionModelId: "execution-model",
+      validatorProvider: "validator-provider",
+      validatorModelId: "validator-model",
+      mergerProvider: "merger-provider",
+      mergerModelId: "merger-model",
+    };
+    const expected = {
+      triage: ["planning-provider", "planning-model"],
+      executor: ["execution-provider", "execution-model"],
+      reviewer: ["validator-provider", "validator-model"],
+      merger: ["merger-provider", "merger-model"],
+    } as const;
+
+    for (const role of ["triage", "executor", "reviewer", "merger"] as const) {
+      expect(resolveHeartbeatSessionModels(settings, { enabled: false }, { roles: [role] })).toMatchObject({
+        defaultProvider: expected[role][0],
+        defaultModelId: expected[role][1],
+      });
+    }
+    expect(resolveHeartbeatSessionModels(settings, { enabled: false })).toMatchObject({
+      defaultProvider: "execution-provider",
+      defaultModelId: "execution-model",
+    });
+  });
+
+  it("uses project override for model-less roles and preserves complete runtime assignments", () => {
+    expect(resolveHeartbeatSessionModels(projectOverride, { enabled: false }, { roles: ["merger"] })).toMatchObject({
+      defaultProvider: "project-provider",
+      defaultModelId: "project-model",
+    });
+    expect(resolveHeartbeatSessionModels(projectOverride, {
+      modelProvider: "agent-provider",
+      modelId: "agent-model",
+    }, { roles: ["merger"] })).toMatchObject({
+      defaultProvider: "agent-provider",
+      defaultModelId: "agent-model",
     });
   });
 });

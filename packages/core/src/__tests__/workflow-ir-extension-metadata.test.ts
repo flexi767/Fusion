@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   downgradeIrToV1IfPure,
   parseWorkflowIr,
-} from "../workflow-ir.js";
+} from "../workflows/workflow-ir.js";
 import {
   __resetWorkflowExtensionRegistryForTests,
   getWorkflowExtensionRegistry,
-} from "../workflow-extension-registry.js";
-import { WORKFLOW_EXTENSION_SCHEMA_VERSION } from "../workflow-extension-types.js";
-import type { WorkflowIrV2 } from "../workflow-ir-types.js";
+} from "../workflows/workflow-extension-registry.js";
+import { WORKFLOW_EXTENSION_SCHEMA_VERSION } from "../workflows/workflow-extension-types.js";
+import type { WorkflowIrV2 } from "../workflows/workflow-ir-types.js";
 
 function ir(overrides: Partial<WorkflowIrV2> = {}): WorkflowIrV2 {
   return {
@@ -199,7 +199,6 @@ describe("workflow IR extension metadata", () => {
         { id: "in-progress", name: "in-progress", traits: [] },
         { id: "in-review", name: "in-review", traits: [] },
         { id: "done", name: "done", traits: [] },
-        { id: "archived", name: "archived", traits: [] },
       ],
     }));
 

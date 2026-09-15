@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
@@ -27,7 +27,10 @@ vi.mock("../BranchGroupCard", () => ({
 
 /*
 FNXC:TaskDetailTabs 2026-06-17-08:20:
-FN-7306 labels the stable internal `chat` tab as Activity, while later Chat-first detail work keeps that legacy `chat` id only for explicit Activity requests. Definition-tab regression coverage must prove omitted non-done task details now land on planner Chat, Activity remains selectable, and explicit `initialTab="definition"` still opens the Definition surface for prompt, GitHub tracking, and dependency sections.
+FN-7306 labels the stable internal `chat` tab as Activity, while later Chat-first detail work keeps that legacy `chat` id only for explicit Activity requests. Definition-tab regression coverage must prove omitted non-done task details now land on planner Chat and Activity remains selectable.
+
+FNXC:TaskDetailTabs 2026-08-28-23:05:
+FN-244 reserves Definition for task steps and PROMPT.md. Dependencies and task metadata keep dedicated tabs, while attachments now live with Artifacts, so Definition-specific coverage must reject those relocated sections rather than preserve the old mixed surface.
 
 FNXC:TaskDetailPlannerChat 2026-06-30-23:58:
 Omitted non-done TaskDetailModal renders open the top-level planner Chat first/default. Activity controls (`Live`, `Feed`, `Raw`, Live/Feed Activity expand, and Raw fullscreen) are intentionally mounted only after selecting Activity or using an explicit legacy Activity tab request.
@@ -65,7 +68,21 @@ function selectActivityView(value: ActivitySegmentTestValue) {
   fireEvent.click(screen.getByRole("menuitem", { name: ACTIVITY_VIEW_LABELS[value] }));
 }
 
+function visibleTestIds(testId: string): HTMLElement[] {
+  return screen.queryAllByTestId(testId).filter((node) => node.closest('[aria-hidden="true"]') == null);
+}
+
+function getVisibleByTestId(testId: string): HTMLElement {
+  const matches = visibleTestIds(testId);
+  expect(matches).toHaveLength(1);
+  return matches[0]!;
+}
+
 describe("TaskDetailModal", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   describe("paste image upload", () => {
     it("uploads an image when pasting clipboard image data", async () => {
       const { uploadAttachment } = await import("../../api");
@@ -84,7 +101,6 @@ describe("TaskDetailModal", () => {
         <TaskDetailModal
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -121,9 +137,8 @@ describe("TaskDetailModal", () => {
       render(
         <TaskDetailModal
           task={makeTask()}
-          initialTab="definition"
+          initialTab="dependencies"
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -161,9 +176,8 @@ describe("TaskDetailModal", () => {
       render(
         <TaskDetailModal
           task={makeTask()}
-          initialTab="definition"
+          initialTab="attachments"
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -216,11 +230,11 @@ describe("TaskDetailModal", () => {
       mockUpload.mockResolvedValueOnce(mockAttachment);
       const addToast = vi.fn();
 
-      const { container } = render(
+      // FNXC:TaskDetailModalTests 2026-07-26-21:28: Query baseElement because FloatingWindow portals modal content into document.body, outside React Testing Library's local render container.
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -250,9 +264,8 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailModal
         task={makeTask({ dependencies: [] })}
-        initialTab="definition"
+        initialTab="dependencies"
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -272,10 +285,9 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailModal
         task={makeTask({ dependencies: ["FN-001", "FN-002"] })}
-        initialTab="definition"
+        initialTab="dependencies"
         tasks={allTasks}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -308,10 +320,9 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailModal
         task={makeTask({ dependencies: [] })}
-        initialTab="definition"
+        initialTab="dependencies"
         tasks={allTasks}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -339,9 +350,8 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailModal
         task={makeTask({ dependencies: ["FN-001", "FN-002"] })}
-        initialTab="definition"
+        initialTab="dependencies"
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -358,11 +368,10 @@ describe("TaskDetailModal", () => {
   });
 
   it("renders in-review PR content only in the Pull Request tab body", () => {
-    const { container } = render(
+    const { baseElement: container } = render(
       <TaskDetailModal
         task={makeTask({ column: "in-review", status: "creating-pr", dependencies: ["FN-001"] })}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -392,7 +401,7 @@ describe("TaskDetailModal", () => {
   });
 
   it("activity list does not have nested scroll constraints", () => {
-    const { container } = render(
+    const { baseElement: container } = render(
       <TaskDetailModal
         task={makeTask({
           log: [
@@ -402,7 +411,6 @@ describe("TaskDetailModal", () => {
           ],
         })}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -432,10 +440,9 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailModal
         task={makeTask({ dependencies: [] })}
-        initialTab="definition"
+        initialTab="dependencies"
         tasks={allTasks}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -462,10 +469,9 @@ describe("TaskDetailModal", () => {
     render(
       <TaskDetailModal
         task={makeTask({ dependencies: [] })}
-        initialTab="definition"
+        initialTab="dependencies"
         tasks={allTasks}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -493,12 +499,11 @@ describe("TaskDetailModal", () => {
       oversight gating, so pin plannerOversightLevel: "off" to keep the
       three-label Activity-view assertion meaningful and honest (FN-7607).
       */
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent", plannerOversightLevel: "off" })}
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -510,11 +515,11 @@ describe("TaskDetailModal", () => {
       expect(screen.queryByRole("button", { name: "Logs" })).toBeNull();
       expect(screen.getByRole("button", { name: "Chat" })).toHaveClass("detail-tab-active");
       expect(screen.getByTestId("task-planner-chat-panel")).toBeTruthy();
-      expect(screen.getByTestId("task-planner-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand planner chat");
+      expect(screen.getByTestId("task-planner-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand task chat");
       expect(container.querySelector(".task-detail-content")).not.toHaveClass("task-detail-content--planner-chat-expanded");
       expect(container.querySelector(".activity-segmented-control")).toBeNull();
       expect(container.querySelector(".activity-segment")).toBeNull();
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
       expect(screen.queryByText("Agent Log")).toBeNull();
       expect(screen.queryByRole("combobox", { name: "Activity view" })).toBeNull();
       expect(container.querySelector(".detail-section--chat")).toBeNull();
@@ -533,7 +538,7 @@ describe("TaskDetailModal", () => {
     });
 
     it("switches to Feed segment via Activity tab and shows activity feed", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({
             prompt: "# Hello\n\nContent",
@@ -542,7 +547,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -563,7 +567,7 @@ describe("TaskDetailModal", () => {
     });
 
     it("Feed segment renders log entries correctly", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({
             log: [
@@ -573,7 +577,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -600,8 +603,10 @@ describe("TaskDetailModal", () => {
     });
 
     it("Feed segment preserves legacy text/detail and duplicate entries", () => {
-      const duplicateEntry = { timestamp: "2026-01-01T00:02:00Z", action: "Repeated diagnostic", outcome: "same payload" };
-      const { container } = render(
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 5, 17, 14, 32, 30, 0));
+      const duplicateEntry = { timestamp: new Date(2026, 5, 17, 14, 32, 7, 482).toISOString(), action: "Repeated diagnostic", outcome: "same payload" };
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({
             log: [
@@ -611,7 +616,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -626,19 +630,75 @@ describe("TaskDetailModal", () => {
       const outcomes = Array.from(container.querySelectorAll(".detail-log-outcome")).map((entry) => entry.textContent);
       expect(actions).toEqual(["Repeated diagnostic", "Repeated diagnostic", "Legacy text entry"]);
       expect(outcomes).toEqual(["same payload", "same payload", "Legacy detail body"]);
+      const preciseTimestamps = Array.from(container.querySelectorAll(".detail-log-precise-timestamp")).map((entry) => entry.textContent);
+      expect(preciseTimestamps).toHaveLength(3);
+      expect(preciseTimestamps.slice(0, 2)).toEqual(["14:32:07.482", "14:32:07.482"]);
     });
 
-    it("Feed segment keeps action/outcome rendering intact", () => {
-      const { container } = render(
+    it("renders a precise clock beside each unchanged Feed relative label", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 5, 17, 14, 32, 30, 0));
+      const timestamp = new Date(2026, 5, 17, 14, 32, 7, 482).toISOString();
+      const { baseElement: container } = render(
+        <TaskDetailModal
+          task={makeTask({ log: [{ timestamp, action: "Recorded event" }] })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+      selectActivityView("feed");
+
+      const entry = container.querySelector(".detail-log-entry") as HTMLElement;
+      expect(entry.querySelector(".detail-log-timestamp")).toHaveTextContent("just now");
+      expect(entry.querySelector(".detail-log-precise-timestamp")).toHaveTextContent("14:32:07.482");
+    });
+
+    it("keeps Feed precise timestamps present at the mobile width", () => {
+      const originalInnerWidth = window.innerWidth;
+      Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 390 });
+      try {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(2026, 5, 17, 14, 32, 30, 0));
+        const timestamp = new Date(2026, 5, 17, 14, 32, 7, 482).toISOString();
+        render(
+          <TaskDetailModal
+            task={makeTask({ log: [{ timestamp, action: "Recorded event" }] })}
+            onClose={noop}
+            onDeleteTask={noopDelete}
+            onMergeTask={noopMerge}
+            onOpenDetail={noopOpenDetail}
+            addToast={noop}
+          />,
+        );
+
+        fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+        selectActivityView("feed");
+        expect(screen.getByTestId("task-activity-precise-timestamp")).toHaveTextContent("14:32:07.482");
+      } finally {
+        Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: originalInnerWidth });
+      }
+    });
+
+    it("Feed segment keeps action/outcome rendering intact and shows only real run agents", () => {
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({
             log: [
-              { timestamp: "2026-01-01T00:01:00Z", action: "Started work", outcome: "Step completed successfully" },
+              {
+                timestamp: "2026-01-01T00:01:00Z",
+                action: "Started work",
+                outcome: "Step completed successfully",
+                runContext: { agentId: "agent-executor" },
+              },
               { timestamp: "2026-01-01T00:00:00Z", action: "Created task" },
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -655,29 +715,34 @@ describe("TaskDetailModal", () => {
       expect(outcomes).toHaveLength(1);
       expect(Array.from(actions).map((entry) => entry.textContent)).toEqual(["Created task", "Started work"]);
       expect(outcomes[0].textContent).toBe("Step completed successfully");
+      expect(container.querySelectorAll(".detail-log-marker")).toHaveLength(2);
+      expect(container.querySelectorAll(".detail-log-agent")).toHaveLength(1);
+      expect(container.querySelector(".detail-log-agent")).toHaveTextContent("agent-executor");
     });
 
-    it("Activity timeline CSS keeps action/outcome high-contrast and timestamp secondary", () => {
+    it("Activity timeline CSS keeps action dominant and outcome/timestamps secondary", () => {
       const stylesCssText = readDashboardStylesSource();
       expect(stylesCssText).toContain(".detail-log-action");
 
       const actionRule = getCssRuleBlock(stylesCssText, ".detail-log-action");
       const outcomeRule = getCssRuleBlock(stylesCssText, ".detail-log-outcome");
       const timestampRule = getCssRuleBlock(stylesCssText, ".detail-log-timestamp");
+      const timestampsRule = getCssRuleBlock(stylesCssText, ".detail-log-timestamps");
 
       expect(actionRule).toContain("color: var(--text);");
-      expect(outcomeRule).toContain("color: var(--text);");
-      expect(outcomeRule).toContain("background: var(--surface);");
+      expect(actionRule).toContain("font-weight: 600;");
+      expect(outcomeRule).toContain("color: var(--text-muted);");
+      expect(outcomeRule).toContain("background: var(--bg-secondary);");
       expect(timestampRule).toContain("color: var(--text-muted);");
       expect(timestampRule).not.toContain("color: var(--text);");
+      expect(timestampsRule).toContain("flex-wrap: wrap;");
     });
 
     it("Feed segment shows empty state when no logs", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ log: [] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -699,7 +764,7 @@ describe("TaskDetailModal", () => {
     });
 
     it("can switch between all tabs and Activity segments", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({
             prompt: "# Hello\n\nContent",
@@ -707,7 +772,6 @@ describe("TaskDetailModal", () => {
           })}
           initialTab="definition"
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -751,11 +815,10 @@ describe("TaskDetailModal", () => {
       const { useAgentLogs } = await import("../../hooks/useAgentLogs");
       const mockUseAgentLogs = vi.mocked(useAgentLogs);
 
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -770,7 +833,7 @@ describe("TaskDetailModal", () => {
 
       // Agent log viewer should appear with one Raw fullscreen affordance and no duplicate Activity expand toggle.
       expect(container.querySelector("[data-testid='agent-log-viewer']")).toBeTruthy();
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
       expect(screen.getAllByTestId("agent-log-fullscreen-toggle")).toHaveLength(1);
       expect(screen.getByTestId("agent-log-fullscreen-toggle")).toHaveAttribute("aria-label", "Expand agent log to full screen");
       expect(container.querySelector(".activity-toolbar")).toBeNull();
@@ -794,7 +857,6 @@ describe("TaskDetailModal", () => {
         <TaskDetailModal
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -803,8 +865,7 @@ describe("TaskDetailModal", () => {
       );
 
       // Default: planner Chat active → Raw Logs fetching stays disabled
-      const initialCall = mockUseAgentLogs.mock.calls[mockUseAgentLogs.mock.calls.length - 1];
-      expect(initialCall[1]).toBe(false);
+      expect(mockUseAgentLogs.mock.calls.some((call) => call[1] === false)).toBe(true);
 
       // Select Activity and Feed — Raw Logs fetching stays disabled
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
@@ -819,11 +880,10 @@ describe("TaskDetailModal", () => {
     });
 
     it("switches to Comments tab", async () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -843,11 +903,10 @@ describe("TaskDetailModal", () => {
     });
 
     it("shows correct top-level tabs without Logs", async () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -855,26 +914,24 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // For an in-progress task (no workflow steps, no merge commit), the
-      // top-level tabs are: Activity, Chat, Plan, Changes, Review, Comments,
-      // Terminal, Cost, Artifacts, Model, Workflow, Stats, Routing.
-      const tabTexts = ["Activity", "Chat", "Plan", "Changes", "Review", "Comments", "Terminal", "Cost", "Artifacts", "Model", "Workflow", "Stats", "Routing"];
-      const tabs = screen.getAllByRole("button").filter((b) =>
-        tabTexts.includes(b.textContent || "")
+      const tabTexts = ["Activity", "Chat", "Plan", "Changes", "Summary", "Stats", "Review", "Comments", "Dependencies", "Artifacts", "Model", "Workflow", "Details", "Terminal"];
+      const tabs = screen.getAllByRole("button").filter((button) =>
+        tabTexts.includes(button.textContent || ""),
       );
       expect(tabs.map((tab) => tab.textContent)).toEqual(tabTexts);
-      expect(tabs[0].textContent).toBe("Activity");
-      expect(tabs[1].textContent).toBe("Chat");
-      expect(tabs[2].textContent).toBe("Plan");
-      expect(tabs[5].textContent).toBe("Comments");
-      expect(tabs[6].textContent).toBe("Terminal");
-      expect(tabs[7].textContent).toBe("Cost");
       expect(screen.queryByRole("button", { name: "Logs" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "History" })).toBeNull();
+      for (const removedTab of ["Cost", "Routing", "Debug", "Attachments", "Recommendations"]) {
+        expect(screen.queryByRole("button", { name: removedTab })).toBeNull();
+      }
 
-      expect(container.querySelectorAll(".detail-tab").length).toBe(13);
-      // Workflow tab should always appear even when no workflow steps are configured
+      expect(container.querySelectorAll(".detail-tab")).toHaveLength(14);
+      fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+      expect(screen.getByTestId("task-history-stage-plan")).toBeInTheDocument();
+      expect(screen.getByTestId("task-history-stage-code")).toBeInTheDocument();
+      expect(screen.getByTestId("task-history-stage-review")).toBeInTheDocument();
+      expect(screen.queryByTestId("task-history-stage-merge")).not.toBeInTheDocument();
       expect(screen.getByText("Workflow")).toBeInTheDocument();
-      // Commits tab should NOT appear for non-done tasks
       expect(screen.queryByText("Commits")).toBeNull();
     });
   });
@@ -916,44 +973,42 @@ describe("TaskDetailModal", () => {
       const mobileCss = css.slice(css.indexOf("@media (max-width: 768px)"));
 
       const expandedTitleRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .detail-title-row");
-      const expandedMetaRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .detail-meta");
       const expandedTabsRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .detail-tabs");
-      const expandedActionsRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .modal-actions");
       const expandedHeaderRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .modal-header");
       const expandedBodyRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .detail-body--chat");
       const expandedSectionRule = getCssRuleBlock(css, ".task-detail-content--chat-expanded .detail-section--chat");
       const mobileTitleRule = getCssRuleBlock(mobileCss, ".task-detail-content--chat-expanded .detail-title-row");
       const mobileTabsRule = getCssRuleBlock(mobileCss, ".task-detail-content--chat-expanded .detail-tabs");
-      const mobileActionsRule = getCssRuleBlock(mobileCss, ".task-detail-content--chat-expanded .modal-actions");
 
       expect(css).not.toContain(".activity-toolbar");
       expect(css).not.toContain("activity-toolbar--expand-only");
-      expect(css).toContain(".detail-activity {\n  position: relative;\n  padding-inline-end: calc(var(--space-2xl) + var(--space-md));\n}");
+      expect(css).toContain(".detail-activity {\n  position: relative;\n  padding-inline-end: 0;\n}");
+      expect(css).toContain(".detail-activity:not(.detail-activity--interventions) > h4,");
+      expect(css).toContain("padding-inline-end: calc(var(--space-2xl) + var(--space-md));");
       expect(activityOverlayRule).toContain("position: absolute");
       expect(activityOverlayRule).toContain("top: var(--space-md)");
       expect(activityOverlayRule).toContain("right: var(--space-md)");
       expect(activityOverlayRule).toContain("z-index: 3");
-      expect(mobileCss).toContain("  .detail-activity {\n    padding-inline-end: 0;\n  }");
+      expect(mobileCss).not.toContain("  .detail-activity {\n    padding-inline-end:");
       expect(mobileCss).toContain("  .activity-expand-toggle--overlay {\n    top: var(--space-sm);\n    right: var(--space-sm);\n  }");
       expect(expandedTitleRule).not.toContain("display: none");
-      expect(expandedMetaRule).toContain("display: none");
+      expect(css).not.toContain(".task-detail-content--chat-expanded .detail-meta");
       expect(expandedTabsRule).toContain("display: flex");
-      expect(expandedActionsRule).toContain("display: none");
+      expect(css).toContain(".task-detail-content--chat-expanded .modal-actions:not(.task-detail-chat-footer)");
+      expect(css).toContain("display: none;");
       expect(expandedHeaderRule).toContain("justify-content: space-between");
       expect(expandedBodyRule).toContain("flex: 1");
       expect(expandedBodyRule).toContain("min-height: 0");
       expect(expandedSectionRule).toContain("margin-top: 0");
       expect(mobileTitleRule).not.toContain("display: none");
       expect(mobileTabsRule).toContain("display: flex");
-      expect(mobileActionsRule).toContain("display: none");
     });
 
     it("FN-6370/FN-6517 expands and collapses Activity Live without leaving chrome hidden", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -964,35 +1019,35 @@ describe("TaskDetailModal", () => {
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       const content = container.querySelector(".task-detail-content");
       const titleRow = container.querySelector(".detail-title-row");
-      const liveToggle = screen.getByTestId("task-chat-expand-toggle");
+      const liveToggle = getVisibleByTestId("task-chat-expand-toggle");
       expect(liveToggle).toHaveClass("task-chat-expand-toggle--overlay");
       expect(liveToggle.closest(".activity-toolbar")).toBeNull();
       expect(container.querySelector(".activity-toolbar")).toBeNull();
       expect(content).not.toHaveClass("task-detail-content--chat-expanded");
       expect(titleRow).toHaveTextContent("FN-099");
       expect(container.querySelector(".detail-tabs")).toBeTruthy();
-      expect(container.querySelector(".modal-actions")).toBeTruthy();
+      expect(container.querySelector(".task-detail-chat-footer .task-chat-composer")).toBeInTheDocument();
 
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).toHaveClass("task-detail-content--chat-expanded");
       expect(titleRow).toHaveTextContent("FN-099");
       expect(titleRow).toHaveTextContent("In Progress");
       expect(container.querySelector(".detail-tabs")).toBeTruthy();
-      expect(container.querySelector(".modal-actions")).toBeTruthy();
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Collapse activity");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-pressed", "true");
+      expect(container.querySelector(".task-detail-chat-footer .task-chat-composer")).toBeInTheDocument();
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Collapse activity");
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-pressed", "true");
 
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).not.toHaveClass("task-detail-content--chat-expanded");
       expect(titleRow).toHaveTextContent("FN-099");
       expect(container.querySelector(".detail-tabs")).toBeTruthy();
-      expect(container.querySelector(".modal-actions")).toBeTruthy();
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand activity to full modal");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-pressed", "false");
+      expect(container.querySelector(".task-detail-chat-footer .task-chat-composer")).toBeInTheDocument();
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand activity to full modal");
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-pressed", "false");
     });
 
     it("FN-7325 keeps Activity expansion available and sticky across Live, Feed, and Raw Logs", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({
             prompt: "# Hello\n\nContent",
@@ -1000,7 +1055,6 @@ describe("TaskDetailModal", () => {
           })}
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1009,31 +1063,31 @@ describe("TaskDetailModal", () => {
       );
 
       const content = container.querySelector(".task-detail-content");
-      expect(screen.getByTestId("task-planner-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand planner chat");
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(screen.getByTestId("task-planner-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand task chat");
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
 
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       expectActivityView("current");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand activity to full modal");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveClass("task-chat-expand-toggle--overlay");
-      expect(screen.getByTestId("task-chat-expand-toggle").closest(".activity-toolbar")).toBeNull();
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand activity to full modal");
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveClass("task-chat-expand-toggle--overlay");
+      expect(getVisibleByTestId("task-chat-expand-toggle").closest(".activity-toolbar")).toBeNull();
       expect(container.querySelector(".activity-toolbar")).toBeNull();
 
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).toHaveClass("task-detail-content--chat-expanded");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Collapse activity");
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Collapse activity");
 
       selectActivityView("feed");
       expect(content).toHaveClass("task-detail-content--chat-expanded");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-pressed", "true");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveClass("activity-expand-toggle--overlay");
-      expect(screen.getByTestId("task-chat-expand-toggle").closest(".activity-toolbar")).toBeNull();
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-pressed", "true");
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveClass("activity-expand-toggle--overlay");
+      expect(getVisibleByTestId("task-chat-expand-toggle").closest(".activity-toolbar")).toBeNull();
       expect(screen.getByText("Expanded feed entry")).toBeInTheDocument();
       expect(container.querySelector(".detail-activity-list")).toBeTruthy();
 
       selectActivityView("raw-logs");
       expect(content).toHaveClass("task-detail-content--chat-expanded");
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
       expect(screen.getByTestId("agent-log-fullscreen-toggle")).toHaveAttribute("aria-label", "Expand agent log to full screen");
       expect(screen.getAllByTestId("agent-log-fullscreen-toggle")).toHaveLength(1);
       expect(container.querySelector("[data-testid='agent-log-viewer']")).toBeTruthy();
@@ -1043,7 +1097,6 @@ describe("TaskDetailModal", () => {
       const { container, rerender } = render(
         <TaskDetailContent
           task={makeTask({ id: "FN-099", prompt: "# Hello\n\nContent" })}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1052,13 +1105,12 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(container.querySelector(".task-detail-content")).toHaveClass("task-detail-content--chat-expanded");
 
       rerender(
         <TaskDetailContent
           task={makeTask({ id: "FN-100", prompt: "# Next\n\nContent" })}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1069,17 +1121,16 @@ describe("TaskDetailModal", () => {
 
       expect(container.querySelector(".task-detail-content")).not.toHaveClass("task-detail-content--chat-expanded");
       expectActivityView("feed");
-      expect(screen.getByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand activity to full modal");
+      expect(getVisibleByTestId("task-chat-expand-toggle")).toHaveAttribute("aria-label", "Expand activity to full modal");
     });
 
     it("FN-7320 removes branch group chrome only while Activity is expanded", () => {
       const branchContext = { groupId: "BG-7320", source: "planning", assignmentMode: "shared" } as const;
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent", branchContext })}
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1088,30 +1139,33 @@ describe("TaskDetailModal", () => {
       );
 
       const content = container.querySelector(".task-detail-content");
+      fireEvent.click(screen.getByRole("button", { name: "Plan" }));
       expect(content).not.toHaveClass("task-detail-content--chat-expanded");
       expect(screen.getByTestId("mock-branch-group-card")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Mock branch group toggle BG-7320" })).toBeInTheDocument();
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
 
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      expect(screen.queryByTestId("mock-branch-group-card")).toBeNull();
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).toHaveClass("task-detail-content--chat-expanded");
       expect(screen.queryByTestId("mock-branch-group-card")).toBeNull();
       expect(screen.queryByRole("button", { name: "Mock branch group toggle BG-7320" })).toBeNull();
 
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).not.toHaveClass("task-detail-content--chat-expanded");
+      expect(screen.queryByTestId("mock-branch-group-card")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Plan" }));
       expect(screen.getByTestId("mock-branch-group-card")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Mock branch group toggle BG-7320" })).toBeInTheDocument();
     });
 
     it("FN-7320 expands Activity for tasks without branch groups without rendering branch shells", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent", branchContext: undefined })}
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1120,19 +1174,18 @@ describe("TaskDetailModal", () => {
       );
 
       expect(screen.queryByTestId("mock-branch-group-card")).toBeNull();
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(container.querySelector(".task-detail-content")).toHaveClass("task-detail-content--chat-expanded");
       expect(screen.queryByTestId("mock-branch-group-card")).toBeNull();
       expect(screen.queryByRole("button", { name: /Mock branch group toggle/ })).toBeNull();
     });
 
     it("FN-6517 keeps the title row visible when embedded chat expands", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailContent
           task={makeTask({ prompt: "# Hello\n\nContent" })}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1148,20 +1201,19 @@ describe("TaskDetailModal", () => {
       expect(content).not.toHaveClass("task-detail-content--chat-expanded");
       expect(titleRow).toHaveTextContent("FN-099");
 
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).toHaveClass("task-detail-content--embedded");
       expect(content).toHaveClass("task-detail-content--chat-expanded");
       expect(titleRow).toHaveTextContent("FN-099");
       expect(titleRow).toHaveTextContent("In Progress");
       expect(container.querySelector(".detail-tabs")).toBeTruthy();
-      expect(container.querySelector(".modal-actions")).toBeTruthy();
+      expect(container.querySelector(".task-detail-chat-footer .task-chat-composer")).toBeInTheDocument();
     });
 
     it("FN-6370 resets expanded Activity when the active tab changes", () => {
       const { container, rerender } = render(
         <TaskDetailContent
           task={makeTask({ prompt: "# Hello\n\nContent" })}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1171,13 +1223,12 @@ describe("TaskDetailModal", () => {
       );
 
       const content = container.querySelector(".task-detail-content");
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(content).toHaveClass("task-detail-content--chat-expanded");
 
       rerender(
         <TaskDetailContent
           task={makeTask({ prompt: "# Hello\n\nContent" })}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1187,15 +1238,14 @@ describe("TaskDetailModal", () => {
       );
 
       expect(container.querySelector(".task-detail-content--chat-expanded")).toBeNull();
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
     });
 
     it("FN-6370 resets expanded Activity when entering edit mode", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ column: "triage", prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1204,21 +1254,20 @@ describe("TaskDetailModal", () => {
       );
 
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
-      fireEvent.click(screen.getByTestId("task-chat-expand-toggle"));
+      fireEvent.click(getVisibleByTestId("task-chat-expand-toggle"));
       expect(container.querySelector(".task-detail-content")).toHaveClass("task-detail-content--chat-expanded");
 
       fireEvent.click(screen.getByLabelText("Edit task"));
       expect(container.querySelector(".task-detail-content--chat-expanded")).toBeNull();
-      expect(screen.queryByTestId("task-chat-expand-toggle")).toBeNull();
+      expect(visibleTestIds("task-chat-expand-toggle")).toHaveLength(0);
     });
 
     it("FN-6532 restores planner Chat first when Chat-first is enabled while preserving explicit Activity requests", () => {
-      const { container, rerender } = render(
+      const { baseElement: container, rerender } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1238,7 +1287,7 @@ describe("TaskDetailModal", () => {
       expect(plannerChatTab).toHaveClass("detail-tab-active");
       expect(activityTab).not.toHaveClass("detail-tab-active");
       expect(definitionTab).not.toHaveClass("detail-tab-active");
-      expect(container.querySelector(".detail-section--planner-chat [data-testid='task-planner-chat-panel']")).toBeTruthy();
+      expect(container.querySelector(".task-detail-planner-keep-alive [data-testid='task-planner-chat-panel']")).toBeTruthy();
       expect(container.querySelector(".detail-section--chat [data-testid='task-chat-tab']")).toBeNull();
 
       rerender(
@@ -1247,7 +1296,6 @@ describe("TaskDetailModal", () => {
           initialTab="logs"
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1266,13 +1314,12 @@ describe("TaskDetailModal", () => {
       const blocker = makeTask({ id: "FN-6574", title: "Definition task", prompt: "# Spec\n\nDefinition body unique text.", dependencies: ["FN-100"], githubTracking: { enabled: true } });
       const dependency = makeTask({ id: "FN-100", title: "Dependency task" });
       const dependent = makeTask({ id: "FN-200", title: "Dependent task", dependencies: ["FN-6574"] });
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={blocker}
           tasks={[blocker, dependency, dependent]}
           initialTab="definition"
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1283,21 +1330,22 @@ describe("TaskDetailModal", () => {
       expect(screen.getByRole("button", { name: "Plan" })).toHaveClass("detail-tab-active");
       expect(screen.getByRole("button", { name: "Activity" })).not.toHaveClass("detail-tab-active");
       expect(container.querySelector(".detail-section--chat")).toBeNull();
+      expect(screen.queryByText("Definition body unique text.")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Read plan" }));
       expect(screen.getByText("Definition body unique text.")).toBeInTheDocument();
-      expect(screen.getByText("GitHub tracking")).toBeInTheDocument();
-      expect(screen.getByText("Dependencies")).toBeInTheDocument();
-      expect(screen.getByText("Blocking")).toBeInTheDocument();
-      expect(container).toHaveTextContent("FN-100");
-      expect(container).toHaveTextContent("FN-200");
+      expect(screen.queryByText("GitHub tracking")).toBeNull();
+      expect(screen.queryByRole("heading", { name: "Dependencies" })).toBeNull();
+      expect(screen.queryByRole("heading", { name: "Blocking" })).toBeNull();
+      expect(container).not.toHaveTextContent("FN-100");
+      expect(container).not.toHaveTextContent("FN-200");
     });
 
     it("FN-6347 applies chat modifiers only while the Activity tab is active", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           taskDetailChatFirst
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1306,30 +1354,60 @@ describe("TaskDetailModal", () => {
       );
 
       expect(container.querySelector(".detail-body--planner-chat")).toBeTruthy();
-      expect(container.querySelector(".detail-section--planner-chat")).toBeTruthy();
+      expect(container.querySelector(".task-detail-planner-keep-alive")).toBeTruthy();
       expect(container.querySelector(".detail-body--chat")).toBeNull();
       expect(container.querySelector(".detail-section--chat")).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       const chatBody = container.querySelector(".detail-body--chat");
-      const chatSection = container.querySelector(".detail-section--chat");
+      const chatKeepAlive = container.querySelector(".task-detail-activity-keep-alive");
       expect(chatBody).toBeTruthy();
       expect(chatBody).not.toHaveClass("detail-body--agent-log");
-      expect(chatSection).toBeTruthy();
-      expect(chatSection!.querySelector("[data-testid='task-chat-tab']")).toBeTruthy();
+      expect(chatKeepAlive?.parentElement).toBe(chatBody);
+      expect(chatKeepAlive!.querySelector("[data-testid='task-chat-tab']")).toBeTruthy();
     selectActivityView("feed");
       selectActivityView("raw-logs");
       expect(container.querySelector(".detail-body--chat")).toBeNull();
-      expect(container.querySelector(".detail-section--chat")).toBeNull();
+      expect(chatKeepAlive).not.toBeVisible();
       expect(container.querySelector(".detail-body--agent-log")).toBeTruthy();
     });
 
+    /*
+    FNXC:TaskDetailTabKeepAlive 2026-07-22-13:05:
+    FN remount-churn fix R6: switching away from Planner chat must not destroy the composer draft or transcript — the tab body stays mounted inside an aria-hidden keep-alive wrapper and restores instantly on return.
+    */
+    it("keeps the planner chat mounted with its draft across tab switches", () => {
+      render(
+        <TaskDetailModal
+          task={makeTask({ prompt: "# Hello\n\nContent" })}
+          taskDetailChatFirst
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      const composer = screen.getByLabelText("Message task chat") as HTMLTextAreaElement;
+      fireEvent.change(composer, { target: { value: "unsent planner draft" } });
+      expect(screen.getByTestId("planner-chat-keep-alive")).not.toHaveAttribute("aria-hidden");
+
+      fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+      // Mounted-but-hidden: same instance, draft intact, wrapper inert for assistive tech.
+      expect(screen.getByTestId("planner-chat-keep-alive")).toHaveAttribute("aria-hidden", "true");
+      expect((screen.getByLabelText("Message task chat") as HTMLTextAreaElement).value).toBe("unsent planner draft");
+
+      fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+      expect(screen.getByTestId("planner-chat-keep-alive")).not.toHaveAttribute("aria-hidden");
+      expect((screen.getByLabelText("Message task chat") as HTMLTextAreaElement).value).toBe("unsent planner draft");
+    });
+
     it("FN-6347 removes the chat body modifier while editing", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ column: "triage", prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1348,11 +1426,10 @@ describe("TaskDetailModal", () => {
 
   describe("Raw Logs full-height layout", () => {
     it("applies detail-body--agent-log class when Activity → Raw Logs segment is active", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1380,12 +1457,11 @@ describe("TaskDetailModal", () => {
       expect(container.querySelector(".detail-body--agent-log")).toBeNull();
     });
 
-    it("wraps AgentLogViewer in detail-section--agent-log class", () => {
-      const { container } = render(
+    it("renders AgentLogViewer directly in the agent-log body", () => {
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -1398,18 +1474,17 @@ describe("TaskDetailModal", () => {
     selectActivityView("feed");
       selectActivityView("raw-logs");
 
-      // The section wrapping AgentLogViewer should have the full-height class
-      const section = container.querySelector(".detail-section--agent-log");
-      expect(section).toBeTruthy();
-      expect(section!.querySelector("[data-testid='agent-log-viewer']")).toBeTruthy();
+      const body = container.querySelector(".detail-body--agent-log");
+      const viewer = container.querySelector("[data-testid='agent-log-viewer']");
+      expect(body).toBeTruthy();
+      expect(viewer?.parentElement).toBe(body);
     });
 
     it("does not apply detail-body--agent-log when editing", () => {
-      const { container } = render(
+      const { baseElement: container } = render(
         <TaskDetailModal
           task={makeTask({ column: "triage", prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}

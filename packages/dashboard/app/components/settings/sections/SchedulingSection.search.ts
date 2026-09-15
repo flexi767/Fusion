@@ -32,15 +32,6 @@ export const schedulingSearchEntries: SettingsSearchEntry[] = [
   },
   {
     sectionId: "scheduling",
-    key: "maxTriageConcurrent",
-    labelKey: "settings.scheduling.maxTriageConcurrent",
-    labelFallback: "Max Triage Concurrent",
-    helpKey: "settings.scheduling.maximumConcurrentPlanningAgents",
-    helpFallback: "Maximum concurrent planning agents. Default: 2.",
-    keywords: ["parallelism", "capacity", "spec"],
-  },
-  {
-    sectionId: "scheduling",
     key: "executorToolFailureRetryCount",
     labelKey: "settings.scheduling.executorToolFailureRetryCount",
     labelFallback: "Executor tool-failure retries",
@@ -63,7 +54,7 @@ export const schedulingSearchEntries: SettingsSearchEntry[] = [
     labelKey: "settings.scheduling.executorToolFailureThreshold",
     labelFallback: "Consecutive tool failures",
     helpKey: "settings.scheduling.executorToolFailureThresholdHelp",
-    helpFallback: "Terminal tool errors required before retrying. Default: 3.",
+    helpFallback: "Terminal tool errors required before retrying. Default: 1.",
     keywords: ["executor", "tool error", "threshold", "auto retry"],
   },
   {
@@ -74,24 +65,6 @@ export const schedulingSearchEntries: SettingsSearchEntry[] = [
     helpKey: "settings.scheduling.executorModelEscalationEnabledHelp",
     helpFallback: "After same-model retries are exhausted, try one configured alternate model or node. Disabled by default.",
     keywords: ["executor", "model", "node", "escalation", "tool error"],
-  },
-  {
-    sectionId: "scheduling",
-    key: "executorEscalationProvider",
-    labelKey: "settings.scheduling.executorEscalationProvider",
-    labelFallback: "Escalation provider",
-    helpKey: "settings.scheduling.executorEscalationProviderHelp",
-    helpFallback: "Provider for the alternate model. Requires an alternate model ID.",
-    keywords: ["executor", "model", "provider", "escalation"],
-  },
-  {
-    sectionId: "scheduling",
-    key: "executorEscalationModelId",
-    labelKey: "settings.scheduling.executorEscalationModelId",
-    labelFallback: "Escalation model ID",
-    helpKey: "settings.scheduling.executorEscalationModelIdHelp",
-    helpFallback: "Alternate model ID. Requires an escalation provider.",
-    keywords: ["executor", "model", "escalation"],
   },
   {
     sectionId: "scheduling",
@@ -189,46 +162,6 @@ export const schedulingSearchEntries: SettingsSearchEntry[] = [
     helpKey: "settings.scheduling.maximumAgeInHoursBeforeAPlanIs",
     helpFallback: "Maximum age in hours before a plan is considered stale. Default: 6 hours.",
     keywords: ["PROMPT.md", "replan", "age"],
-  },
-  {
-    sectionId: "scheduling",
-    key: "autoArchiveDoneTasksEnabled",
-    labelKey: "settings.scheduling.enableAutomaticTaskArchiving",
-    labelFallback: " Enable automatic task archiving ",
-    helpKey: "settings.scheduling.completedTasksOlderThanTheThresholdAreMoved",
-    helpFallback:
-      "Completed tasks older than the threshold are moved out of the active task database. Default: enabled.",
-    keywords: ["done column", "cleanup", "prune", "board clutter"],
-  },
-  {
-    sectionId: "scheduling",
-    key: "autoArchiveDoneAfterMs",
-    labelKey: "settings.scheduling.archiveCompletedTasksAfterDays",
-    labelFallback: "Archive Completed Tasks After (days)",
-    helpKey: "settings.scheduling.numberOfDaysATaskCanStayIn",
-    helpFallback:
-      "Number of days a task can stay in Done before it is archived. Default: 2 days (48 hours).",
-    keywords: ["retention", "cleanup", "age"],
-  },
-  {
-    sectionId: "scheduling",
-    key: "archiveAgentLogMode",
-    labelKey: "settings.scheduling.archiveAgentLog",
-    labelFallback: "Archive Agent Log",
-    helpKey: "settings.scheduling.compactModeKeepsArchiveSizeLowWhilePreserving",
-    helpFallback:
-      "Compact mode keeps archive size low while preserving recent agent activity for context. Default: compact.",
-    keywords: ["history", "transcript", "disk space", "retention"],
-  },
-  {
-    sectionId: "scheduling",
-    key: "autoArchiveDuplicateTasksEnabled",
-    labelKey: "settings.scheduling.autoArchiveDuplicateTasks",
-    labelFallback: " Automatically archive duplicate tasks ",
-    helpKey: "settings.scheduling.autoArchiveDuplicateTasksHelp",
-    helpFallback:
-      "Automatically archive tasks detected as same-agent duplicates on creation (off by default). When disabled, duplicates are flagged in place with the yellow Duplicate chip and Keep/Archive actions instead of being archived automatically.",
-    keywords: ["near duplicate", "dedupe", "repeat"],
   },
   {
     sectionId: "scheduling",

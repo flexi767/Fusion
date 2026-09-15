@@ -13,24 +13,22 @@
  *   - Graceful shutdown of all engines via `stopAll()`
  */
 
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
-import type {
-  CentralCore,
-  TaskStore,
-  RegisteredProject,
-  MigrationProgressEvent,
-} from "@fusion/core";
+import { createTaskStoreForBackend, resolveEffectiveConcurrency, type CentralCore, type TaskStore, type RegisteredProject, type MigrationProgressEvent } from "@fusion/core";
 import { ProjectEngine } from "./project-engine.js";
 import type { ProjectEngineOptions } from "./project-engine.js";
-import type { ProjectRuntimeConfig } from "./project-runtime.js";
-import { AgentSemaphore } from "./concurrency.js";
+import type { ProjectRuntimeConfig } from "./project/project-runtime.js";
 import {
   acquireEngineSingleton,
   EngineAlreadyRunningError,
   type EngineSingletonLock,
-} from "./engine-singleton-lock.js";
+} from "./project/engine-singleton-lock.js";
 import { runtimeLog } from "./logger.js";
+import {
+  preserveAllRemoteTunnelsForSupervisedRestart,
+  shutdownAllRemoteTunnels,
+} from "./remote-access/remote-tunnel-service.js";
 
 /**
  * Options shared across all engines created by the manager.
@@ -47,6 +45,7 @@ export interface EngineManagerOptions {
   createGroupPr?: ProjectEngineOptions["createGroupPr"];
   syncGroupPr?: ProjectEngineOptions["syncGroupPr"];
   prNodeGithubOps?: ProjectEngineOptions["prNodeGithubOps"];
+  createPrNodeGithubOps?: ProjectEngineOptions["createPrNodeGithubOps"];
   prReconcileGithubOps?: ProjectEngineOptions["prReconcileGithubOps"];
   getTaskMergeBlocker?: ProjectEngineOptions["getTaskMergeBlocker"];
   onInsightRunProcessed?: ProjectEngineOptions["onInsightRunProcessed"];
@@ -68,6 +67,18 @@ export interface EngineManagerOptions {
 /** Default interval for background reconciliation (30 seconds). */
 export const DEFAULT_RECONCILIATION_INTERVAL_MS = 30_000;
 
+/**
+ * FNXC:RemoteAccess 2026-09-01-02:54:
+ * Shutdown intent, threaded from the only place that knows it: the dashboard sets its exit code to
+ * FUSION_RESTART_EXIT_CODE when a restart was REQUESTED. It is passed as an argument rather than read
+ * from the environment on purpose — FUSION_RESTART_SUPERVISED is inherited by every child process, and
+ * trusting it once already produced the "restart does nothing" bug (see hasLiveSupervisingParent).
+ */
+export interface StopAllOptions {
+  /** True when this process is exiting for a supervisor that will relaunch it immediately. */
+  supervisedRestart?: boolean;
+}
+
 export class ProjectEngineManager {
   private engines = new Map<string, ProjectEngine>();
   private starting = new Map<string, Promise<ProjectEngine>>();
@@ -86,14 +97,14 @@ export class ProjectEngineManager {
   private externalEngines = new Set<string>();
   private stopped = false;
 
-  /**
-   * Shared global semaphore — ONE instance across ALL project engines.
-   * Enforces the cross-project globalMaxConcurrent limit. Without this,
-   * each engine creates its own semaphore and the global limit is not shared.
-   */
-  private globalSemaphore: AgentSemaphore;
-  private currentGlobalLimit = 4;
-  private concurrencyListener?: (...args: unknown[]) => void;
+  /*
+  FNXC:CapacityModel 2026-07-28-20:10 (drop the cross-project cap):
+  The shared cross-project semaphore, its mutable limit and the
+  `concurrency:changed` subscription are DELETED. Capacity is two numbers per
+  project; a machine-wide cap was a third limiter with its own separate authority
+  (a central-DB singleton row), and reconciling it against the per-project gates is
+  exactly the multi-limiter arbitration this simplification removes.
+  */
 
   /** Reconciliation state for background project startup. */
   private reconciliationInterval: ReturnType<typeof setInterval> | null = null;
@@ -103,32 +114,6 @@ export class ProjectEngineManager {
     private centralCore: CentralCore,
     private options: EngineManagerOptions = {},
   ) {
-    // Dynamic getter so live changes to globalMaxConcurrent take effect immediately
-    this.globalSemaphore = new AgentSemaphore(() => this.currentGlobalLimit);
-
-    // Listen for concurrency changes from CentralCore
-    if (typeof centralCore.on === "function") {
-      this.concurrencyListener = (state: unknown) => {
-        const s = state as { globalMaxConcurrent?: number };
-        if (typeof s.globalMaxConcurrent === "number") {
-          this.currentGlobalLimit = s.globalMaxConcurrent;
-          runtimeLog.log(`Global concurrency limit updated to ${this.currentGlobalLimit}`);
-        }
-      };
-      centralCore.on("concurrency:changed", this.concurrencyListener);
-    }
-
-    // Read initial limit from CentralCore (async — updates the mutable limit)
-    this.refreshGlobalLimit();
-  }
-
-  private async refreshGlobalLimit(): Promise<void> {
-    try {
-      const state = await this.centralCore.getGlobalConcurrencyState();
-      this.currentGlobalLimit = state.globalMaxConcurrent;
-    } catch {
-      // Keep default of 4
-    }
   }
 
   // ── Public accessors ──
@@ -283,8 +268,8 @@ export class ProjectEngineManager {
     runtimeLog.log(`Engine startup complete: ${started} started, ${failed} failed`);
   }
 
-  /** Gracefully stop all engines and reconciliation. */
-  async stopAll(): Promise<void> {
+  /** Close admission on every engine and stop reconciliation without tearing engines down. */
+  beginDrain(): void {
     this.stopped = true;
     this.reconciliationStopped = true;
 
@@ -294,11 +279,23 @@ export class ProjectEngineManager {
       this.reconciliationInterval = null;
     }
 
-    // Remove concurrency change listener
-    if (this.concurrencyListener && typeof this.centralCore.off === "function") {
-      this.centralCore.off("concurrency:changed", this.concurrencyListener);
-      this.concurrencyListener = undefined;
+    for (const engine of this.engines.values()) {
+      try {
+        engine.beginDrain?.();
+      } catch (error) {
+        runtimeLog.warn(
+          `Engine drain error: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
+    for (const starting of this.starting.values()) {
+      void starting.then((engine) => engine.beginDrain?.()).catch(() => undefined);
+    }
+  }
+
+  /** Gracefully stop all engines and reconciliation. */
+  async stopAll(options: StopAllOptions = {}): Promise<void> {
+    this.beginDrain();
 
     /*
     FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
@@ -310,6 +307,44 @@ export class ProjectEngineManager {
     } catch (error) {
       runtimeLog.warn(`Failed to persist local node offline before engine shutdown: ${error instanceof Error ? error.message : String(error)}`);
     }
+
+    /*
+    FNXC:RemoteAccess 2026-08-31-07:08:
+    Remote tunnels are process-lifetime, not engine-lifetime (see remote-tunnel-service.ts), so THIS
+    is the only path that stops them — `engine.stop()` no longer does, which is what lets "Stop
+    engine"/"Restart engine" leave the operator's public URL alive. Run it before engine.stop() while
+    each TaskStore is still open, so the "was running on shutdown" marker persists and restore-on-start
+    can bring the tunnel back.
+    */
+    /*
+    FNXC:RemoteAccess 2026-09-01-02:54:
+    A SUPERVISED RESTART IS NOT A SHUTDOWN. `supervisedRestart` is set when the dashboard is exiting with
+    FUSION_RESTART_EXIT_CODE for a supervisor that will relaunch it seconds later (Command Center
+    "Restart", and "Update from source", which ends in the same exit). Killing the tunnel there took the
+    operator's public URL down on every routine restart — observed twice, container healthy, URL dead.
+    Only a genuine process/container exit stops it.
+    */
+    const supervisedRestart = options.supervisedRestart === true;
+    const tunnelShutdowns = Array.from(this.engines.entries()).map(
+      async ([id, engine]) => {
+        try {
+          await engine.shutdownRemoteTunnelForProcessExit({ supervisedRestart });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          runtimeLog.warn(`Engine ${id} remote tunnel ${supervisedRestart ? "handover" : "shutdown"} error: ${message}`);
+        }
+      },
+    );
+    await Promise.all(tunnelShutdowns);
+    // Sweep any tunnel whose engine is already gone (e.g. a paused project) so no child process
+    // outlives this one publishing a port nothing serves — or, across a supervised restart, so it is
+    // released rather than killed.
+    const sweep = supervisedRestart
+      ? preserveAllRemoteTunnelsForSupervisedRestart()
+      : shutdownAllRemoteTunnels();
+    await sweep.catch((err) => {
+      runtimeLog.warn(`Remote tunnel sweep error: ${err instanceof Error ? err.message : String(err)}`);
+    });
 
     const stops = Array.from(this.engines.entries()).map(
       async ([id, engine]) => {
@@ -542,22 +577,49 @@ export class ProjectEngineManager {
   }
 
   private async buildRuntimeConfig(project: RegisteredProject): Promise<ProjectRuntimeConfig> {
-    const settings = project.settings as
-      | Record<string, unknown>
-      | undefined;
+    const workingDirectory = await this.centralCore.resolveLocalProjectWorkingDirectory(project.id);
+    const capacity = await this.resolveStartupConcurrency(project, workingDirectory);
 
     return {
       projectId: project.id,
-      workingDirectory: await this.centralCore.resolveLocalProjectWorkingDirectory(project.id),
+      workingDirectory,
       isolationMode:
         (project.isolationMode as "in-process" | "child-process") ??
         "in-process",
-      maxConcurrent: (settings?.maxConcurrent as number) ?? 4,
-      maxWorktrees: (settings?.maxWorktrees as number) ?? 10,
-      // Shared global semaphore — all engines share one concurrency pool
-      globalSemaphore: this.globalSemaphore,
+      maxConcurrent: capacity.maxConcurrent,
+      maxWorktrees: capacity.worktreeLimit ?? capacity.maxConcurrent,
       onMigrationProgress: this.options.onMigrationProgress,
     };
+  }
+
+  /*
+  FNXC:CapacityModel 2026-08-21-15:45:
+  FN-9185 makes live project settings authoritative even while a runtime is starting.
+  The registry snapshot is used only when a project-scoped TaskStore cannot be opened; this avoids
+  constructing a startup capacity from a stale central record that omits a persisted project override.
+  */
+  private async resolveStartupConcurrency(project: RegisteredProject, workingDirectory: string) {
+    const externalStore = this.options.externalTaskStore;
+    const getExternalSettingsFast = externalStore?.getSettingsFast;
+    if (externalStore && typeof getExternalSettingsFast === "function" && sameProjectRoot(externalStore.getRootDir(), workingDirectory)) {
+      return resolveEffectiveConcurrency(await getExternalSettingsFast.call(externalStore));
+    }
+
+    // A missing root cannot host a project-scoped store (notably a stale registry row).
+    if (!existsSync(workingDirectory)) {
+      return resolveEffectiveConcurrency(project.settings as Record<string, unknown> | undefined);
+    }
+
+    try {
+      const boot = await createTaskStoreForBackend({ rootDir: workingDirectory, projectId: project.id });
+      try {
+        return resolveEffectiveConcurrency(await boot.taskStore.getSettingsFast());
+      } finally {
+        await boot.shutdown();
+      }
+    } catch {
+      return resolveEffectiveConcurrency(project.settings as Record<string, unknown> | undefined);
+    }
   }
 
   private buildEngineOptions(
@@ -585,6 +647,7 @@ export class ProjectEngineManager {
       createGroupPr: this.options.createGroupPr,
       syncGroupPr: this.options.syncGroupPr,
       prNodeGithubOps: this.options.prNodeGithubOps,
+      createPrNodeGithubOps: this.options.createPrNodeGithubOps,
       prReconcileGithubOps: this.options.prReconcileGithubOps,
       getTaskMergeBlocker: this.options.getTaskMergeBlocker,
       onInsightRunProcessed: this.options.onInsightRunProcessed,

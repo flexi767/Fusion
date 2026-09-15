@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateAgentActionGate } from "../agent-action-gate.js";
+import { evaluateAgentActionGate } from "../agents/agent-action-gate.js";
 import {
   ACTION_GATE_NETWORK_API_TOOLS,
   ACTION_GATE_TASK_AGENT_MANAGEMENT_TOOLS,
@@ -13,8 +13,8 @@ import {
   TASK_AGENT_MUTATION_TOOLS,
   classifyGitCommand,
   isGitWriteCommand,
-} from "../gating-classifications.js";
-import { classifyPermanentAgentToolCall, resolvePermanentAgentToolDecision } from "../permanent-agent-gating.js";
+} from "../execution/gating-classifications.js";
+import { classifyPermanentAgentToolCall, resolvePermanentAgentToolDecision } from "../agents/permanent-agent-gating.js";
 import type { AgentPermissionPolicy } from "@fusion/core";
 
 const unrestrictedPolicy: AgentPermissionPolicy = {
@@ -67,7 +67,7 @@ const FN_7111_GOVERNED_TOOLS = [
   ["fn_task_promote", "task_agent_mutation"],
   ["fn_task_refine", "task_agent_mutation"],
   ["fn_run_verification", "command_execution"],
-  ["fn_acquire_repo_worktree", "command_execution"],
+  ["fn_install_worktree_dependencies", "command_execution"],
   ["fn_research_cancel", "network_api"],
 ] as const;
 
@@ -130,6 +130,7 @@ describe("gating-classifications parity", () => {
       [
         "find",
         "fn_agent_org_chart",
+        "fn_agent_read_evaluations",
         "fn_agent_show",
         "fn_artifact_list",
         "fn_artifact_register",
@@ -158,6 +159,7 @@ describe("gating-classifications parity", () => {
         "fn_task_list",
         "fn_task_log",
         "fn_task_logs_read",
+        "fn_task_prompt_write",
         "fn_task_search",
         "fn_task_show",
         "fn_task_verification_status",
@@ -176,6 +178,22 @@ describe("gating-classifications parity", () => {
   it("classifies fn_ask_question in both gate source sets", () => {
     expect(READONLY_FN_TOOLS.has("fn_ask_question")).toBe(true);
     expect((COORDINATION_EXEMPT_TOOLS as readonly string[]).includes("fn_ask_question")).toBe(true);
+  });
+
+  it("classifies fn_task_prompt_write as coordination-exempt so plan persistence is not approval-gated", () => {
+    expect(READONLY_FN_TOOLS.has("fn_task_prompt_write")).toBe(true);
+    expect((COORDINATION_EXEMPT_TOOLS as readonly string[]).includes("fn_task_prompt_write")).toBe(true);
+    expect(classifyPermanentAgentToolCall("fn_task_prompt_write")).toEqual({ category: "none", recognized: true });
+    expect(resolvePermanentAgentToolDecision({
+      toolName: "fn_task_prompt_write",
+      gating: { permissionPolicy: approvalRequiredPolicy },
+    })).toMatchObject({ category: "none", disposition: "allow", recognized: true });
+    expect(evaluateAgentActionGate({
+      agentId: "a1",
+      toolName: "fn_task_prompt_write",
+      args: { content: "# Plan" },
+      permissionPolicy: approvalRequiredPolicy,
+    })).toMatchObject({ category: "exempt", disposition: "allow" });
   });
 
   it("ensures coordination exempt tools are recognized and allowed in permanent gating", () => {
@@ -203,6 +221,14 @@ describe("gating-classifications parity", () => {
     });
   });
 
+  it("classifies mission blocked-badge repair in both gate paths without readonly exemptions", () => {
+    const toolName = "fn_mission_clear_blocked";
+    expect(ACTION_GATE_TASK_AGENT_MANAGEMENT_TOOLS.has(toolName)).toBe(true);
+    expect(PERMANENT_AGENT_TASK_MUTATION_TOOLS.has(toolName)).toBe(true);
+    expect(READONLY_FN_TOOLS.has(toolName)).toBe(false);
+    expect((COORDINATION_EXEMPT_TOOLS as readonly string[]).includes(toolName)).toBe(false);
+  });
+
   it("classifies ideation reads and mutations in both policy paths", () => {
     for (const toolName of ["fn_ideation_list", "fn_ideation_show"]) {
       expect(READONLY_FN_TOOLS.has(toolName)).toBe(true);
@@ -227,25 +253,31 @@ describe("gating-classifications parity", () => {
       recognized: true,
     });
 
-    for (const [permissionPolicy, disposition] of policyMatrix) {
-      expect(resolvePermanentAgentToolDecision({
-        toolName: "fn_task_create",
-        args: { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } },
-        gating: { permissionPolicy },
-      })).toMatchObject({
-        category: "task_agent_mutation",
-        disposition,
-        recognized: true,
-      });
-      expect(evaluateAgentActionGate({
-        agentId: "a1",
-        toolName: "fn_task_create",
-        args: { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } },
-        permissionPolicy,
-      })).toMatchObject({
-        category: "task_agent_mutation",
-        disposition,
-      });
+    /*
+    FNXC:EngineTests 2026-07-22-13:07:
+    Cover freeform (no lineage) and mission-linked args: both follow policy disposition.
+    */
+    for (const args of [{}, { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } }]) {
+      for (const [permissionPolicy, disposition] of policyMatrix) {
+        expect(resolvePermanentAgentToolDecision({
+          toolName: "fn_task_create",
+          args,
+          gating: { permissionPolicy },
+        })).toMatchObject({
+          category: "task_agent_mutation",
+          disposition,
+          recognized: true,
+        });
+        expect(evaluateAgentActionGate({
+          agentId: "a1",
+          toolName: "fn_task_create",
+          args,
+          permissionPolicy,
+        })).toMatchObject({
+          category: "task_agent_mutation",
+          disposition,
+        });
+      }
     }
   });
 
@@ -562,7 +594,10 @@ describe("gating-classifications parity", () => {
         continue;
       }
       if (FILE_WRITE_DELETE_FN_TOOLS.has(toolName)) {
-        expect({ toolName, actionKind, permanentKind }).toEqual({ toolName, actionKind: "readonly", permanentKind: "file-write" });
+        // FNXC:AgentGating 2026-07-26-15:10: both gates now agree fn_task_attach
+        // is a file write; the old "readonly" action-side expectation encoded the
+        // silent exempt-fallback defect fixed by the fail-closed classifier.
+        expect({ toolName, actionKind, permanentKind }).toEqual({ toolName, actionKind: "file-write", permanentKind: "file-write" });
         continue;
       }
       if (NETWORK_API_TOOLS.has(toolName) && !ACTION_GATE_NETWORK_API_TOOLS.has(toolName)) {

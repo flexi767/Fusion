@@ -5,6 +5,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { loadStylesCss } from "../../../test/cssFixture";
 import { CommandCenter } from "../CommandCenter";
+import { selectCommandCenterSection } from "./sectionNavTestUtils";
 
 const apiMock = vi.fn();
 vi.mock("../../../api/legacy", () => ({
@@ -14,7 +15,7 @@ vi.mock("../../../api/legacy", () => ({
     projectId ? `${path}${path.includes("?") ? "&" : "?"}projectId=${encodeURIComponent(projectId)}` : path,
   fetchOrgTree: vi.fn().mockResolvedValue([]),
   fetchExecutorStats: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, maxConcurrent: 2 }),
-  fetchSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxTriageConcurrent: 1, maxWorktrees: 5 }),
+  fetchSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 5 }),
   fetchConfig: vi.fn().mockResolvedValue({ maxConcurrent: 2, rootDir: "/" }),
   updateSettings: vi.fn().mockResolvedValue({}),
 }));
@@ -330,7 +331,6 @@ function mockMobileMatchMedia(matchesMobile: boolean) {
 function assertScrollOwnerContract(panel: HTMLElement) {
   const shell = screen.getByTestId("command-center");
   const header = shell.querySelector(".cc-header") as HTMLElement;
-  const tablist = screen.getByRole("tablist");
 
   const shellStyle = window.getComputedStyle(shell);
   const panelStyle = window.getComputedStyle(panel);
@@ -340,7 +340,6 @@ function assertScrollOwnerContract(panel: HTMLElement) {
   expect(panelStyle.minHeight).toBe("0px");
   expect(panelStyle.overflowY).toBe("auto");
   expect(window.getComputedStyle(header).flexShrink).toBe("0");
-  expect(window.getComputedStyle(tablist).flexShrink).toBe("0");
 }
 
 function assertNoChartScrollSteal(panel: HTMLElement) {
@@ -357,9 +356,9 @@ function assertNoChartScrollSteal(panel: HTMLElement) {
 }
 
 async function openChartTab(tab: string) {
-  fireEvent.click(screen.getByTestId(`command-center-tab-${tab}`));
+  selectCommandCenterSection(tab);
   const panel = screen.getByTestId(`command-center-panel-${tab}`);
-  expect(panel).toBe(screen.getByRole("tabpanel"));
+  expect(panel).toBe(screen.getByRole("region"));
   await vi.waitFor(() => {
     expect(screen.queryByTestId(`cc-area-${tab}-loading`)).toBeNull();
   });
@@ -368,6 +367,20 @@ async function openChartTab(tab: string) {
 
 describe("CommandCenter mobile scroll regression (FN-6595)", () => {
   beforeEach(() => {
+  /*
+  FNXC:CommandCenter 2026-07-30-22:10:
+  CLEAR THE PERSISTED SUB-TAB — cases in this file are no longer independent without it.
+
+  #2420 made `activeTab` initialise from per-project persisted state
+  (`getCommandCenterState(projectId)?.activeTab`) instead of always `"overview"`, because Command
+  Center unmounts on navigation by design and has to restore its sub-tab on remount. These cases
+  click through to other tabs, so the FIRST case now leaves `mission-control` persisted and every
+  later case renders `command-center-panel-mission-control` — the `command-center-panel-overview`
+  lookups then fail with no hint that the cause is a previous test.
+
+  Confirmed as ordering, not breakage: each failing case passes when run alone with `-t`.
+  */
+  localStorage.clear();
     apiMock.mockReset();
     mockOverviewApi();
     injectCommandCenterCss();
@@ -381,32 +394,38 @@ describe("CommandCenter mobile scroll regression (FN-6595)", () => {
     await screen.findByTestId("command-center-empty");
     expect(screen.getByTestId("command-center-controls")).toBeTruthy();
     expect(screen.getByTestId("cc-controls-concurrency")).toBeTruthy();
-    expect(screen.getByTestId("cc-controls-org-portability")).toBeTruthy();
+    /*
+    FNXC:DashboardTests 2026-07-19-01:20:
+    FN-8351 moved org portability from overview controls into the Team area.
+    Overview must not still require cc-controls-org-portability; Team owns it.
+    */
+    expect(screen.queryByTestId("cc-controls-org-portability")).toBeNull();
     expect(screen.queryByTestId("cc-controls-config-versions")).toBeNull();
     expect(screen.queryByTestId("cc-controls-org-chart")).toBeNull();
     expect(screen.queryByTestId("cc-controls-heartbeat")).toBeNull();
     assertScrollOwnerContract(overviewPanel);
 
-    fireEvent.click(screen.getByTestId("command-center-tab-tokens"));
+    selectCommandCenterSection("tokens");
     const tokensPanel = screen.getByTestId("command-center-panel-tokens");
-    expect(tokensPanel).toBe(screen.getByRole("tabpanel"));
+    expect(tokensPanel).toBe(screen.getByRole("region"));
     assertScrollOwnerContract(tokensPanel);
 
-    fireEvent.click(screen.getByTestId("command-center-tab-team"));
+    selectCommandCenterSection("team");
     const teamPanel = screen.getByTestId("command-center-panel-team");
-    expect(teamPanel).toBe(screen.getByRole("tabpanel"));
+    expect(teamPanel).toBe(screen.getByRole("region"));
     expect(screen.getByTestId("cc-team-org-chart")).toBeTruthy();
     expect(screen.getByTestId("cc-team-heartbeat")).toBeTruthy();
+    expect(screen.getByTestId("cc-controls-org-portability")).toBeTruthy();
     assertScrollOwnerContract(teamPanel);
 
-    fireEvent.click(screen.getByTestId("command-center-tab-github"));
+    selectCommandCenterSection("github");
     const githubPanel = screen.getByTestId("command-center-panel-github");
-    expect(githubPanel).toBe(screen.getByRole("tabpanel"));
+    expect(githubPanel).toBe(screen.getByRole("region"));
     assertScrollOwnerContract(githubPanel);
 
-    fireEvent.click(screen.getByTestId("command-center-tab-system"));
+    selectCommandCenterSection("system");
     const systemPanel = screen.getByTestId("command-center-panel-system");
-    expect(systemPanel).toBe(screen.getByRole("tabpanel"));
+    expect(systemPanel).toBe(screen.getByRole("region"));
     await screen.findByTestId("cc-area-system");
     assertScrollOwnerContract(systemPanel);
   });

@@ -1,3 +1,4 @@
+import { ViewHeader } from "./ViewHeader";
 import "./ArtifactsGallery.css";
 import { useCallback, useContext, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -12,7 +13,6 @@ import {
   Package,
   Pencil,
   Video,
-  X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -22,6 +22,7 @@ import { artifactMediaUrl, artifactMediaUrlWithToken, fetchArtifact, updateArtif
 import { withTokenHeader } from "../auth";
 import { FileEditor } from "./FileEditor";
 import { FloatingWindow } from "./FloatingWindow";
+import { ArtifactImage, ArtifactImageViewer } from "./ArtifactImageViewer";
 import { NavigationHistoryContext } from "../hooks/useNavigationHistory";
 
 /*
@@ -212,7 +213,10 @@ export function ArtifactsGallery({ artifacts, projectId, isMobile, addToast, onO
         );
       })}
 
-      {viewer && viewer.kind === "media" && (
+      {viewer && viewer.kind === "media" && viewer.artifact.type === "image" && (
+        <ArtifactImageViewer artifactId={viewer.artifact.id} title={viewer.artifact.title || t("documents.untitledArtifact", "Untitled artifact")} projectId={projectId} taskId={viewer.artifact.taskId} onOpenTask={onOpenTask} onClose={dismissViewer} />
+      )}
+      {viewer && viewer.kind === "media" && viewer.artifact.type !== "image" && (
         <MediaLightbox artifact={viewer.artifact} projectId={projectId} t={t} onClose={dismissViewer} onOpenTask={onOpenTask} />
       )}
       {viewer && viewer.kind === "pdf" && (
@@ -289,7 +293,7 @@ interface TileProps {
 
 function VisualTile({ artifact, category, projectId, t, onOpen }: TileProps) {
   const title = artifact.title || t("documents.untitledArtifact", "Untitled artifact");
-  const mediaUrl = artifactMediaUrlWithToken(artifact.id, projectId);
+  const mediaUrl = category === "image" ? "" : artifactMediaUrlWithToken(artifact.id, projectId);
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
@@ -308,7 +312,7 @@ function VisualTile({ artifact, category, projectId, t, onOpen }: TileProps) {
         onKeyDown={handleKeyDown}
       >
         {category === "image" ? (
-          <img src={mediaUrl} alt={title} loading="lazy" />
+          <ArtifactImage artifactId={artifact.id} projectId={projectId} title={title} />
         ) : (
           <video src={mediaUrl} muted preload="metadata" aria-label={t("documents.artifactVideoLabel", "Video artifact: {{title}}", { title })} />
         )}
@@ -498,15 +502,19 @@ function OverlayShell({ label, onClose, children, wide, closeRef, windowKey, per
 
 function ViewerHeader({ title, onClose, t, actions, closeRef }: { title: string; onClose: () => void; t: TFunction<"app">; actions?: React.ReactNode; closeRef: React.RefObject<HTMLButtonElement | null> }) {
   return (
-    <div className="artifacts-gallery-viewer-header">
-      <h3 className="artifacts-gallery-viewer-title">{title}</h3>
-      <div className="artifacts-gallery-viewer-actions">
-        {actions}
-        <button ref={closeRef} className="modal-close" onClick={onClose} aria-label={t("documents.closeLightbox", "Close artifact preview")}>
-          <X size={20} />
-        </button>
-      </div>
-    </div>
+    /*
+    FNXC:StandardizedViewLayout 2026-09-13-22:40:
+    FN-379 remediation: gallery viewers share the canonical header, keeping their own actions and focus ref.
+    */
+    <ViewHeader
+      className="artifacts-gallery-viewer-header"
+      headingLevel={3}
+      title={title}
+      actions={actions}
+      onClose={onClose}
+      closeButtonRef={closeRef}
+      closeButtonProps={{ "aria-label": t("documents.closeLightbox", "Close artifact preview") }}
+    />
   );
 }
 

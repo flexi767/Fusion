@@ -38,7 +38,10 @@ function ensureMigrationsStaged() {
   }
 }
 
-async function importCore() {
+/* FNXC:OperatorScriptLaneAssumptions 2026-07-31-02:10: exported so operator scripts can reach core
+   helpers (lane resolution) through the SAME staged-dist seam `openBackend` already uses, rather than
+   each growing its own dist path — `@fusion/core` is not resolvable from the repo-root `scripts/`. */
+export async function importCore() {
   ensureMigrationsStaged();
   try {
     return await import(pathToFileURL(resolve(repoRoot, "packages/core/dist/index.js")).href);
@@ -66,9 +69,12 @@ async function importCore() {
  * Throws when PostgreSQL cannot start. These scripts must never fall back to
  * the removed SQLite runtime.
  */
-export async function openBackend(rootDir = process.cwd()) {
+export async function openBackend(rootDir = process.cwd(), options = {}) {
   const core = await importCore();
-  const boot = await core.createTaskStoreForBackend({ rootDir });
+  const boot = await core.createTaskStoreForBackend({
+    rootDir,
+    skipArchiveReintegrationOnInit: options.skipArchiveReintegrationOnInit === true,
+  });
   const asyncLayer = boot.taskStore.getAsyncLayer();
   if (!asyncLayer) {
     await boot.shutdown().catch(() => {});

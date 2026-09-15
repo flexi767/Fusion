@@ -1,10 +1,21 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getViewportMode, isFullScreenSheetViewport, isMobileViewport, MOBILE_MEDIA_QUERY, useViewportMode } from "../useViewportMode";
+import {
+  getViewportMode,
+  isFullScreenSheetViewport,
+  isMobileViewport,
+  isTabletTouchViewport,
+  MOBILE_MEDIA_QUERY,
+  publishViewportMode,
+  useViewportMode,
+  VIEWPORT_MODE_DATASET_KEY,
+} from "../useViewportMode";
 
 const TABLET_MEDIA_QUERY = "(min-width: 769px) and (max-width: 1024px)";
 const MOBILE_WIDTH_MEDIA_QUERY = "(max-width: 768px)";
+const FULL_SCREEN_SHEET_WIDTH_MEDIA_QUERY = "(max-width: 767.98px)";
 const MOBILE_HEIGHT_MEDIA_QUERY = "(max-height: 480px)";
+const PHONE_WIDTH_MEDIA_QUERY = "(max-width: 600px)";
 const originalScreenDescriptor = Object.getOwnPropertyDescriptor(window, "screen");
 
 function stubScreen(width: number, height: number) {
@@ -15,7 +26,7 @@ function stubMissingScreen() {
   Object.defineProperty(window, "screen", { configurable: true, value: undefined });
 }
 
-function installViewportMedia(options: { width: boolean; height: boolean; tablet: boolean }) {
+function installViewportMedia(options: { width: boolean; height: boolean; tablet: boolean; sheetWidth?: boolean }) {
   vi.stubGlobal(
     "matchMedia",
     vi.fn((query: string) => ({
@@ -24,7 +35,9 @@ function installViewportMedia(options: { width: boolean; height: boolean; tablet
           ? options.width || options.height
           : query === MOBILE_WIDTH_MEDIA_QUERY
             ? options.width
-            : query === MOBILE_HEIGHT_MEDIA_QUERY
+            : query === FULL_SCREEN_SHEET_WIDTH_MEDIA_QUERY
+              ? (options.sheetWidth ?? options.width)
+              : query === MOBILE_HEIGHT_MEDIA_QUERY
               ? options.height
               : query === TABLET_MEDIA_QUERY
                 ? options.tablet
@@ -47,6 +60,7 @@ function createViewportMediaMock(initial: { mobile: boolean; tablet: boolean }) 
   const matches = new Map<string, boolean>([
     [MOBILE_MEDIA_QUERY, initial.mobile],
     [MOBILE_WIDTH_MEDIA_QUERY, initial.mobile],
+    [FULL_SCREEN_SHEET_WIDTH_MEDIA_QUERY, initial.mobile],
     [MOBILE_HEIGHT_MEDIA_QUERY, false],
     [TABLET_MEDIA_QUERY, initial.tablet],
   ]);
@@ -77,6 +91,7 @@ function createViewportMediaMock(initial: { mobile: boolean; tablet: boolean }) 
         matches.set(query, nextMatches);
         if (query === MOBILE_MEDIA_QUERY) {
           matches.set(MOBILE_WIDTH_MEDIA_QUERY, nextMatches);
+          matches.set(FULL_SCREEN_SHEET_WIDTH_MEDIA_QUERY, nextMatches);
         }
       },
       dispatchChange: () => {
@@ -104,9 +119,27 @@ function createViewportMediaMock(initial: { mobile: boolean; tablet: boolean }) 
 describe("useViewportMode", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    delete document.documentElement.dataset[VIEWPORT_MODE_DATASET_KEY];
     if (originalScreenDescriptor) {
       Object.defineProperty(window, "screen", originalScreenDescriptor);
     }
+  });
+
+  it("publishViewportMode mirrors mode onto documentElement dataset", () => {
+    publishViewportMode("tablet");
+    expect(document.documentElement.dataset[VIEWPORT_MODE_DATASET_KEY]).toBe("tablet");
+    publishViewportMode("mobile");
+    expect(document.documentElement.dataset[VIEWPORT_MODE_DATASET_KEY]).toBe("mobile");
+  });
+
+  it("useViewportMode publishes data-viewport-mode for CSS chrome alignment", () => {
+    stubScreen(1024, 768);
+    installViewportMedia({ width: false, height: false, tablet: true });
+
+    const { result, unmount } = renderHook(() => useViewportMode());
+    expect(result.current).toBe("tablet");
+    expect(document.documentElement.dataset[VIEWPORT_MODE_DATASET_KEY]).toBe("tablet");
+    unmount();
   });
 
   it("treats short landscape phones as mobile", () => {
@@ -148,6 +181,142 @@ describe("useViewportMode", () => {
 
     expect(getViewportMode()).toBe("tablet");
     expect(renderHook(() => useViewportMode()).result.current).toBe("tablet");
+  });
+
+  /*
+  FNXC:ViewportMode 2026-07-24-18:55:
+  Regression cover for large Android phones losing the bottom nav bar. `window.screen`
+  is not a reliable phone/tablet discriminator — these devices report a screen min edge
+  above the 480px phone threshold, so the tablet-class exclusion stripped mobile mode at
+  any CSS width. The invariant is width-based and asserted across every width signal the
+  classifier reads (media query, innerWidth, visualViewport), not just the reported case,
+  because each of the three can lead on a different device or update late on rotation.
+  */
+  describe("phone width floor overrides physical-screen tablet classification", () => {
+    const LARGE_PHONE_SCREEN: [number, number] = [1080, 2400];
+
+    function withTouch(run: () => void) {
+      const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+      Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 5 });
+      try {
+        run();
+      } finally {
+        if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+      }
+    }
+
+    function stubPhoneWidthMedia(phoneWidthMatches: boolean) {
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches:
+            query === MOBILE_MEDIA_QUERY || query === MOBILE_WIDTH_MEDIA_QUERY
+              ? true
+              : query === PHONE_WIDTH_MEDIA_QUERY
+                ? phoneWidthMatches
+                : false,
+          media: query,
+          onchange: null,
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+        })),
+      );
+    }
+
+    it("stays mobile when the phone width media query matches", () => {
+      withTouch(() => {
+        stubScreen(...LARGE_PHONE_SCREEN);
+        stubPhoneWidthMedia(true);
+
+        expect(isMobileViewport()).toBe(true);
+        expect(getViewportMode()).toBe("mobile");
+      });
+    });
+
+    it("stays mobile on a narrow innerWidth even when the media query has not updated", () => {
+      withTouch(() => {
+        stubScreen(...LARGE_PHONE_SCREEN);
+        stubPhoneWidthMedia(false);
+        vi.stubGlobal("innerWidth", 430);
+
+        expect(isMobileViewport()).toBe(true);
+        expect(getViewportMode()).toBe("mobile");
+      });
+    });
+
+    it("stays mobile on a narrow visualViewport pane", () => {
+      withTouch(() => {
+        stubScreen(...LARGE_PHONE_SCREEN);
+        stubPhoneWidthMedia(false);
+        const originalVisualViewport = window.visualViewport;
+        Object.defineProperty(window, "visualViewport", {
+          configurable: true,
+          value: { width: 412, height: 915, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+        });
+
+        try {
+          expect(isMobileViewport()).toBe(true);
+          expect(getViewportMode()).toBe("mobile");
+        } finally {
+          Object.defineProperty(window, "visualViewport", { configurable: true, value: originalVisualViewport });
+        }
+      });
+    });
+
+    it("leaves the 601-768px tablet band to the physical-screen classification", () => {
+      withTouch(() => {
+        stubScreen(768, 1024);
+        stubPhoneWidthMedia(false);
+        vi.stubGlobal("innerWidth", 700);
+
+        expect(isMobileViewport()).toBe(false);
+      });
+    });
+  });
+
+  it("enables the resize touch target only for tablet-class touch viewports", () => {
+    const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    try {
+      stubScreen(768, 1024);
+      installViewportMedia({ width: true, height: false, tablet: false });
+      expect(isTabletTouchViewport()).toBe(true);
+
+      stubScreen(1024, 768);
+      installViewportMedia({ width: false, height: false, tablet: true });
+      expect(isTabletTouchViewport()).toBe(true);
+
+      stubScreen(1920, 1080);
+      installViewportMedia({ width: false, height: false, tablet: false });
+      expect(isTabletTouchViewport()).toBe(false);
+
+      stubScreen(390, 844);
+      installViewportMedia({ width: true, height: false, tablet: false });
+      expect(isTabletTouchViewport()).toBe(false);
+    } finally {
+      if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+    }
+  });
+
+  it("keeps a touch tablet at the 768px boundary out of the phone presentation", () => {
+    const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    stubScreen(768, 1024);
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    installViewportMedia({ width: true, sheetWidth: false, height: false, tablet: false });
+
+    try {
+      expect(isMobileViewport()).toBe(false);
+      expect(isFullScreenSheetViewport()).toBe(false);
+      expect(getViewportMode()).toBe("tablet");
+    } finally {
+      if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+    }
+  });
+
+  it("keeps 767px phone sheets below the 768px tablet boundary", () => {
+    stubScreen(390, 844);
+    installViewportMedia({ width: true, sheetWidth: true, height: false, tablet: false });
+    expect(isFullScreenSheetViewport()).toBe(true);
   });
 
   it("keeps desktop mode when only the short-height clause matches on a desktop-class screen", () => {

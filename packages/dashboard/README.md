@@ -459,11 +459,24 @@ Browse and edit task worktree files directly from the task detail modal:
 - **Safety Features**:
   - Path traversal prevention (blocks `..` patterns)
   - Binary file detection (prevents editing images, executables, etc.)
-  - 1MB file size limit
+  - 1MB UTF-8 file-content size limit
+  - File-save JSON requests allow up to 6,292,480 bytes so a supported 1MB control-character file
+    can survive JSON escaping; this transport envelope does not increase the file-content limit
   - Unsaved change indicators
 - **Keyboard Shortcuts**:
   - `Ctrl/Cmd+S` to save
   - `Escape` to close
+
+### Large chat and file requests
+
+Pasted Direct, Planner, and Room Chat text sent as JSON can be up to 2 MiB per request. The limit
+is a transport limit, not a model-context promise: provider context also includes conversation
+history, instructions, tool input, reasoning, and output. Chat attachment uploads remain multipart
+with their existing file count and size limits.
+
+File-editor saves have an approximately 6 MiB JSON transport envelope only to accommodate JSON
+escaping of the unchanged 1 MiB UTF-8 file-content maximum. File-browser operations such as mkdir,
+copy, move, delete, and rename, plus unrelated JSON endpoints, retain the 100 KiB request limit.
 
 ### Activity Log
 View a centralized timeline of all task lifecycle events. Click the history icon in the header to open the Activity Log modal.
@@ -476,6 +489,7 @@ View a centralized timeline of all task lifecycle events. Click the history icon
 - **Event Types**: Track task:created, task:moved, task:merged, task:failed, task:deleted, and settings:updated events
 - **Task Links**: Click any task ID in the log to open its detail modal
 - **Filter by Type**: Use the dropdown to show only specific event types (e.g., only failures, only merges)
+- **Exact Task-ID Search**: Enter a task ID (for example, `FN-066`) to retrieve its complete durable history. The task filter composes with project and event-type filters in both the modal and right dock.
 - **Auto-refresh**: Log updates automatically every 30 seconds when the modal is open
 - **Pagination**: "Load More" button fetches older entries (100 entries per request, max 1000)
 - **Clear Log**: Maintenance function to clear all activity history (with confirmation)
@@ -623,7 +637,7 @@ The dashboard includes several runtime safeguards to stay responsive during long
 
 - **Agent log cap**: The UI keeps only the most recent **500 agent log entries per task** in memory. Historical log fetches and live SSE appends are both capped to this window. Tool-oriented `detail` payloads may be clipped server-side before they reach the dashboard so oversized command output does not stall the shared engine/dashboard event loop. The 500-entry limit is still a whole-list in-memory cap only.
 - **Memoized task rendering**: `TaskCard`, `Column`, and worktree grouping are memoized so unrelated SSE updates do not force the whole board to repaint. The board also preserves stable per-column task arrays for unchanged columns.
-- **Large-column pagination**: Columns with more than **100 tasks** use incremental client-side pagination, rendering **50 tasks initially** and loading **25 more** at a time. This is applied to active non-archived, non-`in-progress` columns to avoid breaking worktree grouping and archived browsing behavior.
+- **Large-column pagination**: Large columns use incremental client-side windowing, rendering **50 tasks initially** and revealing **25 more** at a time. Done additionally uses server pagination in pages of 50 with an exact independent total, so completed history stays bounded without undercounting the column header.
 - **Badge update isolation**: Live GitHub PR/issue badge websocket updates are rendered through a dedicated child component so badge freshness is preserved even when task cards are memoized.
 - **SSE cleanup and reconnects**: Task and log streaming hooks explicitly clean up EventSource listeners/connections, automatically refetch the task snapshot after a stream reconnect, and avoid duplicate stream setup during rerenders.
 - **Foreground recovery refresh**: The task board refreshes its task snapshot when the browser tab becomes visible again so long-lived hidden tabs do not keep showing stale board/list data after missed live events.
@@ -685,7 +699,8 @@ This works by configuring packages to resolve their workspace dependencies via T
 The dashboard server exposes a REST API at `/api`:
 
 ### Tasks
-- `GET /api/tasks` - List all tasks
+- `GET /api/tasks` - List live, non-completed tasks
+- `GET /api/tasks/done` - List completed tasks with server pagination and an exact total
 - `GET /api/tasks/:id` - Get task details
 - `POST /api/tasks` - Create new task
 - `PATCH /api/tasks/:id` - Update task
@@ -698,10 +713,6 @@ The dashboard server exposes a REST API at `/api`:
   - To explicitly remove incoming dependency references and then delete, call `DELETE /api/tasks/:id?removeDependencyReferences=true`.
   - To explicitly remove incoming lineage references and then delete, call `DELETE /api/tasks/:id?removeLineageReferences=true`.
   - Both opt-in paths rewrite the referencing tasks atomically before deleting the target task, so no live task is left pointing at a missing task ID.
-- `POST /api/tasks/:id/archive` - Archive a done task.
-  - Default mode is safe: if live lineage children still reference this task as `sourceParentTaskId`, the route returns `409` with `{ error, details: { code: "TASK_HAS_LINEAGE_CHILDREN", taskId, lineageChildIds } }`.
-  - To unlink those lineage references first, call `POST /api/tasks/:id/archive?removeLineageReferences=true`.
-
 ### Git Operations
 - `GET /api/git/status` - Current branch and status
 - `GET /api/git/commits` - Recent commits (with optional `?limit=`)  
@@ -769,7 +780,7 @@ For real-time PR/issue badge updates, configure a GitHub App instead of relying 
 **Fallback Behavior:**
 When webhook delivery is unavailable, the 5-minute refresh endpoints (`/api/tasks/:id/pr/status`, `/api/tasks/:id/issue/status`) continue to work as the fallback path. Staleness is computed from persisted `lastCheckedAt` timestamps only (no in-memory poller state).
 
-### External Signal Ingestion (Sentry / Datadog / PagerDuty / generic webhook)
+### External Signal Ingestion (GitHub / Sentry / Datadog / PagerDuty / generic webhook)
 
 Inbound signals from error trackers and alerting tools are ingested into triage
 tasks via `POST /api/signals/:provider`. Every endpoint requires a valid HMAC
@@ -788,6 +799,9 @@ source-controlled:
   verifies `X-Datadog-Signature`; `groupingKey` = monitor `aggreg_key`/`alert_id`.
 - `FUSION_SIGNAL_PAGERDUTY_SECRET` — PagerDuty (`POST /api/signals/pagerduty`),
   verifies `X-PagerDuty-Signature` (`v1=<hex>`); `groupingKey` = `incident.id`.
+- `FUSION_SIGNAL_GITHUB_SECRET` — GitHub (`POST /api/signals/github`), verifies
+  `X-Hub-Signature-256` for `check_suite`, `workflow_run`, and `status`. Terminal
+  success/neutral/skipped deliveries atomically resolve an existing incident without a triage task.
 
 **Security:** mandatory HMAC (401 on missing/invalid secret or signature),
 replay window (±5 min) + delivery-id nonce dedup, persistent external-id dedup,
@@ -931,7 +945,7 @@ Plugin management endpoints with multi-project scoping support via `projectId` q
 
 - **Frontend**: React + Vite, TypeScript, xterm.js for terminal emulation, CSS custom properties for theming
 - **Backend**: Express server with REST API, badge WebSocket at `/api/ws`, terminal WebSocket at `/api/terminal/ws`, and Server-Sent Events (SSE) for task/log updates
-- **Terminal**: @homebridge/node-pty-prebuilt-multiarch (aliased as node-pty) for PTY spawning, WebSocket for bidirectional I/O
+- **Terminal**: @lydell/node-pty (aliased as node-pty) for PTY spawning, WebSocket for bidirectional I/O
 - **Badge Updates**: `useBadgeWebSocket()` shares a single browser socket and subscribes per visible GitHub-linked task card
 - **State Management**: Custom hooks with EventSource for real-time task updates plus a dedicated WebSocket store for badge snapshots
 - **Git Integration**: Server-side git command execution with validation

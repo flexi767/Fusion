@@ -1,6 +1,6 @@
 import "./TaskReviewTab.css";
 import { getErrorMessage, isReviewArtifact, type PrCheckStatus, type Task, type TaskDetail, type TaskReviewSummary } from "@fusion/core";
-import { resolveEffectiveAutoMerge } from "../../../core/src/task-merge";
+import { resolveEffectiveAutoMerge } from "../../../core/src/merge/task-merge";
 import { Bot, ExternalLink, GitPullRequest, User } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -14,6 +14,8 @@ import { ArtifactsGallery } from "./ArtifactsGallery";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { MailboxMessageContent } from "./MailboxMessageContent";
 import { useArtifacts } from "../hooks/useArtifacts";
+import type { ColumnRoleFlags } from "../utils/columnRoles";
+import { isReviewColumnRole, isWipColumnRole } from "../utils/columnRoles";
 
 interface Props {
   task: Task | TaskDetail;
@@ -22,6 +24,18 @@ interface Props {
   onRequestCreatePr?: () => void;
   prAuthAvailable?: boolean;
   autoMergeEnabled?: boolean;
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-07:20 (fleet phase):
+  Resolved trait flags for the task's CURRENT column. OPTIONAL: TaskDetailModal already has them
+  (`workflowMoveMetadata?.currentColumnFlags`) and passes them; the test harness and any other host omit
+  them and the role helpers fall back to the legacy id, so nothing else changes.
+
+  Three of this tab's four questions were "is this card in review", driving the Create-PR button, the
+  "frozen on entry to review" auto-merge hint, and PR-feedback addressing. On a renamed review lane all
+  three silently took their non-review branch — the button vanished and the hint claimed the effective
+  value was not frozen when it was.
+  */
+  columnFlags?: ColumnRoleFlags;
   addToast: (message: string, type?: ToastType) => void;
 }
 
@@ -40,6 +54,9 @@ type DisplayReviewItem = {
   body: string;
   author?: string;
   path?: string;
+  line?: number;
+  severity?: "low" | "medium" | "high" | "critical";
+  resolution?: "open" | "resolved-in-review" | "superseded" | "dispute-upheld";
   createdAt?: string;
   status: "queued" | "in-progress" | "addressed" | "failed";
   addressing?: AddressingRecord;
@@ -117,6 +134,9 @@ function getDisplayReviewItems(review: ReviewState): DisplayReviewItem[] {
       body: item.body,
       author: item.author?.login,
       path: item.path,
+      line: item.line,
+      severity: item.severity,
+      resolution: item.resolution,
       createdAt: item.createdAt,
       status: addressing?.status ?? "queued",
       addressing,
@@ -133,6 +153,8 @@ function getDisplayReviewItems(review: ReviewState): DisplayReviewItem[] {
       body: record.snapshot?.body ?? record.snapshot?.summary ?? record.itemId,
       author: record.snapshot?.authorLogin,
       path: record.snapshot?.filePath,
+      line: record.snapshot?.lineNumber,
+      severity: record.snapshot?.severity,
       createdAt: record.selectedAt,
       status: record.status,
       addressing: record,
@@ -148,8 +170,11 @@ export function TaskReviewTab({
   onRequestCreatePr,
   prAuthAvailable,
   autoMergeEnabled = false,
+  columnFlags,
   addToast,
 }: Props) {
+  const isReviewColumn = isReviewColumnRole(columnFlags, task.column);
+  const isWipColumn = isWipColumnRole(columnFlags, task.column);
   const { t } = useTranslation("app");
   const [selected, setSelected] = useState<string[]>([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -189,12 +214,12 @@ export function TaskReviewTab({
       return authorTypeFilter === "bot" ? authorInfo.authorIsBot : !authorInfo.authorIsBot;
     });
   }, [authorTypeFilter, displayItems]);
-  const visibleItemIds = useMemo(() => new Set(filteredDisplayItems.map((item) => item.id)), [filteredDisplayItems]);
+  const visibleItemIds = useMemo(() => new Set(filteredDisplayItems.filter((item) => !item.resolution || item.resolution === "open").map((item) => item.id)), [filteredDisplayItems]);
   const canRevise = selected.length > 0 && !revising;
   const canAddressPrFeedback = isPrMode
     && Boolean(getTaskPrimaryPrInfo(task))
-    && (task.column === "in-review" || task.column === "in-progress")
-    && (canStartPrFeedbackAddressing(task) || displayItems.length > 0);
+    && (isReviewColumn || isWipColumn)
+    && (canStartPrFeedbackAddressing(task, columnFlags) || displayItems.length > 0);
 
   useEffect(() => {
     writeBooleanPref(REVIEW_MARKDOWN_TOGGLE_STORAGE_KEY, renderMarkdown);
@@ -263,7 +288,10 @@ export function TaskReviewTab({
       ? "status-dot status-dot--pending"
       : "status-dot status-dot--online";
 
-  const toggleSelected = (id: string) => setSelected((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
+  const toggleSelected = (id: string) => {
+    if (displayItems.some((item) => item.id === id && item.resolution && item.resolution !== "open")) return;
+    setSelected((prev) => (prev.includes(id) ? prev.filter((value) => value !== id) : [...prev, id]));
+  };
 
   const onRefresh = async () => {
     try {
@@ -422,12 +450,12 @@ export function TaskReviewTab({
               <option value="off">{t("taskReview.autoMergeOff", "Auto-merge off")}</option>
             </select>
             <div className="task-review-tab__meta" data-testid="task-review-auto-merge-effective-hint">
-              {task.column === "in-review"
+              {isReviewColumn
                 ? t("taskReview.effectiveFrozen", "Effective: {{label}} — frozen on entry to review", { label: effectiveAutoMergeLabel })
                 : t("taskReview.effective", "Effective: {{label}}", { label: effectiveAutoMergeLabel })}
             </div>
           </div>
-          {task.column === "in-review" && !task.prInfo && prAuthAvailable === true && !effectiveAutoMerge && typeof onRequestCreatePr === "function" ? (
+          {isReviewColumn && !task.prInfo && prAuthAvailable === true && !effectiveAutoMerge && typeof onRequestCreatePr === "function" ? (
             <button className="btn btn-sm" onClick={() => onRequestCreatePr?.()} data-testid="task-review-create-pr">
               <GitPullRequest />
               {t("taskReview.createPr", "Create PR")}
@@ -544,19 +572,32 @@ export function TaskReviewTab({
             const prState = isPrMode ? item.item?.state : undefined;
             const prUrl = isPrMode ? item.item?.htmlUrl ?? item.addressing?.snapshot?.url : undefined;
             const summaryPrefix = item.path && !isPrMode ? `${item.path}: ` : "";
+            const isOpen = !item.resolution || item.resolution === "open";
+            const resolutionLabel = item.resolution === "resolved-in-review"
+              ? t("taskReview.fixedInReview", "Fixed in review")
+              : item.resolution === "dispute-upheld"
+                ? t("taskReview.disputeUpheld", "Dispute upheld")
+                : t("taskReview.superseded", "Superseded");
 
             return (
-              <li key={item.id} className="task-review-tab__item card" data-review-comment-author-type={authorType}>
+              <li key={item.id} className={`task-review-tab__item card${isOpen ? "" : " task-review-tab__item--informational"}`} data-review-comment-author-type={authorType} {...(!isOpen ? { "data-review-resolution": item.resolution } : {})}>
                 <div className="task-review-tab__item-inner">
-                  <label htmlFor={checkboxId} className="task-review-tab__direct-item task-review-tab__direct-item--selectable">
-                    <div className="task-review-tab__item-header">
-                      <div className="task-review-tab__item-selection">
-                        <input id={checkboxId} type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} />
-                        <span className="task-review-tab__item-summary">{summaryPrefix}{item.summary}</span>
+                  {isOpen ? (
+                    <label htmlFor={checkboxId} className="task-review-tab__direct-item task-review-tab__direct-item--selectable">
+                      <div className="task-review-tab__item-header">
+                        <div className="task-review-tab__item-selection">
+                          <input id={checkboxId} type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} />
+                          <span className="task-review-tab__item-summary">{summaryPrefix}{item.summary}</span>
+                        </div>
+                        <span className={`task-review-tab__status task-review-tab__status--${item.status}`}>{item.status}</span>
                       </div>
-                      <span className={`task-review-tab__status task-review-tab__status--${item.status}`}>{item.status}</span>
+                    </label>
+                  ) : (
+                    <div className="task-review-tab__item-header">
+                      <span className="task-review-tab__item-summary">{summaryPrefix}{item.summary}</span>
+                      <span className="task-review-tab__resolution-badge">{resolutionLabel}</span>
                     </div>
-                  </label>
+                  )}
                   {/*
                   FNXC:TaskReview 2026-06-27-00:00:
                   Every Review-tab item needs visible author provenance across PR live items, reviewer-agent items, and snapshot-only addressing records. Render a deterministic avatar image only for human GitHub logins; missing authors and bots use generic icons so there is never an empty or broken avatar shell.
@@ -598,7 +639,11 @@ export function TaskReviewTab({
                         ) : null}
                       </div>
                     ) : (
-                      <div className="task-review-tab__meta">{formatTimestamp(item.createdAt, t)}</div>
+                      <div className="task-review-tab__meta">
+                        {formatTimestamp(item.createdAt, t)}
+                        {item.path ? ` · ${item.path}${item.line ? `:${item.line}` : ""}` : ""}
+                        {item.severity ? ` · ${item.severity}` : ""}
+                      </div>
                     )}
                     {item.addressing ? (
                       <div className="task-review-tab__meta">

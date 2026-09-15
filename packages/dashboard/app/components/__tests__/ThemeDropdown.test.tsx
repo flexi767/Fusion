@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import i18next from "i18next";
 import { ThemeDropdown } from "../ThemeDropdown";
+import { readAppFile } from "../../test/cssFixture";
 
 // FNXC:Theme 2026-07-16-14:30: FN-8146 pins the historical Settings-grid set, including restored shadcn-mono, so a removal from COLOR_THEMES cannot make the all-themes checks pass circularly.
-const EXPECTED_THEME_IDS = ['default', 'ocean', 'forest', 'sunset', 'zen', 'berry', 'high-contrast', 'industrial', 'monochrome', 'slate', 'ash', 'air', 'graphite', 'silver', 'solarized', 'factory', 'factory-mono', 'ayu', 'one-dark', 'nord', 'dracula', 'gruvbox', 'tokyo-night', 'catppuccin-mocha', 'github-dark', 'everforest', 'rose-pine', 'kanagawa', 'night-owl', 'palenight', 'monokai-pro', 'slime', 'brutalist', 'neon-city', 'parchment', 'terminal', 'glass', 'glass-silver', 'horizon', 'vitesse', 'outrun', 'snazzy', 'porple', 'espresso', 'mars', 'poimandres', 'ember', 'rust', 'copper', 'foundry', 'carbon', 'sandstone', 'lagoon', 'frost', 'lavender', 'neon-bloom', 'sepia', 'cobalt', 'clay', 'moss', 'shadcn', 'shadcn-ember', 'shadcn-custom', 'shadcn-blue', 'shadcn-green', 'shadcn-red', 'shadcn-purple', 'shadcn-pink', 'shadcn-orange', 'shadcn-yellow', 'shadcn-mono', 'shadcn-mono-red', 'shadcn-mono-blue', 'shadcn-mono-green', 'shadcn-mono-purple', 'shadcn-mono-pink', 'shadcn-mono-orange', 'shadcn-mono-yellow', 'shadcn-black', 'shadcn-gray', 'shadcn-gray-blue'] as const;
+// FNXC:DashboardTheming 2026-08-23-01:51: Iceberg must remain after Velvet so the Command Center theme trigger proves the shared persisted registry and global swatch contract render together.
+const EXPECTED_THEME_IDS = ['default', 'ocean', 'forest', 'sunset', 'zen', 'berry', 'high-contrast', 'industrial', 'monochrome', 'slate', 'ash', 'air', 'graphite', 'silver', 'solarized', 'factory', 'factory-mono', 'ayu', 'one-dark', 'nord', 'dracula', 'gruvbox', 'tokyo-night', 'catppuccin-mocha', 'github-dark', 'everforest', 'rose-pine', 'kanagawa', 'night-owl', 'palenight', 'monokai-pro', 'slime', 'brutalist', 'neon-city', 'parchment', 'medieval', 'terminal', 'glass', 'glass-silver', 'liquid-glass', 'horizon', 'vitesse', 'outrun', 'snazzy', 'porple', 'espresso', 'mars', 'poimandres', 'ember', 'rust', 'copper', 'foundry', 'carbon', 'sandstone', 'lagoon', 'frost', 'lavender', 'neon-bloom', 'sepia', 'cobalt', 'clay', 'moss', 'aurora', 'calm', 'dawn', 'sage', 'midnight', 'velvet', 'iceberg', 'flexoki', 'cozy-cartoon', 'factory-dark', 'factory-light', 'shadcn', 'shadcn-ember', 'shadcn-custom', 'shadcn-blue', 'shadcn-green', 'shadcn-red', 'shadcn-purple', 'shadcn-pink', 'shadcn-orange', 'shadcn-yellow', 'shadcn-mono', 'shadcn-mono-red', 'shadcn-mono-blue', 'shadcn-mono-green', 'shadcn-mono-purple', 'shadcn-mono-pink', 'shadcn-mono-orange', 'shadcn-mono-yellow', 'shadcn-black', 'shadcn-gray', 'shadcn-gray-blue'] as const;
 
 function renderedThemeIds(listbox: HTMLElement) {
   return within(listbox).getAllByRole("option").map((option) => {
@@ -55,7 +58,7 @@ describe("ThemeDropdown", () => {
   });
 
   it("keeps tokenized space below the Settings current-theme row", () => {
-    const css = readFileSync("app/components/ThemeDropdown.css", "utf8");
+    const css = readAppFile("components/ThemeDropdown.css");
 
     expect(css).toMatch(/\.theme-dropdown--current-row\s*\{\s*margin-bottom:\s*var\(--space-lg\);\s*\}/);
   });
@@ -72,6 +75,23 @@ describe("ThemeDropdown", () => {
     expect(defaultOptions[0]).toHaveTextContent("Shadcn Ember (Default)");
   });
 
+  it("filters and selects Liquid Glass by keyboard with a non-empty swatch", () => {
+    const onColorThemeChange = vi.fn();
+    render(<ThemeDropdown colorTheme="glass-silver" onColorThemeChange={onColorThemeChange} />);
+
+    const trigger = screen.getByRole("button", { name: /glass silver/i });
+    fireEvent.click(trigger);
+    const filter = screen.getByRole("searchbox", { name: /filter color themes/i });
+    fireEvent.change(filter, { target: { value: "Liquid Glass" } });
+    const option = screen.getByRole("option", { name: "Liquid Glass" });
+    expect(option.querySelector(".theme-swatch-liquid-glass")).toBeTruthy();
+    expect(option.querySelectorAll(".theme-option-swatch-sample")).toHaveLength(4);
+    fireEvent.keyDown(option, { key: "Enter" });
+
+    expect(onColorThemeChange).toHaveBeenCalledWith("liquid-glass");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
   it("renders Glass Silver as a non-empty compact dropdown option", () => {
     render(<ThemeDropdown colorTheme="glass-silver" onColorThemeChange={vi.fn()} />);
 
@@ -83,6 +103,107 @@ describe("ThemeDropdown", () => {
     const glassSilverOption = screen.getByRole("option", { name: /glass silver/i });
     expect(glassSilverOption).toHaveTextContent("Glass Silver");
     expect(glassSilverOption.querySelector(".theme-swatch-glass-silver")).toBeTruthy();
+  });
+
+  it.each([
+    ["compact", "compact" as const, /ocean/i],
+    ["current-row", "current-row" as const, /current theme dark \/ ocean/i],
+  ])("selects Dawn with a non-empty preview from the shared %s trigger", (_label, triggerVariant, triggerName) => {
+    document.documentElement.setAttribute("data-color-theme", "ocean");
+    document.documentElement.setAttribute("data-theme", "dark");
+    const previewTokens = document.createElement("style");
+    previewTokens.textContent = `
+      :root { --dawn-swatch-sample-1: #151229; --dawn-swatch-sample-2: #2a2248; --dawn-swatch-sample-3: #efb66a; --dawn-swatch-sample-4: #c8a4ff; }
+      [data-theme="light"] { --dawn-swatch-sample-1: #fff8f2; --dawn-swatch-sample-2: #f1ddd7; --dawn-swatch-sample-3: #9b5618; --dawn-swatch-sample-4: #704eaa; }
+    `;
+    document.head.appendChild(previewTokens);
+    const onColorThemeChange = vi.fn();
+
+    const { rerender } = render(
+      <ThemeDropdown
+        triggerVariant={triggerVariant}
+        colorTheme="ocean"
+        themeMode="dark"
+        onColorThemeChange={onColorThemeChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: triggerName }));
+    const dawnOption = screen.getByRole("option", { name: "Dawn" });
+    expect(dawnOption.querySelector(".theme-swatch-dawn")).toBeTruthy();
+    expect(dawnOption.querySelectorAll(".theme-option-swatch-sample")).toHaveLength(4);
+    for (const sample of [1, 2, 3, 4]) {
+      expect(getComputedStyle(document.documentElement).getPropertyValue(`--dawn-swatch-sample-${sample}`).trim()).not.toBe("");
+    }
+    fireEvent.click(dawnOption);
+    expect(onColorThemeChange).toHaveBeenCalledWith("dawn");
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    document.documentElement.setAttribute("data-theme", "light");
+    rerender(
+      <ThemeDropdown
+        triggerVariant={triggerVariant}
+        colorTheme="ocean"
+        themeMode="light"
+        onColorThemeChange={onColorThemeChange}
+      />,
+    );
+    for (const sample of [1, 2, 3, 4]) {
+      expect(getComputedStyle(document.documentElement).getPropertyValue(`--dawn-swatch-sample-${sample}`).trim()).not.toBe("");
+    }
+    previewTokens.remove();
+  });
+
+  it.each([
+    ["compact", "compact" as const, /ocean/i],
+    ["current-row", "current-row" as const, /current theme system \/ ocean/i],
+  ])("searches, previews, and selects Midnight from the shared %s trigger", (_label, triggerVariant, triggerName) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390, writable: true });
+    window.dispatchEvent(new Event("resize"));
+    document.documentElement.setAttribute("data-color-theme", "ocean");
+    document.documentElement.setAttribute("data-theme", "light");
+    const previewTokens = document.createElement("style");
+    previewTokens.textContent = `
+      :root { --midnight-swatch-sample-1: #0b1026; --midnight-swatch-sample-2: #1b2450; --midnight-swatch-sample-3: #a78bfa; --midnight-swatch-sample-4: #67d4e8; }
+      [data-theme="light"] { --midnight-swatch-sample-1: #f5f6ff; --midnight-swatch-sample-2: #e2e6fa; --midnight-swatch-sample-3: #5134a3; --midnight-swatch-sample-4: #16778c; }
+    `;
+    document.head.appendChild(previewTokens);
+    const onColorThemeChange = vi.fn();
+
+    const { rerender } = render(
+      <ThemeDropdown
+        triggerVariant={triggerVariant}
+        colorTheme="ocean"
+        themeMode="system"
+        resolvedThemeMode="light"
+        onColorThemeChange={onColorThemeChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: triggerName }));
+    const filter = screen.getByRole("searchbox", { name: /filter color themes/i });
+    fireEvent.change(filter, { target: { value: "Midnight" } });
+    const midnightOption = screen.getByRole("option", { name: "Midnight" });
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    expect(midnightOption.querySelector(".theme-swatch-midnight")).toBeTruthy();
+    expect(midnightOption.querySelectorAll(".theme-option-swatch-sample")).toHaveLength(4);
+    for (const sample of [1, 2, 3, 4]) {
+      expect(getComputedStyle(document.documentElement).getPropertyValue(`--midnight-swatch-sample-${sample}`).trim()).not.toBe("");
+    }
+    fireEvent.click(midnightOption);
+    expect(onColorThemeChange).toHaveBeenCalledWith("midnight");
+
+    rerender(
+      <ThemeDropdown
+        triggerVariant={triggerVariant}
+        colorTheme="midnight"
+        themeMode="system"
+        resolvedThemeMode="dark"
+        onColorThemeChange={onColorThemeChange}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /midnight/i })).toHaveTextContent("Midnight");
+    previewTokens.remove();
   });
 
   it("selects themes and closes from click, escape, and outside click", () => {
@@ -198,14 +319,119 @@ describe("ThemeDropdown", () => {
   });
 
   it("keeps Shadcn Mono and Mono Red swatches scoped to the active light mode", () => {
-    const css = readFileSync("app/components/ThemeSelector.css", "utf8");
+    const css = readAppFile("components/ThemeSelector.css");
 
     expect(css).toContain('[data-theme="light"] .theme-swatch-shadcn-mono,\n[data-theme="light"] .theme-swatch-shadcn-mono-red');
     expect(css).not.toContain('[data-theme="light"] .theme-swatch-shadcn-mono,\n.theme-swatch-shadcn-mono-red');
   });
 
+  it("filters rendered labels case- and diacritic-insensitively without changing canonical order", () => {
+    render(<ThemeDropdown colorTheme="ocean" onColorThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /ocean/i }));
+    const filter = screen.getByRole("searchbox", { name: /filter color themes/i });
+
+    fireEvent.change(filter, { target: { value: "  shadcn mono red  " } });
+    expect(renderedThemeIds(screen.getByRole("listbox"))).toEqual(["shadcn-mono-red"]);
+
+    fireEvent.change(filter, { target: { value: "rose pine" } });
+    expect(renderedThemeIds(screen.getByRole("listbox"))).toEqual(["rose-pine"]);
+
+    fireEvent.change(filter, { target: { value: "   " } });
+    expect(renderedThemeIds(screen.getByRole("listbox"))).toEqual(EXPECTED_THEME_IDS);
+    expect(new Set(renderedThemeIds(screen.getByRole("listbox"))).size).toBe(EXPECTED_THEME_IDS.length);
+  });
+
+  it("filters the translated display label and falls back to theme metadata", () => {
+    i18next.addResourceBundle("en", "app", { theme: { colorTheme: { ocean: "Marée" } } }, true, true);
+    const { unmount } = render(<ThemeDropdown colorTheme="ocean" onColorThemeChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /marée/i }));
+    const filter = screen.getByRole("searchbox", { name: /filter color themes/i });
+    fireEvent.change(filter, { target: { value: "maree" } });
+    expect(screen.getByRole("option", { name: "Marée" })).toBeDefined();
+    fireEvent.change(filter, { target: { value: "forest" } });
+    expect(screen.getByRole("option", { name: "Forest" })).toBeDefined();
+    unmount();
+    i18next.removeResourceBundle("en", "app");
+  });
+
+  it("keeps no-result filtering non-selectable and restores a valid filtered roving option", () => {
+    const onColorThemeChange = vi.fn();
+    render(<ThemeDropdown colorTheme="ocean" onColorThemeChange={onColorThemeChange} />);
+    fireEvent.click(screen.getByRole("button", { name: /ocean/i }));
+    const filter = screen.getByRole("searchbox", { name: /filter color themes/i });
+    fireEvent.change(filter, { target: { value: "missing theme" } });
+    expect(screen.getByText(/no color themes found/i)).toBeDefined();
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+    fireEvent.keyDown(filter, { key: "ArrowDown" });
+    expect(onColorThemeChange).not.toHaveBeenCalled();
+    fireEvent.change(filter, { target: { value: "ocean" } });
+    expect(screen.getByRole("option", { name: "Ocean" })).toHaveAttribute("tabindex", "0");
+  });
+
+  it("uses pointer and trigger keyboard origins to focus the specified targets", () => {
+    const { unmount } = render(<ThemeDropdown colorTheme="forest" onColorThemeChange={vi.fn()} />);
+    const pointerTrigger = screen.getByRole("button", { name: /forest/i });
+    expect(pointerTrigger).not.toHaveAttribute("aria-controls");
+    fireEvent.click(pointerTrigger);
+    expect(screen.getByRole("searchbox", { name: /filter color themes/i })).toHaveFocus();
+    expect(pointerTrigger).toHaveAttribute("aria-controls", "theme-dropdown-listbox");
+    unmount();
+
+    for (const [key, expected] of [["ArrowDown", "Fusion Legacy"], ["ArrowUp", "Shadcn Gray Blue"], ["Enter", "Forest"], [" ", "Forest"]]) {
+      const { unmount: close } = render(<ThemeDropdown colorTheme="forest" onColorThemeChange={vi.fn()} />);
+      const trigger = screen.getByRole("button", { name: /forest/i });
+      fireEvent.keyDown(trigger, { key });
+      expect(screen.getByRole("option", { name: expected })).toHaveFocus();
+      expect(screen.getByRole("searchbox", { name: /filter color themes/i })).not.toHaveFocus();
+      close();
+    }
+  });
+
+  it("transfers input focus and navigates only filtered options before selecting once", () => {
+    const onColorThemeChange = vi.fn();
+    render(<ThemeDropdown colorTheme="ocean" onColorThemeChange={onColorThemeChange} />);
+    fireEvent.click(screen.getByRole("button", { name: /ocean/i }));
+    const filter = screen.getByRole("searchbox", { name: /filter color themes/i });
+    fireEvent.change(filter, { target: { value: "shadcn mono" } });
+    fireEvent.keyDown(filter, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: "Shadcn Mono" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("option", { name: "Shadcn Mono" }), { key: "ArrowUp" });
+    expect(screen.getByRole("option", { name: "Shadcn Mono Yellow" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("option", { name: "Shadcn Mono Yellow" }), { key: "Home" });
+    expect(screen.getByRole("option", { name: "Shadcn Mono" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("option", { name: "Shadcn Mono" }), { key: "End" });
+    expect(screen.getByRole("option", { name: "Shadcn Mono Yellow" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("option", { name: "Shadcn Mono Yellow" }), { key: "Enter" });
+    expect(onColorThemeChange).toHaveBeenCalledTimes(1);
+    expect(onColorThemeChange).toHaveBeenCalledWith("shadcn-mono-yellow");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("searchbox")).toBeNull();
+  });
+
+  it("removes conditional listbox linkage and filter shell for all close paths", () => {
+    render(<ThemeDropdown colorTheme="ocean" onColorThemeChange={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /ocean/i });
+    fireEvent.click(trigger);
+    fireEvent.keyDown(screen.getByRole("searchbox", { name: /filter color themes/i }), { key: "Escape" });
+    expect(trigger).not.toHaveAttribute("aria-controls");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("searchbox")).toBeNull();
+
+    fireEvent.click(trigger);
+    fireEvent.pointerDown(document.body);
+    expect(trigger).not.toHaveAttribute("aria-controls");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("searchbox")).toBeNull();
+  });
+
+  it("uses tokenized filter styles within the existing mobile static popover", () => {
+    const css = readAppFile("components/ThemeDropdown.css");
+    expect(css).toMatch(/\.theme-dropdown-filter \.input:focus-visible[\s\S]*?var\(--accent\)[\s\S]*?var\(--focus-ring\)/);
+    expect(css).toMatch(/\.theme-dropdown-no-results[\s\S]*?var\(--space-sm\)[\s\S]*?var\(--text-muted\)/);
+  });
+
   it("preserves the mobile static in-flow popover branch without dropdown elevation", () => {
-    const css = readFileSync("app/components/ThemeDropdown.css", "utf8");
+    const css = readAppFile("components/ThemeDropdown.css");
 
     expect(css).toMatch(
       /@media \(max-width: 768px\) \{[\s\S]*?\.theme-dropdown\.open \{[\s\S]*?z-index: auto;[\s\S]*?\.theme-dropdown-popover \{[\s\S]*?position: static;[\s\S]*?z-index: auto;/,

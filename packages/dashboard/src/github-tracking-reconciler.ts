@@ -1,9 +1,68 @@
-import type { GlobalSettings, ProjectSettings, TaskSourceIssue, TaskStore } from "@fusion/core";
+import { createLogger } from "@fusion/core";
+
+const severityAuditLog = createLogger("dashboard-github-tracking-reconciler");
+import type { GlobalSettings, LifecycleColumns, ProjectSettings, Task, TaskSourceIssue, TaskStore, WorkflowIr } from "@fusion/core";
+import { resolveTaskLifecycleColumns } from "@fusion/core";
 import { resolveGithubTrackingAuth } from "./github-auth.js";
 import { GitHubClient } from "./github.js";
 
 const RECONCILE_SCAN_LIMIT = 200;
 const RECONCILE_CONCURRENCY_LIMIT = 4;
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-05:10:
+Prefetch one workflow-lifecycle map per bounded live-task page, then filter synchronously. Custom
+Complete columns close tracked issues without loading or reviving historical archive snapshots.
+*/
+type LifecycleByTaskId = ReadonlyMap<string, LifecycleColumns | undefined>;
+
+async function resolveLifecycleByTaskId(
+  store: TaskStore,
+  tasks: readonly Task[],
+  irCache: Map<string, WorkflowIr>,
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-12:10 (#2737 review — greptile P2):
+  STOP once `limit` tasks have matched. The first version resolved for every row `listTasks` returned —
+  an unbounded board — before slicing to RECONCILE_SCAN_LIMIT, so the prefetch did unbounded work to feed
+  a bounded scan. `match` is applied here rather than by the caller precisely so the loop can stop.
+
+  Rows past the cut are left unresolved and absent from the map. That is safe because the only consumers
+  are the terminal predicates, which fall back to the legacy ids for an absent entry — the same degraded
+  answer they would give on a store with no workflow reader — and those rows are dropped by the slice
+  anyway.
+  */
+  options?: { match?: (task: Task, lifecycle: LifecycleColumns | undefined) => boolean; limit?: number },
+): Promise<LifecycleByTaskId> {
+  const byTaskId = new Map<string, LifecycleColumns | undefined>();
+  let matched = 0;
+  for (const task of tasks) {
+    if (byTaskId.has(task.id)) continue;
+    const lifecycle = await resolveTaskLifecycleColumns(store, task.id, irCache);
+    byTaskId.set(task.id, lifecycle);
+    if (options?.match && options.match(task, lifecycle)) {
+      matched += 1;
+      if (options.limit !== undefined && matched >= options.limit) break;
+    }
+  }
+  return byTaskId;
+}
+
+/** Is this task in a Complete lane by its own workflow's roles? */
+function isTerminalTask(task: Task, lifecycleByTaskId: LifecycleByTaskId): boolean {
+  const lifecycle = lifecycleByTaskId.get(task.id);
+  return task.column === (lifecycle?.complete ?? "done");
+}
+
+function hasLinkedTrackingIssue(task: Task): boolean {
+  const issue = task.githubTracking?.issue;
+  return task.githubTracking?.enabled === true
+    && Boolean(issue?.owner && issue.repo && issue.number);
+}
+
+function compareUpdatedAtDesc(a: Task, b: Task): number {
+  const delta = (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "");
+  return delta !== 0 ? delta : b.id.localeCompare(a.id);
+}
 
 export class GitHubTrackingReconciler {
   /*
@@ -21,14 +80,14 @@ export class GitHubTrackingReconciler {
   */
   async runSweep(store: TaskStore, options: { offset: number }): Promise<{ nextOffset: number }> {
     let nextOffset = 0;
-    await this.runPass("deleted/archived", async () => {
-      const result = await this.reconcileDeletedAndArchived(store, {
+    await this.runPass("deleted", async () => {
+      const result = await this.reconcileDeletedTasks(store, {
         offset: options.offset,
         limit: RECONCILE_SCAN_LIMIT,
       });
       nextOffset = result.hasMore ? options.offset + RECONCILE_SCAN_LIMIT : 0;
     });
-    // Done-task tracking + source-issue passes run regardless of the deleted/archived pass outcome.
+    // Done-task tracking + source-issue passes run regardless of the deleted-task pass outcome.
     await this.runPass("done-task tracking", () => this.reconcile(store));
     await this.runPass("source-issue", () => this.reconcileSourceIssues(store));
     return { nextOffset };
@@ -38,17 +97,27 @@ export class GitHubTrackingReconciler {
     try {
       await fn();
     } catch (err) {
-      console.warn(
+      severityAuditLog.warn(
         `[github-tracking-reconcile] ${label} pass failed (other passes still run): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
 
   async reconcile(store: TaskStore): Promise<{ scanned: number; closed: number; skipped: number; errors: number }> {
-    const listedTasks = await store.listTasks({ slim: true, includeArchived: true });
-    const tasks = (Array.isArray(listedTasks) ? listedTasks : [])
-      .filter((task) => task.column === "done" || task.column === "archived")
-      .slice(0, RECONCILE_SCAN_LIMIT);
+    const listedTasks = await store.listTasks({ slim: true, includeArchived: false });
+    const allTasks = Array.isArray(listedTasks) ? listedTasks : [];
+    /*
+    FNXC:GithubTracking 2026-08-15-22:27:
+    This board lists thousands of terminal rows oldest-first (`createdAt ASC`). The previous
+    scan took the first 200 terminal cards — almost all untracked archived history — so a
+    recently completed tracked task (FN-9046 / FN-9054 / FN-9061, positions ~7880+) never
+    entered the close pass. Restrict to linked tracking issues, then prefer recently updated
+    rows so late-created issues are closed on the next sweep.
+    */
+    const tracked = allTasks.filter(hasLinkedTrackingIssue);
+    const newestTracked = [...tracked].sort(compareUpdatedAtDesc).slice(0, RECONCILE_SCAN_LIMIT);
+    const lifecycleByTaskId = await resolveLifecycleByTaskId(store, newestTracked, new Map<string, WorkflowIr>());
+    const tasks = newestTracked.filter((task) => isTerminalTask(task, lifecycleByTaskId));
 
     const projectSettings = ((await store.getSettings()) ?? {}) as Pick<ProjectSettings, "githubAuthMode" | "githubAuthToken">;
     const globalSettings = (await store.getGlobalSettingsStore?.()?.getSettings?.() ?? {}) as Pick<GlobalSettings, never>;
@@ -82,8 +151,7 @@ export class GitHubTrackingReconciler {
           return;
         }
 
-        const stateReason = task.column === "archived" && !task.executionCompletedAt ? "not_planned" : "completed";
-        await client.setIssueState(issue.owner, issue.repo, issue.number, "closed", stateReason);
+        await client.setIssueState(issue.owner, issue.repo, issue.number, "closed", "completed");
         closed += 1;
       } catch (error) {
         errors += 1;
@@ -99,9 +167,15 @@ export class GitHubTrackingReconciler {
   }
 
   async reconcileSourceIssues(store: TaskStore): Promise<{ scanned: number; closed: number; skipped: number; errors: number }> {
-    const listedTasks = await store.listTasks({ slim: false, includeArchived: true });
-    const tasks = (Array.isArray(listedTasks) ? listedTasks : [])
-      .filter((task) => (task.column === "done" || task.column === "archived") && task.sourceIssue?.provider === "github")
+    const listedTasks = await store.listTasks({ slim: false, includeArchived: false });
+    const allTasks = Array.isArray(listedTasks) ? listedTasks : [];
+    const lifecycleByTaskId = await resolveLifecycleByTaskId(store, allTasks, new Map<string, WorkflowIr>(), {
+      match: (task, lifecycle) => task.sourceIssue?.provider === "github"
+        && task.column === (lifecycle?.complete ?? "done"),
+      limit: RECONCILE_SCAN_LIMIT,
+    });
+    const tasks = allTasks
+      .filter((task) => isTerminalTask(task, lifecycleByTaskId) && task.sourceIssue?.provider === "github")
       .slice(0, RECONCILE_SCAN_LIMIT);
 
     const projectSettings = ((await store.getSettings()) ?? {}) as Pick<ProjectSettings, "githubCloseSourceIssueOnDone" | "githubAuthMode" | "githubAuthToken">;
@@ -151,8 +225,7 @@ export class GitHubTrackingReconciler {
           return;
         }
 
-        const stateReason = task.column === "archived" && !task.executionCompletedAt ? "not_planned" : "completed";
-        await client.setIssueState(owner, repo, issueNumberValue, "closed", stateReason);
+        await client.setIssueState(owner, repo, issueNumberValue, "closed", "completed");
         if (!sourceIssue.closedAt) {
           await persistSourceIssueClosedAt(store, task.id, sourceIssue, new Date().toISOString());
         }
@@ -178,13 +251,15 @@ export class GitHubTrackingReconciler {
     store: TaskStore,
     options?: { offset?: number; limit?: number },
   ): Promise<{ scanned: number; filled: number; skipped: number; errors: number; hasMore: boolean }> {
-    const listedTasks = await store.listTasks({ slim: false, includeArchived: true });
+    const listedTasks = await store.listTasks({ slim: false, includeArchived: false });
     const offset = Number.isInteger(options?.offset) && (options?.offset ?? 0) > 0 ? options?.offset ?? 0 : 0;
     const limit = Number.isInteger(options?.limit) && (options?.limit ?? RECONCILE_SCAN_LIMIT) >= 0
       ? Math.min(options?.limit ?? RECONCILE_SCAN_LIMIT, RECONCILE_SCAN_LIMIT)
       : RECONCILE_SCAN_LIMIT;
-    const matchingTasks = (Array.isArray(listedTasks) ? listedTasks : [])
-      .filter((task) => (task.column === "done" || task.column === "archived")
+    const allTasks = Array.isArray(listedTasks) ? listedTasks : [];
+    const lifecycleByTaskId = await resolveLifecycleByTaskId(store, allTasks, new Map<string, WorkflowIr>());
+    const matchingTasks = allTasks
+      .filter((task) => isTerminalTask(task, lifecycleByTaskId)
         && task.sourceIssue?.provider === "github"
         && !task.sourceIssue?.closedAt);
     const tasks = matchingTasks.slice(offset, offset + limit);
@@ -241,7 +316,7 @@ export class GitHubTrackingReconciler {
     return { scanned: tasks.length, filled, skipped, errors, hasMore };
   }
 
-  async reconcileDeletedAndArchived(
+  async reconcileDeletedTasks(
     store: TaskStore,
     options?: { offset?: number; limit?: number },
   ): Promise<{ scanned: number; closed: number; skipped: number; errors: number; hasMore: boolean }> {
@@ -249,13 +324,18 @@ export class GitHubTrackingReconciler {
     const listedTasks = await store.listTasksForGithubTrackingReconcile(options);
     const tasks = Array.isArray(listedTasks?.tasks) ? listedTasks.tasks : [];
     const hasMore = listedTasks?.hasMore === true;
-
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-05:20:
+    This bounded reconciliation page contains only soft-deleted rows selected by
+    `listTasksForGithubTrackingReconcile`; completed tasks close their issue on the live lifecycle path.
+    The historical archive subsystem is a migration source and is not a second task-lifecycle authority.
+    */
     const projectSettings = ((await store.getSettings()) ?? {}) as Pick<ProjectSettings, "githubAuthMode" | "githubAuthToken">;
     const globalSettings = (await store.getGlobalSettingsStore?.()?.getSettings?.() ?? {}) as Pick<GlobalSettings, never>;
     const resolution = resolveGithubTrackingAuth({ projectSettings, globalSettings });
     if (!resolution.ok) {
       for (const task of tasks) {
-        await store.logEntry(task.id, "Skipped GitHub tracking issue reconciliation (deleted/archived pass)", resolution.message);
+        await store.logEntry(task.id, "Skipped GitHub tracking issue reconciliation (deleted pass)", resolution.message);
       }
       return { scanned: tasks.length, closed: 0, skipped: tasks.length, errors: 0, hasMore };
     }
@@ -282,21 +362,13 @@ export class GitHubTrackingReconciler {
           return;
         }
 
-        // Archived entries do not preserve the pre-archive column. FN-5577 uses
-        // executionCompletedAt as the done-heuristic for archived rows.
-        const stateReason = task.deletedAt
-          ? "not_planned"
-          : task.column === "archived" && task.executionCompletedAt
-            ? "completed"
-            : "not_planned";
-
-        await client.setIssueState(issue.owner, issue.repo, issue.number, "closed", stateReason);
+        await client.setIssueState(issue.owner, issue.repo, issue.number, "closed", "not_planned");
         closed += 1;
       } catch (error) {
         errors += 1;
         await store.logEntry(
           task.id,
-          "Failed to reconcile GitHub tracking issue (deleted/archived pass)",
+          "Failed to reconcile GitHub tracking issue (deleted pass)",
           error instanceof Error ? error.message : String(error),
         );
       }

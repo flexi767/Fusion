@@ -53,7 +53,6 @@ describe("Utility component mobile adaptations", () => {
       stats: {
         runningTaskCount: 1,
         blockedTaskCount: 2,
-        stuckTaskCount: 0,
         queuedTaskCount: 3,
         inReviewCount: 4,
         executorState: "running",
@@ -67,13 +66,19 @@ describe("Utility component mobile adaptations", () => {
   });
 
   it("renders ExecutorStatusBar segments", () => {
+    /*
+    FNXC:DashboardTests 2026-07-22-18:20:
+    ExecutorStatusBar ships Waiting (not Queued) for intake/hold and no longer
+    renders an In Review segment — align mobile utility coverage with ExecutorStatusBar.tsx.
+    */
     render(<ExecutorStatusBar tasks={[]} />);
 
     const bar = screen.getByRole("status");
+    expect(bar).toHaveTextContent("Waiting");
     expect(bar).toHaveTextContent("Running");
     expect(bar).toHaveTextContent("Blocked");
-    expect(bar).toHaveTextContent("Queued");
-    expect(bar).toHaveTextContent("In Review");
+    expect(bar).not.toHaveTextContent("Queued");
+    expect(bar).not.toHaveTextContent("In Review");
   });
 
   it("renders ActiveAgentsPanel grid and cards when agents are provided", () => {

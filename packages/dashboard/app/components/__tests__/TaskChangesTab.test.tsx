@@ -287,7 +287,7 @@ describe("TaskChangesTab — commit-backed (done tasks)", () => {
     expect(screen.getByText("d.ts")).toBeTruthy();
   });
 
-  it("shows commit metadata for done task", async () => {
+  it("keeps done-task commit metadata out of Changes while preserving the diff", async () => {
     mockFetchTaskDiff.mockResolvedValue(DONE_TASK_DIFF);
 
     render(
@@ -300,10 +300,39 @@ describe("TaskChangesTab — commit-backed (done tasks)", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText("abc1234")).toBeTruthy(); // short SHA
+      expect(screen.getByText("src/app.ts")).toBeTruthy();
     });
-    expect(screen.getByText("Merge branch 'fusion/fn-001' into main")).toBeTruthy();
-    expect(screen.getByText(/Merged .+/)).toBeTruthy();
+    expect(screen.queryByText("Merge Details")).toBeNull();
+    expect(screen.queryByText("abc1234")).toBeNull();
+    expect(screen.queryByText("Merge branch 'fusion/fn-001' into main")).toBeNull();
+  });
+
+  it("omits the merge panel for completed and live Changes diffs", async () => {
+    mockFetchTaskDiff.mockResolvedValue(DONE_TASK_DIFF);
+
+    const completed = render(
+      <TaskChangesTab
+        taskId="FN-001"
+        column="done"
+        mergeDetails={MERGE_DETAILS}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("src/app.ts")).toBeTruthy());
+    expect(screen.queryByText("Merge Details")).toBeNull();
+    completed.unmount();
+
+    render(
+      <TaskChangesTab
+        taskId="FN-001"
+        worktree="/path/to/worktree"
+        column="in-progress"
+        mergeDetails={MERGE_DETAILS}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("src/app.ts")).toBeTruthy());
+    expect(screen.queryByText("Merge Details")).toBeNull();
   });
 
   it("renders attribution notes for short-circuit and fallback merge details", async () => {
@@ -447,7 +476,7 @@ describe("TaskChangesTab — commit-backed (done tasks)", () => {
     });
   });
 
-  it("renders commit SHA metadata even when only commitSha is set", async () => {
+  it("keeps Changes free of merge details when only commitSha is set", async () => {
     mockFetchTaskDiff.mockResolvedValue(DONE_TASK_DIFF);
 
     const { container } = render(
@@ -463,12 +492,8 @@ describe("TaskChangesTab — commit-backed (done tasks)", () => {
       expect(screen.getByText("src/app.ts")).toBeTruthy();
     });
 
-    // SHA metadata should render since commitSha is present
-    expect(container.querySelector(".commit-diff-meta")).toBeTruthy();
-    expect(screen.getByText("abc1234")).toBeTruthy(); // short SHA
-    // But message and timestamp should NOT be present since they're not set
-    expect(container.querySelector(".commit-diff-message")).toBeNull();
-    expect(container.querySelector(".commit-diff-timestamp")).toBeNull();
+    expect(container.querySelector(".merge-details-card")).toBeNull();
+    expect(screen.queryByText("abc1234")).toBeNull();
   });
 });
 
@@ -1145,11 +1170,13 @@ describe("TaskChangesTab — compact spacing class", () => {
 
     const { container } = render(
       <div className="detail-body" data-testid="mobile-detail-body" style={{ maxInlineSize: "430px", overflowX: "hidden" }}>
-        <TaskChangesTab
-          taskId="FN-6997"
-          worktree="/path/to/worktree"
-          column="in-progress"
-        />
+        <div className="detail-body-content">
+          <TaskChangesTab
+            taskId="FN-6997"
+            worktree="/path/to/worktree"
+            column="in-progress"
+          />
+        </div>
       </div>,
     );
 
@@ -1158,7 +1185,7 @@ describe("TaskChangesTab — compact spacing class", () => {
     });
 
     const mobileDetailBody = screen.getByTestId("mobile-detail-body");
-    const taskTab = container.querySelector(".detail-body > .task-changes-tab");
+    const taskTab = container.querySelector(".detail-body > .detail-body-content > .task-changes-tab");
     const fileList = taskTab?.querySelector(".changes-file-list.task-changes-file-list--compact");
     const diffPatch = fileList?.querySelector(".changes-diff-patch.changes-diff-patch--wrap");
 
@@ -1194,18 +1221,21 @@ describe("TaskChangesTab — compact spacing class", () => {
     expect(rule).toContain("max-width: calc(100% + (calc(var(--space-md) + var(--space-xs) / 2) * 2));");
   });
 
-  it("keeps mobile widening equal and opposite to detail-body padding while preserving overflow containment", () => {
+  it("keeps mobile widening equal and opposite to detail-body content padding while preserving overflow containment", () => {
     const css = loadAllAppCss();
-    const detailBodyMobileRuleMatch = css.match(/\.detail-body\s*\{\s*padding:\s*calc\(var\(--space-md\) \+ var\(--space-xs\) \/ 2\);([\s\S]*?)\}/);
+    const detailBodyMobileRuleMatch = css.match(/\.detail-body\s*\{\s*padding:\s*0;([\s\S]*?)\}/);
+    const detailBodyContentMobileRuleMatch = css.match(/\.detail-body-content\s*\{\s*padding:\s*calc\(var\(--space-md\) \+ var\(--space-xs\) \/ 2\);([\s\S]*?)\}/);
     const compactListMobileRuleMatch = css.match(/@media\s*\(max-width:\s*768px\)\s*\{\s*\.task-changes-tab\s+\.changes-file-list\.task-changes-file-list--compact\s*\{([\s\S]*?)\}/);
 
     expect(detailBodyMobileRuleMatch).toBeTruthy();
+    expect(detailBodyContentMobileRuleMatch).toBeTruthy();
     expect(compactListMobileRuleMatch).toBeTruthy();
 
     const mobilePadding = "calc(var(--space-md) + var(--space-xs) / 2)";
     expect(css).toContain("@media (max-width: 768px)");
-    expect(detailBodyMobileRuleMatch![0]).toContain(`padding: ${mobilePadding};`);
+    expect(detailBodyMobileRuleMatch![0]).toContain("padding: 0;");
     expect(detailBodyMobileRuleMatch![1]).toContain("overflow-x: hidden;");
+    expect(detailBodyContentMobileRuleMatch![0]).toContain(`padding: ${mobilePadding};`);
     expect(compactListMobileRuleMatch![1]).toContain(`margin-left: calc(-1 * ${mobilePadding});`);
     expect(compactListMobileRuleMatch![1]).toContain(`margin-right: calc(-1 * ${mobilePadding});`);
     expect(compactListMobileRuleMatch![1]).toContain(`max-width: calc(100% + (${mobilePadding} * 2));`);
@@ -1421,7 +1451,7 @@ describe("TaskChangesTab — header toolbar structure", () => {
     expect(screen.getByLabelText("Expand diff view")).toBeTruthy();
   });
 
-  it("keeps commit metadata above the header while preserving the actions structure", async () => {
+  it("keeps the Changes header direct while omitting merge details", async () => {
     mockFetchTaskDiff.mockResolvedValue(DONE_TASK_DIFF);
     const { container } = render(
       <TaskChangesTab
@@ -1438,11 +1468,9 @@ describe("TaskChangesTab — header toolbar structure", () => {
 
     const taskTab = container.querySelector(".task-changes-tab");
     const header = taskTab?.querySelector(":scope > .changes-header");
-    const commitMeta = taskTab?.querySelector(":scope > .commit-diff-meta");
 
-    expect(commitMeta).toBeTruthy();
+    expect(taskTab?.querySelector(".merge-details-card")).toBeNull();
     expect(header).toBeTruthy();
-    expect(commitMeta?.nextElementSibling).toBe(header ?? null);
     expect(header?.querySelector(".changes-header-actions-wrapper .changes-header-actions-secondary")).toBeTruthy();
   });
 

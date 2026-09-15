@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { globSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
@@ -9,69 +9,165 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "../..");
 
-function readWorkspacePackageManifestPaths() {
-  const workspacePath = path.join(repoRoot, "pnpm-workspace.yaml");
+function normalizeDockerSource(source) {
+  return source.replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function readWorkspacePackageManifestPaths(root = repoRoot) {
+  const workspacePath = path.join(root, "pnpm-workspace.yaml");
   const workspace = YAML.parse(readFileSync(workspacePath, "utf8"));
   const entries = Array.isArray(workspace?.packages) ? workspace.packages : [];
   const manifestPaths = new Set();
 
   for (const entry of entries) {
-    if (entry === "packages/*") {
-      const packageDirs = readdirSync(path.join(repoRoot, "packages"), { withFileTypes: true })
-        .filter((dirent) => dirent.isDirectory())
-        .map((dirent) => dirent.name);
-      for (const dir of packageDirs) {
-        const manifest = `packages/${dir}/package.json`;
-        if (existsSync(path.join(repoRoot, manifest))) {
-          manifestPaths.add(manifest);
-        }
-      }
+    if (typeof entry !== "string" || entry.startsWith("!")) {
       continue;
     }
 
-    if (entry === "plugins/examples/*") {
-      const exampleDirs = readdirSync(path.join(repoRoot, "plugins/examples"), { withFileTypes: true })
-        .filter((dirent) => dirent.isDirectory())
-        .map((dirent) => dirent.name);
-      for (const dir of exampleDirs) {
-        const manifest = `plugins/examples/${dir}/package.json`;
-        if (existsSync(path.join(repoRoot, manifest))) {
-          manifestPaths.add(manifest);
-        }
-      }
-      continue;
-    }
-
-    const manifest = `${entry}/package.json`;
-    if (existsSync(path.join(repoRoot, manifest))) {
-      manifestPaths.add(manifest);
+    for (const manifest of globSync(`${entry.replace(/\/$/, "")}/package.json`, {
+      cwd: root,
+      nodir: true,
+    })) {
+      manifestPaths.add(manifest.split(path.sep).join("/"));
     }
   }
 
   return manifestPaths;
 }
 
+function readBuilderPreInstallCopySources(dockerfile) {
+  const builderStart = dockerfile.match(/^FROM\s+.*\s+AS\s+builder\s*$/im);
+  assert.ok(builderStart?.index !== undefined, "Dockerfile must define a builder stage");
+
+  const afterBuilder = dockerfile.slice(builderStart.index + builderStart[0].length);
+  const nextStage = afterBuilder.search(/^FROM\s+/im);
+  const builderStage = nextStage === -1 ? afterBuilder : afterBuilder.slice(0, nextStage);
+  const install = builderStage.match(/RUN\s+pnpm\s+install\s+--frozen-lockfile\b/);
+  assert.ok(install?.index !== undefined, "builder stage must run pnpm install --frozen-lockfile");
+
+  const copied = [];
+  for (const match of builderStage.slice(0, install.index).matchAll(/^COPY\s+(?:--\S+\s+)*(.*?)\s+\S+\s*$/gm)) {
+    const sources = match[1].trim().split(/\s+/).map(normalizeDockerSource);
+    copied.push(...sources);
+  }
+  return copied;
+}
+
+function findMissingWorkspaceManifests(manifests, copySources) {
+  return [...manifests].filter((manifest) => !copySources.some((source) => (
+    source === manifest || source === "." || manifest.startsWith(`${source}/`)
+  ))).sort();
+}
+
 function readDockerfileCopiedManifestPaths() {
   const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
-  const copied = new Set();
-  for (const match of dockerfile.matchAll(/^COPY\s+(\S+)\s+\.\/\S+$/gm)) {
-    const source = match[1];
-    if (source.endsWith("/package.json")) {
-      copied.add(source);
-    }
-  }
+  const copied = readBuilderPreInstallCopySources(dockerfile);
   return { copied, dockerfile };
 }
 
-test("Dockerfile builder manifest copy list covers pnpm workspace package manifests", () => {
+test("Dockerfile builder pre-install copies cover every current workspace manifest", () => {
   const expected = readWorkspacePackageManifestPaths();
   const { copied } = readDockerfileCopiedManifestPaths();
 
-  const missing = [...expected].filter((manifest) => !copied.has(manifest));
-  assert.deepEqual(missing, []);
+  assert.deepEqual(findMissingWorkspaceManifests(expected, copied), []);
+  assert.equal(new Set(copied).size, copied.length, "builder pre-install COPY sources must not be duplicated");
 });
 
-test("Dockerfile no longer references removed packages/tui package.json", () => {
-  const { dockerfile } = readDockerfileCopiedManifestPaths();
-  assert.ok(!dockerfile.includes("COPY packages/tui/package.json ./packages/tui/package.json"));
+test("coverage rejects a selected plugin omitted before frozen install", () => {
+  const expected = readWorkspacePackageManifestPaths();
+  const omitted = [...expected].sort().find((manifest) => manifest.startsWith("plugins/"));
+  assert.ok(omitted, "workspace fixture must include a plugin manifest");
+
+  const completeSources = [...expected];
+  const incompleteSources = completeSources.filter((source) => source !== omitted);
+  assert.deepEqual(findMissingWorkspaceManifests(expected, incompleteSources), [omitted]);
+});
+
+test("coverage ignores post-install and runner copies while tolerating removed paths", () => {
+  const expected = readWorkspacePackageManifestPaths();
+  const omitted = [...expected].sort().find((manifest) => manifest.startsWith("plugins/"));
+  assert.ok(omitted, "workspace fixture must include a plugin manifest");
+
+  const builderCopies = [...expected]
+    .filter((manifest) => manifest !== omitted)
+    .map((manifest) => `COPY ${manifest} ./${manifest}`)
+    .join("\n");
+  const dockerfile = `FROM node:22-slim AS builder\n${builderCopies}\nRUN pnpm install --frozen-lockfile\nCOPY ${omitted} ./${omitted}\nFROM node:22-slim AS runner\nCOPY ${omitted} ./${omitted}`;
+  const copied = readBuilderPreInstallCopySources(dockerfile);
+
+  assert.deepEqual(findMissingWorkspaceManifests(expected, copied), [omitted]);
+  assert.deepEqual(
+    findMissingWorkspaceManifests(expected, [...expected, "plugins/not-in-workspace/package.json"]),
+    [],
+    "removed or nonexistent COPY paths must not affect selected workspace coverage",
+  );
+});
+
+/*
+FNXC:DockerRun 2026-08-18-05:35:
+The runner stage MUST install ca-certificates. The slim base ships none, and git verifies TLS
+against the system store, so without it every HTTPS clone dies with "server certificate
+verification failed. CAfile: none CRLfile: none" and project setup is impossible in Docker.
+
+This regressed unnoticed because Node carries its OWN bundled CA store: the dashboard, model APIs
+and OAuth token exchanges all worked, so nothing looked wrong until the first clone. Nothing else
+in the image exercises the system trust store, which is exactly why it needs a guard rather than
+relying on someone noticing.
+*/
+test("runner stage installs ca-certificates alongside git", () => {
+  const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+  const runnerStage = dockerfile.slice(dockerfile.indexOf("FROM node:22-slim AS runner"));
+  assert.ok(runnerStage.length > 0, "runner stage must exist");
+
+  const aptInstall = runnerStage.match(/apt-get install[^\n]*(?:\\\n[^\n]*)*/)?.[0] ?? "";
+  assert.match(aptInstall, /\bgit\b/, "runner stage must install git");
+  assert.match(
+    aptInstall,
+    /\bca-certificates\b/,
+    "runner stage must install ca-certificates — git cannot verify HTTPS remotes without a system CA bundle",
+  );
+  assert.match(
+    aptInstall,
+    /\bripgrep\b/,
+    "runner stage must install ripgrep — the coding agents Fusion drives use `rg` as their primary search tool",
+  );
+  /*
+  FNXC:DockerRun 2026-08-20-04:30:
+  Without git-lfs, git checks out 130-byte pointer files in place of LFS-tracked binaries and still
+  reports a clean tree — silent corruption of a working checkout rather than a visibly missing tool.
+  */
+  assert.match(
+    aptInstall,
+    /\bgit-lfs\b/,
+    "runner stage must install git-lfs — LFS-tracked assets otherwise check out as pointer stubs and git reports the tree clean",
+  );
+});
+
+/*
+FNXC:DockerRun 2026-08-18-06:40:
+The operator tooling the image promises must actually be in it. `gh` backs the gh-cli GitHub auth
+mode, `cloudflared` backs remote access, and `tailscale` is the private-network option; each is
+installed from its vendor's signed apt repository. Assert the repo wiring AND the package names, so
+dropping either half (a keyring without the install, or an install whose repo line was removed) fails
+here instead of at first use inside a container.
+
+FNXC:DockerRun 2026-08-27-20:00:
+`google-chrome-stable` is covered by the same guard because its absence is the failure mode that is
+HARDEST to attribute: the agent-browser plugin and the Chrome DevTools MCP server both launch an
+existing browser and download none, so an image without one fails only at first browser use, far
+from the Dockerfile, with an error naming a channel path rather than a missing package.
+*/
+test("runner stage installs gh, tailscale, cloudflared and google-chrome-stable from vendor repositories", () => {
+  const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+  const runnerStage = dockerfile.slice(dockerfile.indexOf("FROM node:22-slim AS runner"));
+
+  for (const [tool, repo] of [
+    ["gh", "https://cli.github.com/packages"],
+    ["tailscale", "https://pkgs.tailscale.com/stable/debian"],
+    ["cloudflared", "https://pkg.cloudflare.com/cloudflared"],
+    ["google-chrome-stable", "https://dl.google.com/linux/chrome/deb/"],
+  ]) {
+    assert.ok(runnerStage.includes(repo), `runner stage must configure the ${tool} apt repository (${repo})`);
+    assert.match(runnerStage, new RegExp(`apt-get install[^\n]*(?:\\\n[^\n]*)*\\b${tool}\\b`), `runner stage must install ${tool}`);
+  }
 });

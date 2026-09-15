@@ -15,8 +15,10 @@ import {
   noopMove,
   noopOpenDetail,
   mockConfirm,
+  mockConfirmWithCheckbox,
   mockUsePluginUiSlots,
   expectBaseRule,
+  expectSingleStatsRuntimeStatus,
   readDashboardStylesSource,
   setupTaskDetailModalHooks,
 } from "./TaskDetailModal.test-helpers";
@@ -24,6 +26,12 @@ import { loadAllAppCss } from "../../test/cssFixture";
 import { TaskDetailModal, TaskDetailContent } from "../TaskDetailModal";
 
 setupTaskDetailModalHooks();
+
+function openTaskDetailActionsMenu() {
+  const trigger = screen.getByRole("button", { name: "Actions" });
+  if (trigger.getAttribute("aria-expanded") !== "true") fireEvent.click(trigger);
+  return screen.getByRole("menu");
+}
 
 function getMediaBlocks(css: string, mediaQuery: string): string[] {
   const blocks: string[] = [];
@@ -83,6 +91,11 @@ function getRuleBlockFromSelectorList(css: string, selector: string): string {
   return ruleEnd === -1 ? "" : css.slice(ruleStart + 1, ruleEnd);
 }
 
+/*
+FNXC:TaskDetailStatsAssertions 2026-08-09-16:50:
+FN-8906 requires Stats-tab runtime-status assertions to be scoped to the named Stats region because
+the modal header lifecycle badge intentionally renders the same raw status string.
+*/
 describe("TaskDetailModal", () => {
   describe("source issue metadata", () => {
     beforeEach(() => {
@@ -93,7 +106,7 @@ describe("TaskDetailModal", () => {
       const user = userEvent.setup();
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             sourceIssue: {
               provider: "github",
@@ -104,7 +117,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -156,7 +168,7 @@ describe("TaskDetailModal", () => {
     it("does not render GitHub badge for non-github providers", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             sourceIssue: {
               provider: "gitlab",
@@ -167,7 +179,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -182,10 +193,9 @@ describe("TaskDetailModal", () => {
     it("hides source issue read section when sourceIssue metadata is missing", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ sourceIssue: undefined })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -213,7 +223,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -221,7 +230,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
 
       await waitFor(() => {
@@ -247,7 +256,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -255,7 +263,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
 
       await waitFor(() => {
@@ -290,7 +298,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -298,7 +305,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
       fireEvent.change(screen.getByTestId("task-source-provider-input"), { target: { value: "gitlab" } });
       fireEvent.change(screen.getByTestId("task-source-repository-input"), { target: { value: "runfusion/dashboard" } });
@@ -340,7 +347,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -348,7 +354,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
       fireEvent.change(screen.getByTestId("task-source-provider-input"), { target: { value: "" } });
       fireEvent.change(screen.getByTestId("task-source-repository-input"), { target: { value: "" } });
@@ -382,7 +388,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -390,7 +395,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
       fireEvent.change(screen.getByTestId("task-source-provider-input"), { target: { value: "gitlab" } });
       fireEvent.click(screen.getByText("Save"));
@@ -398,17 +403,17 @@ describe("TaskDetailModal", () => {
       await waitFor(() => {
         expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: source patch failed", "error");
       });
-      expect(container.querySelector("#task-form-title")).toBeTruthy();
+      expect(document.querySelector("#task-form-title")).toBeTruthy();
     });
   });
 
-  describe("Plan tab original prompt", () => {
+  describe("Details tab original prompt", () => {
     it("is collapsed by default and expands to render the original prompt as markdown", () => {
       const originalPrompt = "# Heading\n\n- item\n\n`code`";
       const generatedPrompt = "# FN-TEST\n\n## Mission\nGenerated plan";
       const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-TEST",
             title: "Title must not replace description",
@@ -416,7 +421,6 @@ describe("TaskDetailModal", () => {
             prompt: generatedPrompt,
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -429,8 +433,6 @@ describe("TaskDetailModal", () => {
       expect(toggle.getAttribute("aria-expanded")).toBe("false");
       // Collapsed by default: the prompt body is not in the DOM until expanded.
       expect(screen.queryByTestId("task-detail-original-prompt")).toBeNull();
-      expect(screen.getByRole("heading", { name: "Mission" })).toBeTruthy();
-      expect(screen.getByText("Generated plan")).toBeTruthy();
 
       fireEvent.click(toggle);
 
@@ -444,25 +446,22 @@ describe("TaskDetailModal", () => {
       expect(originalPromptNode.textContent).not.toContain("# Heading");
       expect(originalPromptNode.textContent).not.toContain("`code`");
 
-      const originalSection = container.querySelector(".detail-section--original-prompt");
-      const planSection = container.querySelector(".detail-section--plan-prompt");
+      const originalSection = document.querySelector(".detail-section--original-prompt");
       expect(originalSection?.contains(screen.getByText("Original prompt"))).toBe(true);
-      expect(planSection?.contains(screen.getByRole("button", { name: "Edit" }))).toBe(true);
-      expect(originalSection?.contains(screen.getByRole("button", { name: "Edit" }))).toBe(false);
+      expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
       expect(originalPromptNode.textContent).not.toBe("Title must not replace description");
     });
 
-    it("renders a non-boxed empty fallback with no toggle, without hiding the generated plan", () => {
+    it("renders a non-boxed empty fallback with no toggle", () => {
       const { container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-EMPTY",
             description: "   \n\t ",
             prompt: "# FN-EMPTY\n\n## Mission\nGenerated plan still visible",
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -473,8 +472,7 @@ describe("TaskDetailModal", () => {
       expect(screen.getByText("No original prompt recorded.")).toBeTruthy();
       expect(screen.queryByTestId("task-detail-original-prompt")).toBeNull();
       expect(screen.queryByRole("button", { name: "Expand original prompt" })).toBeNull();
-      expect(container.querySelector(".detail-section--original-prompt .detail-original-prompt-text")).toBeNull();
-      expect(screen.getByText("Generated plan still visible")).toBeTruthy();
+      expect(document.querySelector(".detail-section--original-prompt .detail-original-prompt-text")).toBeNull();
     });
 
     it("shows the same collapsible original prompt section in embedded task detail content", () => {
@@ -482,13 +480,12 @@ describe("TaskDetailModal", () => {
       const { container } = render(
         <TaskDetailContent
           embedded
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-EMBED",
             description: originalPrompt,
             prompt: "# FN-EMBED\n\n## Mission\nEmbedded generated plan",
           })}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -496,11 +493,10 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(container.querySelector(".task-detail-content--embedded")).toBeTruthy();
+      expect(document.querySelector(".task-detail-content--embedded")).toBeTruthy();
       expect(screen.queryByTestId("task-detail-original-prompt")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Expand original prompt" }));
       expect(screen.getByTestId("task-detail-original-prompt").textContent).toBe(originalPrompt);
-      expect(screen.getByText("Embedded generated plan")).toBeTruthy();
     });
 
     it("applies wrapping and mobile CSS contracts to the expanded original prompt section", () => {
@@ -528,7 +524,7 @@ describe("TaskDetailModal", () => {
 
   describe("inline editing", () => {
     const chooseInlinePriority = (priority: TaskPriority) => {
-      fireEvent.click(screen.getByTestId("detail-priority-trigger"));
+      openTaskDetailActionsMenu();
       fireEvent.click(screen.getByTestId(`detail-priority-option-${priority}`));
     };
     beforeEach(() => {
@@ -541,7 +537,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -549,7 +544,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const editButton = container.querySelector(".modal-edit-btn");
+      const editButton = document.querySelector(".modal-edit-btn");
       expect(editButton).toBeTruthy();
     });
 
@@ -559,7 +554,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -567,7 +561,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const editButton = container.querySelector(".modal-edit-btn");
+      const editButton = document.querySelector(".modal-edit-btn");
       expect(editButton).toBeTruthy();
     });
 
@@ -577,7 +571,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "in-progress", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -585,7 +578,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const editButton = container.querySelector(".modal-edit-btn");
+      const editButton = document.querySelector(".modal-edit-btn");
       expect(editButton).toBeNull();
     });
 
@@ -595,7 +588,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -604,23 +596,22 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      const editButton = container.querySelector(".modal-edit-btn");
+      const editButton = document.querySelector(".modal-edit-btn");
       expect(editButton).toBeTruthy();
       fireEvent.click(editButton!);
 
       // Edit button should be hidden now
-      expect(container.querySelector(".modal-edit-btn")).toBeNull();
+      expect(document.querySelector(".modal-edit-btn")).toBeNull();
       // But TaskForm title input should be visible
-      expect(container.querySelector("#task-form-title")).toBeTruthy();
+      expect(document.querySelector("#task-form-title")).toBeTruthy();
     });
 
-    it("entering edit mode shows title input and description textarea", () => {
-      const { container } = render(
+    it("keeps the title out of the header while edit mode exposes both fields", () => {
+      render(
         <TaskDetailModal
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test task", description: "Test description" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -628,17 +619,18 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // Initially shows title as h2
-      expect(container.querySelector("h2.detail-title")).toBeTruthy();
-      expect(container.querySelector("#task-form-title")).toBeNull();
+      const header = document.querySelector(".task-detail-content > .modal-header");
+      expect(header).not.toHaveTextContent("Test task");
+      expect(header?.querySelector("h1, h2, h3, h4, h5, h6")).toBeNull();
+      expect(screen.getByTestId("task-detail-definition-description")).toHaveTextContent("Test description");
+      expect(document.querySelector("#task-form-title")).toBeNull();
 
-      // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      // Now shows edit form with TaskForm fields
-      expect(container.querySelector("h2.detail-title")).toBeNull();
-      expect(container.querySelector("#task-form-title")).toBeTruthy();
-      expect(container.querySelector("#task-form-description")).toBeTruthy();
+      expect(header).not.toHaveTextContent("Test task");
+      expect(document.querySelector("h2.detail-title")).toBeNull();
+      expect(document.querySelector("#task-form-title")).toHaveValue("Test task");
+      expect(document.querySelector("#task-form-description")).toHaveValue("Test description");
     });
 
     it("clicking Cancel exits edit mode without saving", () => {
@@ -647,7 +639,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Original title", description: "Original description" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -656,18 +647,19 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       // Change values
-      const titleInput = container.querySelector("#task-form-title") as HTMLInputElement;
+      const titleInput = document.querySelector("#task-form-title") as HTMLInputElement;
       fireEvent.change(titleInput, { target: { value: "Modified title" } });
 
       // Click Cancel
       fireEvent.click(screen.getByText("Cancel"));
 
-      // Should exit edit mode without saving
-      expect(container.querySelector("#task-form-title")).toBeNull();
-      expect(container.querySelector("h2.detail-title")?.textContent).toBe("Original title");
+      // The editable value is restored without recreating a visible header title.
+      expect(document.querySelector("#task-form-title")).toBeNull();
+      expect(document.querySelector(".modal-header")).not.toHaveTextContent("Original title");
+      expect(screen.getByTestId("task-detail-definition-description")).toHaveTextContent("Original description");
     });
 
     it("clicking Save calls updateTask with correct parameters", async () => {
@@ -680,7 +672,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Original title", description: "Original description" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -689,11 +680,11 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       // Change values
-      const titleInput = container.querySelector("#task-form-title") as HTMLInputElement;
-      const descTextarea = container.querySelector("#task-form-description") as HTMLTextAreaElement;
+      const titleInput = document.querySelector("#task-form-title") as HTMLInputElement;
+      const descTextarea = document.querySelector("#task-form-description") as HTMLTextAreaElement;
       fireEvent.change(titleInput, { target: { value: "New title" } });
       fireEvent.change(descTextarea, { target: { value: "New description" } });
 
@@ -708,13 +699,133 @@ describe("TaskDetailModal", () => {
       });
     });
 
+    it("deletes a cleared description through the confirmed task callback", async () => {
+      const { updateTask } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      const onDeleteTask = vi.fn(async () => makeTask({ id: "FN-001" }) as Task);
+      mockConfirmWithCheckbox.mockResolvedValue({ choice: "primary", checkboxValue: false });
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ id: "FN-001", column: "triage", title: "Original title", description: "Original description" })}
+          onClose={noop}
+          onDeleteTask={onDeleteTask}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(document.querySelector("#task-form-description")!, { target: { value: "   \n\t" } });
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockConfirmWithCheckbox).toHaveBeenCalledWith(expect.objectContaining({ title: "Delete Task", danger: true }));
+        expect(onDeleteTask).toHaveBeenCalledTimes(1);
+      });
+      expect(mockUpdate).not.toHaveBeenCalledWith("FN-001", expect.objectContaining({ description: "" }), undefined);
+    });
+
+    it("keeps a cleared description editable when deletion is cancelled", async () => {
+      const { updateTask } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      const onDeleteTask = vi.fn(async () => makeTask({ id: "FN-001" }) as Task);
+      mockConfirmWithCheckbox.mockResolvedValue({ choice: "cancel", checkboxValue: false });
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ id: "FN-001", column: "triage", description: "Original description" })}
+          onClose={noop}
+          onDeleteTask={onDeleteTask}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(document.querySelector("#task-form-description")!, { target: { value: "" } });
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => expect(mockConfirmWithCheckbox).toHaveBeenCalledTimes(1));
+      expect(onDeleteTask).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalledWith("FN-001", expect.objectContaining({ description: "" }), undefined);
+      expect(document.querySelector("#task-form-description")).toBeTruthy();
+    });
+
+    it("does not delete a restored draft from a stale confirmation", async () => {
+      let resolveConfirmation: ((value: { choice: "primary"; checkboxValue: boolean }) => void) | undefined;
+      const confirmation = new Promise<{ choice: "primary"; checkboxValue: boolean }>((resolve) => {
+        resolveConfirmation = resolve;
+      });
+      const onDeleteTask = vi.fn(async () => makeTask({ id: "FN-001" }) as Task);
+      mockConfirmWithCheckbox.mockReturnValue(confirmation);
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ id: "FN-001", column: "triage", description: "Original description" })}
+          onClose={noop}
+          onDeleteTask={onDeleteTask}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      const description = document.querySelector("#task-form-description")!;
+      fireEvent.change(description, { target: { value: "" } });
+      fireEvent.click(screen.getByText("Save"));
+      await waitFor(() => expect(mockConfirmWithCheckbox).toHaveBeenCalledTimes(1));
+      fireEvent.change(description, { target: { value: "Restored description" } });
+      await act(async () => resolveConfirmation?.({ choice: "primary", checkboxValue: false }));
+
+      expect(onDeleteTask).not.toHaveBeenCalled();
+      expect(document.querySelector("#task-form-description")).toBeTruthy();
+    });
+
+    it("fences the description debounce and Save click to one embedded-host deletion", async () => {
+      vi.useFakeTimers();
+      try {
+        const onDeleteTask = vi.fn(async () => makeTask({ id: "FN-001" }) as Task);
+        const onRequestClose = vi.fn();
+        mockConfirmWithCheckbox.mockResolvedValue({ choice: "primary", checkboxValue: false });
+
+        render(
+          <TaskDetailContent
+            initialTab="definition"
+            embedded
+            task={makeTask({ id: "FN-001", column: "triage", description: "Original description" })}
+            onOpenDetail={noopOpenDetail}
+            onDeleteTask={onDeleteTask}
+            onMergeTask={noopMerge}
+            addToast={noop}
+            onRequestClose={onRequestClose}
+          />,
+        );
+
+        fireEvent.click(document.querySelector(".modal-edit-btn")!);
+        fireEvent.change(document.querySelector("#task-form-description")!, { target: { value: "" } });
+        fireEvent.click(screen.getByText("Save"));
+        await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+        expect(onDeleteTask).toHaveBeenCalledTimes(1);
+        expect(onRequestClose).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("Save button is enabled in edit mode", () => {
       const { container } = render(
         <TaskDetailModal
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test title", description: "Test description" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -723,7 +834,7 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       const saveButton = screen.getByText("Save");
       expect(saveButton.hasAttribute("disabled")).toBe(false);
@@ -740,7 +851,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Original" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -749,9 +859,9 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const titleInput = container.querySelector("#task-form-title") as HTMLInputElement;
+      const titleInput = document.querySelector("#task-form-title") as HTMLInputElement;
       fireEvent.change(titleInput, { target: { value: "Changed title" } });
 
       // Click Save
@@ -773,7 +883,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Original" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -782,9 +891,9 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const titleInput = container.querySelector("#task-form-title") as HTMLInputElement;
+      const titleInput = document.querySelector("#task-form-title") as HTMLInputElement;
       fireEvent.change(titleInput, { target: { value: "Changed title" } });
 
       // Click Save
@@ -795,7 +904,7 @@ describe("TaskDetailModal", () => {
       });
 
       // Should exit edit mode
-      expect(container.querySelector("#task-form-title")).toBeNull();
+      expect(document.querySelector("#task-form-title")).toBeNull();
     });
 
     it("failed save shows toast with error and stays in edit mode", async () => {
@@ -810,7 +919,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Original" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -819,9 +927,9 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const titleInput = container.querySelector("#task-form-title") as HTMLInputElement;
+      const titleInput = document.querySelector("#task-form-title") as HTMLInputElement;
       fireEvent.change(titleInput, { target: { value: "Changed title" } });
 
       // Click Save
@@ -832,7 +940,7 @@ describe("TaskDetailModal", () => {
       });
 
       // Should stay in edit mode
-      expect(container.querySelector("#task-form-title")).toBeTruthy();
+      expect(document.querySelector("#task-form-title")).toBeTruthy();
     });
 
     it("Escape key exits edit mode", async () => {
@@ -841,7 +949,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test title" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -850,8 +957,8 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
-      expect(container.querySelector("#task-form-title")).toBeTruthy();
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      expect(document.querySelector("#task-form-title")).toBeTruthy();
 
       // Press Escape (handled via document-level keydown listener)
       await act(async () => {
@@ -860,7 +967,7 @@ describe("TaskDetailModal", () => {
       });
 
       // Should exit edit mode
-      expect(container.querySelector("#task-form-title")).toBeNull();
+      expect(document.querySelector("#task-form-title")).toBeNull();
     });
 
     it("edit mode shows both title and description fields", () => {
@@ -869,7 +976,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test title", description: "Test description" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -878,11 +984,11 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       // Both title and description should be present in TaskForm
-      expect(container.querySelector("#task-form-title")).toBeTruthy();
-      expect(container.querySelector("#task-form-description")).toBeTruthy();
+      expect(document.querySelector("#task-form-title")).toBeTruthy();
+      expect(document.querySelector("#task-form-description")).toBeTruthy();
     });
 
     it("edit mode renders model configuration and workflow steps", () => {
@@ -891,7 +997,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -900,7 +1005,7 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       // Model configuration is present via TaskForm in edit mode.
       // U6/R3: the per-step "Workflow Steps" section was removed from TaskForm;
@@ -919,7 +1024,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc", dependencies: ["FN-002"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -928,9 +1032,9 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const descTextarea = container.querySelector("#task-form-description") as HTMLTextAreaElement;
+      const descTextarea = document.querySelector("#task-form-description") as HTMLTextAreaElement;
       fireEvent.change(descTextarea, { target: { value: "Updated desc" } });
 
       // Click Save
@@ -953,7 +1057,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc", priority: "normal" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -961,7 +1064,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       fireEvent.click(screen.getByText("Save"));
 
@@ -969,9 +1072,9 @@ describe("TaskDetailModal", () => {
         expect(mockUpdate).not.toHaveBeenCalled();
       });
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
-      fireEvent.change(container.querySelector("#task-priority") as HTMLSelectElement, { target: { value: "urgent" } });
+      fireEvent.change(document.querySelector("#task-priority") as HTMLSelectElement, { target: { value: "urgent" } });
       fireEvent.click(screen.getByText("Save"));
 
       await waitFor(() => {
@@ -995,7 +1098,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1004,14 +1106,14 @@ describe("TaskDetailModal", () => {
       );
 
       // No change → no updateTask call.
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByText("Save"));
       await waitFor(() => {
         expect(mockUpdate).not.toHaveBeenCalled();
       });
 
       // Selecting a level sends that value.
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
       const select = await screen.findByTestId("planner-oversight-level-select");
       fireEvent.change(select, { target: { value: "observe" } });
@@ -1036,7 +1138,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc", plannerOversightLevel: "observe" as Task["plannerOversightLevel"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1044,7 +1145,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
       const select = await screen.findByTestId("planner-oversight-level-select");
       expect(select).toHaveValue("observe");
@@ -1065,7 +1166,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc", executionMode: "standard" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1073,7 +1173,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "fast" } });
       fireEvent.click(screen.getByText("Save"));
 
@@ -1092,7 +1192,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc", executionMode: "fast" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1100,13 +1199,75 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "standard" } });
       fireEvent.click(screen.getByText("Save"));
 
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: null }, undefined);
       });
+    });
+
+    it("keeps edit-mode optional workflow steps out of the fast-to-standard update payload", async () => {
+      const { updateTask } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      mockUpdate.mockResolvedValue({ id: "FN-001" } as Task);
+
+      const { container } = render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({
+            id: "FN-001",
+            column: "triage",
+            title: "Test",
+            description: "Desc",
+            executionMode: "fast",
+            enabledWorkflowSteps: ["code-review"],
+          })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "standard" } });
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: null }, undefined);
+      });
+      expect(mockUpdate.mock.calls[0]?.[1]).toEqual({ executionMode: null });
+      expect(mockUpdate.mock.calls[0]?.[1]).not.toHaveProperty("enabledWorkflowSteps");
+    });
+
+    it("patches edit-mode standard-to-fast on a todo task without confirmation or replanning", async () => {
+      const { updateTask, rebuildTaskSpec } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      const mockRebuild = vi.mocked(rebuildTaskSpec);
+      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", title: "Test", description: "Desc", executionMode: "fast" }) as Task);
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ id: "FN-001", column: "todo", title: "Test", description: "Desc", executionMode: "standard" })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "fast" } });
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined));
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
     });
 
     it("confirms and replans when edit-mode executionMode changes on a todo task", async () => {
@@ -1121,7 +1282,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", title: "Test", description: "Desc", executionMode: "fast" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1129,7 +1289,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.change(screen.getByTestId("task-form-execution-mode-select"), { target: { value: "standard" } });
       fireEvent.click(screen.getByText("Save"));
 
@@ -1153,7 +1313,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test", description: "Desc", executionMode: "fast" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1161,7 +1320,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
       fireEvent.click(screen.getByText("Save"));
 
       await waitFor(() => {
@@ -1175,7 +1334,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", description: "Priority metadata", priority: undefined })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1183,8 +1341,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const priorityTrigger = screen.getByTestId("detail-priority-trigger");
-      expect(priorityTrigger).toHaveAccessibleName("Priority: Normal");
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-priority-option-normal")).toHaveAttribute("aria-pressed", "true");
     });
 
     it("renders priority select and execution mode toggle together and keeps both interactive", async () => {
@@ -1199,7 +1357,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", priority: "high", executionMode: "standard" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1207,23 +1364,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const controls = screen.getByTestId("detail-meta-inline-controls");
-      const priorityTrigger = screen.getByTestId("detail-priority-trigger");
-      const executionModeToggle = screen.getByRole("button", { name: "Execution mode: standard" });
-
-      /*
-      FNXC:QuickAddActionRow 2026-07-16-16:00:
-      FN-8194: attach, GitHub, and Oversight precede the Quick Add-matched
-      Priority/Fast controls; both controls remain direct interactive children.
-      */
-      expect(controls).toContainElement(priorityTrigger.parentElement);
-      expect(executionModeToggle.parentElement).toBe(controls);
+      const menu = openTaskDetailActionsMenu();
+      expect(menu).toContainElement(screen.getByTestId("detail-priority-option-high"));
+      expect(menu).toContainElement(screen.getByTestId("detail-execution-mode-toggle"));
 
       chooseInlinePriority("urgent");
-      fireEvent.click(executionModeToggle);
+      await waitFor(() => expect(mockUpdate).toHaveBeenNthCalledWith(1, "FN-001", { priority: "urgent" }, undefined));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
-        expect(mockUpdate).toHaveBeenNthCalledWith(1, "FN-001", { priority: "urgent" }, undefined);
         expect(mockUpdate).toHaveBeenNthCalledWith(2, "FN-001", { executionMode: "fast" }, undefined);
       });
     });
@@ -1252,7 +1402,6 @@ describe("TaskDetailModal", () => {
             priority: "normal",
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1284,7 +1433,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", description: "Priority metadata", priority: "high" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1310,7 +1458,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", description: "Priority metadata", priority: "low" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1323,27 +1470,29 @@ describe("TaskDetailModal", () => {
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { priority: "urgent" }, undefined);
       });
-      await waitFor(() => {
-        expect(screen.getByTestId("detail-priority-trigger")).toHaveAccessibleName("Priority: Low");
-      });
-      expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Request failed", "error");
+      await waitFor(() => expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Request failed", "error"));
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-priority-option-low")).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("prompts before replanning a todo task when changing inline execution mode from standard to fast", async () => {
+    it.each([
+      ["desktop", undefined],
+      ["mobile", "back"],
+    ] as const)("patches a todo task from standard to fast in place on %s", async (_surface, mobileHeaderMode) => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       const addToast = vi.fn();
       const onTaskUpdated = vi.fn();
-      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: "fast" }) as Task);
-      mockRebuild.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "triage", status: "needs-replan", executionMode: "fast" }) as Task);
+      const updatedTask = makeTask({ id: "FN-001", column: "todo", executionMode: "fast" });
+      mockUpdate.mockResolvedValueOnce(updatedTask as Task);
 
       render(
         <TaskDetailModal
           initialTab="definition"
+          mobileHeaderMode={mobileHeaderMode}
           task={makeTask({ id: "FN-001", column: "todo", executionMode: "standard" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1352,24 +1501,19 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
-      await waitFor(() => {
-        expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({
-          title: "Change execution mode and replan?",
-          message: "Changing execution mode for this task will move it back to Planning so Fusion can rebuild the plan for fast mode.",
-        }));
-      });
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
-        expect(mockRebuild).toHaveBeenCalledWith("FN-001", undefined);
       });
-      expect(mockUpdate.mock.invocationCallOrder[0]).toBeLessThan(mockRebuild.mock.invocationCallOrder[0]);
-      expect(onTaskUpdated).not.toHaveBeenCalled();
-      expect(addToast).toHaveBeenCalledWith("Execution mode updated to fast — FN-001 returned to Planning for replanning", "info");
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
+      expect(onTaskUpdated).toHaveBeenCalledWith(updatedTask);
+      expect(addToast).toHaveBeenCalledWith("Execution mode updated to fast", "success");
     });
 
-    it("cancels a todo inline execution mode change before update or replan", async () => {
+    it("cancels the retained fast-to-standard todo replan before update", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
@@ -1378,9 +1522,8 @@ describe("TaskDetailModal", () => {
       render(
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({ id: "FN-001", column: "todo", executionMode: "standard" })}
+          task={makeTask({ id: "FN-001", column: "todo", executionMode: "fast" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1388,17 +1531,22 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
         expect(mockConfirm).toHaveBeenCalled();
       });
       expect(mockUpdate).not.toHaveBeenCalled();
       expect(mockRebuild).not.toHaveBeenCalled();
-      expect(screen.getByRole("button", { name: "Execution mode: standard" })).toHaveAttribute("aria-pressed", "false");
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("prompts and replans a todo task when changing inline execution mode from fast to standard", async () => {
+    it.each([
+      ["desktop", undefined],
+      ["mobile", "back"],
+    ] as const)("prompts and replans a todo task from fast to standard on %s", async (_surface, mobileHeaderMode) => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
@@ -1408,9 +1556,9 @@ describe("TaskDetailModal", () => {
       render(
         <TaskDetailModal
           initialTab="definition"
+          mobileHeaderMode={mobileHeaderMode}
           task={makeTask({ id: "FN-001", column: "todo", executionMode: "fast" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1418,7 +1566,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: fast" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
         expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({
@@ -1430,19 +1579,17 @@ describe("TaskDetailModal", () => {
       expect(mockUpdate.mock.invocationCallOrder[0]).toBeLessThan(mockRebuild.mock.invocationCallOrder[0]);
     });
 
-    it("prompts and replans an in-progress task when changing inline execution mode", async () => {
+    it("patches an in-progress task from standard to fast without confirmation or replanning", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "in-progress", executionMode: "fast" }) as Task);
-      mockRebuild.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "triage", status: "needs-replan", executionMode: "fast" }) as Task);
 
       render(
         <TaskDetailModal
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "in-progress", executionMode: "standard" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1450,13 +1597,14 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
-        expect(mockConfirm).toHaveBeenCalled();
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
-        expect(mockRebuild).toHaveBeenCalledWith("FN-001", undefined);
       });
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(mockRebuild).not.toHaveBeenCalled();
     });
 
     it("updates triage inline execution mode without prompting or replanning", async () => {
@@ -1473,7 +1621,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", executionMode: "standard" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1482,7 +1629,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
@@ -1491,25 +1639,23 @@ describe("TaskDetailModal", () => {
       expect(mockRebuild).not.toHaveBeenCalled();
       expect(onTaskUpdated).toHaveBeenCalledWith(updatedTask);
       expect(addToast).toHaveBeenCalledWith("Execution mode updated to fast", "success");
-      await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Execution mode: fast" })).toHaveAttribute("aria-pressed", "true");
-      });
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("reverts inline execution mode when active-task replan fails after update", async () => {
+    it("reverts to fast when the retained fast-to-standard replan fails after update", async () => {
       const { updateTask, rebuildTaskSpec } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);
       const mockRebuild = vi.mocked(rebuildTaskSpec);
       const addToast = vi.fn();
-      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: "fast" }) as Task);
+      mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-001", column: "todo", executionMode: null }) as Task);
       mockRebuild.mockRejectedValueOnce(new Error("Replan failed"));
 
       render(
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({ id: "FN-001", column: "todo", executionMode: "standard" })}
+          task={makeTask({ id: "FN-001", column: "todo", executionMode: "fast" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1517,16 +1663,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: "Execution mode: standard" }));
+      openTaskDetailActionsMenu();
+      fireEvent.click(screen.getByTestId("detail-execution-mode-toggle"));
 
       await waitFor(() => {
-        expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
+        expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: null }, undefined);
         expect(mockRebuild).toHaveBeenCalledWith("FN-001", undefined);
       });
-      await waitFor(() => {
-        expect(screen.getByRole("button", { name: "Execution mode: standard" })).toHaveAttribute("aria-pressed", "false");
-      });
-      expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Replan failed", "error");
+      await waitFor(() => expect(addToast).toHaveBeenCalledWith("Failed to update FN-001: Replan failed", "error"));
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toHaveAttribute("aria-pressed", "true");
     });
 
     it("disables inline execution mode toggle while save is in-flight", async () => {
@@ -1541,7 +1687,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", executionMode: "standard" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1549,19 +1694,22 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const toggle = screen.getByRole("button", { name: "Execution mode: standard" });
+      openTaskDetailActionsMenu();
+      const toggle = screen.getByTestId("detail-execution-mode-toggle");
       fireEvent.click(toggle);
-      expect(toggle).toBeDisabled();
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      openTaskDetailActionsMenu();
+      expect(screen.getByTestId("detail-execution-mode-toggle")).toBeDisabled();
 
       await waitFor(() => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { executionMode: "fast" }, undefined);
       });
     });
 
-    it("renders no-commits-expected toggle after plan and before attachments", () => {
+    it("renders no-commits-expected toggle in Details", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "todo",
@@ -1569,7 +1717,6 @@ describe("TaskDetailModal", () => {
             prompt: "# FN-001\n\n## Plan\n\nPlan marker text for ordering assertion.",
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1577,14 +1724,11 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const planMarker = screen.getByText("Plan marker text for ordering assertion.");
       const noCommitsCheckbox = screen.getByLabelText("No commits expected (decision-only task)");
-      const attachmentsHeading = screen.getByRole("heading", { name: "Attachments" });
-
       const noCommitsWrapper = noCommitsCheckbox.closest(".detail-section");
       expect(noCommitsWrapper).toBeTruthy();
-      expect(planMarker.compareDocumentPosition(noCommitsWrapper!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
-      expect(noCommitsWrapper!.compareDocumentPosition(attachmentsHeading)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      expect(document.querySelector(".detail-section--plan-prompt")).toBeNull();
+      expect(document.querySelector(".detail-attachments-grid")).toBeNull();
     });
 
     it("toggles no-commits-expected checkbox and patches task", async () => {
@@ -1594,10 +1738,9 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ id: "FN-001", column: "todo", noCommitsExpected: false })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1618,7 +1761,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", title: "My Task", description: "My Description" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1627,10 +1769,10 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const titleInput = container.querySelector("#task-form-title") as HTMLInputElement;
-      const descTextarea = container.querySelector("#task-form-description") as HTMLTextAreaElement;
+      const titleInput = document.querySelector("#task-form-title") as HTMLInputElement;
+      const descTextarea = document.querySelector("#task-form-description") as HTMLTextAreaElement;
       expect(titleInput.value).toBe("My Task");
       expect(descTextarea.value).toBe("My Description");
     });
@@ -1645,7 +1787,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", branch: "feature/fn-3422", baseBranch: "develop" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1653,10 +1794,10 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const workingBranchInput = container.querySelector("#task-working-branch") as HTMLInputElement;
-      const baseBranchInput = container.querySelector("#task-base-branch") as HTMLInputElement;
+      const workingBranchInput = document.querySelector("#task-working-branch") as HTMLInputElement;
+      const baseBranchInput = document.querySelector("#task-base-branch") as HTMLInputElement;
       expect(workingBranchInput.value).toBe("feature/fn-3422");
       expect(baseBranchInput.value).toBe("develop");
 
@@ -1678,7 +1819,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", branch: "feature/fn-3422", baseBranch: "develop" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1686,8 +1826,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
-      fireEvent.change(container.querySelector("#task-base-branch") as HTMLInputElement, { target: { value: "release/2026-05" } });
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(document.querySelector("#task-base-branch") as HTMLInputElement, { target: { value: "release/2026-05" } });
       fireEvent.click(screen.getByText("Save"));
 
       await waitFor(() => {
@@ -1705,7 +1845,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", branch: "feature/fn-3422", baseBranch: "main" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1713,9 +1852,9 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
-      fireEvent.change(container.querySelector("#task-working-branch") as HTMLInputElement, { target: { value: "" } });
-      fireEvent.change(container.querySelector("#task-base-branch") as HTMLInputElement, { target: { value: "" } });
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
+      fireEvent.change(document.querySelector("#task-working-branch") as HTMLInputElement, { target: { value: "" } });
+      fireEvent.change(document.querySelector("#task-base-branch") as HTMLInputElement, { target: { value: "" } });
       fireEvent.click(screen.getByText("Save"));
 
       await waitFor(() => {
@@ -1750,7 +1889,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={initialTask}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1759,9 +1897,9 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
-      const descTextarea = container.querySelector("#task-form-description") as HTMLTextAreaElement;
+      const descTextarea = document.querySelector("#task-form-description") as HTMLTextAreaElement;
       fireEvent.change(descTextarea, { target: { value: "New Description" } });
 
       await waitFor(() => {
@@ -1784,6 +1922,9 @@ describe("TaskDetailModal", () => {
         models: availableModels,
         favoriteProviders: [],
         favoriteModels: [],
+        providerInstances: {
+          anthropic: { instances: [{ id: "anthropic-primary", isDefault: true }, { id: "anthropic-secondary", isDefault: false }] },
+        },
       });
 
       const initialTask = makeTask({ id: "FN-001", column: "triage", title: "Model sync test" });
@@ -1791,15 +1932,22 @@ describe("TaskDetailModal", () => {
         ...initialTask,
         modelProvider: "anthropic",
         modelId: "claude-sonnet-4-5",
+        credentialInstanceId: null,
+      };
+      const updatedAfterExecutorInstance: Task = {
+        ...updatedAfterExecutor,
+        credentialInstanceId: "anthropic-secondary",
       };
       const updatedAfterValidator: Task = {
-        ...updatedAfterExecutor,
+        ...updatedAfterExecutorInstance,
         validatorModelProvider: "openai",
         validatorModelId: "gpt-4o",
+        validatorCredentialInstanceId: null,
       };
 
       mockUpdateTask
         .mockResolvedValueOnce(updatedAfterExecutor)
+        .mockResolvedValueOnce(updatedAfterExecutorInstance)
         .mockResolvedValueOnce(updatedAfterValidator);
 
       const addToast = vi.fn();
@@ -1818,7 +1966,6 @@ describe("TaskDetailModal", () => {
             task={task}
             projectId="project-alpha"
             onClose={noop}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -1836,41 +1983,66 @@ describe("TaskDetailModal", () => {
       });
 
       await user.click(screen.getByLabelText("Executor Model"));
-      await user.click(screen.getByText("Claude Sonnet 4.5"));
+      await user.click(screen.getByRole("option", { name: /Claude Sonnet 4\.5/ }));
 
       await waitFor(() => {
         expect(mockUpdateTask).toHaveBeenNthCalledWith(
           1,
           "FN-001",
-          expect.objectContaining({
+          {
             modelProvider: "anthropic",
             modelId: "claude-sonnet-4-5",
-          }),
+            credentialInstanceId: null,
+          },
           "project-alpha",
         );
       });
 
-      await user.click(screen.getByLabelText("Reviewer Model"));
-      await user.click(screen.getByText("GPT-4o"));
+      await user.click(screen.getByLabelText("Executor Model"));
+      await user.selectOptions(await screen.findByTestId("custom-model-dropdown-credential-instance"), "anthropic-secondary");
 
       await waitFor(() => {
         expect(mockUpdateTask).toHaveBeenNthCalledWith(
           2,
           "FN-001",
           {
+            modelProvider: "anthropic",
+            modelId: "claude-sonnet-4-5",
+            credentialInstanceId: "anthropic-secondary",
+          },
+          "project-alpha",
+        );
+        expect(onTaskUpdated).toHaveBeenCalledWith(expect.objectContaining({
+          modelProvider: "anthropic",
+          modelId: "claude-sonnet-4-5",
+          credentialInstanceId: "anthropic-secondary",
+        }));
+      });
+
+      await user.keyboard("{Escape}");
+      await user.click(screen.getByLabelText("Reviewer Model"));
+      await user.click(screen.getByRole("option", { name: /GPT-4o/ }));
+
+      await waitFor(() => {
+        expect(mockUpdateTask).toHaveBeenNthCalledWith(
+          3,
+          "FN-001",
+          {
             validatorModelProvider: "openai",
             validatorModelId: "gpt-4o",
+            validatorCredentialInstanceId: null,
           },
           "project-alpha",
         );
         expect(onTaskUpdated).toHaveBeenCalledWith(expect.objectContaining({
           validatorModelProvider: "openai",
           validatorModelId: "gpt-4o",
+          validatorCredentialInstanceId: null,
         }));
         expect(addToast).not.toHaveBeenCalledWith(expect.any(String), "error");
       });
 
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       await waitFor(() => {
         expect(screen.getByLabelText("Executor Model")).toHaveTextContent("Claude Sonnet 4.5");
@@ -1892,6 +2064,9 @@ describe("TaskDetailModal", () => {
         ],
         favoriteProviders: [],
         favoriteModels: [],
+        providerInstances: {
+          anthropic: { instances: [{ id: "anthropic-primary", isDefault: true }, { id: "anthropic-secondary", isDefault: false }] },
+        },
       });
       mockUpdateTask.mockRejectedValueOnce(new Error("Task not found"));
 
@@ -1904,10 +2079,10 @@ describe("TaskDetailModal", () => {
             title: "Scoped reviewer failure",
             validatorModelProvider: "anthropic",
             validatorModelId: "claude-haiku-5",
+            validatorCredentialInstanceId: "anthropic-primary",
           })}
           projectId="project-alpha"
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1918,17 +2093,21 @@ describe("TaskDetailModal", () => {
 
       await waitFor(() => expect(screen.getByLabelText("Reviewer Model")).toBeInTheDocument());
       await user.click(screen.getByLabelText("Reviewer Model"));
-      await user.click(await screen.findByText("GPT-4o"));
+      await user.click(await screen.findByRole("option", { name: /GPT-4o/ }));
 
       await waitFor(() => {
         expect(mockUpdateTask).toHaveBeenCalledWith("FN-001", {
           validatorModelProvider: "openai",
           validatorModelId: "gpt-4o",
+          validatorCredentialInstanceId: null,
         }, "project-alpha");
         expect(addToast).toHaveBeenCalledTimes(1);
         expect(addToast).toHaveBeenCalledWith("Task not found", "error");
         expect(screen.getByLabelText("Reviewer Model")).toHaveTextContent("Claude Haiku 5");
       });
+
+      await user.click(screen.getByLabelText("Reviewer Model"));
+      expect(await screen.findByTestId("custom-model-dropdown-credential-instance")).toHaveValue("anthropic-primary");
     });
 
     it("renders Save and Cancel in the modal footer, not inside the edit form body", () => {
@@ -1937,7 +2116,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1946,10 +2124,10 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       // The edit form body should NOT contain the Save or Cancel action buttons
-      const editForm = container.querySelector(".modal-edit-form");
+      const editForm = document.querySelector(".modal-edit-form");
       expect(editForm).toBeTruthy();
       const formButtons = Array.from(editForm!.querySelectorAll("button"));
       const formButtonTexts = formButtons.map((b) => b.textContent);
@@ -1958,7 +2136,7 @@ describe("TaskDetailModal", () => {
       expect(formButtonTexts).not.toContain("Saving…");
 
       // The modal-actions footer should contain the Save and Cancel buttons
-      const modalActions = container.querySelector(".modal-actions");
+      const modalActions = document.querySelector(".modal-actions");
       expect(modalActions).toBeTruthy();
       const footerButtons = modalActions!.querySelectorAll("button");
       const buttonTexts = Array.from(footerButtons).map((b) => b.textContent);
@@ -1972,7 +2150,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "triage", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1981,13 +2158,13 @@ describe("TaskDetailModal", () => {
       );
 
       // Enter edit mode
-      fireEvent.click(container.querySelector(".modal-edit-btn")!);
+      fireEvent.click(document.querySelector(".modal-edit-btn")!);
 
       // The hint should be in the modal-actions footer, not inside the edit form body
-      const editForm = container.querySelector(".modal-edit-form");
+      const editForm = document.querySelector(".modal-edit-form");
       expect(editForm!.querySelector(".modal-edit-hint")).toBeNull();
 
-      const modalActions = container.querySelector(".modal-actions");
+      const modalActions = document.querySelector(".modal-actions");
       expect(modalActions!.querySelector(".modal-edit-hint")).toBeTruthy();
     });
 
@@ -1997,7 +2174,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ id: "FN-001", column: "todo", title: "Test task" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2005,17 +2181,12 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // Should NOT be in edit mode — no edit hint, no Save/Cancel in footer
-      const modalActions = container.querySelector(".modal-actions");
-      expect(modalActions!.querySelector(".modal-edit-hint")).toBeNull();
-
-      const footerButtons = modalActions!.querySelectorAll("button");
-      const buttonTexts = Array.from(footerButtons).map((b) => b.textContent);
-      expect(buttonTexts).not.toContain("Save");
-      expect(buttonTexts).not.toContain("Cancel");
-      // Should contain Actions dropdown and Move primary action
-      expect(buttonTexts).toContain("Actions");
-      expect(buttonTexts.some((t) => t?.includes("Move to"))).toBe(true);
+      // A standard task has no empty footer; lifecycle controls live in the canonical header.
+      expect(document.querySelector(".modal-actions")).toBeNull();
+      expect(screen.getByRole("button", { name: "Actions" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+      expect(container.querySelector(".detail-move-dropdown, .detail-move-btn, .detail-move-menu")).toBeNull();
     });
   });
 
@@ -2034,7 +2205,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2068,7 +2238,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2095,10 +2264,9 @@ describe("TaskDetailModal", () => {
     it("shows Assign Agent button when task has no assigned agent", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ assignedAgentId: undefined })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2125,10 +2293,9 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ assignedAgentId: "agent-002" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2159,10 +2326,9 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ assignedAgentId: undefined })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2195,10 +2361,9 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ assignedAgentId: "agent-005" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2252,7 +2417,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2261,7 +2425,15 @@ describe("TaskDetailModal", () => {
       );
 
       // Modal renders immediately without crashing
-      expect(container.querySelector(".modal-overlay")).toBeTruthy();
+      /*
+      FNXC:FloatingWindow 2026-07-30-06:40:
+      `.modal-overlay` is no longer the modal shell — TaskDetailModal renders inside `FloatingWindow`,
+      whose overlay class is `floating-window-overlay`. The only `.modal-overlay` left in this
+      component is the unrelated REFINE overlay (TaskDetailModal.tsx:6612), so this assertion was
+      looking for a different element entirely. Asserting the modal's own shell class instead, which
+      is what "renders immediately" is actually about.
+      */
+      expect(document.querySelector(".task-detail-modal")).toBeTruthy();
       expect(screen.getByText("FN-200")).toBeDefined();
     });
 
@@ -2298,7 +2470,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2333,7 +2504,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={detail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2373,7 +2543,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2381,15 +2550,16 @@ describe("TaskDetailModal", () => {
         />,
       );
 
+      fireEvent.click(screen.getByRole("button", { name: "Read plan" }));
       expect(screen.getByText("Loading specification…")).toBeDefined();
-      // Token stats now live in their own Stats tab — switch to it before
-      // asserting on token-loading text.
+      // Return from the Plan document before switching to Stats.
+      fireEvent.click(screen.getByRole("button", { name: "Back to definition" }));
       fireEvent.click(screen.getByRole("button", { name: "Stats" }));
       expect(screen.getByText("Execution Timing")).toBeInTheDocument();
       expect(screen.getByText("Execution Details")).toBeInTheDocument();
       expect(screen.getByText("Loading token statistics…")).toBeDefined();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
-      expect(screen.getByText("executing")).toBeInTheDocument();
+      expectSingleStatsRuntimeStatus("executing");
     });
 
     it("shows spec content after fetchTaskDetail resolves", async () => {
@@ -2448,7 +2618,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2456,19 +2625,19 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      // Initially shows loading
+      // The complete specification is loaded in the Plan document sub-view.
+      fireEvent.click(screen.getByRole("button", { name: "Read plan" }));
       expect(screen.getByText("Loading specification…")).toBeDefined();
 
-      // After fetch resolves, spec content appears
+      // After fetch resolves, spec content appears in the Plan document rather than the Description markdown.
       await waitFor(() => {
-        const markdownBody = container.querySelector(".markdown-body");
-        expect(markdownBody).toBeTruthy();
+        expect(screen.getByTestId("task-detail-plan-full")).toHaveTextContent("This is the loaded spec content.");
       }, { timeout: 3000 });
 
-      // Loading indicator should be gone
+      // Loading indicator should be gone.
       expect(screen.queryByText("Loading specification…")).toBeNull();
 
-      // Token stats live behind the Stats tab now.
+      fireEvent.click(screen.getByRole("button", { name: "Back to definition" }));
       fireEvent.click(screen.getByRole("button", { name: "Stats" }));
       expect(screen.queryByText("Loading token statistics…")).toBeNull();
       expect(screen.getByText("Execution Timing")).toBeInTheDocument();
@@ -2478,13 +2647,13 @@ describe("TaskDetailModal", () => {
       expect(screen.getByText("Execution mode")).toBeInTheDocument();
       expect(screen.getByText("Runtime status")).toBeInTheDocument();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
-      expect(screen.getByText("executing")).toBeInTheDocument();
-      expect(screen.getByText((1200).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((450).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((210).toLocaleString())).toBeInTheDocument();
-      expect(screen.getByText((1860).toLocaleString())).toBeInTheDocument();
-      const firstUsed = container.querySelector('time[datetime="2026-04-24T09:00:00.000Z"]');
-      const lastUsed = container.querySelector('time[datetime="2026-04-24T10:15:00.000Z"]');
+      expectSingleStatsRuntimeStatus("executing");
+      expect(screen.getAllByText((1200).toLocaleString()).length).toBeGreaterThan(0);
+      expect(screen.getAllByText((450).toLocaleString()).length).toBeGreaterThan(0);
+      expect(screen.getAllByText((210).toLocaleString()).length).toBeGreaterThan(0);
+      expect(screen.getAllByText((1860).toLocaleString()).length).toBeGreaterThan(0);
+      const firstUsed = document.querySelector('time[datetime="2026-04-24T09:00:00.000Z"]');
+      const lastUsed = document.querySelector('time[datetime="2026-04-24T10:15:00.000Z"]');
       expect(firstUsed).toBeTruthy();
       expect(lastUsed).toBeTruthy();
     });
@@ -2509,7 +2678,7 @@ describe("TaskDetailModal", () => {
         updatedAt: "2026-01-01T00:00:00Z",
       };
 
-      mockFetch.mockResolvedValueOnce({
+      mockFetch.mockResolvedValue({
         ...strippedTask,
         prompt: "# Spec",
         log: [
@@ -2523,7 +2692,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={strippedTask}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2533,15 +2701,15 @@ describe("TaskDetailModal", () => {
 
       // Wait for fetchTaskDetail to resolve.
       await waitFor(() => {
-        expect(container.querySelector(".markdown-body")).toBeTruthy();
+        expect(document.querySelector(".markdown-body")).toBeTruthy();
       }, { timeout: 3000 });
 
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       fireEvent.click(screen.getByRole("menuitem", { name: "Feed" }));
 
-      const activityList = container.querySelector(".detail-activity-list");
+      const activityList = document.querySelector(".detail-activity-list");
       expect(activityList).toBeTruthy();
-      const logEntries = container.querySelectorAll(".detail-log-entry");
+      const logEntries = document.querySelectorAll(".detail-log-entry");
       expect(logEntries).toHaveLength(2);
       expect(logEntries[0].textContent).toContain("Started executor");
       expect(logEntries[1].textContent).toContain("Created task");
@@ -2574,7 +2742,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2615,7 +2782,6 @@ describe("TaskDetailModal", () => {
           task={makeTask()}
           onClose={noop}
           onOpenDetail={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2647,7 +2813,6 @@ describe("TaskDetailModal", () => {
           task={makeTask()}
           onClose={noop}
           onOpenDetail={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2656,10 +2821,10 @@ describe("TaskDetailModal", () => {
 
       await userEvent.click(screen.getByText("Plugin B Tab"));
 
-      const slots = container.querySelectorAll('[data-slot-id="task-detail-tab"]');
+      const slots = document.querySelectorAll('[data-slot-id="task-detail-tab"]');
       expect(slots).toHaveLength(1);
       expect(slots[0]).toHaveAttribute("data-plugin-id", "plugin-b");
-      expect(container.querySelector('[data-plugin-id="plugin-a"]')).toBeNull();
+      expect(document.querySelector('[data-plugin-id="plugin-a"]')).toBeNull();
     });
 
     it("renders no extra tabs when no plugins register", () => {
@@ -2676,7 +2841,6 @@ describe("TaskDetailModal", () => {
           task={makeTask()}
           onClose={noop}
           onOpenDetail={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2700,7 +2864,7 @@ describe("TaskDetailModal", () => {
     it("renders after the prompt/spec section in read mode", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "todo",
@@ -2711,25 +2875,20 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
         />,
       );
 
-      const promptContent = screen.getByText("Prompt content before tracking metadata.");
-      const githubTrackingLabel = screen.getByText("GitHub tracking");
-
-      expect(
-        promptContent.compareDocumentPosition(githubTrackingLabel) & Node.DOCUMENT_POSITION_FOLLOWING,
-      ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      expect(screen.getByText("GitHub tracking")).toBeInTheDocument();
+      expect(screen.queryByText("Prompt content before tracking metadata.")).toBeNull();
     });
 
     it("renders linked issue as link when url exists", async () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             githubTracking: {
               enabled: true,
@@ -2745,7 +2904,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2789,11 +2947,10 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={optimisticTask}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2814,11 +2971,10 @@ describe("TaskDetailModal", () => {
     it("shows section when tracking is disabled and task is in an eligible column", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ column: "todo", githubTracking: { enabled: false } })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2847,11 +3003,10 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={optimisticTask}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2887,7 +3042,7 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "todo",
@@ -2897,7 +3052,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={addToast}
@@ -2930,7 +3084,7 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "todo",
@@ -2940,7 +3094,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2975,11 +3128,10 @@ describe("TaskDetailModal", () => {
     it("hides the inline enable button when tracking is already enabled", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ column: "todo", githubTracking: { enabled: true } })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2993,7 +3145,7 @@ describe("TaskDetailModal", () => {
     it("hides the inline enable button when an issue is already linked", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             column: "todo",
             githubTracking: {
@@ -3009,7 +3161,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -3047,11 +3198,10 @@ describe("TaskDetailModal", () => {
     it("hides section when tracking is disabled and task is not in an eligible column", () => {
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ column: "done", githubTracking: { enabled: false } })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -3084,11 +3234,10 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ id: "FN-001", column: "done", githubTracking: { enabled: true } })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onTaskUpdated={onTaskUpdated}
@@ -3114,7 +3263,7 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "todo",
@@ -3131,7 +3280,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -3158,7 +3306,7 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "in-progress",
@@ -3168,7 +3316,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -3213,16 +3360,20 @@ describe("TaskDetailModal", () => {
         },
       } as Task);
 
+      let signalSparseUpdate!: () => void;
+      const sparseUpdateApplied = new Promise<void>((resolve) => {
+        signalSparseUpdate = resolve;
+      });
+
       function Harness(): JSX.Element {
         const [taskState, setTaskState] = useState(baseTask);
 
         return (
           <TaskDetailModal
-            initialTab="definition"
+            initialTab="details"
             task={taskState}
             onClose={noop}
             onOpenDetail={noopOpenDetail}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onTaskUpdated={(nextTask) => {
@@ -3232,6 +3383,7 @@ describe("TaskDetailModal", () => {
                   ...current,
                   githubTracking: undefined,
                 }));
+                signalSparseUpdate();
               }, 0);
             }}
             addToast={noop}
@@ -3251,6 +3403,8 @@ describe("TaskDetailModal", () => {
         expect(mockUpdate).toHaveBeenCalledWith("FN-001", { githubTracking: { enabled: false } }, undefined);
       });
 
+      await sparseUpdateApplied;
+
       await waitFor(() => {
         expect((screen.getByRole("checkbox", { name: "Enable GitHub tracking" }) as HTMLInputElement).checked).toBe(false);
       });
@@ -3265,11 +3419,10 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({ id: "FN-001", column: "todo", githubTracking: { enabled: true, repoOverride: "runfusion/fusion" } })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -3301,7 +3454,7 @@ describe("TaskDetailModal", () => {
       mockConfirm.mockResolvedValueOnce(false);
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="details"
           task={makeTask({
             id: "FN-001",
             column: "todo",
@@ -3318,7 +3471,6 @@ describe("TaskDetailModal", () => {
           })}
           onClose={noop}
           onOpenDetail={noopOpenDetail}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -3341,13 +3493,12 @@ describe("TaskDetailModal", () => {
   });
 });
 
-describe("TaskDetailModal inline action row parity (FN-8194)", () => {
+describe("TaskDetailModal footer quick-action parity (FN-8194)", () => {
   const renderDetail = (task: Task) => render(
     <TaskDetailModal
-      initialTab="definition"
+      initialTab="details"
       task={task}
       onClose={noop}
-      onMoveTask={noopMove}
       onDeleteTask={noopDelete}
       onMergeTask={noopMerge}
       onOpenDetail={noopOpenDetail}
@@ -3358,16 +3509,19 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
   it("uses the existing file input and preserves Quick Add action order", async () => {
     renderDetail(makeTask({ id: "FN-8194", column: "todo", plannerOversightLevel: "observe" }));
 
-    const controls = screen.getByTestId("detail-meta-inline-controls");
+    const menu = openTaskDetailActionsMenu();
     const attach = screen.getByTestId("detail-inline-attach");
     const github = screen.getByTestId("detail-inline-github-toggle");
-    const oversight = await screen.findByTestId("detail-oversight-menu-trigger");
-    const priority = screen.getByTestId("detail-priority-trigger").parentElement!;
-    const fast = screen.getByRole("button", { name: "Execution mode: standard" });
+    const oversight = await screen.findByTestId("detail-actions-oversight-heading");
+    const priority = screen.getByTestId("detail-actions-priority-heading");
+    const fast = screen.getByTestId("detail-execution-mode-toggle");
     const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
     const fileInputClick = vi.spyOn(fileInput, "click");
 
-    expect([...controls.children]).toEqual([attach, github, oversight.parentElement, priority, fast]);
+    for (const [before, after] of [[attach, github], [github, oversight], [oversight, priority], [priority, fast]]) {
+      expect(before.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    expect(menu).toContainElement(attach);
     fireEvent.click(attach);
     expect(fileInputClick).toHaveBeenCalledOnce();
   });
@@ -3378,7 +3532,6 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
         initialTab="chat"
         task={makeTask({ id: "FN-8232", column: "todo" })}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -3390,6 +3543,7 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
     expect(fileInputs).toHaveLength(1);
     const fileInputClick = vi.spyOn(fileInputs[0], "click");
 
+    openTaskDetailActionsMenu();
     fireEvent.click(screen.getByTestId("detail-inline-attach"));
 
     expect(fileInputClick).toHaveBeenCalledOnce();
@@ -3402,26 +3556,66 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
 
     renderDetail(makeTask({ id: "FN-8194", column: "todo", githubTracking: { enabled: false } }));
 
+    openTaskDetailActionsMenu();
     const toggle = screen.getByTestId("detail-inline-github-toggle");
     expect(toggle).toHaveAttribute("aria-pressed", "false");
-    expect(toggle).not.toHaveClass("btn-primary");
     fireEvent.click(toggle);
 
     await waitFor(() => {
       expect(mockUpdate).toHaveBeenCalledWith("FN-8194", { githubTracking: { enabled: true } }, undefined);
     });
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(toggle).toHaveClass("btn-primary");
+    openTaskDetailActionsMenu();
+    await waitFor(() => expect(screen.getByTestId("detail-inline-github-toggle")).toHaveAttribute("aria-pressed", "true"));
   });
 
-  it("hides the GitHub toggle for non-editable and GitLab-tracked tasks", () => {
+  it("enables GitHub tracking for Ideas intake tasks after workflow metadata fails", async () => {
+    const { updateTask, fetchBoardWorkflows } = await import("../../api");
+    const mockUpdate = vi.mocked(updateTask);
+    vi.mocked(fetchBoardWorkflows).mockRejectedValueOnce(new Error("workflow metadata unavailable"));
+    mockUpdate.mockResolvedValueOnce(makeTask({ id: "FN-ideas", column: "ideas", githubTracking: { enabled: true } }) as Task);
+
+    renderDetail(makeTask({ id: "FN-ideas", column: "ideas", githubTracking: { enabled: false } }));
+
+    openTaskDetailActionsMenu();
+    const toggle = screen.getByTestId("detail-inline-github-toggle");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(mockUpdate).toHaveBeenCalledWith("FN-ideas", { githubTracking: { enabled: true } }, undefined);
+    });
+    openTaskDetailActionsMenu();
+    await waitFor(() => expect(screen.getByTestId("detail-inline-github-toggle")).toHaveAttribute("aria-pressed", "true"));
+  });
+
+  it("shows the GitHub toggle after Coding (Ideas) workflow metadata resolves", async () => {
+    const { fetchBoardWorkflows } = await import("../../api");
+    vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+      flagEnabled: true,
+      defaultWorkflowId: "builtin:coding",
+      workflows: [
+        { id: "builtin:coding", name: "Coding", columns: [{ id: "done", name: "Done", flags: {} }] },
+        { id: "builtin:coding-ideas-v2", name: "Coding (Ideas)", columns: [{ id: "done", name: "Done", flags: {} }] },
+      ],
+      taskWorkflowIds: { "FN-ideas-workflow": "builtin:coding-ideas-v2" },
+    });
+
+    renderDetail(makeTask({ id: "FN-ideas-workflow", column: "done", githubTracking: { enabled: false } }));
+
+    openTaskDetailActionsMenu();
+    expect(screen.queryByTestId("detail-inline-github-toggle")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("detail-inline-github-toggle")).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("hides the GitHub toggle for unrelated and GitLab-tracked tasks", () => {
     const { unmount } = renderDetail(makeTask({ id: "FN-8194", column: "done", githubTracking: { enabled: true } }));
+    openTaskDetailActionsMenu();
     expect(screen.queryByTestId("detail-inline-github-toggle")).not.toBeInTheDocument();
     unmount();
 
     renderDetail(makeTask({
       id: "FN-8195",
-      column: "todo",
+      column: "ideas",
       gitlabTracking: {
         item: {
           kind: "project_issue",
@@ -3433,6 +3627,7 @@ describe("TaskDetailModal inline action row parity (FN-8194)", () => {
         },
       },
     }) as Task);
+    openTaskDetailActionsMenu();
     expect(screen.queryByTestId("detail-inline-github-toggle")).not.toBeInTheDocument();
   });
 });

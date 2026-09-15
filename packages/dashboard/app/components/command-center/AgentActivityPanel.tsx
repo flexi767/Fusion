@@ -1,0 +1,111 @@
+import { useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { AgentActivityEventType } from "../../api";
+import { ActivityFeedRowPresentation } from "../ActivityFeed";
+import { isHiddenAgentActivityType } from "../agentsOrgChartActivity";
+import { AreaShell } from "./areas/AreaShell";
+import { AGENT_ACTIVITY_TYPE_CONFIG, resolveAgentActivityPresentation } from "./agentActivityPresentation";
+import type { DateRange } from "./DateRangePicker";
+import { useAgentActivity, type AgentActivityFilters } from "./useAgentActivity";
+import "./AgentActivityPanel.css";
+import { useVirtualizedList } from "../../hooks/useVirtualizedList";
+import { useAutoPaginationSentinel } from "../../hooks/useAutoPaginationSentinel";
+
+const LIVE_RENDER_LIMIT = 100;
+const EVENT_TYPES = (Object.keys(AGENT_ACTIVITY_TYPE_CONFIG) as AgentActivityEventType[])
+  .filter((type) => !isHiddenAgentActivityType(type));
+
+export interface AgentActivityPanelProps {
+  projectId?: string;
+  range: DateRange;
+  onOpenAgent?: (agentId: string) => void;
+  onOpenTask?: (taskId: string) => void;
+}
+
+/*
+FNXC:CommandCenterAgentActivity 2026-08-10-02:03:
+This panel provides the org-wide live log and manual-windowed scroll-back timeline without a virtualization dependency. It reuses the ActivityFeed icon/time vocabulary, fetches only `/api/agent-activity`, and keeps DateRange client-side because that route has no time-range parameter.
+*/
+export function AgentActivityPanel({ projectId, range, onOpenAgent, onOpenTask }: AgentActivityPanelProps) {
+  const { t } = useTranslation("app");
+  const [mode, setMode] = useState<"live" | "timeline">("live");
+  const [filters, setFilters] = useState<AgentActivityFilters>({});
+  const activity = useAgentActivity({ projectId, filters, range });
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+
+  const agentOptions = useMemo(
+    () => [...new Set(activity.events.map((event) => event.agentId).filter(Boolean))].sort(),
+    [activity.events],
+  );
+  /*
+  FNXC:AgentActivityStream 2026-08-14-19:18:
+  FN-9041 hides historical state churn at this render boundary because the cursor hook must retain
+  every wire row for correct no-progress and exhaustion accounting. Filter before each display limit
+  so hidden rows cannot consume a visible slot, while paging can still load older real activity.
+  */
+  const visibleEvents = activity.visibleEvents.filter((event) => !isHiddenAgentActivityType(event.type));
+  const rows = mode === "live"
+    ? activity.events.filter((event) => !isHiddenAgentActivityType(event.type)).slice(0, LIVE_RENDER_LIMIT)
+    : visibleEvents;
+  const virtualRows = useVirtualizedList({ collectionKey: `${mode}:${filters.agentId ?? ""}:${filters.taskId ?? ""}:${filters.type ?? ""}`, keys: rows.map((row) => row.eventId), scrollRef: listRef, estimateHeight: 64, maxRenderedRows: 60, initialAlign: "start" });
+  const visibleRowIds = new Set(virtualRows.visibleKeys);
+  const renderedRows = rows.filter((row) => visibleRowIds.has(row.eventId));
+  const pagination = useAutoPaginationSentinel({ rootRef: panelRef, hasMore: mode === "timeline" && activity.hasMore, loading: activity.isLoadingOlder, onLoadMore: activity.loadOlder, direction: "end" });
+
+  return (
+    <section className="cc-agent-activity" ref={panelRef}>
+      <div className="cc-agent-activity-mode" role="group" aria-label={t("commandCenter.agentActivity.mode", "Activity mode")}>
+        <button type="button" className="btn btn-sm" aria-pressed={mode === "live"} onClick={() => setMode("live")}>{t("commandCenter.agentActivity.live", "Live")}</button>
+        <button type="button" className="btn btn-sm" aria-pressed={mode === "timeline"} onClick={() => setMode("timeline")}>{t("commandCenter.agentActivity.timeline", "Timeline")}</button>
+      </div>
+      {mode === "timeline" ? (
+        <div className="cc-agent-activity-filters">
+          <select className="input" aria-label={t("commandCenter.agentActivity.agentFilter", "Filter by agent")} value={filters.agentId ?? ""} onChange={(event) => setFilters((current) => ({ ...current, agentId: event.target.value || undefined }))}>
+            <option value="">{t("commandCenter.agentActivity.allAgents", "All agents")}</option>
+            {agentOptions.map((agentId) => <option key={agentId} value={agentId}>{agentId}</option>)}
+          </select>
+          <input className="input" aria-label={t("commandCenter.agentActivity.taskFilter", "Filter by task")} value={filters.taskId ?? ""} placeholder={t("commandCenter.agentActivity.taskFilter", "Filter by task")} onChange={(event) => setFilters((current) => ({ ...current, taskId: event.target.value || undefined }))} />
+          <select className="input" aria-label={t("commandCenter.agentActivity.typeFilter", "Filter by event type")} value={filters.type ?? ""} onChange={(event) => setFilters((current) => ({ ...current, type: (event.target.value || undefined) as AgentActivityEventType | undefined }))}>
+            <option value="">{t("commandCenter.agentActivity.allTypes", "All event types")}</option>
+            {EVENT_TYPES.map((type) => <option key={type} value={type}>{AGENT_ACTIVITY_TYPE_CONFIG[type].label}</option>)}
+          </select>
+          <span className="cc-agent-activity-range-note">{t("commandCenter.agentActivity.rangeNote", "Time range filters loaded events; it is not sent to the server.")}</span>
+        </div>
+      ) : null}
+      <AreaShell testId="agent-activity" isLoading={activity.isLoading} error={activity.error} isEmpty={!rows.length && !activity.hasMore} emptyMessage={t("commandCenter.agentActivity.empty", "No agent activity yet.")}>
+        {!rows.length ? <div className="cc-area-empty" data-testid="cc-area-agent-activity-empty"><p>{t("commandCenter.agentActivity.empty", "No agent activity yet.")}</p></div> : (
+          <div className="cc-agent-activity-list" ref={listRef} onScroll={virtualRows.onScroll}>
+            {virtualRows.topSpacerHeight > 0 ? <div aria-hidden="true" style={{ height: virtualRows.topSpacerHeight }} /> : null}
+            {renderedRows.map((row) => <AgentActivityRow key={row.eventId} event={row} onOpenAgent={onOpenAgent} onOpenTask={onOpenTask} />)}
+            {virtualRows.bottomSpacerHeight > 0 ? <div aria-hidden="true" style={{ height: virtualRows.bottomSpacerHeight }} /> : null}
+          </div>
+        )}
+        {mode === "timeline" && activity.hasMore ? <div ref={pagination.sentinelRef} role="status" aria-live="polite" data-testid="agent-activity-auto-pagination-sentinel">{activity.isLoadingOlder ? t("commandCenter.agentActivity.loadingOlder", "Loading…") : null}</div> : null}
+        {mode === "timeline" && !activity.hasMore && activity.exhaustedReason ? <p className="cc-agent-activity-end">{t("commandCenter.agentActivity.end", "End of activity history")}</p> : null}
+      </AreaShell>
+    </section>
+  );
+}
+
+function AgentActivityRow({ event, onOpenAgent, onOpenTask }: { event: ReturnType<typeof useAgentActivity>["events"][number]; onOpenAgent?: (agentId: string) => void; onOpenTask?: (taskId: string) => void }) {
+  const { t } = useTranslation("app");
+  const presentation = resolveAgentActivityPresentation(event.type, event.metadata);
+  const config = {
+    icon: presentation.icon,
+    color: presentation.color,
+    label: t(presentation.labelKey, presentation.fallbackLabel),
+  };
+  const openTaskLabel = t("commandCenter.agentActivity.openTask", "Open task {{taskId}}", { taskId: event.taskId });
+  const openAgentLabel = t("commandCenter.agentActivity.openAgent", "Open agent {{agentId}}", { agentId: event.agentId });
+  const content = <ActivityFeedRowPresentation
+    config={config}
+    timestamp={event.occurredAt}
+    details={<span className="activity-feed-description">{event.summary}</span>}
+  />;
+  if (event.taskId && onOpenTask) {
+    return <div className="cc-agent-activity-target"><button type="button" className="cc-agent-activity-row" aria-label={openTaskLabel} onClick={() => onOpenTask(event.taskId!)}>{content}</button>{onOpenAgent ? <button type="button" className="btn btn-sm" aria-label={openAgentLabel} onClick={() => onOpenAgent(event.agentId)}>{event.agentId}</button> : null}</div>;
+  }
+  if (event.agentId && onOpenAgent) return <button type="button" className="cc-agent-activity-row" aria-label={openAgentLabel} onClick={() => onOpenAgent(event.agentId)}>{content}</button>;
+  return <div className="cc-agent-activity-row">{content}</div>;
+}

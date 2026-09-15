@@ -7,6 +7,15 @@ FN-6603 found that unicode-range scoping is not enough when the symbols face is 
 
 FNXC:Terminal 2026-06-20-18:04:
 FN-6811 recurrence #6 tightened ownership of this scoped symbols face: every terminal surface that exposes the DOM glyph fallback must define the same ASCII-excluding @font-face in its own CSS chunk, and tests must check each CSS owner independently rather than relying on combined app CSS.
+
+FNXC:TerminalLayout 2026-08-01-04:23:
+SHELL NAMING MAP — the terminal renders through FIVE shells and only some live in this file:
+docked/below panels and the mobile sheet are plain `.modal`/host elements styled here, but the
+FLOATING pop-out wraps `terminalContent` in FloatingWindow (FloatingWindow.css). An
+inset/padding bug reported "on the terminal
+modal" in tablet view is almost certainly the FloatingWindow shell, not a rule in this file.
+The shared body no longer reserves FN-8015's inline-end gutter (deleted 2026-08-17 for every
+caller), so the pop-out's insets now come only from `terminalContent` itself.
 */
 @font-face {
   font-family: "Fusion Terminal Nerd Font Symbols";
@@ -52,8 +61,7 @@ FN-7621 recurrence #3 root cause: styles.css's mobile `@media (max-width: 768px)
   touch-action: pan-x pan-y;
 }
 
-.modal-overlay.terminal-modal-overlay--docked.terminal-modal-overlay--docked,
-.modal-overlay.terminal-modal-overlay--floating.terminal-modal-overlay--floating {
+.modal-overlay.terminal-modal-overlay--docked.terminal-modal-overlay--docked {
   align-items: stretch;
   justify-content: flex-end;
   padding: 0;
@@ -61,14 +69,6 @@ FN-7621 recurrence #3 root cause: styles.css's mobile `@media (max-width: 768px)
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   pointer-events: none;
-}
-
-/*
-FNXC:FloatingWindow 2026-06-22-21:30:
-Only the FLOATING terminal joins the shared cross-type floating stack. Reset the base `.modal-overlay` z-index:100 to auto so this click-through overlay does NOT establish a stacking context; the floating panel's inline z-index (from floatingWindowStack, 4000+) then interleaves at the root with the right-dock pop-out, the floating New Task dialog, and FloatingWindow. Docked mode keeps the base overlay stacking (full-width bottom panel) and is intentionally excluded.
-*/
-.modal-overlay.terminal-modal-overlay--floating {
-  z-index: auto;
 }
 
 .modal.terminal-modal {
@@ -90,6 +90,22 @@ Only the FLOATING terminal joins the shared cross-type floating stack. Reset the
 }
 .modal.terminal-modal:not([style*="height"]) {
   height: min(85vh, calc(100dvh - 40px));
+}
+
+/*
+FNXC:ModalTouchGeometry 2026-07-27-19:00:
+The floating terminal is now content inside FloatingWindow, so its old standalone dimensions and
+native resize grip must not escape the shared geometry host. The docked and below presentations
+retain their own sizing rules below.
+*/
+.floating-window .modal.terminal-modal.terminal-modal--floating {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  resize: none;
 }
 
 .modal.terminal-modal.terminal-modal--docked {
@@ -200,82 +216,6 @@ FN-7897: reserve space for the fixed ExecutorStatusBar footer when it is rendere
   background: var(--border);
 }
 
-.modal.terminal-modal.terminal-modal--floating {
-  --floating-window-shadow: var(--shadow-lg);
-  position: fixed;
-  left: var(--terminal-float-x);
-  top: var(--terminal-float-y);
-  width: var(--terminal-float-width);
-  height: var(--terminal-float-height);
-  min-width: calc(var(--space-xl) * 20);
-  min-height: calc(var(--space-xl) * 13.333);
-  max-width: calc(100vw - (var(--space-lg) * 2));
-  max-height: calc(100dvh - (var(--space-lg) * 2));
-  resize: none;
-  pointer-events: auto;
-  /*
-  FNXC:FloatingWindow 2026-06-23-23:32:
-  Floating modals share a gentle theme-controlled elevation token. Use the app shadow fallback instead of undefined --shadow-xl so themes can opt out or tune shadow strength consistently across Terminal, New Task, Right Dock, and shared FloatingWindow panels.
-  */
-  box-shadow: var(--floating-window-shadow, var(--shadow-lg));
-}
-
-/*
-FNXC:Terminal 2026-06-22-19:50:
-The floating-mode header is the move grip. `touch-action: none` is required so a touch-drag on it is delivered as a continuous pointermove stream (paired with setPointerCapture on the captured element) instead of being hijacked by the browser into page scroll/pan. Without it the floating drag stutters on touch — same fix the right-dock pop-out drag handle uses. cursor: grab/grabbing signals the move affordance on desktop.
-*/
-.terminal-header--draggable {
-  cursor: grab;
-  user-select: none;
-  touch-action: none;
-  min-height: 48px;
-}
-
-.terminal-header--draggable:active {
-  cursor: grabbing;
-}
-
-.terminal-floating-resize-handle {
-  position: absolute;
-  z-index: 2;
-  touch-action: none;
-}
-
-.terminal-floating-resize-handle--n,
-.terminal-floating-resize-handle--s {
-  left: var(--space-sm);
-  right: var(--space-sm);
-  height: var(--space-sm);
-  cursor: ns-resize;
-}
-
-.terminal-floating-resize-handle--n { top: 0; }
-.terminal-floating-resize-handle--s { bottom: 0; }
-
-.terminal-floating-resize-handle--e,
-.terminal-floating-resize-handle--w {
-  top: var(--space-sm);
-  bottom: var(--space-sm);
-  width: var(--space-sm);
-  cursor: ew-resize;
-}
-
-.terminal-floating-resize-handle--e { right: 0; }
-.terminal-floating-resize-handle--w { left: 0; }
-
-.terminal-floating-resize-handle--ne,
-.terminal-floating-resize-handle--nw,
-.terminal-floating-resize-handle--se,
-.terminal-floating-resize-handle--sw {
-  width: var(--space-lg);
-  height: var(--space-lg);
-}
-
-.terminal-floating-resize-handle--ne { top: 0; right: 0; cursor: nesw-resize; }
-.terminal-floating-resize-handle--nw { top: 0; left: 0; cursor: nwse-resize; }
-.terminal-floating-resize-handle--se { bottom: 0; right: 0; cursor: nwse-resize; }
-.terminal-floating-resize-handle--sw { bottom: 0; left: 0; cursor: nesw-resize; }
-
 .terminal-header {
   display: flex;
   align-items: center;
@@ -308,6 +248,77 @@ The floating-mode header is the move grip. `touch-action: none` is required so a
 .terminal-tabs::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 2px;
+}
+
+/*
+FNXC:TerminalModalControls 2026-07-31-22:41:
+The tablet classifier, rather than the legacy 769px media query, owns this grip so a known
+768px touch tablet remains a floating window instead of receiving phone-sheet chrome.
+
+FNXC:TerminalModalControls 2026-08-01-03:48:
+The grip is no longer the sole drag surface — the whole tablet floating header (including empty
+tab-strip space) is `touch-action: none` and draggable below — but it stays as the always-visible
+affordance that signals the window is movable.
+*/
+.modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-header__drag-grip {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: var(--modal-resize-touch-target);
+  min-block-size: var(--modal-resize-touch-target);
+  touch-action: none;
+  cursor: grab;
+  user-select: none;
+}
+
+.modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-header__drag-grip::before {
+  content: "";
+  inline-size: var(--space-lg);
+  block-size: var(--space-xs);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--text-muted) 55%, transparent);
+}
+
+.modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-header__drag-grip:active {
+  cursor: grabbing;
+}
+
+/*
+FNXC:TerminalModalControls 2026-08-01-03:48:
+Supersedes the 2026-07-31 pan-x contract: the operator wants the floating terminal draggable
+from the empty strip space behind the tabs and anywhere in the top toolbar, not only the grip.
+`touch-action: none` on the tablet floating header (and its strip) hands the whole touch gesture
+to FloatingWindow's pointer drag; without it the browser claims horizontal movement as a native
+pan and pointercancels the drag mid-gesture. Native strip panning is not lost: an overflowing
+strip is replaced by the `.terminal-mobile-tabs` dropdown (ResizeObserver in TerminalModal.tsx),
+so a visible strip never scrolls horizontally. Tab presses stay tab presses via the scoped
+stopPropagation in renderTerminalTabStrip.
+*/
+.modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-header,
+.modal.terminal-modal.terminal-modal--tablet.terminal-modal--floating .terminal-tabs {
+  touch-action: none;
+}
+
+/*
+FNXC:TerminalModalControls 2026-07-31-22:19:
+Tablets start docked, so the header pop-out control needs the same touch-sized reach without
+changing its established 14px icon or toolbar layout. Its pseudo-element only enlarges the button
+hit area; it is not a second terminal control.
+*/
+.modal.terminal-modal.terminal-modal--tablet .terminal-clear-btn.terminal-clear-btn--icon[data-testid="terminal-popout-toggle"] {
+  position: relative;
+}
+
+.modal.terminal-modal.terminal-modal--tablet .terminal-clear-btn.terminal-clear-btn--icon[data-testid="terminal-popout-toggle"]::before {
+  content: "";
+  position: absolute;
+  inline-size: var(--modal-resize-touch-target);
+  block-size: var(--modal-resize-touch-target);
+  inset-inline-start: 50%;
+  inset-block-start: 50%;
+  transform: translate(-50%, -50%);
 }
 
 .terminal-tab {
@@ -343,6 +354,17 @@ The floating-mode header is the move grip. `touch-action: none` is required so a
 
 .terminal-tab--active:hover {
   border-bottom-color: var(--in-progress);
+}
+
+/*
+FNXC:TerminalModalControls 2026-08-01-03:48:
+The floating header (including empty tab-strip space) is a window drag surface at every pointer
+type; show the grab affordance there while real tab surfaces keep the base `.terminal-tab`
+pointer cursor above.
+*/
+.modal.terminal-modal.terminal-modal--floating .terminal-header,
+.modal.terminal-modal.terminal-modal--floating .terminal-tabs {
+  cursor: grab;
 }
 
 .terminal-tab-indicator {
@@ -679,6 +701,7 @@ The worktree listbox must escape the mobile terminal header's clipped overflow. 
 
 .terminal-close {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
   width: 44px;
@@ -1042,10 +1065,19 @@ The terminal header pop-out/dock affordance is an icon-only utility control. It 
 
 /* === PTY Terminal Styles === */
 
+/*
+FNXC:TerminalLayout 2026-08-01-00:48:
+FN-8634 fixes the operator-reported Terminal end-side excess across modal, dock, floating,
+and embedded shells. xterm injects a native viewport track inside `.terminal-xterm`; padding
+on that same element made the painted end track appear as extra whitespace. Keep the symmetric
+shell padding on this clipped container and leave xterm's overflow, fit, and reflow ownership
+unchanged so both painted-track and no-track states have equal perceived empty insets.
+*/
 .terminal-container {
   flex: 1;
   min-height: 0;
   position: relative;
+  padding: var(--space-xs);
   background: var(--terminal-bg);
   overflow: hidden;
 }
@@ -1054,7 +1086,7 @@ The terminal header pop-out/dock affordance is an icon-only utility control. It 
   width: 100%;
   height: 100%;
   min-height: 0;
-  padding: var(--space-xs);
+  padding: 0;
 }
 
 /*
@@ -1459,7 +1491,8 @@ The shortcut bar (modifier keys + arrow keys) must sit on ONE line, not stack in
 }
 
 .terminal-reconnect-btn,
-.terminal-restart-btn {
+.terminal-restart-btn,
+.terminal-reopen-btn {
   display: flex;
   align-items: center;
   gap: var(--space-xs);
@@ -1475,7 +1508,8 @@ The shortcut bar (modifier keys + arrow keys) must sit on ONE line, not stack in
 }
 
 .terminal-reconnect-btn:hover,
-.terminal-restart-btn:hover {
+.terminal-restart-btn:hover,
+.terminal-reopen-btn:hover {
   background: var(--card-hover);
   border-color: var(--text-muted);
 }
@@ -1577,15 +1611,11 @@ Android folded Chrome can keep a wide layout viewport while visualViewport is th
 }
 
 /*
-FNXC:TerminalHeader 2026-07-04-20:45:
-FN-7565: pin the mobile close (X) button to the top-right corner of the header.
-Without an explicit order, the close button (a direct .terminal-header child)
-defaults to order:0 and sorts BEFORE .terminal-mobile-tabs (order:1) /
-.terminal-workspace-picker (order:2), landing at the far left instead of the
-corner. Giving it the highest order plus margin-inline-start:auto renders it
-last and flush against the right edge, matching where users expect an
-app-sheet close control. Covers the folded-Android visualViewport path (this
-selector applies even when the max-width media query below does not).
+FNXC:TerminalModalControls 2026-08-03-00:21:
+The shared non-embedded close control is rendered after the new-terminal tab action.
+On mobile its explicit order stays above the tab dropdown and workspace picker so the
+same final control is also flush right in the wrapped phone header, including the
+folded-Android visualViewport path where the media query below may not apply.
 */
 .modal.terminal-modal.terminal-modal--mobile .terminal-close--corner {
   order: 3;
@@ -1885,7 +1915,50 @@ The Android keyboard-open recurrence can start with a touch-primary visualViewpo
     min-width: 36px;
     min-height: 36px;
   }
+
+  /*
+  FNXC:TerminalModalControls 2026-07-24-01:10:
+  A known touch tablet can share this CSS-width breakpoint with a phone. The React
+  classifier marks it explicitly, so restore the stored floating/docked geometry
+  after the phone fallback rules (which use !important to defeat stale phone sizes).
+  This keeps the shared header move grip and all eight resize targets reachable at
+  exactly 768px without exposing any geometry controls on true-phone sheets.
+  */
+  .modal.terminal-modal.terminal-modal--tablet.terminal-modal--docked {
+    min-width: 0 !important;
+    min-height: calc(var(--space-xl) * 10) !important;
+    width: 100vw !important;
+    height: var(--terminal-docked-height) !important;
+    max-width: none !important;
+    max-height: calc(100dvh - (var(--space-xl) * 4)) !important;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    border: 1px solid var(--border);
+  }
+
+  .modal.terminal-modal.terminal-modal--tablet .terminal-header {
+    flex-wrap: nowrap;
+    row-gap: 0;
+    padding-top: 0;
+    overflow: visible;
+  }
+
+  .modal.terminal-modal.terminal-modal--tablet .terminal-tabs {
+    display: flex;
+  }
+
+  .modal.terminal-modal.terminal-modal--tablet .terminal-mobile-tabs {
+    display: none;
+  }
+
+  .modal.terminal-modal.terminal-modal--tablet .terminal-title {
+    display: flex;
+  }
+
+  .terminal-below-host:has(.terminal-modal.terminal-modal--tablet) {
+    display: flex;
+  }
 }
+
 
 @media (max-width: 768px) {
   .terminal-below-host {
@@ -1946,4 +2019,136 @@ FN-7813 embeds the shared terminal inside Task Detail. The host must fill the pa
   .terminal-modal--embedded .terminal-actions {
     min-width: 0;
   }
+}
+
+/*
+FNXC:TerminalSharing 2026-08-19-04:10:
+The reopen list must be portaled and fixed-positioned: `.terminal-status-bar` is an overflow-x
+scroll container, so a popover anchored inside it would be clipped. Positioned from the trigger's
+rect (inline left/bottom) and stacked with nextFloatingZ so it clears pinned/popped-out terminals.
+*/
+.terminal-reopen-menu {
+  position: fixed;
+  max-width: min(calc(var(--space-xl) * 14), calc(100vw - (var(--space-md) * 2)));
+  max-height: min(calc(var(--space-xl) * 12), calc(100dvh - (var(--space-md) * 2)));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-xs);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: var(--shadow-lg);
+}
+
+.terminal-reopen-menu-label {
+  padding: var(--space-sm) var(--space-sm) var(--space-xs);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.terminal-reopen-menu-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  width: 100%;
+  padding: var(--space-sm);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.terminal-reopen-menu-option:hover {
+  background: var(--card-hover);
+}
+
+.terminal-reopen-menu-option-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.terminal-reopen-menu-option-main span,
+.terminal-reopen-menu-option-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-reopen-menu-option-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  max-width: 180px;
+}
+
+/*
+FNXC:AlphaMobileDrawer 2026-09-10-16:56:
+The mobile terminal keeps its PTY and keyboard-overlap lifecycle while its bounded Alpha drawer reaches the viewport bottom above the trigger pill and absorbs system clearance inside the panel. Standard mobile remains governed by the earlier fullscreen rules because this selector requires the App-published Alpha project-shell marker.
+
+FNXC:AlphaMobileDrawer 2026-09-11-01:40:
+The Alpha terminal consumes the same canonical drawer block-size and shared handle gesture as the other drawer owners. Its close button is absent only under that contract; PTY content, Escape/backdrop recovery, and keyboard-aware input remain reachable.
+
+FNXC:MobileDrawerMotion 2026-09-12-20:37:
+The Alpha terminal applies the shared bottom-edge entry to its outer modal only. Reduced motion suppresses that animation while PTY state, keyboard geometry, backdrop, Escape, and drag dismissal remain unchanged.
+*/
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] .terminal-modal-overlay:not(.terminal-modal-overlay--docked) {
+  align-items: flex-end;
+  padding-block-start: calc(env(safe-area-inset-top, 0px) + var(--space-2xl));
+  background: color-mix(in srgb, var(--bg) 38%, transparent);
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] .terminal-modal-overlay:not(.terminal-modal-overlay--docked) > .terminal-modal {
+  position: relative;
+  inset: auto;
+  width: 100%;
+  height: var(--alpha-mobile-drawer-block-size);
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: var(--alpha-mobile-drawer-block-size);
+  padding-block-end: var(--mobile-nav-alpha-system-offset);
+  border: var(--btn-border-width) solid var(--border);
+  border-block-end: 0;
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  box-shadow: var(--shadow-lg);
+  animation: alpha-mobile-drawer-rise-in var(--duration-normal) ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] .terminal-modal-overlay:not(.terminal-modal-overlay--docked) > .terminal-modal {
+    animation: none;
+  }
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] .terminal-drawer-handle-target {
+  display: flex;
+  flex: 0 0 var(--touch-target-min-size);
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] .terminal-drawer-handle-target:active {
+  cursor: grabbing;
+}
+
+html[data-alpha-mobile-drawers="true"][data-viewport-mode="mobile"] .terminal-drawer-handle {
+  width: calc(var(--space-xl) + var(--space-md));
+  height: var(--space-xs);
+  border-radius: var(--radius-pill);
+  background: var(--border-strong);
 }

@@ -20,7 +20,9 @@ import {
   DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS,
   isMergeActiveStatus,
   isStaleMergeActiveStatus,
-} from "../merge-active-status.js";
+  shouldClearOrphanedMergeStamp,
+} from "../merge/merge-active-status.js";
+import { clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp } from "../merge/clear-orphaned-merge-stamp.js";
 
 const NOW = Date.parse("2026-07-16T00:00:00.000Z");
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
@@ -48,6 +50,26 @@ describe("isMergeActiveStatus", () => {
     for (const s of ["failed", "stuck-killed", "needs-replan", null, undefined, ""]) {
       expect(isMergeActiveStatus(s as string | null | undefined)).toBe(false);
     }
+  });
+});
+
+describe("shouldClearOrphanedMergeStamp", () => {
+  it("clears every unconfirmed merge-active status", () => {
+    for (const status of ACTIVE_MERGE_STATUSES) {
+      expect(shouldClearOrphanedMergeStamp(task({ status }) as never)).toBe(true);
+    }
+  });
+
+  it("preserves absent, terminal, and confirmed stamps", () => {
+    for (const status of [null, undefined, "failed", "awaiting-approval", "awaiting-user-review"]) {
+      expect(shouldClearOrphanedMergeStamp(task({ status: status as string | null }) as never)).toBe(false);
+    }
+    expect(
+      shouldClearOrphanedMergeStamp({
+        ...task(),
+        mergeDetails: { mergeConfirmed: true },
+      } as never),
+    ).toBe(false);
   });
 });
 
@@ -113,6 +135,54 @@ describe("isStaleMergeActiveStatus — the FN-8004 wedge", () => {
   it("never classifies a non-merge-active status as stale, however old", () => {
     for (const status of ["failed", "stuck-killed", null]) {
       expect(isStaleMergeActiveStatus(task({ status }), { nowMs: NOW })).toBe(false);
+    }
+  });
+});
+
+
+describe("merge stamp clear authorizations", () => {
+  const makeStore = (initial: Record<string, unknown>) => {
+    let live = { id: "FN-1", updatedAt: LONG_AGO, ...initial } as never;
+    const updateTask = async (_id: string, patch: Record<string, unknown>) => {
+      live = { ...live, ...patch } as never;
+      return live;
+    };
+    return {
+      get live() { return live as Record<string, unknown>; },
+      store: {
+        getTask: async () => live,
+        updateTask,
+        updateTaskAtomic: async (_id: string, updater: (task: never) => Record<string, unknown> | null) => {
+          const patch = updater(live);
+          if (patch) await updateTask("FN-1", patch);
+          return live;
+        },
+        logEntry: async () => undefined,
+      },
+    };
+  };
+
+  it("owner authorization clears every unconfirmed active phase but preserves final states", async () => {
+    for (const status of ACTIVE_MERGE_STATUSES) {
+      const fixture = makeStore({ status });
+      await expect(clearOwnedMergeStamp(fixture.store as never, "FN-1", "MergeAborted")).resolves.toBe(true);
+      expect(fixture.live.status).toBeNull();
+    }
+    for (const initial of [{ status: "done" }, { status: "failed" }, { status: "merging", mergeDetails: { mergeConfirmed: true } }]) {
+      const fixture = makeStore(initial);
+      await expect(clearOwnedMergeStamp(fixture.store as never, "FN-1", "MergeAborted")).resolves.toBe(false);
+      expect(fixture.live.status).toBe(initial.status);
+    }
+  });
+
+  it("unowned authorization requires parseable age evidence", async () => {
+    const stale = makeStore({ status: "merging" });
+    await expect(reconcileUnownedStaleMergeStamp(stale.store as never, "FN-1", { nowMs: NOW })).resolves.toBe(true);
+    expect(stale.live.status).toBeNull();
+    for (const updatedAt of [ago(1_000), "not-a-date"]) {
+      const fresh = makeStore({ status: "merging", updatedAt });
+      await expect(reconcileUnownedStaleMergeStamp(fresh.store as never, "FN-1", { nowMs: NOW })).resolves.toBe(false);
+      expect(fresh.live.status).toBe("merging");
     }
   });
 });

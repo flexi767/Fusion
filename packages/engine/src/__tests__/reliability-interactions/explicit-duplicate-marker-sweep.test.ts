@@ -14,7 +14,7 @@ function duplicateStub(canonicalId: string): string {
 
 async function createPromptTask(
   fx: ReliabilityFixture,
-  input: { id: string; column: "triage" | "todo" | "in-review"; title?: string; prompt: string },
+  input: { id: string; column: "triage" | "todo" | "in-review"; title?: string; prompt: string; sourceType?: "api" | "dashboard_ui" },
 ) {
   /*
   FNXC:ExplicitDuplicateMarkerSweep 2026-07-16-11:25:
@@ -25,6 +25,7 @@ async function createPromptTask(
   const task = await fx.store.createTask({
     title: input.title ?? input.id,
     description: `${input.id} description`,
+    source: input.sourceType ? { sourceType: input.sourceType } : undefined,
   });
   if (input.column !== "triage") {
     await fx.store.moveTask(task.id, input.column);
@@ -60,7 +61,7 @@ const canRun = hasGit && hasPg;
     const liveTasks = await fx.store.listTasks({ includeArchived: false });
     expect(liveTasks.map((task) => task.id)).toContain(duplicate.id);
     expect((await fx.store.getTask(canonical.id)).column).toBe("todo");
-    const activity = await fx.store.getActivityLog({ type: "task:auto-archived-duplicate", limit: 20 });
+    const activity = await fx.store.getActivityLog({ type: "task:near-duplicate-flagged", limit: 20 });
     expect(activity.find((entry) => entry.taskId === duplicate.id)).toEqual(
       expect.objectContaining({
         metadata: expect.objectContaining({ canonicalTaskId: canonical.id, source: "triage-marker-flagged" }),
@@ -107,8 +108,44 @@ const canRun = hasGit && hasPg;
     const updated = await fx.store.getTask(duplicate.id);
     expect(updated.paused).not.toBe(true);
     expect(updated.pausedReason ?? null).toBeNull();
-    expect(updated.status ?? null).toBeNull();
+    // needs-replan (not null) so the card cannot look planning-finished without PROMPT
+    expect(updated.status).toBe("needs-replan");
+    expect(updated.sourceMetadata).toEqual(expect.objectContaining({
+      nearDuplicateOf: canonicalId,
+      nearDuplicateDismissed: true,
+      duplicateSource: "triage-marker",
+    }));
     expect(existsSync(promptPath)).toBe(false);
+    expect(updated.log?.some((entry) =>
+      entry.action === "Duplicate marker cleared for re-specification"
+      && String(entry.outcome ?? "").includes(canonicalId),
+    )).toBe(true);
+  });
+
+  it.each([
+    ["dashboard user", "dashboard_ui", "needs-replan"],
+    ["programmatic source", "api", "needs-replan"],
+  ] as const)("handles a repeated inactive marker from a %s according to provenance", async (_label, sourceType, expectedStatus) => {
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
+    fixtures.push(fx);
+
+    const canonical = await fx.store.createTask({ title: "Completed canonical", description: "canonical", column: "done" });
+    const duplicate = await createPromptTask(fx, { id: "FN-5302", column: "triage", prompt: duplicateStub(canonical.id), sourceType });
+    await fx.store.updateTask(duplicate.id, {
+      sourceMetadataPatch: {
+        nearDuplicateOf: canonical.id,
+        duplicateSource: "triage-marker",
+        nearDuplicateDismissed: true,
+        duplicateMarkerClearCount: 1,
+      },
+    });
+
+    await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
+
+    const updated = await fx.store.getTask(duplicate.id);
+    expect(updated.status).toBe(expectedStatus);
+    expect(updated.error ?? null).toBeNull();
+    expect(updated.sourceMetadata).toEqual(expect.objectContaining({ duplicateMarkerClearCount: 2 }));
   });
 
   it.each([
@@ -146,7 +183,11 @@ const canRun = hasGit && hasPg;
     const updated = await fx.store.getTask(duplicate.id);
     expect(updated.paused).not.toBe(true);
     expect(updated.pausedReason ?? null).toBeNull();
-    expect(updated.sourceMetadata).toEqual(expect.objectContaining({ nearDuplicateOf: canonical.id.toLowerCase(), nearDuplicateDismissed: true }));
+    expect(updated.status).toBe("needs-replan");
+    expect(updated.sourceMetadata).toEqual(expect.objectContaining({
+      nearDuplicateOf: canonical.id,
+      nearDuplicateDismissed: true,
+    }));
     expect(existsSync(promptPath)).toBe(false);
   });
 
@@ -201,15 +242,34 @@ const canRun = hasGit && hasPg;
   });
 
   it("honors the disable flag", async () => {
-    const fx = await makeReliabilityFixture({ settings: { resolveExplicitDuplicateMarkerEnabled: false, taskPrefix: "FN" } as never });
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-21:45 (this guard could not fire):
+    `triageDuplicateResolution: "delete"` is REQUIRED for this case to mean anything. Without it the
+    sweep has no resolution action to take, so the duplicate survives whether the disable flag is
+    honoured or ignored — the assertion held for a reason unrelated to the flag. Proven by mutation:
+    forcing `enabled = true` in resolveExplicitDuplicateMarkerTasks left all 16 cases green. With the
+    resolution mode set, that same mutation deletes the duplicate and this case fails.
+    */
+    const fx = await makeReliabilityFixture({ settings: { resolveExplicitDuplicateMarkerEnabled: false, taskPrefix: "FN", triageDuplicateResolution: "delete" } as never });
     fixtures.push(fx);
 
     const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
-    const duplicate = await createPromptTask(fx, { id: "FN-5303", column: "triage", prompt: duplicateStub(canonical.id) });
+    const duplicate = await createPromptTask(fx, { id: "FN-5303", column: "todo", prompt: duplicateStub(canonical.id) });
+
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-21:30:
+    Assert the card DID NOT MOVE, rather than that it sits in a named column. The invariant this
+    case owns is "the disable flag stops the sweep"; the column id was incidental, and pinning
+    `triage` broke it post-U11 (that column is no longer declared, so the seed lands in the merged
+    Planning column `todo`). Reading the column back BEFORE the sweep also means this cannot pass
+    because the seed happened to land where the assertion looked.
+    */
+    const columnBefore = (await fx.store.getTask(duplicate.id)).column;
 
     await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
 
-    expect((await fx.store.getTask(duplicate.id)).column).toBe("triage");
+    // Survives at all (the flag blocked the delete) AND did not move.
+    expect((await fx.store.getTask(duplicate.id)).column).toBe(columnBefore);
   });
 
   it("caps work at 50 tasks per sweep", async () => {
@@ -241,8 +301,11 @@ const canRun = hasGit && hasPg;
     fixtures.push(fx);
 
     const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
-    const first = await createPromptTask(fx, { id: "FN-5304", column: "triage", prompt: duplicateStub(canonical.id) });
-    const second = await createPromptTask(fx, { id: "FN-5305", column: "triage", prompt: duplicateStub(canonical.id) });
+    const first = await createPromptTask(fx, { id: "FN-5304", column: "todo", prompt: duplicateStub(canonical.id) });
+    const second = await createPromptTask(fx, { id: "FN-5305", column: "todo", prompt: duplicateStub(canonical.id) });
+    // Same reason as the disable-flag case: what matters is that `first` SURVIVES the thrown
+    // delete, not which column it sits in.
+    const firstColumnBefore = (await fx.store.getTask(first.id)).column;
 
     const originalDeleteTask = fx.store.deleteTask.bind(fx.store);
     const deleteSpy = vi.spyOn(fx.store, "deleteTask").mockImplementation(async (taskId, options) => {
@@ -254,7 +317,7 @@ const canRun = hasGit && hasPg;
 
     expect(await (fx.manager as any).resolveExplicitDuplicateMarkerTasks()).toBe(1);
     expect(deleteSpy).toHaveBeenCalled();
-    expect((await fx.store.getTask(first.id)).column).toBe("triage");
+    expect((await fx.store.getTask(first.id)).column).toBe(firstColumnBefore);
     await expect(fx.store.getTask(second.id)).rejects.toThrow(`Task ${second.id} not found`);
   });
 });

@@ -1,3 +1,6 @@
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewHeader } from "./ViewHeader";
+import { ViewLayout } from "./ViewLayout";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { PlanningQuestion, Settings, ThinkingLevel } from "@fusion/core";
@@ -46,6 +49,7 @@ import {
   Minimize2,
 } from "lucide-react";
 import { ConversationHistory } from "./ConversationHistory";
+import { ThinkingTrace } from "./ThinkingTrace";
 import { MailboxMessageContent } from "./MailboxMessageContent";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { FloatingWindow } from "./FloatingWindow";
@@ -565,12 +569,28 @@ export function MissionInterviewModal({
     };
   }, [connectToMissionInterviewStream, isOpen, resumeSessionId, view.type, projectId]);
 
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  Missions is keyed by project, so a project switch unmounts this modal mid-composition.
+  Mirror handleClose's draft rule on unmount: persist an un-started goal under THIS
+  instance's projectId (constant for its lifetime thanks to the key), so the old project's
+  draft is neither dropped nor written under the new project's kb-mission-last-goal key.
+  */
+  const missionGoalRef = useRef(missionGoal);
+  missionGoalRef.current = missionGoal;
+  const viewTypeRef = useRef(view.type);
+  viewTypeRef.current = view.type;
+
   // Cleanup stream on unmount
   useEffect(() => {
     return () => {
       streamConnectionRef.current?.close();
       streamConnectionRef.current = null;
+      if (missionGoalRef.current && viewTypeRef.current === "initial") {
+        saveMissionGoal(missionGoalRef.current, projectId);
+      }
     };
+    // projectId is intentionally omitted: it is constant per keyed instance.
   }, []);
 
   // Unload protection
@@ -811,28 +831,20 @@ export function MissionInterviewModal({
         The Plan Mission with AI workspace must be draggable and resizable on desktop by delegating geometry to FloatingWindow, while mobile keeps the existing full-screen/sheet-like mission interview flow. Keep one embedded mission header so close/send-to-background controls do not duplicate FloatingWindow chrome.
       */}
       <div className="modal modal-lg planning-modal mission-interview-modal">
-        <div className="modal-header mission-interview-modal__drag-handle">
-          <div className="detail-title-row">
-            <Target size={20} className="icon-triage" />
-            <h3>{t("missions.planTitle", "Plan Mission with AI")}</h3>
-          </div>
-          <div className="modal-header-actions">
-            {canSendToBackground && (
-              <button
-                className="modal-send-to-background"
-                onClick={handleSendToBackground}
-                title={t("missions.sendToBackground", "Send to background")}
-                aria-label={t("missions.sendToBackground", "Send to background")}
-              >
-                <Minimize2 size={16} />
-              </button>
-            )}
-            <button className="modal-close" onClick={handleClose} aria-label={t("actions.close", "Close")}>
-              <X size={20} />
-            </button>
-          </div>
-        </div>
-
+        {/* FNXC:StandardizedMissionInterviewLayout 2026-09-13-16:30: Mission interviews use the same header/content shell as their owning Missions destination while retaining backgrounding and close semantics. */}
+        <ViewLayout
+          contentOwnsScroll
+          header={(
+            <ViewHeader
+              icon={Target}
+              title={t("missions.planTitle", "Plan Mission with AI")}
+              className="mission-interview-modal__drag-handle"
+              actions={canSendToBackground ? <ViewActionButton icon={Minimize2} label={t("missions.sendToBackground", "Send to background")} onClick={handleSendToBackground} /> : undefined}
+              onClose={handleClose}
+              closeButtonProps={{ "aria-label": t("actions.close", "Close") }}
+            />
+          )}
+        >
         <div className="planning-modal-body">
           {error && <div className="form-error planning-error">{error}</div>}
           {/*
@@ -984,7 +996,7 @@ export function MissionInterviewModal({
                 </button>
                 {showThinking && streamingOutput && (
                   <div className="planning-thinking-output">
-                    <pre>{streamingOutput}</pre>
+                    <ThinkingTrace text={streamingOutput} format="plain" />
                   </div>
                 )}
               </div>
@@ -1048,6 +1060,7 @@ export function MissionInterviewModal({
           )}
 
         </div>
+        </ViewLayout>
       </div>
     </FloatingWindow>
   );

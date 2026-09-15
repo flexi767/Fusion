@@ -1,13 +1,18 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import type { Task, TaskComment } from "@fusion/core";
-import { getErrorMessage } from "@fusion/core";
+import { getErrorMessage, MAX_TASK_MESSAGE_LENGTH, type Task, type TaskComment } from "@fusion/core";
 import "./TaskComments.css";
 import { addSteeringComment, updateTaskComment, deleteTaskComment } from "../api";
 import type { ToastType } from "../hooks/useToast";
 
-const MAX_COMMENT_LENGTH = 2000;
+/*
+FNXC:TaskMessageLength 2026-08-29-08:02:
+The task-comment composer must share the server's generous task-message limit so its counter and
+submit gate cannot reject an operator message that the route accepts.
+*/
 
 interface TaskCommentsProps {
   task: Task;
@@ -27,9 +32,32 @@ function isAIGuidanceComment(author: string): boolean {
   return author === "agent" || author === "system";
 }
 
+function EditCommentComposer({ value, onChange, onCancel, onSave, disabled, projectId, t }: {
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onSave: () => void;
+  disabled: boolean;
+  projectId?: string;
+  t: TFunction<"app">;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef, value, onChange, projectId });
+  return <div className="comments-edit-form">
+    <textarea ref={textareaRef} value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled} rows={3} className="comments-textarea" />
+    <div className="comments-edit-actions">
+      <MicButton {...dictation.micProps} disabled={disabled} />
+      <button className="btn btn-sm" onClick={onCancel} disabled={disabled}>{t("actions.cancel", "Cancel")}</button>
+      <button className="btn btn-primary btn-sm" onClick={onSave} disabled={disabled || !value.trim()}>{t("actions.save", "Save")}</button>
+    </div>
+  </div>;
+}
+
 export function TaskComments({ task, onTaskUpdated, addToast, currentAuthor = "user", projectId }: TaskCommentsProps) {
   const { t } = useTranslation("app");
   const [draft, setDraft] = useState("");
+  const draftRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef: draftRef, value: draft, onChange: setDraft, projectId });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -41,7 +69,7 @@ export function TaskComments({ task, onTaskUpdated, addToast, currentAuthor = "u
     );
   }, [task.comments]);
 
-  const isOverLimit = draft.length > MAX_COMMENT_LENGTH;
+  const isOverLimit = draft.length > MAX_TASK_MESSAGE_LENGTH;
 
   async function handleAddComment() {
     const text = draft.trim();
@@ -142,33 +170,15 @@ export function TaskComments({ task, onTaskUpdated, addToast, currentAuthor = "u
                   ) : null}
                 </div>
                 {isEditing ? (
-                  <div className="comments-edit-form">
-                    <textarea
-                      value={editingText}
-                      onChange={(event) => setEditingText(event.target.value)}
-                      rows={3}
-                      className="comments-textarea"
-                    />
-                    <div className="comments-edit-actions">
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => {
-                          setEditingId(null);
-                          setEditingText("");
-                        }}
-                        disabled={submitting}
-                      >
-                        {t("actions.cancel", "Cancel")}
-                      </button>
-                      <button
-                        className="btn btn-primary btn-sm"
-                        onClick={() => void handleSaveEdit(comment.id)}
-                        disabled={submitting || !editingText.trim()}
-                      >
-                        {t("actions.save", "Save")}
-                      </button>
-                    </div>
-                  </div>
+                  <EditCommentComposer
+                    value={editingText}
+                    onChange={setEditingText}
+                    onCancel={() => { setEditingId(null); setEditingText(""); }}
+                    onSave={() => void handleSaveEdit(comment.id)}
+                    disabled={submitting}
+                    projectId={projectId}
+                    t={t}
+                  />
                 ) : (
                   <div className="detail-log-outcome comments-outcome-text">
                     {comment.text}
@@ -182,6 +192,7 @@ export function TaskComments({ task, onTaskUpdated, addToast, currentAuthor = "u
 
       <div className="comments-compose-form">
         <textarea
+          ref={draftRef}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={handleKeyDown}
@@ -189,9 +200,9 @@ export function TaskComments({ task, onTaskUpdated, addToast, currentAuthor = "u
           placeholder={placeholder}
           className="comments-textarea"
         />
-        <div className="comments-footer-row">
+        <div className="comments-footer-row"><MicButton {...dictation.micProps} disabled={submitting} />
           <span className={`comments-char-count${isOverLimit ? " comments-char-count--over" : ""}`}>
-            {draft.length} / {MAX_COMMENT_LENGTH}
+            {draft.length} / {MAX_TASK_MESSAGE_LENGTH}
           </span>
           <button
             className="btn btn-primary btn-sm"

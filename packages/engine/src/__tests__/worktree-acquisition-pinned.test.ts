@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { join } from "node:path";
-import { acquireTaskWorktree } from "../worktree-acquisition.js";
+import { acquireTaskWorktree } from "../worktree/worktree-acquisition.js";
 
 /*
 FNXC:TaskPinnedWorktrees 2026-07-16-12:30:
@@ -8,8 +8,13 @@ The pinned-mode branch is validated in isolation with mocked git/liveness seams 
 deterministic (no real-git worktree creation). classifyTaskWorktree / branch lookup / fs existence are the
 observable inputs to derive→validate→reuse-or-recreate; we drive each of them.
 */
-vi.mock("../worktree-pool.js", async () => {
-  const actual = await vi.importActual<any>("../worktree-pool.js");
+/*
+FNXC:TestHarnessIntegrity 2026-08-12-01:04:
+A moved `vi.mock` target and its `importActual` sibling must change together; guarding only the mock target
+leaves the factory broken at runtime.
+*/
+vi.mock("../worktree/worktree-pool.js", async () => {
+  const actual = await vi.importActual<any>("../worktree/worktree-pool.js");
   return {
     ...actual,
     classifyTaskWorktree: vi.fn().mockResolvedValue({ ok: true }),
@@ -20,8 +25,13 @@ vi.mock("../worktree-pool.js", async () => {
   };
 });
 
-vi.mock("../branch-conflicts.js", async () => {
-  const actual = await vi.importActual<any>("../branch-conflicts.js");
+/*
+FNXC:TestHarnessIntegrity 2026-08-12-01:04:
+A moved `vi.mock` target and its `importActual` sibling must change together; guarding only the mock target
+leaves the factory broken at runtime.
+*/
+vi.mock("../execution/branch-conflicts.js", async () => {
+  const actual = await vi.importActual<any>("../execution/branch-conflicts.js");
   return {
     ...actual,
     classifyBootstrapMisbinding: vi.fn().mockResolvedValue({
@@ -33,11 +43,43 @@ vi.mock("../branch-conflicts.js", async () => {
   };
 });
 
-vi.mock("../worktree-db-hydrate.js", () => ({
+/*
+FNXC:TestHarnessIntegrity 2026-08-12-01:04:
+The real worktree-pool factory now loads after its sibling path is repaired. Keep this pinned-path suite
+filesystem-free by isolating the reservation seam rather than relying on the nonexistent `/repo` fixture root.
+*/
+vi.mock("@fusion/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@fusion/core")>();
+  return {
+    ...actual,
+    canonicalizeWorktreePath: vi.fn(async (path: string) => path),
+    acquireWorktreePathReservation: vi.fn(async () => ({
+      canonicalPath: "/repo/.fusion/worktrees/fn-7996",
+      token: "test-reservation",
+      previousState: "free",
+      state: "held",
+      release: vi.fn(async () => undefined),
+      quarantine: vi.fn(async () => undefined),
+    })),
+  };
+});
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    mkdir: vi.fn(async () => undefined),
+    realpath: vi.fn(async (path: string) => path),
+    rename: vi.fn(async () => undefined),
+    stat: vi.fn(async () => ({ isDirectory: () => true })),
+  };
+});
+
+vi.mock("../worktree/worktree-db-hydrate.js", () => ({
   hydrateWorktreeDb: vi.fn().mockResolvedValue({ degraded: false, tasksCopied: 0, documentsCopied: 0, artifactsCopied: 0 }),
 }));
 
-vi.mock("../worktree-desktop-artifacts.js", () => ({
+vi.mock("../worktree/worktree-desktop-artifacts.js", () => ({
   removeDesktopBuildArtifacts: vi.fn().mockResolvedValue({ removed: [], skipped: [], failures: [] }),
 }));
 
@@ -47,10 +89,11 @@ vi.mock("node:fs", async () => {
 });
 
 import { existsSync } from "node:fs";
-import { classifyTaskWorktree, getRegisteredWorktreeBranches, removeWorktree } from "../worktree-pool.js";
+import { rename } from "node:fs/promises";
+import { classifyTaskWorktree, getRegisteredWorktreeBranches, removeWorktree } from "../worktree/worktree-pool.js";
 
 const ROOT = "/repo";
-const PINNED = join(ROOT, ".worktrees", "fn-7996");
+const PINNED = join(ROOT, ".fusion", "worktrees", "fn-7996");
 
 function makeStore() {
   return {
@@ -100,22 +143,15 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
       rootDir: ROOT,
       store: makeStore(),
       settings: pinnedSettings,
-      // A pool is attached with recycleWorktrees on — pinned mode must ignore it entirely.
-      pool: { acquire: vi.fn(() => join(ROOT, ".worktrees", "grand-ridge")), prepareForTask: vi.fn(), release: vi.fn() } as any,
-      settingsOverride: undefined,
       createWorktree,
     } as any);
 
-    expect(result.worktreePath).toBe(join(ROOT, ".worktrees", "fn-8069"));
-    expect(createWorktree).toHaveBeenCalledWith("fusion/fn-8069", join(ROOT, ".worktrees", "fn-8069"), "FN-8069", "main", false);
+    expect(result.worktreePath).toBe(join(ROOT, ".fusion", "worktrees", "fn-8069"));
+    expect(createWorktree).toHaveBeenCalledWith("fusion/fn-8069", join(ROOT, ".fusion", "worktrees", "fn-8069"), "FN-8069", "main", false);
   });
 
-  it("runtime backstop: recycle ON disables pinning (mutually exclusive) so the pool is consulted", async () => {
-    // recycleWorktrees + worktreeNaming:"task-id" is rejected at the settings-write boundary; if a legacy
-    // on-disk config still carries both, the runtime degrades safely to recycling (pinning off), so the
-    // pool IS consulted — pinned mode never calls pool.acquire.
-    const acquire = vi.fn(() => null); // empty pool → falls through to fresh
-    const release = vi.fn();
+  it("ignores persisted legacy naming and recycle settings while retaining the task-id path", async () => {
+    const acquire = vi.fn(() => null);
     const createWorktree = vi.fn(async (branch: string, path: string) => ({ path, branch }));
 
     const result = await acquireTaskWorktree({
@@ -123,12 +159,12 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
       rootDir: ROOT,
       store: makeStore(),
       settings: { worktreeNaming: "task-id", recycleWorktrees: true } as any,
-      pool: { acquire, prepareForTask: vi.fn(), release } as any,
+      // Legacy callers may still supply this unknown option; native acquisition must ignore it.
+      pool: { acquire, prepareForTask: vi.fn(), release: vi.fn() } as any,
       createWorktree,
-    });
+    } as any);
 
-    expect(acquire).toHaveBeenCalledWith("FN-7996");
-    // Falls through to the normal fresh path (task-id naming still derives fn-7996 for the directory name).
+    expect(acquire).not.toHaveBeenCalled();
     expect(result.worktreePath).toBe(PINNED);
   });
 
@@ -171,7 +207,7 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
     expect(result.source).toBe("existing");
     expect(result.worktreePath).toBe(PINNED);
     // The successful acquisition must leave the task assigned, not orphaned.
-    expect(store.updateTask).toHaveBeenCalledWith("FN-7996", { worktree: PINNED, branch: "fusion/fn-7996" });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-7996", { worktree: PINNED, branch: "fusion/fn-7996", branchWriteOrigin: "engine" });
     expect(createWorktree).not.toHaveBeenCalled();
     expect(removeWorktree).not.toHaveBeenCalled();
   });
@@ -225,7 +261,7 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
     }));
   });
 
-  it("reclaims an unregistered same-name dir in place", async () => {
+  it("preserves an unregistered same-name dir before recreating in place", async () => {
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(classifyTaskWorktree).mockResolvedValue({ ok: false, classification: "unregistered", reason: "not registered" } as any);
     const createWorktree = vi.fn(async (branch: string, path: string) => ({ path, branch }));
@@ -238,7 +274,8 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
       createWorktree,
     });
 
-    expect(removeWorktree).toHaveBeenCalledWith(expect.objectContaining({ worktreePath: PINNED }));
+    expect(removeWorktree).not.toHaveBeenCalled();
+    expect(rename).toHaveBeenCalledWith(PINNED, expect.stringContaining("/.fusion/recovery/worktrees/fn-7996-"));
     expect(createWorktree).toHaveBeenCalledWith("fusion/fn-7996", PINNED, "FN-7996", "main", false);
     expect(result.worktreePath).toBe(PINNED);
   });

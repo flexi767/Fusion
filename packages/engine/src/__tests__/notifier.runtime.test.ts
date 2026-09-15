@@ -5,12 +5,12 @@ Notifier runtime suite split extracts the later NtfyNotifier reconfiguration, er
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { MergeResult } from "@fusion/core";
-import { NtfyNotifier, notifyFallbackUsed } from "../notifier.js";
+import { NtfyNotifier, notifyFallbackUsed } from "../util/notifier.js";
 import { NotificationService } from "../notification/notification-service.js";
 import { MockTaskStore, createTask, flushAsyncWork } from "./notifier.test-harness.js";
 
 vi.mock("../logger.js", () => ({
-  schedulerLog: { log: vi.fn(), error: vi.fn() },
+  schedulerLog: { log: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
 describe("NtfyNotifier runtime behaviors", () => {

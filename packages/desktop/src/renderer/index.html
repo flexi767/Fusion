@@ -50,9 +50,12 @@
             "brutalist",
             "neon-city",
             "parchment",
+            "medieval",
             "terminal",
             "glass",
             "glass-silver",
+            // FNXC:LiquidGlassTheme 2026-09-09-15:50: Electron first paint accepts the same persisted Liquid Glass ID as Core and the web bootstrap, avoiding a fallback flash before React hydration.
+            "liquid-glass",
             "horizon",
             "vitesse",
             "outrun",
@@ -75,6 +78,19 @@
             "cobalt",
             "clay",
             "moss",
+            "aurora",
+            "calm",
+            "dawn",
+            "sage",
+            "midnight",
+            "velvet",
+            // FNXC:DashboardTheming 2026-08-23-01:51: Iceberg remains after Velvet in Electron first-paint validation and must stay synchronized with core, selector metadata, web validation, token blocks, and swatch CSS.
+            "iceberg",
+            // FNXC:DashboardTheming 2026-08-27-04:23: Flexoki remains after Iceberg in Electron first-paint validation and must stay synchronized with core, selector metadata, web validation, token blocks, and swatch CSS.
+            "flexoki",
+            "cozy-cartoon",
+            "factory-dark",
+            "factory-light",
             "shadcn",
             "shadcn-ember",
             "shadcn-custom",
@@ -99,6 +115,7 @@
           ];
 
           // FNXC:DashboardTheming 2026-06-30-00:00: Desktop pre-hydration mirrors the full core theme union before falling back to Shadcn Ember, so every explicit legacy id stays valid on native startup.
+          // FNXC:DashboardTheming 2026-08-19-19:23: Electron first paint must accept persisted Medieval before React hydrates; invalid or unset values still fall back to Shadcn Ember.
           if (!validThemes.includes(colorTheme)) {
             colorTheme = "shadcn-ember";
           }

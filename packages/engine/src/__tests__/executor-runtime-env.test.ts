@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { FusionPlugin, PluginLoader, PluginStore, TaskStore } from "@fusion/core";
-import { PluginRunner } from "../plugin-runner.js";
+import { PluginRunner } from "../plugins/plugin-runner.js";
 import { createLogger } from "../logger.js";
 
 vi.mock("../logger.js", () => ({
-  createLogger: vi.fn(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() })),
-  executorLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  createLogger: vi.fn(() => ({ log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() })),
+  executorLog: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 describe("PluginRunner.collectExecutorRuntimeEnv", () => {

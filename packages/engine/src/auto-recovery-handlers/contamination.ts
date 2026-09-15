@@ -1,10 +1,11 @@
 import type { TaskStore } from "@fusion/core";
-import { classifyForeignOnlyContamination } from "../branch-conflicts.js";
-import type { AutoRecoveryContext, AutoRecoveryDecision, AutoRecoveryFailure, AutoRecoveryHandlers } from "../auto-recovery.js";
+import { classifyForeignOnlyContamination } from "../execution/branch-conflicts.js";
+import type { AutoRecoveryContext, AutoRecoveryDecision, AutoRecoveryFailure, AutoRecoveryHandlers } from "../healing/auto-recovery.js";
+import { moveTaskToContainedBackwardTarget } from "../execution/lifecycle-move.js";
 import { createLogger, type Logger } from "../logger.js";
 import { recoverForeignOnlyContamination } from "../recovery/foreign-only-contamination.js";
-import { resolveIntegrationBranch } from "../integration-branch.js";
-import type { RunAuditor } from "../run-audit.js";
+import { resolveIntegrationBranch } from "../merge/integration-branch.js";
+import type { RunAuditor } from "../util/run-audit.js";
 
 const baseLog = createLogger("auto-recovery:contamination");
 
@@ -81,12 +82,23 @@ export class ContaminationAutoRecoveryHandler implements Pick<AutoRecoveryHandle
     }
 
     if (recoveryKind === "default") {
-      await this.deps.taskStore.moveTask(task.id, "todo", {
-        moveSource: "engine",
-        preserveResumeState: true,
-        preserveProgress: true,
-        preserveWorktree: true,
-      });
+      /*
+      FNXC:LifecycleContainment 2026-08-28-03:03:
+      Contamination recovery uses the live source role and an adjacent target. Review returns to WIP,
+      WIP returns to hold, and missing/capacity-blocked destinations remain in place.
+      */
+      await moveTaskToContainedBackwardTarget(
+        this.deps.taskStore,
+        task.id,
+        "contamination-recovery",
+        {
+          moveSource: "engine",
+          preserveResumeState: true,
+          preserveProgress: true,
+          preserveWorktree: true,
+        },
+        task.column,
+      );
 
       await this.deps.taskStore.updateTask(task.id, {
         paused: false,

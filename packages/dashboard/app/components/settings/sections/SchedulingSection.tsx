@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { DEFAULT_PROJECT_SETTINGS } from "@fusion/core";
 import { MovedSettingsStub } from "./MovedSettingsStub";
 import { SettingsToggleRow } from "../SettingsToggleRow";
 import { SettingsSelectRow } from "../SettingsSelectRow";
@@ -6,8 +7,6 @@ import { SettingsNumberRow } from "../SettingsNumberRow";
 import { SettingsTextRow } from "../SettingsTextRow";
 import { SettingsHelpTip } from "../SettingsHelpTip";
 import type { SettingsFormState, SetSettingsForm } from "./context";
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const AUTO_ARCHIVE_DEFAULT_AFTER_DAYS = 2;
 export interface SchedulingSectionProps {
     form: SettingsFormState;
     setForm: SetSettingsForm;
@@ -34,23 +33,21 @@ export function SchedulingSection({ form, setForm, concurrencyLoading = false, o
     const { t } = useTranslation("app");
     return (<>
       <h4 className="settings-section-heading">{t("settings.scheduling.scheduling", "Scheduling")}</h4>
-      {/* FNXC:ExecutorToolFailureRetry 2026-07-16-12:00: project controls tune the bounded same-model retry before terminal executor parking; values floor to core's resolver contract. */}
+      {/* FNXC:ExecutorToolFailureRetry 2026-08-06-14:56: project controls tune bounded same-model retry before terminal executor parking; one terminal tool error qualifies by default while values still floor to core's resolver contract. */}
       <SettingsNumberRow descriptor={{ key: "executorToolFailureRetryCount", label: t("settings.scheduling.executorToolFailureRetryCount", "Executor tool-failure retries"), help: t("settings.scheduling.executorToolFailureRetryCountHelp", "Same-model retries after consecutive tool-call failures. Set 0 to disable. Default: 2."), scope: "project", min: 0, step: 1 }} value={form.executorToolFailureRetryCount ?? 2} onChange={(v) => setForm((f) => ({ ...f, executorToolFailureRetryCount: Math.max(0, Math.floor(v ?? 2)) } as SettingsFormState))} />
       <SettingsNumberRow descriptor={{ key: "executorToolFailureRetryBackoffMs", label: t("settings.scheduling.executorToolFailureRetryBackoffMs", "Tool-failure retry backoff (ms)"), help: t("settings.scheduling.executorToolFailureRetryBackoffMsHelp", "Unref'd wait before retrying. Default: 2000."), scope: "project", min: 0, step: 1 }} value={form.executorToolFailureRetryBackoffMs ?? 2000} onChange={(v) => setForm((f) => ({ ...f, executorToolFailureRetryBackoffMs: Math.max(0, Math.floor(v ?? 2000)) } as SettingsFormState))} />
-      <SettingsNumberRow descriptor={{ key: "executorToolFailureThreshold", label: t("settings.scheduling.executorToolFailureThreshold", "Consecutive tool failures"), help: t("settings.scheduling.executorToolFailureThresholdHelp", "Terminal tool errors required before retrying. Default: 3."), scope: "project", min: 1, step: 1 }} value={form.executorToolFailureThreshold ?? 3} onChange={(v) => setForm((f) => ({ ...f, executorToolFailureThreshold: Math.max(1, Math.floor(v ?? 3)) } as SettingsFormState))} />
+      <SettingsNumberRow descriptor={{ key: "executorToolFailureThreshold", label: t("settings.scheduling.executorToolFailureThreshold", "Consecutive tool failures"), help: t("settings.scheduling.executorToolFailureThresholdHelp", "Terminal tool errors required before retrying. Default: 1."), scope: "project", min: 1, step: 1 }} value={form.executorToolFailureThreshold ?? 1} onChange={(v) => setForm((f) => ({ ...f, executorToolFailureThreshold: Math.max(1, Math.floor(v ?? 1)) } as SettingsFormState))} />
       {/* FNXC:ExecutorEscalation 2026-07-16-21:00: Keep alternate model/node escalation opt-in and adjacent to its FN-7996 retry policy; a complete model pair or node id is required before the executor consumes its one extra attempt. */}
       <SettingsToggleRow descriptor={{ key: "executorModelEscalationEnabled", label: t("settings.scheduling.executorModelEscalationEnabled", "Escalate after tool-failure retries"), help: t("settings.scheduling.executorModelEscalationEnabledHelp", "After same-model retries are exhausted, try one configured alternate model or node. Disabled by default."), scope: "project" }} value={form.executorModelEscalationEnabled === true} onChange={(value) => setForm((f) => ({ ...f, executorModelEscalationEnabled: value === true } as SettingsFormState))} />
-      <SettingsTextRow descriptor={{ key: "executorEscalationProvider", label: t("settings.scheduling.executorEscalationProvider", "Escalation provider"), help: t("settings.scheduling.executorEscalationProviderHelp", "Provider for the alternate model. Requires an alternate model ID."), scope: "project" }} value={form.executorEscalationProvider ?? ""} onChange={(value) => setForm((f) => ({ ...f, executorEscalationProvider: value ?? "" } as SettingsFormState))} />
-      <SettingsTextRow descriptor={{ key: "executorEscalationModelId", label: t("settings.scheduling.executorEscalationModelId", "Escalation model ID"), help: t("settings.scheduling.executorEscalationModelIdHelp", "Alternate model ID. Requires an escalation provider."), scope: "project" }} value={form.executorEscalationModelId ?? ""} onChange={(value) => setForm((f) => ({ ...f, executorEscalationModelId: value ?? "" } as SettingsFormState))} />
       <SettingsTextRow descriptor={{ key: "executorEscalationNodeId", label: t("settings.scheduling.executorEscalationNodeId", "Escalation node ID"), help: t("settings.scheduling.executorEscalationNodeIdHelp", "Optional configured node; a node target re-enters scheduler routing."), scope: "project" }} value={form.executorEscalationNodeId ?? ""} onChange={(value) => setForm((f) => ({ ...f, executorEscalationNodeId: value ?? "" } as SettingsFormState))} />
       <SettingsNumberRow
         descriptor={{
           key: "maxConcurrent",
           label: t("settings.scheduling.maxConcurrentTasks", "Max Concurrent Tasks"),
-          help: t("settings.scheduling.maxConcurrentTasksHint", "Default: 2."),
+          help: t("settings.scheduling.maxConcurrentTasksHint", `Default: ${DEFAULT_PROJECT_SETTINGS.maxConcurrent}. Caps every AI-active task, including planning, independently of Max Worktrees.`),
           scope: "project",
           min: 1,
-          max: 10,
+          max: 50,
           disabled: concurrencyLoading,
         }}
         value={form.maxConcurrent ?? null}
@@ -76,19 +73,6 @@ export function SchedulingSection({ form, setForm, concurrencyLoading = false, o
             const n = Math.min(8, Math.max(1, Math.floor(v) || 1));
             setForm((f) => ({ ...f, maxConcurrentVerifications: n } as SettingsFormState));
         }}
-      />
-      <SettingsNumberRow
-        descriptor={{
-          key: "maxTriageConcurrent",
-          label: t("settings.scheduling.maxTriageConcurrent", "Max Triage Concurrent"),
-          help: t("settings.scheduling.maximumConcurrentPlanningAgents", "Maximum concurrent planning agents. Default: 2."),
-          scope: "project",
-          min: 1,
-          max: 10,
-          disabled: concurrencyLoading,
-        }}
-        value={form.maxTriageConcurrent ?? null}
-        onChange={(v) => setForm((f) => ({ ...f, maxTriageConcurrent: v ?? undefined } as SettingsFormState))}
       />
       <SettingsNumberRow
         descriptor={{
@@ -203,75 +187,6 @@ export function SchedulingSection({ form, setForm, concurrencyLoading = false, o
         }}
         value={form.specStalenessMaxAgeMs !== undefined ? Math.round(form.specStalenessMaxAgeMs / 3600000) : null}
         onChange={(v) => setForm((f) => ({ ...f, specStalenessMaxAgeMs: v !== null ? v * 3600000 : undefined }))}
-      />
-      <SettingsToggleRow
-        descriptor={{
-          key: "autoArchiveDoneTasksEnabled",
-          label: t("settings.scheduling.enableAutomaticTaskArchiving", " Enable automatic task archiving "),
-          help: t("settings.scheduling.completedTasksOlderThanTheThresholdAreMoved", "Completed tasks older than the threshold are moved out of the active task database. Default: enabled."),
-          scope: "project",
-        }}
-        value={form.autoArchiveDoneTasksEnabled ?? true}
-        onChange={(v) => setForm((f) => ({
-            ...f,
-            autoArchiveDoneTasksEnabled: v === true,
-        }))}
-      />
-      {/* FNXC:SettingsScheduling 2026-07-15-17:35: The threshold and log mode are gated on the archiving toggle and disabled rather than hidden, so an operator turning archiving on can see the values that will take effect. An unset threshold displays the schema default (2 days) rather than an empty field, because archiving is on by default and a blank box would misread as "never". */}
-      <SettingsNumberRow
-        descriptor={{
-          key: "autoArchiveDoneAfterMs",
-          label: t("settings.scheduling.archiveCompletedTasksAfterDays", "Archive Completed Tasks After (days)"),
-          help: t("settings.scheduling.numberOfDaysATaskCanStayIn", "Number of days a task can stay in Done before it is archived. Default: 2 days (48 hours)."),
-          scope: "project",
-          min: 1,
-          step: 1,
-          disabled: form.autoArchiveDoneTasksEnabled === false,
-        }}
-        value={form.autoArchiveDoneAfterMs !== undefined ? Math.round(form.autoArchiveDoneAfterMs / MS_PER_DAY) : AUTO_ARCHIVE_DEFAULT_AFTER_DAYS}
-        onChange={(v) => setForm((f) => ({
-            ...f,
-            autoArchiveDoneAfterMs: v === null ? undefined : v * MS_PER_DAY,
-        }))}
-      />
-      <SettingsSelectRow
-        descriptor={{
-          key: "archiveAgentLogMode",
-          label: t("settings.scheduling.archiveAgentLog", "Archive Agent Log"),
-          help: t("settings.scheduling.compactModeKeepsArchiveSizeLowWhilePreserving", "Compact mode keeps archive size low while preserving recent agent activity for context. Default: compact."),
-          scope: "project",
-          disabled: form.autoArchiveDoneTasksEnabled === false,
-          options: [
-            { value: "compact", label: t("settings.scheduling.compactSummaryAndRecentEntries", "Compact summary and recent entries") },
-            { value: "none", label: t("settings.scheduling.doNotArchiveAgentLogs", "Do not archive agent logs") },
-            { value: "full", label: t("settings.scheduling.fullAgentLog", "Full agent log") },
-          ],
-        }}
-        value={form.archiveAgentLogMode ?? "compact"}
-        onChange={(v) => setForm((f) => ({
-            ...f,
-            archiveAgentLogMode: v as "none" | "compact" | "full",
-        }))}
-      />
-      {/**
-       * FNXC:DuplicateIntake 2026-07-07-00:00 (FN-7658):
-       * Operators do not want same-agent duplicate tasks (FN-4892 intake heuristic)
-       * silently archived on creation — they want visibility and a chance to decide
-       * via the near-duplicate flag/UI. Default off; this toggle restores the old
-       * aggressive auto-archive behavior when enabled.
-       */}
-      <SettingsToggleRow
-        descriptor={{
-          key: "autoArchiveDuplicateTasksEnabled",
-          label: t("settings.scheduling.autoArchiveDuplicateTasks", " Automatically archive duplicate tasks "),
-          help: t("settings.scheduling.autoArchiveDuplicateTasksHelp", "Automatically archive tasks detected as same-agent duplicates on creation (off by default). When disabled, duplicates are flagged in place with the yellow Duplicate chip and Keep/Archive actions instead of being archived automatically."),
-          scope: "project",
-        }}
-        value={form.autoArchiveDuplicateTasksEnabled ?? false}
-        onChange={(v) => setForm((f) => ({
-            ...f,
-            autoArchiveDuplicateTasksEnabled: v === true,
-        }))}
       />
       <SettingsSelectRow
         descriptor={{

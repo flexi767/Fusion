@@ -1,9 +1,13 @@
 import { exec } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { readOwnCliVersion } from "../cli-version.js";
+import { result } from "../output.js";
 import { promisify } from "node:util";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { isVersionNewer, resolveUpdateTargetVersion } from "@fusion/core";
+import {
+  EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+  isVersionNewer,
+  resolveUpdateTargetVersion,
+  resolveUpdatesExternallyManaged,
+} from "@fusion/core";
 import type { UpdateChannel } from "@fusion/core";
 import { getCachedUpdateStatus, getConfiguredUpdateChannel, persistUpdateChannel } from "../update-cache.js";
 
@@ -35,6 +39,91 @@ export type RunUpdateOptions = {
   force?: boolean;
 };
 
+const UPDATE_CLI_OPTIONS = "--check, --global, --json, --channel <stable|beta>, --force";
+
+type UpdateCliParseResult =
+  | { options: RunUpdateOptions; error?: never }
+  | { options?: never; error: string };
+
+/*
+FNXC:UpdateArgumentHonesty 2026-07-21-12:00:
+Update and upgrade must fail closed for unknown or duplicate options. A documented
+flag that ships only in a newer CLI must never become a false “Already up to date.”
+success on an older build, and typos must not silently no-op (FN-8452 / #2368).
+This parser owns argv structure only: it requires a non-flag --channel value but
+passes that raw value to runUpdate for semantic stable/beta validation. Reject
+repeated options rather than silently choosing first or last for the same
+honesty guarantee.
+*/
+export function parseUpdateCliArgs(args: string[]): UpdateCliParseResult {
+  const options: RunUpdateOptions = {};
+  const seen = new Set<string>();
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (seen.has(arg)) {
+      return { error: `Error: duplicate option '${arg}'.` };
+    }
+
+    switch (arg) {
+      case "--check":
+        seen.add(arg);
+        options.check = true;
+        break;
+      case "--global":
+        seen.add(arg);
+        options.global = true;
+        break;
+      case "--json":
+        seen.add(arg);
+        options.json = true;
+        break;
+      case "--force":
+        seen.add(arg);
+        options.force = true;
+        break;
+      case "--channel": {
+        seen.add(arg);
+        const channel = args[index + 1];
+        if (channel === undefined || channel.startsWith("-")) {
+          return { error: "Error: --channel requires a value: stable or beta." };
+        }
+        options.channel = channel;
+        index += 1;
+        break;
+      }
+      default:
+        return { error: `Error: unknown option '${arg}'. Valid options: ${UPDATE_CLI_OPTIONS}.` };
+    }
+  }
+
+  return { options };
+}
+
+type UpdateCommandDependencies = {
+  runUpdate?: (options: RunUpdateOptions) => Promise<void>;
+  writeError?: (message: string) => void;
+  exit?: (code: number) => void;
+};
+
+/**
+ * Dispatch the strict argv parser used by both `fn update` and `fn upgrade`.
+ * Kept injectable so the bin wiring can be tested without a registry request.
+ */
+export async function dispatchUpdateCliArgs(
+  args: string[],
+  dependencies: UpdateCommandDependencies = {},
+): Promise<void> {
+  const parsed = parseUpdateCliArgs(args);
+  if ("error" in parsed) {
+    (dependencies.writeError ?? console.error)(parsed.error);
+    (dependencies.exit ?? process.exit)(1);
+    return;
+  }
+
+  await (dependencies.runUpdate ?? runUpdate)(parsed.options);
+}
+
 type UpdateStatus = {
   currentVersion: string;
   latestVersion: string;
@@ -43,55 +132,26 @@ type UpdateStatus = {
   channel: UpdateChannel;
 };
 
-function readOwnCliVersion(): string | undefined {
-  let currentDir: string;
-  try {
-    currentDir = dirname(fileURLToPath(import.meta.url));
-  } catch {
-    return undefined;
-  }
+type UpdateDistTags = {
+  latest?: string;
+  beta?: string;
+};
 
-  for (let i = 0; i < 8; i += 1) {
-    const pkgPath = resolve(currentDir, "package.json");
-    if (existsSync(pkgPath)) {
-      try {
-        const parsed = JSON.parse(readFileSync(pkgPath, "utf-8")) as { name?: string; version?: string };
-        if (parsed.name === "@runfusion/fusion" && typeof parsed.version === "string") {
-          return parsed.version;
-        }
-      } catch {
-        // Ignore parse errors and keep walking.
-      }
-    }
+type ChannelTarget = {
+  targetVersion: string;
+  distTags: UpdateDistTags;
+};
 
-    const parentDir = resolve(currentDir, "..");
-    if (parentDir === currentDir) {
-      break;
-    }
-    currentDir = parentDir;
-  }
-
-  return undefined;
-}
-
-async function fetchChannelTargetVersion(channel: UpdateChannel): Promise<string> {
+async function fetchChannelTargetVersion(channel: UpdateChannel): Promise<ChannelTarget> {
   const response = await fetch(REGISTRY_URL);
-  const payload = (await response.json()) as {
-    "dist-tags"?: {
-      latest?: string;
-      beta?: string;
-    };
-  };
-
-  const targetVersion = resolveUpdateTargetVersion(channel, {
-    latest: payload?.["dist-tags"]?.latest,
-    beta: payload?.["dist-tags"]?.beta,
-  });
+  const payload = (await response.json()) as { "dist-tags"?: UpdateDistTags };
+  const distTags = payload?.["dist-tags"] ?? {};
+  const targetVersion = resolveUpdateTargetVersion(channel, distTags);
   if (typeof targetVersion !== "string" || targetVersion.length === 0) {
     throw new Error(`Could not determine ${channel} version from npm registry response.`);
   }
 
-  return targetVersion;
+  return { targetVersion, distTags };
 }
 
 // FNXC:UpdateChannels 2026-07-19-16:20: the version comes from the npm
@@ -236,7 +296,46 @@ function printStatus(status: UpdateStatus, checkOnly: boolean): void {
 }
 
 function printJson(status: UpdateStatus): void {
-  console.log(JSON.stringify(status));
+  result(JSON.stringify(status) + "\n");
+}
+
+/*
+FNXC:UpdateBetaNotice 2026-07-21-12:15:
+Stable, human-readable output may mention but never install a newer beta so
+release-note readers can discover it without changing stable resolution
+(FN-8452 / #2368 suggested fix #3). Show the notice only when channel is stable,
+JSON is off, this run fetched the live registry, beta is non-empty, and beta is
+strictly newer than both current and stable target. Cache-only and registry
+failure paths must never invent a beta notice.
+*/
+function printBetaAvailabilityNotice({
+  channel,
+  jsonOutput,
+  registrySucceeded,
+  betaTag,
+  currentVersion,
+  stableTarget,
+}: {
+  channel: UpdateChannel;
+  jsonOutput: boolean;
+  registrySucceeded: boolean;
+  betaTag: string | undefined;
+  currentVersion: string;
+  stableTarget: string;
+}): void {
+  if (
+    channel !== "stable" ||
+    jsonOutput ||
+    !registrySucceeded ||
+    typeof betaTag !== "string" ||
+    betaTag.length === 0 ||
+    !isVersionNewer(betaTag, currentVersion) ||
+    !isVersionNewer(betaTag, stableTarget)
+  ) {
+    return;
+  }
+
+  console.log(`A newer beta (${betaTag}) is available. To opt in, run \`fn update --channel beta\` or \`npm install -g @runfusion/fusion@beta\`.`);
 }
 
 function getLatestVersionFallback(currentVersion: string, channel: UpdateChannel): string | null {
@@ -248,15 +347,30 @@ function getLatestVersionFallback(currentVersion: string, channel: UpdateChannel
   return cached.latestVersion;
 }
 
-export async function runUpdate(options: RunUpdateOptions = {}): Promise<void> {
+export type RunUpdateDependencies = {
+  externallyManaged?: () => boolean;
+  installVersion?: (globalInstall: boolean, version: string) => Promise<void>;
+  writeError?: (message: string) => void;
+  exit?: (code: number) => void;
+};
+
+export async function runUpdate(options: RunUpdateOptions = {}, dependencies: RunUpdateDependencies = {}): Promise<void> {
   const checkOnly = options.check === true;
   const globalInstall = options.global !== false;
   const jsonOutput = options.json === true;
   const force = options.force === true;
+  const writeError = dependencies.writeError ?? console.error;
+  const exit = dependencies.exit ?? process.exit;
+
+  if (!checkOnly && (dependencies.externallyManaged ?? resolveUpdatesExternallyManaged)()) {
+    writeError(EXTERNALLY_MANAGED_UPDATE_MESSAGE);
+    exit(1);
+    return;
+  }
 
   if (options.channel !== undefined && options.channel !== "stable" && options.channel !== "beta") {
-    console.error(`Error: invalid --channel '${options.channel}'. Valid channels: stable, beta.`);
-    process.exit(1);
+    writeError(`Error: invalid --channel '${options.channel}'. Valid channels: stable, beta.`);
+    exit(1);
     return;
   }
 
@@ -279,22 +393,27 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<void> {
     channel = await getConfiguredUpdateChannel();
   }
 
-  const currentVersion = readOwnCliVersion();
+  const currentVersion = readOwnCliVersion(import.meta.url);
   if (!currentVersion) {
-    console.error("Error: Could not determine current Fusion CLI version.");
-    process.exit(1);
+    writeError("Error: Could not determine current Fusion CLI version.");
+    exit(1);
     return;
   }
 
   let latestVersion: string;
+  let betaTag: string | undefined;
+  let registrySucceeded = false;
   try {
-    latestVersion = await fetchChannelTargetVersion(channel);
+    const target = await fetchChannelTargetVersion(channel);
+    latestVersion = target.targetVersion;
+    betaTag = target.distTags.beta;
+    registrySucceeded = true;
   } catch (error) {
     const fallbackVersion = getLatestVersionFallback(currentVersion, channel);
     if (!fallbackVersion) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`Error checking for updates: ${message}`);
-      process.exit(1);
+      writeError(`Error checking for updates: ${message}`);
+      exit(1);
       return;
     }
 
@@ -322,6 +441,7 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<void> {
       printJson(checkStatus);
     } else {
       printStatus(checkStatus, true);
+      printBetaAvailabilityNotice({ channel, jsonOutput, registrySucceeded, betaTag, currentVersion, stableTarget: latestVersion });
     }
 
     if (updateAvailable) {
@@ -343,16 +463,17 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<void> {
       printJson(status);
     } else {
       printStatus(status, false);
+      printBetaAvailabilityNotice({ channel, jsonOutput, registrySucceeded, betaTag, currentVersion, stableTarget: latestVersion });
     }
     return;
   }
 
   try {
-    await installVersion(globalInstall, latestVersion);
+    await (dependencies.installVersion ?? installVersion)(globalInstall, latestVersion);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`Error installing update: ${message}`);
-    process.exit(1);
+    writeError(`Error installing update: ${message}`);
+    exit(1);
     return;
   }
 
@@ -370,4 +491,5 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<void> {
   }
 
   printStatus(updatedStatus, false);
+  printBetaAvailabilityNotice({ channel, jsonOutput, registrySucceeded, betaTag, currentVersion, stableTarget: latestVersion });
 }

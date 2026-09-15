@@ -152,6 +152,7 @@ vi.mock("../../hooks/useViewportMode", () => ({
   isShortViewport: () => false,
   getViewportMode: () => viewportMock.mode,
   isMobileViewport: () => viewportMock.mode === "mobile",
+  isTabletTouchViewport: (mode?: string) => mode === "tablet",
   useViewportMode: () => viewportMock.mode,
 }));
 
@@ -223,29 +224,29 @@ describe("SettingsModal navigation rail resize", () => {
     expect(getCssBlock(settingsModalCss, ".settings-navigation")).not.toContain("border-right:");
     expect(getCssBlock(settingsModalCss, ".settings-sidebar")).not.toContain("border-right:");
 
-    const firstRender = renderModal({ initialSection: "keyboard-shortcuts" });
+    const firstRender = renderModal({ initialSection: "keyboard-shortcuts", projectId: "settings-project" });
     await waitForSettingsModalReady();
 
     const separator = screen.getByRole("separator", { name: "Resize settings navigation" });
     expect(separator).toHaveAttribute("aria-orientation", "vertical");
-    expect(separator).toHaveAttribute("aria-valuemin", "200");
-    expect(separator).toHaveAttribute("aria-valuemax", "420");
-    expect(separator).toHaveAttribute("aria-valuenow", "248");
-    expect(getSettingsNavigation().style.getPropertyValue("--settings-nav-width")).toBe("248px");
+    expect(separator).toHaveAttribute("aria-valuemin", "220");
+    expect(separator).toHaveAttribute("aria-valuemax", "560");
+    expect(separator).toHaveAttribute("aria-valuenow", "300");
+    expect(getSettingsNavigation().style.getPropertyValue("--view-sidebar-current-width")).toBe("300px");
 
     fireEvent.pointerDown(separator, { pointerId: 1, clientX: 100 });
     fireEvent.pointerMove(document, { pointerId: 1, clientX: 160 });
     fireEvent.pointerUp(document, { pointerId: 1, clientX: 160 });
 
-    await waitFor(() => expect(localStorage.getItem("fusion:settings-nav-width")).toBe("308"));
-    expect(getSettingsNavigation().style.getPropertyValue("--settings-nav-width")).toBe("308px");
+    await waitFor(() => expect(localStorage.getItem("kb:settings-project:kb-dashboard-view-sidebar-width")).toBe("360"));
+    expect(getSettingsNavigation().style.getPropertyValue("--view-sidebar-current-width")).toBe("360px");
 
     firstRender.unmount();
-    renderModal({ initialSection: "keyboard-shortcuts" });
+    renderModal({ initialSection: "keyboard-shortcuts", projectId: "settings-project" });
     await waitForSettingsModalReady();
 
-    expect(getSettingsNavigation().style.getPropertyValue("--settings-nav-width")).toBe("308px");
-    expect(screen.getByRole("separator", { name: "Resize settings navigation" })).toHaveAttribute("aria-valuenow", "308");
+    expect(getSettingsNavigation().style.getPropertyValue("--view-sidebar-current-width")).toBe("360px");
+    expect(screen.getByRole("separator", { name: "Resize settings navigation" })).toHaveAttribute("aria-valuenow", "360");
   });
 
   it("does not render the resize handle when the viewport hook reports mobile", async () => {
@@ -255,7 +256,31 @@ describe("SettingsModal navigation rail resize", () => {
     await waitForSettingsModalReady();
 
     expect(screen.queryByRole("separator", { name: "Resize settings navigation" })).not.toBeInTheDocument();
-    expect(getSettingsNavigation().style.getPropertyValue("--settings-nav-width")).toBe("");
+    expect(getSettingsNavigation()).toHaveClass("view-sidebar--mobile");
+  });
+
+  it("uses one fixed non-shrinking icon slot for fallback and custom desktop rows", async () => {
+    const iconBlock = getCssBlock(settingsModalCss, ".settings-scope-icon");
+    expect(iconBlock).toContain("inline-size: var(--space-md);");
+    expect(iconBlock).toContain("block-size: var(--space-md);");
+    expect(iconBlock).toContain("flex: 0 0 var(--space-md);");
+
+    renderModal({ initialSection: "appearance" });
+    await waitForSettingsModalReady();
+
+    const fallbackGlobal = screen.getByRole("button", { name: /Appearance$/ });
+    const fallbackProject = screen.getByRole("button", { name: /General · Project$/ });
+    const customIcon = screen.getByRole("button", { name: /Source Control · Global$/ });
+    expect(fallbackGlobal?.querySelector("svg.settings-scope-icon")).toBeTruthy();
+    expect(fallbackProject?.querySelector("svg.settings-scope-icon")).toBeTruthy();
+    expect(customIcon?.querySelector("svg.settings-scope-icon")).toBeTruthy();
+
+    const preferencesHeader = screen.getByText("Preferences").closest(".settings-group-header");
+    expect(preferencesHeader?.querySelector(".settings-scope-icon")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("settings-search-input"), { target: { value: "source control" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: /Source Control · Global$/ }).querySelector("svg.settings-scope-icon")).toBeTruthy());
+    expect(screen.queryByText("Preferences")).not.toBeInTheDocument();
   });
 
   it("does not render the resize handle when the Settings media query matches mobile", async () => {
@@ -265,6 +290,6 @@ describe("SettingsModal navigation rail resize", () => {
     await waitForSettingsModalReady();
 
     expect(screen.queryByRole("separator", { name: "Resize settings navigation" })).not.toBeInTheDocument();
-    expect(getSettingsNavigation().style.getPropertyValue("--settings-nav-width")).toBe("");
+    expect(getSettingsNavigation()).toHaveClass("view-sidebar--mobile");
   });
 });

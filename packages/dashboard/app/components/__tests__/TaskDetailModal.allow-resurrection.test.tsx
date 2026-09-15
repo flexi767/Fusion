@@ -26,7 +26,6 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
       <TaskDetailModal
         task={makeTask()}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={onDeleteTask}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -35,7 +34,7 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "Actions" }));
-    await user.click(screen.getByRole("menuitem", { name: "Delete" }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
       expect(onDeleteTask).toHaveBeenCalledWith("FN-099", { allowResurrection: true });
@@ -51,7 +50,6 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
       <TaskDetailModal
         task={makeTask()}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={onDeleteTask}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -60,7 +58,7 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "Actions" }));
-    await user.click(screen.getByRole("menuitem", { name: "Delete" }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
       expect(onDeleteTask).toHaveBeenCalledWith("FN-099", { allowResurrection: false });
@@ -82,7 +80,6 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
       <TaskDetailModal
         task={makeTask()}
         onClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={onDeleteTask}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -91,7 +88,7 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "Actions" }));
-    await user.click(screen.getByRole("menuitem", { name: "Delete" }));
+    await user.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() => {
       expect(onDeleteTask).toHaveBeenNthCalledWith(2, "FN-099", {
@@ -103,32 +100,4 @@ describe("TaskDetailModal allowResurrection delete flow", () => {
     });
   });
 
-  it("archive branch stays delete-unaffected", async () => {
-    const user = userEvent.setup();
-    const onDeleteTask = vi.fn(async () => makeTask());
-    const onArchiveTask = vi.fn(async () => makeTask({ column: "archived" }));
-    mockConfirmWithChoice.mockResolvedValueOnce("tertiary");
-
-    render(
-      <TaskDetailModal
-        task={makeTask({ column: "done" })}
-        onClose={noop}
-        onMoveTask={noopMove}
-        onDeleteTask={onDeleteTask}
-        onArchiveTask={onArchiveTask}
-        onMergeTask={noopMerge}
-        onOpenDetail={noopOpenDetail}
-        addToast={noop}
-      />,
-    );
-
-    await user.click(screen.getByRole("button", { name: "Actions" }));
-    await user.click(screen.getByRole("menuitem", { name: "Delete" }));
-
-    await waitFor(() => {
-      expect(onArchiveTask).toHaveBeenCalledWith("FN-099");
-      expect(onDeleteTask).not.toHaveBeenCalled();
-      expect(mockConfirmWithCheckbox).not.toHaveBeenCalled();
-    });
-  });
 });

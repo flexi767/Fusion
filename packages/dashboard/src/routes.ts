@@ -10,7 +10,7 @@ import multer from "multer";
 import { resolve, sep, join, isAbsolute } from "node:path";
 import * as nodeFs from "node:fs";
 
-import type { AnthropicProviderRegistration, TaskStore, ModelPreset, ThinkingLevel } from "@fusion/core";
+import type { AnthropicProviderRegistration, TaskStore, ModelPreset, ThinkingLevel, ProviderInstanceRef } from "@fusion/core";
 import {
   type Task,
   type PiExtensionEntry,
@@ -23,11 +23,13 @@ import {
   listAgentMemoryFiles,
   readAgentMemoryFile,
   writeAgentMemoryFile,
+  resolveWorkflowIrForTask,
+  columnsWithFlag,
+  resolveEffectiveConcurrency,
 } from "@fusion/core";
 import type { ServerOptions } from "./server.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS, type AiSessionType } from "./ai-session-store.js";
 import { getSession as getPlanningSession, cleanupSession as cleanupPlanningSession, normalizePlanningSummaryPayload } from "./planning.js";
-import { getSubtaskSession, cleanupSubtaskSession } from "./subtask-breakdown.js";
 import { getMissionInterviewSession, cleanupMissionInterviewSession } from "./mission-interview.js";
 import { getTargetInterviewSession, cleanupTargetInterviewSession } from "./milestone-slice-interview.js";
 import { writeSSEEvent } from "./sse-buffer.js";
@@ -52,6 +54,7 @@ import { registerSecretsRoutes } from "./routes/register-secrets-routes.js";
 import { registerMessagingScriptRoutes } from "./routes/register-messaging-scripts.js";
 import { registerGitGitHubRoutes } from "./routes/register-git-github.js";
 import { registerGitLabRoutes } from "./routes/register-gitlab.js";
+import { registerJiraRoutes } from "./routes/register-jira.js";
 import { registerFilesTerminalWorkspaceRoutes } from "./routes/register-files-terminal-workspaces.js";
 import { registerAgentsProjectsNodesRoutes } from "./routes/register-agents-projects-nodes.js";
 import { registerProjectRoutes } from "./routes/register-project-routes.js";
@@ -62,6 +65,7 @@ import { registerSettingsSyncRoutes } from "./routes/register-settings-sync-rout
 import { registerSecretsSyncRoutes } from "./routes/register-secrets-sync-routes.js";
 import { registerMeshRoutes } from "./routes/register-mesh-routes.js";
 import { registerDiscoveryRoutes } from "./routes/register-discovery-routes.js";
+import { registerUiMetadataRoutes } from "./routes/register-ui-metadata-routes.js";
 import { registerSettingsSyncInboundRoutes } from "./routes/register-settings-sync-inbound-routes.js";
 import { registerSecretsSyncInboundRoutes } from "./routes/register-secrets-sync-inbound-routes.js";
 import { registerAgentCoreListCreateRoutes, registerAgentCoreRoutes } from "./routes/register-agent-core-routes.js";
@@ -72,6 +76,7 @@ import { registerOrgPortabilityRoutes } from "./routes/register-org-portability-
 import { registerAgentSkillsRoutes } from "./routes/register-agent-skills-routes.js";
 import { registerPluginsAutomationRoutes } from "./routes/register-plugins-automation.js";
 import { registerProxyRoutes } from "./routes/register-proxy-routes.js";
+import { registerPatchnodeRoutes } from "./routes/register-patchnode-routes.js";
 import { registerModelRoutes } from "./routes/register-model-routes.js";
 import { registerCustomProviderRoutes } from "./routes/register-custom-provider-routes.js";
 import { registerUsageRoutes } from "./routes/register-usage-routes.js";
@@ -84,6 +89,7 @@ import { registerAuthRoutes } from "./routes/register-auth-routes.js";
 import { registerRuntimeProviderRoutes } from "./routes/register-runtime-provider-routes.js";
 import { registerFnBinaryRoutes } from "./routes/register-fn-binary-routes.js";
 import { registerUpdateCheckRoutes } from "./routes/register-update-check-routes.js";
+import { registerVoiceRoutes } from "./routes/register-voice-routes.js";
 import { registerDiagnosticsRoutes } from "./routes/register-diagnostics-routes.js";
 import { registerSystemRoutes } from "./routes/register-system-routes.js";
 import { registerCliAgentHooksRoute } from "./routes/cli-agent-hooks.js";
@@ -106,22 +112,45 @@ const TASK_DETAIL_ACTIVITY_LOG_LIMIT = 500;
  * intentionally remain exported from this file for existing tests/importers.
  */
 export { __resetBatchImportRateLimiter } from "./routes/register-git-github.js";
+export { __resetModelRegistryRefreshCacheForTests } from "./model-registry-refresh-cache.js";
 
 /**
  * Minimal interface matching pi 0.80.8+ ModelRuntime's ModelRegistry
  * compatibility facade. Avoids a direct dependency on the pi-coding-agent package.
  */
+export interface ModelRegistryModelLike {
+  id: string;
+  name: string;
+  provider: string;
+  reasoning: boolean;
+  contextWindow: number;
+  /** Pi model-level tristate map; omitted means capability metadata is unavailable to Fusion's picker. */
+  thinkingLevelMap?: Partial<Record<string, string | null>>;
+}
+
 export interface ModelRegistryLike {
   /**
    * FNXC:ModelCatalog 2026-07-16-17:55:
    * pi 0.80.8 refreshes asynchronously, so the models endpoint must wait for it
    * before reading getAvailable() and surface any refresh failure to the caller.
+   *
+   * FNXC:ModelCatalog 2026-08-12-20:46:
+   * Pi 0.84.1 returns refresh metadata instead of void. Preserve it as unknown because
+   * the route needs only completion while structural compatibility must track the SDK.
+   *
+   * FNXC:ModelCatalog 2026-09-02-22:06:
+   * Pi 0.84.4 preserves the refresh metadata contract. Keep the result unknown because
+   * the route only waits for completion before reading the refreshed catalog.
    */
-  refresh(): Promise<void>;
+  refresh(): Promise<unknown>;
+  /** Optional runtime passthrough lets request refreshes use the engine abort-aware path. */
+  modelRuntime?: {
+    refresh: (options?: { allowNetwork?: boolean; signal?: AbortSignal; force?: boolean }) => Promise<unknown>;
+  };
   /** Get models that have auth configured. */
-  getAvailable(): Array<{ id: string; name: string; provider: string; reasoning: boolean; contextWindow: number }>;
+  getAvailable(): ModelRegistryModelLike[];
   /** Optional pi ModelRegistry surface used for supplemental model registration. */
-  getAll?: () => Array<{ id: string; name?: string; provider: string; reasoning?: boolean; input?: string[]; cost?: { input: number; output: number; cacheRead: number; cacheWrite: number }; contextWindow?: number; maxTokens?: number; compat?: unknown }>;
+  getAll?: () => Array<ModelRegistryModelLike & { name?: string; reasoning?: boolean; input?: string[]; cost?: { input: number; output: number; cacheRead: number; cacheWrite: number }; contextWindow?: number; maxTokens?: number; compat?: unknown }>;
   /** Optional pi ModelRegistry surface used for supplemental model registration. */
   registerProvider?: (providerName: string, config: AnthropicProviderRegistration) => void;
 }
@@ -164,6 +193,16 @@ export interface AuthStorageLike {
   getApiKey?(providerId: string): string | null | undefined | Promise<string | null | undefined>;
   /** Get raw stored credentials for usage providers. */
   get?(providerId: string): { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [key: string]: unknown } | null | undefined;
+  listInstances?(providerId: string): ProviderInstanceRef[];
+  getInstance?(ref: ProviderInstanceRef): { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [key: string]: unknown } | null | undefined;
+  setInstanceApiKey?(ref: ProviderInstanceRef, apiKey: string, label?: string): Promise<void>;
+  loginInstance?(ref: ProviderInstanceRef, callbacks: Parameters<AuthStorageLike["login"]>[1], label?: string): Promise<void>;
+  logoutInstance?(ref: ProviderInstanceRef): Promise<void>;
+  clearInstanceApiKey?(ref: ProviderInstanceRef): Promise<void>;
+  removeInstance?(ref: ProviderInstanceRef): Promise<void>;
+  getDefaultInstance?(providerId: string): ProviderInstanceRef | undefined;
+  setDefaultInstance?(ref: ProviderInstanceRef): Promise<void>;
+  renameInstance?(ref: ProviderInstanceRef, label?: string): Promise<void>;
 }
 
 /*
@@ -885,6 +924,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
     getProjectIdFromRequest,
     getScopedStore,
     getProjectContext,
+    getProjectPluginLoader,
     emitRemoteRouteDiagnostic,
     emitAuthSyncAuditLog,
     parseScopeParam,
@@ -909,6 +949,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
     getProjectIdFromRequest,
     getScopedStore,
     getProjectContext,
+    getProjectPluginLoader,
     emitRemoteRouteDiagnostic,
     emitAuthSyncAuditLog,
     parseScopeParam,
@@ -974,11 +1015,18 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
     replayBufferedSSE,
     validateOptionalModelField,
     upload,
+    // FNXC:ChatMemoryCaptureWiring 2026-08-18-14:37: forward engineManager so
+    // resolveProjectChatContext can resolve the engine's ChatStore instance —
+    // the one the RUFU-068 Stash chat-capture subscription is attached to.
+    // Without this every chat request used a dashboard-local ChatStore and
+    // per-message Stash capture silently never fired.
+    engineManager: options?.engineManager,
   }));
   registrarMounter.mount("registerChatRoomRoutes", () => registerChatRoomRoutes(routeContext, { upload }));
   registrarMounter.mount("registerMessagingScriptRoutes", () => registerMessagingScriptRoutes(routeContext));
   registrarMounter.mount("registerGitGitHubRoutes", () => registerGitGitHubRoutes(routeContext));
   registrarMounter.mount("registerGitLabRoutes", () => registerGitLabRoutes(routeContext));
+  registrarMounter.mount("registerJiraRoutes", () => registerJiraRoutes(routeContext));
   registrarMounter.mount("registerFilesTerminalWorkspaceRoutes", () => registerFilesTerminalWorkspaceRoutes(routeContext));
   registrarMounter.mount("registerAgentsProjectsNodesRoutes", () => registerAgentsProjectsNodesRoutes(routeContext));
   registrarMounter.mount("registerPluginsAutomationRoutes", () => registerPluginsAutomationRoutes(routeContext, { parseLastEventId, replayBufferedSSE, getCreateFnAgent: () => createFnAgentForRefine }));
@@ -1196,10 +1244,13 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
         // If we can't get activity log, that's OK - just leave lastActivityAt undefined
       }
 
+      const capacity = resolveEffectiveConcurrency(settings);
       res.json({
         globalPause: settings.globalPause ?? false,
         enginePaused: settings.enginePaused ?? false,
-        maxConcurrent: settings.maxConcurrent ?? 2,
+        maxConcurrent: capacity.maxConcurrent,
+        maxWorktrees: capacity.worktreeLimit ?? settings.maxWorktrees,
+        worktreeLimitEnabled: settings.worktreeLimitEnabled !== false,
         lastActivityAt,
       });
     } catch (err: unknown) {
@@ -1250,6 +1301,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // by opening storm-guarded fix tasks back in triage.
   registrarMounter.mount("registerMonitorRoutes", () => registerMonitorRoutes(routeContext));
   registrarMounter.mount("registerUpdateCheckRoutes", () => registerUpdateCheckRoutes(routeContext));
+  registrarMounter.mount("registerVoiceRoutes", () => registerVoiceRoutes(routeContext));
   registrarMounter.mount("registerDiagnosticsRoutes", () => registerDiagnosticsRoutes(routeContext));
   // CLI Agent Executor hook ingestion (U17) — per-session token auth, exempt from
   // the daemon bearer-token middleware (hook scripts only hold the session token).
@@ -1310,19 +1362,31 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
    * Terminal task statuses — tasks in these states should not be displayed
    * as "working on" in agent UI surfaces to avoid stale activity indicators.
    */
-  const TERMINAL_TASK_STATUSES = new Set(["done", "archived"]);
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-07-31-07:00 (dashboard-server feed):
+  DELIBERATE-LITERAL — the fallback for a task whose workflow will not resolve, reviewed
+  2026-07-31-07:00. The resolved answer is threaded per task at the call site below.
+
+  Census-invisible before this change: a `Set` literal is a definition, not a comparison, so nothing
+  in the lifecycle backlog pointed at this file. On a renamed board it matched nothing, so a FINISHED
+  card kept its agent's "working on" indicator lit — the agent list showed work that had already
+  shipped, which is exactly the stale indicator this sanitizer exists to prevent.
+  */
+  /* FNXC:TaskArchiveRemoval 2026-09-04-14:51: Complete is the only live terminal role; the fallback must never classify the historical soft-delete sentinel as a board lane. */
+  const TERMINAL_TASK_STATUSES = new Set(["done"]);
   const UNRESOLVED_AGENT_TASK_COLUMN = "unresolved";
 
   /**
-   * Check if a task status is terminal (done or archived).
+   * Check if a task status is terminal (complete, with Done as the degraded fallback).
    */
-  function isTerminalTaskStatus(status: string | undefined): boolean {
-    return status !== undefined && TERMINAL_TASK_STATUSES.has(status);
+  function isTerminalTaskStatus(status: string | undefined, resolvedTerminal?: ReadonlySet<string>): boolean {
+    if (status === undefined) return false;
+    return (resolvedTerminal ?? TERMINAL_TASK_STATUSES).has(status);
   }
 
   /**
    * Sanitize agent responses to omit taskId when the linked task is in a terminal state.
-   * This prevents stale "working on" UI indicators for completed/archived tasks.
+   * This prevents stale "working on" UI indicators for completed tasks.
    *
    * @param agents - Array of agents to sanitize
    * @param scopedStore - Task store for looking up linked task status
@@ -1343,11 +1407,33 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
       taskStatusMap = new Map<string, string>();
     }
 
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-07:00 (dashboard-server feed):
+    Each linked task's OWN terminal lanes, resolved once per unique id with a shared IR cache. A task
+    whose workflow will not resolve is left out of the map and falls back to Done above,
+    which is the pre-existing behaviour rather than a guess.
+    */
+    const terminalIrCache = new Map<string, never>();
+    const terminalByTaskId = new Map<string, ReadonlySet<string>>();
+    for (const taskId of taskIds) {
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-31-09:30 (#2787 review — greptile P1):
+      MEMBERSHIP, not first-per-role — a workflow may declare more than one Complete column, and
+      `resolveLifecycleColumns` returns only the FIRST. A linked task in the second terminal lane
+      kept its `taskId` and the agent stayed displayed as working on finished
+      work, which is the exact symptom this sanitizer exists to remove.
+      */
+      const ir = await resolveWorkflowIrForTask(scopedStore, taskId, terminalIrCache as never).catch(() => undefined);
+      if (!ir) continue;
+      const terminal = columnsWithFlag(ir, "complete");
+      if (terminal.length > 0) terminalByTaskId.set(taskId, new Set(terminal));
+    }
+
     return agents.map((agent) => {
       if (!agent.taskId) return agent;
 
       const taskStatus = taskStatusMap.get(agent.taskId);
-      if (isTerminalTaskStatus(taskStatus)) {
+      if (isTerminalTaskStatus(taskStatus, terminalByTaskId.get(agent.taskId))) {
         // Omit taskId for terminal tasks — use spread to create shallow copy without taskId
         const { taskId: _omitted, taskColumn: _taskColumnOmitted, ...sanitized } = agent;
         return sanitized as import("@fusion/core").Agent;
@@ -1469,7 +1555,6 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // surrounding route handlers. registerIntegratedRouters() mounts:
   // - /missions
   // - /insights
-  // - /todos
   registrarMounter.mount("registerIntegratedRouters", () => registerIntegratedRouters({
     router,
     store,
@@ -1713,11 +1798,6 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
       await aiSessionStore.delete(id);
     }
 
-    try {
-      if (await getSubtaskSession(id)) cleanupSubtaskSession(id);
-    } catch {
-      // Session may not belong to subtask breakdown or may already be cleaned up.
-    }
 
     try {
       if (await getMissionInterviewSession(id)) cleanupMissionInterviewSession(id);
@@ -1981,6 +2061,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // ── Node Discovery Routes (mDNS / DNS-SD) ────────────────────────────────
 
   registrarMounter.mount("registerDiscoveryRoutes", () => registerDiscoveryRoutes(routeContext));
+  registrarMounter.mount("registerUiMetadataRoutes", () => registerUiMetadataRoutes(routeContext));
 
   // ── Inbound Settings/Auth Sync Routes ─────────────────────────────────────
 
@@ -2002,6 +2083,17 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
         options.pluginLoader,
         pluginRunner,
         store,
+        /*
+        FNXC:PluginRoutes 2026-07-22-20:30:
+        Per-request project-scoped loader resolution for plugin-defined routes — the
+        same getProjectPluginLoader cache the plugin management registrar uses — so a
+        plugin enabled after boot, or enabled only in a non-launch project, serves its
+        API routes the moment its dashboard view appears.
+        */
+        async (req) => {
+          const { store: scopedStore, engine } = await routeContext.getProjectContext(req);
+          return routeContext.getProjectPluginLoader(scopedStore, engine);
+        },
       ),
     );
   }
@@ -2031,6 +2123,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // ── Skills Routes ──────────────────────────────────────────────────────────
 
   registrarMounter.mount("registerAgentSkillsRoutes", () => registerAgentSkillsRoutes(routeContext));
+  registrarMounter.mount("registerPatchnodeRoutes", () => registerPatchnodeRoutes(routeContext));
 
   // Remote node proxy routes stay last so explicit handlers always precede
   // the wildcard /proxy/:nodeId/{*splat} route in Express match order.

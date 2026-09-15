@@ -13,9 +13,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { TaskStore } from "@fusion/core";
+import { THINKING_LEVELS, type TaskStore, type ThinkingLevel } from "@fusion/core";
 import { createSessionDiagnostics, nonfatal } from "./ai-session-diagnostics.js";
 import { registerBeforeExitCleanup } from "./process-lifecycle.js";
+import { laneModelOptions, resolveLaneSessionModel } from "./lane-session-model.js";
 
 // Dynamic import for @fusion/core to get prompt override resolution
 
@@ -54,6 +55,10 @@ function ensureEngineReady(): Promise<void> {
 // ── Constants ───────────────────────────────────────────────────────────────
 
 /** System prompt for the AI agent that generates agent specifications */
+/*
+FNXC:PromptOverrides 2026-08-23-23:25:
+Duplicate of the `agent-generation-system` entry in core's PROMPT_KEY_CATALOG, which is what `resolvePrompt` returns for an un-overridden run; this constant is reached only if that key disappears. Keep the two literals identical — FN-021's thinking-level edit landed here alone and never reached a real generation.
+*/
 export const AGENT_GENERATION_SYSTEM_PROMPT = `You are an agent specification generator for the fn task board system.
 
 Your job: given a user-provided role description, generate a complete agent specification suitable for creating an AI agent.
@@ -73,7 +78,7 @@ You MUST respond with ONLY valid JSON (no markdown, no explanation):
   "role": "The most appropriate capability: triage | executor | reviewer | merger | scheduler | engineer | custom",
   "description": "A brief 1-2 sentence description of the agent's purpose and expertise",
   "systemPrompt": "A detailed markdown system prompt for the agent. This should be comprehensive and include:\\n- Role definition\\n- Core responsibilities\\n- Specific areas of expertise\\n- Behavioral guidelines\\n- Output format expectations\\n- Edge case handling instructions",
-  "thinkingLevel": "off | minimal | low | medium | high",
+  "thinkingLevel": "off | minimal | low | medium | high | xhigh | max",
   "maxTurns": 1000
 }
 
@@ -91,6 +96,7 @@ You MUST respond with ONLY valid JSON (no markdown, no explanation):
 - "low": For moderate complexity tasks
 - "medium": For complex analysis, code review, architecture decisions
 - "high": For critical decisions, security analysis, complex debugging
+- "xhigh" or "max": For the hardest problems when the selected model advertises that level
 
 ## Max Turns Guidelines
 - 5-10: Simple, focused tasks (quick reviews, status checks)
@@ -133,7 +139,7 @@ export interface AgentGenerationSpec {
   /** Detailed system prompt in markdown */
   systemPrompt: string;
   /** Suggested thinking level */
-  thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel: ThinkingLevel;
   /** Suggested max turns (1-500) */
   maxTurns: number;
 }
@@ -401,7 +407,7 @@ export function parseGenerationResponse(text: string): AgentGenerationSpec {
     role: typeof obj.role === "string" ? obj.role : "custom",
     description: typeof obj.description === "string" ? obj.description : "",
     systemPrompt: typeof obj.systemPrompt === "string" ? obj.systemPrompt : "",
-    thinkingLevel: ["off", "minimal", "low", "medium", "high", "xhigh"].includes(obj.thinkingLevel as string)
+    thinkingLevel: THINKING_LEVELS.includes(obj.thinkingLevel as ThinkingLevel)
       ? (obj.thinkingLevel as AgentGenerationSpec["thinkingLevel"])
       : "off",
     maxTurns: typeof obj.maxTurns === "number"
@@ -505,11 +511,20 @@ async function generateSpecWithAI(
    * FNXC:McpConfig 2026-06-26-16:58:
    * Agent onboarding generation is a tools:none readonly helper, but routes can provide a dashboard-scoped TaskStore. Forward the resolved in-memory MCP server set consistently without changing tool semantics; no-store callers remain empty and secrets are never logged.
    */
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  Resolve an explicit provider/model pair. Without one the runtime silently substitutes its
+  own built-in default model (anthropic/claude-opus-4-8), leaving the operator's configured
+  provider and failing with `401 invalid x-api-key` for anyone with no raw Anthropic key —
+  and bypassing test-mode forcing. See lane-session-model.ts.
+  */
+  const generationModel = await resolveLaneSessionModel(store);
   const agent = await createFnAgent({
     cwd: rootDir,
     systemPrompt: effectiveSystemPrompt,
     tools: "none",
     mcpServers,
+    ...laneModelOptions(generationModel),
   });
 
   try {

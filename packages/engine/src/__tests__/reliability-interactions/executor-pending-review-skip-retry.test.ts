@@ -114,6 +114,27 @@ describe("reliability interactions: FN-5436 executor pending-review skip", () =>
       log: [{ action: "code review requested for Step 0 (Step 1)", timestamp: new Date().toISOString() }],
     });
     store.getTask.mockResolvedValue(task);
+    /*
+    FNXC:EngineTests 2026-07-23-21:40:
+    The graph's `parse` node re-derives the step list from PROMPT.md and writes every step
+    back as `pending` on each run, so an `in-progress` step on the fixture literal no longer
+    survives to `detectPendingReviewBlock`. The pending-review shape this test pins can only
+    arise from the implementation session itself: the agent starts the step, requests review,
+    and exits without fn_task_done. Simulate exactly that by having each session mark the
+    parsed step `in-progress` (the review-request log line is already on the row).
+    */
+    mockedCreateFnAgent.mockImplementation(async () => ({
+      session: {
+        prompt: vi.fn(async () => {
+          store._setRow("FN-5436-RI-C", { steps: [{ name: "Preflight", status: "in-progress" }] });
+        }),
+        dispose: vi.fn(),
+        subscribe: vi.fn(),
+        on: vi.fn(),
+        sessionManager: { getLeafId: vi.fn().mockReturnValue("leaf-1") },
+        state: {},
+      },
+    }) as any);
 
     const executor = new TaskExecutor(store as any, "/repo");
     await executor.execute(task);
@@ -123,7 +144,17 @@ describe("reliability interactions: FN-5436 executor pending-review skip", () =>
       error: "executor-exit-while-review-pending",
     });
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-5436-RI-C", expect.objectContaining({ taskDoneRetryCount: 3 }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-5436-RI-C", "in-review");
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-22:00:
+    The review handoff now carries move options, so the two-argument form no longer matches. Asserting
+    the PROVENANCE rather than `expect.anything()` (which the sibling assertions in this file use):
+    this pins that the move came from the review-pending-handoff node with progress preserved, so a
+    move made by some other path to the same destination cannot satisfy it.
+    */
+    expect(store.moveTask).toHaveBeenCalledWith("FN-5436-RI-C", "in-review", expect.objectContaining({
+      preserveProgress: true,
+      workflowMoveMetadata: expect.objectContaining({ nodeId: "review-pending-handoff" }),
+    }));
   });
 
   it("FN-5436 composition: recoverApprovedStepsOnResume leaves pending-review skip disabled after approval resolves step", async () => {

@@ -44,6 +44,18 @@ function restoreClipboardMocks() {
   Object.defineProperty(document, "execCommand", { configurable: true, value: originalExecCommand });
 }
 
+/*
+FNXC:Secrets 2026-07-30-10:10:
+Read the DECLARED stroke for `.secrets-action-icon` out of the real stylesheet. jsdom cannot resolve
+`currentColor`, so the declaration is the only place the paint source is observable in this
+environment.
+*/
+function secretsActionIconStrokeDeclaration(): string | undefined {
+  const css = loadAllAppCss();
+  const rule = /\.secrets-action-icon\s*\{([^}]*)\}/.exec(css);
+  return /stroke:\s*([^;]+);/.exec(rule?.[1] ?? "")?.[1]?.trim();
+}
+
 function expectVisibleActionIcon(button: HTMLElement) {
   const svg = button.querySelector("svg");
   expect(svg).not.toBeNull();
@@ -54,7 +66,26 @@ function expectVisibleActionIcon(button: HTMLElement) {
   expect(Number.parseFloat(svgStyle.height)).toBeGreaterThan(0);
   expect(svgStyle.display).toBe("block");
   expect(svgStyle.stroke.toLowerCase()).not.toBe("none");
-  expect(svgStyle.stroke).not.toBe(buttonStyle.backgroundColor);
+  /*
+  FNXC:Secrets 2026-07-30-10:10 (greptile P2 — the colour check alone was not enough):
+  Two halves, because neither is sufficient on its own and jsdom cannot resolve the paint directly.
+
+  `SecretsView.css:227` declares `stroke: currentColor`, and jsdom does NOT resolve `currentColor` —
+  `getComputedStyle().stroke` returns `rgba(0, 0, 0, 0)` for every icon. That is also the icon
+  button's transparent background, so the ORIGINAL assertion (`stroke !== backgroundColor`) was two
+  unresolved values matching each other rather than a visibility check.
+
+  Comparing the resolved `color` fixes that, but on its own it would still pass if the rule regressed
+  to `stroke: transparent`: the paint would be invisible while `color` stayed fine and
+  `stroke !== "none"` also held (transparent is not none). So the paint SOURCE is asserted from the
+  stylesheet — the rule must still take its stroke from `currentColor` — and the resolved `color`
+  must differ from the button background. Together: the icon is painted in `color`, and `color` is
+  not the button's own background.
+
+  True pixel visibility remains the e2e screenshot suite's job.
+  */
+  expect(secretsActionIconStrokeDeclaration()).toBe("currentColor");
+  expect(svgStyle.color).not.toBe(buttonStyle.backgroundColor);
 }
 
 // FNXC:Secrets 2026-06-23-01:30: The cross-node sync passphrase status/actions now live behind a collapsed-by-default
@@ -75,6 +106,143 @@ describe("SecretsView", () => {
     restoreClipboardMocks();
     removeAllCss();
     delete document.documentElement.dataset.theme;
+  });
+
+  it("binds list and sync status requests to the selected project", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(mockJsonResponse({ ok: true, body: { secrets: [] } }))
+      .mockResolvedValueOnce(mockJsonResponse({ ok: true, body: { configured: false } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<SecretsView addToast={vi.fn()} projectId="proj A" />);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith("/api/secrets?projectId=proj%20A", expect.anything());
+      expect(fetchMock).toHaveBeenCalledWith("/api/secrets/sync-passphrase?projectId=proj%20A", expect.anything());
+    });
+  });
+
+  it("drops stale project rows when project selection changes before a prior response resolves", async () => {
+    let resolveA!: (response: Response) => void;
+    let resolveB!: (response: Response) => void;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/secrets?projectId=proj_A") return new Promise<Response>((resolve) => { resolveA = resolve; });
+      if (url === "/api/secrets?projectId=proj_B") return new Promise<Response>((resolve) => { resolveB = resolve; });
+      if (url.includes("/sync-passphrase")) return Promise.resolve(mockJsonResponse({ ok: true, body: { configured: false } }));
+      return Promise.resolve(mockJsonResponse({ ok: true, body: { secrets: [] } }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { rerender } = render(<SecretsView addToast={vi.fn()} projectId="proj_A" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets?projectId=proj_A", expect.anything()));
+
+    rerender(<SecretsView addToast={vi.fn()} projectId="proj_B" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets?projectId=proj_B", expect.anything()));
+    expect(screen.queryByText("A_ONLY")).not.toBeInTheDocument();
+
+    resolveB(mockJsonResponse({ ok: true, body: { secrets: [
+      { id: "b", key: "B_ONLY", scope: "project", description: null, accessPolicy: "prompt", envExportable: false, envExportKey: null, lastReadAt: null },
+      { id: "global", key: "SHARED", scope: "global", description: null, accessPolicy: "prompt", envExportable: false, envExportKey: null, lastReadAt: null },
+    ] } }));
+    expect(await screen.findByText("B_ONLY")).toBeInTheDocument();
+    expect(screen.getByText("SHARED")).toBeInTheDocument();
+
+    resolveA(mockJsonResponse({ ok: true, body: { secrets: [{ id: "a", key: "A_ONLY", scope: "project", description: null, accessPolicy: "prompt", envExportable: false, envExportKey: null, lastReadAt: null }] } }));
+    await waitFor(() => expect(screen.getByText("B_ONLY")).toBeInTheDocument());
+    expect(screen.queryByText("A_ONLY")).not.toBeInTheDocument();
+  });
+
+  it("does not let an A mutation completion close or clear B's secret draft", async () => {
+    let resolveCreateA!: (response: Response) => void;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url === "/api/secrets?projectId=proj_A" && method === "POST") return new Promise<Response>((resolve) => { resolveCreateA = resolve; });
+      if (url.startsWith("/api/secrets?") && method === "GET") return Promise.resolve(mockJsonResponse({ ok: true, body: { secrets: [] } }));
+      if (url.includes("/sync-passphrase") && method === "GET") return Promise.resolve(mockJsonResponse({ ok: true, body: { configured: false } }));
+      return Promise.resolve(mockJsonResponse({ ok: true, body: { success: true } }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { rerender } = render(<SecretsView addToast={vi.fn()} projectId="proj_A" />);
+    await screen.findByText("No secrets found.");
+    await userEvent.click(screen.getByRole("button", { name: "Add Secret" }));
+    let dialog = screen.getByRole("dialog", { name: "Add secret" });
+    let inputs = within(dialog).getAllByRole("textbox");
+    await userEvent.type(inputs[0]!, "A_PENDING");
+    await userEvent.type(inputs[1]!, "a-value");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets?projectId=proj_A", expect.objectContaining({ method: "POST" })));
+
+    rerender(<SecretsView addToast={vi.fn()} projectId="proj_B" />);
+    await screen.findByText("No secrets found.");
+    await userEvent.click(screen.getByRole("button", { name: "Add Secret" }));
+    dialog = screen.getByRole("dialog", { name: "Add secret" });
+    inputs = within(dialog).getAllByRole("textbox");
+    await userEvent.type(inputs[0]!, "B_DRAFT");
+
+    resolveCreateA(mockJsonResponse({ ok: true, status: 201, body: { id: "a", key: "A_PENDING" } }));
+    await waitFor(() => expect(within(screen.getByRole("dialog", { name: "Add secret" })).getAllByRole("textbox")[0]).toHaveValue("B_DRAFT"));
+  });
+
+  it("binds create, update, reveal, delete, and sync mutations to the selected project", async () => {
+    const projectId = "proj_actions";
+    const baseUrl = `/api/secrets?projectId=${projectId}`;
+    const row = { id: "secret-1", key: "VISIBLE", scope: "project" as const, description: null, accessPolicy: "prompt" as const, envExportable: false, envExportKey: null, lastReadAt: null };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url === baseUrl && method === "GET") return Promise.resolve(mockJsonResponse({ ok: true, body: { secrets: [row] } }));
+      if (url === baseUrl && method === "POST") return Promise.resolve(mockJsonResponse({ ok: true, status: 201, body: { ...row, id: "created", key: "CREATED" } }));
+      if (url === "/api/secrets/sync-passphrase?projectId=proj_actions" && method === "GET") return Promise.resolve(mockJsonResponse({ ok: true, body: { configured: true } }));
+      if (url === "/api/secrets/sync-passphrase?projectId=proj_actions" && method === "PUT") return Promise.resolve(mockJsonResponse({ ok: true, body: { success: true } }));
+      if (url === "/api/secrets/sync-passphrase?projectId=proj_actions" && method === "DELETE") return Promise.resolve(mockJsonResponse({ ok: true, body: { success: true } }));
+      if (url === "/api/secrets/project/secret-1?projectId=proj_actions" && method === "PATCH") return Promise.resolve(mockJsonResponse({ ok: true, body: row }));
+      if (url === "/api/secrets/project/secret-1/reveal?projectId=proj_actions" && method === "POST") return Promise.resolve(mockJsonResponse({ ok: true, body: { key: row.key, value: "revealed-value" } }));
+      if (url === "/api/secrets/project/secret-1?projectId=proj_actions" && method === "DELETE") return Promise.resolve(mockJsonResponse({ ok: true, status: 204, body: undefined }));
+      return Promise.resolve(mockJsonResponse({ ok: false, body: { error: `Unhandled ${method} ${url}` } }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<SecretsView addToast={vi.fn()} projectId={projectId} />);
+    await screen.findByText("VISIBLE");
+
+    await userEvent.click(screen.getByRole("button", { name: "Add Secret" }));
+    let dialog = screen.getByRole("dialog", { name: "Add secret" });
+    const createInputs = within(dialog).getAllByRole("textbox");
+    await userEvent.type(createInputs[0]!, "CREATED");
+    await userEvent.type(createInputs[1]!, "created-value");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(baseUrl, expect.objectContaining({ method: "POST" })));
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit" }));
+    dialog = screen.getByRole("dialog", { name: "Edit secret" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets/project/secret-1?projectId=proj_actions", expect.objectContaining({ method: "PATCH" })));
+
+    await userEvent.click(screen.getByRole("button", { name: "Reveal" }));
+    expect(await screen.findByText("revealed-value")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith("/api/secrets/project/secret-1/reveal?projectId=proj_actions", expect.objectContaining({ method: "POST" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets/project/secret-1?projectId=proj_actions", expect.objectContaining({ method: "DELETE" })));
+
+    await expandPassphraseDisclosure();
+    await screen.findByText("Configured");
+    await userEvent.click(screen.getByRole("button", { name: "Rotate" }));
+    dialog = screen.getByRole("dialog", { name: "Rotate sync passphrase" });
+    const passphraseInputs = dialog.querySelectorAll("input");
+    await userEvent.type(passphraseInputs[0]!, "new-passphrase");
+    await userEvent.type(passphraseInputs[1]!, "new-passphrase");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Rotate" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets/sync-passphrase?projectId=proj_actions", expect.objectContaining({ method: "PUT" })));
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/secrets/sync-passphrase?projectId=proj_actions", expect.objectContaining({ method: "DELETE" })));
   });
 
   it("renders Not configured status", async () => {

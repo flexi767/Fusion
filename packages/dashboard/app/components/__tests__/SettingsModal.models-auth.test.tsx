@@ -5,6 +5,7 @@ import path from "path";
 import { SettingsModal } from "../SettingsModal";
 import type { SettingsExportData, UpdateCheckResponse } from "../../api";
 import { ApiRequestError } from "../../api";
+import { __test_resetPendingUpdateInstall } from "../../hooks/usePendingUpdateInstall";
 import {
   mockFetchSettings,
   mockFetchSettingsByScope,
@@ -77,6 +78,7 @@ import {
   settingsModalUser,
   expectSettingPersists,
   installSettingsModalEnv,
+  flushSettingsAutoSave,
 } from "./SettingsModal.test-harness";
 
 vi.mock("../../api", async (importOriginal) => {
@@ -121,6 +123,7 @@ vi.mock("../../api", async (importOriginal) => {
     fetchProjects: (...args: unknown[]) => mockFetchProjects(...args),
     fetchDashboardHealth: (...args: unknown[]) => mockFetchDashboardHealth(...args),
     checkForUpdates: (...args: unknown[]) => mockCheckForUpdates(...args),
+    checkForUpdate: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: null, updateAvailable: false })),
     installUpdate: (...args: unknown[]) => mockInstallUpdate(...args),
     fetchRemoteSettings: (...args: unknown[]) => mockFetchRemoteSettings(...args),
     updateRemoteSettings: (...args: unknown[]) => mockUpdateRemoteSettings(...args),
@@ -162,6 +165,7 @@ vi.mock("../../hooks/useViewportMode", () => ({
   isShortViewport: () => false,
   getViewportMode: () => "mobile",
   isMobileViewport: () => true,
+  isTabletTouchViewport: (mode?: string) => mode === "tablet",
   useViewportMode: () => "mobile",
 }));
 vi.mock("lucide-react", async (importOriginal) => {
@@ -206,10 +210,32 @@ describe("SettingsModal", () => {
   installSettingsModalEnv();
 
   beforeEach(() => {
+    __test_resetPendingUpdateInstall();
     localStorage.setItem("fusion:settings:show-advanced", "true");
   });
 
   describe("Project Models", () => {
+    it("renders the Fast & Cheap Model lane with its help in Global and Project Models", async () => {
+      mockFetchModels.mockResolvedValue({
+        models: MODEL_FIXTURE,
+        favoriteProviders: [],
+        favoriteModels: [],
+      });
+
+      renderModal({ initialSection: "global-models" });
+      await waitForSettingsModalReady();
+      expect(screen.getByLabelText("Fast & Cheap Model")).toBeInTheDocument();
+      expect(screen.getByText("Select a cheap model here for quick edits. It is used for Fast Mode when creating a task.")).toBeInTheDocument();
+      expect(document.querySelector('[data-settings-key="fastCheapGlobalModelId"]')).toBeInTheDocument();
+
+      cleanup();
+      renderModal({ initialSection: "project-models" });
+      await waitForSettingsModalReady();
+      expect(screen.getByLabelText("Fast & Cheap Model")).toBeInTheDocument();
+      expect(screen.getByText(/Select a cheap model here for quick edits\. It is used for Fast Mode when creating a task\./)).toBeInTheDocument();
+      expect(document.querySelector('[data-settings-key="fastCheapModelId"]')).toBeInTheDocument();
+    });
+
     it("saves opencode-go startup model sync toggle in global settings", async () => {
       mockFetchModels.mockResolvedValue({
         models: MODEL_FIXTURE,
@@ -227,15 +253,109 @@ describe("SettingsModal", () => {
       });
     });
 
-    it("saves the task-definition input-language toggle in the project settings payload", async () => {
+    it("saves task output language in the project settings payload", async () => {
       await expectSettingPersists({
         section: "Models · Project",
-        label: "Write task definitions in the operator's input language",
-        kind: "checkbox",
-        value: true,
+        label: "AI-authored task language",
+        kind: "select",
+        value: "input",
         scope: "project",
-        expectedKey: "taskDefinitionInInputLanguage",
+        expectedKey: "taskOutputLanguage",
       });
+    });
+
+    /*
+    FNXC:ExecutorEscalation 2026-08-03-05:43:
+    The original Scheduling text fields accepted incomplete provider/model pairs. The project-scoped picker must instead present one provider-qualified selection, save both legacy keys together, and clear both keys together.
+    */
+    it("selects and clears the executor escalation model as one project-scoped pair", async () => {
+      mockFetchModels.mockResolvedValue({
+        models: MODEL_FIXTURE,
+        favoriteProviders: [],
+        favoriteModels: [],
+      });
+      mockFetchSettings.mockResolvedValue({
+        ...defaultSettings,
+        executorEscalationProvider: "anthropic",
+        executorEscalationModelId: "claude-sonnet-4-5",
+      });
+      mockFetchSettingsByScope.mockResolvedValue({
+        global: defaultSettings,
+        project: {
+          executorEscalationProvider: "anthropic",
+          executorEscalationModelId: "claude-sonnet-4-5",
+        },
+      });
+
+      renderModal({ initialSection: "project-models" });
+      await waitForSettingsModalReady();
+
+      const selector = screen.getByLabelText("Executor Escalation Model");
+      expect(selector).toHaveTextContent("Claude Sonnet 4.5");
+      await settingsModalUser.click(selector);
+      await settingsModalUser.click(await screen.findByText("GPT-4o"));
+      fireEvent.click(document.querySelector(".modal-close") as HTMLButtonElement);
+
+      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          executorEscalationProvider: "openai",
+          executorEscalationModelId: "gpt-4o",
+        }),
+        undefined,
+      ));
+
+      cleanup();
+      mockUpdateSettings.mockClear();
+      renderModal({ initialSection: "project-models" });
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByLabelText("Executor Escalation Model"));
+      await settingsModalUser.click(await screen.findByText("No escalation model"));
+      fireEvent.click(document.querySelector(".modal-close") as HTMLButtonElement);
+
+      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          executorEscalationProvider: null,
+          executorEscalationModelId: null,
+        }),
+        undefined,
+      ));
+    });
+
+    it("disables the escalation selector while the catalog is loading or empty", async () => {
+      let resolveModels: ((value: { models: typeof MODEL_FIXTURE; favoriteProviders: string[]; favoriteModels: string[] }) => void) | undefined;
+      mockFetchModels.mockImplementation(() => new Promise((resolve) => {
+        resolveModels = resolve;
+      }));
+
+      renderModal({ initialSection: "project-models" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByLabelText("Executor Escalation Model")).toBeDisabled();
+      resolveModels?.({ models: MODEL_FIXTURE, favoriteProviders: [], favoriteModels: [] });
+      await waitFor(() => expect(screen.getByLabelText("Executor Escalation Model")).not.toBeDisabled());
+    });
+
+    it("treats incomplete legacy escalation pairs as unset and removes Scheduling model inputs", async () => {
+      mockFetchModels.mockResolvedValue({
+        models: MODEL_FIXTURE,
+        favoriteProviders: [],
+        favoriteModels: [],
+      });
+      mockFetchSettings.mockResolvedValue({
+        ...defaultSettings,
+        executorEscalationProvider: "anthropic",
+      });
+
+      renderModal({ initialSection: "project-models" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByLabelText("Executor Escalation Model")).toHaveTextContent("No escalation model");
+      await settingsModalUser.click(screen.getByRole("button", { name: "Scheduling" }));
+
+      expect(screen.queryByLabelText("Escalation provider")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("Escalation model ID")).not.toBeInTheDocument();
+      expect(screen.getByRole("checkbox", { name: "Escalate after tool-failure retries" })).toBeInTheDocument();
+      expect(screen.getByLabelText("Escalation node ID")).toBeInTheDocument();
     });
 
     it("renders and saves OpenRouter advanced settings", async () => {
@@ -254,8 +374,10 @@ describe("SettingsModal", () => {
       expect(screen.getByLabelText("OpenRouter HTTP-Referer")).toBeInTheDocument();
       expect(screen.getByLabelText("OpenRouter X-Title")).toBeInTheDocument();
 
-      await settingsModalUser.type(screen.getByLabelText("OpenRouter HTTP-Referer"), "https://example.app");
-      await settingsModalUser.type(screen.getByLabelText("OpenRouter X-Title"), "Example App");
+      // FNXC:SettingsModalTests 2026-08-16-03:46: flush the 500ms auto-save debounce on the fake clock instead of a real-timer waitFor (FN-2707); assertions unchanged. Fake timers must be enabled BEFORE the mutating edits so the debounce lands on the fake clock.
+      vi.useFakeTimers();
+      fireEvent.change(screen.getByLabelText("OpenRouter HTTP-Referer"), { target: { value: "https://example.app" } });
+      fireEvent.change(screen.getByLabelText("OpenRouter X-Title"), { target: { value: "Example App" } });
       fireEvent.change(screen.getByLabelText("OpenRouter supported_parameters filter"), {
         target: { value: "tools, structured_outputs" },
       });
@@ -263,14 +385,13 @@ describe("SettingsModal", () => {
       fireEvent.change(screen.getByLabelText("OpenRouter routing order"), { target: { value: "openai, anthropic" } });
       fireEvent.change(screen.getByLabelText("OpenRouter routing ignore"), { target: { value: "provider-x" } });
       fireEvent.change(screen.getByLabelText("OpenRouter routing only"), { target: { value: "provider-y" } });
-      await settingsModalUser.selectOptions(screen.getByLabelText("OpenRouter allow fallbacks"), "deny");
-      await settingsModalUser.selectOptions(screen.getByLabelText("OpenRouter routing sort"), "latency");
-      await settingsModalUser.click(screen.getByLabelText("Require parameters"));
+      fireEvent.change(screen.getByLabelText("OpenRouter allow fallbacks"), { target: { value: "deny" } });
+      fireEvent.change(screen.getByLabelText("OpenRouter routing sort"), { target: { value: "latency" } });
+      fireEvent.click(screen.getByLabelText("Require parameters"));
 
-
-      await waitFor(() => {
-        expect(mockUpdateGlobalSettings).toHaveBeenCalled();
-      });
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+      expect(mockUpdateGlobalSettings).toHaveBeenCalled();
 
       expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -348,11 +469,13 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.click(screen.getByRole("button", { name: "Models · Project" }));
       await settingsModalUser.click(screen.getByLabelText("Project Default Model"));
-      await settingsModalUser.click(screen.getByText("GPT-4o"));
+      // FNXC:SettingsModalTests 2026-08-16-03:46: the picker is already open; the item click is the mutating edit, so it runs under fake timers and the 500ms auto-save debounce is flushed on the fake clock (FN-2707).
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByText("GPT-4o"));
 
-      await waitFor(() => {
-        expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
-      });
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+      expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
 
       expect(mockUpdateSettings).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -452,7 +575,7 @@ describe("SettingsModal", () => {
       const onOpenWorkflowSettings = vi.fn();
       await setupWorkflowModelLaneTest({ renderProps: { onOpenWorkflowSettings } });
 
-      const workflowHeading = screen.getByRole("heading", { name: "Default workflow model lanes" });
+      const workflowHeading = screen.getByRole("heading", { name: "Workflow lanes" });
       const advancedButton = screen.getByRole("button", { name: "Advanced workflow policy" });
       const actionRow = advancedButton.closest(".settings-model-lane-actions");
       const presetsHeading = screen.getByRole("heading", { name: "Model Presets" });
@@ -500,7 +623,8 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.click(screen.getByLabelText("Plan/Triage Model"));
       await settingsModalUser.click(await screen.findByText("GPT-4o"));
-      await settingsModalUser.click(screen.getAllByRole("button", { name: "Close" }).at(-1)!);
+      // FNXC:SettingsModalTests 2026-07-27-17:20: scoped footer-close selector avoids the whole-tree accessible-name walk of getAllByRole({ name: "Close" }).
+      await settingsModalUser.click(document.querySelector(".modal-actions-right button") as HTMLButtonElement);
 
       await waitFor(() => expect(mockUpdateWorkflowSettingValues).toHaveBeenCalledWith("workflow-custom", expectedPatch, "proj-1"));
       expect(onClose).toHaveBeenCalledTimes(1);
@@ -516,10 +640,12 @@ describe("SettingsModal", () => {
       await setupWorkflowModelLaneTest();
 
       await settingsModalUser.click(screen.getByLabelText("Plan/Triage Model"));
-      await settingsModalUser.click(await screen.findByText("GPT-4o"));
-      await waitFor(() => {
-        expect(mockUpdateWorkflowSettingValues).toHaveBeenCalledWith("workflow-custom", expectedPatch, "proj-1");
-      });
+      const laneOption = await screen.findByText("GPT-4o");
+      vi.useFakeTimers();
+      fireEvent.click(laneOption);
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+      expect(mockUpdateWorkflowSettingValues).toHaveBeenCalledWith("workflow-custom", expectedPatch, "proj-1");
 
       cleanup();
       mockFetchWorkflow.mockClear();
@@ -528,7 +654,7 @@ describe("SettingsModal", () => {
       await setupWorkflowModelLaneTest({ stored: expectedPatch, effective: expectedPatch });
 
       const lane = screen.getByTestId("workflow-model-lane-planning");
-      expect(within(lane).getByText("Override (Project)")).toBeInTheDocument();
+      expect(within(lane).getByText("Project baseline")).toBeInTheDocument();
       expect(within(lane).getByText("GPT-4o")).toBeInTheDocument();
       expect(screen.getByTestId("workflow-model-lane-execution")).toHaveTextContent("Inherited (Workflow)");
     });
@@ -583,7 +709,7 @@ describe("SettingsModal", () => {
       });
 
       const lane = screen.getByTestId("workflow-model-lane-validator-fallback");
-      expect(within(lane).getByText("Override (Project)")).toBeInTheDocument();
+      expect(within(lane).getByText("Project baseline")).toBeInTheDocument();
       await settingsModalUser.click(within(lane).getByRole("button", { name: "Reset" }));
 
       await waitFor(() => {
@@ -789,7 +915,7 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
 
       expect(screen.queryByText(/^Version\s+/)).not.toBeInTheDocument();
-      await settingsModalUser.click(screen.getByRole("button", { name: "Scheduling · Project" }));
+      await settingsModalUser.click(screen.getByRole("button", { name: "Scheduling" }));
       expect(await screen.findByLabelText("Max Concurrent Tasks")).toBeInTheDocument();
       expect(addToast).not.toHaveBeenCalled();
     });
@@ -870,6 +996,75 @@ describe("SettingsModal", () => {
       await waitFor(() => expect(mockInstallUpdate).toHaveBeenCalledTimes(1));
       expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Update now" })).not.toBeInTheDocument();
+    });
+
+    it("preserves the installed restart state after closing and reopening Settings", async () => {
+      mockCheckForUpdates.mockResolvedValueOnce({
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updateAvailable: true,
+      });
+      mockInstallUpdate.mockResolvedValueOnce({
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updated: true,
+        outcome: "installed",
+      });
+
+      const firstModal = renderModal();
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Check for updates" }));
+      await settingsModalUser.click(await screen.findByRole("button", { name: "Update now" }));
+      expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
+
+      firstModal.unmount();
+      renderModal();
+      await waitForSettingsModalReady();
+
+      expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Restart Fusion" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Update now" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Updating…" })).not.toBeInTheDocument();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+      expect(mockInstallUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it("retains a successful install that completes after Settings closes", async () => {
+      mockCheckForUpdates.mockResolvedValueOnce({
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updateAvailable: true,
+      });
+      let resolveInstall: ((result: { currentVersion: string; latestVersion: string; updated: boolean; outcome: "installed" }) => void) | undefined;
+      mockInstallUpdate.mockReturnValueOnce(new Promise((resolve) => {
+        resolveInstall = resolve;
+      }));
+
+      const firstModal = renderModal();
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Check for updates" }));
+      await settingsModalUser.click(await screen.findByRole("button", { name: "Update now" }));
+      expect(await screen.findByRole("button", { name: "Updating…" })).toBeDisabled();
+
+      firstModal.unmount();
+      await act(async () => {
+        resolveInstall?.({
+          currentVersion: "1.0.0",
+          latestVersion: "2.0.0",
+          updated: true,
+          outcome: "installed",
+        });
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Restart Fusion" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Update now" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Updating…" })).not.toBeInTheDocument();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+      expect(mockInstallUpdate).toHaveBeenCalledTimes(1);
     });
 
     it("disables update-now and shows inline errors while installing", async () => {
@@ -1128,10 +1323,10 @@ describe("SettingsModal", () => {
         return 1 as unknown as ReturnType<typeof setInterval>;
       });
 
-      const { container } = renderModal();
+      renderModal();
       await waitForSettingsModalReady();
 
-      const settingsContent = container.querySelector(".settings-content") as HTMLDivElement;
+      const settingsContent = document.querySelector(".settings-content") as HTMLDivElement;
       expect(settingsContent).toBeInTheDocument();
       const scrollToSpy = vi.fn();
       Object.defineProperty(settingsContent, "scrollTo", {
@@ -1247,6 +1442,64 @@ describe("SettingsModal", () => {
 
         expect(addToast).toHaveBeenCalledWith("Login successful", "success");
         expect(addToast).not.toHaveBeenCalledWith("Login did not complete. Please try again.", "error");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("preserves sibling providers and named accounts while polling a named OAuth login", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus
+        .mockResolvedValueOnce({
+          providers: [
+            {
+              id: "anthropic-subscription",
+              name: "Anthropic Subscription",
+              authenticated: false,
+              type: "oauth",
+              instanceId: "work",
+              instances: [
+                { instanceId: "work", label: "Work", isDefault: true, authenticated: false, type: "oauth" },
+                { instanceId: "personal", label: "Personal", isDefault: false, authenticated: false, type: "oauth" },
+              ],
+            },
+            { id: "github", name: "GitHub", authenticated: false, type: "oauth" },
+          ],
+        })
+        .mockResolvedValueOnce({
+          providers: [
+            {
+              id: "anthropic-subscription",
+              name: "Anthropic Subscription",
+              authenticated: false,
+              type: "oauth",
+              instanceId: "work",
+              loginInProgress: true,
+              instances: [{ instanceId: "work", label: "Work", isDefault: true, authenticated: false, type: "oauth" }],
+            },
+          ],
+        });
+      mockLoginProvider.mockResolvedValueOnce({ url: "https://claude.ai/oauth/authorize" });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Authentication" }));
+      vi.useFakeTimers();
+
+      try {
+        const instances = screen.getByTestId("auth-instances-anthropic-subscription");
+        fireEvent.click(within(instances).getAllByRole("button", { name: "Login" })[0]);
+
+        await act(async () => {
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(2000);
+        });
+
+        expect(mockLoginProvider).toHaveBeenCalledWith("anthropic-subscription", "work");
+        expect(mockFetchAuthStatus).toHaveBeenLastCalledWith({ provider: "anthropic-subscription", instance: "work" });
+        expect(openSpy).toHaveBeenCalledWith("https://claude.ai/oauth/authorize", "_blank");
+        expect(screen.getByText("Personal")).toBeInTheDocument();
+        expect(screen.getByTestId("auth-provider-icon-github")).toBeInTheDocument();
       } finally {
         vi.useRealTimers();
       }
@@ -1456,6 +1709,29 @@ describe("SettingsModal", () => {
       }
     });
 
+    it("skips the manual-paste confirmation for remote Codex device code", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", requiresManualCode: false }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({
+        url: "https://auth.openai.com/codex/device",
+        deviceCode: { userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" },
+      });
+
+      render(<SettingsModal onClose={noop} addToast={vi.fn()} />);
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Authentication" }));
+      const codexCard = screen.getByTestId("auth-provider-icon-openai-codex").closest(".auth-provider-card") as HTMLElement;
+      await settingsModalUser.click(within(codexCard).getByRole("button", { name: "Login" }));
+
+      expect(await within(codexCard).findByText("ABCD-1234")).toBeInTheDocument();
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("provider-login-dialog-openai-codex")).toBeNull();
+      expect(within(codexCard).queryByTestId("auth-manual-code-openai-codex")).not.toBeInTheDocument();
+      expect(openSpy).not.toHaveBeenCalled();
+    });
+
     it("uses execCommand fallback when clipboard API is unavailable", async () => {
       const addToast = vi.fn();
       Object.defineProperty(navigator, "clipboard", {
@@ -1557,6 +1833,26 @@ describe("SettingsModal", () => {
       expect(mockClearApiKey).toHaveBeenCalledWith("anthropic-api-key");
     });
 
+    it("routes named credential instances through their matching auth actions", async () => {
+      mockFetchAuthStatus.mockResolvedValue({
+        providers: [
+          { id: "anthropic-subscription", name: "Anthropic Subscription", authenticated: true, type: "oauth", instanceId: "work" },
+          { id: "anthropic-api-key", name: "Anthropic API Key", authenticated: true, type: "api_key", instanceId: "billing", keyHint: "sk-•••••work" },
+        ],
+      });
+
+      render(<SettingsModal onClose={noop} addToast={vi.fn()} />);
+      await settingsModalUser.click(await screen.findByRole("button", { name: "Authentication" }));
+
+      const subscriptionCard = screen.getByTestId("auth-provider-icon-anthropic-subscription").closest(".auth-provider-card") as HTMLElement;
+      const apiKeyCard = screen.getByTestId("auth-provider-icon-anthropic-api-key").closest(".auth-provider-card") as HTMLElement;
+      await settingsModalUser.click(within(subscriptionCard).getByRole("button", { name: "Logout" }));
+      await settingsModalUser.click(within(apiKeyCard).getByRole("button", { name: "Clear" }));
+
+      expect(mockLogoutProvider).toHaveBeenCalledWith("anthropic-subscription", "work");
+      expect(mockClearApiKey).toHaveBeenCalledWith("anthropic-api-key", "billing");
+    });
+
     it("scrolls settings content to top after API key save succeeds", async () => {
       mockFetchAuthStatus.mockResolvedValueOnce({
         providers: [{ id: "openai", name: "OpenAI", authenticated: false, type: "api_key" }],
@@ -1565,10 +1861,10 @@ describe("SettingsModal", () => {
         providers: [{ id: "openai", name: "OpenAI", authenticated: true, type: "api_key" }],
       });
 
-      const { container } = renderModal();
+      renderModal();
       await waitForSettingsModalReady();
 
-      const settingsContent = container.querySelector(".settings-content") as HTMLDivElement;
+      const settingsContent = document.querySelector(".settings-content") as HTMLDivElement;
       expect(settingsContent).toBeInTheDocument();
       const scrollToSpy = vi.fn();
       Object.defineProperty(settingsContent, "scrollTo", {
@@ -1592,9 +1888,9 @@ describe("SettingsModal", () => {
       });
       mockSaveApiKey.mockResolvedValueOnce({ success: true, modelsRefreshed: 4 });
 
-      const { container } = renderModal();
+      renderModal();
       await waitForSettingsModalReady();
-      const settingsContent = container.querySelector(".settings-content") as HTMLDivElement;
+      const settingsContent = document.querySelector(".settings-content") as HTMLDivElement;
       Object.defineProperty(settingsContent, "scrollTo", { value: vi.fn(), writable: true });
 
       const card = screen.getByTestId("auth-provider-icon-opencode-go").closest(".auth-provider-card") as HTMLElement;
@@ -1610,9 +1906,9 @@ describe("SettingsModal", () => {
       });
       mockSaveApiKey.mockResolvedValueOnce({ success: true, modelsRefreshed: 0, refreshReason: "no-models-from-cli" });
 
-      const { container } = renderModal();
+      renderModal();
       await waitForSettingsModalReady();
-      const settingsContent = container.querySelector(".settings-content") as HTMLDivElement;
+      const settingsContent = document.querySelector(".settings-content") as HTMLDivElement;
       Object.defineProperty(settingsContent, "scrollTo", { value: vi.fn(), writable: true });
 
       const card = screen.getByTestId("auth-provider-icon-opencode-go").closest(".auth-provider-card") as HTMLElement;
@@ -1628,9 +1924,9 @@ describe("SettingsModal", () => {
       });
       mockSaveApiKey.mockResolvedValueOnce({ success: true, refreshError: "spawn opencode ENOENT" });
 
-      const { container } = renderModal();
+      renderModal();
       await waitForSettingsModalReady();
-      const settingsContent = container.querySelector(".settings-content") as HTMLDivElement;
+      const settingsContent = document.querySelector(".settings-content") as HTMLDivElement;
       Object.defineProperty(settingsContent, "scrollTo", { value: vi.fn(), writable: true });
 
       const card = screen.getByTestId("auth-provider-icon-opencode-go").closest(".auth-provider-card") as HTMLElement;
@@ -1860,4 +2156,3 @@ describe("SettingsModal", () => {
     });
   });
 });
-

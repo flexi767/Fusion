@@ -1,21 +1,31 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { AgentRuntime } from "../agent-runtime.js";
-import { resolveRuntime } from "../runtime-resolution.js";
-import { createResolvedAgentSession } from "../agent-session-helpers.js";
-import type { PluginRunner } from "../plugin-runner.js";
+import type { AgentRuntime } from "../agents/agent-runtime.js";
+import { resolveRuntime } from "../execution/runtime-resolution.js";
+import { createResolvedAgentSession } from "../agents/agent-session-helpers.js";
+import type { PluginRunner } from "../plugins/plugin-runner.js";
 import type { PluginRuntimeRegistration } from "@fusion/core";
 
 const mockCreateFnAgent = vi.hoisted(() => vi.fn());
 
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn(() => ({
-    log: vi.fn(),
+    log: vi.fn(), debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   })),
 }));
 
 vi.mock("../pi.js", () => ({
+  /*
+  FNXC:TestInfrastructure 2026-07-29-15:30:
+  `wrapCustomToolsForPluginRuntime` (agent-session-helpers.ts:104) applies this as
+  the outermost tool wrapper on every NON-PI runtime path — which is exactly what
+  this suite exercises — so omitting it threw "No wrapToolsWithOutputBudget export
+  is defined on the ../pi.js mock" at session construction. Identity stub: the real
+  function returns tools byte-identical for a null budget, and this suite asserts
+  runtime selection/metadata, not output budgeting.
+  */
+  wrapToolsWithOutputBudget: vi.fn((tools: unknown[]) => tools),
   createFnAgent: mockCreateFnAgent,
   promptWithFallback: vi.fn().mockResolvedValue(undefined),
   describeModel: vi.fn().mockReturnValue("pi/default"),

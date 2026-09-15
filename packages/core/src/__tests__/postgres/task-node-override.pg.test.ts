@@ -120,6 +120,69 @@ pgTest("task node override persistence (PostgreSQL)", () => {
     expect((await store.getTask(third.id)).nodeId).toBeUndefined();
   });
 
+  /*
+  FNXC:NodeRouting 2026-08-09-05:08:
+  Durable #3365 coverage proves the JSON/SQL round trip cannot retain a dispatch snapshot after a
+  non-checked-out override change. The negative cases preserve lease-bound and explicit replacement
+  routes; source-only replacement clears the old id rather than storing a half-stale snapshot.
+  */
+  describe("effective route invalidation", () => {
+    async function createWithSnapshot() {
+      const store = h.store();
+      const task = await store.createTask({description: "effective route repro", nodeId: "node-old"});
+      await store.updateTask(task.id, {
+        effectiveNodeId: "node-old",
+        effectiveNodeSource: "task-override",
+      });
+      return {store, task};
+    }
+
+    it("clears the persisted snapshot after changing a non-checked-out override", async () => {
+      const {store, task} = await createWithSnapshot();
+      await store.updateTask(task.id, {nodeId: "node-new"});
+
+      const fetched = await store.getTask(task.id);
+      expect(fetched.nodeId).toBe("node-new");
+      expect(fetched.effectiveNodeId).toBeUndefined();
+      expect(fetched.effectiveNodeSource).toBeUndefined();
+    });
+
+    it("preserves a snapshot for a task checked out when read", async () => {
+      const {store, task} = await createWithSnapshot();
+      await store.updateTask(task.id, {checkedOutBy: "agent-x"});
+      await store.updateTask(task.id, {nodeId: "node-new"});
+
+      const fetched = await store.getTask(task.id);
+      expect(fetched.effectiveNodeId).toBe("node-old");
+      expect(fetched.effectiveNodeSource).toBe("task-override");
+    });
+
+    it("preserves a route during combined reassignment after checkout is cleared mid-pass", async () => {
+      const {store, task} = await createWithSnapshot();
+      await store.updateTask(task.id, {assignedAgentId: "agent-x", checkedOutBy: "agent-x"});
+      await store.updateTask(task.id, {assignedAgentId: "agent-y", nodeId: "node-new"});
+
+      const fetched = await store.getTask(task.id);
+      expect(fetched.checkedOutBy).toBeUndefined();
+      expect(fetched.effectiveNodeId).toBe("node-old");
+      expect(fetched.effectiveNodeSource).toBe("task-override");
+    });
+
+    it("honors a complete replacement and clears only the stale id for source-only replacement", async () => {
+      const complete = await createWithSnapshot();
+      await complete.store.updateTask(complete.task.id, {
+        nodeId: "node-new", effectiveNodeId: "node-new", effectiveNodeSource: "task-override",
+      });
+      expect((await complete.store.getTask(complete.task.id)).effectiveNodeId).toBe("node-new");
+
+      const sourceOnly = await createWithSnapshot();
+      await sourceOnly.store.updateTask(sourceOnly.task.id, {nodeId: "node-new", effectiveNodeSource: "local"});
+      const fetched = await sourceOnly.store.getTask(sourceOnly.task.id);
+      expect(fetched.effectiveNodeId).toBeUndefined();
+      expect(fetched.effectiveNodeSource).toBe("local");
+    });
+  });
+
   // FNXC:StateMachine 2026-07-07-12:00: Signature 2 (FN-7641) end-to-end regression through the
   // real store.updateTask surface (not just the pure guard) — nodeId='end' must finalize-on-proof
   // or error, never silently no-op, for both non-workflow and custom-workflow tasks.
@@ -175,7 +238,14 @@ pgTest("task node override persistence (PostgreSQL)", () => {
 
     it("is a true no-op (no throw, stays done) when the task is already done", async () => {
       const store = h.store();
-      const created = await store.createTask({ description: "already done repro" });
+      /*
+      FNXC:MergeAuthority 2026-08-23-16:20:
+      A merge door now refuses a card whose ENABLED pre-merge optional groups have produced no result
+      (b47fb70b81 / 038f802ba4 — the graph is the only merge authority). This case is about the
+      nodeId='end' no-op on an already-done card, so it declares no pre-merge gates instead of relying
+      on the default-on groups the door would legitimately block on.
+      */
+      const created = await store.createTask({ description: "already done repro", enabledWorkflowSteps: [] });
       await store.moveTask(created.id, "todo");
       await store.moveTask(created.id, "in-progress");
       await store.moveTask(created.id, "in-review");

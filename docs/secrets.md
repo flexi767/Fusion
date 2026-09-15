@@ -37,7 +37,7 @@ Threat-model baseline:
 
 - Secret plaintext is **not** stored in PostgreSQL.
 - Ciphertext + nonce are persisted; plaintext exists only in process memory during create/reveal.
-- Secret values must never be logged.
+- Secret values must never be logged in audit metadata, structured logs, or API responses. A policy-allowed `fn_secret_get` read intentionally delivers plaintext into the agent's model-visible transcript; that session/agent log is persisted and executor memory capture can record its `tool_result`, so operators should use `prompt` or `deny` when that exposure is unsuitable.
 - MCP server settings store only secret references for sensitive env/header/token fields; imports surface plaintext as secret-creation descriptors instead of persisting it in settings.
 - MCP server secret references are materialized only at session/probe creation time for MCP-capable AI lanes and `POST /api/mcp/validate`; responses and structured logs include status/count metadata only, never resolved env/header values.
 
@@ -113,17 +113,24 @@ Approval integration is active through `fn_secret_get` policy handling (`package
 
 Dashboard secrets CRUD is shipped via `SecretsView` (`packages/dashboard/app/components/SecretsView.tsx`), backed by the existing secrets API/store surfaces.
 
+Dashboard requests carry the currently selected `projectId`. Secrets routes require that explicit request identity **before** resolving project context, so a missing, empty, or whitespace-only id is rejected with HTTP 400 instead of selecting the daemon launch directory's fallback store. The selected id intentionally binds the project store: project-scoped rows use that project's RLS-protected `project.secrets` partition, while global-scoped rows still use shared `central.secrets_global` and remain visible from every selected project.
+
+### Recovering pre-fix fallback rows
+
+Older dashboard writes made without an explicit project id may be stranded in a `local-*` project partition associated with the daemon launch directory. Fusion does not move these rows automatically: their intended registered-project destination cannot be inferred safely. An operator who has independently identified the destination may reassign only the affected `project.secrets` rows using an audited database recovery procedure. Do not apply this procedure to `central.secrets_global`, and do not treat direct SQL reassignment as runtime architecture.
+
 ## Agent Access (`fn_secret_get`)
 
-`fn_secret_get` is shipped in `packages/cli/src/extension.ts:1542-1629`.
+`fn_secret_get` is shipped in `packages/cli/src/extension.ts`.
 
 Tool contract:
 - Params: `key` (required), `scope?: "project" | "global"`.
 - Resolution: when `scope` is omitted, lookup is project → global; when provided, only that scope is queried. Missing key returns `{ error: "not-found" }`.
+- An `auto` read, or a one-time approved `prompt` read, returns plaintext in model-visible tool `content` with an immediate-use instruction. `details.value` remains available for host consumers.
+- Ambiguous identity, missing, deny, pending approval, and denied approval outcomes contain no plaintext in either `content` or `details`.
 - Policy outcomes:
-  - `auto` → reveals and returns plaintext value (`secret:read` audit at `extension.ts:1615`).
-  - `prompt` → creates `ApprovalRequestStore` request (`secret-read:{scope}:{key}:{agentId}` dedupe key) and returns `{ outcome: "pending_approval", approvalRequestId }` (`extension.ts:1607-1611`).
-  - `deny` → immediate refusal and `secret:approval-denied` audit (`extension.ts:1581-1583`).
+  - `prompt` creates an `ApprovalRequestStore` request (`secret-read:{scope}:{key}:{agentId}` dedupe key) and returns `{ outcome: "pending_approval", approvalRequestId }` until approval is redeemed once.
+  - `deny` returns an immediate refusal and emits `secret:approval-denied`.
 
 ## `.env` Auto-write into Worktrees
 
@@ -132,8 +139,9 @@ Fusion can materialize env-exportable secrets into each acquired task worktree w
 - Supported settings: `enabled`, `filename` (default `.env`, validated as local filename only), `overwritePolicy` (`skip`/`merge`/`replace`), `keyPrefix`, `requireGitignored` (default `true`).
 - Safety guard: when `requireGitignored` is enabled, Fusion runs `git check-ignore -- <filename>` and refuses writes unless the file is ignored.
 - Write contract: managed content is canonicalized and written atomically with mode `0o600`; audit metadata includes keys and counts, never values.
-- Fingerprint sidecar: successful writes persist `.fusion-secrets-env.fingerprint` containing `<sha256>\n<filename>\n` (mode `0o600`) so teardown can verify file integrity before deletion.
-- Teardown cleanup: when a worktree is removed, Fusion deletes the managed env file only when the on-disk fingerprint still matches; edited files are preserved and only the sidecar is removed.
+- Fingerprint record: successful writes atomically persist `.fusion-secrets-env.fingerprint` containing `<sha256>\n<filename>\n` with mode `0o600` in the worktree's private Git directory (`git rev-parse --git-dir`), never in project content. This keeps Fusion bookkeeping out of porcelain status while teardown can verify file integrity before deletion.
+- Legacy reconciliation: before a reused worktree refreshes, Fusion recognizes the exact v0.75.1 UTF-8 root wire format: `<64 lowercase SHA-256 hex>\n<valid filename>\n` (normally `<sha>\n.secrets.env\n`), with no marker or envelope. It writes and syncs a temporary private record, atomically renames it, and syncs the private Git directory before unlinking the root record; it then syncs the worktree root directory before declaring execution safe. Retry re-writes and syncs even a private-only record, so a readable record left after a failed post-rename write cannot bypass the private-directory durability barrier. Thus a crash before either barrier remains fail-closed and retries converge without losing the only validated cleanup authority. Identical private and legacy records reduce to the private record; a valid private record supersedes an absent or invalid legacy record. A malformed sole record, unavailable Git directory, directory-sync failure, tracked root record, or different valid records fails the refresh closed without deleting or overwriting records or the env file.
+- Teardown cleanup: Fusion selects only one uniquely validated canonical record. It deletes the managed env file only when its fingerprint still matches and Git proves it is untracked; a missing env removes equivalent validated records, while a tracked or edited env, malformed record, or conflicting records are preserved for safety and diagnosis. Metadata removal or directory-sync failure is reported as a fixed non-success cleanup outcome rather than a false successful cleanup, so retry can reconcile the remaining authority.
 
 Settings shape is split by scope: project-level secrets settings include `ProjectSettings.secretsEnv` and MCP secret references in `ProjectSettings.mcpServers`, while cross-node sync passphrase state is stored only as the reserved `__sync_passphrase__` row in `secrets_global` and exposed read-only through `GlobalSettings.secretsSyncPassphraseConfigured` (`packages/core/src/types.ts`). Settings never carry plaintext passphrases or MCP credentials; MCP env/header/token fields use `{ secretRef, scope }` and materialize through `SecretsStore.revealSecret(...)` only at the runtime use seam.
 
@@ -204,6 +212,20 @@ Track follow-up: **FN-5031** (missing `packages/core/src/__tests__/secrets-env.t
 
 **Plaintext prohibition:** audit payload metadata must never include plaintext, decrypted values, ciphertext, or nonce fields. Use `assertNoSecretPlaintext(...)` as the canonical enforcement helper before emitting secret audit events.
 
+## Provider credential instances (`auth.json`)
+
+Fusion keeps provider credentials in `~/.fusion/agent/auth.json`. A legacy bare key such as `"openrouter"` is the default instance; a named key is `"openrouter[work]"`. Provider and instance ids are non-empty, no-whitespace, no-bracket strings up to 64 characters. Resolving or reading any credential never rewrites `auth.json`; a rotated OAuth token is persisted only to the concrete instance row it was read from, and only while that row still contains the pre-refresh credential material.
+
+`__fusionDefaultInstances` is reserved metadata, never a credential. Its per-provider pointer wins only when it names an existing valid credential; resolution otherwise falls back to the bare key, then the lexicographically first named instance, then no instance (`getDefaultInstance` returns `undefined`). The metadata is untrusted: malformed records or stale entries are ignored without a read-time repair. Deleting a pointed-to instance removes that pointer in the same locked write.
+
+Long-lived storage instances compare the file stamp before reads, so a default-instance change made by another process is observed without restarting the session. External Claude/Codex OAuth hydration is refused for multi-instance providers, named instance targets, and rows with a provably different `accountId`; a newer CLI credential may still update a single bare row when account identity cannot be proven.
+
+Legacy string APIs parse this grammar rather than accepting raw keys. `set("provider", credential)` updates the resolved default, or creates the bare key when none exists; `remove`, `logout`, `removeInstance`, and `modify` are no-ops when no instance exists. `setDefaultInstance` never creates a credential and rejects a missing target. All mutators, including deletes, reject the reserved metadata key. `list()` and `getAll()` remain logical-provider keyed (one resolved credential per provider); use `listInstances()` for individual instances. On-disk records are untrusted and values are type-filtered as credentials, so metadata and malformed values are never returned. External Claude/Codex hydration intentionally consumes bare keys only and ignores named instance keys.
+
+At session creation, an explicitly selected credential instance wins over the provider default only for that provider. A missing named instance falls back to the canonical provider default and is recorded in `session:runtime-resolved`; Fusion never substitutes an arbitrary instance. If there is no default, session resolution fails without exposing credential material. Omitted instance ids retain the legacy default-resolving behavior.
+
+Dashboard auth routes accept an optional instance id; omitted or blank ids retain default-instance behavior. `GET /api/auth/status?provider=<id>&instance=<id>` keeps the full provider envelope but describes the requested instance at that provider entry. A valid missing id is an unauthenticated `200` result, never a fallback to another account. Credential-establishing login and API-key writes may create a supplied id; rename, default, logout, and delete require an existing id. OAuth binds the id and optional opaque label to its server-side flow state, so a callback cannot fall back to the default account. Instance listings expose only ids, labels, auth status, and masked key hints; raw key and token material never leaves storage. `removeInstance` deletes the credential row and its default participation, while credential clear only removes its usable credential state.
+
 ## Operational Notes
 
 - Backups: preserve PostgreSQL project/central schemas and the master-key material/provider source used by the deployment. Retain legacy SQLite backups only as controlled migration/recovery inputs; they are not runtime authority.
@@ -221,3 +243,7 @@ other secret references remain key-only, so importing a bundle requires the dest
 operator to provision the referenced secrets. `secretsAccessPolicy` and
 `secretsSyncPassphraseConfigured` remain because they are configuration/state rather
 than secret values.
+
+### JIRA API token
+
+Store a JIRA API token or PAT as `JIRA_API_TOKEN` (or the configured `jiraAuthTokenSecretKey`). Fusion checks project scope first and falls back to global scope. The token is revealed only in-process when deriving a branch name and is never logged or returned.

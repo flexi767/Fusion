@@ -13,7 +13,7 @@ import {
   isEngineerRoleAgent,
   isExecutorRoleAgent,
   isImplementationTask,
-} from "../agent-role-policy.js";
+} from "../agents/agent-role-policy.js";
 
 describe("agent-role-policy", () => {
   it("treats triage/todo/in-progress/in-review as implementation tasks", () => {
@@ -42,6 +42,13 @@ describe("agent-role-policy", () => {
     expect(
       canAgentTakeImplementationTask({ role: "executor" }, { column: "todo" }, { allowEngineer: true }),
     ).toBe(true);
+  });
+
+  it("accepts a canonical multi-role executor regardless of legacy role projection", () => {
+    const multiRoleAgent = { roles: ["reviewer", "executor"] as const, role: "reviewer" as const };
+    expect(isExecutorRoleAgent(multiRoleAgent)).toBe(true);
+    expect(canAgentTakeImplementationTaskForExplicitRouting(multiRoleAgent, { column: "todo" })).toBe(true);
+    expect(canAgentTakeImplementationTaskForBacklogPickup(multiRoleAgent, { column: "todo" })).toBe(true);
   });
 
   it("allows durable engineer for explicit routing and opt-in backlog pickup only", () => {

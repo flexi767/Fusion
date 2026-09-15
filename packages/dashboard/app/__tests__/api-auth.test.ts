@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { API_JSON_HEADERS } from "../test/apiRequestHeaders";
 import {
   fetchTaskDetail,
   uploadAttachment,
@@ -13,8 +14,6 @@ import {
   connectMissionInterviewStream,
   assignTask,
   fetchAgentTasks,
-  archiveTask,
-  unarchiveTask,
   deleteTask,
   ApiRequestError,
   moveTask,
@@ -182,8 +181,8 @@ describe("fetchAuthStatus", () => {
     const result = await fetchAuthStatus();
 
     expect(result.providers).toEqual([{ id: "anthropic", name: "Anthropic", authenticated: true }]);
-    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/status", {
-      headers: { "Content-Type": "application/json" },
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/status?origin=http%3A%2F%2Flocalhost%3A3000", {
+      headers: API_JSON_HEADERS,
     });
   });
 
@@ -209,7 +208,7 @@ describe("loginProvider", () => {
 
     expect(result.url).toBe("https://auth.example.com/login");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/login", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ provider: "anthropic", origin: window.location.origin }),
     });
@@ -236,7 +235,7 @@ describe("logoutProvider", () => {
 
     expect(result.success).toBe(true);
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/logout", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ provider: "anthropic" }),
     });
@@ -285,7 +284,7 @@ describe("addSteeringComment", () => {
     expect(result.steeringComments).toHaveLength(1);
     expect(result.steeringComments![0].text).toBe("Please handle the edge case");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/steer", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ text: "Please handle the edge case" }),
     });
@@ -317,7 +316,7 @@ describe("fetchGitRemotes", () => {
 
     expect(result).toEqual(remotes);
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/git/remotes", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
     });
   });
 
@@ -355,7 +354,7 @@ describe("fetchGitRemotesDetailed", () => {
 
     expect(result).toEqual(remotes);
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/git/remotes/detailed", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
     });
   });
 
@@ -388,7 +387,7 @@ describe("addGitRemote", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/git/remotes", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       body: JSON.stringify({ name: "origin", url: "https://github.com/dustinbyrne/kb.git" }),
     });
   });
@@ -426,7 +425,7 @@ describe("removeGitRemote", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/git/remotes/origin", {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
     });
   });
 
@@ -457,7 +456,7 @@ describe("renameGitRemote", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/git/remotes/origin", {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       body: JSON.stringify({ newName: "upstream" }),
     });
   });
@@ -495,7 +494,7 @@ describe("updateGitRemoteUrl", () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/git/remotes/origin/url", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       body: JSON.stringify({ url: "https://new-url.com/repo.git" }),
     });
   });
@@ -540,7 +539,7 @@ describe("approvePlan", () => {
     expect(result.column).toBe("todo");
     expect(result.status).toBeUndefined();
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/approve-plan", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
     });
   });
@@ -574,7 +573,7 @@ describe("rejectPlan", () => {
     expect(result.column).toBe("triage");
     expect(result.status).toBeUndefined();
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/reject-plan", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
     });
   });
@@ -600,7 +599,7 @@ describe("refineTask", () => {
   const FAKE_REFINED_TASK: Task = {
     id: "FN-002",
     description: "Refinement of FN-001",
-    column: "triage",
+    column: "todo",
     dependencies: ["FN-001"],
     steps: [],
     currentStep: 0,
@@ -615,10 +614,11 @@ describe("refineTask", () => {
     const result = await refineTask("FN-001", "Need to add more tests and improve error handling");
 
     expect(result.id).toBe("FN-002");
-    expect(result.column).toBe("triage");
+    expect(result.column).toBe("todo");
+    expect(result.column).not.toBe("triage");
     expect(result.dependencies).toContain("FN-001");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/refine", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ feedback: "Need to add more tests and improve error handling" }),
     });
@@ -659,7 +659,7 @@ describe("reviseTaskReviewItems", () => {
     await reviseTaskReviewItems("FN-001", [{ id: "ri-1", source: "pr-review", summary: "Fix x", body: "Fix x" }]);
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/review/address", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({
         selectedItems: [{ id: "ri-1", source: "pr-review", summary: "Fix x", body: "Fix x" }],
@@ -694,7 +694,7 @@ describe("agent API wrappers", () => {
     }, "proj_123");
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/agents?projectId=proj_123", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({
         name: "reviewer",
@@ -723,7 +723,7 @@ describe("agent API wrappers", () => {
     }, "proj_123");
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/agents/agent-001?projectId=proj_123", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "PATCH",
       body: JSON.stringify({
         runtimeConfig: { heartbeatTimeoutMs: 45000, maxConcurrentRuns: 3 },
@@ -756,7 +756,7 @@ describe("startAgentRun", () => {
 
     expect(result.id).toBe("run-001");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/agents/agent-001/runs", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
       method: "POST",
       body: JSON.stringify({ source: "manual", triggerDetail: "Agent activated via dashboard" }),
     });
@@ -803,7 +803,7 @@ describe("fetchAgentChildren", () => {
     expect(result).toHaveLength(2);
     expect(result[0].id).toBe("child-1");
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/agents/agent-001/children", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
     });
   });
 
@@ -814,7 +814,7 @@ describe("fetchAgentChildren", () => {
     await fetchAgentChildren("agent-001", "proj_123");
 
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/agents/agent-001/children?projectId=proj_123", {
-      headers: { "Content-Type": "application/json" },
+      headers: API_JSON_HEADERS,
     });
   });
 

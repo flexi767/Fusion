@@ -22,6 +22,7 @@ For a full walkthrough (installation, onboarding, first task, and daily workflow
 | [Getting Started](./getting-started.md) | Installation, first-run, first task, and daily workflow basics |
 | [Dashboard Guide](./dashboard-guide.md) | Board/list views, left/right sidebar navigation, Artifacts, Import Tasks, chat, workflow selection/editor, terminal, git manager, files, planning, and UI tools |
 | [CLI Reference](./cli-reference.md) | Complete `fn` command reference with subcommands, flags, and examples |
+| [Computer Use](./computer-use.md) | `fn computer` desktop-app discovery, snapshots, actions, permissions, and JSON contract |
 | [Remote Access](./remote-access.md) | Operator runbook for Tailscale/Cloudflare setup, tokenized login links, security caveats, and troubleshooting |
 | [Native Shell Connection Guide](./native-shell.md) | Canonical mobile/desktop shell onboarding, profile management, QR/manual setup, and remote handoff behavior |
 
@@ -41,6 +42,7 @@ For a full walkthrough (installation, onboarding, first task, and daily workflow
 | [Custom Non-Coding Workflows MVP Spec](./custom-workflows-mvp-spec.md) | MVP framing for user-authored non-coding workflows, lifecycle mapping, metrics, and risk checklist |
 | [Task Evaluations](./evals.md) | Eval scoring contract, evidence persistence, score categories, and evaluation pipeline |
 | [Multi-Project](./multi-project.md) | Central registry architecture, project management, isolation modes, and migration paths |
+| [Workspaces (Multi-Repository)](./workspaces.md) | Workspace setup, per-repository execution and land, recovery, revert, and archive cleanup |
 
 ### Configuration & Agents
 <!--
@@ -58,7 +60,9 @@ Planner oversight (FN-7508 → FN-7583) is fully documented in Settings Referenc
 | [Architecture](./architecture.md) | System architecture, package layout, storage model, and engine execution flow |
 | [Secrets Store (`SecretsStore`)](./architecture.md#secrets-store-secretsstore) | Core encrypted secret subsystem overview: scopes, AES-256-GCM at-rest model, policy semantics, and public store API surface |
 | [Dashboard Real-Time](./dashboard-realtime.md) | Canonical event-stream architecture contract (shared `/api/events` bus + dedicated stream boundaries), with project/node scoping, reconnect/cleanup behavior, and realtime pitfalls |
+| [Agent Activity Contract](./agent-activity-contract.md) | Canonical wire, cursor, and retention contract for the project-scoped `GET /api/agent-activity` durable activity-history API |
 | [Storage](./storage.md) | PostgreSQL runtime storage, archive, migration compatibility, and file-backed payloads |
+| [Memory Backend Integration](./memory-backend-integration.md) | Stash memory backend persistence: session capture, per-chat transcript backfill, and opt-in vector search |
 | [DAG Architecture Deliverables](./dag/) | Milestone A DAG architecture documents plus Milestone B prototype scaffold docs (schema migration plan, DagCoordinator design, implementation checklist) |
 | [Dev Server Module Audit](./dev-server-modules.md) | Analysis of parallel dashboard dev-server module families, production wiring, and consolidation guidance |
 | [Shared Cluster Protocol](./shared-mesh-protocol.md) | Shared PostgreSQL multi-node contract: claims/leases, membership, auth, and retired multi-leader mesh replication |
@@ -68,6 +72,7 @@ Planner oversight (FN-7508 → FN-7583) is fully documented in Settings Referenc
 | [Docker](./docker.md) | Container builds, deployment, and persistence configuration |
 | [Code Signing](./CODE_SIGNING.md) | macOS and Windows code signing configuration for release binaries |
 | [Diagnostics](./diagnostics.md) | Engine diagnostic logging subsystems, structured log keys, and key diagnostic points catalog |
+| [Run-Audit Catalogue](./run-audit.md) | Durable reference catalogue of delivery-pipeline run-audit events (finalization, self-healing reconciliation, durable-agent error-state) — the S4 reliability/durability/observability observability surface |
 | [Sandbox Backends](./sandbox.md) | Pluggable sandbox backends for executor command isolation (bubblewrap, spawn-based) |
 | [Secrets](./secrets.md) | Encrypted secrets storage, per-secret access policies, scopes, and agent tool wiring |
 | [Testing](./testing.md) | Full testing lanes, worker fanout guidance, test taxonomy, and file organization |
@@ -146,6 +151,10 @@ FN-7088 links previously-unlinked first-class testing and baseline docs here so 
 | [SQLite → PostgreSQL Migration Review (2026-06-26, historical)](./postgres-migration-review-2026-06-26.md) | Historical multi-agent review of the incomplete migration branch and its original findings |
 | [Dashboard Theme & UI Plugin System Proposal (2026-07-01)](./proposals/2026-07-01-dashboard-theme-plugin-system.md) | Feasibility-spike proposal for a controlled dashboard theme/UI shell extension point sharing one backend source of truth |
 | [Full-loop Agent Tool-Surface Audit and Delivery Plan](./agent-tool-surface-full-loop.md) | Source-grounded audit of engine-agent and dashboard chat tool factories, gap analysis for mission hierarchy integration, and delivery plan (FN-8280) |
+| [Dashboard Modal Inventory](./dashboard-modal-inventory.md) | Canonical classification of all 45 dashboard modal surfaces (classes A–D) with file:line evidence, FloatingWindow migration targets, and the shared migration contract (FN-8605 → FN-8617) |
+| [Workflow-Owned Lifecycle Closing Verification](./workflow-owned-lifecycle-closing-verification.md) | Closing-bar verification runbook and recorded pass history for the workflow-owned lifecycle cutover programme — gate, verify:fast, E2E families, and census |
+| [Native `spawn@:-1` Storm Source Attribution (RUFU-077)](./performance/spawn-storm-attribution.md) | Measured local contribution plus out-of-repo/native-dependency attribution for native spawn storms |
+| [Stash Vector/Semantic Search Evaluation (RUFU-126)](./research/stash-vector-search-evaluation.md) | Decision record and opt-in prototype for Stash-backed vector/semantic recall; live-instance rollout is operator-gated |
 
 ## External Resources
 
@@ -159,3 +168,5 @@ FN-7088 links previously-unlinked first-class testing and baseline docs here so 
 - **Workflow author:** Dashboard Guide → Workflow Editor → Workflow Steps → Settings Reference
 - **Power user / automation owner:** Settings Reference → Workflow Steps → Agents → Planner Oversight (Settings Reference § Workflow Settings)
 - **Maintainer / contributor:** Architecture → Multi-Project → Contributing
+
+- [Knowledge graph](knowledge-graph.md) — deterministic committable codebase structure graph.

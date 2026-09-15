@@ -37,6 +37,20 @@ import {
 
 /** ACK cadence — ACK roughly every 32KB of consumed output. */
 const ACK_THRESHOLD_BYTES = 32 * 1024;
+
+/*
+FNXC:Terminal 2026-07-26-11:30:
+Mobile browsers (iOS Safari tab, iOS installed PWA, Chrome Android) DISCARD a backgrounded tab under memory pressure, costing the user a full white-splash reload on return. xterm retains its whole scrollback ring in JS memory, so this ring is one of the larger allocations this view holds. That made 2000 lines look like a free win.
+
+FNXC:Terminal 2026-07-26-14:05 (CORRECTION — do not restore the 2000-line value on the old reasoning):
+The 2000-line cut above was justified with "the server-side replay on re-attach remains the authority for older history". THAT WAS FALSE, in two ways, and the wrong reasoning must not be reintroduced:
+1. The server ring is NOT unbounded and is NOT larger than the client ring. It is `DEFAULT_SCROLLBACK_BYTES = 512 * 1024` BYTES in `packages/engine/src/cli-agent/session-manager.ts` — roughly 6000-7000 typical 80-column lines, i.e. LESS than the 10000-line client ring it was supposed to back-stop.
+2. More importantly, server replay only happens AT ATTACH TIME (`cli-session-ws.ts` sends one `scrollback` frame on connect). While a session stays attached, the client ring is the ONLY history the user can scroll back through — nothing re-fetches evicted lines. So every line evicted past the cap is permanently unreachable, not merely "not cached locally".
+Concretely: an agent session emitting ~4000 lines of build output loses the first compile error at 2000. Restored to the pre-cut 10000, which sits at/above what the server could replay anyway, so the ring is genuinely the user-reachable history and not a redundant copy of it.
+Keep in step with TerminalModal's TERMINAL_SCROLLBACK_LINES (duplicated rather than shared so neither terminal surface pulls the other's heavy module into its lazy chunk). Note the two surfaces have DIFFERENT server rings — TerminalModal's is far smaller (50000 characters) — so the values are kept in step for maintenance, not because the backing store is the same.
+The WebGL-context disposal below is the part of the memory work that was sound; it stays.
+*/
+const TERMINAL_SCROLLBACK_LINES = 10000;
 const RESIZE_DEBOUNCE_MS = 100;
 
 /**
@@ -147,6 +161,11 @@ export interface SessionTerminalProps {
   showConfirmAdvance?: boolean;
   /** Settings deep link for the posture chip tooltip. */
   onOpenAdapterSettings?: () => void;
+  /*
+  FNXC:TaskDetailTerminalKeepAlive 2026-07-22-12:50:
+  Keep-alive visibility gate (FN remount-churn fix R6/R9). The task-detail Terminal tab keeps SessionTerminal mounted-but-hidden across tab switches so the WebSocket and scrollback survive. While hidden the box stays real (visibility-based hiding), so xterm geometry never collapses; on the hidden -> active transition we refit + force a font remeasure, and if the WebSocket died while hidden we re-run the whole attach lifecycle (fresh ticket + xterm) instead of revealing a dead terminal. Defaults to true so standalone mounts are unaffected.
+  */
+  active?: boolean;
 }
 
 interface AttachTicketResponse {
@@ -189,11 +208,17 @@ export function SessionTerminal({
   onConfirmAdvance,
   showConfirmAdvance = false,
   onOpenAdapterSettings,
+  active = true,
 }: SessionTerminalProps) {
   const { t } = useTranslation("app");
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<ITerminalAddon | null>(null);
+  /*
+  FNXC:Terminal 2026-07-26-11:32:
+  The WebGL renderer owns a real GL context plus glyph atlas textures. GL contexts are a scarce process-wide resource that GC does not release promptly, and unreleased ones are a known source of iOS memory pressure — which is what makes the OS discard the backgrounded tab. Hold the addon so teardown disposes it EXPLICITLY before term.dispose(), instead of relying on xterm's AddonManager or the onContextLoss handler to get there.
+  */
+  const webglAddonRef = useRef<ITerminalAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   const [postureTooltipOpen, setPostureTooltipOpen] = useState(false);
@@ -391,6 +416,33 @@ export function SessionTerminal({
     return () => window.removeEventListener("storage", onStorage);
   }, [applyLiveTerminalPreferences]);
 
+  /*
+  FNXC:TaskDetailTerminalKeepAlive 2026-07-22-12:50:
+  Reveal handling for the kept-alive hidden state (R9 + dead-socket recovery):
+  - Refit on reveal: the hidden visibility-based box keeps real geometry, but its size can change while hidden; mirror the init sequence (fit -> resize frame -> forced font remeasure -> refresh) because a same-value font reassignment is a no-op against xterm's OptionsService (docs/solutions/ui-bugs/xterm-options-noop-remeasure-after-font-settle.md).
+  - Dead-socket recovery: keep-alive intentionally leaves the WS open while hidden, but if the server closed it in the meantime, bump reattachEpoch so the main lifecycle effect re-runs the full attach (fresh ticket, fresh xterm) instead of revealing a dead terminal.
+  */
+  const [reattachEpoch, setReattachEpoch] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const term = xtermRef.current;
+    const fitAddon = fitAddonRef.current as unknown as { fit?: () => void } | null;
+    if (term && fitAddon?.fit) {
+      try {
+        fitAddon.fit();
+        sendResizeMessage(term.cols, term.rows);
+        forceTerminalFontRemeasure(term, String(term.options.fontFamily ?? ""));
+        term.refresh(0, Math.max(0, term.rows - 1));
+      } catch {
+        /* ignore transient measure failures on reveal */
+      }
+    }
+    const ws = wsRef.current;
+    if (ws && ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING) {
+      setReattachEpoch((epoch) => epoch + 1);
+    }
+  }, [active, sendResizeMessage]);
+
   // ── xterm lifecycle + WS bridge ──────────────────────────────────────────
   useEffect(() => {
     if (!sessionId || typeof window === "undefined") return;
@@ -457,7 +509,7 @@ export function SessionTerminal({
         cursorBlink: terminalPreferences.cursorBlink && ticketCanAcceptInput,
         cursorStyle: terminalPreferences.cursorStyle,
         disableStdin: !ticketCanAcceptInput,
-        scrollback: 10000,
+        scrollback: TERMINAL_SCROLLBACK_LINES,
         // Defensive: do NOT register an OSC 52 (clipboard-write) handler. The
         // server-side neutralizer (U10) strips it; we add no client handling.
         fontFamily: resolvedFontFamily,
@@ -503,8 +555,10 @@ export function SessionTerminal({
               } catch {
                 /* fall back to DOM renderer */
               }
+              if (webglAddonRef.current === webgl) webglAddonRef.current = null;
             });
             term.loadAddon(webgl);
+            webglAddonRef.current = webgl;
           }
         } catch {
           /* WebGL unavailable — DOM renderer is the default fallback */
@@ -633,6 +687,14 @@ export function SessionTerminal({
           try {
             (fitAddon as unknown as { fit: () => void }).fit();
             sendResize(term.cols, term.rows);
+            /*
+            FNXC:Terminal 2026-07-23-21:05:
+            Blank-first-terminal recurrence (shared invariant with TerminalModal.fitAndResizeForSession):
+            a renderer stalled at init leaves buffered output unpainted, and fit() with unchanged cols/rows
+            triggers no internal repaint. Follow every observer-driven fit with an explicit full-viewport
+            refresh so the initial ResizeObserver notification repairs a stalled renderer.
+            */
+            term.refresh(0, Math.max(0, term.rows - 1));
           } catch {
             /* ignore transient measure failures */
           }
@@ -656,7 +718,23 @@ export function SessionTerminal({
           return;
         }
         switch (msg.type) {
-          case "scrollback":
+          case "scrollback": {
+            if (typeof msg.data !== "string") return;
+            /*
+            FNXC:TerminalSharing 2026-08-19-04:00:
+            Clear before replaying. The server sends scrollback as its own frame precisely so the
+            client can (see cli-session-ws.ts), but this handler used to treat it exactly like
+            `data` and append. That is safe only because every reattach path here rebuilds a fresh
+            xterm via reattachEpoch — the moment anyone adds an in-place reconnect, appending a full
+            replay onto a terminal that still shows that history duplicates it, which is precisely
+            the duplicated-prompt bug fixed in the PTY terminal.
+            */
+            term.reset();
+            const text = decodeBase64ToString(msg.data);
+            const byteLen = text.length;
+            term.write(text, () => ackBytes(byteLen));
+            break;
+          }
           case "data": {
             if (typeof msg.data !== "string") return;
             const text = decodeBase64ToString(msg.data);
@@ -693,6 +771,18 @@ export function SessionTerminal({
         }
         wsRef.current = null;
       }
+      /*
+      FNXC:Terminal 2026-07-26-11:35:
+      Dispose the WebGL addon explicitly BEFORE the terminal, so the GL context is released deterministically on teardown rather than left to xterm's AddonManager and GC. See webglAddonRef.
+      */
+      if (webglAddonRef.current) {
+        try {
+          webglAddonRef.current.dispose();
+        } catch {
+          /* already disposed (e.g. by onContextLoss) */
+        }
+        webglAddonRef.current = null;
+      }
       const term = xtermRef.current;
       if (term) {
         try {
@@ -704,7 +794,8 @@ export function SessionTerminal({
       }
       fitAddonRef.current = null;
     };
-  }, [sessionId, readOnly, mode, projectId, sendResizeMessage]);
+    // FNXC:TaskDetailTerminalKeepAlive 2026-07-22-12:50: reattachEpoch re-runs this whole lifecycle when a reveal finds the WS dead (single-effect teardown semantics preserved).
+  }, [sessionId, readOnly, mode, projectId, sendResizeMessage, reattachEpoch]);
 
   const replayLabel = useMemo(() => {
     if (mode === "idle") return t("cliTerminal.replayIdle", "Session idle");
@@ -814,12 +905,14 @@ export function SessionTerminal({
         )}
       </header>
 
-      <div
-        className="cli-session-terminal__viewport"
-        ref={containerRef}
-        data-testid="cli-terminal-viewport"
-        style={terminalGlyphStyle}
-      />
+      <div className="cli-session-terminal__viewport-shell">
+        <div
+          className="cli-session-terminal__viewport"
+          ref={containerRef}
+          data-testid="cli-terminal-viewport"
+          style={terminalGlyphStyle}
+        />
+      </div>
 
       {showConfirmAdvance && !advanceDismissed && (
         <div className="cli-session-terminal__advance-strip" role="region">

@@ -12,7 +12,7 @@ import {
   formatTaskIdentifier,
   resolveNtfyEvents,
   sendNtfyNotificationWithResult,
-} from "../notifier.js";
+} from "../util/notifier.js";
 import { schedulerLog } from "../logger.js";
 
 export interface NtfyProviderConfig {
@@ -34,6 +34,7 @@ type SupportedNtfyEvent =
   | "in-review"
   | "merged"
   | "failed"
+  | "task-wedged"
   | "awaiting-approval"
   | "awaiting-user-review"
   | "planning-awaiting-input"
@@ -50,6 +51,7 @@ const SUPPORTED_EVENTS = new Set<SupportedNtfyEvent>([
   "in-review",
   "merged",
   "failed",
+  "task-wedged",
   "awaiting-approval",
   "awaiting-user-review",
   "planning-awaiting-input",
@@ -120,13 +122,13 @@ export class NtfyNotificationProvider implements NotificationProvider {
 
   isEventSupported(event: NotificationEvent): boolean {
     if (!SUPPORTED_EVENTS.has(event as SupportedNtfyEvent)) {
-      schedulerLog.log(`NtfyNotificationProvider event filtered unsupported event=${event}`);
+      schedulerLog.debug(`NtfyNotificationProvider event filtered unsupported event=${event}`);
       return false;
     }
 
     const enabledEvents = this.config?.events ?? [...DEFAULT_NTFY_EVENTS];
     const allowed = enabledEvents.includes(event as NtfyNotificationEvent);
-    schedulerLog.log(
+    schedulerLog.debug(
       `NtfyNotificationProvider allowlist event=${event} decision=${allowed ? "allowed" : "filtered-by-event"}`,
     );
     return allowed;
@@ -214,18 +216,32 @@ export class NtfyNotificationProvider implements NotificationProvider {
         message: `Task "${identifier}" has failed and needs attention`,
         priority: "high",
       },
+      "task-wedged": {
+        title: `Task ${taskId} needs operator action`,
+        message: [
+          `Task "${identifier}" is wedged${typeof payload.metadata?.reason === "string" ? `: ${payload.metadata.reason}` : " and needs operator action"}`,
+          typeof payload.metadata?.gate === "string" ? `Gate: ${payload.metadata.gate}` : null,
+          typeof payload.metadata?.action === "string" ? `Recommended action: ${payload.metadata.action}` : null,
+        ].filter((part): part is string => part !== null).join("\n"),
+        priority: "high",
+      },
       "awaiting-approval": {
         title: payload.metadata?.awaitingApprovalReason === "plan-review-replan-cap"
           ? `Plan Review cap reached for ${taskId}`
-          : `Plan needs approval for ${taskId}`,
+          : payload.metadata?.awaitingApprovalReason === "merge-blocked-by-policy"
+            ? `Pull-request policy block for ${taskId}`
+            : `Plan needs approval for ${taskId}`,
         /*
-        FNXC:PlanReviewReplan 2026-07-15-11:09:
-        Replan-cap escalations must say Plan Review failed to converge so the push is
-        actionable, not a generic "needs approval" ping.
+        FNXC:PullRequestMerge 2026-08-09-05:07:
+        Policy holds reuse awaiting-approval's delivery channel but require a
+        merge-specific instruction; calling them plan approvals sends operators
+        to the wrong remediation surface.
         */
         message: payload.metadata?.awaitingApprovalReason === "plan-review-replan-cap"
           ? `Task "${identifier}" needs approval because Plan Review requested revisions repeatedly without converging. Approve the current plan or reject to regenerate.`
-          : `Task "${identifier}" needs your approval before implementation can start`,
+          : payload.metadata?.awaitingApprovalReason === "merge-blocked-by-policy"
+            ? `Task "${identifier}" has a pull request blocked by repository policy. Resolve the policy requirement, then retry the merge.`
+            : `Task "${identifier}" needs your approval before implementation can start`,
         priority: "high",
       },
       "awaiting-user-review": {
@@ -294,7 +310,8 @@ export class NtfyNotificationProvider implements NotificationProvider {
       }
     })();
 
-    schedulerLog.log(
+    // FNXC:EngineDiagnostics 2026-07-26-10:25: send/delivery bookkeeping every notify; failures surface via result + dispatch failed logs.
+    schedulerLog.debug(
       `NtfyNotificationProvider send event=${event} host=${host} topic=${this.config.topic}`,
     );
 
@@ -309,7 +326,7 @@ export class NtfyNotificationProvider implements NotificationProvider {
       signal: this.abortController?.signal,
     });
 
-    schedulerLog.log(
+    schedulerLog.debug(
       `NtfyNotificationProvider delivery event=${event} status=${response?.status ?? "error"} ok=${String(response?.ok ?? false)}`,
     );
 

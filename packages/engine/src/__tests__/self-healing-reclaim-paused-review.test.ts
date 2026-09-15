@@ -2,14 +2,41 @@ import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskStore } from "@fusion/core";
 import { SelfHealingManager } from "../self-healing.js";
-import * as branchConflicts from "../branch-conflicts.js";
-import * as worktreePool from "../worktree-pool.js";
+import * as branchConflicts from "../execution/branch-conflicts.js";
+import {
+  isUsableTaskWorktree,
+  relocateReclaimableWorktreeIntoRoot,
+  removeWorktree,
+} from "../worktree/worktree-pool.js";
+import { withBranchWriteProvenance } from "./branch-write-provenance-store-stub.js";
+
+/*
+FNXC:EngineTests 2026-07-20-23:55:
+Reclaim runs real worktree remove/relocate unless the pool is mocked. Mirror the
+self-healing suite mocks so these unit tests stay hermetic.
+*/
+vi.mock("../worktree/worktree-pool.js", () => ({
+  isUsableTaskWorktree: vi.fn().mockResolvedValue(true),
+  classifyTaskWorktree: vi.fn().mockResolvedValue({ ok: false, classification: "missing", reason: "test" }),
+  removeWorktree: vi.fn().mockResolvedValue(undefined),
+  relocateReclaimableWorktreeIntoRoot: vi.fn(async ({ sourcePath }: { sourcePath: string }) => ({
+    kind: "ready",
+    path: sourcePath,
+    relocated: false,
+  })),
+  getRegisteredWorktreePaths: vi.fn().mockReturnValue([]),
+  getRegisteredWorktreeBranchMap: vi.fn().mockReturnValue(new Map()),
+  resolveWorktreeBackend: vi.fn().mockReturnValue({ kind: "native" }),
+  scanIdleWorktrees: vi.fn().mockResolvedValue([]),
+  scanOrphanedBranches: vi.fn().mockResolvedValue([]),
+}));
 
 function createStore(): TaskStore & EventEmitter {
   const emitter = new EventEmitter() as TaskStore & EventEmitter;
-  (emitter as any).getSettings = vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false });
+  (emitter as any).getSettings = vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, autoMerge: true });
   (emitter as any).listTasks = vi.fn();
-  (emitter as any).updateTask = vi.fn().mockResolvedValue(undefined);
+  (emitter as any).getTask = vi.fn().mockResolvedValue({ column: "in-review" });
+  (emitter as any).updateTask = vi.fn(withBranchWriteProvenance(async () => undefined));
   (emitter as any).moveTask = vi.fn().mockResolvedValue(undefined);
   (emitter as any).handoffToReview = vi.fn().mockImplementation(async (taskId: string) => {
     await (emitter as any).moveTask(taskId, "in-review");
@@ -26,7 +53,15 @@ describe("self-healing reclaim paused review", () => {
   beforeEach(() => {
     store = createStore();
     manager = new SelfHealingManager(store, { rootDir: "/tmp/test" });
-    vi.spyOn(worktreePool, "isUsableTaskWorktree").mockResolvedValue(true);
+    vi.mocked(isUsableTaskWorktree).mockResolvedValue(true);
+    vi.mocked(removeWorktree).mockResolvedValue(undefined as never);
+    vi.mocked(relocateReclaimableWorktreeIntoRoot).mockImplementation(async ({ sourcePath }: { sourcePath: string }) => ({
+      kind: "ready" as const,
+      path: sourcePath,
+      relocated: false,
+    }));
+    // FNXC:EngineTests 2026-07-20-23:55: in-review reclaim requires backward-move triple proof ok.
+    vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true });
   });
 
   afterEach(() => {
@@ -52,7 +87,7 @@ describe("self-healing reclaim paused review", () => {
 
     expect(recovered).toBe(1);
     expect(store.updateTask).toHaveBeenCalledWith("FN-4485", expect.objectContaining({ paused: false, pausedReason: undefined, status: null, error: null }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4485", "todo", expect.objectContaining({ moveSource: "engine" }));
+    expect(store.moveTask).toHaveBeenCalledWith("FN-4485", "in-progress", expect.objectContaining({ moveSource: "engine" }));
     expect(store.logEntry).toHaveBeenCalledWith("FN-4485", expect.stringContaining("[recovery] reclaim-paused-review"));
     expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
       mutationType: "branch:auto-reclaim",
@@ -63,7 +98,8 @@ describe("self-healing reclaim paused review", () => {
   it("reclaims paused in-progress branch-conflict task without moving columns", async () => {
     const activeStore = { listActiveHeartbeatRuns: vi.fn().mockResolvedValue([{ startedAt: new Date().toISOString(), contextSnapshot: { taskId: "FN-9998" } }]) } as any;
     manager = new SelfHealingManager(store, { rootDir: "/tmp/test", agentStore: activeStore });
-    vi.spyOn(worktreePool, "isUsableTaskWorktree").mockResolvedValue(true);
+    vi.mocked(isUsableTaskWorktree).mockResolvedValue(true);
+    vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true });
 
     (store.listTasks as any)
       .mockResolvedValueOnce([])
@@ -91,7 +127,14 @@ describe("self-healing reclaim paused review", () => {
     vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({
       kind: "live-foreign",
       livePath: "/tmp/foreign",
-      error: new Error("foreign owner"),
+      error: new branchConflicts.BranchConflictError({
+        branchName: "fusion/fn-4487",
+        conflictingWorktreePath: "/tmp/foreign",
+        existingTipSha: "abc123",
+        strandedCommits: [{ sha: "abc123", subject: "foreign" }],
+        startPoint: "main",
+        recommendedAction: "manual",
+      }),
     } as any);
 
     const recovered = await manager.reclaimSelfOwnedBranchConflicts();

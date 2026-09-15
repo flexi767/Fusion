@@ -1,9 +1,19 @@
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewHeader } from "./ViewHeader";
+import { ViewLayout } from "./ViewLayout";
+import { ViewSidebar } from "./ViewSidebar";
 import "./MissionManager.css";
 import { useState, useEffect, useCallback, useRef, useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getErrorMessage, type Goal } from "@fusion/core";
+import {
+  featureValidationRepairEligibility,
+  getErrorMessage,
+  type DriftAlignment,
+  type Goal,
+  type MissionBlockerDescriptor,
+} from "@fusion/core";
 import {
   X,
   Plus,
@@ -11,7 +21,6 @@ import {
   Trash2,
   ChevronRight,
   ChevronDown,
-  ChevronLeft,
   Target,
   Layers,
   Package,
@@ -32,6 +41,7 @@ import { useConfirm } from "../hooks/useConfirm";
 import type { ToastType } from "../hooks/useToast";
 import { useViewportMode } from "../hooks/useViewportMode";
 import { useNavigationHistoryContext } from "../hooks/useNavigationHistory";
+import { useAutoPaginationSentinel } from "../hooks/useAutoPaginationSentinel";
 import { subscribeSse } from "../sse-bus";
 import { MissionInterviewModal } from "./MissionInterviewModal";
 import { MilestoneSliceInterviewModal } from "./MilestoneSliceInterviewModal";
@@ -55,6 +65,7 @@ import type {
   MilestoneValidationTelemetry,
   MissionFeatureLoopSnapshot,
   MissionValidatorRun,
+  ValidationDiagnostics,
 } from "./mission-types";
 import {
   fetchMissions,
@@ -80,6 +91,10 @@ import {
   previewEnrichedDescription,
   resumeMission,
   stopMission,
+  clearMissionBlockedStatus,
+  fetchMissionBlockedDiagnostics,
+  normalizeMissionBlockers,
+  parseMissionResumeConflict,
   startMission,
   updateMissionAutopilot,
   fetchMissionsHealth,
@@ -87,12 +102,16 @@ import {
   fetchAssertions,
   createAssertion,
   updateAssertion,
+  deleteAssertion,
   linkFeatureToAssertion,
   unlinkFeatureFromAssertion,
   fetchFeaturesForAssertion,
   fetchMilestoneValidation,
   fetchMilestoneValidationTelemetry,
   triggerValidation,
+  VALIDATION_ALREADY_RUNNING,
+  repairFeatureValidation,
+  reconcileMission,
   fetchValidationLoopState,
   fetchValidationRuns,
   fetchValidationRun,
@@ -105,16 +124,12 @@ import {
   api,
   type AiSessionSummary,
   type BranchGroupSummary,
+  type MissionReconcilePassResult,
 } from "../api";
 import type { AutopilotState, MissionInterviewDraftSummary } from "./mission-types";
 import { readCache, SWR_CACHE_KEYS, writeCache } from "../utils/swrCache";
 import { getRelativeTimeBucket } from "../utils/relativeTimeAgo";
 import { isNativeStructureDragEnabled, serializeNativeStructureRef } from "../utils/nativeStructureDrag";
-
-const MISSION_SIDEBAR_DEFAULT_WIDTH = 300;
-const MISSION_SIDEBAR_MIN_WIDTH = 220;
-const MISSION_SIDEBAR_MAX_WIDTH = 560;
-const MISSION_SIDEBAR_STORAGE_KEY = "fusion:mission-sidebar-width";
 
 interface MissionManagerProps {
   isOpen: boolean;
@@ -192,6 +207,25 @@ const validationStateColors: Record<string, { bg: string; text: string }> = {
 };
 
 const featureRetryBudgetMax = 3;
+
+/**
+ * FNXC:MilestoneValidationFreshness 2026-08-01-20:42:
+ * Every rollup and telemetry response for a milestone shares this request generation. Only the newest request may update a badge, including when the newest legitimate state regresses to failed.
+ */
+export class MilestoneValidationFreshnessCoordinator {
+  private readonly generations = new Map<string, number>();
+
+  begin(milestoneId: string): number {
+    const generation = (this.generations.get(milestoneId) ?? 0) + 1;
+    this.generations.set(milestoneId, generation);
+    return generation;
+  }
+
+  isCurrent(milestoneId: string, generation: number): boolean {
+    return this.generations.get(milestoneId) === generation;
+  }
+}
+
 const missionInterviewListStatuses: ReadonlySet<AiSessionSummary["status"]> = new Set([
   "generating",
   "awaiting_input",
@@ -214,6 +248,15 @@ function getInterviewStatusLabel(status: AiSessionSummary["status"], t: (key: st
   }
 }
 
+/**
+ * FNXC:MissionBlockedRepair 2026-08-11-02:56:
+ * Feature-validation repair intentionally does not change mission status. Both badge surfaces use
+ * this shared eligibility helper so a stale mission badge always has the same explicit repair path.
+ */
+export function getMissionBlockedRepairState(mission: Pick<Mission, "status">, blockers: MissionBlockerDescriptor[]): { showClear: boolean; blockers: MissionBlockerDescriptor[] } {
+  return { showClear: mission.status === "blocked", blockers: mission.status === "blocked" ? blockers : [] };
+}
+
 function getMissionRunHelperText(status: MissionStatus, t: (key: string, fallback: string) => string): string | null {
   switch (status) {
     case "planning":
@@ -221,7 +264,7 @@ function getMissionRunHelperText(status: MissionStatus, t: (key: string, fallbac
     case "active":
       return t("missions.runHelperActive", "Stopping pauses linked tasks and marks the mission blocked.");
     case "blocked":
-      return t("missions.runHelperBlocked", "Resuming re-activates the mission and continues execution.");
+      return t("missions.runHelperBlocked", "Resume re-activates execution; Clear blocked status repairs only a stale badge.");
     default:
       return null;
   }
@@ -301,6 +344,7 @@ interface MissionFormData {
   autoMergeOverride: MissionAutoMergeOverride;
   baseBranch: string;
   branchStrategy: MissionBranchStrategy;
+  taskPrefix: string;
 }
 
 interface MilestoneFormData {
@@ -334,7 +378,44 @@ const EMPTY_MISSION_FORM: MissionFormData = {
   branchStrategy: {
     mode: "project-default",
   },
+  taskPrefix: "",
 };
+
+interface MissionMergeBehaviorFieldProps {
+  value: MissionAutoMergeOverride;
+  onChange: (value: MissionAutoMergeOverride) => void;
+  t: (key: string, fallback: string) => string;
+}
+
+/*
+FNXC:MissionAutoMerge 2026-08-08-16:11:
+Every Mission Manager create and edit surface must explain the same three merge
+choices beside its selector: inherited project behavior, feature-by-feature
+auto-merge, and the shared-branch single-pull-request review path. A shared
+field prevents a duplicated form path from silently omitting that contract.
+*/
+export function MissionMergeBehaviorField({ value, onChange, t }: MissionMergeBehaviorFieldProps) {
+  return (
+    <label>
+      {t("missions.autoMergeOverride", "Merge behavior")}
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value as MissionAutoMergeOverride)}
+        aria-label={t("missions.autoMergeOverrideAriaLabel", "Mission auto-merge override")}
+      >
+        <option value="inherit">{t("missions.autoMergeInherited", "Use project default")}</option>
+        <option value="on">{t("missions.autoMergeOn", "Auto-merge")}</option>
+        <option value="off">{t("missions.singlePullRequest", "Single pull request")}</option>
+      </select>
+      <small className="mission-detail__autopilot-description">
+        {t(
+          "missions.autoMergeOverrideDescription",
+          "Inherited follows the project setting. Auto-merge lands each feature as it passes. Single pull request keeps every feature on one shared branch for joint review and merge.",
+        )}
+      </small>
+    </label>
+  );
+}
 
 const EMPTY_MILESTONE_FORM: MilestoneFormData = {
   title: "",
@@ -513,6 +594,7 @@ const TASK_EVENT_TYPES: MissionEventType[] = ["feature_triaged", "feature_comple
 const SLICE_EVENT_TYPES: MissionEventType[] = ["slice_activated", "slice_completed", "milestone_completed"];
 const STATE_CHANGE_EVENT_TYPES: MissionEventType[] = [
   "mission_started",
+  "mission_status_changed",
   "mission_paused",
   "mission_resumed",
   "mission_completed",
@@ -543,6 +625,46 @@ function matchesEventFilter(
     default:
       return true;
   }
+}
+
+function getValidationDiagnostics(metadata: Record<string, unknown> | null): ValidationDiagnostics | undefined {
+  const candidate = metadata?.validationDiagnostics;
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const diagnostics = candidate as Partial<ValidationDiagnostics>;
+  if (typeof diagnostics.runId !== "string" || typeof diagnostics.sourceFeatureId !== "string" || !Array.isArray(diagnostics.assertions)) {
+    return undefined;
+  }
+
+  // FNXC:MissionValidationDiagnostics 2026-07-23-13:15: Mission events are
+  // durable and can predate this contract. Normalize partial JSON at the UI
+  // boundary so malformed legacy metadata cannot crash activity on any viewport.
+  return {
+    runId: diagnostics.runId,
+    sourceFeatureId: diagnostics.sourceFeatureId,
+    outcome: diagnostics.outcome === "pass" || diagnostics.outcome === "fail" || diagnostics.outcome === "blocked" || diagnostics.outcome === "error" || diagnostics.outcome === "inconclusive" ? diagnostics.outcome : "error",
+    nextAction: typeof diagnostics.nextAction === "string" ? diagnostics.nextAction : "Review the validator run before retrying or triaging the feature.",
+    assertions: diagnostics.assertions.map((value, index) => {
+      const assertion = value && typeof value === "object" ? value as Partial<ValidationDiagnostics["assertions"][number]> : {};
+      const evidence = Array.isArray(assertion.evidence) ? assertion.evidence.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const reference = item as { kind?: unknown; text?: unknown; truncated?: unknown };
+        return [{
+          ...(typeof reference.kind === "string" ? { kind: reference.kind } : {}),
+          ...(typeof reference.text === "string" ? { text: reference.text } : {}),
+          ...(reference.truncated === true ? { truncated: true } : {}),
+        }];
+      }) : [];
+      return {
+        assertionId: typeof assertion.assertionId === "string" ? assertion.assertionId : `Assertion ${index + 1}`,
+        verdict: assertion.verdict === "pass" || assertion.verdict === "fail" || assertion.verdict === "blocked" ? assertion.verdict : "blocked",
+        ...(typeof assertion.message === "string" ? { message: assertion.message } : {}),
+        ...(typeof assertion.expected === "string" ? { expected: assertion.expected } : {}),
+        ...(typeof assertion.actual === "string" ? { actual: assertion.actual } : {}),
+        evidence,
+        ...(typeof assertion.omittedEvidenceCount === "number" && assertion.omittedEvidenceCount > 0 ? { omittedEvidenceCount: assertion.omittedEvidenceCount } : {}),
+      };
+    }),
+  };
 }
 
 function getEventTypeClassName(eventType: MissionEventType): string {
@@ -631,6 +753,112 @@ function normalizeMissionHierarchy(mission: MissionWithHierarchy): MissionWithHi
   };
 }
 
+/*
+FNXC:MissionValidationRepair 2026-08-11-00:07:
+Both feature presentations must expose the same narrowly-scoped escape from a stale validation badge. This renders only actions allowed by the core predicate, so a live validation or implementation cycle is never pre-empted and the execution loop remains unable to escape blocked on its own.
+*/
+/*
+FNXC:MissionReconcileControl 2026-08-11-06:49:
+Preview content is the dry-run result from the server authority, not a browser-derived plan.
+Nothing mutates until the operator explicitly applies this panel.
+*/
+function MissionReconcilePreview({
+  result,
+  featureTitles,
+  busy,
+  disabled,
+  onApply,
+  onDismiss,
+  t,
+}: {
+  result: MissionReconcilePassResult;
+  featureTitles: Map<string, string>;
+  busy: "preview" | "apply" | null;
+  disabled: boolean;
+  onApply: () => void;
+  onDismiss: () => void;
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const planned = result.planned ?? [];
+  const isEmpty = planned.length === 0 && result.statusUpdates === 0 && result.badgeRepairs === 0 && result.terminalRepairs === 0;
+  /*
+  FNXC:MissionReconcileUI 2026-08-11-07:37 DELIBERATE-LITERAL:
+  The reconciliation API's `skippedReason` discriminant describes mission state; it is not a task lifecycle column or move target.
+  Hoist the check so preview copy and apply eligibility share one interpretation of the archived-mission response.
+  */
+  const missionIsArchived = result.skippedReason === "archived";
+  const canApply = !missionIsArchived && !isEmpty && planned.length > 0;
+
+  return (
+    <section className="mission-detail__reconcile-panel" aria-label={t("missions.reconcilePreview", "Reconcile preview")}>
+      <div className="mission-detail__reconcile-summary">
+        <span>{t("missions.reconcileStatusUpdates", "Status updates: {{count}}", { count: result.statusUpdates })}</span>
+        <span>{t("missions.reconcileBadgeRepairs", "Badge repairs: {{count}}", { count: result.badgeRepairs })}</span>
+        <span>{t("missions.reconcileTerminalRepairs", "Terminal repairs: {{count}}", { count: result.terminalRepairs })}</span>
+      </div>
+      {missionIsArchived ? <p>{t("missions.reconcileArchived", "Mission is archived — nothing reconciled")}</p>
+        : isEmpty ? <p>{t("missions.reconcileUpToDate", "Already up to date")}</p>
+          : <ul className="mission-detail__reconcile-list">{planned.map((entry) => (
+            <li key={`${entry.featureId}:${entry.action}`}>
+              {featureTitles.get(entry.featureId) ?? entry.featureId} — {entry.action}
+            </li>
+          ))}</ul>}
+      <div className="mission-detail__reconcile-actions">
+        {canApply && <button className="mission-btn mission-btn--primary mission-btn--sm" onClick={onApply} disabled={busy !== null || disabled} data-testid="mission-reconcile-apply">
+          {busy === "apply" ? <Loader2 className="spinner" /> : <Check />}<span>{t("missions.applyReconcile", "Apply reconcile")}</span>
+        </button>}
+        <button className="mission-btn mission-btn--ghost mission-btn--sm" onClick={onDismiss} disabled={busy !== null}>
+          <span>{t("common.dismiss", "Dismiss")}</span>
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function FeatureValidationRepairActions({
+  feature,
+  busy,
+  onClear,
+  onReRun,
+  t,
+}: {
+  feature: Pick<MissionFeature, "id" | "status" | "loopState">;
+  busy: boolean;
+  onClear: (featureId: string) => void;
+  onReRun: (featureId: string) => void;
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const eligibility = featureValidationRepairEligibility(feature);
+  if (!eligibility.clear && !eligibility.reRun) return null;
+
+  return (
+    <>
+      {eligibility.clear && (
+        <button
+          className="mission-icon-btn mission-icon-btn--repair"
+          onClick={() => onClear(feature.id)}
+          title={t("missions.clearValidationBadge", "Clear validation badge")}
+          aria-label={t("missions.clearValidationBadge", "Clear validation badge")}
+          disabled={busy}
+        >
+          {busy ? <Loader2 size={14} className="spinner" /> : <X size={14} />}
+        </button>
+      )}
+      {eligibility.reRun && (
+        <button
+          className="mission-icon-btn mission-icon-btn--repair"
+          onClick={() => onReRun(feature.id)}
+          title={t("missions.rerunValidation", "Re-run validation")}
+          aria-label={t("missions.rerunValidation", "Re-run validation")}
+          disabled={busy}
+        >
+          {busy ? <Loader2 size={14} className="spinner" /> : <RefreshCw size={14} />}
+        </button>
+      )}
+    </>
+  );
+}
+
 export function MissionManager({ isOpen, isInline = false, onClose, addToast, projectId, workflowId, onSelectTask, availableTasks = [], resumeSessionId, targetMissionId, milestoneSliceResumeSessionId, onMilestoneSliceResumeFetchError, onNavigateToGoal }: MissionManagerProps) {
   const { t } = useTranslation("app");
   const { confirm } = useConfirm();
@@ -644,80 +872,17 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const initialMissions = readCache<MissionWithSummary[]>(missionsCacheKey);
   const [missions, setMissions] = useState<MissionWithSummary[]>(() => (Array.isArray(initialMissions) ? initialMissions : []));
   const [selectedMission, setSelectedMission] = useState<MissionWithHierarchy | null>(null);
+  const [selectedMissionIntentId, setSelectedMissionIntentId] = useState<string | null>(null);
+  const [reconcileBusy, setReconcileBusy] = useState<"preview" | "apply" | null>(null);
+  const [reconcilePreview, setReconcilePreview] = useState<{ missionId: string; result: MissionReconcilePassResult } | null>(null);
   const [selectedMissionBranchGroup, setSelectedMissionBranchGroup] = useState<BranchGroupSummary | null>(null);
   const [loading, setLoading] = useState(!(Array.isArray(initialMissions) && initialMissions.length > 0));
   const hasHydratedRef = useRef(Array.isArray(initialMissions) && initialMissions.length > 0);
   const [detailLoading, setDetailLoading] = useState(false);
   const isMobile = useViewportMode() === "mobile";
   const { pushNav } = useNavigationHistoryContext();
-  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
-    if (typeof window === "undefined") return MISSION_SIDEBAR_DEFAULT_WIDTH;
-    const stored = window.localStorage.getItem(MISSION_SIDEBAR_STORAGE_KEY);
-    const parsed = stored ? Number(stored) : NaN;
-    if (!Number.isFinite(parsed)) return MISSION_SIDEBAR_DEFAULT_WIDTH;
-    return Math.max(MISSION_SIDEBAR_MIN_WIDTH, Math.min(MISSION_SIDEBAR_MAX_WIDTH, parsed));
-  });
-
-  const persistSidebarWidth = useCallback((width: number) => {
-    try {
-      window.localStorage.setItem(MISSION_SIDEBAR_STORAGE_KEY, String(width));
-    } catch {
-      // Ignore storage errors.
-    }
-  }, []);
-
-  const handleSidebarResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    if (isMobile) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const handle = event.currentTarget;
-    if (typeof handle.setPointerCapture === "function") {
-      handle.setPointerCapture(event.pointerId);
-    }
-    const startX = event.clientX;
-    const startWidth = sidebarWidth;
-    let latestWidth = startWidth;
-    document.body.style.userSelect = "none";
-
-    const onPointerMove = (moveEvent: PointerEvent) => {
-      const deltaX = moveEvent.clientX - startX;
-      const nextWidth = Math.max(
-        MISSION_SIDEBAR_MIN_WIDTH,
-        Math.min(MISSION_SIDEBAR_MAX_WIDTH, startWidth + deltaX),
-      );
-      latestWidth = nextWidth;
-      setSidebarWidth(nextWidth);
-    };
-
-    const onPointerUp = (upEvent: PointerEvent) => {
-      if (typeof handle.releasePointerCapture === "function") {
-        handle.releasePointerCapture(upEvent.pointerId);
-      }
-      document.body.style.userSelect = "";
-      document.removeEventListener("pointermove", onPointerMove);
-      document.removeEventListener("pointerup", onPointerUp);
-      persistSidebarWidth(latestWidth);
-    };
-
-    document.addEventListener("pointermove", onPointerMove);
-    document.addEventListener("pointerup", onPointerUp);
-  }, [isMobile, persistSidebarWidth, sidebarWidth]);
-
-  const handleSidebarResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (isMobile) return;
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    const step = event.shiftKey ? 50 : 10;
-    const delta = event.key === "ArrowLeft" ? -step : step;
-    const nextWidth = Math.max(
-      MISSION_SIDEBAR_MIN_WIDTH,
-      Math.min(MISSION_SIDEBAR_MAX_WIDTH, sidebarWidth + delta),
-    );
-    setSidebarWidth(nextWidth);
-    persistSidebarWidth(nextWidth);
-  }, [isMobile, persistSidebarWidth, sidebarWidth]);
-
-  // Form states
+  const [showArchived, setShowArchived] = useState(false);
+  const [isCreateMenuOpen, setIsCreateMenuOpen] = useState(false);
   const [isCreatingMission, setIsCreatingMission] = useState(false);
   const [editingMissionId, setEditingMissionId] = useState<string | null>(null);
   const [missionForm, setMissionForm] = useState<MissionFormData>(EMPTY_MISSION_FORM);
@@ -896,7 +1061,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   }, [isActive, milestoneSliceResumeSessionId, onMilestoneSliceResumeFetchError]);
 
   // Delete confirmation
-  const [deleteConfirmId, setDeleteConfirmId] = useState<{ type: string; id: string } | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<{ type: string; id: string; milestoneId?: string } | null>(null);
 
   // Assertion panel state
   const [assertionsByMilestone, setAssertionsByMilestone] = useState<Map<string, MissionContractAssertion[]>>(new Map());
@@ -917,6 +1082,11 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const [validationTelemetry, setValidationTelemetry] = useState<MilestoneValidationTelemetry | null>(null);
   const [validationRoundsExpanded, setValidationRoundsExpanded] = useState(true);
   const [validatingFeatures, setValidatingFeatures] = useState<Set<string>>(new Set());
+  const [repairingValidationFeatures, setRepairingValidationFeatures] = useState<Set<string>>(new Set());
+  const [missionBlockers, setMissionBlockers] = useState<MissionBlockerDescriptor[]>([]);
+  const [missionBlockedDiagnosticsError, setMissionBlockedDiagnosticsError] = useState(false);
+  const [clearingBlockedMissionId, setClearingBlockedMissionId] = useState<string | null>(null);
+  const [missionBlockedReason, setMissionBlockedReason] = useState("");
 
   // Feature loop state
   const [featureLoopStates, setFeatureLoopStates] = useState<Map<string, MissionFeatureLoopSnapshot>>(new Map());
@@ -940,10 +1110,46 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const missionEventsRef = useRef<MissionEvent[]>([]);
   const missionsRef = useRef<MissionWithSummary[]>([]);
   const selectedMissionRef = useRef<MissionWithHierarchy | null>(null);
+  // Intent changes synchronously on list clicks while committed detail intentionally lags its fetch.
+  const selectedMissionIntentRef = useRef<string | null>(null);
   const selectedMilestoneIdRef = useRef<string | null>(null);
+  /*
+  FNXC:MissionBranchGroupDetail 2026-08-08-16:58:
+  Mission selection can issue overlapping detail requests. Keep only the latest
+  response authoritative so a delayed prior mission cannot restore its hierarchy
+  or trigger a stale shared-branch scan after the operator has selected another.
+  */
+  const missionDetailRequestGenerationRef = useRef(0);
+  /*
+  FNXC:MissionReconcileControl 2026-08-11-06:49:
+  Reconcile responses are generation-guarded on success, rejection, and cleanup. A late loser
+  cannot alter a new mission, while a selection boundary owns synchronous busy/preview release.
+  */
+  const reconcileRequestGenerationRef = useRef(0);
+  const invalidateReconcileRequests = useCallback((nextIntentMissionId: string | null) => {
+    reconcileRequestGenerationRef.current += 1;
+    selectedMissionIntentRef.current = nextIntentMissionId;
+    setSelectedMissionIntentId(nextIntentMissionId);
+    setReconcileBusy(null);
+    setReconcilePreview(null);
+  }, []);
+  /*
+  FNXC:MissionBranchGroupDetail 2026-08-08-17:07:
+  Returning to the mission list, deleting the selected mission, hiding this
+  inline view, or unmounting also changes selection. Invalidate in-flight
+  detail reads at each of those boundaries so they cannot resurrect a detail
+  after the operator has left it.
+  */
+  const invalidateMissionDetailRequests = useCallback(() => {
+    missionDetailRequestGenerationRef.current += 1;
+    invalidateReconcileRequests(null);
+  }, [invalidateReconcileRequests]);
+  // FNXC:MilestoneValidationFreshness 2026-08-01-20:42: Rollup and telemetry responses share one per-milestone generation so an older request cannot restore a repaired failed badge, while a newer failure remains valid.
+  const validationRequestGenerationRef = useRef(new MilestoneValidationFreshnessCoordinator());
   const activeTabRef = useRef<"structure" | "activity">("structure");
   const eventsFilterRef = useRef<"all" | "errors" | "state_changes" | "tasks" | "slices" | "autopilot">("all");
   const [eventsLoading, setEventsLoading] = useState(false);
+  const missionActivityRef = useRef<HTMLDivElement | null>(null);
   const [eventsTotal, setEventsTotal] = useState(0);
   const [eventsFilter, setEventsFilter] = useState<
     "all" | "errors" | "state_changes" | "tasks" | "slices" | "autopilot"
@@ -970,6 +1176,15 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   }, [eventsTotal, missions, selectedMission?.eventCount, selectedMission?.id]);
 
   const displayedMissionEvents = useMemo(() => [...missionEvents].reverse(), [missionEvents]);
+  const reconcileFeatureTitles = useMemo(() => new Map(
+    (selectedMission?.milestones ?? []).flatMap((milestone) => milestone.slices.flatMap((slice) =>
+      slice.features.map((feature) => [feature.id, feature.title] as const),
+    )),
+  ), [selectedMission]);
+
+  useEffect(() => {
+    setReconcilePreview(null);
+  }, [selectedMission?.id]);
 
   // Keep latest state available to long-lived SSE handlers without reconnect churn.
   missionsRef.current = missions;
@@ -977,6 +1192,27 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   selectedMilestoneIdRef.current = selectedMilestoneId;
   activeTabRef.current = activeTab;
   eventsFilterRef.current = eventsFilter;
+
+  const beginValidationRequest = useCallback((milestoneId: string): number =>
+    validationRequestGenerationRef.current.begin(milestoneId), []);
+
+  const isCurrentValidationRequest = useCallback((milestoneId: string, generation: number): boolean =>
+    validationRequestGenerationRef.current.isCurrent(milestoneId, generation), []);
+
+  const loadValidationRollup = useCallback(async (milestoneId: string) => {
+    const generation = beginValidationRequest(milestoneId);
+    try {
+      const rollup = await fetchMilestoneValidation(milestoneId, projectId);
+      if (!isCurrentValidationRequest(milestoneId, generation)) return;
+      setValidationRollupByMilestone((prev) => {
+        const next = new Map(prev);
+        next.set(milestoneId, rollup);
+        return next;
+      });
+    } catch {
+      // Silently fail
+    }
+  }, [beginValidationRequest, isCurrentValidationRequest, projectId]);
 
   const scrollActivityToLatest = useCallback((behavior: ScrollBehavior = "auto") => {
     const endNode = activityEventsEndRef.current;
@@ -1060,14 +1296,28 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   }, [addToast, projectId, t]);
 
   const loadMissionDetail = useCallback(async (missionId: string) => {
+    /*
+    FNXC:MissionReconcileControl 2026-08-11-07:20:
+    Every detail-load entry point, including `targetMissionId` deep links, is a selection boundary.
+    Update intent before fetching so a new deep-linked mission can reconcile once it commits.
+    */
+    if (selectedMissionIntentRef.current !== missionId) {
+      invalidateReconcileRequests(missionId);
+    }
+    const requestGeneration = ++missionDetailRequestGenerationRef.current;
     try {
       setDetailLoading(true);
       const payload = await fetchMission(missionId, projectId);
+      if (requestGeneration !== missionDetailRequestGenerationRef.current) return;
       if (!payload || typeof payload !== "object") {
         throw new Error("Malformed mission detail response");
       }
 
       const data = normalizeMissionHierarchy(payload as MissionWithHierarchy);
+      if (selectedMissionIntentRef.current === null) {
+        selectedMissionIntentRef.current = data.id;
+        setSelectedMissionIntentId(data.id);
+      }
       setSelectedMission(data);
       if (data.milestones.length > 0) {
         const firstMilestoneId = data.milestones[0].id;
@@ -1107,24 +1357,44 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
 
         // Load assertions and validation rollup for the selected milestone.
         void loadAssertionsForMilestone(nextSelectedMilestoneId);
-        fetchMilestoneValidation(nextSelectedMilestoneId, projectId).then((rollup) => {
-          setValidationRollupByMilestone((prev) => {
-            const next = new Map(prev);
-            next.set(nextSelectedMilestoneId, rollup);
-            return next;
-          });
-        }).catch(() => { /* silently fail */ });
+        void loadValidationRollup(nextSelectedMilestoneId);
       } else {
         setSelectedMilestoneId(null);
         setValidationTelemetry(null);
       }
     } catch (err) {
+      if (requestGeneration !== missionDetailRequestGenerationRef.current) return;
       console.error("[MissionManager] loadMissionDetail:", err);
       addToast(getErrorMessage(err) || t("missions.loadDetailFailed", "Failed to load mission details"), "error");
     } finally {
-      setDetailLoading(false);
+      if (requestGeneration === missionDetailRequestGenerationRef.current) {
+        setDetailLoading(false);
+      }
     }
-  }, [addToast, loadAssertionsForMilestone, projectId]);
+  }, [addToast, invalidateReconcileRequests, loadAssertionsForMilestone, loadValidationRollup, projectId]);
+
+  /*
+  FNXC:MissionBranchGroupDetail 2026-08-08-16:11:
+  Mission detail may resolve multiple linked tasks asynchronously. Reset first and
+  cancel the prior scan when mission, project, or component ownership changes so
+  an unavailable candidate can be skipped but an old response never leaks its
+  branch, member count, or PR state into the current mission.
+  */
+  /*
+  FNXC:SpecLockMissionAlignment 2026-08-10-16:17:
+  FN-8845 keeps delivery status and spec alignment independent. Mission reconciliation persists
+  its deterministic projection on linked features; render that shared state rather than performing
+  browser-only task-report joins that can disagree with periodic/autopilot reconciliation. An
+  unlinked or archived feature remains unavailable and never receives a fabricated projection.
+  */
+  const featureSpecAlignments = useMemo<Record<string, DriftAlignment>>(() => Object.fromEntries(
+    (selectedMission?.milestones ?? []).flatMap((milestone) => milestone.slices.flatMap((slice) =>
+      slice.features.map((feature) => [
+        feature.id,
+        feature.taskId ? (feature.specAlignment ?? "unavailable") : "unavailable",
+      ] as const),
+    )),
+  ), [selectedMission]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1168,15 +1438,23 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     }
 
     let cancelled = false;
+    const generation = beginValidationRequest(selectedMilestoneId);
     setValidationTelemetry(null);
 
     fetchMilestoneValidationTelemetry(selectedMilestoneId, projectId)
       .then((telemetry) => {
-        if (cancelled) {
+        if (cancelled || !isCurrentValidationRequest(selectedMilestoneId, generation)) {
           return;
         }
         if (!isMilestoneValidationTelemetry(telemetry)) {
           setValidationTelemetry(null);
+          /*
+          FNXC:MilestoneValidationFreshness 2026-08-01-21:17:
+          Telemetry is optional, but its request still supersedes every shared badge writer.
+          Renew the authoritative rollup when telemetry is absent so the discarded older rollup
+          cannot leave a repaired milestone's previous failed badge in the map.
+          */
+          void loadValidationRollup(selectedMilestoneId);
           return;
         }
 
@@ -1188,15 +1466,16 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
         });
       })
       .catch(() => {
-        if (!cancelled) {
+        if (!cancelled && isCurrentValidationRequest(selectedMilestoneId, generation)) {
           setValidationTelemetry(null);
+          void loadValidationRollup(selectedMilestoneId);
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [isActive, selectedMilestoneId, projectId]);
+  }, [beginValidationRequest, isActive, isCurrentValidationRequest, loadValidationRollup, selectedMilestoneId, projectId]);
 
   useEffect(() => {
     setValidationRoundsExpanded(true);
@@ -1214,27 +1493,33 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     });
   }, [selectedMilestoneId]);
 
-  const refreshValidationTelemetry = useCallback((milestoneId: string) => {
-    if (!milestoneId || milestoneId !== selectedMilestoneIdRef.current) {
-      return;
-    }
-
-    void fetchMilestoneValidationTelemetry(milestoneId, projectId)
-      .then((telemetry) => {
-        if (selectedMilestoneIdRef.current !== milestoneId || !isMilestoneValidationTelemetry(telemetry)) {
-          return;
-        }
-        setValidationTelemetry(telemetry);
-        setValidationRollupByMilestone((prev) => {
-          const next = new Map(prev);
-          next.set(milestoneId, telemetry.rollup);
-          return next;
-        });
-      })
-      .catch(() => {
-        // Silently fail - telemetry is supplemental
+  const refreshValidationTelemetry = useCallback(async (milestoneId: string) => {
+    if (!milestoneId || milestoneId !== selectedMilestoneIdRef.current) return;
+    const generation = beginValidationRequest(milestoneId);
+    try {
+      const telemetry = await fetchMilestoneValidationTelemetry(milestoneId, projectId);
+      if (selectedMilestoneIdRef.current !== milestoneId
+        || !isCurrentValidationRequest(milestoneId, generation)) return;
+      if (!isMilestoneValidationTelemetry(telemetry)) {
+        setValidationTelemetry(null);
+        void loadValidationRollup(milestoneId);
+        return;
+      }
+      setValidationTelemetry(telemetry);
+      setValidationRollupByMilestone((prev) => {
+        const next = new Map(prev);
+        next.set(milestoneId, telemetry.rollup);
+        return next;
       });
-  }, [projectId]);
+    } catch {
+      // Telemetry is supplemental, but the shared generation requires a fresh rollup fallback.
+      if (selectedMilestoneIdRef.current === milestoneId
+        && isCurrentValidationRequest(milestoneId, generation)) {
+        setValidationTelemetry(null);
+        void loadValidationRollup(milestoneId);
+      }
+    }
+  }, [beginValidationRequest, isCurrentValidationRequest, loadValidationRollup, projectId]);
 
   const loadMissionEvents = useCallback(async (
     missionId: string,
@@ -1409,6 +1694,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
         try {
           const deletedMissionId = JSON.parse(messageEvent.data) as string;
           if (deletedMissionId && selectedMissionRef.current?.id === deletedMissionId) {
+            invalidateMissionDetailRequests();
             setSelectedMission(null);
           }
         } catch {
@@ -1642,6 +1928,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   }, [
     isActive,
     isActivityScrolledNearBottom,
+    invalidateMissionDetailRequests,
     loadMissionDetail,
     loadMissionHealth,
     loadMissions,
@@ -1652,6 +1939,13 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   ]);
 
   // Mission handlers
+  const handleMissionTaskPrefixChange = useCallback((rawValue: string) => {
+    const taskPrefix = rawValue.toUpperCase();
+    /** FNXC:MissionTaskPrefix 2026-07-26-12:00: keep all mission forms aligned with server validation so invalid prefixes never enter client state. */
+    if (taskPrefix !== "" && !/^[A-Z][A-Z0-9]*$/.test(taskPrefix)) return;
+    setMissionForm((current) => ({ ...current, taskPrefix }));
+  }, []);
+
   const handleEditMission = useCallback((mission: Mission) => {
     setEditingMissionId(mission.id);
     setIsCreatingMission(false);
@@ -1663,6 +1957,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       autoMergeOverride: missionAutoMergeOverride(mission.autoMerge),
       baseBranch: mission.baseBranch ?? "",
       branchStrategy: normalizeMissionBranchStrategy(mission.branchStrategy),
+      taskPrefix: mission.taskPrefix ?? "",
     });
   }, []);
 
@@ -1703,6 +1998,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
             : {}),
           baseBranch: missionForm.baseBranch.trim() || undefined,
           branchStrategy,
+          taskPrefix: missionForm.taskPrefix.trim() || undefined,
         }, projectId);
         addToast(t("missions.created", "Mission created"), "success");
       } else if (editingMissionId) {
@@ -1717,6 +2013,11 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
           autoMerge: resolveMissionAutoMerge(missionForm.autoMergeOverride) ?? null,
           baseBranch: missionForm.baseBranch.trim() || "",
           branchStrategy,
+          /*
+          FNXC:MissionTaskPrefix 2026-07-26-12:00:
+          Edit-save must send taskPrefix:null when the field is cleared. Empty input must not map to undefined: JSON.stringify drops undefined keys, the PATCH route treats a missing key as "no change".
+          */
+          taskPrefix: missionForm.taskPrefix.trim() || null,
         };
         if (missionForm.autopilotEnabled) {
           updates.autoAdvance = true;
@@ -1742,13 +2043,14 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       await deleteMission(missionId, projectId);
       addToast(t("missions.deleted", "Mission deleted"), "success");
       if (selectedMission?.id === missionId) {
+        invalidateMissionDetailRequests();
         setSelectedMission(null);
       }
       await loadMissions();
     } catch (err) {
       addToast(getErrorMessage(err) || t("missions.deleteFailed", "Failed to delete mission"), "error");
     }
-  }, [addToast, loadMissions, selectedMission, projectId, t]);
+  }, [addToast, invalidateMissionDetailRequests, loadMissions, selectedMission, projectId, t]);
 
   const requestDeleteMission = useCallback(async (missionId: string) => {
     /*
@@ -1849,19 +2151,13 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
         next.add(milestoneId);
         // Load assertions and validation rollup when expanding milestone
         void loadAssertionsForMilestone(milestoneId);
-        fetchMilestoneValidation(milestoneId, projectId).then((rollup) => {
-          setValidationRollupByMilestone((prev) => {
-            const next = new Map(prev);
-            next.set(milestoneId, rollup);
-            return next;
-          });
-        }).catch(() => { /* silently fail */ });
+        void loadValidationRollup(milestoneId);
       } else {
         next.delete(milestoneId);
       }
       return next;
     });
-  }, [loadAssertionsForMilestone, projectId]);
+  }, [loadAssertionsForMilestone, loadValidationRollup]);
 
   // Slice handlers
   const handleCreateSlice = useCallback((milestoneId: string) => {
@@ -2117,19 +2413,6 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
 
   // ── Assertion handlers ──
 
-  const loadValidationRollup = useCallback(async (milestoneId: string) => {
-    try {
-      const rollup = await fetchMilestoneValidation(milestoneId, projectId);
-      setValidationRollupByMilestone((prev) => {
-        const next = new Map(prev);
-        next.set(milestoneId, rollup);
-        return next;
-      });
-    } catch {
-      // Silently fail
-    }
-  }, [projectId]);
-
   const handleCreateAssertion = useCallback(async (milestoneId: string) => {
     if (!assertionForm.title.trim() || !assertionForm.assertion.trim()) {
       addToast(t("missions.assertionFieldsRequired", "Title and assertion text are required"), "error");
@@ -2153,6 +2436,14 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       setSaving(false);
     }
   }, [assertionForm, addToast, loadAssertionsForMilestone, loadValidationRollup, projectId]);
+
+  const handleDeleteAssertion = useCallback(async (assertionId: string, milestoneId: string) => {
+    await deleteAssertion(assertionId, projectId);
+    addToast(t("missions.assertionDeleted", "Assertion deleted"), "success");
+    await loadAssertionsForMilestone(milestoneId);
+    await loadValidationRollup(milestoneId);
+    setDeleteConfirmId(null);
+  }, [addToast, loadAssertionsForMilestone, loadValidationRollup, projectId]);
 
   const handleEditAssertion = useCallback((assertion: MissionContractAssertion) => {
     setEditingAssertionId(assertion.id);
@@ -2275,7 +2566,19 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
         return next;
       });
     } catch (err) {
-      addToast(getErrorMessage(err) || t("missions.validationTriggerFailed", "Failed to trigger validation"), "error");
+      if (err instanceof ApiRequestError
+        && err.status === 409
+        && (err.details as { code?: string } | undefined)?.code === VALIDATION_ALREADY_RUNNING) {
+        addToast(t("missions.validationAlreadyRunning", "Validation is already running for this feature"), "info");
+        try {
+          const snapshot = await fetchValidationLoopState(featureId, projectId);
+          setFeatureLoopStates((prev) => new Map(prev).set(featureId, snapshot));
+        } catch {
+          // FNXC:MissionValidation 2026-08-11-03:43: Preserve the specific conflict message when the live-state refresh races its owning validator.
+        }
+      } else {
+        addToast(getErrorMessage(err) || t("missions.validationTriggerFailed", "Failed to trigger validation"), "error");
+      }
     } finally {
       setValidatingFeatures((prev) => {
         const next = new Set(prev);
@@ -2297,6 +2600,84 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       // Silently fail
     }
   }, [projectId]);
+
+
+  const applyValidationRepairSnapshot = useCallback((updated: MissionFeature) => {
+    setSelectedMission((current) => current ? {
+      ...current,
+      milestones: current.milestones.map((milestone) => ({
+        ...milestone,
+        slices: milestone.slices.map((slice) => ({
+          ...slice,
+          features: slice.features.map((feature) => feature.id === updated.id ? { ...feature, ...updated } : feature),
+        })),
+      })),
+    } : current);
+    setValidationTelemetry((current) => current ? {
+      ...current,
+      fixFeatures: current.fixFeatures.map((feature) => feature.id === updated.id ? { ...feature, ...updated } : feature),
+    } : current);
+  }, []);
+
+  const handleClearValidationBadge = useCallback(async (featureId: string) => {
+    try {
+      setRepairingValidationFeatures((prev) => new Set(prev).add(featureId));
+      const repaired = await repairFeatureValidation(featureId, "clear", undefined, projectId);
+      if ("id" in repaired) applyValidationRepairSnapshot(repaired);
+      addToast(t("missions.validationBadgeCleared", "Validation badge cleared"), "success");
+      /*
+      FNXC:MissionValidationRepair 2026-08-11-02:10:
+      A successful repair changes the feature row itself, not only its validation snapshot.
+      Refresh the selected mission and validation telemetry so both the canonical row and generated
+      fix-feature header lose stale badges immediately without a browser reload.
+      */
+      await Promise.all([
+        loadFeatureLoopState(featureId),
+        selectedMission?.id ? loadMissionDetail(selectedMission.id) : Promise.resolve(),
+        selectedMilestoneId ? refreshValidationTelemetry(selectedMilestoneId) : Promise.resolve(),
+      ]);
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 409) {
+        addToast(t("missions.validationStateChanged", "Feature state changed — refreshed"), "error");
+        await loadFeatureLoopState(featureId);
+      } else {
+        addToast(getErrorMessage(err) || t("missions.validationRepairFailed", "Failed to repair validation state"), "error");
+      }
+    } finally {
+      setRepairingValidationFeatures((prev) => {
+        const next = new Set(prev);
+        next.delete(featureId);
+        return next;
+      });
+    }
+  }, [addToast, applyValidationRepairSnapshot, loadFeatureLoopState, loadMissionDetail, projectId, refreshValidationTelemetry, selectedMilestoneId, selectedMission?.id]);
+
+  const handleRerunValidation = useCallback(async (featureId: string) => {
+    try {
+      setRepairingValidationFeatures((prev) => new Set(prev).add(featureId));
+      const repaired = await repairFeatureValidation(featureId, "re_run", undefined, projectId);
+      if ("id" in repaired) applyValidationRepairSnapshot(repaired);
+      addToast(t("missions.validationRerun", "Validation re-run started"), "success");
+      await Promise.all([
+        loadFeatureLoopState(featureId),
+        selectedMission?.id ? loadMissionDetail(selectedMission.id) : Promise.resolve(),
+        selectedMilestoneId ? refreshValidationTelemetry(selectedMilestoneId) : Promise.resolve(),
+      ]);
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 409) {
+        addToast(t("missions.validationStateChanged", "Feature state changed — refreshed"), "error");
+        await loadFeatureLoopState(featureId);
+      } else {
+        addToast(getErrorMessage(err) || t("missions.validationRepairFailed", "Failed to repair validation state"), "error");
+      }
+    } finally {
+      setRepairingValidationFeatures((prev) => {
+        const next = new Set(prev);
+        next.delete(featureId);
+        return next;
+      });
+    }
+  }, [addToast, applyValidationRepairSnapshot, loadFeatureLoopState, loadMissionDetail, projectId, refreshValidationTelemetry, selectedMilestoneId, selectedMission?.id]);
 
   // Load validation runs for a feature
   const loadValidationRuns = useCallback(async (featureId: string) => {
@@ -2366,6 +2747,35 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     }
   }, [projectId]);
 
+  useEffect(() => {
+    if (!selectedMission || selectedMission.status !== "blocked") {
+      setMissionBlockers([]); setMissionBlockedDiagnosticsError(false); return;
+    }
+    let cancelled = false;
+    fetchMissionBlockedDiagnostics(selectedMission.id, projectId).then((diagnostics) => {
+      if (!cancelled) {
+        const blockers = diagnostics?.blockers;
+        // FNXC:MissionBlockedRepair 2026-08-11-03:15:
+        // A malformed diagnostics response must retain the clear control but identify its blocker
+        // explanation as unavailable instead of presenting an authoritative-looking empty list.
+        setMissionBlockers(normalizeMissionBlockers(blockers));
+        setMissionBlockedDiagnosticsError(!Array.isArray(blockers));
+      }
+    }).catch(() => { if (!cancelled) { setMissionBlockers([]); setMissionBlockedDiagnosticsError(true); } });
+    return () => { cancelled = true; };
+  }, [projectId, selectedMission?.id, selectedMission?.status]);
+
+  const handleClearMissionBlockedStatus = useCallback(async (missionId: string, reason?: string) => {
+    try {
+      setClearingBlockedMissionId(missionId);
+      const result = await clearMissionBlockedStatus(missionId, reason?.trim() ? { reason: reason.trim() } : {}, projectId);
+      setMissionBlockers(normalizeMissionBlockers(result.blockers));
+      addToast(result.blockers.length > 0 ? t("missions.blockedClearedStillGated", "Blocked status cleared; automation remains gated until Resume.") : t("missions.blockedCleared", "Blocked status cleared"), result.blockers.length > 0 ? "warning" : "success");
+      await loadMissionDetail(missionId); loadMissions();
+    } catch (err) { addToast(getErrorMessage(err) || t("missions.clearBlockedFailed", "Failed to clear blocked status"), "error"); }
+    finally { setClearingBlockedMissionId(null); }
+  }, [addToast, loadMissionDetail, loadMissions, projectId, t]);
+
   // Toggle feature expansion to show run history
   const toggleFeatureExpanded = useCallback(async (featureId: string) => {
     if (expandedFeatureId === featureId) {
@@ -2396,9 +2806,15 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       await loadMissionDetail(missionId);
       loadMissions();
     } catch (err) {
-      addToast(getErrorMessage(err) || t("missions.resumeFailed", "Failed to resume mission"), "error");
+      const conflict = parseMissionResumeConflict(err);
+      if (conflict && conflict.blockers.length > 0) {
+        setMissionBlockers(conflict.blockers);
+        setMissionBlockedDiagnosticsError(false);
+        const rendered = conflict.blockers.map((blocker) => `${blocker.rootFeatureId} — ${blocker.reason}`).join(", ");
+        addToast(t("missions.resumeBlocked", { blockers: rendered, defaultValue: "Mission cannot resume until its recorded blockers are resolved: {{blockers}}" }), "error");
+      } else addToast(getErrorMessage(err) || t("missions.resumeFailed", "Failed to resume mission"), "error");
     }
-  }, [addToast, loadMissionDetail, loadMissions, projectId]);
+  }, [addToast, loadMissionDetail, loadMissions, projectId, t]);
 
   // Stop mission — set status to "blocked" and pause all linked tasks
   const handleStopMission = useCallback(async (missionId: string) => {
@@ -2486,7 +2902,57 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     }
   }, [addToast, loadMissionDetail, loadMissions, projectId]);
 
+  const isReconcileRequestStale = useCallback((generation: number, missionId: string) =>
+    generation !== reconcileRequestGenerationRef.current || selectedMissionRef.current?.id !== missionId,
+  []);
+
+  const handleReconcilePreview = useCallback(async (missionId: string) => {
+    // The committed selectedMission is not an intent signal during a detail-load switch.
+    if (missionId !== selectedMissionIntentRef.current) return;
+    const generation = ++reconcileRequestGenerationRef.current;
+    setReconcileBusy("preview");
+    try {
+      const result = await reconcileMission(missionId, { dryRun: true }, projectId);
+      if (isReconcileRequestStale(generation, missionId)) return;
+      setReconcilePreview({ missionId, result });
+    } catch (err) {
+      if (isReconcileRequestStale(generation, missionId)) return;
+      addToast(getErrorMessage(err) || t("missions.reconcilePreviewFailed", "Failed to preview reconcile"), "error");
+    } finally {
+      if (!isReconcileRequestStale(generation, missionId)) setReconcileBusy(null);
+    }
+  }, [addToast, isReconcileRequestStale, projectId, t]);
+
+  const handleReconcileApply = useCallback(async (missionId: string) => {
+    // Refuse an apply dispatched from an old header in the synchronous selection window.
+    if (missionId !== selectedMissionIntentRef.current) return;
+    const generation = ++reconcileRequestGenerationRef.current;
+    setReconcileBusy("apply");
+    try {
+      const result = await reconcileMission(missionId, { dryRun: false }, projectId);
+      if (isReconcileRequestStale(generation, missionId)) return;
+      addToast(t("missions.reconcileApplied", "Reconciled: {{status}} status, {{badge}} badge, {{terminal}} terminal repairs", {
+        status: result.statusUpdates, badge: result.badgeRepairs, terminal: result.terminalRepairs,
+      }), "success");
+      setReconcilePreview(null);
+      await loadMissionDetail(missionId);
+      if (isReconcileRequestStale(generation, missionId)) return;
+      void loadMissions();
+    } catch (err) {
+      if (isReconcileRequestStale(generation, missionId)) return;
+      addToast(getErrorMessage(err) || t("missions.reconcileApplyFailed", "Failed to apply reconcile"), "error");
+    } finally {
+      if (!isReconcileRequestStale(generation, missionId)) setReconcileBusy(null);
+    }
+  }, [addToast, isReconcileRequestStale, loadMissionDetail, loadMissions, projectId, t]);
+
   const handleSelectMission = useCallback((mission: Mission) => {
+    /*
+    FNXC:MissionReconcileControl 2026-08-11-06:49:
+    Detail refs lag a direct mission switch until its fetch commits. Record operator intent and
+    invalidate/release synchronously so the retained old header cannot reconcile an abandoned mission.
+    */
+    invalidateReconcileRequests(mission.id);
     setActiveTab("structure");
     setSelectedMilestoneId(null);
     setValidationTelemetry(null);
@@ -2495,9 +2961,10 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     setEventsFilter("all");
     setExpandedEventMetadata(new Set());
     loadMissionDetail(mission.id);
-  }, [loadMissionDetail]);
+  }, [invalidateReconcileRequests, loadMissionDetail]);
 
   const handleBackToList = useCallback(() => {
+    invalidateMissionDetailRequests();
     setSelectedMission(null);
     setSelectedMilestoneId(null);
     setValidationTelemetry(null);
@@ -2507,7 +2974,11 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     setEventsFilter("all");
     setExpandedEventMetadata(new Set());
     loadMissions();
-  }, [loadMissions]);
+  }, [invalidateMissionDetailRequests, loadMissions]);
+
+  useEffect(() => () => {
+    invalidateMissionDetailRequests();
+  }, [invalidateMissionDetailRequests]);
 
   const hasMoreEvents = missionEvents.length < eventsTotal;
   const autopilotState = (selectedMission?.autopilotState ?? "inactive") as AutopilotState;
@@ -2522,9 +2993,15 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
 
   useEffect(() => {
     if (!isActive) {
+      /*
+      FNXC:MissionReconcileControl 2026-08-11-06:49:
+      Inline Mission Manager stays mounted when hidden. Treat that visibility boundary like a
+      deselection so an in-flight reconcile cannot toast or update hidden, abandoned detail.
+      */
+      invalidateMissionDetailRequests();
       previousMobileDetailVisibleRef.current = false;
     }
-  }, [isActive]);
+  }, [invalidateMissionDetailRequests, isActive]);
 
   useEffect(() => {
     const isMobileDetailVisible = isActive && isMobile && Boolean(selectedMission);
@@ -2575,6 +3052,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
 
     void loadMissionEvents(selectedMission.id, { append: true });
   }, [eventsLoading, hasMoreEvents, loadMissionEvents, selectedMission]);
+  const missionEventPagination = useAutoPaginationSentinel({ rootRef: missionActivityRef, hasMore: hasMoreEvents, loading: eventsLoading, onLoadMore: handleLoadMoreEvents, direction: "start" });
 
   const toggleEventMetadata = useCallback((eventId: string) => {
     setExpandedEventMetadata((prev) => {
@@ -2631,6 +3109,64 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [isActive, onClose]);
+
+  /*
+  FNXC:MissionDraftDiscard 2026-08-03-02:16:
+  Discard posts the draft session id and optional projectId only (project-scoped API). A 409 lock
+  conflict keeps the draft visible and surfaces the "open in another tab" warning; 404 removes the
+  stale list row. No browser tab id is sent in the body.
+
+  FNXC:Missions 2026-08-03-02:01:
+  Hoisted above `if (!isActive) return null` so hide/show of the inline Missions tab does not change
+  the hook list (handleConfirmDelete depends on this callback).
+  */
+  const handleDiscardInterviewSession = useCallback(async (sessionId: string) => {
+    try {
+      await discardMissionInterviewDraft(sessionId, projectId);
+      setMissionInterviewDrafts((current) => current.filter((session) => session.id !== sessionId));
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 409) {
+        addToast(t("missions.draftOpenInAnotherTab", "Draft is open in another tab"), "error");
+        return;
+      }
+      if (err instanceof ApiRequestError && err.status === 404) {
+        setMissionInterviewDrafts((current) => current.filter((session) => session.id !== sessionId));
+        return;
+      }
+      addToast(getErrorMessage(err) || t("missions.draftDiscardFailed", "Failed to discard draft"), "error");
+      return;
+    } finally {
+      setDeleteConfirmId(null);
+    }
+  }, [addToast, projectId, t]);
+  /*
+  FNXC:MissionAssertions 2026-08-01-19:44:
+  Every deleteConfirmId type must dispatch a deletion, and the shared confirmation panel must surface rejected requests. Assertion deletion is an operator recovery path for validation failures, so a silent no-op would leave stale rollups unrepairable.
+
+  FNXC:Missions 2026-08-03-02:01:
+  This useCallback MUST stay above the `if (!isActive) return null` early return. Declaring it after
+  the return dropped a hook when the inline Missions tab was hidden (isOpen=false), which crashed
+  React with "Rendered fewer hooks than expected" on hide/show cycles.
+  */
+  const handleConfirmDelete = useCallback(async () => {
+    if (!deleteConfirmId) return;
+
+    try {
+      if (deleteConfirmId.type === "milestone") {
+        await handleDeleteMilestone(deleteConfirmId.id);
+      } else if (deleteConfirmId.type === "slice") {
+        await handleDeleteSlice(deleteConfirmId.id);
+      } else if (deleteConfirmId.type === "feature") {
+        await handleDeleteFeature(deleteConfirmId.id);
+      } else if (deleteConfirmId.type === "assertion" && deleteConfirmId.milestoneId) {
+        await handleDeleteAssertion(deleteConfirmId.id, deleteConfirmId.milestoneId);
+      } else if (deleteConfirmId.type === "interview_draft") {
+        await handleDiscardInterviewSession(deleteConfirmId.id);
+      }
+    } catch (err) {
+      addToast(getErrorMessage(err) || t("missions.deleteFailed", "Failed to delete item"), "error");
+    }
+  }, [addToast, deleteConfirmId, handleDeleteAssertion, handleDeleteFeature, handleDeleteMilestone, handleDeleteSlice, handleDiscardInterviewSession, t]);
 
   if (!isActive) return null;
 
@@ -2804,6 +3340,28 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
 
                   <div className="mission-detail__actions">
                     <div className="mission-detail__run-controls">
+                    <button
+                      className="mission-btn mission-btn--ghost"
+                      onClick={() => handleReconcilePreview(selectedMission.id)}
+                      title={t("missions.reconcileNow", "Reconcile now")}
+                      aria-label={t("missions.reconcileNow", "Reconcile now")}
+                      data-testid="mission-reconcile-now"
+                      disabled={reconcileBusy !== null || selectedMissionIntentId !== selectedMission.id}
+                    >
+                      {reconcileBusy === "preview" ? <Loader2 className="spinner" /> : <RefreshCw />}
+                      <span>{t("missions.reconcileNow", "Reconcile now")}</span>
+                    </button>
+                    {reconcilePreview?.missionId === selectedMission.id && (
+                      <MissionReconcilePreview
+                        result={reconcilePreview.result}
+                        featureTitles={reconcileFeatureTitles}
+                        busy={reconcileBusy}
+                        disabled={selectedMissionIntentId !== selectedMission.id}
+                        onApply={() => handleReconcileApply(selectedMission.id)}
+                        onDismiss={() => setReconcilePreview(null)}
+                        t={t}
+                      />
+                    )}
                     {selectedMission.status === "active" && (
                       <button
                         className="mission-btn mission-btn--danger"
@@ -2825,6 +3383,28 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                         <Play size={14} />
                         <span>{t("missions.resumeMission", "Resume mission")}</span>
                       </button>
+                    )}
+                    {getMissionBlockedRepairState(selectedMission, missionBlockers).showClear && (
+                      <>
+                        {/* FNXC:MissionBlockedRepair 2026-08-11-02:56: This mission-level control is separate from feature validation repair because that repair never alters the durable mission badge. */}
+                        <button
+                          className="mission-btn mission-btn--ghost"
+                          onClick={() => handleClearMissionBlockedStatus(selectedMission.id, missionBlockedReason)}
+                          title={t("missions.clearBlockedStatus", "Clear blocked status")}
+                          aria-label={t("missions.clearBlockedStatus", "Clear blocked status")}
+                          disabled={clearingBlockedMissionId === selectedMission.id}
+                        >
+                          <Check size={14} />
+                          <span>{t("missions.clearBlockedStatus", "Clear blocked status")}</span>
+                        </button>
+                        <div className="mission-blocked-repair" aria-label={t("missions.whyBlocked", "Why blocked")}>
+                          <strong>{t("missions.whyBlocked", "Why blocked")}</strong>
+                          {missionBlockedDiagnosticsError ? <span>{t("missions.blockedDiagnosticsUnknown", "Blocker diagnostics are unavailable.")}</span> : missionBlockers.length === 0 ? <span>{t("missions.noRecordedBlockers", "No recorded blockers.")}</span> : (
+                            <ul>{missionBlockers.map((blocker) => <li key={`${blocker.rootFeatureId}\u0000${blocker.source}\u0000${blocker.reason}`}>{blocker.rootFeatureId}: {blocker.reason} ({blocker.source})</li>)}</ul>
+                          )}
+                          <input className="input" value={missionBlockedReason} onChange={(event) => setMissionBlockedReason(event.target.value)} placeholder={t("missions.clearBlockedReason", "Optional repair reason")} aria-label={t("missions.clearBlockedReason", "Optional repair reason")} />
+                        </div>
+                      </>
                     )}
                     {selectedMission.status === "planning" && (
                       <button
@@ -2891,6 +3471,16 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                     />
                   </label>
                   <label>
+                    {t("missions.taskPrefix", "Task prefix")}
+                    <input
+                      type="text"
+                      placeholder={t("missions.taskPrefixPlaceholder", "e.g. ERR (defaults to project prefix)")}
+                      value={missionForm.taskPrefix}
+                      onChange={(e) => handleMissionTaskPrefixChange(e.target.value)}
+                      aria-label={t("missions.taskPrefixAriaLabel", "Mission task prefix")}
+                    />
+                  </label>
+                  <label>
                     {t("missions.branchStrategy", "Branch strategy")}
                     <select
                       value={missionForm.branchStrategy.mode}
@@ -2911,25 +3501,11 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                       <option value="custom-new">{t("missions.branchStrategyCustomNew", "Create custom branch")}</option>
                     </select>
                   </label>
-                  <label>
-                    {t("missions.autoMergeOverride", "Merge behavior")}
-                    <select
-                      value={missionForm.autoMergeOverride}
-                      onChange={(e) => setMissionForm({ ...missionForm, autoMergeOverride: e.target.value as MissionAutoMergeOverride })}
-                      aria-label={t("missions.autoMergeOverrideAriaLabel", "Mission auto-merge override")}
-                    >
-                      <option value="inherit">{t("missions.autoMergeInherited", "Use project default")}</option>
-                      <option value="on">{t("missions.autoMergeOn", "Auto-merge")}</option>
-                      <option value="off">{t("missions.singlePullRequest", "Single pull request")}</option>
-                    </select>
-                    {/*
-                    FNXC:MissionAutoMerge 2026-07-19-00:00:
-                    Operators need in-context guidance for the per-mission merge choice: auto-merge lands each feature independently, while a single pull request keeps all features on one shared branch for joint review.
-                    */}
-                    <span className="mission-detail__autopilot-description">
-                      {t("missions.autoMergeOverrideDescription", "Auto-merge merges each feature as it passes. Single pull request keeps every feature on one shared branch to review and merge together.")}
-                    </span>
-                  </label>
+                  <MissionMergeBehaviorField
+                    value={missionForm.autoMergeOverride}
+                    onChange={(autoMergeOverride) => setMissionForm({ ...missionForm, autoMergeOverride })}
+                    t={t}
+                  />
                   {(missionForm.branchStrategy.mode === "existing" || missionForm.branchStrategy.mode === "custom-new") && (
                     <label>
                       {t("missions.branchName", "Branch name")}
@@ -3280,6 +3856,17 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                                             {fixFeature.loopState}
                                           </span>
                                         )}
+                                        {featureValidationRepairEligibility(fixFeature).clear || featureValidationRepairEligibility(fixFeature).reRun ? (
+                                          <div className="mission-fix-feature__actions">
+                                            <FeatureValidationRepairActions
+                                              feature={fixFeature}
+                                              busy={repairingValidationFeatures.has(fixFeature.id)}
+                                              onClear={handleClearValidationBadge}
+                                              onReRun={handleRerunValidation}
+                                              t={t}
+                                            />
+                                          </div>
+                                        ) : null}
                                       </div>
                                       <div className="mission-fix-feature__meta">
                                         <span>{t("missions.source", "Source:")}</span>
@@ -3495,6 +4082,15 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                                           >
                                             {feature.status}
                                           </span>
+                                          {feature.taskId && featureSpecAlignments[feature.id] && (
+                                            <span
+                                              className={`mission-status-badge mission-status-badge--sm mission-spec-alignment mission-spec-alignment--${featureSpecAlignments[feature.id]}`}
+                                              data-testid={`mission-feature-spec-alignment-${feature.id}`}
+                                              aria-label={t("missions.specAlignment", "Spec alignment: {{alignment}}", { alignment: featureSpecAlignments[feature.id] })}
+                                            >
+                                              {featureSpecAlignments[feature.id]}
+                                            </span>
+                                          )}
                                           {/* Loop state indicator */}
                                           {(feature.loopState && feature.loopState !== "idle") && (
                                             <span
@@ -3563,6 +4159,13 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                                             </span>
                                           )}
                                           <div className="mission-feature__actions">
+                                            <FeatureValidationRepairActions
+                                              feature={feature}
+                                              busy={repairingValidationFeatures.has(feature.id)}
+                                              onClear={handleClearValidationBadge}
+                                              onReRun={handleRerunValidation}
+                                              t={t}
+                                            />
                                             {feature.status === "defined" && !feature.taskId && (
                                               <button
                                                 className="mission-icon-btn"
@@ -3997,8 +4600,9 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                                         </button>
                                         <button
                                           className="mission-icon-btn mission-icon-btn--danger"
-                                          onClick={() => setDeleteConfirmId({ type: "assertion", id: assertion.id })}
+                                          onClick={() => setDeleteConfirmId({ type: "assertion", id: assertion.id, milestoneId: milestone.id })}
                                           title={t("missions.deleteAssertion", "Delete assertion")}
+                                          aria-label={t("missions.deleteAssertion", "Delete assertion")}
                                         >
                                           <Trash2 size={14} />
                                         </button>
@@ -4194,7 +4798,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 )}
                 </div>
               ) : (
-                <div className="mission-detail__activity" data-testid="mission-activity-tab">
+                <div className="mission-detail__activity" data-testid="mission-activity-tab" ref={missionActivityRef}>
                   <div className="mission-detail__activity-controls">
                     <label className="mission-detail__activity-filter">
                       <span>{t("missions.filterLabel", "Filter")}</span>
@@ -4216,17 +4820,9 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                     </span>
                   </div>
 
-                  {!eventsLoading && hasMoreEvents && (
-                    <div className="mission-detail__activity-load-more mission-detail__activity-load-more--top">
-                      <button
-                        className="mission-btn mission-btn--ghost"
-                        onClick={handleLoadMoreEvents}
-                        data-testid="mission-activity-load-more"
-                      >
-                        {t("missions.loadMore", "Load more")}
-                      </button>
-                    </div>
-                  )}
+                  {hasMoreEvents ? (
+                    <div ref={missionEventPagination.sentinelRef} className="mission-detail__activity-load-more mission-detail__activity-load-more--top" data-testid="mission-activity-auto-pagination-sentinel" role="status" aria-live="polite" />
+                  ) : null}
 
                   {eventsLoading ? (
                     <div className="mission-manager__loading mission-detail__activity-loading">
@@ -4260,6 +4856,21 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                             <span className="mission-event__timestamp">
                               {new Date(event.timestamp).toLocaleString()}
                             </span>
+                            {(() => {
+                              const diagnostics = getValidationDiagnostics(event.metadata);
+                              if (!diagnostics) return null;
+                              return <section className="mission-event__diagnostics" aria-label={t("missions.validationDiagnostics", "Validation diagnostics")}>
+                                <strong>{t("missions.validatorRun", "Validator run")}: {diagnostics.runId}</strong>
+                                <span>{t("missions.nextAction", "Next action")}: {diagnostics.nextAction}</span>
+                                {diagnostics.assertions.map((assertion) => <div className="mission-event__diagnostic" key={assertion.assertionId}>
+                                  <strong>{assertion.assertionId}: {assertion.verdict}</strong>
+                                  {assertion.expected && <span>{t("missions.expected", "Expected")}: {assertion.expected}</span>}
+                                  {assertion.actual && <span>{t("missions.observed", "Observed")}: {assertion.actual}</span>}
+                                  {assertion.evidence.map((evidence, index) => <span key={index}>{t("missions.evidence", "Evidence")}: {evidence.text ?? evidence.kind ?? t("missions.recorded", "recorded")}{evidence.truncated ? ` (${t("missions.truncated", "truncated")})` : ""}</span>)}
+                                  {assertion.omittedEvidenceCount ? <span>{t("missions.evidenceOmitted", "Additional evidence omitted")}: {assertion.omittedEvidenceCount}</span> : null}
+                                </div>)}
+                              </section>;
+                            })()}
                             {hasMetadata && (
                               <div className="mission-event__metadata">
                                 <button
@@ -4290,7 +4901,22 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     );
   };
 
+  /*
+  FNXC:MissionAutoMerge 2026-08-08-17:21:
+  Keep AI planning as the primary Plan New Mission CTA, but retain a visible,
+  production manual-create path for operators who need to choose merge behavior
+  before a mission exists. This link opens the existing form without changing
+  the frozen planning button set.
+  */
+  const openDirectMissionCreate = () => {
+    setIsCreateMenuOpen(false);
+    setMissionForm(EMPTY_MISSION_FORM);
+    setEditingMissionId(null);
+    setIsCreatingMission(true);
+  };
+
   const openNewMissionInterview = () => {
+    setIsCreateMenuOpen(false);
     if (resumeSessionId) {
       dismissedResumeSessionIdRef.current = resumeSessionId;
     }
@@ -4315,30 +4941,6 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     setInterviewLaunchMode("new");
     setLocalResumeSessionId(undefined);
     setShowInterviewModal(false);
-  };
-
-  const handleDiscardInterviewSession = async (sessionId: string) => {
-    try {
-      /*
-      FNXC:MissionDraftDiscard 2026-06-24-02:42:
-      The mission draft Discard confirmation must send the current browser tab id so a draft locked by this tab can be removed while a draft actively owned by another tab returns the lock warning and stays visible.
-      */
-      await discardMissionInterviewDraft(sessionId, projectId);
-      setMissionInterviewDrafts((current) => current.filter((session) => session.id !== sessionId));
-    } catch (err) {
-      if (err instanceof ApiRequestError && err.status === 409) {
-        addToast(t("missions.draftOpenInAnotherTab", "Draft is open in another tab"), "error");
-        return;
-      }
-      if (err instanceof ApiRequestError && err.status === 404) {
-        setMissionInterviewDrafts((current) => current.filter((session) => session.id !== sessionId));
-        return;
-      }
-      addToast(getErrorMessage(err) || t("missions.draftDiscardFailed", "Failed to discard draft"), "error");
-      return;
-    } finally {
-      setDeleteConfirmId(null);
-    }
   };
 
   const renderInterviewSessionItems = () => missionInterviewDrafts.map((session) => {
@@ -4572,6 +5174,18 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 <span>{t("missions.resumeMission", "Resume mission")}</span>
               </button>
             )}
+            {getMissionBlockedRepairState(m, []).showClear && (
+              <button
+                className="mission-btn mission-btn--ghost mission-btn--sm"
+                onClick={() => handleClearMissionBlockedStatus(m.id)}
+                title={t("missions.clearBlockedStatus", "Clear blocked status")}
+                aria-label={t("missions.clearBlockedStatus", "Clear blocked status")}
+                disabled={clearingBlockedMissionId === m.id}
+              >
+                <Check size={14} />
+                <span>{t("missions.clearBlockedStatus", "Clear blocked status")}</span>
+              </button>
+            )}
             {m.status === "planning" && (
               <button
                 className="mission-btn mission-btn--primary mission-btn--sm"
@@ -4608,14 +5222,29 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     );
   });
 
-  const renderMissionListContent = ({ hideBottomButtons = false }: { hideBottomButtons?: boolean } = {}) => {
-    const persistedInterviewMissions = missions.filter((mission) => mission.interviewState === "in_progress");
-    const standardMissions = missions.filter((mission) => mission.interviewState !== "in_progress");
-    const showBottomPlanButton = !hideBottomButtons;
+  const renderMissionListContent = () => {
+    /*
+    FNXC:StandardizedMissionLayout 2026-09-13-16:30:
+    Archived missions are a list concern rather than a second destination. The filter stays with the collection while the one Plan New Mission action remains in the shared header at every breakpoint.
+    */
+    const visibleMissions = missions.filter((mission) => showArchived || mission.status !== "archived");
+    const persistedInterviewMissions = visibleMissions.filter((mission) => mission.interviewState === "in_progress");
+    const standardMissions = visibleMissions.filter((mission) => mission.interviewState !== "in_progress");
 
     return (
       <div className="mission-list">
-              {/* Create mission form */}
+        <div className="mission-list__filters">
+          <button
+            type="button"
+            className="btn btn-sm"
+            aria-pressed={showArchived}
+            onClick={() => setShowArchived((visible) => !visible)}
+          >
+            {showArchived ? t("missions.hideArchived", "Hide archived") : t("missions.showArchived", "Show archived")}
+          </button>
+        </div>
+
+        {/* Create mission form */}
               {isCreatingMission && (
                 <div className="mission-form-card">
                   <input
@@ -4643,6 +5272,16 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                     />
                   </label>
                   <label>
+                    {t("missions.taskPrefix", "Task prefix")}
+                    <input
+                      type="text"
+                      placeholder={t("missions.taskPrefixPlaceholder", "e.g. ERR (defaults to project prefix)")}
+                      value={missionForm.taskPrefix}
+                      onChange={(e) => handleMissionTaskPrefixChange(e.target.value)}
+                      aria-label={t("missions.taskPrefixAriaLabel", "Mission task prefix")}
+                    />
+                  </label>
+                  <label>
                     {t("missions.branchStrategy", "Branch strategy")}
                     <select
                       value={missionForm.branchStrategy.mode}
@@ -4663,21 +5302,11 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                       <option value="custom-new">{t("missions.branchStrategyCustomNew", "Create custom branch")}</option>
                     </select>
                   </label>
-                  <label>
-                    {t("missions.autoMergeOverride", "Merge behavior")}
-                    <select
-                      value={missionForm.autoMergeOverride}
-                      onChange={(e) => setMissionForm({ ...missionForm, autoMergeOverride: e.target.value as MissionAutoMergeOverride })}
-                      aria-label={t("missions.autoMergeOverrideAriaLabel", "Mission auto-merge override")}
-                    >
-                      <option value="inherit">{t("missions.autoMergeInherited", "Use project default")}</option>
-                      <option value="on">{t("missions.autoMergeOn", "Auto-merge")}</option>
-                      <option value="off">{t("missions.singlePullRequest", "Single pull request")}</option>
-                    </select>
-                    <span className="mission-detail__autopilot-description">
-                      {t("missions.autoMergeOverrideDescription", "Auto-merge merges each feature as it passes. Single pull request keeps every feature on one shared branch to review and merge together.")}
-                    </span>
-                  </label>
+                  <MissionMergeBehaviorField
+                    value={missionForm.autoMergeOverride}
+                    onChange={(autoMergeOverride) => setMissionForm({ ...missionForm, autoMergeOverride })}
+                    t={t}
+                  />
                   {(missionForm.branchStrategy.mode === "existing" || missionForm.branchStrategy.mode === "custom-new") && (
                     <label>
                       {t("missions.branchName", "Branch name")}
@@ -4752,6 +5381,16 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                     />
                   </label>
                   <label>
+                    {t("missions.taskPrefix", "Task prefix")}
+                    <input
+                      type="text"
+                      placeholder={t("missions.taskPrefixPlaceholder", "e.g. ERR (defaults to project prefix)")}
+                      value={missionForm.taskPrefix}
+                      onChange={(e) => handleMissionTaskPrefixChange(e.target.value)}
+                      aria-label={t("missions.taskPrefixAriaLabel", "Mission task prefix")}
+                    />
+                  </label>
+                  <label>
                     {t("missions.branchStrategy", "Branch strategy")}
                     <select
                       value={missionForm.branchStrategy.mode}
@@ -4772,21 +5411,11 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                       <option value="custom-new">{t("missions.branchStrategyCustomNew", "Create custom branch")}</option>
                     </select>
                   </label>
-                  <label>
-                    {t("missions.autoMergeOverride", "Merge behavior")}
-                    <select
-                      value={missionForm.autoMergeOverride}
-                      onChange={(e) => setMissionForm({ ...missionForm, autoMergeOverride: e.target.value as MissionAutoMergeOverride })}
-                      aria-label={t("missions.autoMergeOverrideAriaLabel", "Mission auto-merge override")}
-                    >
-                      <option value="inherit">{t("missions.autoMergeInherited", "Use project default")}</option>
-                      <option value="on">{t("missions.autoMergeOn", "Auto-merge")}</option>
-                      <option value="off">{t("missions.singlePullRequest", "Single pull request")}</option>
-                    </select>
-                    <span className="mission-detail__autopilot-description">
-                      {t("missions.autoMergeOverrideDescription", "Auto-merge merges each feature as it passes. Single pull request keeps every feature on one shared branch to review and merge together.")}
-                    </span>
-                  </label>
+                  <MissionMergeBehaviorField
+                    value={missionForm.autoMergeOverride}
+                    onChange={(autoMergeOverride) => setMissionForm({ ...missionForm, autoMergeOverride })}
+                    t={t}
+                  />
                   {(missionForm.branchStrategy.mode === "existing" || missionForm.branchStrategy.mode === "custom-new") && (
                     <label>
                       {t("missions.branchName", "Branch name")}
@@ -4839,35 +5468,16 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 </div>
               )}
 
-              {missions.length === 0 && missionInterviewDrafts.length === 0 && persistedInterviewMissions.length === 0 && !isCreatingMission && (
+              {visibleMissions.length === 0 && missionInterviewDrafts.length === 0 && !isCreatingMission && (
                 <div className="mission-manager__empty mission-manager__empty--large mission-manager__empty--mission">
                   <Target size={32} />
                   <h3 className="mission-manager__empty-title">{t("missions.noMissionsYetTitle", "No missions yet")}</h3>
                   <p className="mission-manager__empty-body">
                     {t("missions.noMissionsYetBody", "Missions are large initiatives that bundle milestones, slices, and features into a single plan. Plan a mission to break down a goal end-to-end and let agents work through it autopilot-style.")}
                   </p>
-                  <button
-                    className="btn btn-sm btn-primary mission-manager__empty-cta"
-                    onClick={openNewMissionInterview}
-                  >
-                    <Sparkles size={14} />
-                    {t("missions.planNewMission", "Plan New Mission")}
-                  </button>
                 </div>
               )}
 
-              {!isCreatingMission && (
-                <div className="mission-list__footer">
-                  {showBottomPlanButton && (
-                    <div className="mission-list__footer-actions">
-                      <button className="btn btn-sm btn-primary mission-list__primary-cta" onClick={openNewMissionInterview}>
-                        <Sparkles size={14} />
-                        {t("missions.planNewMission", "Plan New Mission")}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
             </div>
     );
   };
@@ -4889,18 +5499,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
           <div className="mission-confirm-panel__actions">
             <button
               className="mission-btn mission-btn--danger"
-              onClick={async () => {
-                if (!deleteConfirmId) return;
-                if (deleteConfirmId.type === "milestone") {
-                  await handleDeleteMilestone(deleteConfirmId.id);
-                } else if (deleteConfirmId.type === "slice") {
-                  await handleDeleteSlice(deleteConfirmId.id);
-                } else if (deleteConfirmId.type === "feature") {
-                  await handleDeleteFeature(deleteConfirmId.id);
-                } else if (deleteConfirmId.type === "interview_draft") {
-                  await handleDiscardInterviewSession(deleteConfirmId.id);
-                }
-              }}
+              onClick={() => { void handleConfirmDelete(); }}
             >
               {isInterviewDraftDelete ? t("missions.discardButton", "Discard") : t("missions.deleteButton", "Delete")}
             </button>
@@ -4962,129 +5561,85 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       data-testid="mission-manager-dialog"
     >
       {/*
-      FNXC:Navigation 2026-06-22-01:10:
-      Missions keeps its own header element (not the shared ViewHeader component) because it owns a dynamic mobile title (mission title when one is selected), a back button for stacked list->detail nav, an inline-vs-modal padding variant, and the mission-header-title test id. To stay visually consistent with the Command Center-modeled ViewHeader, the title uses the same icon size (20) and 1.125rem title metric via .mission-manager__title.
+      FNXC:StandardizedMissionLayout 2026-09-13-16:30:
+      Missions and its resumable interview drafts share the canonical header/list/detail shell. The shared sidebar keeps one project-scoped width across Planning and Missions, while all existing mission fetch, repair, interview, and navigation callbacks remain owned here.
       */}
-      <div className={`mission-manager__header${isInline ? " mission-manager__header--inline" : ""}`}>
-        <div className="mission-manager__header-title">
-          {selectedMission && (
-            <button
-              className="mission-manager__back-btn"
-              onClick={handleBackToList}
-              title={t("missions.backToMissions", "Back to missions")}
-              aria-label={t("missions.backToMissionsList", "Back to missions list")}
-              data-testid="mission-back-btn"
-            >
-              <ChevronLeft size={18} />
-            </button>
-          )}
-          <Target size={20} className="mission-manager__header-icon" />
-          <h2 className="mission-manager__title" data-testid="mission-header-title">
-            <span className="mission-manager__title-text mission-manager__title-text--desktop">{t("missions.title", "Missions")}</span>
-            <span className="mission-manager__title-text mission-manager__title-text--mobile">
-              {selectedMission ? selectedMission.title : t("missions.title", "Missions")}
-            </span>
-          </h2>
-        </div>
-        {!isInline && (
-          <button
-            className="modal-close"
-            onClick={onClose}
-            title={t("missions.close", "Close")}
-            aria-label={t("missions.closeMissionManager", "Close Mission Manager")}
-            data-testid="mission-close-btn"
-          >
-            <X size={18} />
-          </button>
+      <ViewLayout
+        contentOwnsScroll
+        mobilePane={selectedMission ? "detail" : "list"}
+        header={(
+          <ViewHeader
+            icon={Target}
+            title={selectedMission && isMobile ? selectedMission.title : t("missions.title", "Missions")}
+            titleTestId="mission-header-title"
+            backAction={selectedMission ? {
+              label: t("missions.backToMissionsList", "Back to missions list"),
+              onClick: handleBackToList,
+              "data-testid": "mission-back-btn",
+            } : undefined}
+            actions={!isCreatingMission ? (
+              <div className="mission-manager__create-menu">
+                <ViewActionButton
+                  kind="create"
+                  label={t("missions.planNewMission", "Plan New Mission")}
+                  aria-expanded={isCreateMenuOpen}
+                  aria-controls={isCreateMenuOpen ? "mission-create-menu" : undefined}
+                  onClick={() => setIsCreateMenuOpen((open) => !open)}
+                />
+                {isCreateMenuOpen ? (
+                  <div id="mission-create-menu" className="mission-manager__create-menu-popover" role="menu">
+                    <button type="button" role="menuitem" onClick={openNewMissionInterview}>
+                      <Sparkles aria-hidden="true" />
+                      {t("missions.planNewMission", "Plan New Mission")}
+                    </button>
+                    <button type="button" role="menuitem" className="mission-list__manual-create-link" onClick={openDirectMissionCreate}>
+                      <Plus aria-hidden="true" />
+                      {t("missions.createButton", "Create")}
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : undefined}
+            onClose={isInline ? undefined : onClose}
+            closeButtonProps={{
+              title: t("missions.close", "Close"),
+              "aria-label": t("missions.closeMissionManager", "Close Mission Manager"),
+              "data-testid": "mission-close-btn",
+            }}
+          />
         )}
-      </div>
-
-      {isMobile ? (
-        <div className="mission-manager__body mission-manager__body--stacked">
-          {loading ? (
-            <div className="mission-manager__loading">
-              <Loader2 size={24} className="spinner" />
-              <span>{t("missions.loadingMissions", "Loading missions...")}</span>
+        sidebar={(
+          <ViewSidebar ariaLabel={t("missions.missionList", "Mission list")} hostIdentity="missions" mobile={isMobile} panelTestId="mission-sidebar">
+            <div className="mission-manager__sidebar">
+              {shouldRenderSidebarDeleteConfirm ? renderDeleteConfirmPanel() : null}
+              <div className="mission-manager__sidebar-list">
+                {loading ? (
+                  <div className="mission-manager__loading">
+                    <Loader2 size={24} className="spinner" />
+                    <span>{t("missions.loadingMissions", "Loading missions...")}</span>
+                  </div>
+                ) : renderMissionListContent()}
+              </div>
             </div>
-          ) : detailLoading ? (
+          </ViewSidebar>
+        )}
+      >
+        <div className="mission-manager__detail-pane">
+          {detailLoading && !selectedMission ? (
             <div className="mission-manager__loading">
               <Loader2 size={24} className="spinner" />
               <span>{t("missions.loadingMissionDetails", "Loading mission details...")}</span>
             </div>
-          ) : selectedMission ? (
-            renderMissionDetailContent()
-          ) : (
-            renderMissionListContent()
-          )}
-          {deleteConfirmId && renderDeleteConfirmPanel()}
-          {linkTaskFeatureId && renderLinkTaskPanel()}
-        </div>
-      ) : (
-        <div className="mission-manager__split">
-          <aside
-            className="mission-manager__sidebar"
-            data-testid="mission-sidebar"
-            aria-label={t("missions.missionList", "Mission list")}
-            style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
-          >
-            <div className="mission-manager__sidebar-list">
-              {loading ? (
-                <div className="mission-manager__loading">
-                  <Loader2 size={24} className="spinner" />
-                  <span>{t("missions.loadingMissions", "Loading missions...")}</span>
-                </div>
-              ) : (
-                renderMissionListContent({ hideBottomButtons: true })
-              )}
+          ) : selectedMission ? renderMissionDetailContent() : (
+            <div className="mission-manager__detail-pane-empty" data-testid="mission-empty-detail">
+              <Target size={32} />
+              <span>{t("missions.selectMissionToView", "Select a mission to view details")}</span>
             </div>
-            <div className="mission-manager__sidebar-footer" data-testid="mission-sidebar-footer">
-              {shouldRenderSidebarDeleteConfirm && renderDeleteConfirmPanel()}
-              <button
-                className="btn btn-primary mission-manager__sidebar-cta"
-                onClick={openNewMissionInterview}
-                title={t("missions.planNewMission", "Plan New Mission")}
-                aria-label={t("missions.planNewMission", "Plan New Mission")}
-              >
-                <Sparkles size={14} />
-                {t("missions.planNewMission", "Plan New Mission")}
-              </button>
-            </div>
-          </aside>
-
-          {!isMobile && (
-            <div
-              className="mission-manager__sidebar-resize-handle"
-              role="separator"
-              aria-orientation="vertical"
-              aria-valuemin={MISSION_SIDEBAR_MIN_WIDTH}
-              aria-valuemax={MISSION_SIDEBAR_MAX_WIDTH}
-              aria-valuenow={sidebarWidth}
-              aria-label={t("missions.resizeSidebar", "Resize mission sidebar")}
-              tabIndex={0}
-              onPointerDown={handleSidebarResizeStart}
-              onKeyDown={handleSidebarResizeKeyDown}
-            />
           )}
-
-          <div className="mission-manager__detail-pane">
-            {detailLoading ? (
-              <div className="mission-manager__loading">
-                <Loader2 size={24} className="spinner" />
-                <span>{t("missions.loadingMissionDetails", "Loading mission details...")}</span>
-              </div>
-            ) : selectedMission ? (
-              renderMissionDetailContent()
-            ) : (
-              <div className="mission-manager__detail-pane-empty" data-testid="mission-empty-detail">
-                <Target size={32} />
-                <span>{t("missions.selectMissionToView", "Select a mission to view details")}</span>
-              </div>
-            )}
-            {deleteConfirmId && !shouldRenderSidebarDeleteConfirm && renderDeleteConfirmPanel()}
-            {linkTaskFeatureId && renderLinkTaskPanel()}
-          </div>
+          {deleteConfirmId && !shouldRenderSidebarDeleteConfirm ? renderDeleteConfirmPanel() : null}
+          {linkTaskFeatureId ? renderLinkTaskPanel() : null}
         </div>
-      )}
+      </ViewLayout>
     </div>
   );
 

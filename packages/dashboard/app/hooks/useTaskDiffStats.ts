@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { fetchTaskDiff } from "../api";
+import type { ColumnRoleFlags } from "../utils/columnRoles";
+import { isCompleteColumnRole, isReviewColumnRole, isWipColumnRole } from "../utils/columnRoles";
 
 interface DiffStats {
   filesChanged: number;
@@ -13,12 +15,25 @@ interface UseTaskDiffStatsResult {
 }
 
 interface UseTaskDiffStatsOptions {
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-03:30 (fleet phase):
+  Resolved trait flags for the task's column, so "is this done / still working" is a ROLE question. The
+  hook took a bare `column: string` and compared it to `done` / `in-progress` / `in-review`, which on a
+  renamed board fetched NOTHING — the diff stats silently never loaded and the row showed no changes.
+
+  OPTIONAL, and the helpers fall back to the legacy ids without it, so the ten existing test call sites
+  and any caller that has no flags keep their current behaviour. The one production caller (TaskCard)
+  already had `taskColumnFlags` in scope.
+  */
+  columnFlags?: ColumnRoleFlags;
   /** Enable fetching when true (default). Suppresses fetches for offscreen cards. */
   enabled?: boolean;
   /** Worktree path for active task columns. */
   worktree?: string;
   /** Version identifier that changes when steps update. Forces cache invalidation when changed. */
   stepVersion?: number | string;
+  /** Authoritative active-task snapshot version, including task metadata that can change without step updates. */
+  snapshotVersion?: number | string;
   /**
    * Done-task merge enrichment signature (e.g. landedFiles length + filesChanged).
    * For done cards this invalidates cache/refetches when mergeDetails enrichment lands,
@@ -101,64 +116,93 @@ export function useTaskDiffStats(
   const enabled = options.enabled ?? true;
   const worktree = options.worktree;
   const stepVersion = options.stepVersion;
+  const snapshotVersion = options.snapshotVersion;
   const pollIntervalMs = options.pollIntervalMs;
   const mergeSignature = options.mergeSignature;
-  const [stats, setStats] = useState<DiffStats | null>(null);
-  const [loading, setLoading] = useState(false);
+  const columnFlags = options.columnFlags;
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-12:15 (PR #2731 review — coderabbit, and I dismissed this
+  twice before checking):
+  DERIVED OUTSIDE THE EFFECT SO THEY CAN BE DEPENDENCIES. `columnFlags` arrives from a board-workflows
+  fetch, so it is `undefined` on first paint and populated later. The effect read it but the dependency
+  array did not list it, so the poll kept the PRE-RESOLUTION answer: on a renamed board a card in a
+  custom complete/wip/review lane never started fetching diff stats at all.
+
+  The booleans rather than the object: `columnFlags` is a prop object whose identity a parent may change
+  every render, which would restart the poll continuously. These are primitives, so they change exactly
+  when the answer changes — which is the dependency the effect actually has.
+  */
+  const shouldFetchDoneTask = isCompleteColumnRole(columnFlags, column);
+  const shouldFetchActiveTask = isWipColumnRole(columnFlags, column)
+    || isReviewColumnRole(columnFlags, column);
+  const activeWorktree = shouldFetchActiveTask ? worktree : undefined;
+  const stepVersionStr = stepVersion !== undefined ? String(stepVersion) : undefined;
+  const snapshotVersionStr = snapshotVersion !== undefined ? String(snapshotVersion) : undefined;
+  const mergeSignatureStr = mergeSignature !== undefined ? String(mergeSignature) : undefined;
+  const mode: "done" | "active" = shouldFetchDoneTask ? "done" : "active";
+  /*
+  FNXC:TaskCardLayout 2026-09-09-16:03:
+  Active diff cache identity includes both execution progress and the authoritative task snapshot. A new `updatedAt` or persisted `modifiedFiles` set must never synchronously repaint stats cached for an older snapshot whose steps and worktree happen to be unchanged.
+  */
+  const cacheVersion = mode === "done"
+    ? mergeSignatureStr
+    : JSON.stringify([stepVersionStr ?? null, snapshotVersionStr ?? null]);
+  const requestKey = getCacheKey(taskId, projectId, activeWorktree, cacheVersion, mode);
+  const synchronouslyCachedStats = enabled && taskId && (shouldFetchDoneTask || shouldFetchActiveTask)
+    ? getCachedStats(taskId, projectId, activeWorktree, cacheVersion, mode)
+    : null;
+  const [state, setState] = useState<{ key: string; stats: DiffStats | null; loading: boolean }>(() => ({
+    key: requestKey,
+    stats: synchronouslyCachedStats,
+    loading: false,
+  }));
 
   useEffect(() => {
     // Disabled state: return stable empty state without fetching
-    if (!enabled) {
-      setStats(null);
-      setLoading(false);
+    if (!enabled || !taskId || (!shouldFetchDoneTask && !shouldFetchActiveTask)) {
+      setState({ key: requestKey, stats: null, loading: false });
       return;
     }
 
-    const shouldFetchDoneTask = column === "done";
-    const shouldFetchActiveTask = column === "in-progress" || column === "in-review";
-
-    if (!taskId || (!shouldFetchDoneTask && !shouldFetchActiveTask)) {
-      setStats(null);
-      setLoading(false);
-      return;
-    }
-
-    const activeWorktree = shouldFetchActiveTask ? worktree : undefined;
-    const stepVersionStr = stepVersion !== undefined ? String(stepVersion) : undefined;
-    const mergeSignatureStr = mergeSignature !== undefined ? String(mergeSignature) : undefined;
-    const mode: "done" | "active" = shouldFetchDoneTask ? "done" : "active";
     let cancelled = false;
 
     async function load(forceRefresh = false) {
       // Check cache first - return immediately without loading flicker (unless force refresh)
       if (!forceRefresh) {
-        const cacheVersion = mode === "done" ? mergeSignatureStr : stepVersionStr;
+        /*
+        FNXC:WorkflowResolvedColumns 2026-07-30-03:30 DELIBERATE-LITERAL:
+        `mode` is this function's OWN `"done" | "active"` discriminant, assigned three lines up from
+        `shouldFetchDoneTask`. It is not a column id and there is no trait to resolve — the census
+        classifies it as a column guard because the receiver is compared to the string `done`, which is
+        a classifier limitation, not a site to convert.
+        */
         const cached = getCachedStats(taskId, projectId, activeWorktree, cacheVersion, mode);
         if (cached) {
           if (!cancelled) {
-            setStats(cached);
-            setLoading(false);
+            setState({ key: requestKey, stats: cached, loading: false });
           }
           return;
         }
       }
 
-      setLoading(true);
+      setState({ key: requestKey, stats: null, loading: true });
       try {
         const data = await fetchTaskDiff(taskId, activeWorktree, projectId);
         if (!cancelled) {
-          setStats(data.stats);
+          setState({ key: requestKey, stats: data.stats, loading: false });
           // Store in cache
-          const cacheVersion = mode === "done" ? mergeSignatureStr : stepVersionStr;
+          /*
+        FNXC:WorkflowResolvedColumns 2026-07-30-03:30 DELIBERATE-LITERAL:
+        `mode` is this function's OWN `"done" | "active"` discriminant, assigned three lines up from
+        `shouldFetchDoneTask`. It is not a column id and there is no trait to resolve — the census
+        classifies it as a column guard because the receiver is compared to the string `done`, which is
+        a classifier limitation, not a site to convert.
+        */
           setCachedStats(taskId, projectId, activeWorktree, cacheVersion, mode, data.stats);
         }
       } catch {
         if (!cancelled) {
-          setStats(null);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
+          setState({ key: requestKey, stats: null, loading: false });
         }
       }
     }
@@ -181,7 +225,10 @@ export function useTaskDiffStats(
         clearInterval(timer);
       }
     };
-  }, [taskId, column, commitSha, projectId, enabled, worktree, stepVersion, mergeSignature, pollIntervalMs]);
+  }, [taskId, column, commitSha, projectId, enabled, worktree, stepVersion, snapshotVersion, mergeSignature, pollIntervalMs, shouldFetchDoneTask, shouldFetchActiveTask, requestKey, activeWorktree, cacheVersion, mode]);
 
-  return { stats, loading };
+  if (state.key !== requestKey) {
+    return { stats: synchronouslyCachedStats, loading: false };
+  }
+  return { stats: state.stats, loading: state.loading };
 }

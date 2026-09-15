@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,7 +17,7 @@ const { mockReviewStep, mockCreateFnAgent, mockPromptWithFallback } = vi.hoisted
   mockPromptWithFallback: vi.fn(),
 }));
 
-vi.mock("../reviewer.js", () => ({
+vi.mock("../execution/reviewer.js", () => ({
   reviewStep: mockReviewStep,
 }));
 
@@ -31,6 +31,12 @@ vi.mock("../pi.js", () => ({
   // must expose the export so the planning path can reach finalization
   // (moveTask todo) instead of throwing on a missing mock member.
   formatModelMarkerDetails: vi.fn((model: string) => model),
+  /*
+  FNXC:EngineTests 2026-07-22-03:20:
+  Catch blocks use `err instanceof ModelFallbackExhaustedError`; wholesale pi mock
+  must export the class or planning failures throw on the instanceof check itself.
+  */
+  ModelFallbackExhaustedError: class ModelFallbackExhaustedError extends Error {},
 }));
 
 vi.mock("@fusion/core", async (importOriginal) => {
@@ -66,12 +72,38 @@ function createDetail(task: Task): TaskDetail {
 }
 
 function createStore(task: Task, settings: Partial<Settings> = {}, overrides: Partial<TaskStore> = {}): TaskStore {
-  return {
-    getTask: vi.fn().mockResolvedValue(createDetail(task)),
+  /*
+  FNXC:EngineTests 2026-07-20-23:40:
+  Finalization rewrites PROMPT hygiene under withTaskLock + readTaskForMove (FN-8361).
+  Minimal mocks that omit those methods fail closed inside runIfStillPlanningUnderTaskLock
+  and never reach moveTask(todo). Mirror the production lock surface so planning tests can
+  finish the approve path.
+  */
+  let live = createDetail(task);
+  const store: any = {
+    getTask: vi.fn(async () => live),
     listTasks: vi.fn().mockResolvedValue([]),
     createTask: vi.fn(),
-    moveTask: vi.fn(),
-    updateTask: vi.fn().mockResolvedValue(undefined),
+    moveTask: vi.fn(async (id: string, column: string) => {
+      if (id === live.id) live = { ...live, column, status: null } as typeof live;
+      return live;
+    }),
+    /*
+    FNXC:EngineTests 2026-07-20-23:50:
+    finalizeApprovedTask releases triage→todo only via moveTaskIf + planning-stage predicate
+    (FN-8361 family). A bare moveTask mock never runs; implement moveTaskIf so the approve
+    path can complete and tests can still assert the moveTaskIf/column outcome.
+    */
+    moveTaskIf: vi.fn(async (id: string, column: string, predicate: (t: Task) => boolean) => {
+      if (id !== live.id || !predicate(live as Task)) return { moved: false, task: live };
+      live = { ...live, column, status: null } as typeof live;
+      store.moveTask(id, column);
+      return { moved: true, task: live };
+    }),
+    updateTask: vi.fn(async (id: string, updates: Partial<Task>) => {
+      if (id === live.id) live = { ...live, ...updates } as typeof live;
+      return live;
+    }),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({
@@ -94,10 +126,31 @@ function createStore(task: Task, settings: Partial<Settings> = {}, overrides: Pa
     getWorkflowDefinition: vi.fn().mockResolvedValue(undefined),
     getWorkflowSettingValues: vi.fn().mockResolvedValue({}),
     getWorkflowSettingsProjectId: vi.fn().mockReturnValue("default"),
+    withTaskLock: vi.fn(async (_id: string, fn: () => Promise<unknown>) => fn()),
+    /*
+    FNXC:EngineTests 2026-08-23-18:48:
+    `fn_task_prompt_write` no longer publishes through `updateTask`. When planning supplies a
+    `canPersist` generation check (FN TaskReset), it takes the planning lifecycle lock and writes
+    via `withTaskLock` + `updateTaskUnlocked` so a Reset cannot be raced. A fake missing that
+    surface makes the tool fail and PROMPT.md is never persisted, which surfaces far away as an
+    ENOENT reading the artifact. Mirror the production lock/write surface, routing the unlocked
+    write through the same `updateTask` mock so live task state stays authoritative.
+    */
+    withPlanningLifecycleLock: vi.fn(async (_id: string, fn: () => Promise<unknown>) => fn()),
+    updateTaskUnlocked: vi.fn(async (id: string, updates: Partial<Task>) => store.updateTask(id, updates)),
+    isBackendMode: vi.fn(() => false),
+    readTaskForMove: vi.fn(async () => live),
     on: vi.fn(),
     emit: vi.fn(),
     ...overrides,
-  } as unknown as TaskStore;
+  };
+  if (!(overrides as { withTaskLock?: unknown }).withTaskLock) {
+    store.withTaskLock = vi.fn(async (_id: string, fn: () => Promise<unknown>) => fn());
+  }
+  if (!(overrides as { readTaskForMove?: unknown }).readTaskForMove) {
+    store.readTaskForMove = vi.fn(async () => live);
+  }
+  return store as TaskStore;
 }
 
 function mockSession(capture: { basePrompt?: string; customTools?: any[] } = {}) {
@@ -127,11 +180,46 @@ async function captureBasePrompt(task: Task, store: TaskStore): Promise<string> 
 }
 
 async function runPlanningSession(task: Task, store: TaskStore, rootDir: string): Promise<void> {
-  mockSession();
+  const capture: { customTools?: any[] } = {};
+  mockSession(capture);
+  /*
+  FNXC:EngineTests 2026-07-22-03:20:
+  Keep write-through on live task state while also materializing PROMPT.md. A prompt-only
+  updateTask mock left finalize reading an empty prompt and withholds coding recovery.
+  Executable Steps satisfy the recoverApprovedTask step-heading gate after U10b.
+  Capture the prior mockImplementation (not bind the mock) so re-wrapping cannot recurse.
+  */
+  const priorUpdate = (store.updateTask as ReturnType<typeof vi.fn>).getMockImplementation?.()
+    ?? (async () => undefined);
+  vi.mocked(store.updateTask).mockImplementation(async (taskId, patch) => {
+    const result = await priorUpdate(taskId, patch);
+    if (typeof patch.prompt === "string") {
+      const promptDir = join(rootDir, ".fusion", "tasks", task.id);
+      await mkdir(promptDir, { recursive: true });
+      await writeFile(join(promptDir, "PROMPT.md"), patch.prompt, "utf8");
+    }
+    return result;
+  });
   mockPromptWithFallback.mockImplementationOnce(async () => {
-    const promptPath = join(rootDir, ".fusion", "tasks", task.id, "PROMPT.md");
-    await mkdir(join(rootDir, ".fusion", "tasks", task.id), { recursive: true });
-    await writeFile(promptPath, "# Task: FN-6236\n\n## Mission\n\nVerify fast policy.\n", "utf8");
+    const promptWriter = capture.customTools?.find((tool) => tool.name === "fn_task_prompt_write");
+    expect(promptWriter).toBeDefined();
+    await promptWriter.execute("persist-plan", {
+      content: [
+        "# Task: FN-6236",
+        "",
+        "## Mission",
+        "",
+        "Verify fast policy.",
+        "",
+        "## Steps",
+        "",
+        "### Step 0: Implement",
+        "- [ ] do the work",
+        "",
+      ].join("\n"),
+    });
+    await expect(readFile(join(rootDir, ".fusion", "tasks", task.id, "PROMPT.md"), "utf8"))
+      .resolves.toContain("Verify fast policy");
   });
 
   await new TriageProcessor(store, rootDir).specifyTask(task);
@@ -156,15 +244,15 @@ describe("fast-mode workflow variant resolution", () => {
     tempRoots = [];
   });
 
-  it("resolves fast tasks to the lean planning-fast workflow prompt", async () => {
-    const task = createTask({ id: "FN-6236-FAST-PROMPT", executionMode: "fast" });
-    const store = createStore(task);
+  it("resolves lean planning to the planning-fast workflow prompt", async () => {
+    const task = createTask({ id: "FN-6236-LEAN-PROMPT", executionMode: "standard" });
+    const store = createStore(task, { leanPlanning: true });
 
     await expect(captureBasePrompt(task, store)).resolves.toBe(renderedFastPlanningPrompt);
   });
 
   it("lets a selected workflow planning-fast seam override the built-in lean prompt", async () => {
-    const task = createTask({ id: "FN-6236-FAST-CUSTOM-SEAM", executionMode: "fast" });
+    const task = createTask({ id: "FN-6236-LEAN-CUSTOM-SEAM", executionMode: "standard" });
     const customFastPrompt = "custom workflow fast planning prompt";
     const customIr: WorkflowIr = {
       version: "v1",
@@ -172,7 +260,7 @@ describe("fast-mode workflow variant resolution", () => {
       nodes: [{ id: "planning-fast", kind: "prompt", config: { seam: "planning-fast", prompt: customFastPrompt } }],
       edges: [],
     };
-    const store = createStore(task, {}, {
+    const store = createStore(task, { leanPlanning: true }, {
       getTaskWorkflowSelection: vi.fn().mockReturnValue({ workflowId: "WF-fast", stepIds: [] }),
       getWorkflowDefinition: vi.fn().mockResolvedValue({ ir: customIr }),
     });
@@ -180,15 +268,15 @@ describe("fast-mode workflow variant resolution", () => {
     await expect(captureBasePrompt(task, store)).resolves.toBe(customFastPrompt);
   });
 
-  it("falls back to the built-in lean fast prompt when the selected workflow has no planning-fast seam", async () => {
-    const task = createTask({ id: "FN-6236-FAST-NO-SEAM", executionMode: "fast" });
+  it("falls back to the built-in lean prompt when the selected workflow has no planning-fast seam", async () => {
+    const task = createTask({ id: "FN-6236-LEAN-NO-SEAM", executionMode: "standard" });
     const noFastSeamIr: WorkflowIr = {
       version: "v1",
       name: "no-fast-seam-workflow",
       nodes: [{ id: "planning", kind: "prompt", config: { seam: "planning", prompt: "standard-only prompt" } }],
       edges: [],
     };
-    const store = createStore(task, {}, {
+    const store = createStore(task, { leanPlanning: true }, {
       getTaskWorkflowSelection: vi.fn().mockReturnValue({ workflowId: "WF-no-fast", stepIds: [] }),
       getWorkflowDefinition: vi.fn().mockResolvedValue({ ir: noFastSeamIr }),
     });
@@ -206,16 +294,14 @@ describe("fast-mode workflow variant resolution", () => {
     expect(basePrompt).not.toBe(renderedFastPlanningPrompt);
   });
 
-  it("finalizes fast tasks without invoking a separate spec reviewer", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "fusion-fn-6236-fast-"));
-    tempRoots.push(rootDir);
-    const task = createTask({ id: "FN-6236-FAST-REVIEW", executionMode: "fast" });
+  it("does not start a planning session for Fast tasks", async () => {
+    const task = createTask({ id: "FN-6236-FAST-BYPASS", executionMode: "fast" });
     const store = createStore(task);
 
-    await runPlanningSession(task, store, rootDir);
+    await new TriageProcessor(store, "/tmp/root").specifyTask(task);
 
-    expect(mockReviewStep).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo");
+    expect(mockCreateFnAgent).not.toHaveBeenCalled();
+    expect(store.logEntry).toHaveBeenCalledWith(task.id, "Fast mode intentionally skips specification planning");
   });
 
   it("finalizes standard tasks without invoking a separate spec reviewer", async () => {
@@ -227,7 +313,7 @@ describe("fast-mode workflow variant resolution", () => {
     await runPlanningSession(task, store, rootDir);
 
     expect(mockReviewStep).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo");
+    expect(store.moveTaskIf).toHaveBeenCalledWith(task.id, "todo", expect.any(Function));
   });
 
   it("ignores legacy autoApproveSpec because workflow Plan Review owns approval", async () => {
@@ -239,13 +325,14 @@ describe("fast-mode workflow variant resolution", () => {
     await runPlanningSession(task, store, rootDir);
 
     expect(mockReviewStep).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo");
+    expect(store.moveTaskIf).toHaveBeenCalledWith(task.id, "todo", expect.any(Function));
   });
 
-  it("preserves user triage prompt override precedence over the fast variant", async () => {
-    const task = createTask({ id: "FN-6236-OVERRIDE", executionMode: "fast" });
+  it("preserves user triage prompt override precedence over lean planning", async () => {
+    const task = createTask({ id: "FN-6236-OVERRIDE", executionMode: "standard" });
     const overridePrompt = "custom fast override prompt";
     const store = createStore(task, {
+      leanPlanning: true,
       agentPrompts: {
         templates: [{ id: "custom-triage", name: "Custom", role: "triage", prompt: overridePrompt }],
         roleAssignments: { triage: "custom-triage" },

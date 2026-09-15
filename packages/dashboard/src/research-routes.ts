@@ -11,6 +11,9 @@ import {
   buildResearchDocumentKey,
   resolveResearchFindingId,
   promoteResearchFinding,
+  createRecallCaptureWriter,
+  createLogger,
+  NOOP_RECALL_CAPTURE_WRITER,
   type ResearchRunListOptions,
   type ResearchRunStatus,
 } from "@fusion/core";
@@ -390,14 +393,22 @@ export function createResearchRouter(store: TaskStore, options?: ServerOptions):
       if (!sliceId) throw badRequest("sliceId is required");
       const missionStore = scopedStore.getMissionStore();
       if (!("addResearchFeature" in missionStore)) throw new ApiError(409, "Research promotion requires the PostgreSQL mission store");
-      const promoted = await promoteResearchFinding(getStore() as never, missionStore, {
-        runId: req.params.runId,
-        findingId: req.params.findingId,
-        sliceId,
-        title: typeof req.body?.title === "string" ? req.body.title : undefined,
-        description: typeof req.body?.description === "string" ? req.body.description : undefined,
-        acceptanceCriteria: typeof req.body?.acceptanceCriteria === "string" ? req.body.acceptanceCriteria : undefined,
-      });
+      const layer = scopedStore.getAsyncLayer();
+      const promoted = await promoteResearchFinding(
+        getStore() as never,
+        missionStore,
+        {
+          runId: req.params.runId,
+          findingId: req.params.findingId,
+          sliceId,
+          title: typeof req.body?.title === "string" ? req.body.title : undefined,
+          description: typeof req.body?.description === "string" ? req.body.description : undefined,
+          acceptanceCriteria: typeof req.body?.acceptanceCriteria === "string" ? req.body.acceptanceCriteria : undefined,
+        },
+        layer
+          ? createRecallCaptureWriter({ layer, logger: createLogger("research-recall-capture") })
+          : NOOP_RECALL_CAPTURE_WRITER,
+      );
       let feature = promoted.feature;
       if (typeof req.body?.taskId === "string" && req.body.taskId.trim()) feature = await missionStore.linkFeatureToTask(feature.id, req.body.taskId.trim());
       if (req.body?.triage === true) feature = await missionStore.triageFeature(feature.id);
@@ -419,8 +430,6 @@ export function createResearchRouter(store: TaskStore, options?: ServerOptions):
 
       const task = await scopedStore.getTask(req.params.taskId);
       if (!task) throw notFound(`Task not found: ${req.params.taskId}`);
-      if (task.column === "archived") throw new ApiError(409, "Cannot enrich archived task");
-
       let documentKey: string;
       try {
         documentKey = buildResearchDocumentKey(req.params.runId);

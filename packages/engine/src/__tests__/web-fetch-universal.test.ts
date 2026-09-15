@@ -8,11 +8,15 @@ function readSource(file: string): string {
 
 describe("fn_web_fetch universal registration", () => {
   it("executor registers fn_web_fetch", () => {
-    expect(readSource("executor.ts")).toContain("createWebFetchTool()");
+    // FNXC:WebFetchUniversal 2026-08-23-18:35: the U4 peel reduced executor.ts to a 10-line
+    // TaskExecutor shell; the implementation session that registers the executor's custom tools
+    // now lives in executor/run-implementation.ts. The universal-registration invariant is
+    // unchanged — only the file that owns the executor's customTools list moved.
+    expect(readSource("executor/run-implementation.ts")).toContain("createWebFetchTool()");
   });
 
   it("step-session executor registers fn_web_fetch", () => {
-    expect(readSource("step-session-executor.ts")).toContain("createWebFetchTool()");
+    expect(readSource("execution/step-session-executor.ts")).toContain("createWebFetchTool()");
   });
 
   it("reviewer registers fn_web_fetch", () => {
@@ -24,13 +28,16 @@ describe("fn_web_fetch universal registration", () => {
     // still registers fn_web_fetch as its first custom tool. Assert the current wiring —
     // createWebFetchTool() heads the reviewCustomTools array and that array is the
     // session's customTools — so this surface stays enumerated without pinning the literal.
-    const reviewerSrc = readSource("reviewer.ts");
+    // FNXC:FullSuiteBookkeeping 2026-08-05-00:15: reviewer lives under execution/ after the engine source peel.
+    const reviewerSrc = readSource("execution/reviewer.ts");
     expect(reviewerSrc).toMatch(/reviewCustomTools\s*=\s*\[\s*createWebFetchTool\(\),/);
     expect(reviewerSrc).toContain("customTools: reviewCustomTools");
   });
 
   it("merger registers fn_web_fetch", () => {
-    expect(readSource("merger.ts")).toContain("customTools: [reportBuildFailureTool, createWebFetchTool()]");
+    const mergerSrc = readSource("merger.ts");
+    expect(mergerSrc).toContain("const mergerFusionTools = [reportBuildFailureTool, createWebFetchTool()]");
+    expect(mergerSrc).toContain("customTools: mergerFusionTools");
   });
 
   it("triage registers fn_web_fetch", () => {

@@ -185,6 +185,22 @@ describe("UsageIndicator", () => {
     expect(screen.getByText("Hourly")).toBeInTheDocument();
   });
 
+  it("renders an authenticated provider with no windows without an error badge or meter", () => {
+    mockUseUsageData.mockReturnValue(createUsageDataState({
+      providers: [{ name: "Grok", icon: "✖️", status: "ok", windows: [] }],
+      lastUpdated: new Date(),
+      refresh: mockRefresh,
+    }));
+
+    render(<UsageIndicator isOpen={true} onClose={mockOnClose} projectId={TEST_PROJECT_ID} />);
+
+    const card = document.querySelector('[data-provider="Grok"]')!;
+    expect(card).toHaveAttribute("data-status", "ok");
+    expect(card.querySelector(".usage-status-badge--error")).toBeNull();
+    expect(card.querySelector(".usage-provider-windows")).toBeNull();
+    expect(screen.getByText("No usage data available")).toBeInTheDocument();
+  });
+
   it("renders drag handle in the right-side actions cluster for each provider card", () => {
     mockUseUsageData.mockReturnValue(createUsageDataState({
       providers: mockProviders,
@@ -1534,6 +1550,23 @@ describe("UsageIndicator", () => {
 
     expect(document.querySelector('[data-provider="kimi"]')).toBeInTheDocument();
     expect(screen.getByText("Moonshot")).toBeInTheDocument();
+  });
+
+  it("maps Xiaomi MiMo usage labels through the shared provider inference", () => {
+    mockUseUsageData.mockReturnValue(createUsageDataState({
+      providers: [
+        { name: "xiaomi/MiMo-V2-Flash", icon: "🟠", status: "ok", windows: [] },
+      ],
+      loading: false,
+      error: null,
+      lastUpdated: new Date(),
+      refresh: mockRefresh,
+    }));
+
+    render(<UsageIndicator isOpen={true} onClose={mockOnClose} projectId={TEST_PROJECT_ID} />);
+
+    expect(screen.getByTestId("xiaomi-icon")).toBeInTheDocument();
+    expect(document.querySelector('[data-provider="xiaomi"]')).toBeInTheDocument();
   });
 
   it("maps Cursor provider to the cursor-cli icon and renders usage windows", () => {

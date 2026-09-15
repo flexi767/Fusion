@@ -1,7 +1,15 @@
 import { describe, it, expect } from "vitest";
 import type { PrInfo, StepStatus } from "../types.js";
 import {
+  getMergeConfirmedFinalizationBlocker,
+  getUnfinishedStepTitles,
+  isPreMergeStepsNotRunBlocker,
+  isStaleContentApprovalBlocker,
+  PreMergeStepsNotRunError,
+  PRE_MERGE_STEPS_NOT_RUN_BLOCKER,
+  STALE_CONTENT_APPROVAL_BLOCKER,
   BLOCKING_TASK_STATUSES,
+  collectLandedMemberReviewAdvisories,
   HARD_BLOCKING_TASK_STATUSES,
   SCHEDULER_TRANSIENT_STATUSES,
   TASK_DONE_BYPASS_BLOCKER_MESSAGE,
@@ -15,10 +23,13 @@ import {
   allowsAutoMergeProcessing,
   isSharedBranchGroupMemberIntegration,
   isLiveSharedBranchGroupMemberIntegration,
+  hasSharedBranchMemberAutoMergeHold,
+  hasPreMergeRemediationAutoMergeHold,
+  hasUserAutoMergeHold,
   resolveEffectiveAutoMerge,
   resolveEffectiveGroupAutoMerge,
   resolveTaskMergeTarget,
-} from "../task-merge.js";
+} from "../merge/task-merge.js";
 
 const baseTask = {
   column: "in-review" as const,
@@ -75,6 +86,68 @@ describe("resolveEffectiveAutoMerge", () => {
     expect(resolveEffectiveAutoMerge({ autoMerge: true, autoMergeProvenance: "legacy-stamp" }, { autoMerge: false })).toBe(true);
     expect(resolveEffectiveAutoMerge({ autoMerge: false, autoMergeProvenance: "user" }, { autoMerge: true })).toBe(false);
     expect(resolveEffectiveAutoMerge({ autoMerge: undefined, autoMergeProvenance: undefined }, { autoMerge: true })).toBe(true);
+  });
+});
+
+describe("hasSharedBranchMemberAutoMergeHold", () => {
+  it.each([
+    [{ autoMerge: undefined }, false, true],
+    [{ autoMerge: false, autoMergeProvenance: "user" }, false, true],
+    [{ autoMerge: false, autoMergeProvenance: "mission" }, false, true],
+    [{ autoMerge: false, autoMergeProvenance: "legacy-stamp" }, false, true],
+    [{ autoMerge: false }, false, true],
+    [{ autoMerge: true, autoMergeProvenance: "user" }, false, false],
+    [{ autoMerge: undefined }, true, false],
+    [{ autoMerge: false, autoMergeProvenance: "user" }, true, true],
+    [{ autoMerge: false, autoMergeProvenance: "mission" }, true, false],
+    [{ autoMerge: false, autoMergeProvenance: "legacy-stamp" }, true, false],
+    [{ autoMerge: false }, true, false],
+  ] as const)("holds task %o with project autoMerge %s: %s", (task, projectAutoMerge, expected) => {
+    expect(hasSharedBranchMemberAutoMergeHold(task, { autoMerge: projectAutoMerge })).toBe(expected);
+  });
+});
+
+describe("hasPreMergeRemediationAutoMergeHold", () => {
+  const taskValues = [undefined, true, false] as const;
+  const provenances = [undefined, "user", "mission", "legacy-stamp"] as const;
+  const branchContexts = [
+    undefined,
+    { assignmentMode: "shared" as const, groupId: "BG-1" },
+    { assignmentMode: "shared" as const, groupId: "" },
+    { assignmentMode: "shared" as const, groupId: "   " },
+    { assignmentMode: "per-task-derived" as const },
+  ];
+
+  it.each([false, true] as const)("uses only the user task hold across branch contexts when project autoMerge is %s", (projectAutoMerge) => {
+    for (const autoMerge of taskValues) {
+      for (const autoMergeProvenance of provenances) {
+        for (const branchContext of branchContexts) {
+          expect(hasPreMergeRemediationAutoMergeHold(
+            { autoMerge, autoMergeProvenance, branchContext },
+            { autoMerge: projectAutoMerge },
+          )).toBe(autoMerge === false && autoMergeProvenance === "user");
+        }
+      }
+    }
+  });
+
+  it("diverges from merge admission for a project-Off shared member", () => {
+    const task = { autoMerge: undefined, branchContext: { assignmentMode: "shared" as const, groupId: "BG-1" } };
+    expect(hasPreMergeRemediationAutoMergeHold(task, { autoMerge: false })).toBe(false);
+    expect(hasSharedBranchMemberAutoMergeHold(task, { autoMerge: false })).toBe(true);
+  });
+});
+
+describe("hasUserAutoMergeHold", () => {
+  it.each([
+    [{ autoMerge: false, autoMergeProvenance: "user" }, true],
+    [{ autoMerge: false, autoMergeProvenance: "mission" }, false],
+    [{ autoMerge: false, autoMergeProvenance: "legacy-stamp" }, false],
+    [{ autoMerge: false }, false],
+    [{ autoMerge: true, autoMergeProvenance: "user" }, false],
+    [{ autoMerge: undefined, autoMergeProvenance: "user" }, false],
+  ] as const)("requires false with user provenance: %o", (task, expected) => {
+    expect(hasUserAutoMergeHold(task)).toBe(expected);
   });
 });
 
@@ -147,6 +220,43 @@ describe("allowsAutoMergeProcessing", () => {
   });
 });
 
+describe("collectLandedMemberReviewAdvisories", () => {
+  const group = { branchName: "mission/M-8823" };
+  const landed = {
+    id: "FN-8823",
+    mergeDetails: { mergeConfirmed: true, mergeTargetSource: "branch-group-integration", mergeTargetBranch: group.branchName },
+  } as const;
+
+  it("includes only non-clean landed pre-merge code-review results and deduplicates repeats", () => {
+    const advisory = {
+      workflowStepId: "code-review",
+      workflowStepName: "Code Review",
+      phase: "pre-merge" as const,
+      reviewKind: "code" as const,
+      status: "passed" as const,
+      verdict: "APPROVE_WITH_NOTES" as const,
+      notes: "Consider extracting this helper.",
+      findings: [{ id: "finding-1", title: "Extract helper", body: "This is duplicated." }],
+    };
+    const result = collectLandedMemberReviewAdvisories([
+      { ...landed, workflowStepResults: [advisory, advisory, { ...advisory, workflowStepId: "plan", reviewKind: "plan" as const }] },
+      { id: "FN-unlanded", mergeDetails: undefined, workflowStepResults: [advisory] },
+    ], group);
+    expect(result).toEqual([expect.objectContaining({ taskId: "FN-8823", workflowStepId: "code-review", notes: advisory.notes })]);
+  });
+
+  it("includes advisory failures but excludes clean, pending, and post-merge results", () => {
+    const result = collectLandedMemberReviewAdvisories([{ ...landed, workflowStepResults: [
+      { workflowStepId: "clean", workflowStepName: "Code", status: "passed", verdict: "APPROVE", phase: "pre-merge", reviewKind: "code" },
+      { workflowStepId: "pending", workflowStepName: "Code", status: "pending", verdict: "APPROVE_WITH_NOTES", phase: "pre-merge", reviewKind: "code" },
+      { workflowStepId: "post", workflowStepName: "Code", status: "advisory_failure", phase: "post-merge", reviewKind: "code" },
+      { workflowStepId: "advisory", workflowStepName: "Code", status: "advisory_failure", phase: "pre-merge", reviewKind: "code", notes: "Check edge case" },
+    ] }], group);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ workflowStepId: "advisory", notes: "Check edge case" });
+  });
+});
+
 describe("resolveEffectiveGroupAutoMerge", () => {
   it("prefers explicit true over global false", () => {
     expect(resolveEffectiveGroupAutoMerge({ autoMerge: true }, { autoMerge: false })).toBe(true);
@@ -202,9 +312,9 @@ describe("isSharedBranchGroupMemberIntegration", () => {
   });
 
   it("requires a live open group for auto-merge-off shared-member integration", () => {
-    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "open" })).toBe(true);
-    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "finalized" })).toBe(false);
-    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "abandoned" })).toBe(false);
+    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "open", branchName: "mission/M-3324" }, "main")).toBe(true);
+    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "finalized", branchName: "mission/M-3324" }, "main")).toBe(false);
+    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "abandoned", branchName: "mission/M-3324" }, "main")).toBe(false);
     expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, null)).toBe(false);
     expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, undefined)).toBe(false);
   });
@@ -216,14 +326,20 @@ describe("isSharedBranchGroupMemberIntegration", () => {
         groupId: "BG-1",
         source: "planning",
       },
-    }, { status: "open" })).toBe(false);
+    }, { status: "open", branchName: "mission/M-3324" }, "main")).toBe(false);
     expect(isLiveSharedBranchGroupMemberIntegration({
       branchContext: {
         assignmentMode: "shared",
         groupId: "   ",
         source: "planning",
       },
-    }, { status: "open" })).toBe(false);
+    }, { status: "open", branchName: "mission/M-3324" }, "main")).toBe(false);
+  });
+
+  it("withholds the exemption for blank or default-branch group targets", () => {
+    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "open", branchName: "  " }, "main")).toBe(false);
+    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "open", branchName: " main " }, "main")).toBe(false);
+    expect(isLiveSharedBranchGroupMemberIntegration(sharedTask, { status: "open", branchName: "release/main" }, "main")).toBe(true);
   });
 });
 
@@ -399,6 +515,48 @@ describe("resolveTaskMergeTarget", () => {
 describe("getTaskMergeBlocker", () => {
   it("returns undefined for a clean task in review", () => {
     expect(getTaskMergeBlocker(baseTask)).toBeUndefined();
+  });
+
+  it("blocks an enabled pre-merge group that has no result only at a merge door", () => {
+    const requiredPreMergeStepIds = new Set(["code-review"]);
+    expect(getTaskMergeBlocker(baseTask, { requiredPreMergeStepIds }))
+      .toBe("task has enabled pre-merge workflow steps that never ran");
+    // Recovery callers deliberately omit the resolved input so they can find the card.
+    expect(getTaskMergeBlocker(baseTask)).toBeUndefined();
+  });
+
+  /* FNXC:RequiredPreMergeSteps 2026-08-22-22:40: the blocker text is a shared contract — the
+     auto-merge error path classifies on the typed error built from it, so it may not drift. */
+  it("exposes the unrun-gate reason as a classifiable constant", () => {
+    expect(getTaskMergeBlocker(baseTask, { requiredPreMergeStepIds: new Set(["code-review"]) }))
+      .toBe(PRE_MERGE_STEPS_NOT_RUN_BLOCKER);
+    expect(isPreMergeStepsNotRunBlocker(PRE_MERGE_STEPS_NOT_RUN_BLOCKER)).toBe(true);
+    expect(isPreMergeStepsNotRunBlocker("task has failed pre-merge workflow steps")).toBe(false);
+    expect(isPreMergeStepsNotRunBlocker(undefined)).toBe(false);
+    expect(new PreMergeStepsNotRunError("FN-9191").message)
+      .toBe(`Cannot merge FN-9191: ${PRE_MERGE_STEPS_NOT_RUN_BLOCKER}`);
+  });
+
+  it("classifies stale-content blockers through merge-door and park wrappers", () => {
+    expect(isStaleContentApprovalBlocker(STALE_CONTENT_APPROVAL_BLOCKER)).toBe(true);
+    expect(isStaleContentApprovalBlocker(`Cannot merge FN-1: ${STALE_CONTENT_APPROVAL_BLOCKER}`)).toBe(true);
+    expect(isStaleContentApprovalBlocker(`AUTO_MERGE_RETRY_REJECTED: Cannot merge FN-1: ${STALE_CONTENT_APPROVAL_BLOCKER}`)).toBe(true);
+    expect(isStaleContentApprovalBlocker(PRE_MERGE_STEPS_NOT_RUN_BLOCKER)).toBe(false);
+    expect(isStaleContentApprovalBlocker("Cannot merge FN-1: task is marked 'needs-replan'")).toBe(false);
+    expect(isStaleContentApprovalBlocker(undefined)).toBe(false);
+    expect(isStaleContentApprovalBlocker(null)).toBe(false);
+  });
+
+  it("accepts an operator-bypassed skipped result for a required pre-merge group", () => {
+    expect(getTaskMergeBlocker({
+      ...baseTask,
+      workflowStepResults: [{
+        workflowStepId: "code-review",
+        workflowStepName: "Code Review",
+        status: "skipped",
+        bypassedBy: "operator",
+      }],
+    }, { requiredPreMergeStepIds: new Set(["code-review"]) })).toBeUndefined();
   });
 
   it("returns reason when task is not in review", () => {
@@ -705,6 +863,11 @@ describe("getTaskHardMergeBlocker", () => {
     })).toBe("task has failed pre-merge workflow steps");
   });
 
+  it("blocks a resultless required pre-merge group", () => {
+    expect(getTaskHardMergeBlocker(baseTask, { requiredPreMergeStepIds: new Set(["code-review"]) }))
+      .toBe("task has enabled pre-merge workflow steps that never ran");
+  });
+
   it("still blocks when task is not in-review", () => {
     expect(getTaskHardMergeBlocker({ ...baseTask, column: "todo" }))
       .toContain("must be in 'in-review'");
@@ -714,6 +877,27 @@ describe("getTaskHardMergeBlocker", () => {
 describe("isTaskReadyForMerge", () => {
   it("returns true for a clean task in review", () => {
     expect(isTaskReadyForMerge(baseTask)).toBe(true);
+  });
+
+  it("uses the caller's resolved review lanes", () => {
+    expect(isTaskReadyForMerge(
+      { ...baseTask, column: "signoff" },
+      { reviewColumns: new Set(["signoff"]) },
+    )).toBe(true);
+  });
+
+  /*
+  FNXC:MergeReadiness 2026-08-23-18:49:
+  A resolved workflow can return an empty review-lane set when it has no usable trait answer. Empty is
+  therefore "unresolved", not an authoritative board with no review lane; keep the legacy `in-review`
+  identity fallback until the caller can supply at least one resolved lane.
+  */
+  it("preserves the legacy review lane fallback for an empty resolved set", () => {
+    expect(isTaskReadyForMerge(baseTask, { reviewColumns: new Set() })).toBe(true);
+    expect(isTaskReadyForMerge(
+      { ...baseTask, column: "signoff" },
+      { reviewColumns: new Set() },
+    )).toBe(false);
   });
 
   it("returns false when pre-merge step failed", () => {
@@ -726,6 +910,10 @@ describe("isTaskReadyForMerge", () => {
         status: "failed",
       }],
     })).toBe(false);
+  });
+
+  it("returns false for a required pre-merge group with no result", () => {
+    expect(isTaskReadyForMerge(baseTask, { requiredPreMergeStepIds: new Set(["code-review"]) })).toBe(false);
   });
 
   it("returns true when only post-merge step failed", () => {
@@ -769,7 +957,7 @@ describe("getTaskCompletionBlocker", () => {
     }, { resolveTask })).resolves.toBeUndefined();
   });
 
-  it.each(["done", "archived"] as const)("ignores blockedBy when resolveTask reports the blocker is %s", async (column) => {
+  it.each(["done"] as const)("ignores blockedBy when resolveTask reports the blocker is %s", async (column) => {
     const resolveTask = async () => ({ id: "FN-4054", column });
 
     await expect(getTaskCompletionBlocker({
@@ -935,5 +1123,105 @@ describe("isTaskBlockedOnApproval", () => {
 
   it("is false when pausedReason is the approval reason but paused is not true", () => {
     expect(isTaskBlockedOnApproval({ paused: false, pausedReason: AWAITING_APPROVAL_PAUSE_REASON, status: undefined })).toBe(false);
+  });
+});
+
+/*
+FNXC:MergeConfirmedFinalization 2026-08-23-21:40 (FN-9193 aftermath).
+
+ORIGINAL SYMPTOM: FN-9193's branch landed on main as eaa1d47c, but a Code Review revision request
+had reset its steps while the approved merge was in flight. The card was left `mergeConfirmed: true`
+WITH incomplete steps, every finalization site refused with "task has incomplete steps", and it sat
+`failed` for five hours. Restarting it made it worse: replanning issued seven fresh `pending` steps,
+so the retry re-created the exact condition that was blocking it — a loop with no exit.
+
+ASSERTION: incomplete steps never block a finalization whose landing the caller has already proven,
+while a genuinely rejecting pre-merge review still does.
+*/
+describe("getMergeConfirmedFinalizationBlocker", () => {
+  const landedWithUnfinishedWork = {
+    ...baseTask,
+    mergeDetails: { mergeConfirmed: true, commitSha: "eaa1d47c" } as never,
+    steps: [
+      { name: "Preflight", status: "in-progress" as StepStatus },
+      { name: "Remove the dead CSS custom-property reference", status: "pending" as StepStatus },
+    ],
+  };
+
+  it("does not block finalization for incomplete steps", () => {
+    // The hard blocker still refuses these — that difference IS the fix.
+    expect(getTaskHardMergeBlocker(landedWithUnfinishedWork)).toBe("task has incomplete steps");
+    expect(getMergeConfirmedFinalizationBlocker(landedWithUnfinishedWork)).toBeUndefined();
+  });
+
+  it("survives the restart loop that re-plans fresh pending steps", () => {
+    const replanned = {
+      ...baseTask,
+      mergeDetails: { mergeConfirmed: true, commitSha: "eaa1d47c" } as never,
+      steps: Array.from({ length: 7 }, (_, i) => ({ name: `Step ${i}`, status: "pending" as StepStatus })),
+    };
+    expect(getMergeConfirmedFinalizationBlocker(replanned)).toBeUndefined();
+  });
+
+  /*
+  FNXC:MergeConfirmedFinalization 2026-08-23-17:55:
+  The exemption needs a DURABLE merge record naming the landed commit. A no-op merge with no sha
+  landed nothing, and the content-scan recovery path (mergeDetails absent, landing inferred from
+  branch content) must keep the blocker or it would launder an unfinished task to done on a
+  heuristic — see `landed-content-soft-blocker.real-git.test.ts`.
+  */
+  it("still blocks incomplete steps without a durable merge record", () => {
+    expect(getMergeConfirmedFinalizationBlocker({
+      ...landedWithUnfinishedWork,
+      mergeDetails: { mergeConfirmed: true, noOpMerge: true } as never,
+    })).toBe("task has incomplete steps");
+    expect(getMergeConfirmedFinalizationBlocker({
+      ...landedWithUnfinishedWork,
+      mergeDetails: undefined,
+    })).toBe("task has incomplete steps");
+    // A no-op that still produced a commit did land something; the exemption applies.
+    expect(getMergeConfirmedFinalizationBlocker({
+      ...landedWithUnfinishedWork,
+      mergeDetails: { mergeConfirmed: true, noOpMerge: true, commitSha: "abc123" } as never,
+    })).toBeUndefined();
+  });
+
+  /*
+  FNXC:MergeConfirmedFinalization 2026-08-23-09:48:
+  Resolved review lanes and required pre-merge steps must reach the hard blocker on both durable-merge and non-durable finalization paths; neither path may fall back to default lane vocabulary.
+  */
+  it("forwards resolved lane options across durable and non-durable finalization", () => {
+    const customReviewTask = {
+      ...baseTask,
+      column: "approval",
+    };
+    const options = {
+      reviewColumns: new Set(["approval"]),
+      requiredPreMergeStepIds: new Set(["code-review"]),
+    };
+
+    expect(getMergeConfirmedFinalizationBlocker({
+      ...customReviewTask,
+      mergeDetails: { mergeConfirmed: true, commitSha: "abc123" } as never,
+    }, options)).toBe(PRE_MERGE_STEPS_NOT_RUN_BLOCKER);
+    expect(getMergeConfirmedFinalizationBlocker({
+      ...customReviewTask,
+      mergeDetails: { mergeConfirmed: true, noOpMerge: true } as never,
+    }, options)).toBe(PRE_MERGE_STEPS_NOT_RUN_BLOCKER);
+  });
+
+  it("still blocks on a failed pre-merge review", () => {
+    // A review that actually rejected this content is a real signal even after landing; the
+    // FN-7720 operator bypass is the sanctioned way past it.
+    expect(getMergeConfirmedFinalizationBlocker({
+      ...landedWithUnfinishedWork,
+      workflowStepResults: [{ workflowStepId: "code-review", workflowStepName: "Code Review", status: "failed", phase: "pre-merge" }],
+    })).toBe("task has failed pre-merge workflow steps");
+  });
+
+  it("names the unfinished steps so they are recorded, not dropped", () => {
+    expect(getUnfinishedStepTitles(landedWithUnfinishedWork))
+      .toEqual(["Preflight", "Remove the dead CSS custom-property reference"]);
+    expect(getUnfinishedStepTitles({ steps: [{ name: "done work", status: "done" as StepStatus }] })).toEqual([]);
   });
 });

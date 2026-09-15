@@ -1,70 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ThemeMode } from "@fusion/core";
 import type { ProjectInfo } from "../api";
-import { getScopedItem, setScopedItem } from "../utils/projectStorage";
-import { getPluginViewId, isPluginViewId, isPluginViewRegistered } from "../plugins/pluginViewRegistry";
+import { getScopedItem, scopedKey, setScopedItem } from "../utils/projectStorage";
+import { getPluginViewId, isPluginViewId, isPluginViewRegistered, parsePluginViewId } from "../plugins/pluginViewRegistry";
 import { recordActivity } from "../utils/report-capture";
+import { DASHBOARD_VIEWS, type BuiltInTaskView } from "../../src/shared/dashboard-views";
 
+export type { BuiltInTaskView } from "../../src/shared/dashboard-views";
 export type ViewMode = "overview" | "project";
-/*
-FNXC:ViewState 2026-06-22-00:00:
-Workflows, Import Tasks, and Automations are promoted to top-level main-content task views (left-sidebar destinations) instead of modal-only overlays, so they render in the main panel like Command Center.
-*/
-export type BuiltInTaskView = "board" | "list" | "graph" | "agents" | "missions" | "chat" | "documents" | "research" | "evals" | "ideation" | "goalsView" | "todos" | "planning" | "skills" | "mailbox" | "insights" | "memory" | "command-center" | "secrets" | "devserver" | "dev-server" | "pull-requests" | "workflows" | "import-tasks" | "automations" | "settings" | "task-detail";
 export type PluginTaskView = `plugin:${string}:${string}`;
 export type TaskView = BuiltInTaskView | PluginTaskView;
 
-const BUILT_IN_TASK_VIEWS: readonly BuiltInTaskView[] = [
-  "board",
-  "list",
-  "graph",
-  "agents",
-  "missions",
-  "chat",
-  "documents",
-  "research",
-  "evals",
-  /*
-  FNXC:Navigation 2026-08-01-00:00:
-  FN-8352 promotes Ideation from a Command Center tab to a persisted,
-  default-off experimental top-level view.
-  */
-  "ideation",
-  "goalsView",
-  /*
-  FNXC:ViewState 2026-06-21-09:14:
-  FN-6829 promotes project Todos from modal-only state into the persisted built-in task-view registry so dashboard navigation can dock it in the right content area.
-  */
-  "todos",
-  /*
-  FNXC:Navigation 2026-06-21-00:00:
-  FN-6886 promotes Planning Mode into a persisted top-level docked task view instead of treating it as a modal-only overlay.
-  */
-  "planning",
-
-  "skills",
-  "mailbox",
-  "insights",
-  "memory",
-  "command-center",
-  "secrets",
-  "devserver",
-  "dev-server",
-  "pull-requests",
-  "workflows",
-  "import-tasks",
-  "automations",
-  /*
-  FNXC:ViewState 2026-06-22-00:00:
-  Settings is promoted from a modal-only overlay into a top-level main-content task view so the header/sidebar Settings entry points dock it in the main panel like Command Center, while preserving deep-link section navigation.
-  */
-  "settings",
-  /*
-  FNXC:Navigation 2026-06-22-00:00:
-  Clicking a task card on the Board opens its detail as a full main-content view ("Full main panel (replaces board)") with a Back-to-board button, instead of the TaskDetailModal overlay. The detail is hosted under this registered `task-detail` task view so navigation/persistence treat it like any other docked main-panel destination.
-  */
-  "task-detail",
-];
+/*
+FNXC:UiMetadataApi 2026-07-14-00:00:
+Persisted task-view validation includes every canonical shared view id and each declared legacy alias. This preserves the existing devserver migration while making the same registry authoritative for dashboard navigation and GET /api/views.
+*/
+export const BUILT_IN_TASK_VIEWS: readonly BuiltInTaskView[] = DASHBOARD_VIEWS.flatMap((view) => [
+  ...(view.aliases ?? []),
+  view.id,
+] as BuiltInTaskView[]);
 
 function isBuiltInTaskView(value: string | null): value is BuiltInTaskView {
   return value !== null && BUILT_IN_TASK_VIEWS.includes(value as BuiltInTaskView);
@@ -74,10 +28,23 @@ function isTaskView(value: string | null): value is TaskView {
   return value !== null && (isBuiltInTaskView(value) || isPluginViewId(value));
 }
 
+/*
+FNXC:ViewState 2026-09-07-22:07:
+Une préférence automatique de plugin n’est restaurable que si ses deux segments désignent une vue encore inscrite au registre courant. Une navigation explicite conserve le contrat syntaxique de `isTaskView`, mais une vue retirée ou indisponible est normalisée vers Board au lieu de recréer une destination fantôme.
+*/
+function isRestorableTaskView(value: string | null): value is TaskView {
+  if (isBuiltInTaskView(value)) return true;
+  if (value === null) return false;
+  const pluginView = parsePluginViewId(value);
+  return pluginView !== null && isPluginViewRegistered(pluginView.pluginId, pluginView.viewId);
+}
+
 const LEGACY_ROADMAPS_PLUGIN_VIEW = getPluginViewId("fusion-plugin-roadmap", "roadmaps");
 
 function normalizeTaskView(value: TaskView): TaskView {
-  return value === "devserver" ? "dev-server" : value;
+  if (value === "devserver") return "dev-server";
+  if (value === "documents" || value === "recommendations") return "mailbox";
+  return value;
 }
 
 /*
@@ -86,9 +53,77 @@ Fusion must land on the Board on load, never the Command Center "Dashboard" view
 
 FNXC:ViewState 2026-07-07-00:00:
 FN-7649: an auto-restored/hydrated landing surface must never be Settings either. Once a project's per-project persisted `kb-dashboard-task-view` becomes `settings` (a common state after configuring a project through Settings), switching projects re-hydrates that scoped value and — without this guard — restores straight to Settings instead of the Board. `settings`, like `command-center`, now resolves to `board` for the auto-restored landing view only (initializer + project-hydration effect). Deep links (`?view=settings`) and explicit header/sidebar navigation to Settings still work because the `?view=` URL effect and `setTaskView`/`handleChangeTaskView` paths use `normalizeTaskView`, not this guard.
+
+FNXC:ViewState 2026-09-07-21:35:
+FN-313 distingue désormais le démarrage frais d’un changement explicite de projet. Les protections de démarrage ci-dessus restent inchangées, mais un retour A → B → A restaure la dernière vue principale propre à A, y compris Settings ou Command Center; `task-detail` reste transitoire et retombe toujours sur Board faute de snapshot en mémoire.
 */
 function resolveLandingTaskView(value: TaskView): TaskView {
   return value === "command-center" || value === "settings" ? "board" : value;
+}
+
+/*
+FNXC:ViewState 2026-07-26-10:35:
+Mobile browsers DISCARD a backgrounded dashboard tab and reload it when the user returns. That reload is indistinguishable from a fresh boot to `localStorage`, so the landing-view guard above bounced an operator who was reading Command Center or Settings back to the Board every time they took a phone call — losing their place through no action of their own.
+The two cases ARE distinguishable by storage lifetime: `sessionStorage` is per-tab and survives reload AND discard-restore, but is never inherited by a newly opened tab. So a session-scoped copy of the live view means "this tab was already running and came back", while its absence means "genuinely fresh boot".
+Deliberately conservative: the session copy bypasses `resolveLandingTaskView` ONLY on the first hydration of a tab that already had a view. A new tab, a cleared session, and every explicit project switch (`hasHydratedScopedTaskViewRef` already true) all keep the FN-7649 bounce to Board. The stored value is a view name only — never a URL, task id, or content.
+*/
+const SESSION_TASK_VIEW_KEY = "kb-dashboard-task-view-session";
+
+/*
+FNXC:ViewState 2026-07-26-10:44:
+`task-detail` is the one view a same-tab restore must NOT reproduce: the detail's task snapshot is in-memory only, so a restored `task-detail` renders MainContent's empty-detail Board fallback — a Board wearing the wrong view name, which also suppresses the board scroll replay. Resolve it to `board` instead. A `?task=` deep link still re-opens the real detail on reload via useDeepLink.
+*/
+function resolveSessionTaskView(value: TaskView): TaskView {
+  return value === "task-detail" ? "board" : normalizeTaskView(value);
+}
+
+function getSessionStorage(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const storage = window.sessionStorage;
+    if (!storage || typeof storage.getItem !== "function" || typeof storage.setItem !== "function") return null;
+    return storage;
+  } catch {
+    // Safari private mode / storage disabled: fall back to the fresh-boot landing behavior.
+    return null;
+  }
+}
+
+/*
+FNXC:ViewState 2026-07-26-19:22:
+Symmetric with the writer: with no project there is no project-scoped key to read, and reading the
+bare one would restore the previous project's view (including any bare key a pre-fix build left in
+this tab's sessionStorage). Absent a project, the same-tab restore simply does not apply.
+*/
+function getScopedSessionTaskView(projectId?: string): string | null {
+  if (typeof projectId !== "string" || projectId.length === 0) return null;
+  const storage = getSessionStorage();
+  if (!storage) return null;
+  try {
+    return storage.getItem(scopedKey(SESSION_TASK_VIEW_KEY, projectId));
+  } catch {
+    return null;
+  }
+}
+
+/*
+FNXC:ViewState 2026-07-26-19:15:
+Project-scoped ONLY, enforced here rather than merely documented at the call site.
+`scopedKey(base, undefined)` returns the BARE key, and the persist effect runs during boot and the
+project-switch window when `currentProject` is undefined — so the previous version DID write the
+unscoped mirror the adjacent comment claimed was never written, and the initializer then read it for
+first paint, leaking the previous project's view into the next project's landing. Dropping the write
+costs nothing: the value is re-persisted the moment a project resolves.
+*/
+function setScopedSessionTaskView(value: TaskView, projectId?: string): void {
+  if (typeof projectId !== "string" || projectId.length === 0) return;
+  const storage = getSessionStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(scopedKey(SESSION_TASK_VIEW_KEY, projectId), value);
+  } catch {
+    // Quota failures must never break navigation.
+  }
 }
 
 function migrateLegacyRoadmapsView(value: string): TaskView {
@@ -153,13 +188,23 @@ export function useViewState(options: UseViewStateOptions): UseViewStateResult {
   });
 
   const [taskView, setTaskView] = useState<TaskView>(() => {
+    /*
+    FNXC:ViewState 2026-07-26-19:18:
+    No unscoped session read here. The initializer runs before the project is known, so the only key
+    it could read is the bare one — which is precisely the cross-project leak the session copy is not
+    allowed to have (and which nothing writes any more). The same-tab restore therefore happens in
+    the project-hydration effect below, where the project id exists; first paint until then falls
+    back to the persisted/landing view exactly as it did before the session copy existed.
+    */
     const saved = getScopedItem("kb-dashboard-task-view");
     const legacyReliabilityView = migrateLegacyReliabilityView(saved);
     if (legacyReliabilityView) return legacyReliabilityView;
     const retiredStashRecoveryView = migrateRetiredStashRecoveryView(saved);
     if (retiredStashRecoveryView) return retiredStashRecoveryView;
     if (saved === "roadmaps") return migrateLegacyRoadmapsView(saved);
-    if (isTaskView(saved)) return resolveLandingTaskView(normalizeTaskView(saved));
+    // FNXC:TodoPluginEnablement 2026-08-03-16:00: static registrations must not revive a disabled project's legacy Todo view.
+    if (saved === "todos") return "board";
+    if (isRestorableTaskView(saved)) return resolveLandingTaskView(normalizeTaskView(saved));
     return "board";
   });
   const hasHydratedScopedTaskViewRef = useRef(false);
@@ -169,6 +214,27 @@ export function useViewState(options: UseViewStateOptions): UseViewStateResult {
   }, [viewMode]);
 
   useEffect(() => {
+    if (!currentProject?.id) {
+      return;
+    }
+
+    /*
+    First hydration of a tab that was already running (reload / discard-restore): the per-tab
+    session copy is the operator's real last view, so honor it verbatim. Every later run of this
+    effect is an explicit project switch and restores that project's last valid main view.
+    */
+    const isExplicitProjectSwitch = hasHydratedScopedTaskViewRef.current;
+    if (!hasHydratedScopedTaskViewRef.current) {
+      const sessionView = getScopedSessionTaskView(currentProject?.id);
+      if (isRestorableTaskView(sessionView)) {
+        setTaskView(resolveSessionTaskView(sessionView));
+        if (currentProject?.id) {
+          hasHydratedScopedTaskViewRef.current = true;
+        }
+        return;
+      }
+    }
+
     const saved = getScopedItem("kb-dashboard-task-view", currentProject?.id);
     const legacyReliabilityView = migrateLegacyReliabilityView(saved);
     const retiredStashRecoveryView = migrateRetiredStashRecoveryView(saved);
@@ -178,24 +244,44 @@ export function useViewState(options: UseViewStateOptions): UseViewStateResult {
       setTaskView(retiredStashRecoveryView);
     } else if (saved === "roadmaps") {
       setTaskView(migrateLegacyRoadmapsView(saved));
-    } else if (isTaskView(saved)) {
+    } else if (saved === "todos") {
+      // FNXC:TodoPluginEnablement 2026-08-03-16:00: a disabled project's persisted legacy Todo view must fall back to Board.
+      setTaskView("board");
+    } else if (isRestorableTaskView(saved)) {
       const preserveLegacyOnFirstScopedHydration =
         !hasHydratedScopedTaskViewRef.current && saved === "devserver";
 
       setTaskView(
-        preserveLegacyOnFirstScopedHydration ? "devserver" : resolveLandingTaskView(normalizeTaskView(saved)),
+        preserveLegacyOnFirstScopedHydration
+          ? "devserver"
+          : isExplicitProjectSwitch
+            ? resolveSessionTaskView(saved)
+            : resolveLandingTaskView(normalizeTaskView(saved)),
       );
     } else {
       setTaskView("board");
     }
 
-    if (currentProject?.id) {
-      hasHydratedScopedTaskViewRef.current = true;
-    }
+    hasHydratedScopedTaskViewRef.current = true;
   }, [currentProject?.id]);
 
   useEffect(() => {
-    setScopedItem("kb-dashboard-task-view", taskView, currentProject?.id);
+    /*
+    FNXC:ViewState 2026-09-07-21:35:
+    Une fenêtre de démarrage ou de changement sans projet résolu ne possède aucune portée légitime. Ne pas écrire non plus la copie localStorage dans cet intervalle: `scopedKey(..., undefined)` produirait une clé nue susceptible de transporter la vue du projet précédent.
+    */
+    if (!currentProject?.id) {
+      return;
+    }
+    setScopedItem("kb-dashboard-task-view", taskView, currentProject.id);
+    /*
+    Per-tab copy: what THIS tab is showing right now, for a reload/discard-restore of this tab.
+    Project-scoped, and skipped entirely while the project is unknown (boot and project-switch
+    windows) — an unscoped mirror would let the previous project's view leak into the next project's
+    landing. That skip is enforced inside setScopedSessionTaskView, not assumed here: this effect
+    deliberately still runs with `currentProject?.id === undefined`.
+    */
+    setScopedSessionTaskView(taskView, currentProject.id);
   }, [currentProject?.id, taskView]);
 
   useEffect(() => {
@@ -236,7 +322,7 @@ export function useViewState(options: UseViewStateOptions): UseViewStateResult {
   */
 
   const handleChangeTaskView = useCallback((newView: TaskView) => {
-    setTaskView(newView);
+    setTaskView(normalizeTaskView(newView));
   }, []);
 
   const handleToggleTheme = useCallback(() => {
@@ -250,7 +336,7 @@ export function useViewState(options: UseViewStateOptions): UseViewStateResult {
     viewMode,
     setViewMode,
     taskView,
-    setTaskView,
+    setTaskView: handleChangeTaskView,
     handleChangeTaskView,
     handleToggleTheme,
   };

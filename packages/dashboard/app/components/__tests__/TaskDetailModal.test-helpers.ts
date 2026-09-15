@@ -3,7 +3,7 @@ import { loadAllAppCss } from "../../test/cssFixture";
 import React from "react";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TaskDetailModal, TaskDetailContent } from "../TaskDetailModal";
 import type { TaskDetail, Column, MergeResult, Task } from "@fusion/core";
@@ -11,13 +11,41 @@ import { clearAuthToken } from "../../auth";
 
 const taskDetailSseSubscriptions = vi.hoisted(() => [] as Array<{
   url: string;
-  options: { events?: Record<string, (event: MessageEvent) => void> };
+  options: {
+    events?: Record<string, (event: MessageEvent) => void>;
+    onReconnect?: () => void;
+  };
 }>);
 
 export { taskDetailSseSubscriptions };
+export const mockFetchOverlapBlockerReport = vi.fn();
+
+/*
+FNXC:TaskDetailOptimisticOpening 2026-08-05-07:39:
+A running task deliberately exposes its raw runtime status in two ownership regions: the modal
+header's lifecycle badge and the Stats panel's Runtime status row. Optimistic-opening assertions
+must scope the Stats claim to its named semantic region, then assert one row there and the expected
+two owned values overall; this catches a duplicated Stats panel without treating legitimate header
+context as a production rendering defect.
+
+FNXC:TaskDetailStatsAssertions 2026-08-09-16:50:
+FN-8906 requires every TaskDetailModal test to use this shared helper: a non-empty raw runtime
+status is owned by the header lifecycle badge and the Stats Runtime status row, so an unscoped
+getByText(status) after opening Stats is ambiguous.
+*/
+export function expectSingleStatsRuntimeStatus(status: string): void {
+  const statsPanel = screen.getByRole("region", { name: "Task execution statistics" });
+  expect(within(statsPanel).getByText(status)).toBeInTheDocument();
+  expect(within(statsPanel).getAllByText(status)).toHaveLength(1);
+  expect(screen.getByTestId("task-detail-status-badge")).toHaveTextContent(status);
+  expect(screen.getAllByText(status)).toHaveLength(2);
+}
 
 vi.mock("../../sse-bus", () => ({
-  subscribeSse: vi.fn((url: string, options: { events?: Record<string, (event: MessageEvent) => void> }) => {
+  subscribeSse: vi.fn((url: string, options: {
+    events?: Record<string, (event: MessageEvent) => void>;
+    onReconnect?: () => void;
+  }) => {
     taskDetailSseSubscriptions.push({ url, options });
     return vi.fn();
   }),
@@ -30,8 +58,14 @@ vi.mock("../../api", async (importOriginal) => {
     deleteAttachment: vi.fn(),
     updateTask: vi.fn().mockResolvedValue({}),
     repairOverlapBlocker: vi.fn().mockResolvedValue({ repaired: true, statusCleared: false, reason: "repaired", message: "Repaired", task: makeTask() }),
+    fetchOverlapBlockerReport: mockFetchOverlapBlockerReport.mockResolvedValue({ taskId: "FN-099", blockerId: null, blockerColumn: null, reason: "no-overlap-blocker", taskScopeCount: 0, blockerScopeCount: 0, overlaps: [] }),
     summarizeTitle: vi.fn().mockResolvedValue("Generated Title"),
     fetchTaskDetail: vi.fn().mockResolvedValue(makeTask()),
+    fetchTaskPrompt: vi.fn().mockResolvedValue({ id: "FN-099", prompt: "# Task FN-099" }),
+    // FNXC:SpecLockTaskDetail 2026-08-09-19:34: every shared detail fixture provides a stable empty retained-evidence response.
+    fetchSpecLock: vi.fn().mockResolvedValue({ latestLock: null, activeLock: null, currentPlan: null, report: null, latestReport: null, history: { locks: [], currentPlans: [], reports: [] } }),
+    // FNXC:DashboardTests 2026-07-19-01:20: FN-8296 TaskDetail polls verification request status.
+    fetchTaskVerificationRequest: vi.fn().mockResolvedValue(null),
     fetchAgentLogs: vi.fn().mockResolvedValue([]),
     requestSpecRevision: vi.fn().mockResolvedValue({}),
     rebuildTaskSpec: vi.fn().mockResolvedValue(makeTask({ column: "triage", status: "needs-replan" })),
@@ -82,7 +116,8 @@ vi.mock("../../api", async (importOriginal) => {
 });
 
 // Mock lucide-react icons used by TaskDetailModal, TaskForm, PrPanel, CustomModelDropdown
-vi.mock("lucide-react", () => ({
+vi.mock("lucide-react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("lucide-react")>()),
   Pencil: () => null,
   Sparkles: (props: any) => React.createElement("svg", { "data-testid": "sparkles-icon", ...props }),
   Globe: () => null,
@@ -100,6 +135,7 @@ vi.mock("lucide-react", () => ({
   X: () => null,
   Maximize2: () => null,
   Minimize2: () => null,
+  WrapText: () => null,
   Loader2: (props: any) => React.createElement("svg", { "data-testid": "loader2-icon", ...props }),
   /*
   FNXC:TaskDetailTabPersistence 2026-07-20-19:10:
@@ -112,6 +148,8 @@ vi.mock("lucide-react", () => ({
   Square: (props: any) => React.createElement("svg", { "data-testid": "square-icon", ...props }),
   Info: (props: any) => React.createElement("svg", { "data-testid": "info-icon", ...props }),
   Bot: () => null,
+  // FNXC:TaskChatDefaultModel 2026-08-19-12:12: Task Chat reuses the Direct Chat thinking-level control, so its Brain icon is part of the shared modal mock surface.
+  Brain: () => null,
   CircleDot: () => null,
   XCircle: () => null,
   Workflow: () => null,
@@ -119,6 +157,8 @@ vi.mock("lucide-react", () => ({
   GitBranch: () => null,
   Gitlab: () => null,
   AlertTriangle: () => null,
+  AlertCircle: () => null,
+  FileCode: () => null,
   Play: () => null,
   Flag: () => null,
   ArrowDown: () => null,
@@ -148,6 +188,7 @@ vi.mock("lucide-react", () => ({
   Paperclip: (props: any) => React.createElement("svg", { "data-testid": "paperclip-icon", ...props }),
   Eye: (props: any) => React.createElement("svg", { "data-testid": "eye-icon", ...props }),
   EyeOff: (props: any) => React.createElement("svg", { "data-testid": "eye-off-icon", ...props }),
+  Copy: (props: any) => React.createElement("svg", { "data-testid": "copy-icon", ...props }),
   // FNXC:Test 2026-07-05-11:20: FN-7579 added "ask-user"/"exit-gate" workflow node types to
   // WorkflowNodeTypes.tsx (HelpCircle, DoorOpen), which WorkflowNodeEditor/WorkflowResultsTab
   // import transitively behind TaskDetailModal's lazy workflow surfaces. The explicit mock list
@@ -171,7 +212,7 @@ vi.mock("lucide-react", () => ({
   User: (props: any) => React.createElement("svg", { "data-testid": "user-icon", ...props }),
   /*
   FNXC:NativeStructureEmbed 2026-07-19-04:30:
-  FN-8291/8292/8293 mount NativeStructurePreview from chat/mail surfaces reachable via
+  FN-8288/FN-8291/8292/8293 mount NativeStructurePreview from chat/mail surfaces reachable via
   StandardChatSurface under TaskDetailModal. Keep Map/Lightbulb/BarChart3/Target/CircleAlert
   on this shared mock or every focused TaskDetailModal suite fails at import.
   */
@@ -201,12 +242,14 @@ vi.mock("../../hooks/usePluginUiSlots", () => ({
 export const mockConfirm = vi.fn();
 export const mockConfirmWithChoice = vi.fn();
 export const mockConfirmWithCheckbox = vi.fn();
+export const mockConfirmWithSelect = vi.fn();
 
 vi.mock("../../hooks/useConfirm", () => ({
   useConfirm: () => ({
     confirm: mockConfirm,
     confirmWithChoice: mockConfirmWithChoice,
     confirmWithCheckbox: mockConfirmWithCheckbox,
+    confirmWithSelect: mockConfirmWithSelect,
   }),
 }));
 
@@ -226,12 +269,60 @@ export function makeTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
   } as TaskDetail;
 }
 
+/**
+ * FNXC:PlannerOversight 2026-08-09-08:59:
+ * Mutation-response fixtures must model TaskStore's advancing update clock.
+ * `mergeTaskSnapshot` intentionally preserves populated fields from an equal-clock sparse response,
+ * so reusing `makeTask`'s fixed clock would simulate a stale payload rather than a server mutation.
+ */
+export function makeUpdatedTask(current: TaskDetail, patch: Partial<TaskDetail>): TaskDetail {
+  const currentUpdatedAt = Date.parse(current.updatedAt);
+  const nextUpdatedAt = new Date(
+    Number.isFinite(currentUpdatedAt) ? currentUpdatedAt + 1_000 : Date.now(),
+  ).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  return makeTask({ ...current, ...patch, updatedAt: nextUpdatedAt });
+}
+
+/*
+FNXC:DashboardTests 2026-08-05-07:32:
+FN-8803 confirms initial slim-task hydration uses `fetchTaskDetail`, while visible
+Definition refresh uses `fetchTaskPrompt`. Both mocks must retain Promise-returning
+defaults after an individual test resets them, so later tests cannot leak an impossible
+undefined response into either production request boundary.
+*/
+export async function resetTaskDetailFetchMock(): Promise<void> {
+  const { fetchTaskDetail } = await import("../../api");
+  vi.mocked(fetchTaskDetail).mockReset();
+  vi.mocked(fetchTaskDetail).mockResolvedValue(makeTask());
+}
+
+export async function resetTaskPromptFetchMock(): Promise<void> {
+  const { fetchTaskPrompt } = await import("../../api");
+  vi.mocked(fetchTaskPrompt).mockReset();
+  vi.mocked(fetchTaskPrompt).mockResolvedValue({ id: "FN-099", prompt: "# Task FN-099" });
+}
+
 export const noop = vi.fn();
 export const noopMove = vi.fn(async () => ({}) as Task);
 export const noopDelete = vi.fn(async () => ({}) as Task);
 export const noopMerge = vi.fn(async () => ({ merged: false }) as MergeResult);
 export const noopRetry = vi.fn(async () => ({}) as Task);
 export const noopOpenDetail = vi.fn();
+
+export async function openTaskDetailActionsMenu(): Promise<HTMLElement> {
+  const trigger = await screen.findByRole("button", { name: "Actions" });
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+  }
+  await waitFor(() => expect(document.querySelector(".detail-actions-menu")).toBeInTheDocument());
+  return document.querySelector<HTMLElement>(".detail-actions-menu")!;
+}
+
+export async function findTaskDetailActionByTestId(testId: string): Promise<HTMLElement> {
+  const menu = await openTaskDetailActionsMenu();
+  return within(menu).findByTestId(testId);
+}
 
 export function getCssRuleBlock(css: string, selector: string): string {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -257,13 +348,18 @@ export function loadDashboardCss(): string {
 }
 
 export function setupTaskDetailModalHooks(): void {
-  beforeEach(() => {
+  beforeEach(async () => {
+    // FNXC:DashboardTests 2026-08-05-07:32: Every TaskDetailModal suite begins with Promise-returning full-detail and narrow-prompt contracts; tests layer pending/rejected/custom responses after these resets.
+    await resetTaskDetailFetchMock();
+    await resetTaskPromptFetchMock();
     mockConfirm.mockReset();
     mockConfirmWithChoice.mockReset();
     mockConfirmWithCheckbox.mockReset();
+    mockConfirmWithSelect.mockReset();
     mockConfirm.mockResolvedValue(true);
     mockConfirmWithChoice.mockResolvedValue("primary");
     mockConfirmWithCheckbox.mockResolvedValue({ choice: "primary", checkboxValue: false });
+    mockConfirmWithSelect.mockResolvedValue({ choice: "primary", checkboxValue: false });
     clearAuthToken();
     localStorage.removeItem("fn.authToken");
     taskDetailSseSubscriptions.length = 0;

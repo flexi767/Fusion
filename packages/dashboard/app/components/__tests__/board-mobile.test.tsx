@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { loadAllAppCss } from "../../test/cssFixture";
+import { loadAllAppCss, readAppFile } from "../../test/cssFixture";
 import path from "node:path";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Task, TaskDetail, Settings } from "@fusion/core";
@@ -90,14 +90,27 @@ function getMainMobileSection(css: string): string {
 }
 
 describe("mobile board magnetic column snap wiring (FN-8235)", () => {
-  it("shares the mobile scroll-end hook across legacy, selected, and aggregate live board renders", () => {
-    const boardSource = fs.readFileSync(path.join(process.cwd(), "app/components/Board.tsx"), "utf8");
+  /*
+  FNXC:WorkflowColumns 2026-07-30-08:00:
+  Re-pinned to TWO board renders, not three. The third was the LEGACY board, deleted by U12/R9 —
+  `<main className="board" id="board" ref={setBoardRef}>` no longer appears in Board.tsx at all, so
+  both the count of 3 and the `toContain` for that markup were pinning removed code. The two that
+  remain are the selected and aggregate workflow-column renders, and the point of this guard is that
+  BOTH share the one scroll-snap hook, which still holds.
+  */
+  it("shares mobile snap and always-enabled mouse-pan wiring across the selected and aggregate live boards", () => {
+    const boardSource = readAppFile("components/Board.tsx");
 
     expect(boardSource).toContain('import { useColumnScrollSnap } from "../hooks/useColumnScrollSnap";');
+    expect(boardSource).toContain('import { useBoardMousePan } from "../hooks/useBoardMousePan";');
     expect(boardSource).toContain("useColumnScrollSnap(boardElement, { mobileOnly: true });");
-    expect(boardSource.match(/ref=\{setBoardRef\}/g)).toHaveLength(3);
-    expect(boardSource.match(/className="board board-workflow-columns"/g)).toHaveLength(2);
-    expect(boardSource).toContain('<main className="board" id="board" ref={setBoardRef}>');
+    expect(boardSource).toContain("useBoardMousePan(boardElement, true)");
+    expect(boardSource.match(/ref=\{setBoardRef\}/g)).toHaveLength(2);
+    expect(boardSource.match(/\{\.\.\.boardMousePanBindings\}/g)).toHaveLength(2);
+    expect(boardSource.match(/className=\{boardClassName\}/g)).toHaveLength(2);
+    expect(readAppFile("components/Board.css")).toContain(".board.board-workflow-columns.is-mouse-panning");
+    // FNXC:BoardNavigation 2026-08-20-02:44: The skeleton stays outside both live interaction owners.
+    expect(boardSource).not.toContain('<main className="board" id="board" ref={setBoardRef}>');
   });
 });
 
@@ -212,11 +225,11 @@ describe("Board and Column mobile CSS", () => {
     expectRuleToContain(mobileSection, ".board", "scroll-snap-type: x proximity;");
   });
 
-  it("contains .board scroll-behavior: smooth in the mobile media block", () => {
+  it("keeps .board scroll-behavior auto for the JavaScript hard settle", () => {
     const css = loadAllAppCss();
     const mobileSection = getMainMobileSection(css);
 
-    expectRuleToContain(mobileSection, ".board", "scroll-behavior: smooth;");
+    expectRuleToContain(mobileSection, ".board", "scroll-behavior: auto;");
   });
 
   it("contains .board > .column width: 300px in the mobile media block", () => {
@@ -292,66 +305,8 @@ describe("TaskCard mobile", () => {
     expectRuleToContain(css, ".card :is(input, textarea, select, [contenteditable=\"true\"])", "user-select: text;");
   });
 
-  it("sets .card-archive-btn opacity: 1 in the mobile media block", () => {
-    const css = loadAllAppCss();
-    const mobileSection = getMainMobileSection(css);
 
-    expectRuleToContain(mobileSection, ".card-archive-btn", "opacity: 1;");
-  });
 
-  it("keeps archive/unarchive/Promote controls visible without min-height overrides in the mobile media block", () => {
-    const css = loadAllAppCss();
-    const mobileSection = getMainMobileSection(css);
-
-    const selectors = [
-      ".card-archive-btn",
-      ".card-unarchive-btn",
-      ".card-send-back-btn",
-    ];
-    const pattern = /([^{}]+)\{([\s\S]*?)\}/g;
-
-    for (const selector of selectors) {
-      let found = false;
-      for (const match of mobileSection.matchAll(pattern)) {
-        const blockSelector = match[1];
-        const block = match[2];
-        if (!blockSelector.includes(selector)) continue;
-        found = true;
-        expect(block).toContain("opacity: 1;");
-        expect(block).not.toContain("min-height:");
-      }
-      expect(found).toBe(true);
-    }
-  });
-
-  it("FN-4351: archive/unarchive/Promote buttons have no min-height in the mobile media block", () => {
-    const css = loadAllAppCss();
-    const mobileSection = getMainMobileSection(css);
-
-    const selectors = [
-      ".card-archive-btn",
-      ".card-unarchive-btn",
-      ".card-send-back-btn",
-    ];
-    const pattern = /([^{}]+)\{([\s\S]*?)\}/g;
-
-    for (const selector of selectors) {
-      let found = false;
-      for (const match of mobileSection.matchAll(pattern)) {
-        const blockSelector = match[1];
-        const block = match[2];
-        if (!blockSelector.includes(selector)) continue;
-        found = true;
-        expect(block).not.toContain("min-height:");
-      }
-      expect(found).toBe(true);
-    }
-
-    expectRuleToContain(mobileSection, ".card-edit-btn", "width: 28px;");
-    expectRuleToContain(mobileSection, ".card-edit-btn", "height: 28px;");
-    expectRuleToContain(mobileSection, ".card-delete-btn", "width: 28px;");
-    expectRuleToContain(mobileSection, ".card-delete-btn", "height: 28px;");
-  });
 
   it("does not force .card-steps-toggle min-height in the mobile media block", () => {
     const css = loadAllAppCss();
@@ -444,11 +399,11 @@ describe("TaskCard mobile", () => {
   /*
   FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
   Mobile coverage for the Revert affordance (FN-5893 Surface Enumeration —
-  mobile breakpoint): the button renders on done/archived cards at mobile
+  mobile breakpoint): the button renders on Done cards at mobile
   width and, critically, leaves NO empty/orphaned button shell when it is
   hidden (no landed commit, or onRevertTask undefined).
   */
-  it("sets .card-revert-btn opacity: 1 in the mobile media block alongside archive/unarchive", () => {
+  it("sets .card-revert-btn opacity to one in the mobile media block", () => {
     const css = loadAllAppCss();
     const mobileSection = getMainMobileSection(css);
 
@@ -472,20 +427,6 @@ describe("TaskCard mobile", () => {
     expect(screen.getByRole("menuitem", { name: "Revert" })).toBeTruthy();
   });
 
-  it("renders the Revert affordance on an archived card at the mobile breakpoint", () => {
-    const task = createTask({ id: "FN-202", column: "archived", mergeDetails: { commitSha: "abc123def456" } as any });
-
-    const { container } = render(
-      <TaskCard
-        task={task}
-        onOpenDetail={vi.fn()}
-        addToast={vi.fn()}
-        onRevertTask={vi.fn(async () => ({ mode: "git", clean: true, revertCommitSha: "deadbeef" }) as any)}
-      />,
-    );
-
-    expect(container.querySelector(".card-revert-btn")).toBeTruthy();
-  });
 
   it("leaves no empty/orphaned Revert button shell when not revertable or onRevertTask is undefined", () => {
     const notRevertableTask = createTask({ id: "FN-203", column: "done", mergeDetails: undefined });
@@ -717,26 +658,6 @@ describe("InlineCreateCard mobile", () => {
     const mobileSection = getMainMobileSection(css);
 
     expectRuleToContain(mobileSection, ".inline-create-priority-select", "min-height: 36px;");
-  });
-
-  it("renders Subtask but no Plan button when expanded", () => {
-    render(
-      <InlineCreateCard
-        tasks={[]}
-        onSubmit={vi.fn().mockResolvedValue(createTask({ id: "FN-300" }))}
-        onCancel={vi.fn()}
-        addToast={vi.fn()}
-        availableModels={[]}
-        onPlanningMode={vi.fn()}
-        onSubtaskBreakdown={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId("inline-create-toggle"));
-
-    expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Plan" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Subtask" })).toBeTruthy();
   });
 
   it("renders dependency dropdown when Deps button is clicked", () => {

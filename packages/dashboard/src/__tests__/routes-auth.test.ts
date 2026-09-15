@@ -26,8 +26,6 @@ import { __resetBatchImportRateLimiter, __setCreateFnAgentForRefine } from "../r
 import * as agentGenerationModule from "../agent-generation.js";
 import { __resetPlanningState, __setCreateFnAgent, planningStreamManager } from "../planning.js";
 import * as planningModule from "../planning.js";
-import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
-import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
@@ -41,7 +39,10 @@ import { resetRuntimeLogSink, setRuntimeLogSink } from "../runtime-logger.js";
 import { resetDiagnosticsSink, setDiagnosticsSink, type LogEntry } from "../ai-session-diagnostics.js";
 import * as updateCheckModule from "../update-check.js";
 import { __setAgentReflectionServiceForTests } from "../routes/register-agent-reflection-rating-routes.js";
-import { parseGitHubCopilotDeviceCode } from "../routes/register-auth-routes.js";
+import { __setLoginInitiationTimeoutMsForTests, parseGitHubCopilotDeviceCode } from "../routes/register-auth-routes.js";
+import { createFusionAuthStorage } from "../../../engine/src/auth/auth-storage.js";
+import { createAuthMiddleware } from "../auth-middleware.js";
+import { __resetModelRegistryRefreshCacheForTests } from "../model-registry-refresh-cache.js";
 
 // Mock @fusion/core for gh CLI auth checks
 const mockCentralListProjects = vi.fn().mockResolvedValue([]);
@@ -177,7 +178,7 @@ vi.mock("@fusion/engine", async () => {
   });
 });
 
-import { AgentStore, Database, RoutineStore, isGhAvailable, isGhAuthenticated, probeGitCliStatus } from "@fusion/core";
+import { AgentStore, Database, MAX_TASK_MESSAGE_LENGTH, RoutineStore, TaskDocumentPreconditionFailedError, isGhAvailable, isGhAuthenticated, probeGitCliStatus } from "@fusion/core";
 import { createFnAgent } from "@fusion/engine";
 
 const mockIsGhAvailable = vi.mocked(isGhAvailable);
@@ -207,8 +208,6 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
-    archiveTask: vi.fn(),
-    unarchiveTask: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     getSettingsFast: vi.fn().mockResolvedValue({}),
     updateSettings: vi.fn(),
@@ -235,6 +234,16 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     addPrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    /*
+    FNXC:PluginMcpServers 2026-07-23-23:30:
+    FN-8491 (3cd023fa4) made resolveProjectContext bind a project-scoped plugin
+    MCP provider on every getProjectContext call. A store that already exposes
+    getProjectScopedPluginMcpServers is treated as runtime-owned and skips the
+    binder (which would otherwise call getPluginStore()); declare it here so the
+    route contracts under test stay isolated from plugin-loader bootstrapping.
+    Same alignment as remote-access-routes.test.ts (d7752931b).
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -368,9 +377,17 @@ describe("GET /models", () => {
     const res = await GET(buildApp(modelRegistry), "/api/models");
 
     expect(res.status).toBe(200);
+    /*
+    FNXC:ModelThinkingCapabilities 2026-08-23-23:50:
+    FN-021 derives `supportedThinkingLevels` for every /api/models row; a non-reasoning model derives ["off"], while a reasoning model with no thinkingLevelMap derives nothing.
+
+    FNXC:ModelCatalog 2026-09-02-22:06:
+    FN-9244's Pi 0.84.4 Muse Spark rows can omit thinkingLevelMap. Every route row now has
+    a defined capability array, using [] when the registry does not publish that metadata.
+    */
     expect(res.body.models).toEqual([
-      { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", reasoning: true, contextWindow: 200000 },
-      { provider: "openai", id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128000 },
+      { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", reasoning: true, contextWindow: 200000, supportedThinkingLevels: [] },
+      { provider: "openai", id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128000, supportedThinkingLevels: ["off"] },
     ]);
     expect(modelRegistry.refresh).toHaveBeenCalled();
   });
@@ -380,6 +397,86 @@ describe("GET /models", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.models).toEqual([]);
+  });
+
+  it("returns instance availability for all configured providers without duplicating catalog models", async () => {
+    const modelRegistry = createMockModelRegistry();
+    const authStorage = createMockAuthStorage({
+      getOAuthProviders: vi.fn().mockReturnValue([{ id: "openai", name: "OpenAI" }]),
+      hasAuth: vi.fn((provider: string) => provider === "openai"),
+      listInstances: vi.fn((provider: string) => provider === "openai"
+        ? [{ providerId: "openai", instanceId: "work" }, { providerId: "openai", instanceId: "personal" }]
+        : []),
+      getDefaultInstance: vi.fn((provider: string) => provider === "openai"
+        ? { providerId: "openai", instanceId: "work" }
+        : undefined),
+      getInstance: vi.fn(() => ({ type: "api_key" })),
+    });
+
+    const res = await GET(buildApp(modelRegistry, authStorage), "/api/models");
+
+    expect(res.body.providerInstances).toEqual({
+      openai: { instances: [{ id: "work", isDefault: true }, { id: "personal", isDefault: false }] },
+    });
+    expect(res.body.models.filter((model: { provider: string }) => model.provider === "openai")).toHaveLength(1);
+  });
+
+  it("derives per-instance unavailable models from the existing credential-kind provider gate", async () => {
+    const modelRegistry = createMockModelRegistry();
+    const authStorage = createMockAuthStorage({
+      getOAuthProviders: vi.fn().mockReturnValue([]),
+      getApiKeyProviders: vi.fn().mockReturnValue([{ id: "openai", name: "OpenAI" }]),
+      hasApiKey: vi.fn((provider: string) => provider === "openai"),
+      listInstances: vi.fn((provider: string) => provider === "openai"
+        ? [{ providerId: "openai", instanceId: "work" }, { providerId: "openai", instanceId: "oauth" }]
+        : []),
+      getDefaultInstance: vi.fn(() => ({ providerId: "openai", instanceId: "work" })),
+      getInstance: vi.fn((ref: { instanceId: string }) => ({ type: ref.instanceId === "work" ? "api_key" : "oauth" })),
+    });
+
+    const res = await GET(buildApp(modelRegistry, authStorage), "/api/models");
+
+    expect(res.body.providerInstances.openai.instances).toEqual([
+      { id: "work", isDefault: true },
+      { id: "oauth", isDefault: false, unavailableModelIds: ["gpt-4o"] },
+    ]);
+  });
+
+  it("omits instance availability when auth storage is unavailable or lacks the optional capability", async () => {
+    const withoutStorage = await GET(buildApp(createMockModelRegistry()), "/api/models");
+    expect(withoutStorage.body).not.toHaveProperty("providerInstances");
+
+    const withoutCapability = await GET(buildApp(createMockModelRegistry(), createMockAuthStorage()), "/api/models");
+    expect(withoutCapability.body).not.toHaveProperty("providerInstances");
+  });
+
+  it("skips a provider whose instance enumeration throws without failing the catalog", async () => {
+    const authStorage = createMockAuthStorage({
+      getOAuthProviders: vi.fn(() => [{ id: "openai", name: "OpenAI" }]),
+      hasAuth: vi.fn(() => true),
+      listInstances: vi.fn(() => { throw new Error("corrupt instance metadata"); }),
+    });
+
+    const res = await GET(buildApp(createMockModelRegistry(), authStorage), "/api/models");
+
+    expect(res.status).toBe(200);
+    expect(res.body.models).toEqual(expect.any(Array));
+    expect(res.body).not.toHaveProperty("providerInstances");
+  });
+
+  it("omits unavailable model ids when instance credentials have no existing distinguishable signal", async () => {
+    const modelRegistry = createMockModelRegistry();
+    const authStorage = createMockAuthStorage({
+      listInstances: vi.fn(() => [{ providerId: "custom", instanceId: "one" }]),
+      getDefaultInstance: vi.fn(() => ({ providerId: "custom", instanceId: "one" })),
+      getInstance: vi.fn(() => ({ type: "api_key" })),
+      getOAuthProviders: vi.fn(() => [{ id: "custom", name: "Custom" }]),
+      hasAuth: vi.fn(() => true),
+    });
+
+    const res = await GET(buildApp(modelRegistry, authStorage), "/api/models");
+
+    expect(res.body.providerInstances.custom.instances).toEqual([{ id: "one", isDefault: true }]);
   });
 
   it("returns empty array when registry has no available models", async () => {
@@ -448,7 +545,7 @@ describe("GET /models", () => {
     }
   });
 
-  it("dedupes Claude Sonnet 5 when upstream registry already includes it", async () => {
+  it("preserves upstream Claude Sonnet 5 while adding missing supplemental models", async () => {
     const modelRegistry = createMutableModelRegistry([
       { id: "claude-sonnet-5", name: "Claude Sonnet 5 Upstream", provider: "anthropic", reasoning: true, contextWindow: 1_000_000, maxTokens: 128_000 },
     ]);
@@ -458,12 +555,13 @@ describe("GET /models", () => {
     expect(res.status).toBe(200);
     const sonnetFiveRows = res.body.models.filter((model: { provider: string; id: string }) => model.provider === "anthropic" && model.id === "claude-sonnet-5");
     expect(sonnetFiveRows).toHaveLength(1);
-    // FNXC:ModelCatalog 2026-07-10: FN-7745's supplemental GPT-5.6 codex merge
-    // legitimately registers the missing openai-codex provider on this bare
-    // registry; the dedupe invariant under test is only that ANTHROPIC is not
-    // re-registered when the upstream registry already advertises Sonnet 5.
+    // The upstream Sonnet row wins while missing supplemental rows are added.
     const anthropicRegistrations = (modelRegistry.registerProvider as ReturnType<typeof vi.fn>).mock.calls.filter((call) => call[0] === "anthropic");
-    expect(anthropicRegistrations).toHaveLength(0);
+    expect(anthropicRegistrations).toHaveLength(1);
+    expect(anthropicRegistrations[0]?.[1].models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "claude-sonnet-5", name: "Claude Sonnet 5 Upstream" }),
+      expect.objectContaining({ id: "claude-fable-5-1", name: "Claude Fable 5.1" }),
+    ]));
   });
 
   // Regression guard: FN-2370's auto-resolved squash inverted this filter,
@@ -485,6 +583,7 @@ describe("GET /models", () => {
         getAvailable: vi.fn().mockReturnValue([
           { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", provider: "anthropic", reasoning: true, contextWindow: 200000 },
           { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 OAuth", provider: "anthropic-subscription", reasoning: true, contextWindow: 200000 },
+          { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 API Key", provider: "anthropic-api-key", reasoning: true, contextWindow: 200000 },
           { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (CLI)", provider: "pi-claude-cli", reasoning: true, contextWindow: 200000 },
           { id: "claude-sonnet-5", name: "Claude Sonnet 5 (CLI)", provider: "pi-claude-cli", reasoning: true, contextWindow: 1_000_000 },
           { id: "claude-sonnet-5", name: "Claude Sonnet 5 Duplicate (CLI)", provider: "pi-claude-cli", reasoning: true, contextWindow: 1_000_000 },
@@ -566,6 +665,7 @@ describe("GET /models", () => {
         expect(providers).toContain("anthropic");
         expect(providers).toContain("pi-claude-cli");
         expect(providers).not.toContain("anthropic-subscription");
+        expect(providers).not.toContain("anthropic-api-key");
         const cliSonnetFiveRows = res.body.models.filter((m: { provider: string; id: string }) => m.provider === "pi-claude-cli" && m.id === "claude-sonnet-5");
         expect(cliSonnetFiveRows).toHaveLength(1);
       });
@@ -853,6 +953,8 @@ function createMockAuthStorage(overrides: Partial<AuthStorageLike> = {}): AuthSt
     hasApiKey: vi.fn().mockReturnValue(false),
     setApiKey: vi.fn(),
     clearApiKey: vi.fn(),
+    listInstances: vi.fn().mockReturnValue([]),
+    getInstance: vi.fn().mockReturnValue(undefined),
     ...overrides,
   } as unknown as AuthStorageLike;
 }
@@ -926,6 +1028,8 @@ describe("GET /auth/status", () => {
     vi.mocked(authStorage.hasApiKey).mockReset();
     vi.mocked(authStorage.setApiKey).mockReset();
     vi.mocked(authStorage.clearApiKey).mockReset();
+    vi.mocked(authStorage.listInstances).mockReset();
+    vi.mocked(authStorage.getInstance).mockReset();
 
     vi.mocked(authStorage.reload).mockResolvedValue(undefined);
     vi.mocked(authStorage.getOAuthProviders).mockReturnValue([{ id: "github-copilot", name: "GitHub Copilot" }]);
@@ -941,6 +1045,70 @@ describe("GET /auth/status", () => {
       { id: "kimi-coding", name: "Kimi" },
     ]);
     vi.mocked(authStorage.hasApiKey).mockReturnValue(false);
+    vi.mocked(authStorage.listInstances).mockReturnValue([]);
+    vi.mocked(authStorage.getInstance).mockReturnValue(undefined);
+    const globalSettingsStore = store.getGlobalSettingsStore();
+    vi.mocked(globalSettingsStore.getSettings).mockReset().mockResolvedValue({});
+  });
+
+  it.each([
+    ["missing", undefined, false],
+    ["empty", [], false],
+    ["one", [{ id: "custom-one" }], true],
+    ["multiple duplicate and corrupt entries", [{ id: "custom-one" }, { id: "custom-one" }, null], true],
+  ])("reports custom-provider setup for %s without changing provider cards", async (_label, customProviders, expected) => {
+    const globalSettingsStore = store.getGlobalSettingsStore();
+    vi.mocked(globalSettingsStore.getSettings).mockResolvedValue({ customProviders } as never);
+
+    const res = await GET(app, "/api/auth/status");
+
+    expect(res.status).toBe(200);
+    expect(res.body.customProvidersConfigured).toBe(expected);
+    expect(res.body.providers).not.toContainEqual(expect.objectContaining({ id: "custom-one" }));
+  });
+
+  it("never serializes OAuth material or its derived fingerprint in instance APIs", async () => {
+    (authStorage.listInstances as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "github-copilot"
+      ? [{ providerId: provider, instanceId: "work" }]
+      : []);
+    (authStorage.getInstance as ReturnType<typeof vi.fn>).mockReturnValue({
+      type: "oauth",
+      access: "access-secret",
+      refresh: "refresh-secret",
+      key: "key-secret",
+      accountFingerprint: "0123456789abcdef",
+      label: "Work account",
+      expires: Date.now() + 60_000,
+    });
+
+    const status = await GET(app, "/api/auth/status");
+    const instances = await GET(app, "/api/auth/providers/github-copilot/instances");
+    expect(JSON.stringify(status.body)).not.toMatch(/access-secret|refresh-secret|key-secret|accountFingerprint|0123456789abcdef/);
+    expect(JSON.stringify(instances.body)).not.toMatch(/access-secret|refresh-secret|key-secret|accountFingerprint|0123456789abcdef/);
+  });
+
+  it("reports a legacy Anthropic OAuth shadow row only alongside subscription instances", async () => {
+    (authStorage.listInstances as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "anthropic-subscription"
+      ? [{ providerId: provider, instanceId: "work" }] : []);
+    (authStorage.getInstance as ReturnType<typeof vi.fn>).mockImplementation(({ providerId, instanceId }: { providerId: string; instanceId: string }) => {
+      if (providerId === "anthropic" && instanceId === "default") return { type: "oauth" };
+      if (providerId === "anthropic-subscription") return { type: "oauth" };
+      return undefined;
+    });
+
+    const res = await GET(app, "/api/auth/status");
+
+    expect(res.body.providers.find((provider: { id: string }) => provider.id === "anthropic-subscription")).toMatchObject({
+      legacyAnthropicOAuthPresent: true,
+    });
+  });
+
+  it("does not report a legacy API key or a legacy-only OAuth credential as a shadow row", async () => {
+    (authStorage.getInstance as ReturnType<typeof vi.fn>).mockReturnValue({ type: "api_key", key: "raw" });
+
+    const res = await GET(app, "/api/auth/status");
+
+    expect(res.body.providers.find((provider: { id: string }) => provider.id === "anthropic-subscription")).not.toHaveProperty("legacyAnthropicOAuthPresent");
   });
 
   it("returns provider list with auth status", async () => {
@@ -967,19 +1135,21 @@ describe("GET /auth/status", () => {
       "kimi-coding",
       "minimax",
       "openrouter",
+      // FNXC:ProviderAuth 2026-08-23-23:50: OrcaRouter joined the static API-key catalog (feat 41c23adf15); these pins enumerate that catalog exactly, so a new entry belongs here rather than being filtered out.
+      "orcarouter",
       "opencode-go",
       "tavily",
       "zai",
     ]);
     const githubCopilot = providers.find((p: any) => p.id === "github-copilot");
-    expect(githubCopilot).toEqual({ id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", expired: false, loginInProgress: false });
+    expect(githubCopilot).toEqual(expect.objectContaining({ id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", expired: false, loginInProgress: false }));
     const openrouter = providers.find((p: any) => p.id === "openrouter");
-    expect(openrouter).toEqual({ id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" });
+    expect(openrouter).toEqual(expect.objectContaining({ id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" }));
     const kimiCoding = providers.find((p: any) => p.id === "kimi-coding");
-    expect(kimiCoding).toEqual({ id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" });
+    expect(kimiCoding).toEqual(expect.objectContaining({ id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" }));
     // Catalog-only entries (not reported by storage) still surface, present-but-unauthenticated.
     const brave = providers.find((p: any) => p.id === "brave");
-    expect(brave).toEqual({ id: "brave", name: "Brave Search", authenticated: false, type: "api_key" });
+    expect(brave).toEqual(expect.objectContaining({ id: "brave", name: "Brave Search", authenticated: false, type: "api_key" }));
     expect(authStorage.reload).toHaveBeenCalled();
   });
 
@@ -1042,14 +1212,14 @@ describe("GET /auth/status", () => {
 
     expect(res.status).toBe(200);
     const githubCopilot = res.body.providers.find((p: any) => p.id === "github-copilot");
-    expect(githubCopilot).toEqual({
+    expect(githubCopilot).toEqual(expect.objectContaining({
       id: "github-copilot",
       name: "GitHub Copilot",
       authenticated: true,
       type: "oauth",
       expired: false,
       loginInProgress: false,
-    });
+    }));
   });
 
   it("includes oauth and model-registry-derived API key providers in one response", async () => {
@@ -1083,21 +1253,23 @@ describe("GET /auth/status", () => {
       "kimi-coding",
       "minimax",
       "openrouter",
+      // FNXC:ProviderAuth 2026-08-23-23:50: OrcaRouter joined the static API-key catalog (feat 41c23adf15); these pins enumerate that catalog exactly, so a new entry belongs here rather than being filtered out.
+      "orcarouter",
       "opencode-go",
       "tavily",
       "zai",
       "acme-extension",
     ]);
     const githubCopilot = providers.find((p: any) => p.id === "github-copilot");
-    expect(githubCopilot).toEqual({ id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", expired: false, loginInProgress: false });
+    expect(githubCopilot).toEqual(expect.objectContaining({ id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", expired: false, loginInProgress: false }));
     const openaiCodex = providers.find((p: any) => p.id === "openai-codex");
-    expect(openaiCodex).toEqual({ id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", expired: false, loginInProgress: false, requiresManualCode: true });
+    expect(openaiCodex).toEqual(expect.objectContaining({ id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", expired: false, loginInProgress: false, requiresManualCode: true }));
     const openrouter = providers.find((p: any) => p.id === "openrouter");
-    expect(openrouter).toEqual({ id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" });
+    expect(openrouter).toEqual(expect.objectContaining({ id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" }));
     const kimiCoding = providers.find((p: any) => p.id === "kimi-coding");
-    expect(kimiCoding).toEqual({ id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" });
+    expect(kimiCoding).toEqual(expect.objectContaining({ id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" }));
     const acmeExtension = providers.find((p: any) => p.id === "acme-extension");
-    expect(acmeExtension).toEqual({ id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key" });
+    expect(acmeExtension).toEqual(expect.objectContaining({ id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key" }));
   });
 
   it.each(["https://my-host.example.com", undefined])(
@@ -1113,7 +1285,7 @@ describe("GET /auth/status", () => {
       ]);
 
       const res = origin
-        ? await REQUEST(app, "GET", "/api/auth/status", undefined, { Origin: origin })
+        ? await REQUEST(app, "GET", `/api/auth/status?origin=${encodeURIComponent(origin)}`)
         : await REQUEST(app, "GET", "/api/auth/status");
 
       expect(res.status).toBe(200);
@@ -1123,7 +1295,7 @@ describe("GET /auth/status", () => {
       const openrouter = res.body.providers.find((p: any) => p.id === "openrouter");
       const claudeCli = res.body.providers.find((p: any) => p.id === "claude-cli");
 
-      expect(openAiCodex.requiresManualCode).toBe(true);
+      expect(openAiCodex.requiresManualCode).toBe(origin ? undefined : true);
       expect(anthropic.requiresManualCode).toBe(true);
       expect(githubCopilot).not.toHaveProperty("requiresManualCode");
       expect(openrouter).not.toHaveProperty("requiresManualCode");
@@ -1170,6 +1342,95 @@ describe("GET /auth/status", () => {
     expect(githubCopilot).toMatchObject({ authenticated: true, expired: false });
     expect(claude).toMatchObject({ authenticated: false, expired: true });
     expect(geminiOauth).toMatchObject({ authenticated: false, expired: false });
+  });
+
+  it.each(["openai-codex", "github-copilot"])("refreshes a renewable %s credential through the real Fusion storage seam before projecting status and its default instance", async (providerId) => {
+    const previousHome = process.env.HOME;
+    const homeDir = mkdtempSync(join(tmpdir(), "fusion-auth-status-refresh-"));
+    const now = Date.now();
+    const renewedExpires = now + 60_000;
+
+    try {
+      process.env.HOME = homeDir;
+      const storage = createFusionAuthStorage();
+      await storage.set(providerId, {
+        type: "oauth",
+        access: "expired-access-token",
+        refresh: "refresh-material",
+        expires: now - 1_000,
+      } as never);
+      const getAuth = vi.fn(async (runtimeProviderId: string) => {
+        await storage.modify(runtimeProviderId, async (credential) => ({
+          ...credential,
+          expires: renewedExpires,
+        }));
+      });
+      storage.setModelRuntime({ getAuth } as never);
+
+      const realApp = express();
+      realApp.use(express.json());
+      realApp.use("/api", createApiRoutes(store, { authStorage: storage }));
+      const res = await GET(realApp, "/api/auth/status");
+
+      expect(res.status).toBe(200);
+      const provider = res.body.providers.find((item: any) => item.id === providerId);
+      expect(provider).toMatchObject({ authenticated: true, expired: false });
+      expect(provider.loginError).toBeUndefined();
+      expect(provider.instances).toEqual([
+        expect.objectContaining({
+          instanceId: "default",
+          isDefault: true,
+          authenticated: true,
+          expired: false,
+        }),
+      ]);
+      expect(getAuth).toHaveBeenCalledWith(providerId);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["openai-codex", "github-copilot"])("keeps an unrenewable %s credential expired in both provider and default-instance status", async (providerId) => {
+    const previousHome = process.env.HOME;
+    const homeDir = mkdtempSync(join(tmpdir(), "fusion-auth-status-unrenewable-"));
+    const now = Date.now();
+
+    try {
+      process.env.HOME = homeDir;
+      const storage = createFusionAuthStorage();
+      await storage.set(providerId, {
+        type: "oauth",
+        access: "expired-access-token",
+        expires: now - 1_000,
+      } as never);
+      const getAuth = vi.fn();
+      storage.setModelRuntime({ getAuth } as never);
+
+      const realApp = express();
+      realApp.use(express.json());
+      realApp.use("/api", createApiRoutes(store, { authStorage: storage }));
+      const res = await GET(realApp, "/api/auth/status");
+
+      expect(res.status).toBe(200);
+      const provider = res.body.providers.find((item: any) => item.id === providerId);
+      expect(provider).toMatchObject({ authenticated: false, expired: true });
+      expect(provider.loginError).toBe("This OAuth session expired and could not be refreshed. Re-login to restore model access.");
+      expect(provider.instances).toEqual([
+        expect.objectContaining({
+          instanceId: "default",
+          isDefault: true,
+          authenticated: false,
+          expired: true,
+        }),
+      ]);
+      expect(getAuth).not.toHaveBeenCalled();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(homeDir, { recursive: true, force: true });
+    }
   });
 
   it("attempts async refresh for expired oauth before reporting status", async () => {
@@ -1551,6 +1812,8 @@ describe("GET /auth/status", () => {
       "kimi-coding",
       "minimax",
       "openrouter",
+      // FNXC:ProviderAuth 2026-08-23-23:50: OrcaRouter joined the static API-key catalog (feat 41c23adf15); these pins enumerate that catalog exactly, so a new entry belongs here rather than being filtered out.
+      "orcarouter",
       "opencode-go",
       "tavily",
       "zai",
@@ -2769,11 +3032,7 @@ describe("POST /auth/login", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.url).toBe(unchangedUrl);
-    expect(res.body.manualCode).toEqual({
-      prompt: "Paste the final redirect URL or authorization code",
-      placeholder: "http://localhost:1455/auth/callback?code=...&state=... or just the code",
-      helpText: "After sign-in, OpenAI may redirect to a localhost callback that cannot open from this dashboard host. Copy the full browser URL from the address bar and paste it here.",
-    });
+    expect(res.body.manualCode).toBeUndefined();
   });
 
   it("maps Anthropic subscription login to upstream anthropic OAuth and skips callback rewrite", async () => {
@@ -2890,6 +3149,42 @@ describe("POST /auth/login", () => {
     );
   });
 
+  it("selects Codex device code on a remote origin without a manual-code form", async () => {
+    let selectedOption: string | undefined;
+    (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([{ id: "openai-codex", name: "OpenAI Codex" }]);
+    (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation(async (_provider: string, callbacks: any) => {
+      selectedOption = await callbacks.onSelect({ options: [{ id: "browser" }, { id: "device_code" }] });
+      callbacks.onDeviceCode({ userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" });
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex", origin: "https://remote.example.com" }), { "Content-Type": "application/json" });
+
+    expect(selectedOption).toBe("device_code");
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe("https://auth.openai.com/codex/device");
+    expect(res.body.deviceCode).toEqual({ userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" });
+    expect(res.body.manualCode).toBeUndefined();
+  });
+
+  it("honors an explicit Codex browser override on a remote origin", async () => {
+    let selectedOption: string | undefined;
+    (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([{ id: "openai-codex", name: "OpenAI Codex" }]);
+    (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation(async (_provider: string, callbacks: any) => {
+      selectedOption = await callbacks.onSelect({ options: [{ id: "browser" }, { id: "device_code" }] });
+      callbacks.onAuth({ url: "https://auth.openai.com/oauth/authorize?state=browser" });
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex", origin: "https://remote.example.com", method: "browser" }), { "Content-Type": "application/json" });
+
+    expect(selectedOption).toBe("browser");
+    expect(res.body.manualCode).toBeDefined();
+  });
+
+  it("rejects an unsupported OAuth method", async () => {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex", method: "nonsense" }), { "Content-Type": "application/json" });
+    expect(res.status).toBe(400);
+  });
+
   it("keeps returning the only option id for single-option prompts", async () => {
     let selectedOption: string | undefined;
     (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([{ id: "openai-codex", name: "OpenAI Codex" }]);
@@ -2930,6 +3225,137 @@ describe("POST /auth/login", () => {
 
     expect(selectedOption).toBe("browser");
     expect(res.status).toBe(200);
+  });
+
+  describe("OpenAI Codex login through the real pi AuthInteraction shim", () => {
+    const originalHome = process.env.HOME;
+    let homeDir: string;
+
+    beforeEach(() => {
+      homeDir = mkdtempSync(join(tmpdir(), "fusion-codex-route-auth-"));
+      process.env.HOME = homeDir;
+      __setLoginInitiationTimeoutMsForTests(25);
+    });
+
+    afterEach(() => {
+      __setLoginInitiationTimeoutMsForTests();
+      rmSync(homeDir, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    });
+
+    it("returns browser authorization while the real manual-code interaction remains unsettled", async () => {
+      const storage = createFusionAuthStorage();
+      const promptLog: string[] = [];
+      let selectedOption: string | undefined;
+      let manualCodeSettled = false;
+      storage.setModelRuntime({
+        login: async (_provider: string, _kind: string, interaction: {
+          prompt: (prompt: { type: string; options?: Array<{ id: string }> }) => Promise<string>;
+          notify: (event: { type: string; url?: string }) => void;
+        }) => {
+          promptLog.push("select");
+          selectedOption = await interaction.prompt({
+            type: "select",
+            options: [{ id: "browser" }, { id: "device_code" }],
+          });
+          promptLog.push("notify:auth_url");
+          interaction.notify({ type: "auth_url", url: "https://auth.openai.com/oauth/authorize?state=s" });
+          promptLog.push("manual_code");
+          const manualCode = interaction.prompt({ type: "manual_code" });
+          void manualCode.then(
+            () => { manualCodeSettled = true; },
+            () => { manualCodeSettled = true; },
+          );
+          await manualCode;
+        },
+      } as never);
+      authStorage = storage;
+
+      const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex" }), { "Content-Type": "application/json" });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(res.status).toBe(200);
+      expect(res.body.url).toContain("state=s");
+      expect(promptLog).toEqual(["select", "notify:auth_url", "manual_code"]);
+      expect(selectedOption).toBe("browser");
+      expect(manualCodeSettled).toBe(false);
+      expect(res.body.error).not.toBe("Login initiation timed out");
+    });
+
+    it("returns a device code through the real interaction shim", async () => {
+      const storage = createFusionAuthStorage();
+      const promptLog: string[] = [];
+      let selectedOption: string | undefined;
+      storage.setModelRuntime({
+        login: async (_provider: string, _kind: string, interaction: {
+          prompt: (prompt: { type: string; options?: Array<{ id: string }> }) => Promise<string>;
+          notify: (event: { type: string; userCode?: string; verificationUri?: string }) => void;
+        }) => {
+          promptLog.push("select");
+          selectedOption = await interaction.prompt({
+            type: "select",
+            options: [{ id: "browser" }, { id: "device_code" }],
+          });
+          promptLog.push("notify:device_code");
+          interaction.notify({
+            type: "device_code",
+            userCode: "ABCD-1234",
+            verificationUri: "https://auth.openai.com/codex/device",
+          });
+        },
+      } as never);
+      authStorage = storage;
+
+      const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex", origin: "https://remote.example.com" }), { "Content-Type": "application/json" });
+
+      expect(res.status).toBe(200);
+      expect(selectedOption).toBe("device_code");
+      expect(promptLog).toEqual(["select", "notify:device_code"]);
+      expect(res.body.url).toBe("https://auth.openai.com/codex/device");
+      expect(res.body.deviceCode).toEqual({ userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" });
+    });
+  });
+
+  describe("initiation timeout cleanup", () => {
+    beforeEach(() => __setLoginInitiationTimeoutMsForTests(20));
+    afterEach(() => __setLoginInitiationTimeoutMsForTests());
+
+    it("aborts a silent login without letting its late settlement clear a successor", async () => {
+      let firstSignal: AbortSignal | undefined;
+      let settleFirst: (() => void) | undefined;
+      let calls = 0;
+      (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([{ id: "openai-codex", name: "OpenAI Codex" }]);
+      (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation((_provider: string, callbacks: { signal: AbortSignal; onAuth: (info: { url: string }) => void }) => {
+        calls += 1;
+        if (calls === 1) {
+          firstSignal = callbacks.signal;
+          return new Promise<void>((resolve) => { settleFirst = resolve; });
+        }
+        callbacks.onAuth({ url: "https://auth.openai.com/oauth/authorize?state=retry" });
+        return new Promise<void>(() => {});
+      });
+      const app = buildApp();
+
+      const timedOut = await REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex" }), { "Content-Type": "application/json" });
+      expect(timedOut.status).toBe(500);
+      expect(timedOut.body.error).toBe("Login initiation timed out");
+      expect(firstSignal?.aborted).toBe(true);
+
+      const status = await GET(app, "/api/auth/status?provider=openai-codex");
+      expect(status.body.providers).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "openai-codex", loginInProgress: false, loginError: "Login initiation timed out" }),
+      ]));
+
+      const retry = await REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "openai-codex" }), { "Content-Type": "application/json" });
+      expect(retry.status).toBe(200);
+
+      settleFirst?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const cancelled = await REQUEST(app, "POST", "/api/auth/cancel", JSON.stringify({ provider: "openai-codex" }), { "Content-Type": "application/json" });
+      expect(cancelled.body).toMatchObject({ cancelled: true });
+    });
   });
 
   it("returns 400 when provider is missing", async () => {
@@ -3299,11 +3725,13 @@ describe("GET /auth/oauth-callback", () => {
       (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
         { id: "google", name: "Google" },
       ]);
+      let finishLogin: (() => void) | undefined;
       (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation((_provider: string, callbacks: any) => {
         callbacks.onAuth({
           url: `https://accounts.example.com/o/oauth2/v2/auth?state=test-state&redirect_uri=${encodeURIComponent(`http://localhost:${port}/oauth2callback`)}`,
         });
-        return Promise.resolve();
+        // The proxy session is valid only while its bound login remains active.
+        return new Promise<void>((resolve) => { finishLogin = resolve; });
       });
 
       const app = buildApp();
@@ -3319,6 +3747,7 @@ describe("GET /auth/oauth-callback", () => {
       const res = await REQUEST(app, "GET", "/api/auth/oauth-callback?code=test-code&state=test-state");
       expect(res.status).toBe(200);
       expect(String(res.body)).toContain("proxied:test-code:test-state");
+      finishLogin?.();
     } finally {
       await new Promise<void>((resolve, reject) => callbackListener.close((err) => (err ? reject(err) : resolve())));
     }
@@ -3394,6 +3823,7 @@ describe("POST /auth/api-key", () => {
   beforeEach(() => {
     store = createMockStore();
     authStorage = createMockAuthStorage();
+    __resetModelRegistryRefreshCacheForTests();
   });
 
   function buildApp(options?: {
@@ -3543,24 +3973,34 @@ describe("POST /auth/api-key", () => {
     expect(res.body.error).toContain("not supported");
   });
 
-  it("runs post-save refresh hook and model registry refresh for opencode-go", async () => {
+  it("runs post-save refresh hook and invalidates the model registry cache for opencode-go", async () => {
     const onApiKeySaved = vi.fn().mockResolvedValue({ registeredCount: 3, reason: "no-models-from-cli" });
-    const modelRegistry = { refresh: vi.fn(), getAvailable: vi.fn().mockReturnValue([]) } as unknown as ModelRegistryLike;
+    const modelRegistry = {
+      refresh: vi.fn(async () => undefined),
+      getAvailable: vi.fn().mockReturnValue([]),
+    } as unknown as ModelRegistryLike;
     (authStorage.getApiKeyProviders as ReturnType<typeof vi.fn>).mockReturnValue([
       { id: "openrouter", name: "OpenRouter" },
       { id: "opencode-go", name: "Opencode (Go)" },
     ]);
+    const app = buildApp({ onApiKeySaved, modelRegistry });
 
-    const res = await REQUEST(buildApp({ onApiKeySaved, modelRegistry }), "POST", "/api/auth/api-key", JSON.stringify({
+    await GET(app, "/api/models");
+    expect(modelRegistry.refresh).toHaveBeenCalledOnce();
+
+    const res = await REQUEST(app, "POST", "/api/auth/api-key", JSON.stringify({
       provider: "opencode-go",
       apiKey: "sk-test",
     }), { "Content-Type": "application/json" });
 
     expect(res.status).toBe(200);
     expect(onApiKeySaved).toHaveBeenCalledWith("opencode-go");
-    expect(modelRegistry.refresh).toHaveBeenCalled();
+    expect(modelRegistry.refresh).toHaveBeenCalledOnce();
     expect(res.body.modelsRefreshed).toBe(3);
     expect(res.body.refreshReason).toBe("no-models-from-cli");
+
+    await GET(app, "/api/models");
+    expect(modelRegistry.refresh).toHaveBeenCalledTimes(2);
   });
 
   it("returns success when post-save refresh hook throws", async () => {
@@ -3692,7 +4132,7 @@ describe("Pause/Unpause endpoints", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/pause");
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ id: "FN-001", paused: true });
-    expect(store.pauseTask).toHaveBeenCalledWith("KB-001", true);
+    expect(store.pauseTask).toHaveBeenCalledWith("KB-001", true, undefined, { userPaused: true });
   });
 
   it("POST /tasks/:id/unpause — unpauses a task", async () => {
@@ -3910,6 +4350,72 @@ describe("Pause/Unpause endpoints", () => {
       expect(store.updateTaskComment).toHaveBeenCalledWith("KB-001", "c1", "Updated");
     });
 
+    it.each([
+      { name: "add-comment", method: "POST" as const, path: "/api/tasks/KB-001/comments", field: "text", status: 200, call: "addTaskComment" as const },
+      { name: "edit-comment", method: "PATCH" as const, path: "/api/tasks/KB-001/comments/comment-1", field: "text", status: 200, call: "updateTaskComment" as const },
+      { name: "refine", method: "POST" as const, path: "/api/tasks/KB-001/refine", field: "feedback", status: 201, call: "refineTask" as const },
+    ])("$name accepts the shared upper boundary and rejects the next character", async (route) => {
+      const task = { ...FAKE_TASK_DETAIL, id: "KB-001", comments: [], steeringComments: [] };
+      const store = createMockStore({
+        addTaskComment: vi.fn().mockResolvedValue(task),
+        updateTaskComment: vi.fn().mockResolvedValue(task),
+        refineTask: vi.fn().mockResolvedValue({ ...task, id: "KB-002" }),
+      });
+      const app = express();
+      app.use(express.json({ limit: "2mb" }));
+      app.use("/api", createApiRoutes(store));
+      const accepted = "a".repeat(MAX_TASK_MESSAGE_LENGTH);
+      const rejected = "a".repeat(MAX_TASK_MESSAGE_LENGTH + 1);
+
+      const acceptedResponse = await REQUEST(app, route.method, route.path, JSON.stringify({ [route.field]: accepted }), {
+        "Content-Type": "application/json",
+      });
+      const rejectedResponse = await REQUEST(app, route.method, route.path, JSON.stringify({ [route.field]: rejected }), {
+        "Content-Type": "application/json",
+      });
+
+      expect(acceptedResponse.status).toBe(route.status);
+      if (route.call === "addTaskComment") {
+        expect(store.addTaskComment).toHaveBeenCalledWith("KB-001", accepted, "user");
+      } else if (route.call === "updateTaskComment") {
+        expect(store.updateTaskComment).toHaveBeenCalledWith("KB-001", "comment-1", accepted);
+      } else {
+        expect(store.refineTask).toHaveBeenCalledWith("KB-001", accepted);
+      }
+      expect(rejectedResponse.status).toBe(400);
+      const fieldName = route.field === "feedback" ? "feedback" : "text";
+      expect(rejectedResponse.body).toEqual({ error: `${fieldName} must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
+    });
+
+    it.each([
+      { name: "add-comment", method: "POST" as const, path: "/api/tasks/KB-001/comments", field: "text" as const },
+      { name: "edit-comment", method: "PATCH" as const, path: "/api/tasks/KB-001/comments/comment-1", field: "text" as const },
+      { name: "refine", method: "POST" as const, path: "/api/tasks/KB-001/refine", field: "feedback" as const },
+      { name: "steer", method: "POST" as const, path: "/api/tasks/KB-001/steer", field: "text" as const },
+    ])("$name rejects whitespace-only task text before persistence", async (route) => {
+      const task = { ...FAKE_TASK_DETAIL, id: "KB-001", comments: [], steeringComments: [] };
+      const addTaskComment = vi.fn().mockResolvedValue(task);
+      const updateTaskComment = vi.fn().mockResolvedValue(task);
+      const refineTask = vi.fn().mockResolvedValue({ ...task, id: "KB-002" });
+      const addSteeringComment = vi.fn().mockResolvedValue(task);
+      const store = createMockStore({ addTaskComment, updateTaskComment, refineTask, addSteeringComment });
+      const app = express();
+      app.use(express.json());
+      app.use("/api", createApiRoutes(store));
+
+      const response = await REQUEST(app, route.method, route.path, JSON.stringify({ [route.field]: " \t\n " }), {
+        "Content-Type": "application/json",
+      });
+
+      const fieldName = route.field === "feedback" ? "feedback" : "text";
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: `${fieldName} must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
+      expect(addTaskComment).not.toHaveBeenCalled();
+      expect(updateTaskComment).not.toHaveBeenCalled();
+      expect(refineTask).not.toHaveBeenCalled();
+      expect(addSteeringComment).not.toHaveBeenCalled();
+    });
+
     it("DELETE /tasks/:id/comments/:commentId — deletes a task comment", async () => {
       const updatedTask = { ...FAKE_TASK_DETAIL, comments: [] };
       const store = createMockStore({ deleteTaskComment: vi.fn().mockResolvedValue(updatedTask) });
@@ -4085,8 +4591,11 @@ describe("Pause/Unpause endpoints", () => {
       expect(res.body.error).toContain("text is required");
     });
 
-    it("returns 400 when text exceeds 2000 characters", async () => {
+    it("accepts the reported 2001-character steering message without truncation", async () => {
       const longText = "a".repeat(2001);
+      const task = { ...FAKE_TASK_DETAIL, id: "KB-001", steeringComments: [] };
+      (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+
       const res = await REQUEST(
         buildApp(),
         "POST",
@@ -4095,8 +4604,35 @@ describe("Pause/Unpause endpoints", () => {
         { "Content-Type": "application/json" }
       );
 
-      expect(res.status).toBe(400);
-      expect(res.body.error).toContain("text must be between 1 and 2000 characters");
+      expect(res.status).toBe(200);
+      expect(store.addSteeringComment).toHaveBeenCalledWith("KB-001", longText, "user");
+    });
+
+    it("enforces the shared steering-message boundary", async () => {
+      const task = { ...FAKE_TASK_DETAIL, id: "KB-001", steeringComments: [] };
+      (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+      const accepted = "a".repeat(MAX_TASK_MESSAGE_LENGTH);
+      const rejected = "a".repeat(MAX_TASK_MESSAGE_LENGTH + 1);
+
+      const acceptedResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/steer",
+        JSON.stringify({ text: accepted }),
+        { "Content-Type": "application/json" },
+      );
+      const rejectedResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/steer",
+        JSON.stringify({ text: rejected }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(acceptedResponse.status).toBe(200);
+      expect(store.addSteeringComment).toHaveBeenCalledWith("KB-001", accepted, "user");
+      expect(rejectedResponse.status).toBe(400);
+      expect(rejectedResponse.body).toEqual({ error: `text must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
     });
 
     it("returns 404 when task not found", async () => {
@@ -4140,6 +4676,17 @@ describe("Pause/Unpause endpoints", () => {
       const app = express();
       app.use(express.json());
       app.use("/api", createApiRoutes(store));
+      return app;
+    }
+
+    const OPERATOR_TOKEN = "fx-005-operator-token";
+    function buildPrivilegedApp(mode: "authenticated" | "no-auth" = "authenticated") {
+      const app = express();
+      app.use(express.json());
+      if (mode === "authenticated") app.use(createAuthMiddleware(OPERATOR_TOKEN));
+      app.use("/api", createApiRoutes(store, mode === "authenticated"
+        ? { daemon: { token: OPERATOR_TOKEN } }
+        : { noAuth: true }));
       return app;
     }
 
@@ -4220,6 +4767,59 @@ describe("Pause/Unpause endpoints", () => {
         );
         expect(res.status).toBe(201);
         expect(store.upsertTaskDocument).toHaveBeenCalledWith("KB-001", { key: "plan", content: "My plan", author: "user", metadata: undefined });
+      });
+
+      it("forwards valid document preconditions", async () => {
+        const hash = `sha256:${"a".repeat(64)}`;
+        (store.upsertTaskDocument as ReturnType<typeof vi.fn>).mockResolvedValue({
+          id: "d1", taskId: "KB-001", key: "plan", content: "Updated", revision: 2,
+          contentHash: hash, author: "user", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z",
+        });
+        const res = await REQUEST(buildApp(), "PUT", "/api/tasks/KB-001/documents/plan", JSON.stringify({
+          content: "Updated", expectedRevision: 1, expectedContentHash: hash,
+        }), { "Content-Type": "application/json" });
+        expect(res.status).toBe(200);
+        expect(store.upsertTaskDocument).toHaveBeenCalledWith("KB-001", expect.objectContaining({
+          expectedRevision: 1, expectedContentHash: hash,
+        }));
+      });
+
+      it("returns structured 409 details for a stale document writer", async () => {
+        const expectedHash = `sha256:${"a".repeat(64)}`;
+        const currentHash = `sha256:${"b".repeat(64)}`;
+        (store.upsertTaskDocument as ReturnType<typeof vi.fn>).mockRejectedValue(new TaskDocumentPreconditionFailedError({
+          projectId: "project-1", taskId: "KB-001", key: "plan", expectedRevision: 1,
+          expectedContentHash: expectedHash, currentRevision: 2, currentContentHash: currentHash,
+        }));
+        const res = await REQUEST(buildApp(), "PUT", "/api/tasks/KB-001/documents/plan", JSON.stringify({
+          content: "Stale", expectedRevision: 1, expectedContentHash: expectedHash,
+        }), { "Content-Type": "application/json" });
+        expect(res.status).toBe(409);
+        expect(res.body.details).toEqual(expect.objectContaining({
+          code: "TASK_DOCUMENT_PRECONDITION_FAILED", currentRevision: 2, currentContentHash: currentHash,
+        }));
+        expect(res.body.details).not.toHaveProperty("content");
+      });
+
+      it.each([
+        [{ expectedRevision: -1 }, "non-negative integer"],
+        [{ expectedRevision: 1.5 }, "non-negative integer"],
+        [{ expectedContentHash: "sha256:ABC" }, "64 lowercase hex"],
+      ])("returns 400 for malformed preconditions %#", async (precondition, message) => {
+        const res = await REQUEST(buildApp(), "PUT", "/api/tasks/KB-001/documents/plan", JSON.stringify({
+          content: "Updated", ...precondition,
+        }), { "Content-Type": "application/json" });
+        expect(res.status).toBe(400);
+        expect(res.body.error).toContain(message);
+        expect(store.upsertTaskDocument).not.toHaveBeenCalled();
+      });
+
+      it("keeps ordinary replacement writes rejected for archived tasks", async () => {
+        (store.upsertTaskDocument as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Task KB-001 is deleted or historical — documents are read-only"));
+        const res = await REQUEST(buildApp(), "PUT", "/api/tasks/KB-001/documents/plan", JSON.stringify({
+          content: "replacement",
+        }), { "Content-Type": "application/json" });
+        expect(res.status).toBe(500);
       });
 
       it("updates existing document with 200", async () => {
@@ -4305,6 +4905,12 @@ describe("Pause/Unpause endpoints", () => {
         const res = await REQUEST(buildApp(), "DELETE", "/api/tasks/KB-001/documents/plan");
         expect(res.status).toBe(204);
         expect(store.deleteTaskDocument).toHaveBeenCalledWith("KB-001", "plan");
+      });
+
+      it("keeps ordinary deletes rejected for archived tasks", async () => {
+        (store.deleteTaskDocument as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Task KB-001 is deleted or historical — documents are read-only"));
+        const res = await REQUEST(buildApp(), "DELETE", "/api/tasks/KB-001/documents/plan");
+        expect(res.status).toBe(500);
       });
 
       it("returns 404 when document not found", async () => {
@@ -5290,6 +5896,48 @@ describe("llama.cpp auth routes", () => {
       reachable: true,
       url: "http://127.0.0.1:8080",
       hasApiKey: false,
+    });
+    /*
+    FNXC:ProviderAuth 2026-08-24-00:00:
+    The `/auth/status` tests below build the full provider catalog, which probes every CLI runtime.
+    Without these stubs those probes fall through the passthrough `execFile` mock and spawn real
+    `claude`/`droid`/`cursor`/`grok`/`omp` subprocesses, making the status assertions the slowest tests
+    in the file (~4s). Mock them unavailable like the main `GET /auth/status` block does so no real
+    subprocess is spawned.
+    */
+    mockProbeGitCliStatus.mockResolvedValue({
+      available: true,
+      version: "2.45.1",
+      installUrl: "https://git-scm.com/downloads",
+    });
+    mockIsGhAvailable.mockReturnValue(false);
+    mockIsGhAuthenticated.mockReturnValue(false);
+    vi.spyOn(claudeCliProbeModule, "probeClaudeCli").mockResolvedValue({
+      available: false,
+      reason: "mocked unavailable",
+      probeDurationMs: 0,
+    });
+    vi.spyOn(droidCliProbeModule, "probeDroidCli").mockResolvedValue({
+      available: false,
+      reason: "mocked unavailable",
+      probeDurationMs: 0,
+    });
+    vi.spyOn(runtimeProviderProbesModule, "probeCursorCliProvider").mockResolvedValue({
+      available: false,
+      reason: "mocked unavailable",
+      probeDurationMs: 0,
+    });
+    vi.spyOn(runtimeProviderProbesModule, "probeGrokCliProvider").mockResolvedValue({
+      available: false,
+      authenticated: false,
+      reason: "mocked unavailable",
+      probeDurationMs: 0,
+    });
+    vi.spyOn(runtimeProviderProbesModule, "probeOmpCliProvider").mockResolvedValue({
+      available: false,
+      authenticated: false,
+      reason: "mocked unavailable",
+      probeDurationMs: 0,
     });
   });
 

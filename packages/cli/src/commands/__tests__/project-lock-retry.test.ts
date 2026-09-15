@@ -66,20 +66,28 @@ vi.mock("@fusion/core", () => ({
   })),
   TaskStore: makeConstructibleMock(makeTaskStore),
   countRunningAgentTasks: () => 0,
+  /*
+  FNXC:CliTests 2026-07-30-20:10:
+  `getTaskCounts` enriches each row before counting. Both helpers were missing here, so
+  `resolveWorkflowIrForTask` was undefined and the throw was absorbed by getTaskCounts's fail-soft
+  catch — which reported zero tasks, the exact symptom this FN-7740 test exists to catch. The test
+  could not distinguish "lock retry failed" from "the mock is incomplete".
+  */
+  resolveWorkflowIrForTask: vi.fn(async () => undefined),
+  enrichRunningAgentTaskShape: vi.fn((task: unknown) => task),
   ensureMemoryFileWithBackend: vi.fn(),
   readProjectIdentity: vi.fn().mockReturnValue(undefined),
   writeProjectIdentity: vi.fn(),
   hasProjectIdentity: vi.fn(() => false),
   isValidSqliteDatabaseFile: vi.fn(() => false),
   isSqliteLockError: isSqliteLockErrorMock,
-  COLUMNS: ["triage", "todo", "in-progress", "in-review", "done", "archived"],
+  COLUMNS: ["triage", "todo", "in-progress", "in-review", "done"],
   COLUMN_LABELS: {
     triage: "Triage",
     todo: "To Do",
     "in-progress": "In Progress",
     "in-review": "In Review",
     done: "Done",
-    archived: "Archived",
   },
 }));
 

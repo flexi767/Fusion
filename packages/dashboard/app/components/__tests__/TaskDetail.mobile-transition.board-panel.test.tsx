@@ -14,10 +14,11 @@
  * which stays the responsibility of `TaskDetail.swipe-back.test.tsx` /
  * `navigation-history.test.tsx` (run unmodified per PROMPT.md).
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Settings, Task } from "@fusion/core";
 import type { ProjectInfo } from "../../api";
+import { readAppFile } from "../../test/cssFixture";
 
 const defaultSettings: Settings = {
   maxConcurrent: 2,
@@ -25,7 +26,6 @@ const defaultSettings: Settings = {
   pollIntervalMs: 15000,
   groupOverlappingFiles: false,
   autoMerge: true,
-  recycleWorktrees: false,
   worktreeInitCommand: "",
   testCommand: "",
   buildCommand: "",
@@ -74,14 +74,30 @@ const mockUseTasks = vi.fn(() => ({
   retryTask: vi.fn(),
   updateTask: vi.fn(),
   duplicateTask: vi.fn(),
-  archiveTask: vi.fn(),
-  unarchiveTask: vi.fn(),
-  archiveAllDone: vi.fn(),
   refreshTasks: vi.fn(),
 }));
-vi.mock("../../hooks/useTasks", () => ({
-  useTasks: (_options?: any) => mockUseTasks(),
-}));
+/*
+FNXC:DashboardTests 2026-08-09-08:02:
+Commit 132026545 (FN-8796 'stabilize task-detail lifecycle snapshots') added `mergeTaskSnapshot`
+to hooks/useTasks.ts, imported by components this test renders (`<App />`). A curated vi.mock
+decorator for "../../hooks/useTasks" must surface every export those components import (`useTasks` +
+`mergeTaskSnapshot`) or the fixture throws `No "mergeTaskSnapshot" export is defined on the useTasks
+mock` at import time.
+
+FNXC:DashboardTests 2026-08-09-08:25:
+This directly mirrors the App.test.tsx / navigation-history fixtures: the file renders `<App />` and
+drives the SSE merge path at App.tsx:2179 (`liveTask.id` where `liveTask = mergeTaskSnapshot(snapshot,
+boardTask)` for retained task detail popups), so `mergeTaskSnapshot: vi.fn()` returning `undefined`
+makes `liveTask.id` throw. Surface the real implementation via a partial `importOriginal` mock while
+`useTasks` stays mocked.
+*/
+vi.mock("../../hooks/useTasks", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../hooks/useTasks")>();
+  return {
+    ...actual,
+    useTasks: (_options?: any) => mockUseTasks(),
+  };
+});
 
 vi.mock("../../hooks/useInsights", () => ({
   useInsights: () => ({
@@ -170,7 +186,6 @@ vi.mock("../../components/PlanningModeModal", () => ({ PlanningModeModal: () => 
 vi.mock("../../components/AgentsView", () => ({ AgentsView: () => <div data-testid="agents-view">Agents</div> }));
 vi.mock("../../components/ResearchView", () => ({ ResearchView: () => <div data-testid="research-view">Research</div> }));
 vi.mock("../../components/EvalsView", () => ({ EvalsView: () => <div data-testid="evals-view">Evals</div> }));
-vi.mock("../../components/TodoView", () => ({ TodoView: () => <div data-testid="todo-view">Todo</div> }));
 vi.mock("../../components/QuickChatFAB", () => ({ QuickChatFAB: () => null }));
 vi.mock("../../components/ScriptsModal", () => ({ ScriptsModal: () => null }));
 vi.mock("../../components/TerminalModal", () => ({ TerminalModal: () => null }));
@@ -180,7 +195,6 @@ vi.mock("../../components/GitManagerModal", () => ({ GitManagerModal: () => null
 vi.mock("../../components/SchedulesModal", () => ({ SchedulesModal: () => null }));
 vi.mock("../../components/WorkflowEditorModal", () => ({ WorkflowEditorModal: () => null }));
 vi.mock("../../components/AgentsModal", () => ({ AgentsModal: () => null }));
-vi.mock("../../components/SubtaskBreakdownModal", () => ({ SubtaskBreakdownModal: () => null }));
 vi.mock("../../components/UsageModal", () => ({ UsageModal: () => null }));
 vi.mock("../../components/ModelOnboardingModal", () => ({ ModelOnboardingModal: () => null }));
 vi.mock("../../components/SetupWizardModal", () => ({ SetupWizardModal: () => null }));
@@ -232,14 +246,17 @@ vi.mock("../../hooks/useNodes", () => ({
 }));
 
 const mockUseViewportMode = vi.fn(() => "desktop");
-vi.mock("../../hooks/useViewportMode", () => ({
-  MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
-  isFullScreenSheetViewport: () => false,
-  isShortViewport: () => false,
-  getViewportMode: () => mockUseViewportMode(),
-  isMobileViewport: () => mockUseViewportMode() === "mobile",
-  useViewportMode: (..._args: unknown[]) => mockUseViewportMode(..._args),
-}));
+vi.mock("../../hooks/useViewportMode", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../hooks/useViewportMode")>();
+  return {
+    ...actual,
+    useViewportMode: () => {
+      const mode = mockUseViewportMode() as "mobile" | "tablet" | "desktop";
+      actual.publishViewportMode(mode);
+      return mode;
+    },
+  };
+});
 
 const mockUseMobileKeyboard = vi.fn(() => ({
   keyboardOverlap: 0, viewportHeight: null, viewportOffsetTop: 0, keyboardOpen: false,
@@ -248,7 +265,36 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: (..._args: unknown[]) => mockUseMobileKeyboard(..._args),
 }));
 
+import { getViewportMode } from "../../hooks/useViewportMode";
 import { App } from "../../App";
+
+const LANDSCAPE_PHONE_WIDTH = 844;
+const LANDSCAPE_PHONE_HEIGHT = 390;
+const originalScreenDescriptor = Object.getOwnPropertyDescriptor(window, "screen");
+const originalInnerWidth = window.innerWidth;
+const originalInnerHeight = window.innerHeight;
+
+function installLandscapePhoneViewport(): void {
+  Object.defineProperty(window, "innerWidth", { writable: true, configurable: true, value: LANDSCAPE_PHONE_WIDTH });
+  Object.defineProperty(window, "innerHeight", { writable: true, configurable: true, value: LANDSCAPE_PHONE_HEIGHT });
+  Object.defineProperty(window, "screen", {
+    configurable: true,
+    value: { width: LANDSCAPE_PHONE_WIDTH, height: LANDSCAPE_PHONE_HEIGHT },
+  });
+  vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+    matches:
+      query === "(max-width: 768px), (max-height: 480px)" ||
+      query === "(max-height: 480px)" ||
+      query === "(min-width: 769px) and (max-width: 1024px)",
+    media: query,
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(() => true),
+  })));
+}
 
 function makeBoardTask(id: string, title: string): Task {
   return {
@@ -278,6 +324,14 @@ describe("Board main-panel task-detail — mobile transition class gating (MainC
     mockUseTasks.mockReset();
   });
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    Object.defineProperty(window, "innerWidth", { writable: true, configurable: true, value: originalInnerWidth });
+    Object.defineProperty(window, "innerHeight", { writable: true, configurable: true, value: originalInnerHeight });
+    if (originalScreenDescriptor) Object.defineProperty(window, "screen", originalScreenDescriptor);
+    delete document.documentElement.dataset.viewportMode;
+  });
+
   it("applies the mobile transition class to the board main-panel surface when the viewport is mobile", async () => {
     mockUseViewportMode.mockReturnValue("mobile");
     const task = makeBoardTask("FN-1", "Board Detail");
@@ -290,9 +344,6 @@ describe("Board main-panel task-detail — mobile transition class gating (MainC
       retryTask: vi.fn(),
       updateTask: vi.fn(),
       duplicateTask: vi.fn(),
-      archiveTask: vi.fn(),
-      unarchiveTask: vi.fn(),
-      archiveAllDone: vi.fn(),
       refreshTasks: vi.fn(),
     }));
 
@@ -303,6 +354,34 @@ describe("Board main-panel task-detail — mobile transition class gating (MainC
       expect(screen.getByTestId("task-detail-main-panel-content")).toBeInTheDocument();
     });
     expect(document.querySelector(".task-detail-main-panel--mobile-transition")).toBeInTheDocument();
+  });
+
+  it("anime le panneau Board sur un téléphone physique en paysage plus large que 768px", async () => {
+    installLandscapePhoneViewport();
+    expect(getViewportMode()).toBe("mobile");
+    mockUseViewportMode.mockImplementation(() => getViewportMode());
+    const task = makeBoardTask("FN-2", "Landscape Board Detail");
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [task],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      refreshTasks: vi.fn(),
+    }));
+
+    await renderAppAndWait("board-view");
+    fireEvent.click(screen.getByTestId("open-task-FN-2"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-detail-main-panel-content")).toBeInTheDocument();
+    });
+    expect(document.documentElement).toHaveAttribute("data-viewport-mode", "mobile");
+    expect(document.querySelector(".task-detail-main-panel--mobile-transition")).toBeInTheDocument();
+    expect(readAppFile("styles.css")).toMatch(/html\[data-viewport-mode="mobile"\] \.task-detail-main-panel--mobile-transition\s*\{[^}]*animation: alpha-mobile-drawer-rise-in/);
   });
 
   it("does NOT apply the mobile transition class to the board main-panel surface on desktop", async () => {
@@ -317,9 +396,6 @@ describe("Board main-panel task-detail — mobile transition class gating (MainC
       retryTask: vi.fn(),
       updateTask: vi.fn(),
       duplicateTask: vi.fn(),
-      archiveTask: vi.fn(),
-      unarchiveTask: vi.fn(),
-      archiveAllDone: vi.fn(),
       refreshTasks: vi.fn(),
     }));
 

@@ -44,6 +44,9 @@ export interface ResolvedBackend {
   readonly runtimeUrl: string | null;
   readonly migrationUrl: string | null;
   readonly migrationUrlOverridden: boolean;
+  /** A proven direct endpoint for session-scoped lifecycle advisory locks. */
+  readonly directSessionUrl?: string | null;
+  readonly directSessionProvenance?: "embedded-lifecycle" | "migration-override" | "runtime-direct" | null;
 }
 
 /**
@@ -99,7 +102,26 @@ export function resolveBackendWithOptions(
     ? databaseMigrationUrl
     : runtimeUrl;
 
-  return { mode, runtimeUrl, migrationUrl, migrationUrlOverridden };
+  /*
+  FNXC:PostgresConnection 2026-08-09-21:53:
+  Planning lifecycle locks require one stable PostgreSQL session. A direct runtime URL is
+  itself eligible; only a pooled runtime needs DATABASE_MIGRATION_URL because a transaction
+  pooler can swap sessions between pg_advisory_lock and pg_advisory_unlock.
+  */
+  const directSessionUrl = migrationUrlOverridden && !looksLikePoolerUrl(databaseMigrationUrl)
+    ? databaseMigrationUrl
+    : runtimeUrl && !looksLikePoolerUrl(runtimeUrl)
+      ? runtimeUrl
+      : null;
+  return {
+    mode, runtimeUrl, migrationUrl, migrationUrlOverridden,
+    directSessionUrl,
+    directSessionProvenance: directSessionUrl
+      ? migrationUrlOverridden && directSessionUrl === databaseMigrationUrl
+        ? "migration-override"
+        : "runtime-direct"
+      : null,
+  };
 }
 
 // ── Pooler detection ─────────────────────────────────────────────────
@@ -188,5 +210,11 @@ export function describeBackendForLog(backend: ResolvedBackend): string {
       `DATABASE_MIGRATION_URL overrides schema-work target: ${redactConnectionString(backend.migrationUrl)}`,
     );
   }
+  const directSession = backend.directSessionProvenance === "runtime-direct"
+    ? "runtime URL"
+    : backend.directSessionProvenance === "migration-override"
+      ? "migration URL"
+      : "none (pooled endpoint — set DATABASE_MIGRATION_URL to a direct connection)";
+  parts.push(`planning lifecycle direct session: ${directSession}`);
   return parts.join(" | ");
 }

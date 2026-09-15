@@ -1,3 +1,6 @@
+import { createLogger } from "../process/logger.js";
+
+const severityAuditLog = createLogger("core-agent-logs");
 /**
  * agent-logs operations.
  *
@@ -9,8 +12,8 @@
 import {TaskStore} from "../store.js";
 import type {AgentLogEntry, GoalCitationInput} from "../types.js";
 import "../builtin-traits.js";
-import {appendAgentLogEntriesSync} from "../agent-log-file-store.js";
-import {truncateAgentLogDetail} from "../agent-log-constants.js";
+import {appendAgentLogEntriesSync} from "../agents/agent-log-file-store.js";
+import {truncateAgentLogDetail} from "../agents/agent-log-constants.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 
 export function flushAgentLogBufferImpl(store: TaskStore): void {
@@ -23,7 +26,7 @@ export function flushAgentLogBufferImpl(store: TaskStore): void {
     const batch = store.agentLogBuffer.slice();
     const flushCount = batch.length;
 
-    let validEntries = batch;
+    const validEntries = batch;
     const flushedEntries = new Set<typeof batch[number]>();
     try {
       // FNXC:PostgresBackend 2026-06-27-00:40:
@@ -43,18 +46,7 @@ export function flushAgentLogBufferImpl(store: TaskStore): void {
       // JSONL line + records goal citations under a just-deleted taskId. There
       // is no FK on goal_citations.task_id (plain text column), so this is an
       // orphaned-by-value metadata row, not a constraint violation or crash.
-      if (!store.backendMode) {
-        const liveTaskIds = new Set(
-          (store.db.prepare(`SELECT id FROM tasks WHERE ${TaskStore.ACTIVE_TASKS_WHERE}`).all() as Array<{ id: string }>).map((row) => row.id),
-        );
-        validEntries = batch.filter((entry) => liveTaskIds.has(entry.taskId));
-        const dropped = batch.length - validEntries.length;
-        if (dropped > 0) {
-          console.warn(
-            `[fusion] Dropped ${dropped} buffered agent log entries for deleted tasks (${store.fusionDir})`,
-          );
-        }
-      }
+      
 
       if (validEntries.length > 0) {
         const citationInputs: GoalCitationInput[] = [];
@@ -84,7 +76,7 @@ export function flushAgentLogBufferImpl(store: TaskStore): void {
                 ),
               );
             } catch (err) {
-              console.warn("[fusion] Failed to scan goal citations from agent_log:", err);
+              severityAuditLog.warn("[fusion] Failed to scan goal citations from agent_log:", err);
             }
           }
         }
@@ -97,15 +89,13 @@ export function flushAgentLogBufferImpl(store: TaskStore): void {
           // fire-and-forget agent-log path.
           try {
             void Promise.resolve(store.recordGoalCitations(citationInputs)).catch((err) => {
-              console.warn("[fusion] Failed to record goal citations from agent_log batch:", err);
+              severityAuditLog.warn("[fusion] Failed to record goal citations from agent_log batch:", err);
             });
           } catch (err) {
-            console.warn("[fusion] Failed to record goal citations from agent_log batch:", err);
+            severityAuditLog.warn("[fusion] Failed to record goal citations from agent_log batch:", err);
           }
         }
-        if (!store.backendMode) {
-          store.db.bumpLastModified();
-        }
+        
       }
     } finally {
       store.agentLogBuffer.splice(0, flushCount);
@@ -117,7 +107,7 @@ export function flushAgentLogBufferImpl(store: TaskStore): void {
             try {
               store.flushAgentLogBuffer();
             } catch (err) {
-              console.error(`[fusion] Retry agent log flush failed (${store.fusionDir}):`, err);
+              severityAuditLog.error(`[fusion] Retry agent log flush failed (${store.fusionDir}):`, err);
             }
           }, TaskStore.AGENT_LOG_FLUSH_MS);
           store.agentLogFlushTimer.unref();
@@ -126,7 +116,13 @@ export function flushAgentLogBufferImpl(store: TaskStore): void {
     }
   }
 
-export async function appendAgentLogBatchImpl(store: TaskStore, entries: Array<{ taskId: string; text: string; type: AgentLogEntry["type"]; detail?: string; agent?: AgentLogEntry["agent"]; }>,): Promise<void> {
+export async function appendAgentLogBatchImpl(store: TaskStore, entries: Array<{ taskId: string; text: string; type: AgentLogEntry["type"]; detail?: string; agent?: AgentLogEntry["agent"]; durationMs?: number; timeToFirstTokenMs?: number }>,): Promise<void> {
+    /*
+    FNXC:AgentLogging 2026-08-29-04:26:
+    AgentLogger uses this batch path in production, so fields dropped here disappear from durable logs,
+    live streams, and every viewer. FN-253 keeps it in parity with the single-entry writer by forwarding
+    bounded detail and the timing fields the logger has always supplied.
+    */
     if (entries.length === 0) {
       return;
     }
@@ -144,19 +140,11 @@ export async function appendAgentLogBatchImpl(store: TaskStore, entries: Array<{
     // PG backend mode: skip the sync SQLite deleted-task pre-filter (store.db
     // throws) — JSONL append below is the backend-independent durable write.
     // See flushAgentLogBufferImpl for the full rationale.
-    let validEntries = normalizedEntries;
-    if (!store.backendMode) {
-      const liveTaskIds = new Set(
-        (store.db.prepare(`SELECT id FROM tasks WHERE ${TaskStore.ACTIVE_TASKS_WHERE}`).all() as Array<{ id: string }>).map((row) => row.id),
-      );
-      validEntries = normalizedEntries.filter((entry) => liveTaskIds.has(entry.taskId));
-      const dropped = normalizedEntries.length - validEntries.length;
-      if (dropped > 0) {
-        console.warn(`[fusion] Dropped ${dropped} batch agent log entries for deleted tasks (${store.fusionDir})`);
-      }
-    }
+    const validEntries = normalizedEntries;
+    
 
     const citationInputs: GoalCitationInput[] = [];
+    const persistedEntries = new Map<typeof normalizedEntries[number], AgentLogEntry>();
     const entriesByTask = new Map<string, typeof validEntries>();
     for (const entry of validEntries) {
       const taskEntries = entriesByTask.get(entry.taskId);
@@ -177,9 +165,15 @@ export async function appendAgentLogBatchImpl(store: TaskStore, entries: Array<{
           type: entry.type,
           detail: entry.detail ?? null,
           agent: entry.agent ?? null,
+          durationMs: entry.durationMs ?? null,
+          timeToFirstTokenMs: entry.timeToFirstTokenMs ?? null,
         })),
       );
-      for (const entry of appended) {
+      for (const [index, entry] of appended.entries()) {
+        const sourceEntry = taskEntries[index];
+        if (sourceEntry) {
+          persistedEntries.set(sourceEntry, entry);
+        }
         try {
           citationInputs.push(
             ...store.scanAndRecordCitations(
@@ -192,7 +186,7 @@ export async function appendAgentLogBatchImpl(store: TaskStore, entries: Array<{
             ),
           );
         } catch (err) {
-          console.warn("[fusion] Failed to scan goal citations from agent log batch:", err);
+          severityAuditLog.warn("[fusion] Failed to scan goal citations from agent log batch:", err);
         }
       }
     }
@@ -201,24 +195,27 @@ export async function appendAgentLogBatchImpl(store: TaskStore, entries: Array<{
       // promise so a citation-write failure is not an unhandled rejection.
       try {
         void Promise.resolve(store.recordGoalCitations(citationInputs)).catch((err) => {
-          console.warn("[fusion] Failed to record goal citations from appendAgentLogBatch:", err);
+          severityAuditLog.warn("[fusion] Failed to record goal citations from appendAgentLogBatch:", err);
         });
       } catch (err) {
-        console.warn("[fusion] Failed to record goal citations from appendAgentLogBatch:", err);
+        severityAuditLog.warn("[fusion] Failed to record goal citations from appendAgentLogBatch:", err);
       }
     }
     if (validEntries.length > 0 && !store.backendMode) {
       store.db.bumpLastModified();
     }
 
-    for (const entry of normalizedEntries) {
+    for (const sourceEntry of normalizedEntries) {
+      const entry: AgentLogEntry = persistedEntries.get(sourceEntry) ?? { timestamp, ...sourceEntry };
       store.emit("agent:log", {
-        timestamp,
+        timestamp: entry.timestamp,
         taskId: entry.taskId,
         text: entry.text,
         type: entry.type,
         ...(entry.detail !== undefined && { detail: entry.detail }),
         ...(entry.agent !== undefined && { agent: entry.agent }),
+        ...(entry.durationMs !== undefined && { durationMs: entry.durationMs }),
+        ...(entry.timeToFirstTokenMs !== undefined && { timeToFirstTokenMs: entry.timeToFirstTokenMs }),
       });
     }
   }

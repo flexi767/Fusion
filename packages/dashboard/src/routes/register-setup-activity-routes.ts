@@ -1,3 +1,7 @@
+import { createLogger, AGENT_ACTIVITY_EVENT_TYPES, isAgentActivityEventType } from "@fusion/core";
+import { queryAgentActivityEvents } from "@fusion/core";
+
+const severityAuditLog = createLogger("dashboard-register-setup-activity-routes");
 import type { ActivityEventType } from "@fusion/core";
 import { ApiError, badRequest, rethrowAsApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
@@ -18,6 +22,10 @@ router.get("/activity", async (req, res) => {
     const limitParam = req.query.limit;
     const sinceParam = req.query.since;
     const typeParam = req.query.type;
+    const taskIdParam = req.query.taskId;
+    if ((taskIdParam !== undefined && typeof taskIdParam !== "string") || (typeParam !== undefined && typeof typeParam !== "string")) {
+      throw badRequest("activity query filters must be single string values");
+    }
 
     // Parse and validate limit. Omitted limit intentionally defaults to 100
     // to match the documented API contract and avoid unbounded history reads.
@@ -36,10 +44,11 @@ router.get("/activity", async (req, res) => {
       throw badRequest(`Invalid type. Must be one of: ${validTypes.join(", ")}`);
     }
 
-    const options: { limit?: number; since?: string; type?: ActivityEventType } = {
+    const options: { limit?: number; since?: string; type?: ActivityEventType; taskId?: string } = {
       limit,
       since: sinceParam as string | undefined,
       type: typeParam as ActivityEventType | undefined,
+      taskId: taskIdParam,
     };
 
     const entries = await scopedStore.getActivityLog(options);
@@ -50,6 +59,22 @@ router.get("/activity", async (req, res) => {
     }
     rethrowAsApiError(err);
   }
+});
+
+/* FNXC:AgentActivityStream 2026-08-09-09:09: activity history is a seq cursor, never a timestamp, so identical writer timestamps remain totally ordered. */
+router.get("/agent-activity", async (req, res) => {
+  try {
+    const { store } = await getProjectContext(req); const layer = store.getAsyncLayer();
+    if (!layer) throw new Error("agent activity requires project data layer");
+    const string = (value: unknown) => typeof value === "string" ? value : undefined;
+    const limitRaw = string(req.query.limit); let limit = 100;
+    if (limitRaw !== undefined) { if (!/^\d+$/.test(limitRaw)) throw badRequest("limit must be a non-negative integer"); limit = Math.min(Number(limitRaw), 1000); }
+    const before = string(req.query.before); const since = string(req.query.since);
+    if (before !== undefined && !/^\d+$/.test(before)) throw badRequest("before must be a decimal cursor");
+    if (since !== undefined && !/^\d+$/.test(since)) throw badRequest("since must be a decimal cursor");
+    const type = string(req.query.type); if (type !== undefined && !isAgentActivityEventType(type)) throw badRequest(`Invalid type. Must be one of: ${AGENT_ACTIVITY_EVENT_TYPES.join(", ")}`);
+    res.json(await queryAgentActivityEvents(layer, { limit, before, since, agentId: string(req.query.agentId), taskId: string(req.query.taskId), type }));
+  } catch (err: unknown) { if (err instanceof ApiError) throw err; rethrowAsApiError(err); }
 });
 
 /**
@@ -77,22 +102,37 @@ export const registerSetupActivityRoutes: ApiRouteRegistrar = (ctx) => {
 /**
  * GET /api/activity-feed
  * Get unified activity feed across all projects.
- * Query: limit, projectId, types
+ * Query: limit, since (older-than cursor), projectId, types, taskId
  * Returns: ActivityFeedEntry[]
  */
 router.get("/activity-feed", async (req, res) => {
   try {
-    const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : 50;
-    const projectId = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
-    const typesParam = typeof req.query.types === "string" ? req.query.types.split(",") : undefined;
-    const types = typesParam as import("@fusion/core").ActivityEventType[] | undefined;
+    const stringQuery = (value: unknown, name: string): string | undefined => {
+      if (value === undefined) return undefined;
+      if (typeof value !== "string") throw badRequest(`${name} must be a single string value`);
+      return value;
+    };
+    const limitRaw = stringQuery(req.query.limit, "limit");
+    const limit = limitRaw === undefined ? 50 : Number.parseInt(limitRaw, 10);
+    if (!Number.isFinite(limit) || limit < 0) throw badRequest("limit must be a non-negative integer");
+    const since = stringQuery(req.query.since, "since");
+    const projectId = stringQuery(req.query.projectId, "projectId");
+    const taskId = stringQuery(req.query.taskId, "taskId");
+    const typesParam = stringQuery(req.query.types, "types");
+    const types = typesParam?.split(",") as import("@fusion/core").ActivityEventType[] | undefined;
 
-    const { CentralCore } = await import("@fusion/core");
-    const central = new CentralCore();
-    await central.init();
+    /*
+    FNXC:ActivityFeed 2026-07-28-03:00:
+    Prefer the server-owned centralCore (already backend-mode with asyncLayer) over `new CentralCore()` so GET /api/activity-feed does not open a per-request pool and cannot hit backendHandle-before-attach. Mirrors global-concurrency / setup-state routes. Layer-less fallback still works once CentralCore.init restores PG bootstrap (#2454 regression).
+    */
+    const central = options?.centralCore ?? new (await import("@fusion/core")).CentralCore();
+    const shouldClose = !options?.centralCore;
+    if (shouldClose || (typeof central.isInitialized === "function" && !central.isInitialized())) {
+      await central.init();
+    }
 
-    const entries = await central.getRecentActivity({ limit, projectId, types });
-    await central.close();
+    const entries = await central.getRecentActivity({ limit: Math.min(limit, 1000), since, projectId, types, taskId });
+    if (shouldClose) await central.close();
 
     res.json(entries);
   } catch (err: unknown) {
@@ -103,62 +143,31 @@ router.get("/activity-feed", async (req, res) => {
   }
 });
 
-/**
- * GET /api/global-concurrency
- * Get global concurrency state across all projects.
- * Returns: GlobalConcurrencyState
- */
+/*
+FNXC:CapacityModel 2026-07-28-23:45 (drop the cross-project cap — settings half):
+PUT /api/global-concurrency is DELETED: it set a machine-wide limit that no longer
+exists. Capacity is two numbers PER PROJECT.
+
+GET SURVIVES but returns TELEMETRY ONLY — live "N running" counts per project, via
+CentralCore's registered side-effect-safe source. It no longer reports
+globalMaxConcurrent or queuedCount: those came from the deleted cap and from slot
+bookkeeping that production code never incremented, so publishing them was
+publishing zeros dressed as state. Nothing gates on this route.
+*/
 router.get("/global-concurrency", async (_req, res) => {
   try {
     const central = options?.centralCore ?? new (await import("@fusion/core")).CentralCore();
     const shouldClose = !options?.centralCore;
     if (shouldClose || (typeof central.isInitialized === "function" && !central.isInitialized())) await central.init();
 
-    const state = await central.getGlobalConcurrencyState();
     const liveCounts = await central.getLiveRunningAgentCounts();
 
-    /*
-    FNXC:GlobalConcurrencyControls 2026-06-26-17:22:
-    The published global-concurrency route reads currentlyActive/projectsActive through CentralCore's live seam while preserving globalMaxConcurrent/queuedCount from slot bookkeeping. The dashboard-registered source only inspects already-open project stores, so this read stays side-effect-safe and never opens watchers or starts project runtimes.
-    */
-    const liveState = {
-      ...state,
+    if (shouldClose) await central.close();
+
+    res.json({
       currentlyActive: liveCounts.currentlyActive,
       projectsActive: liveCounts.projectsActive,
-    };
-
-    if (shouldClose) await central.close();
-
-    res.json(liveState);
-  } catch (err: unknown) {
-    if (err instanceof ApiError) {
-      throw err;
-    }
-    rethrowAsApiError(err);
-  }
-});
-
-/**
- * PUT /api/global-concurrency
- * Update the system-wide concurrency limit across all projects.
- * Body: { globalMaxConcurrent: number }
- * Returns: GlobalConcurrencyState
- */
-router.put("/global-concurrency", async (req, res) => {
-  const { globalMaxConcurrent } = req.body ?? {};
-  if (!Number.isInteger(globalMaxConcurrent) || globalMaxConcurrent < 1 || globalMaxConcurrent > 10000) {
-    throw badRequest("globalMaxConcurrent must be an integer between 1 and 10000");
-  }
-
-  try {
-    const central = options?.centralCore ?? new (await import("@fusion/core")).CentralCore();
-    const shouldClose = !options?.centralCore;
-    if (shouldClose || (typeof central.isInitialized === "function" && !central.isInitialized())) await central.init();
-
-    const state = await central.updateGlobalConcurrency({ globalMaxConcurrent });
-    if (shouldClose) await central.close();
-
-    res.json(state);
+    });
   } catch (err: unknown) {
     if (err instanceof ApiError) {
       throw err;
@@ -194,7 +203,7 @@ router.get("/first-run-status", async (_req, res) => {
       const hasProjects = detectedProjects.length > 0;
       const singleProjectPath = detectedProjects.length === 1 ? detectedProjects[0].path : null;
 
-      console.warn(
+      severityAuditLog.warn(
         `[routes:first-run-status] Falling back to detected projects after central DB error: ${
           error instanceof Error ? error.message : String(error)
         }`,
@@ -241,7 +250,7 @@ router.get("/setup-state", async (_req, res) => {
       state = await detector.detectFirstRunState(central);
       projects = await central.listProjects();
     } catch (error) {
-      console.warn(
+      severityAuditLog.warn(
         `[routes:setup-state] Unable to read central DB state: ${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {

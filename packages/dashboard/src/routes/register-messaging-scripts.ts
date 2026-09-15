@@ -1,7 +1,7 @@
 import type { Request } from "express";
 import { resolve } from "node:path";
-import { ApprovalRequestStore, DASHBOARD_USER_ID, MessageStore, type MessageType, type ParticipantType, validateMessageMetadata } from "@fusion/core";
-import { ApiError, badRequest, notFound } from "../api-error.js";
+import { ApprovalRequestStore, DASHBOARD_USER_ID, MessageStore, isDashboardInboxCategory, type DashboardInboxCategory, type MessageType, type ParticipantType, validateMessageMetadata } from "@fusion/core";
+import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
 import { getTerminalService } from "../terminal-service.js";
 import type { ApiRoutesContext } from "./types.js";
 import { requireAsyncLayer } from "../require-async-layer.js";
@@ -20,7 +20,17 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
-      res.json(settings.scripts ?? {});
+      if (req.query.catalog === "1") {
+        res.json(Object.entries(settings.scripts ?? {}).map(([name, command]) => ({
+          name,
+          command,
+          ...(settings.scriptMetadata?.[name]?.description
+            ? { description: settings.scriptMetadata[name]!.description }
+            : {}),
+        })));
+      } else {
+        res.json(settings.scripts ?? {});
+      }
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -38,22 +48,22 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
   router.post("/scripts", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
-      const { name, command } = req.body;
+      const { name, command, originalName, description } = req.body ?? {};
 
-      if (!name || typeof name !== "string" || !name.trim()) {
-        throw badRequest("name is required");
-      }
-      if (command === undefined || typeof command !== "string") {
-        throw badRequest("command is required");
-      }
+      if (typeof name !== "string" || !name.trim()) throw badRequest("name is required");
+      if (typeof command !== "string") throw badRequest("command is required");
+      if (originalName !== undefined && typeof originalName !== "string") throw badRequest("originalName must be a string");
+      if (description !== undefined && typeof description !== "string") throw badRequest("description must be a string");
 
-      const settings = await scopedStore.getSettings();
-      const scripts = {
-        ...(settings.scripts ?? {}),
-        [name.trim()]: command.trim(),
-      };
-      await scopedStore.updateSettings({ scripts });
-      res.json(scripts);
+      try {
+        const catalog = await scopedStore.mutateScript({ name, command, originalName, description });
+        res.json(catalog.find((entry) => entry.name === name.trim()));
+      } catch (error) {
+        if ((error as { code?: unknown })?.code === "SCRIPT_NAME_CONFLICT") {
+          throw conflict(error instanceof Error ? error.message : "Script name already exists", { code: "SCRIPT_NAME_CONFLICT" });
+        }
+        throw error;
+      }
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -70,12 +80,9 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
   router.delete("/scripts/:name", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
-      const { name } = req.params;
-      const settings = await scopedStore.getSettings();
-      const scripts = { ...(settings.scripts ?? {}) };
-      delete scripts[name];
-      await scopedStore.updateSettings({ scripts });
-      res.json(scripts);
+      const name = Array.isArray(req.params.name) ? req.params.name[0] : req.params.name;
+      const catalog = await scopedStore.mutateScript({ originalName: name, name, delete: true });
+      res.json(Object.fromEntries(catalog.map((entry) => [entry.name, entry.command])));
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -97,10 +104,6 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
 
       if (!scriptName) {
         throw badRequest("Script name is required");
-      }
-
-      if (!/^[a-zA-Z0-9_-]+$/.test(scriptName)) {
-        throw badRequest("Script name must contain only alphanumeric characters, hyphens, and underscores (no spaces)");
       }
 
       const settings = await scopedStore.getSettings();
@@ -229,18 +232,39 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
     return undefined;
   }
 
+  async function resolveCategoryUnreadCounts(
+    msgStore: MessageStore,
+  ): Promise<Record<DashboardInboxCategory, number> | undefined> {
+    const reader = (msgStore as Partial<MessageStore>).getDashboardInboxCategoryCounts;
+    if (typeof reader !== "function") return undefined;
+    try {
+      return await reader.call(msgStore, DASHBOARD_USER_ID, "user");
+    } catch {
+      return undefined;
+    }
+  }
+
   router.get("/messages/inbox", async (req, res) => {
     try {
       const msgStore = await getMessageStore(req);
+      const category = isDashboardInboxCategory(req.query.category) ? req.query.category : undefined;
       const filter = {
         limit: parseInt(req.query.limit as string) || 20,
         offset: parseInt(req.query.offset as string) || 0,
         read: req.query.unreadOnly === "true" ? false : undefined,
+        archived: req.query.archived === "true",
         type: req.query.type as MessageType | undefined,
+        ...(category ? { category } : {}),
       };
       const messages = await msgStore.getInbox(DASHBOARD_USER_ID, "user", filter);
       const mailbox = await msgStore.getMailbox(DASHBOARD_USER_ID, "user");
-      res.json({ messages, total: messages.length, unreadCount: mailbox.unreadCount });
+      const categoryUnreadCounts = await resolveCategoryUnreadCounts(msgStore);
+      res.json({
+        messages,
+        total: messages.length,
+        unreadCount: mailbox.unreadCount,
+        ...(categoryUnreadCounts ? { categoryUnreadCounts } : {}),
+      });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -255,6 +279,7 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
       const filter = {
         limit: parseInt(req.query.limit as string) || 20,
         offset: parseInt(req.query.offset as string) || 0,
+        archived: req.query.archived === "true",
         type: req.query.type as MessageType | undefined,
       };
       const messages = await msgStore.getOutbox(DASHBOARD_USER_ID, "user", filter);
@@ -280,7 +305,12 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
       } catch {
         pendingApprovalCount = 0;
       }
-      res.json({ unreadCount: mailbox.unreadCount, pendingApprovalCount });
+      const categoryUnreadCounts = await resolveCategoryUnreadCounts(msgStore);
+      res.json({
+        unreadCount: mailbox.unreadCount,
+        pendingApprovalCount,
+        ...(categoryUnreadCounts ? { categoryUnreadCounts } : {}),
+      });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -293,7 +323,10 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
   router.post("/messages/read-all", async (req, res) => {
     try {
       const msgStore = await getMessageStore(req);
-      const count = await msgStore.markAllAsRead(DASHBOARD_USER_ID, "user");
+      const category = isDashboardInboxCategory(req.body?.category) ? req.body.category : undefined;
+      const count = category
+        ? await msgStore.markAllAsRead(DASHBOARD_USER_ID, "user", category)
+        : await msgStore.markAllAsRead(DASHBOARD_USER_ID, "user");
       res.json({ markedAsRead: count });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -391,6 +424,7 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
       const messages = await msgStore.getConversation(
         { id: DASHBOARD_USER_ID, type: "user" },
         { id: participantId, type: participantType as ParticipantType },
+        { archived: req.query.archived === "true" },
       );
       res.json(messages);
     } catch (err: unknown) {
@@ -427,7 +461,7 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
       release it; every create still carries the stable unique proposalClaimId.
       */
       const findCreatedTask = async (proposalIdempotencyKey: string) =>
-        (await scopedStore.listTasks({ includeArchived: true })).find((task) => task.proposalClaimId === proposalIdempotencyKey);
+        (await scopedStore.listTasks({ includeArchived: false })).find((task) => task.proposalClaimId === proposalIdempotencyKey);
 
       if (metadata.proposalStatus === "created" && metadata.createdTaskId) {
         const task = await scopedStore.getTask(metadata.createdTaskId).catch(() => null);
@@ -518,6 +552,29 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
     }
   });
 
+  // IMPORTANT: Register archive actions before the generic /messages/:id route.
+  router.post("/messages/:id/archive", async (req, res) => {
+    try {
+      const message = await (await getMessageStore(req)).archiveMessage(req.params.id);
+      res.json(message);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      if ((err instanceof Error ? err.message : String(err)).includes("not found")) throw notFound(err instanceof Error ? err.message : String(err));
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.post("/messages/:id/unarchive", async (req, res) => {
+    try {
+      const message = await (await getMessageStore(req)).unarchiveMessage(req.params.id);
+      res.json(message);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      if ((err instanceof Error ? err.message : String(err)).includes("not found")) throw notFound(err instanceof Error ? err.message : String(err));
+      rethrowAsApiError(err);
+    }
+  });
+
   router.post("/messages/:id/read", async (req, res) => {
     try {
       const msgStore = await getMessageStore(req);
@@ -553,7 +610,7 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
   router.get("/agents/mailbox/all", async (req, res) => {
     try {
       const msgStore = await getMessageStore(req);
-      const messages = await msgStore.getAllAgentToAgentMessages();
+      const messages = await msgStore.getAllAgentToAgentMessages({ archived: req.query.archived === "true" });
       const unreadCount = await msgStore.getUnreadAgentToAgentCount();
       res.json({ messages, total: messages.length, unreadCount });
     } catch (err: unknown) {
@@ -569,8 +626,9 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
       const msgStore = await getMessageStore(req);
       const agentId = req.params.id;
       const mailbox = await msgStore.getMailbox(agentId, "agent");
-      const inbox = await msgStore.getInbox(agentId, "agent");
-      const outbox = await msgStore.getOutbox(agentId, "agent");
+      const archived = req.query.archived === "true";
+      const inbox = await msgStore.getInbox(agentId, "agent", { archived });
+      const outbox = await msgStore.getOutbox(agentId, "agent", { archived });
       res.json({ ...mailbox, messages: inbox, inbox, outbox });
     } catch (err: unknown) {
       if (err instanceof ApiError) {

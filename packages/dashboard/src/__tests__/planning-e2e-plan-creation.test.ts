@@ -9,6 +9,10 @@ vi.mock("@fusion/engine", () => ({
   resolveMcpServersForStore: async () => ({ servers: [] }),
   buildSessionSkillContextSync: () => ({ skillSelectionContext: undefined, resolvedSkillNames: [], skillSource: "role-fallback" as const }),
   createFnAgent: vi.fn(),
+  // FNXC:PlanningRuntimeResolution 2026-07-24-16:20: planning builds sessions through the
+  // shared runtime-resolving seam; these suites drive it via __setCreateFnAgent, so the
+  // engine export only needs to exist on the mock factory.
+  createResolvedAgentSession: vi.fn(),
   createAgentTask: vi.fn(),
   createWorkflowAuthoringTools: () => [],
   createChatTaskDocumentTools: () => [],
@@ -19,6 +23,7 @@ import { request as performRequest } from "../test-request.js";
 import {
   __resetPlanningState,
   __setCreateFnAgent,
+  createTaskFromPlanSession,
   getSession,
 } from "../planning.js";
 import { registerPlanningSubtaskRoutes } from "../routes/register-planning-subtask-routes.js";
@@ -111,27 +116,44 @@ function installContextAwareAgent() {
 }
 
 function createStore() {
-  let createdTask: { id: string; title: string; description: string } | undefined;
-  const createTask = vi.fn(async (input: { title: string; description: string }) => {
-    createdTask = { id: "FN-E2E-001", title: input.title, description: input.description };
-    return createdTask;
+  /*
+  FNXC:PlanningMultiTask 2026-07-24-01:40:
+  Tasks record their proposalClaimId and stay listed so findCreatedTask's epoch-keyed
+  crash-window reconciliation is exercised for real (review finding: only epoch 0 was
+  covered). `tasks` is exposed so tests can inject an orphaned row simulating a crash
+  between task insert and session finalize.
+  */
+  const tasks: Array<Record<string, unknown> & { id: string; title: string; description: string; proposalClaimId?: string }> = [];
+  const createTask = vi.fn(async (input: Record<string, unknown> & { title: string; description: string; proposalClaimId?: string }) => {
+    const created = {
+      ...input,
+      id: `FN-E2E-00${tasks.length + 1}`,
+    };
+    tasks.push(created);
+    return created;
   });
   return {
     getSettings: vi.fn().mockResolvedValue({
       autoMerge: false,
       agentClarificationEnabled: false,
       ntfyEnabled: false,
+      githubLinkImportedIssuesToTracking: true,
     }),
     getRootDir: vi.fn().mockReturnValue("/tmp/planning-e2e"),
-    listTasks: vi.fn(async () => createdTask ? [createdTask] : []),
+    listTasks: vi.fn(async () => [...tasks]),
     getTask: vi.fn(async (id: string) => {
-      if (createdTask?.id === id) return createdTask;
+      const found = tasks.find((task) => task.id === id);
+      if (found) return found;
       throw new Error("not found");
     }),
     createTask,
     updateTask: vi.fn().mockResolvedValue(undefined),
+    addAttachment: vi.fn().mockResolvedValue(undefined),
     logEntry: vi.fn().mockResolvedValue(undefined),
-  } as unknown as TaskStore & { createTask: typeof createTask };
+    upsertTaskDocument: vi.fn().mockResolvedValue(undefined),
+    getGlobalSettingsStore: vi.fn(() => ({ getSettings: vi.fn().mockResolvedValue({}) })),
+    tasks,
+  } as unknown as TaskStore & { createTask: typeof createTask; tasks: typeof tasks };
 }
 
 function buildApp(store: TaskStore): express.Express {
@@ -205,8 +227,78 @@ describe("Planning Mode plan creation E2E", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     __resetPlanningState();
     __setCreateFnAgent(undefined as never);
+  });
+
+  /*
+  FNXC:GitHubPlanningSourceIssue 2026-08-09-09:45:
+  The agent/CLI task-creation twin must consume the same persisted canonical seed as the
+  dashboard route. This regression keeps its source provenance and source block intact
+  without relying on the HTTP registrar's mocked planning adapter.
+  */
+  it("creates GitHub provenance through the production agent planning twin", async () => {
+    const initialPlan = [
+      "Plan work for GitHub issue: Preserve imported context",
+      "",
+      "Issue description:",
+      "Verbatim imported body.",
+      "",
+      "Source: https://github.com/owner/repo/issues/42",
+    ].join("\n");
+    const started = await post(app, "/api/planning/start", { initialPlan });
+    expect(started.status).toBe(201);
+
+    const created = await createTaskFromPlanSession(started.body.sessionId, store);
+    expect(created.alreadyCreated).toBe(false);
+    expect(created.task).toMatchObject({
+      sourceIssue: { provider: "github", repository: "owner/repo", issueNumber: 42 },
+      source: { sourceType: "github_import", sourceMetadata: { issueUrl: "https://github.com/owner/repo/issues/42", issueNumber: 42 } },
+      githubTracking: { enabled: true },
+    });
+    expect(created.task.description).toContain("## Source Issue");
+    expect(created.task.description).toContain("Verbatim imported body.");
+    expect(store.upsertTaskDocument).toHaveBeenCalledWith(created.task.id, expect.objectContaining({
+      key: "github-issue",
+      content: expect.stringContaining("Verbatim imported body."),
+    }));
+
+    const replay = await createTaskFromPlanSession(started.body.sessionId, store);
+    expect(replay).toMatchObject({ alreadyCreated: true, task: { id: created.task.id } });
+    expect(store.createTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("attaches persisted GitHub image URLs through the production CLI planning twin", async () => {
+    const initialPlan = [
+      "Plan work for GitHub issue: Screenshot report",
+      "",
+      "Issue description:",
+      "Captured body.",
+      "",
+      "Source: https://github.com/owner/repo/issues/42",
+    ].join("\n");
+    const started = await post(app, "/api/planning/start", { initialPlan });
+    expect(started.status).toBe(201);
+    const planningSession = await getSession(started.body.sessionId);
+    expect(planningSession).toBeDefined();
+    planningSession!.sourceIssue = {
+      provider: "github",
+      repository: "owner/repo",
+      externalIssueId: "42",
+      issueNumber: 42,
+      url: "https://github.com/owner/repo/issues/42",
+      imageUrls: ["https://github.com/user-attachments/assets/body", "https://github.com/user-attachments/assets/comment"],
+    };
+    const fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const created = await createTaskFromPlanSession(started.body.sessionId, store);
+
+    expect(created.alreadyCreated).toBe(false);
+    expect(store.addAttachment).toHaveBeenCalledTimes(2);
+    expect(store.logEntry).toHaveBeenCalledWith(created.task.id, "Imported 2 image attachments from GitHub issue", "https://github.com/owner/repo/issues/42");
+    expect(fetchMock.mock.calls.every(([url]) => String(url).startsWith("https://github.com/user-attachments/assets/"))).toBe(true);
   });
 
   it("converts the lean running plan into a task without a separate validation step", async () => {
@@ -224,6 +316,83 @@ describe("Planning Mode plan creation E2E", () => {
 
     const retry = await post(app, "/api/planning/create-task", { sessionId });
     expect(retry).toMatchObject({ status: 200, body: { task: { id: "FN-E2E-001" }, alreadyCreated: true } });
+    expect(store.createTask).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+  FNXC:PlanningMultiTask 2026-07-24-00:20:
+  One plan can produce multiple tasks. Editing the plan after a task exists rotates the
+  creation epoch: the next Proceed creates a FRESH task under a new epoch-suffixed
+  proposalClaimId instead of replaying the first task, while unedited replays (above) stay
+  idempotent within their epoch.
+  */
+  it("creates a second task after the plan is edited past the first one", async () => {
+    const start = await post(app, "/api/planning/start", { initialPlan: "Build secure account recovery" });
+    expect(start.status).toBe(201);
+    const sessionId = start.body.sessionId as string;
+
+    const created = await post(app, "/api/planning/create-task", { sessionId });
+    expect(created.status).toBe(201);
+    expect(store.createTask).toHaveBeenCalledTimes(1);
+    expect(store.createTask.mock.calls[0][0]).toMatchObject({ proposalClaimId: `planning-session:${sessionId}` });
+
+    // Editing the validated plan reopens it and rotates the creation epoch.
+    const refined = await post(app, "/api/planning/respond", { sessionId, responses: { refine: true, focus: "split rollout" } });
+    expect(refined.status).toBe(200);
+    const session = await getSession(sessionId);
+    expect(session?.taskCreationEpoch).toBe(1);
+    expect(session?.createdTaskIds).toEqual(["FN-E2E-001"]);
+
+    const second = await post(app, "/api/planning/create-task", { sessionId });
+    expect(second.status).toBe(201);
+    expect(second.body.alreadyCreated).toBe(false);
+    expect(store.createTask).toHaveBeenCalledTimes(2);
+    expect(store.createTask.mock.calls[1][0]).toMatchObject({ proposalClaimId: `planning-session:${sessionId}#1` });
+
+    /*
+    FNXC:PlanningMultiTask 2026-07-24-01:40:
+    Replay idempotency must hold INSIDE a rotated epoch too (review finding: only epoch 0's
+    replay was pinned): an unedited Proceed after the second create returns that same task.
+    */
+    const replayAfterRotation = await post(app, "/api/planning/create-task", { sessionId });
+    expect(replayAfterRotation.status).toBe(200);
+    expect(replayAfterRotation.body.alreadyCreated).toBe(true);
+    expect(replayAfterRotation.body.task.id).toBe("FN-E2E-002");
+    expect(store.createTask).toHaveBeenCalledTimes(2);
+  });
+
+  /*
+  FNXC:PlanningMultiTask 2026-07-24-01:40:
+  Crash-after-insert recovery inside a ROTATED epoch: a task row exists under the epoch-1
+  claim key but the session linkage was never finalized. Proceed must reconcile that row via
+  findCreatedTask on the current epoch key instead of inserting a duplicate (review finding:
+  the crash-window regression test only covered the un-suffixed epoch-0 key).
+  */
+  it("reconciles a crash-orphaned task row under an epoch-suffixed claim key instead of duplicating it", async () => {
+    const start = await post(app, "/api/planning/start", { initialPlan: "Build secure account recovery" });
+    expect(start.status).toBe(201);
+    const sessionId = start.body.sessionId as string;
+
+    const created = await post(app, "/api/planning/create-task", { sessionId });
+    expect(created.status).toBe(201);
+    expect(store.createTask).toHaveBeenCalledTimes(1);
+
+    const refined = await post(app, "/api/planning/respond", { sessionId, responses: { refine: true, focus: "split rollout" } });
+    expect(refined.status).toBe(200);
+    expect((await getSession(sessionId))?.taskCreationEpoch).toBe(1);
+
+    // Simulate the crash window: the epoch-1 task row landed, but finalize never ran.
+    store.tasks.push({
+      id: "FN-E2E-CRASH",
+      title: "Crash-orphaned second task",
+      description: "inserted before finalize",
+      proposalClaimId: `planning-session:${sessionId}#1`,
+    });
+
+    const retry = await post(app, "/api/planning/create-task", { sessionId });
+    expect(retry.status).toBe(200);
+    expect(retry.body.alreadyCreated).toBe(true);
+    expect(retry.body.task.id).toBe("FN-E2E-CRASH");
     expect(store.createTask).toHaveBeenCalledTimes(1);
   });
 

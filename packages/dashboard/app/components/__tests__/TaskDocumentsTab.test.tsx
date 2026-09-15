@@ -6,7 +6,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import type { ArtifactWithTask, TaskDocument } from "@fusion/core";
 import { TaskDocumentsTab } from "../TaskDocumentsTab";
-import { artifactMediaUrlWithToken, fetchTaskDocuments, fetchTaskDocumentRevisions } from "../../api";
+import { artifactMediaUrlWithToken, fetchTaskDocuments, fetchTaskDocumentRevisions, putTaskDocument } from "../../api";
 import { useArtifacts } from "../../hooks/useArtifacts";
 
 vi.mock("../../api", () => ({
@@ -21,10 +21,14 @@ vi.mock("../../api", () => ({
 vi.mock("../../hooks/useArtifacts", () => ({
   useArtifacts: vi.fn(),
 }));
+vi.mock("../../hooks/useArtifactImageBlob", () => ({
+  useArtifactImageBlob: vi.fn(() => ({ url: "blob:secure-preview", loading: false, error: null, reload: vi.fn() })),
+}));
 
 const mockFetchTaskDocuments = vi.mocked(fetchTaskDocuments);
 const mockFetchTaskDocumentRevisions = vi.mocked(fetchTaskDocumentRevisions);
 const mockArtifactMediaUrlWithToken = vi.mocked(artifactMediaUrlWithToken);
+const mockPutTaskDocument = vi.mocked(putTaskDocument);
 const mockUseArtifacts = vi.mocked(useArtifacts);
 
 function getDocumentCard(key: string): HTMLElement {
@@ -86,6 +90,7 @@ const mockDocuments: TaskDocument[] = [
     key: "plan",
     content: "This is the **plan** content",
     revision: 1,
+    contentHash: `sha256:${"a".repeat(64)}`,
     author: "agent",
     createdAt: "2026-04-19T10:00:00.000Z",
     updatedAt: "2026-04-19T12:00:00.000Z",
@@ -96,6 +101,7 @@ const mockDocuments: TaskDocument[] = [
     key: "notes",
     content: "# Notes\n\n- Item 1\n- Item 2",
     revision: 2,
+    contentHash: `sha256:${"b".repeat(64)}`,
     author: "user",
     createdAt: "2026-04-19T09:00:00.000Z",
     updatedAt: "2026-04-19T11:00:00.000Z",
@@ -117,6 +123,40 @@ describe("TaskDocumentsTab", () => {
       error: null,
       refresh: vi.fn().mockResolvedValue(undefined),
     });
+  });
+
+  it("explicitly rebases a preserved conflict draft before saving with the refreshed baseline", async () => {
+    const refreshedDocuments = mockDocuments.map((doc) => doc.key === "plan" ? {
+      ...doc,
+      content: "Concurrent server content",
+      revision: 2,
+      contentHash: `sha256:${"c".repeat(64)}`,
+    } : doc);
+    mockFetchTaskDocuments
+      .mockResolvedValueOnce(mockDocuments)
+      .mockResolvedValue(refreshedDocuments);
+    mockPutTaskDocument
+      .mockRejectedValueOnce(Object.assign(new Error("stale"), { status: 409 }))
+      .mockResolvedValueOnce(refreshedDocuments[0]);
+    render(<TaskDocumentsTab taskId="KB-001" addToast={addToast} projectId="project-1" canEdit />);
+
+    const card = await waitFor(() => getDocumentCard("plan"));
+    fireEvent.click(within(card).getByRole("button", { name: "Edit" }));
+    const editor = within(card).getByRole("textbox");
+    fireEvent.change(editor, { target: { value: "My preserved draft" } });
+    fireEvent.click(within(card).getByRole("button", { name: "Save" }));
+
+    const rebaseButton = await within(card).findByRole("button", { name: "Rebase draft" });
+    expect(editor).toHaveValue("My preserved draft");
+    expect(within(card).getByRole("button", { name: "Save" })).toBeDisabled();
+    fireEvent.click(rebaseButton);
+    fireEvent.click(within(card).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockPutTaskDocument).toHaveBeenNthCalledWith(2, "KB-001", "plan", "My preserved draft", {
+      expectedRevision: 2,
+      expectedContentHash: `sha256:${"c".repeat(64)}`,
+    }, "project-1"));
+    await waitFor(() => expect(within(card).queryByRole("textbox")).not.toBeInTheDocument());
   });
 
   it("renders the renamed Artifacts heading with document list", async () => {
@@ -201,7 +241,7 @@ describe("TaskDocumentsTab", () => {
       expect(screen.getByRole("heading", { name: "Media artifacts" })).toBeInTheDocument();
     });
 
-    expect(screen.getByRole("img", { name: "Image artifact" })).toHaveAttribute("src", "/api/artifacts/artifact-image/media?fn_token=daemon-token");
+    expect(screen.getByRole("img", { name: "Image artifact" })).toHaveAttribute("src", "blob:secure-preview");
     expect(screen.getByRole("button", { name: "Expand image artifact Image artifact" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Expand image artifact Video artifact/ })).not.toBeInTheDocument();
     expect(screen.getByLabelText("Video artifact: Video artifact").tagName).toBe("VIDEO");
@@ -232,7 +272,11 @@ describe("TaskDocumentsTab", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Artifact media preview" });
     expect(dialog).toBeInTheDocument();
-    expect(screen.getAllByRole("img", { name: "Image artifact" })[1]).toHaveAttribute("src", "/api/artifacts/artifact-image/media?fn_token=daemon-token");
+    const expandedImage = screen.getAllByRole("img", { name: "Image artifact" })[1];
+    expect(expandedImage).toHaveAttribute("src", "blob:secure-preview");
+    expect(within(dialog).getByTestId("artifact-image-viewer-zoom-level")).toHaveTextContent("100%");
+    fireEvent.click(within(dialog).getByTestId("artifact-image-viewer-zoom-in"));
+    expect(expandedImage.style.transform).toContain("scale(1.25)");
 
     fireEvent.click(screen.getByRole("button", { name: "Close artifact preview" }));
 
@@ -263,7 +307,7 @@ describe("TaskDocumentsTab", () => {
     });
   });
 
-  it("traps keyboard focus inside the image artifact lightbox", async () => {
+  it("moves focus to the shared viewer close control", async () => {
     mockUseArtifacts.mockReturnValue({
       artifacts: mockArtifacts,
       loading: false,
@@ -274,18 +318,7 @@ describe("TaskDocumentsTab", () => {
     render(<TaskDocumentsTab taskId="KB-001" addToast={addToast} projectId="project-1" />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Expand image artifact Image artifact" }));
-    const closeButton = screen.getByRole("button", { name: "Close artifact preview" });
-    expect(closeButton).toHaveFocus();
-
-    fireEvent.keyDown(document, { key: "Tab" });
-    expect(closeButton).toHaveFocus();
-
-    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
-    expect(closeButton).toHaveFocus();
-
-    screen.getAllByRole("button", { name: "Collapse" })[0].focus();
-    fireEvent.keyDown(document, { key: "Tab" });
-    expect(closeButton).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Close artifact preview" })).toHaveFocus();
   });
 
   it("surfaces artifact fetch errors", async () => {

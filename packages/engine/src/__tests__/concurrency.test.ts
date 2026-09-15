@@ -2,19 +2,23 @@ import { describe, it, expect, vi } from "vitest";
 import type { Task } from "@fusion/core";
 import {
   AgentSemaphore,
+  ProjectAdmissionCoordinator,
+  compareAdmissionCandidates,
   ScopedAgentSemaphore,
   PRIORITY_MERGE,
   PRIORITY_EXECUTE,
   PRIORITY_SPECIFY,
   clearPreHeldExecutorSlotsForTests,
   computeTopLevelConcurrencyClaimed,
+  getPreHeldExecutorSlotsForTests,
   dropPreHeldExecutorSlot,
   hasPreHeldExecutorSlot,
   persistedTopLevelAgentSlots,
   recoverIdleSemaphoreLeakCandidate,
   registerPreHeldExecutorSlot,
+  resolveAgentCapacityLimit,
   takePreHeldExecutorSlot,
-} from "../concurrency.js";
+} from "../concurrency/concurrency.js";
 
 describe("ScopedAgentSemaphore", () => {
   it("returns only this scope's residual slots without clobbering other scopes", async () => {
@@ -396,7 +400,7 @@ describe("AgentSemaphore", () => {
 
   it("counts persisted top-level slots with the shared in-review running-agent predicate", () => {
     const tasks = [
-      { column: "in-progress" },
+      { column: "in-progress", sessionFile: "/tmp/live" },
       { column: "triage", status: "planning", paused: false },
       { column: "triage", status: "planning", paused: true },
       { column: "in-review", status: "reviewing", paused: false },
@@ -411,9 +415,9 @@ describe("AgentSemaphore", () => {
     expect(persistedTopLevelAgentSlots(tasks)).toBe(7);
   });
 
-  it("claims top-level concurrency as max(live running agents, semaphore active, pending specify)", () => {
+  it("claims only this project's live agents and pending planners", () => {
     const tasks = [
-      { column: "in-progress" },
+      { column: "in-progress", sessionFile: "/tmp/live" },
       { column: "triage", status: "planning", paused: false },
       { column: "triage", status: "planning", paused: false },
       { column: "triage", status: "planning", paused: false },
@@ -423,9 +427,10 @@ describe("AgentSemaphore", () => {
 
     // 4 planning + 1 in-progress = 5 live holders (the reported over-cap symptom).
     expect(computeTopLevelConcurrencyClaimed({ tasks })).toBe(5);
-    // Prefer the larger of live holders and in-memory activeCount.
+    // Host semaphore activity belongs to the process-wide pool, not this
+    // project's maxConcurrent accounting.
     expect(computeTopLevelConcurrencyClaimed({ tasks, semaphoreActiveCount: 2 })).toBe(5);
-    expect(computeTopLevelConcurrencyClaimed({ tasks: [], semaphoreActiveCount: 3, pendingSpecifyCount: 2 })).toBe(3);
+    expect(computeTopLevelConcurrencyClaimed({ tasks: [], semaphoreActiveCount: 3, pendingSpecifyCount: 2 })).toBe(2);
     expect(computeTopLevelConcurrencyClaimed({ tasks: [], semaphoreActiveCount: 1, pendingSpecifyCount: 2 })).toBe(2);
   });
 
@@ -440,12 +445,15 @@ describe("AgentSemaphore", () => {
     expect(hasPreHeldExecutorSlot("FN-1")).toBe(false);
     expect(takePreHeldExecutorSlot("FN-1")).toBe(false);
 
-    // Failed dispatch path releases both the registry entry and the semaphore slot.
-    expect(sem.tryAcquire()).toBe(true);
+    /*
+    FNXC:CapacityModel 2026-07-29-13:20: the failed-dispatch path releases the
+    REGISTRY ENTRY; the semaphore half moved to the call sites that own the
+    reference. The surviving contract is that a failed dispatch leaves nothing a
+    later pass could "take".
+    */
     registerPreHeldExecutorSlot("FN-2");
-    dropPreHeldExecutorSlot("FN-2", sem);
+    dropPreHeldExecutorSlot("FN-2");
     expect(hasPreHeldExecutorSlot("FN-2")).toBe(false);
-    expect(sem.activeCount).toBe(1);
     sem.release();
     clearPreHeldExecutorSlotsForTests();
   });
@@ -468,8 +476,9 @@ describe("AgentSemaphore", () => {
     expect(sem.activeCount).toBe(1);
 
     // Authoritative / work-engine / heartbeat-defer early returns must drop, not leave the registration.
-    dropPreHeldExecutorSlot("FN-LEGACY-HANDOFF", sem);
+    dropPreHeldExecutorSlot("FN-LEGACY-HANDOFF");
     expect(hasPreHeldExecutorSlot("FN-LEGACY-HANDOFF")).toBe(false);
+    sem.release();
     expect(sem.activeCount).toBe(0);
 
     // Happy path: re-register then take + release (runWithExecutorSemaphore contract).
@@ -480,8 +489,8 @@ describe("AgentSemaphore", () => {
     sem.release();
     expect(sem.activeCount).toBe(0);
     // Second drop after take is a no-op — safe for execute()'s outer finally belt-and-suspenders.
-    dropPreHeldExecutorSlot("FN-LEGACY-TAKE", sem);
-    expect(sem.activeCount).toBe(0);
+    dropPreHeldExecutorSlot("FN-LEGACY-TAKE");
+    expect(hasPreHeldExecutorSlot("FN-LEGACY-TAKE")).toBe(false);
     clearPreHeldExecutorSlotsForTests();
   });
 
@@ -504,13 +513,12 @@ describe("AgentSemaphore", () => {
     const release = () => {
       if (released) return;
       released = true;
-      dropPreHeldExecutorSlot("FN-MOVE-FAIL", sem);
+      dropPreHeldExecutorSlot("FN-MOVE-FAIL");
     };
     release();
     release(); // idempotent
 
     expect(hasPreHeldExecutorSlot("FN-MOVE-FAIL")).toBe(false);
-    expect(sem.activeCount).toBe(0);
     clearPreHeldExecutorSlotsForTests();
   });
 
@@ -580,8 +588,8 @@ describe("AgentSemaphore", () => {
     for (let i = 0; i < 6; i++) await sem.acquire();
     // Two genuinely running tasks persist; four held slots are leaked.
     const tasks = [
-      { column: "in-progress" },
-      { column: "in-progress" },
+      { column: "in-progress", sessionFile: "/tmp/live" },
+      { column: "in-progress", sessionFile: "/tmp/live" },
     ] as Task[];
 
     const first = recoverIdleSemaphoreLeakCandidate({
@@ -627,7 +635,7 @@ describe("AgentSemaphore", () => {
     const sem = new AgentSemaphore(4);
     await sem.acquire();
     sem.acquireNestedSlot(); // legitimate nested overshoot: active=2, persisted=1
-    const tasks = [{ column: "in-progress" }] as Task[];
+    const tasks = [{ column: "in-progress", sessionFile: "/tmp/live" }] as Task[];
 
     const candidate = recoverIdleSemaphoreLeakCandidate({
       semaphore: sem,
@@ -666,7 +674,7 @@ describe("AgentSemaphore", () => {
     for (let i = 0; i < 5; i++) await sem.acquire(); // 5 persisted running tasks
     await sem.acquire(); // 1 leaked slot (no persisted task backs it)
     sem.acquireNestedSlot(); // live nested run starts: active=7, nested=1
-    const tasks = Array.from({ length: 5 }, () => ({ column: "in-progress" })) as Task[];
+    const tasks = Array.from({ length: 5 }, () => ({ column: "in-progress", sessionFile: "/tmp/live" })) as Task[];
 
     const first = recoverIdleSemaphoreLeakCandidate({
       semaphore: sem,
@@ -704,7 +712,7 @@ describe("AgentSemaphore", () => {
     // both held slots — no excess, no candidate.
     const result = recoverIdleSemaphoreLeakCandidate({
       semaphore: sem,
-      tasks: [{ column: "in-progress" }] as Task[],
+      tasks: [{ column: "in-progress", sessionFile: "/tmp/live" }] as Task[],
       candidateSinceMs: 999,
       inFlightCount: 1,
       nowMs: 700_000,
@@ -1056,5 +1064,458 @@ describe("AgentSemaphore resilience (FN-978)", () => {
     // Release the second one
     sem.release();
     expect(sem.activeCount).toBe(0);
+  });
+});
+
+
+describe("ProjectAdmissionCoordinator", () => {
+  it("clears test-only coordinator and pre-held state across every shared category", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const projectId = "project-reset";
+    let resolveClaim!: (value: number) => void;
+    const pendingClaim = new Promise<number>((resolve) => { resolveClaim = resolve; });
+
+    const drainingReservation = coordinator.reserveIfAvailable({
+      projectId,
+      taskId: "FN-DRAINING",
+      consumesWorktree: false,
+      maxConcurrent: 4,
+      claimed: () => pendingClaim,
+    });
+    await Promise.resolve();
+    expect(coordinator.inspectProjectStateForTests(projectId).draining).toBe(true);
+
+    resolveClaim(0);
+    await drainingReservation;
+    expect(coordinator.inspectProjectStateForTests(projectId)).toMatchObject({
+      reservedCount: 1,
+      draining: false,
+    });
+
+    coordinator.registerProvider("specify:project-reset", {
+      projectId,
+      refresh: async () => [],
+    });
+    expect(coordinator.inspectProjectStateForTests(projectId).providerIds)
+      .toContain("specify:project-reset");
+
+    coordinator.clearReservationsForTests();
+    expect(coordinator.inspectProjectStateForTests(projectId)).toEqual({
+      reservedCount: 0,
+      reservedWorktreeCount: 0,
+      draining: false,
+      providerIds: [],
+    });
+    expect(await coordinator.reserveIfAvailable({
+      projectId,
+      taskId: "FN-AFTER-DRAINING-RESET",
+      consumesWorktree: false,
+      maxConcurrent: 1,
+      claimed: () => 0,
+    })).toBe(true);
+    coordinator.clearReservationsForTests();
+    coordinator.registerProvider("specify:project-reset", {
+      projectId,
+      refresh: async () => [],
+    });
+    expect(coordinator.inspectProjectStateForTests(projectId).providerIds)
+      .toEqual(["specify:project-reset"]);
+
+    registerPreHeldExecutorSlot("FN-PREHELD-RESET");
+    expect(getPreHeldExecutorSlotsForTests()).toContain("FN-PREHELD-RESET");
+    clearPreHeldExecutorSlotsForTests();
+    expect(getPreHeldExecutorSlotsForTests()).toEqual([]);
+  });
+
+  it("shares the final active-task slot across planning, execution, and merge lanes", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const started: string[] = [];
+    const activeTaskLimit = resolveAgentCapacityLimit({ maxConcurrent: 12 });
+
+    for (const [lane, taskId, createdAt] of [
+      ["planning", "FN-PLANNING", "2026-01-01T00:00:00.000Z"],
+      ["execute", "FN-EXECUTE", "2026-01-02T00:00:00.000Z"],
+      ["review", "FN-MERGE", "2026-01-03T00:00:00.000Z"],
+    ] as const) {
+      coordinator.registerProvider(lane, {
+        projectId: "project-a",
+        refresh: async () => [{
+          taskId,
+          projectId: "project-a",
+          lane,
+          consumesWorktree: lane === "execute",
+          createdAt,
+          start: async () => { started.push(taskId); },
+        }],
+      });
+    }
+
+    expect(await coordinator.admitNext({
+      projectId: "project-a",
+      maxConcurrent: activeTaskLimit,
+      claimed: () => 11,
+    })).toBe("FN-MERGE");
+    expect(await coordinator.reserveIfAvailable({
+      projectId: "project-a",
+      taskId: "FN-DIRECT-SCHEDULER",
+      consumesWorktree: true,
+      maxConcurrent: activeTaskLimit,
+      claimed: () => 11,
+    })).toBe(false);
+    expect(started).toEqual(["FN-MERGE"]);
+
+    // Once the selected task is durably live, its matching reservation is the
+    // same slot—not a second occupant—so the next real slot remains usable.
+    expect(await coordinator.reserveIfAvailable({
+      projectId: "project-a",
+      taskId: "FN-DIRECT-SCHEDULER",
+      consumesWorktree: true,
+      maxConcurrent: 13,
+      claimed: () => 12,
+      claimedTaskIds: () => ["FN-MERGE"],
+    })).toBe(true);
+
+    coordinator.releaseReservation("FN-DIRECT-SCHEDULER");
+    coordinator.releaseReservation("FN-MERGE");
+  });
+
+  it("does not lose a holder that transfers from reservation to durable state during a claim read", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    expect(await coordinator.reserveIfAvailable({
+      projectId: "project-transfer",
+      taskId: "FN-HANDOFF",
+      consumesWorktree: false,
+      maxConcurrent: 1,
+      claimed: () => 0,
+    })).toBe(true);
+
+    let finishSnapshot!: () => void;
+    const snapshotBlocked = new Promise<void>((resolve) => { finishSnapshot = resolve; });
+    let snapshotStarted!: () => void;
+    const snapshotDidStart = new Promise<void>((resolve) => { snapshotStarted = resolve; });
+    const candidate = coordinator.reserveIfAvailable({
+      projectId: "project-transfer",
+      taskId: "FN-CANDIDATE",
+      consumesWorktree: false,
+      maxConcurrent: 1,
+      claimed: async () => {
+        snapshotStarted();
+        await snapshotBlocked;
+        // This is the pre-persistence snapshot: the handoff is not durable in it yet.
+        return 0;
+      },
+      claimedTaskIds: () => [],
+    });
+
+    await snapshotDidStart;
+    // The handoff becomes durable and releases its transient reservation while the stale read is open.
+    coordinator.releaseReservation("FN-HANDOFF");
+    finishSnapshot();
+
+    expect(await candidate).toBe(false);
+    coordinator.releaseReservation("FN-CANDIDATE");
+  });
+
+  it("evaluates a waiting admission claim only after the prior project drain finishes", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    let releaseDrain!: () => void;
+    const drainBlocked = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    let drainStarted!: () => void;
+    const drainDidStart = new Promise<void>((resolve) => { drainStarted = resolve; });
+    const first = coordinator.reserveIfAvailable({
+      projectId: "project-serialized-snapshot",
+      taskId: "FN-BLOCKER",
+      consumesWorktree: false,
+      maxConcurrent: 0,
+      claimed: async () => {
+        drainStarted();
+        await drainBlocked;
+        return 0;
+      },
+    });
+    await drainDidStart;
+
+    const freshClaim = vi.fn(() => 1);
+    const second = coordinator.reserveIfAvailable({
+      projectId: "project-serialized-snapshot",
+      taskId: "FN-WAITING",
+      consumesWorktree: false,
+      maxConcurrent: 1,
+      claimed: freshClaim,
+    });
+    await Promise.resolve();
+    expect(freshClaim).not.toHaveBeenCalled();
+
+    releaseDrain();
+    expect(await first).toBe(false);
+    expect(await second).toBe(false);
+    expect(freshClaim).toHaveBeenCalledOnce();
+  });
+
+  it("admits the oldest same-project candidate atomically and partitions projects", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const started: string[] = [];
+    const candidates = [
+      { taskId: "FN-20", projectId: "a", lane: "execute" as const, consumesWorktree: true, createdAt: "2026-01-02T00:00:00.000Z", start: async () => { started.push("new"); } },
+      { taskId: "FN-10", projectId: "a", lane: "execute" as const, consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z", start: async () => { started.push("old"); } },
+      { taskId: "FN-1", projectId: "b", lane: "execute" as const, consumesWorktree: true, createdAt: "2026-01-03T00:00:00.000Z", start: async () => { started.push("other-project"); } },
+    ];
+    const sem = new AgentSemaphore(2);
+    await Promise.all([
+      coordinator.admitNext({ projectId: "a", maxConcurrent: 1, claimed: () => 0, refresh: async () => candidates, semaphore: sem }),
+      coordinator.admitNext({ projectId: "a", maxConcurrent: 1, claimed: () => started.length, refresh: async () => candidates, semaphore: sem }),
+    ]);
+    expect(started).toEqual(["old"]);
+    sem.release();
+    await coordinator.admitNext({ projectId: "b", maxConcurrent: 1, claimed: () => 0, refresh: async () => candidates, semaphore: sem });
+    expect(started).toEqual(["old", "other-project"]);
+  });
+
+  /*
+  FNXC:ConcurrencyAdmission 2026-07-26-09:45:
+  Regression for the planning-starvation half of the FN-8600 incident: a card sat "Queued to plan"
+  while capacity was free, because admitNext only ever evaluated candidates[0]. When the oldest
+  candidate's lane declines the handoff, younger work in another lane must still be admitted.
+
+  Invariant under test (not just the reported repro): a declining candidate is SKIPPED, not
+  vetoing; age order is still respected among the candidates that can start; the declined
+  candidate's reservation and host slot are fully returned; and a single call still admits at most
+  one task.
+  */
+  it("skips candidates whose lane declines and admits the next oldest instead", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const semaphore = new AgentSemaphore(4);
+    const started: string[] = [];
+
+    const admitted = await coordinator.admitNext({
+      projectId: "project-a",
+      maxConcurrent: 4,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [
+        // Oldest, but its lane cannot start it (e.g. a merge id no longer queued).
+        {
+          taskId: "FN-OLDEST", projectId: "project-a", lane: "review", consumesWorktree: false, createdAt: "2026-01-01T00:00:00.000Z",
+          start: async () => { started.push("FN-OLDEST"); return false; },
+        },
+        // Also declines — proves the walk continues past more than one.
+        {
+          taskId: "FN-MIDDLE", projectId: "project-a", lane: "review", consumesWorktree: false, createdAt: "2026-01-02T00:00:00.000Z",
+          start: async () => { started.push("FN-MIDDLE"); return false; },
+        },
+        // The planning candidate that was starving behind them.
+        {
+          taskId: "FN-PLANNING", projectId: "project-a", lane: "planning", consumesWorktree: false, createdAt: "2026-01-03T00:00:00.000Z",
+          start: async () => { started.push("FN-PLANNING"); },
+        },
+        // Younger still: must NOT be admitted, so skipping never becomes overtaking.
+        {
+          taskId: "FN-YOUNGEST", projectId: "project-a", lane: "planning", consumesWorktree: false, createdAt: "2026-01-04T00:00:00.000Z",
+          start: async () => { started.push("FN-YOUNGEST"); },
+        },
+      ],
+    });
+
+    expect(admitted).toBe("FN-PLANNING");
+    expect(started).toEqual(["FN-OLDEST", "FN-MIDDLE", "FN-PLANNING"]);
+    // Exactly one host slot is held — by the admitted task, not the decliners.
+    expect(semaphore.activeCount).toBe(1);
+
+    coordinator.releaseReservation("FN-PLANNING");
+    semaphore.release();
+    expect(semaphore.activeCount).toBe(0);
+  });
+
+  /*
+  FNXC:ConcurrencyAdmission 2026-07-26-10:35:
+  Compatibility shims have no `tryAcquire`, so they never take a host slot. Releasing one anyway
+  returns capacity nobody held — `returnSlot` decrements `_active` and drains a waiter regardless.
+  Walking past decliners would repeat that once per decliner, so N decliners could free N phantom
+  slots and push concurrency past maxConcurrent.
+  */
+  it("does not release phantom host slots when the semaphore shim cannot reserve", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const releases: number[] = [];
+    // A pre-tryAcquire shim: release only, no tryAcquire.
+    const shim = { release: () => { releases.push(1); } };
+
+    const admitted = await coordinator.admitNext({
+      projectId: "project-shim",
+      maxConcurrent: 4,
+      claimed: () => 0,
+      semaphore: shim as unknown as Parameters<ProjectAdmissionCoordinator["admitNext"]>[0]["semaphore"],
+      refresh: async () => [
+        { taskId: "FN-A", projectId: "project-shim", lane: "execute", consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z", start: async () => false },
+        { taskId: "FN-B", projectId: "project-shim", lane: "execute", consumesWorktree: true, createdAt: "2026-01-02T00:00:00.000Z", start: async () => false },
+        { taskId: "FN-C", projectId: "project-shim", lane: "execute", consumesWorktree: true, createdAt: "2026-01-03T00:00:00.000Z", start: async () => undefined },
+      ],
+    });
+
+    expect(admitted).toBe("FN-C");
+    // Two decliners must not have produced two unmatched releases.
+    expect(releases).toHaveLength(0);
+  });
+
+  /*
+  FNXC:ConcurrencyAdmission 2026-07-26-11:05:
+  The triage and scheduler lanes set `reserve: () => registerPreHeldExecutorSlot(id)`. If a decline
+  unwinds the semaphore but not that registration, the id stays in the module-global pre-held set
+  with no backing acquire — the next pass's `takePreHeldExecutorSlot` then runs a full top-level
+  session without acquiring a slot and releases one it never held, leaving `_active` permanently
+  below the live agent count and the global cap silently breached.
+  */
+  it("drops a declined candidate's pre-held executor slot, not just the semaphore slot", async () => {
+    clearPreHeldExecutorSlotsForTests();
+    const coordinator = new ProjectAdmissionCoordinator();
+    const semaphore = new AgentSemaphore(4);
+
+    const admitted = await coordinator.admitNext({
+      projectId: "project-prehold",
+      maxConcurrent: 4,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [
+        {
+          taskId: "FN-DECLINE", projectId: "project-prehold", lane: "execute", consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z",
+          reserve: () => registerPreHeldExecutorSlot("FN-DECLINE"),
+          start: async () => false,
+        },
+        {
+          taskId: "FN-TAKES", projectId: "project-prehold", lane: "execute", consumesWorktree: true, createdAt: "2026-01-02T00:00:00.000Z",
+          reserve: () => registerPreHeldExecutorSlot("FN-TAKES"),
+          start: async () => undefined,
+        },
+      ],
+    });
+
+    expect(admitted).toBe("FN-TAKES");
+    // The decliner must leave nothing behind that a later pass could "take".
+    expect(hasPreHeldExecutorSlot("FN-DECLINE")).toBe(false);
+    // Only the admitted candidate still holds a slot.
+    expect(semaphore.activeCount).toBe(1);
+    expect(hasPreHeldExecutorSlot("FN-TAKES")).toBe(true);
+
+    dropPreHeldExecutorSlot("FN-TAKES");
+    expect(hasPreHeldExecutorSlot("FN-TAKES")).toBe(false);
+    // The admitted candidate keeps its host slot until its own lane releases.
+    expect(semaphore.activeCount).toBe(1);
+    clearPreHeldExecutorSlotsForTests();
+  });
+
+  it("returns the reservation and host slot when a candidate's start() throws", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const semaphore = new AgentSemaphore(2);
+
+    await expect(coordinator.admitNext({
+      projectId: "project-throw",
+      maxConcurrent: 4,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [{
+        taskId: "FN-BOOM", projectId: "project-throw", lane: "execute", consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z",
+        start: async () => { throw new Error("lane exploded"); },
+      }],
+    })).rejects.toThrow("lane exploded");
+
+    // A thrown lane must not strand capacity.
+    expect(semaphore.activeCount).toBe(0);
+  });
+
+  it("stops the walk when the host semaphore is exhausted rather than spinning candidates", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const semaphore = new AgentSemaphore(1);
+    // Exhaust the host semaphore so no candidate can acquire a slot.
+    expect(semaphore.tryAcquire()).toBe(true);
+    const started: string[] = [];
+
+    const admitted = await coordinator.admitNext({
+      projectId: "project-a",
+      maxConcurrent: 4,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [
+        { taskId: "FN-1", projectId: "project-a", lane: "execute", consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z", start: async () => { started.push("FN-1"); } },
+        { taskId: "FN-2", projectId: "project-a", lane: "execute", consumesWorktree: true, createdAt: "2026-01-02T00:00:00.000Z", start: async () => { started.push("FN-2"); } },
+      ],
+    });
+
+    expect(admitted).toBeUndefined();
+    expect(started).toEqual([]);
+    expect(semaphore.activeCount).toBe(1);
+    semaphore.release();
+  });
+
+  it("releases a rejected handoff and retains an accepted reservation until lane transfer", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const semaphore = new AgentSemaphore(1);
+    const rejected = await coordinator.admitNext({
+      projectId: "project-a",
+      maxConcurrent: 1,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [{
+        taskId: "FN-1", projectId: "project-a", lane: "execute", consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z",
+        start: async () => false,
+      }],
+    });
+    expect(rejected).toBeUndefined();
+    expect(semaphore.activeCount).toBe(0);
+
+    let releaseStart!: () => void;
+    const startBlocked = new Promise<void>((resolve) => { releaseStart = resolve; });
+    const first = coordinator.admitNext({
+      projectId: "project-a",
+      maxConcurrent: 1,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [{
+        taskId: "FN-2", projectId: "project-a", lane: "execute", consumesWorktree: true, createdAt: "2026-01-01T00:00:00.000Z",
+        start: async () => { await startBlocked; },
+      }],
+    });
+    await Promise.resolve();
+    const second = coordinator.admitNext({
+      projectId: "project-a",
+      maxConcurrent: 1,
+      claimed: () => 0,
+      semaphore,
+      refresh: async () => [{
+        taskId: "FN-3", projectId: "project-a", lane: "execute", consumesWorktree: true, createdAt: "2026-01-02T00:00:00.000Z",
+        start: async () => true,
+      }],
+    });
+    releaseStart();
+    expect(await first).toBe("FN-2");
+    expect(await second).toBeUndefined();
+    coordinator.releaseReservation("FN-2");
+    semaphore.release();
+  });
+
+  it("refreshes every lane and admits review before older execution and planning", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const started: string[] = [];
+    const register = (lane: "review" | "execute" | "planning", taskId: string, createdAt: string, name: string) => {
+      coordinator.registerProvider(name, {
+        projectId: "project-a",
+        refresh: async () => [{ taskId, projectId: "project-a", lane, consumesWorktree: lane === "execute", createdAt, start: async () => { started.push(name); } }],
+      });
+    };
+    register("planning", "FN-1", "2026-01-01T00:00:00.000Z", "planner");
+    register("execute", "FN-2", "2026-01-02T00:00:00.000Z", "executor");
+    register("review", "FN-3", "2026-01-03T00:00:00.000Z", "merge");
+
+    await coordinator.admitNext({ projectId: "project-a", maxConcurrent: 1, claimed: () => 0 });
+    expect(started).toEqual(["merge"]);
+  });
+
+  it("uses oldest valid age then task ID only within one lifecycle lane", () => {
+    const ordered = [
+      { taskId: "bad", lane: "execute" as const, createdAt: "not-a-date" },
+      { taskId: "FN-12", lane: "execute" as const, createdAt: "2026-01-01T00:00:00.000Z" },
+      { taskId: "FN-2", lane: "execute" as const, createdAt: "2026-01-01T00:00:00.000Z" },
+      { taskId: "also-bad", lane: "execute" as const },
+      { taskId: "FN-older-planning", lane: "planning" as const, createdAt: "2020-01-01T00:00:00.000Z" },
+    ].sort(compareAdmissionCandidates);
+    expect(ordered.map((item) => item.taskId)).toEqual(["FN-2", "FN-12", "also-bad", "bad", "FN-older-planning"]);
   });
 });

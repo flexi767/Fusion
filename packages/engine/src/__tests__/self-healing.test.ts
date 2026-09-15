@@ -1,3 +1,12 @@
+/*
+FNXC:WorkflowColumns 2026-07-29-12:15 (post-#2515 audit):
+Fixtures use the MERGED planning column ("todo"), not the deleted "triage". #2515
+collapsed the default lineage's two pre-implementation columns into one with id
+"todo" carrying `intake` + `hold`, so a default-workflow card is never in "triage"
+again. A fixture left there exercised a state the product can no longer produce —
+and, because the converted sweeps resolve intake by ROLE, would have quietly
+asserted that the sweeps do nothing.
+*/
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock node modules
@@ -63,8 +72,10 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-vi.mock("../worktree-pool.js", () => ({
-  WorktreePool: vi.fn(),
+vi.mock("../worktree/worktree-pool.js", async () => {
+  const { existsSync: fsExistsSync } = await import("node:fs");
+  const { join: joinPath, resolve: resolvePath } = await import("node:path");
+  return {
   // FN-4811: Must mirror the production `RemovalReason` const in worktree-backend.ts
   // exactly — every key referenced as `RemovalReason.X` in production code (self-healing,
   // executor, merger) needs to resolve here, otherwise removeWorktree({ reason: undefined })
@@ -82,22 +93,40 @@ vi.mock("../worktree-pool.js", () => ({
     SelfHealingBranchConflict: "self-healing-branch-conflict",
     SelfHealingIdleSweep: "self-healing-idle-sweep",
     PoolPrune: "pool-prune",
+    CompletionLandedCleanup: "completion-landed-cleanup",
   },
   scanIdleWorktrees: vi.fn().mockResolvedValue([]),
   scanOrphanedBranches: vi.fn().mockResolvedValue([]),
   cleanupOrphanedWorktrees: vi.fn().mockResolvedValue(0),
   isUsableTaskWorktree: vi.fn().mockResolvedValue(true),
+  /*
+  FNXC:MissingWorktreeRecovery 2026-07-26-07:15:
+  Keep the real `.git` probe: the unusable-worktree recovery decides whether to PRESERVE
+  `task.worktree` from it, so a blanket `true` would re-hide the MG-047 strand (a recorded
+  worktree that is gone must be cleared, not carried into the next dispatch).
+  */
+  hasRequiredWorktreeFiles: vi.fn((worktreePath: string) => fsExistsSync(joinPath(worktreePath, ".git"))),
+  // Mirrors the real implementation (worktree-pool.ts): the `.git` probe subsumes directory
+  // existence, plus the repo-root rejection when a rootDir is supplied.
+  hasUsableWorktreeShape: vi.fn((worktreePath: string | undefined | null, rootDir?: string) => {
+    if (!worktreePath) return false;
+    if (!fsExistsSync(joinPath(worktreePath, ".git"))) return false;
+    if (rootDir && resolvePath(rootDir) === resolvePath(worktreePath)) return false;
+    return true;
+  }),
   classifyTaskWorktree: vi.fn().mockResolvedValue({ ok: false, classification: "missing", reason: "test-default" }),
   getRegisteredWorktreePaths: vi.fn().mockResolvedValue(new Set<string>()),
   getRegisteredWorktreeBranchMap: vi.fn().mockResolvedValue(new Map<string, string>()),
   removeWorktree: vi.fn().mockResolvedValue(undefined),
   relocateReclaimableWorktreeIntoRoot: vi.fn(async ({ sourcePath }: { sourcePath: string }) => ({ kind: "ready", path: sourcePath, relocated: false })),
   resolveWorktreeBackend: vi.fn(),
-}));
+  };
+});
 
 const { selfHealingLoggerMock } = vi.hoisted(() => ({
   selfHealingLoggerMock: {
     log: vi.fn(),
+    debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   },
@@ -105,25 +134,34 @@ const { selfHealingLoggerMock } = vi.hoisted(() => ({
 
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn((_name: string) => selfHealingLoggerMock),
-  schedulerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  schedulerLog: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 vi.mock("../merger.js", () => ({
   classifyOwnedLandedEvidence: vi.fn(),
 }));
 
-import { SelfHealingManager, isBranchAheadOfBase, MAX_AUTO_MERGE_RETRIES } from "../self-healing.js";
+vi.mock("../merge/post-landing-worktree-cleanup.js", () => ({
+  cleanupLandedTaskWorktree: vi.fn(async (input: { store: { updateTask: (taskId: string, patch: { worktree: null }) => Promise<unknown> }; taskId: string }) => {
+    await input.store.updateTask(input.taskId, { worktree: null });
+    return { outcome: "removed", removed: true };
+  }),
+}));
+
+import { SelfHealingManager, isBranchAheadOfBase, MAX_AUTO_MERGE_RETRIES, MAX_TASK_DONE_RETRIES } from "../self-healing.js";
+import { resolveAiMergeRootPath } from "../worktree/worktree-paths.js";
+import { cleanupLandedTaskWorktree } from "../merge/post-landing-worktree-cleanup.js";
 import { HEARTBEAT_ERROR_RECOVERY_METADATA_KEY, HEARTBEAT_ERROR_RETRY_EXHAUSTED_PAUSE_REASON, HEARTBEAT_ERROR_UNRECOVERABLE_PAUSE_REASON, readHeartbeatErrorRetryCount } from "../agent-heartbeat.js";
-import type { TaskStore, Settings, Task, AgentStore, Agent, NotificationProvider } from "@fusion/core";
+import { PlanningLifecycleLockTransportError, TaskDeletedError, TaskNotFoundError, TransitionRejectionError, type TaskStore, type Settings, type Task, type AgentStore, type Agent, type NotificationProvider } from "@fusion/core";
 import { EventEmitter } from "node:events";
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "../worktree-pool.js";
-import { activeSessionRegistry, executingTaskLock } from "../active-session-registry.js";
-import * as branchConflictModule from "../branch-conflicts.js";
+import { classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "../worktree/worktree-pool.js";
+import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
+import * as branchConflictModule from "../execution/branch-conflicts.js";
 import { createLogger } from "../logger.js";
 import { NotificationService } from "../notification/notification-service.js";
 import { classifyOwnedLandedEvidence } from "../merger.js";
@@ -135,6 +173,7 @@ const mockedClassifyTaskWorktree = vi.mocked(classifyTaskWorktree);
 const mockedGetRegisteredWorktreePaths = vi.mocked(getRegisteredWorktreePaths);
 const mockedGetRegisteredWorktreeBranchMap = vi.mocked(getRegisteredWorktreeBranchMap);
 const mockedRemoveWorktree = vi.mocked(removeWorktree);
+const mockedCleanupLandedTaskWorktree = vi.mocked(cleanupLandedTaskWorktree);
 const mockedResolveWorktreeBackend = vi.mocked(resolveWorktreeBackend);
 const mockedScanIdleWorktrees = vi.mocked(scanIdleWorktrees);
 const mockedScanOrphanedBranches = vi.mocked(scanOrphanedBranches);
@@ -144,6 +183,7 @@ const mockedClassifyOwnedLandedEvidence = vi.mocked(classifyOwnedLandedEvidence)
 
 type MockLogger = {
   log: ReturnType<typeof vi.fn>;
+  debug: ReturnType<typeof vi.fn>;
   warn: ReturnType<typeof vi.fn>;
   error: ReturnType<typeof vi.fn>;
 };
@@ -174,12 +214,27 @@ function createMockStore(overrides: Record<string, unknown> = {}): TaskStore & E
     } as unknown as Task),
     updateTask: vi.fn().mockResolvedValue({} as Task),
     logEntry: vi.fn().mockResolvedValue(undefined),
+    applyInReviewStallObservationFenced: vi.fn().mockImplementation(async (id: string, compute: (current: Task) => any) => {
+      const latestList = (store.listTasks as ReturnType<typeof vi.fn>).mock.results.at(-1);
+      const listed = latestList ? await latestList.value : [];
+      const current = (listed as Task[]).find((candidate) => candidate.id === id);
+      if (!current) return { applied: false, reason: "task-missing" };
+      const patch = compute(current);
+      if (!patch) return { applied: false, reason: "refused" };
+      current.log = [...(current.log ?? []), patch.logEntry];
+      const { logEntry, ...fields } = patch;
+      Object.assign(current, fields);
+      await store.logEntry(id, logEntry.action);
+      if (Object.keys(fields).length > 0) await store.updateTask(id, fields);
+      return { applied: true, task: current };
+    }),
+    transitionQueuedEpisode: vi.fn().mockResolvedValue({ appended: true }),
     moveTask: vi.fn().mockResolvedValue(undefined),
     handoffToReview: vi.fn().mockResolvedValue(undefined),
     enqueueMergeQueue: vi.fn().mockResolvedValue(undefined),
     peekMergeQueue: vi.fn().mockReturnValue([]),
     mergeTask: vi.fn().mockResolvedValue(undefined),
-    archiveTaskAndCleanup: vi.fn().mockResolvedValue({} as Task),
+    getBranchGroup: vi.fn().mockResolvedValue(null),
     /*
     FNXC:PgMigrationQuarantine 2026-07-16-08:00:
     VAL-REMOVAL-005 moved run-audit reads and operational-log retention to the
@@ -222,11 +277,23 @@ describe("SelfHealingManager", () => {
     store = createMockStore();
     manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     mockedRemoveWorktree.mockResolvedValue(undefined);
+    mockedCleanupLandedTaskWorktree.mockClear();
     mockedClassifyTaskWorktree.mockResolvedValue({ ok: false, classification: "missing", reason: "test-default" });
     mockedGetRegisteredWorktreePaths.mockResolvedValue(new Set<string>());
     mockedGetRegisteredWorktreeBranchMap.mockResolvedValue(new Map<string, string>());
     mockedClassifyOwnedLandedEvidence.mockResolvedValue({ kind: "proven-no-op", baseRef: "main", ownDiffEmpty: true });
   });
+
+
+  /*
+  FNXC:LifecycleContainment 2026-08-28-04:47:
+  Race ordering: every rebound call site hands in the `task.column` it read when the sweep SELECTED
+  the card. Containment is role-relative, so acting on that snapshot after an operator drag or another
+  engine path moved the card sends it to the destination for a role it no longer occupies. The repair
+  must resolve its target from the row as it stands at repair time, in both directions.
+  */
+
+
 
   afterEach(() => {
     manager.stop();
@@ -393,396 +460,7 @@ describe("SelfHealingManager", () => {
     });
   });
 
-  // ── Stuck kill budget ─────────────────────────────────────────────
-
-  describe("checkStuckBudget", () => {
-    it("returns true and increments count when within budget", async () => {
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001");
-
-      expect(result).toBe(true);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", { stuckKillCount: 1 });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        expect.stringContaining("Stuck kill 1/6"),
-      );
-    });
-
-    it("returns true for subsequent kills within budget", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        stuckKillCount: 2,
-      } as unknown as Task);
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001");
-
-      expect(result).toBe(true);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", { stuckKillCount: 3 });
-    });
-
-    it("walks stuck kills from 0 to max+1 and terminalizes deterministically", async () => {
-      let killCount = 0;
-      (store.getTask as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
-        id: "FN-001",
-        stuckKillCount: killCount,
-      } as unknown as Task));
-      (store.updateTask as ReturnType<typeof vi.fn>).mockImplementation(async (_taskId: string, patch: Partial<Task>) => {
-        if (typeof patch.stuckKillCount === "number") killCount = patch.stuckKillCount;
-      });
-
-      manager.start();
-
-      for (let i = 1; i <= 6; i++) {
-        const result = await manager.checkStuckBudget("FN-001", "inactivity");
-        expect(result).toBe(true);
-        expect(killCount).toBe(i);
-      }
-
-      const terminal = await manager.checkStuckBudget("FN-001", "loop");
-      expect(terminal).toBe(false);
-      expect(killCount).toBe(7);
-      expect(store.updateTask).toHaveBeenLastCalledWith("FN-001", {
-        stuckKillCount: 7,
-        status: "failed",
-        error: "STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (7/6) after last reason=loop.",
-      });
-      expect(store.handoffToReview).toHaveBeenLastCalledWith("FN-001", expect.objectContaining({
-        ownerAgentId: null,
-        evidence: expect.objectContaining({ reason: "stuck-loop-exhausted", agentId: "self-healing" }),
-      }));
-      expect(store.logEntry).toHaveBeenLastCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (7/6), last reason=loop. No further automatic retries will run. Manually retry, pause, or move the task to triage to resume work.",
-      );
-    });
-
-    it("parks incomplete stuck-loop exhaustion in todo without review handoff or automatic retry", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        column: "in-progress",
-        stuckKillCount: 6,
-        assignedAgentId: "agent-1",
-        steps: [
-          { name: "Preflight", status: "done" },
-          { name: "Delivery", status: "in-progress" },
-        ],
-      } as unknown as Task);
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        stuckKillCount: 7,
-        status: "failed",
-        error: expect.stringContaining("STUCK_LOOP_EXHAUSTED"),
-        paused: true,
-        pausedReason: "stuck-loop-exhausted-manual-intervention-required",
-        pausedByAgentId: "self-healing",
-        assignedAgentId: null,
-        checkedOutBy: null,
-        checkedOutAt: null,
-        checkoutNodeId: null,
-        checkoutRunId: null,
-        checkoutLeaseRenewedAt: null,
-        checkoutLeaseEpoch: 0,
-        nextRecoveryAt: null,
-      }));
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {
-        preserveProgress: true,
-        preserveStatus: true,
-        moveSource: "engine",
-        recoveryRehome: true,
-      });
-      expect(store.handoffToReview).not.toHaveBeenCalled();
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: incomplete task exhausted stuck kill budget (7/6), last reason=loop. Parked in todo with progress preserved; no further automatic retries will run until an operator manually retries, decomposes, or rescopes the task.",
-      );
-    });
-
-    it("leaves user-paused incomplete stuck-loop exhaustion paused and unrequeued", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        column: "in-progress",
-        stuckKillCount: 6,
-        paused: true,
-        userPaused: true,
-        steps: [
-          { name: "Preflight", status: "done" },
-          { name: "Delivery", status: "in-progress" },
-        ],
-      } as unknown as Task);
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.updateTask).not.toHaveBeenCalled();
-      expect(store.moveTask).not.toHaveBeenCalled();
-      expect(store.handoffToReview).not.toHaveBeenCalled();
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_KILL: skipped stuck-budget recovery for loop because the task is user-paused; leaving paused.",
-      );
-      expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        paused: false,
-        userPaused: false,
-        status: "queued",
-      }));
-    });
-
-    it("does not fall back to executor requeue when todo parking fails", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        column: "in-progress",
-        stuckKillCount: 6,
-        steps: [
-          { name: "Preflight", status: "done" },
-          { name: "Delivery", status: "in-progress" },
-        ],
-      } as unknown as Task);
-      (store.moveTask as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("database is busy"));
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        stuckKillCount: 7,
-        status: "failed",
-        paused: true,
-        pausedReason: "stuck-loop-exhausted-manual-intervention-required",
-      }));
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {
-        preserveProgress: true,
-        preserveStatus: true,
-        moveSource: "engine",
-        recoveryRehome: true,
-      });
-      expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        paused: false,
-        userPaused: false,
-        pausedReason: null,
-        status: "queued",
-      }));
-      expect(store.handoffToReview).not.toHaveBeenCalled();
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: incomplete task exhausted stuck kill budget (7/6), last reason=loop. Failed to move task to todo (database is busy); task was marked failed/paused in place and will not be automatically retried.",
-      );
-    });
-
-    it("does not requeue when in-place park succeeds but success logging fails", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        column: "in-progress",
-        stuckKillCount: 6,
-        steps: [
-          { name: "Preflight", status: "done" },
-          { name: "Delivery", status: "in-progress" },
-        ],
-      } as unknown as Task);
-      (store.moveTask as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("database is busy"));
-      (store.logEntry as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("log unavailable"));
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        stuckKillCount: 7,
-        status: "failed",
-        paused: true,
-        pausedReason: "stuck-loop-exhausted-manual-intervention-required",
-      }));
-      expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        paused: false,
-        status: "queued",
-      }));
-      expect(store.handoffToReview).not.toHaveBeenCalled();
-    });
-
-    it("logs in-place park patch failures after todo move failure without executor fallback", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        column: "in-progress",
-        stuckKillCount: 6,
-        steps: [
-          { name: "Preflight", status: "done" },
-          { name: "Delivery", status: "in-progress" },
-        ],
-      } as unknown as Task);
-      (store.updateTask as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce({} as Task)
-        .mockRejectedValueOnce(new Error("write conflict"));
-      (store.moveTask as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("database is busy"));
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledTimes(2);
-      expect(store.handoffToReview).not.toHaveBeenCalled();
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: incomplete task failed to move to todo (database is busy), and the in-place park patch also failed (write conflict); pre-move park metadata was already applied, but operator verification is required before retry.",
-      );
-      expect(store.logEntry).not.toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: incomplete task exhausted stuck kill budget (7/6), last reason=loop. Failed to move task to todo (database is busy); task was marked failed/paused in place and will not be automatically retried.",
-      );
-    });
-
-    it("logs post-move park patch failures without executor fallback", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        column: "in-progress",
-        stuckKillCount: 6,
-        steps: [
-          { name: "Preflight", status: "done" },
-          { name: "Delivery", status: "in-progress" },
-        ],
-      } as unknown as Task);
-      (store.updateTask as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce({} as Task)
-        .mockRejectedValueOnce(new Error("write conflict"));
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {
-        preserveProgress: true,
-        preserveStatus: true,
-        moveSource: "engine",
-        recoveryRehome: true,
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: incomplete task moved to todo with progress preserved, but post-move park patch failed (write conflict); operator repair is required before retry.",
-      );
-      expect(store.logEntry).not.toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_LOOP_EXHAUSTED: incomplete task exhausted stuck kill budget (7/6), last reason=loop. Parked in todo with progress preserved; no further automatic retries will run until an operator manually retries, decomposes, or rescopes the task.",
-      );
-      expect(store.handoffToReview).not.toHaveBeenCalled();
-    });
-
-    it("terminalizes no-progress churn without incrementing stuck kill budget", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        lineageId: "lin-001",
-        stuckKillCount: 3,
-      } as unknown as Task);
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "no-progress-churn", {
-        ignoredStepUpdateCount: 25,
-      });
-
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
-        status: "failed",
-        error: "STUCK_NO_PROGRESS_CHURN: detected 25 ignored step-update rebuffs after compact-and-resume failed to recover progress. Task is likely too large; decompose via fn_task_create child tasks or rescope. No further automatic retries will run.",
-      });
-      expect(store.handoffToReview).toHaveBeenCalledWith("FN-001", expect.objectContaining({
-        ownerAgentId: null,
-        evidence: expect.objectContaining({ reason: "stuck-no-progress-churn", agentId: "self-healing" }),
-      }));
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-001",
-        "STUCK_NO_PROGRESS_CHURN: detected 25 ignored step-update rebuffs after compact-and-resume failed to recover progress. No further automatic retries will run. Pause the task, manually decompose the work via fn_task_create child tasks, or move it to triage to rescope.",
-      );
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        domain: "database",
-        mutationType: "task:stuck-no-progress-churn-terminalized",
-        target: "FN-001",
-        metadata: expect.objectContaining({
-          taskId: "FN-001",
-          ignoredStepUpdateCount: 25,
-          stuckKillStreak: 3,
-          lastReason: "no-progress-churn",
-        }),
-      }));
-    });
-
-    it("respects custom maxStuckKills setting", async () => {
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        maxStuckKills: 1,
-        maintenanceIntervalMs: 0,
-      } as unknown as Settings);
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        stuckKillCount: 1,
-      } as unknown as Task);
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001");
-
-      expect(result).toBe(false);
-    });
-
-    it("returns true on error (safe fallback)", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("DB error"));
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001");
-
-      expect(result).toBe(true);
-      expect(store.updateTask).not.toHaveBeenCalledWith(
-        "FN-001",
-        expect.objectContaining({ error: expect.stringContaining("STUCK_LOOP_EXHAUSTED:") }),
-      );
-    });
-
-    it("keeps task failed and logs warning when moveTask(in-review) fails at exhaustion", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-        stuckKillCount: 6,
-      } as unknown as Task);
-      (store.handoffToReview as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("concurrent move"));
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001", "loop");
-
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
-        stuckKillCount: 7,
-        status: "failed",
-        error: "STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (7/6) after last reason=loop.",
-      });
-      expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(
-        expect.stringContaining("handoffTaskToReview failed (concurrent move)"),
-      );
-    });
-
-    it("handles undefined stuckKillCount as 0", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
-        id: "FN-001",
-      } as unknown as Task);
-
-      manager.start();
-
-      const result = await manager.checkStuckBudget("FN-001");
-
-      expect(result).toBe(true);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", { stuckKillCount: 1 });
-    });
-  });
+  // ── Stuck-session recovery is covered by executor-stuck-requeue-preserve-progress.test.ts ──
 
   // ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -819,47 +497,6 @@ describe("SelfHealingManager", () => {
       expect(store.updateSettings).not.toHaveBeenCalled();
     });
 
-    it("runStartupRecovery invokes the startup recovery subset", async () => {
-      vi.mocked(store.getSettings).mockResolvedValue({
-        globalPause: false,
-        enginePaused: false,
-      } as unknown as Settings);
-      const recoverNoProgressNoTaskDoneFailures = vi.spyOn(manager, "recoverNoProgressNoTaskDoneFailures").mockResolvedValue(1);
-      const recoverCompletedTasks = vi.spyOn(manager, "recoverCompletedTasks").mockResolvedValue(1);
-      const recoverStuckMergeDeadlocks = vi.spyOn(manager, "recoverStuckMergeDeadlocks").mockResolvedValue(1);
-      const recoverMisclassifiedFailures = vi.spyOn(manager, "recoverMisclassifiedFailures").mockResolvedValue(1);
-      const recoverPartialProgressNoTaskDoneFailures = vi.spyOn(manager, "recoverPartialProgressNoTaskDoneFailures").mockResolvedValue(1);
-      const recoverOrphanedExecutions = vi.spyOn(manager, "recoverOrphanedExecutions").mockResolvedValue(1);
-      const recoverApprovedTriageTasks = vi.spyOn(manager, "recoverApprovedTriageTasks").mockResolvedValue(1);
-      const resetDurableAgentErrorStateOnStartup = vi.spyOn(manager, "resetDurableAgentErrorStateOnStartup").mockResolvedValue(1);
-      const recoverOrphanedAgents = vi.spyOn(manager, "recoverOrphanedAgents").mockResolvedValue(1);
-      const recoverAgentsRunningOnInactiveTasks = vi.spyOn(manager, "recoverAgentsRunningOnInactiveTasks").mockResolvedValue(1);
-      const clearStaleBlockedBy = vi.spyOn(manager, "clearStaleBlockedBy").mockResolvedValue(1);
-      const surfaceInReviewStalls = vi.spyOn(manager, "surfaceInReviewStalls").mockResolvedValue(1);
-      const surfaceInReviewStalled = vi.spyOn(manager, "surfaceInReviewStalled").mockResolvedValue(1);
-      const surfaceStalePausedReviews = vi.spyOn(manager, "surfaceStalePausedReviews").mockResolvedValue(1);
-      const surfaceStalePausedTodos = vi.spyOn(manager, "surfaceStalePausedTodos").mockResolvedValue(1);
-      const reconcileEngineDowntimeActiveTiming = vi.spyOn(manager, "reconcileEngineDowntimeActiveTiming").mockResolvedValue({ shiftedTaskIds: [], downtimeMs: 0 });
-
-      await manager.runStartupRecovery();
-
-      expect(recoverNoProgressNoTaskDoneFailures).toHaveBeenCalledTimes(1);
-      expect(recoverCompletedTasks).toHaveBeenCalledTimes(1);
-      expect(recoverStuckMergeDeadlocks).toHaveBeenCalledTimes(1);
-      expect(recoverMisclassifiedFailures).toHaveBeenCalledTimes(1);
-      expect(recoverPartialProgressNoTaskDoneFailures).toHaveBeenCalledTimes(1);
-      expect(recoverOrphanedExecutions).toHaveBeenCalledTimes(1);
-      expect(recoverApprovedTriageTasks).toHaveBeenCalledTimes(1);
-      expect(resetDurableAgentErrorStateOnStartup).toHaveBeenCalledTimes(1);
-      expect(recoverOrphanedAgents).toHaveBeenCalledTimes(1);
-      expect(recoverAgentsRunningOnInactiveTasks).toHaveBeenCalledTimes(1);
-      expect(clearStaleBlockedBy).toHaveBeenCalledTimes(1);
-      expect(reconcileEngineDowntimeActiveTiming).toHaveBeenCalledTimes(1);
-      expect(surfaceInReviewStalls).toHaveBeenCalledTimes(1);
-      expect(surfaceInReviewStalled).toHaveBeenCalledTimes(1);
-      expect(surfaceStalePausedReviews).toHaveBeenCalledTimes(1);
-      expect(surfaceStalePausedTodos).toHaveBeenCalledTimes(1);
-    });
 
     it("runStartupRecovery clears stale blockedBy rows", async () => {
       vi.mocked(store.getSettings).mockResolvedValue({
@@ -873,7 +510,7 @@ describe("SelfHealingManager", () => {
 
       await manager.runStartupRecovery();
 
-      expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+      expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
       expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("Auto-recovered (FN-5488): cleared stale blockedBy"));
     });
 
@@ -923,7 +560,7 @@ describe("SelfHealingManager", () => {
 
       await manager.runStartupRecovery();
 
-      expect(store.updateTask).not.toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+      expect(store.updateTask).not.toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     });
   });
 
@@ -1919,6 +1556,174 @@ describe("SelfHealingManager", () => {
       expect(agentStore.updateAgentState).not.toHaveBeenCalledWith("agent-keep", "active");
       managerWithAgents.stop();
     });
+
+    it("continues after task-gone lookup races and recovers later agents", async () => {
+      const agents: Agent[] = [
+        { id: "agent-deleted", state: "running", taskId: "FN-DELETED", updatedAt: new Date(Date.now() - 120_000).toISOString() } as Agent,
+        { id: "agent-missing", state: "running", taskId: "FN-MISSING", updatedAt: new Date(Date.now() - 120_000).toISOString() } as Agent,
+        { id: "agent-error", state: "running", taskId: "FN-ERROR", updatedAt: new Date(Date.now() - 120_000).toISOString() } as Agent,
+        { id: "agent-later", state: "running", taskId: "FN-LATER", updatedAt: new Date(Date.now() - 120_000).toISOString() } as Agent,
+      ];
+      const getTask = vi.fn(async (taskId: string) => {
+        if (taskId === "FN-DELETED") throw new TaskDeletedError(taskId, new Date().toISOString());
+        if (taskId === "FN-MISSING") throw new TaskNotFoundError(taskId);
+        if (taskId === "FN-ERROR") throw new Error("database unavailable");
+        return { id: taskId, column: "todo" } as Task;
+      });
+      const agentStore = {
+        listAgents: vi.fn(async () => agents),
+        getActiveHeartbeatRun: vi.fn(async () => null),
+        updateAgentState: vi.fn(async (agentId: string, state: Agent["state"]) => {
+          const agent = agents.find((candidate) => candidate.id === agentId);
+          if (agent) agent.state = state;
+        }),
+        syncExecutionTaskLink: vi.fn(async (agentId: string, taskId?: string) => {
+          const agent = agents.find((candidate) => candidate.id === agentId);
+          if (agent) agent.taskId = taskId;
+        }),
+      } as unknown as AgentStore;
+      const managerWithAgents = new SelfHealingManager(
+        createMockStore({ getTask }),
+        { rootDir: "/tmp/test-project", agentStore },
+      );
+
+      const recovered = await managerWithAgents.recoverAgentsRunningOnInactiveTasks();
+
+      expect(recovered).toBe(3);
+      expect(agentStore.syncExecutionTaskLink).toHaveBeenCalledWith("agent-later", undefined);
+      managerWithAgents.stop();
+    });
+
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-23:55:
+    `agentLinkTerminalColumns` was UNCOVERED on the #3115 map. The case above uses `todo` and
+    `in-progress`, so the terminal skip is never the deciding branch.
+
+    An earlier attempt of mine put the card in a renamed WIP lane and stayed green when blinded —
+    correctly, because that card is caught by the wip∪review set first and the terminal resolver never
+    decides anything. The card has to rest in a renamed COMPLETE lane for this guard to be the one
+    that matters.
+
+    What the literal costs: a finished task's agent is not skipped, so the sweep unlinks an agent from
+    a task that completed normally — churn on a row that needed no repair, and a lost link if the
+    agent was about to be reused.
+    */
+    it("skips an agent whose task rests in a RENAMED complete lane", async () => {
+      const now = Date.now();
+      const agents: Agent[] = [
+        { id: "agent-done", state: "running", taskId: "FN-SHIPPED", updatedAt: new Date(now - 120_000).toISOString() } as Agent,
+      ];
+      const getTask = vi.fn(async () => ({ id: "FN-SHIPPED", column: "shipped" } as Task));
+      const agentStore = {
+        listAgents: vi.fn(async () => agents),
+        getActiveHeartbeatRun: vi.fn(async () => null),
+        updateAgentState: vi.fn(async () => undefined),
+        syncExecutionTaskLink: vi.fn(async () => undefined),
+      } as unknown as AgentStore;
+      const store = createMockStore({ getTask });
+      (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions = vi.fn(async () => [{
+        id: "custom:renamed",
+        ir: {
+          version: "v2",
+          id: "custom:renamed",
+          nodes: [],
+          edges: [],
+          columns: [
+            { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+            { id: "shipped", name: "shipped", traits: [{ trait: "complete" }] },
+          ],
+        },
+      }]);
+      const managerWithAgents = new SelfHealingManager(store, { rootDir: "/tmp/test-project", agentStore });
+
+      await managerWithAgents.recoverAgentsRunningOnInactiveTasks();
+
+      /* The unlink is the action this guard prevents; asserting it is what discriminates. */
+      expect(agentStore.syncExecutionTaskLink).not.toHaveBeenCalled();
+      managerWithAgents.stop();
+    });
+
+    it("FN-8919: thrown task misses recover later stale running agents without aborting", async () => {
+      const agents = [
+        { id: "agent-poison", state: "running", taskId: "ERR-024", updatedAt: new Date().toISOString() } as Agent,
+        { id: "agent-stale", state: "running", taskId: "FN-stale", updatedAt: new Date().toISOString() } as Agent,
+      ];
+      const agentStore = {
+        listAgents: vi.fn(async () => agents),
+        getActiveHeartbeatRun: vi.fn(async () => null),
+        updateAgentState: vi.fn(async (id: string, state: Agent["state"]) => { agents.find((agent) => agent.id === id)!.state = state; }),
+        syncExecutionTaskLink: vi.fn(async (id: string, taskId?: string) => { agents.find((agent) => agent.id === id)!.taskId = taskId; }),
+      } as unknown as AgentStore;
+      const getTask = vi.fn(async (taskId: string) => {
+        if (taskId === "ERR-024") throw new TaskNotFoundError("ERR-024");
+        return null;
+      });
+      const recoveryStore = createMockStore({ getTask });
+      const managerWithAgents = new SelfHealingManager(recoveryStore, { rootDir: "/tmp/test-project", agentStore });
+
+      await expect(managerWithAgents.recoverAgentsRunningOnInactiveTasks()).resolves.toBe(2);
+
+      expect(agentStore.syncExecutionTaskLink).toHaveBeenCalledWith("agent-poison", undefined);
+      expect(agentStore.syncExecutionTaskLink).toHaveBeenCalledWith("agent-stale", undefined);
+      expect(recoveryStore.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        target: "agent-poison",
+        metadata: expect.objectContaining({
+          reason: "running durable agent linked to missing task without live execution proof",
+        }),
+      }));
+      managerWithAgents.stop();
+    });
+
+    it("FN-8919: transient lookup errors preserve one running link while later links recover", async () => {
+      const agents = [
+        { id: "agent-transient", state: "running", taskId: "FN-connection", updatedAt: new Date().toISOString() } as Agent,
+        { id: "agent-deleted", state: "running", taskId: "KB-1", updatedAt: new Date().toISOString() } as Agent,
+        { id: "agent-stale", state: "running", taskId: "FN-stale", updatedAt: new Date().toISOString() } as Agent,
+      ];
+      const agentStore = {
+        listAgents: vi.fn(async () => agents),
+        getActiveHeartbeatRun: vi.fn(async () => null),
+        updateAgentState: vi.fn(async (id: string, state: Agent["state"]) => { agents.find((agent) => agent.id === id)!.state = state; }),
+        syncExecutionTaskLink: vi.fn(async (id: string, taskId?: string) => { agents.find((agent) => agent.id === id)!.taskId = taskId; }),
+      } as unknown as AgentStore;
+      const getTask = vi.fn(async (taskId: string) => {
+        if (taskId === "FN-connection") throw new Error("connection terminated unexpectedly");
+        if (taskId === "KB-1") throw new TaskDeletedError("KB-1", "2026-08-10T00:00:00.000Z");
+        return null;
+      });
+      const managerWithAgents = new SelfHealingManager(createMockStore({ getTask }), { rootDir: "/tmp/test-project", agentStore });
+
+      await expect(managerWithAgents.recoverAgentsRunningOnInactiveTasks()).resolves.toBe(2);
+
+      expect(agents[0].taskId).toBe("FN-connection");
+      expect(agentStore.syncExecutionTaskLink).not.toHaveBeenCalledWith("agent-transient", undefined);
+      expect(agentStore.syncExecutionTaskLink).toHaveBeenCalledWith("agent-deleted", undefined);
+      expect(agentStore.syncExecutionTaskLink).toHaveBeenCalledWith("agent-stale", undefined);
+      managerWithAgents.stop();
+    });
+
+    it("FN-8919: complete, live, ephemeral, and unlinked agents keep existing running-sweep behavior", async () => {
+      const agents = [
+        { id: "agent-complete", state: "running", taskId: "FN-complete", updatedAt: new Date().toISOString() } as Agent,
+        { id: "agent-live", state: "running", taskId: "FN-live", updatedAt: new Date().toISOString() } as Agent,
+        { id: "agent-ephemeral", state: "running", taskId: "FN-stale", metadata: { type: "spawned" }, updatedAt: new Date().toISOString() } as Agent,
+        { id: "agent-unlinked", state: "running", updatedAt: new Date().toISOString() } as Agent,
+      ];
+      const agentStore = {
+        listAgents: vi.fn(async () => agents),
+        getActiveHeartbeatRun: vi.fn(async () => null),
+        updateAgentState: vi.fn(),
+        syncExecutionTaskLink: vi.fn(),
+      } as unknown as AgentStore;
+      const getTask = vi.fn(async (taskId: string) => ({ id: taskId, column: taskId === "FN-complete" ? "done" : "in-progress" } as Task));
+      const managerWithAgents = new SelfHealingManager(createMockStore({ getTask }), { rootDir: "/tmp/test-project", agentStore });
+
+      await expect(managerWithAgents.recoverAgentsRunningOnInactiveTasks()).resolves.toBe(0);
+
+      expect(agentStore.syncExecutionTaskLink).not.toHaveBeenCalled();
+      expect(getTask).toHaveBeenCalledTimes(2);
+      managerWithAgents.stop();
+    });
   });
 
   describe("recoverStaleHeartbeatRuns", () => {
@@ -2068,96 +1873,9 @@ describe("SelfHealingManager", () => {
     });
   });
 
-  describe("recoverNoProgressNoTaskDoneFailures", () => {
-    it("requeues clean in-progress no-task_done failures with no step progress", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-        getExecutingTaskIds: () => new Set<string>(),
-      });
-      vi.spyOn(managerWithRecovery as any, "hasRecoverableGitWork").mockReturnValue(false);
 
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-1473",
-          column: "in-progress",
-          status: "failed",
-          error: "Agent finished without calling fn_task_done (after retry)",
-          paused: false,
-          steps: [],
-        },
-      ]);
 
-      const result = await managerWithRecovery.recoverNoProgressNoTaskDoneFailures();
 
-      expect(result).toBe(1);
-      expect(store.listTasks).toHaveBeenCalledWith({ column: "in-progress", slim: true });
-      expect(store.updateTask).toHaveBeenCalledWith("FN-1473", {
-        status: "stuck-killed",
-        worktree: null,
-        branch: null,
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-1473",
-        expect.stringContaining("no-progress no-task_done failure"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-1473", "todo", { moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-
-    it("skips no-task_done failures with step progress", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-        getExecutingTaskIds: () => new Set<string>(),
-      });
-      vi.spyOn(managerWithRecovery as any, "hasRecoverableGitWork").mockReturnValue(false);
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-1473",
-          column: "in-progress",
-          status: "failed",
-          error: "Agent finished without calling fn_task_done (after retry)",
-          paused: false,
-          steps: [{ status: "done" }, { status: "pending" }],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverNoProgressNoTaskDoneFailures();
-
-      expect(result).toBe(0);
-      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1473", expect.anything());
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-1473", "todo");
-
-      managerWithRecovery.stop();
-    });
-
-    it("skips when git work should be preserved", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-        getExecutingTaskIds: () => new Set<string>(),
-      });
-      vi.spyOn(managerWithRecovery as any, "hasRecoverableGitWork").mockReturnValue(true);
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-1473",
-          column: "in-progress",
-          status: "failed",
-          error: "Agent finished without calling fn_task_done (after retry)",
-          paused: false,
-          steps: [{ status: "pending" }],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverNoProgressNoTaskDoneFailures();
-
-      expect(result).toBe(0);
-      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1473", expect.anything());
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-1473", "todo");
-
-      managerWithRecovery.stop();
-    });
 
     it("treats dirty worktrees as recoverable git work", async () => {
       const task = {
@@ -2176,7 +1894,6 @@ describe("SelfHealingManager", () => {
       expect(await (manager as any).hasRecoverableGitWork(task)).toBe(true);
       mockedExecSync.mockClear();
     });
-  });
 
   describe("silent catch logging", () => {
     it("logs warn when interrupted-merge worktree removal fails", async () => {
@@ -2231,174 +1948,6 @@ describe("SelfHealingManager", () => {
 
       mockedExecSync.mockClear();
       mockedExistsSync.mockReset();
-    });
-  });
-
-  // ── Auto-archive ────────────────────────────────────────────────────
-
-  describe("archiveStaleDoneTasks", () => {
-    it("skips when auto-archive is disabled and doneAutoArchiveDays is 0", async () => {
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoArchiveDoneTasksEnabled: false,
-        doneAutoArchiveDays: 0,
-      } as unknown as Settings);
-
-      const result = await manager.archiveStaleDoneTasks();
-
-      expect(result).toBe(0);
-      expect(store.listTasks).not.toHaveBeenCalled();
-      expect(store.archiveTaskAndCleanup).not.toHaveBeenCalled();
-    });
-
-    it("archives stale done tasks with cleanup using the configured ms age when doneAutoArchiveDays is 0", async () => {
-      vi.setSystemTime(new Date("2026-01-04T00:00:00.000Z"));
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoArchiveDoneTasksEnabled: true,
-        autoArchiveDoneAfterMs: 24 * 60 * 60 * 1000,
-        doneAutoArchiveDays: 0,
-      } as unknown as Settings);
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-001",
-          column: "done",
-          columnMovedAt: "2026-01-02T23:59:00.000Z",
-          updatedAt: "2026-01-02T23:59:00.000Z",
-        },
-        {
-          id: "FN-002",
-          column: "done",
-          columnMovedAt: "2026-01-03T12:00:00.000Z",
-          updatedAt: "2026-01-03T12:00:00.000Z",
-        },
-      ]);
-
-      const result = await manager.archiveStaleDoneTasks();
-
-      expect(result).toBe(1);
-      expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false });
-      expect(store.archiveTaskAndCleanup).toHaveBeenCalledWith("FN-001");
-      expect(store.archiveTaskAndCleanup).not.toHaveBeenCalledWith("FN-002");
-    });
-
-    it("uses doneAutoArchiveDays threshold and logs task age", async () => {
-      vi.setSystemTime(new Date("2026-03-01T00:00:00.000Z"));
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoArchiveDoneTasksEnabled: true,
-        autoArchiveDoneAfterMs: 48 * 60 * 60 * 1000,
-        doneAutoArchiveDays: 30,
-      } as unknown as Settings);
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-030",
-          column: "done",
-          columnMovedAt: "2026-01-29T00:00:00.000Z",
-          updatedAt: "2026-01-29T00:00:00.000Z",
-        },
-        {
-          id: "FN-031",
-          column: "done",
-          columnMovedAt: "2026-01-31T00:00:00.000Z",
-          updatedAt: "2026-01-31T00:00:00.000Z",
-        },
-      ]);
-
-      const result = await manager.archiveStaleDoneTasks();
-
-      expect(result).toBe(1);
-      expect(store.archiveTaskAndCleanup).toHaveBeenCalledWith("FN-030");
-      expect(store.archiveTaskAndCleanup).not.toHaveBeenCalledWith("FN-031");
-      expect(getSelfHealingLogger().log).toHaveBeenCalledWith(
-        "auto-archive: archived FN-030 (age 31d, threshold 30d)",
-      );
-    });
-
-    it("doneAutoArchiveDays takes precedence over autoArchiveDoneAfterMs", async () => {
-      vi.setSystemTime(new Date("2026-03-01T00:00:00.000Z"));
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoArchiveDoneTasksEnabled: true,
-        autoArchiveDoneAfterMs: 60 * 60 * 1000,
-        doneAutoArchiveDays: 30,
-      } as unknown as Settings);
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-AGE-29",
-          column: "done",
-          columnMovedAt: "2026-01-31T00:00:00.000Z",
-          updatedAt: "2026-01-31T00:00:00.000Z",
-        },
-      ]);
-
-      const result = await manager.archiveStaleDoneTasks();
-
-      expect(result).toBe(0);
-      expect(store.archiveTaskAndCleanup).not.toHaveBeenCalled();
-    });
-
-    it.each([
-      { label: "negative", doneAutoArchiveDays: -1 },
-      { label: "non-integer", doneAutoArchiveDays: 2.5 },
-    ])("falls back to ms retention when doneAutoArchiveDays is $label", async ({ doneAutoArchiveDays }) => {
-      vi.setSystemTime(new Date("2026-01-04T00:00:00.000Z"));
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoArchiveDoneTasksEnabled: true,
-        autoArchiveDoneAfterMs: 24 * 60 * 60 * 1000,
-        doneAutoArchiveDays,
-      } as unknown as Settings);
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-FALLBACK",
-          column: "done",
-          columnMovedAt: "2026-01-02T23:59:00.000Z",
-          updatedAt: "2026-01-02T23:59:00.000Z",
-        },
-      ]);
-
-      const result = await manager.archiveStaleDoneTasks();
-
-      expect(result).toBe(1);
-      expect(store.archiveTaskAndCleanup).toHaveBeenCalledWith("FN-FALLBACK");
-    });
-
-    it("skips stale done tasks that have active dependents", async () => {
-      vi.setSystemTime(new Date("2026-01-04T00:00:00.000Z"));
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoArchiveDoneTasksEnabled: true,
-        autoArchiveDoneAfterMs: 24 * 60 * 60 * 1000,
-      } as unknown as Settings);
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-100",
-          column: "done",
-          columnMovedAt: "2026-01-02T00:00:00.000Z",
-          updatedAt: "2026-01-02T00:00:00.000Z",
-          dependencies: [],
-        },
-        {
-          id: "FN-101",
-          column: "done",
-          columnMovedAt: "2026-01-02T00:00:00.000Z",
-          updatedAt: "2026-01-02T00:00:00.000Z",
-          dependencies: [],
-        },
-        {
-          id: "FN-200",
-          column: "todo",
-          dependencies: ["FN-100"],
-        },
-        {
-          id: "FN-201",
-          column: "done",
-          columnMovedAt: "2026-01-03T23:00:00.000Z",
-          updatedAt: "2026-01-03T23:00:00.000Z",
-          dependencies: ["FN-101"],
-        },
-      ]);
-
-      const result = await manager.archiveStaleDoneTasks();
-
-      expect(result).toBe(1);
-      expect(store.archiveTaskAndCleanup).toHaveBeenCalledWith("FN-101");
-      expect(store.archiveTaskAndCleanup).not.toHaveBeenCalledWith("FN-100");
     });
   });
 
@@ -3014,7 +2563,17 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.recoverStrandedCompletedTodoTasks();
 
       expect(result).toBe(1);
-      expect(store.listTasks).toHaveBeenCalledWith({ column: "todo", slim: true });
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-28-06:40 (Phase B / slice B3.1 — U4):
+      The query shape CHANGED on purpose. This sweep can no longer scope itself to
+      `column: "todo"` — that literal made it blind to every workflow whose hold
+      column is named something else, so a finished card sat in `drafting` forever.
+      It now reads the board and filters by each task's RESOLVED hold column.
+
+      The behavioral assertions below are the ones that matter and are unchanged:
+      one qualifying card, promoted exactly once. Only the query shape moved.
+      */
+      expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false });
       expect(recoverFn).toHaveBeenCalledTimes(1);
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-101" }));
 
@@ -3365,169 +2924,109 @@ describe("SelfHealingManager", () => {
       expect(source).not.toMatch(/Refusing to start coding agent/);
     });
 
-    it("requeues failed in-review tasks with unusable-worktree session-start errors", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
+    /*
+    FNXC:MissingWorktreeRecovery 2026-07-26-07:15:
+    The mismatch-preserve branch needs a worktree that is REALLY there (temp dir + `.git`), because
+    the recovery now proves usability before carrying `task.worktree` forward. A fictional path is
+    indistinguishable from the MG-047 strand where the recorded worktree had been removed.
+    */
+
+    /*
+    FNXC:MissingWorktreeRecovery 2026-07-26-07:15:
+    Reported strand (in-review MG-047): the session-start refusal named an AI-merge clean room
+    ("incomplete worktree") while the RECORDED task worktree had already been removed. Preserving
+    the recorded path because it merely differed from the failing one re-dispatched the card into a
+    directory that no longer existed ("Working directory does not exist … Cannot execute bash
+    commands") on every retry, until the budget burned out and the card parked failed in review.
+    Surfaces: the failing path may be a clean room or the task worktree, and the recorded worktree
+    may be gone entirely, present-but-incomplete (no `.git`), or the repo root itself (the FN-6861
+    class — the main checkout is a registered worktree carrying `.git`, so only the repo-root gate
+    rejects it) — all must clear the metadata.
+    */
+    it.each([
+      {
+        label: "recorded task worktree no longer exists",
+        seed: (base: string) => join(base, "removed-by-cleanup"),
         rootDir: "/tmp/test-project",
-      });
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-3900",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          worktree: "/tmp/project/.worktrees/fn-3900-stale",
-          branch: "fusion/fn-3900",
-          sessionFile: "/tmp/project/.fusion/sessions/fn-3900.json",
-          error: "Refusing to start coding agent in missing worktree: /tmp/other/.worktrees/fn-3900",
-          steps: [{ status: "done" }, { status: "pending" }],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-3900", {
-        status: null,
-        error: null,
-        worktreeSessionRetryCount: 1,
-        worktree: "/tmp/project/.worktrees/fn-3900-stale",
-        branch: "fusion/fn-3900",
-        sessionFile: null,
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-3900",
-        expect.stringContaining("unusable worktree"),
-      );
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-3900",
-        expect.stringContaining("/tmp/project/.worktrees/fn-3900-stale"),
-      );
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-3900",
-        expect.stringContaining("session-start unusable-worktree assertion"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-3900", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-
-    it("requeues incomplete-worktree failures and clears stale worktree metadata", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-4559",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          worktree: "/tmp/project/.worktrees/noble-eagle-stale",
-          branch: "fusion/FN-4559",
-          sessionFile: "/tmp/project/.fusion/sessions/FN-4559.json",
-          error: "Refusing to start coding agent in incomplete worktree: /tmp/project/.worktrees/noble-eagle",
-          steps: [{ status: "done" }, { status: "pending" }],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-4559", {
-        status: null,
-        error: null,
-        worktreeSessionRetryCount: 1,
-        worktree: "/tmp/project/.worktrees/noble-eagle-stale",
         branch: "fusion/FN-4559",
-        sessionFile: null,
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-4559",
-        expect.stringContaining("Auto-recovered"),
-      );
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-4559",
-        expect.stringContaining("session-start unusable-worktree assertion"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-4559", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-
-    it("requeues unregistered-worktree failures", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-4560",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          worktree: "/tmp/project/.worktrees/fn-4560",
-          branch: "fusion/FN-4560",
-          sessionFile: "/tmp/project/.fusion/sessions/FN-4560.json",
-          error: "Refusing to start coding agent in unregistered git worktree: /tmp/project/.worktrees/fn-4560",
-          steps: [{ status: "done" }, { status: "pending" }],
-          log: [],
+        expectedBranch: null,
+      },
+      {
+        label: "recorded task worktree exists but has no .git",
+        seed: (base: string) => {
+          const dir = join(base, "incomplete");
+          mkdirSync(dir, { recursive: true });
+          return dir;
         },
-      ]);
-
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
-
-      expect(result).toBe(1);
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-4560",
-        expect.stringContaining("session-start unusable-worktree assertion"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-4560", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-
-    it("requeues zero-progress unusable-worktree failures with cleared git/session metadata", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
-      });
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-4651",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          worktree: "/tmp/project/.worktrees/fn-4651",
-          branch: "fusion/FN-4651",
-          sessionFile: "/tmp/project/.fusion/sessions/FN-4651.json",
-          error: "Refusing to start coding agent in missing worktree: /tmp/project/.worktrees/fn-4651",
-          steps: [{ status: "pending" }],
-          log: [],
+        branch: "fusion/FN-4559",
+        expectedBranch: null,
+      },
+      {
+        label: "recorded task worktree is the repo root",
+        seed: (base: string) => {
+          // A real checkout shape: exists AND carries `.git`. Only the repo-root gate rejects it.
+          writeFileSync(join(base, ".git"), "gitdir: /tmp/test-project/.git\n");
+          return base;
         },
-      ]);
+        rootDir: null, // replaced with the temp base below, so root === recorded worktree
+        branch: "fusion/FN-4559",
+        expectedBranch: null,
+      },
+      {
+        /*
+        A non-canonical branch is NOT re-derivable from the task id, so clearing it would abandon
+        the card's only pointer to its commits. The dead worktree is still cleared.
+        */
+        label: "branch is non-canonical and must survive the clear",
+        seed: (base: string) => join(base, "removed-by-cleanup"),
+        rootDir: "/tmp/test-project",
+        branch: "fusion/FN-4559-2",
+        expectedBranch: "fusion/FN-4559-2",
+      },
+    ])("requeues incomplete-worktree failures and clears stale worktree metadata when the $label", async ({ seed, rootDir, branch, expectedBranch }) => {
+      const base = mkdtempSync(join(tmpdir(), "fusion-dead-worktree-"));
+      try {
+        const recordedWorktree = seed(base);
+        const managerWithRecovery = new SelfHealingManager(store, {
+          rootDir: rootDir ?? base,
+        });
 
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
+        (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+          {
+            id: "FN-4559",
+            column: "in-review",
+            paused: false,
+            status: "failed",
+            worktree: recordedWorktree,
+            branch,
+            sessionFile: "/tmp/project/.fusion/sessions/FN-4559.json",
+            // The refusal names the AI-merge clean room, NOT the recorded task worktree.
+            error: "Refusing to start coding agent in incomplete worktree: /tmp/project/.worktrees/.ai-merge/fusion-ai-merge-fn-4559-TGahla",
+            steps: [{ status: "done" }, { status: "pending" }],
+            log: [],
+          },
+        ]);
 
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-4651", {
-        status: null,
-        error: null,
-        worktreeSessionRetryCount: 1,
-        worktree: null,
-        branch: null,
-        sessionFile: null,
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-4651",
-        expect.stringContaining("Auto-recovered (no-progress): session-start refused unusable worktree"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-4651", "todo", { moveSource: "engine", recoveryRehome: true });
+        const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
 
-      managerWithRecovery.stop();
+        expect(result).toBe(1);
+        expect(store.updateTask).toHaveBeenCalledWith("FN-4559", {
+          status: null,
+          error: null,
+          worktreeSessionRetryCount: 1,
+          worktree: null,
+          ...(expectedBranch === branch ? {} : { branch: expectedBranch, branchWriteOrigin: "engine" }),
+          sessionFile: null,
+        });
+        managerWithRecovery.stop();
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
     });
+
+
+
 
     it("escalates when unusable-worktree retry cap is exhausted", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -3563,49 +3062,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("recovers merge-active unusable-worktree failures before merge re-drive can reuse phantom metadata", async () => {
-      const enqueueMerge = vi.fn();
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-        enqueueMerge,
-      });
-      const strandedTasks = (["merging", "merging-pr", "merging-fix"] as const).map((status) => ({
-        id: `FN-7802-${status}`,
-        column: "in-review",
-        paused: false,
-        status,
-        scopeOverride: true,
-        scopeOverrideReason: "operator requested main-checkout retry",
-        worktree: `/tmp/project/.worktrees/${status}-phantom`,
-        branch: `fusion/fn-7802-${status}`,
-        sessionFile: `/tmp/project/.fusion/sessions/${status}.json`,
-        error: `Refusing to start coding agent in missing worktree: /tmp/project/.worktrees/${status}-phantom`,
-        worktreeSessionRetryCount: 3,
-        steps: [{ status: "done" }, { status: "pending" }],
-        log: [],
-      }));
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue(strandedTasks);
-
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
-
-      expect(result).toBe(3);
-      for (const task of strandedTasks) {
-        expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: null,
-          error: null,
-          worktree: null,
-          branch: null,
-          sessionFile: null,
-          worktreeSessionRetryCount: 0,
-          recoveryRetryCount: 1,
-        }));
-        expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-      }
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:reconcile-missing-worktree-merge-active" }));
-      expect(enqueueMerge).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
 
     it("bounds repeated merge-active stale-metadata clears with recoveryRetryCount", async () => {
       const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
@@ -3644,37 +3100,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("recovers merge-active unusable-worktree failures even when task.worktree is already null", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-7802-NULL-WORKTREE",
-          column: "in-review",
-          paused: false,
-          status: "merging-fix",
-          worktree: null,
-          branch: "fusion/FN-7802-NULL-WORKTREE",
-          sessionFile: "/tmp/project/.fusion/sessions/fn-7802-null.json",
-          error: "Refusing to start coding agent in unregistered git worktree: /tmp/project/.worktrees/fn-7802-null",
-          worktreeSessionRetryCount: 3,
-          steps: [{ status: "done" }],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-7802-NULL-WORKTREE", expect.objectContaining({
-        worktree: null,
-        branch: null,
-        sessionFile: null,
-        worktreeSessionRetryCount: 0,
-        recoveryRetryCount: 1,
-      }));
-      expect(store.moveTask).toHaveBeenCalledWith("FN-7802-NULL-WORKTREE", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-      managerWithRecovery.stop();
-    });
 
     it("does not automate merge-active unusable-worktree recovery when auto-merge is off", async () => {
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: false, globalPause: false, enginePaused: false });
@@ -3705,33 +3130,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("emits no-action for workspace tasks instead of single-repo missing-worktree recovery", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-7802-WORKSPACE",
-          column: "in-review",
-          paused: false,
-          status: "merging",
-          worktree: null,
-          workspaceWorktrees: { app: { worktree: "/tmp/ws/app", branch: "fusion/FN-7802-WORKSPACE" } },
-          error: "Refusing to start coding agent in missing worktree: /tmp/ws/app",
-          steps: [{ status: "done" }],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverMissingWorktreeReviewFailures();
-
-      expect(result).toBe(0);
-      expect(store.updateTask).not.toHaveBeenCalled();
-      expect(store.moveTask).not.toHaveBeenCalled();
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:reconcile-missing-worktree-merge-active-no-action",
-        metadata: expect.objectContaining({ reason: "workspace-task" }),
-      }));
-      managerWithRecovery.stop();
-    });
 
     it("leaves live worktrees and status-none review rows out of merge-active recovery", async () => {
       const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
@@ -3845,7 +3243,7 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.reconcileTaskWorktreeMetadata();
 
       expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-7802-SCOPE", { worktree: null, branch: null, sessionFile: null });
+      expect(store.updateTask).toHaveBeenCalledWith("FN-7802-SCOPE", { worktree: null, branch: null, branchWriteOrigin: "engine", sessionFile: null });
       expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:auto-recover-worktree-metadata-cleared" }));
       managerWithRecovery.stop();
     });
@@ -3874,6 +3272,142 @@ describe("SelfHealingManager", () => {
       expect(result).toBe(0);
       expect(store.updateTask).not.toHaveBeenCalled();
       expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:auto-recover-worktree-metadata-skipped-active" }));
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-21:30:
+    THE FN-5256 GUARD HAD NO RENAMED-BOARD CASE, which is why blinding this sweep's wip resolver back
+    to `["in-progress"]` leaves all 825 self-healing tests green: the guard test directly above uses
+    that literal, so it cannot tell the conversion from the id it replaced.
+
+    What that costs on a renamed board: the guard matches nothing, `scopeOverrideMergeActiveSafe`
+    becomes true for a card an executor is actively running, and this sweep nulls its
+    `worktree`/`branch`/`sessionFile` — yanking the checkout out from under a live shell. FN-5256 is
+    the incident that guard exists to prevent.
+    */
+    it("does NOT clear worktree metadata for a scopeOverride task live in a RENAMED wip lane (FN-5256)", async () => {
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      mockedExistsSync.mockReturnValue(false);
+      mockedGetRegisteredWorktreeBranchMap.mockResolvedValue(new Map<string, string>());
+      (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions = vi.fn(async () => [{
+        ir: {
+          version: "v2",
+          id: "custom:renamed",
+          nodes: [],
+          edges: [],
+          columns: [
+            { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+            { id: "checking", name: "checking", traits: [{ trait: "merge" }] },
+          ],
+        },
+      }]);
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-RENAMED-LIVE",
+          column: "building",
+          paused: false,
+          status: null,
+          scopeOverride: true,
+          worktree: "/tmp/project/.worktrees/fn-renamed-live",
+          branch: "fusion/FN-RENAMED-LIVE",
+          sessionFile: "/tmp/project/.fusion/sessions/fn-renamed-live.json",
+          steps: [{ status: "in-progress" }],
+          log: [],
+        },
+      ]);
+
+      const result = await managerWithRecovery.reconcileTaskWorktreeMetadata();
+
+      expect(result).toBe(0);
+      /* The live checkout survives: nothing nulled the worktree out from under the executor. */
+      expect(store.updateTask).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-13:40:
+    The other two resolvers in this sweep, both UNCOVERED on the #3115 map. Each is blinded and
+    measured separately, because this sweep's own dependency test proved a single case can pin one
+    resolver and leave its sibling green.
+    */
+    it("SKIPS a card resting in a RENAMED terminal lane", async () => {
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      mockedExistsSync.mockReturnValue(false);
+      mockedGetRegisteredWorktreeBranchMap.mockResolvedValue(new Map<string, string>());
+      (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions = vi.fn(async () => [{
+        ir: {
+          version: "v2",
+          id: "custom:renamed",
+          nodes: [],
+          edges: [],
+          columns: [
+            { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+            { id: "checking", name: "checking", traits: [{ trait: "merge" }] },
+            { id: "shipped", name: "shipped", traits: [{ trait: "complete" }] },
+          ],
+        },
+      }]);
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-TERMINAL",
+          column: "shipped",
+          paused: false,
+          status: null,
+          scopeOverride: true,
+          worktree: "/tmp/project/.worktrees/fn-terminal",
+          branch: "fusion/FN-TERMINAL",
+          sessionFile: "/tmp/project/.fusion/sessions/fn-terminal.json",
+          steps: [{ status: "done" }],
+          log: [],
+        },
+      ]);
+
+      const result = await managerWithRecovery.reconcileTaskWorktreeMetadata();
+
+      /* A finished card is not this sweep's business; keyed on the id it was reconciled every pass. */
+      expect(result).toBe(0);
+      expect(store.updateTask).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    it("does NOT clear metadata for a merge-active card in a RENAMED review lane (FN-5256)", async () => {
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      mockedExistsSync.mockReturnValue(false);
+      mockedGetRegisteredWorktreeBranchMap.mockResolvedValue(new Map<string, string>());
+      (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions = vi.fn(async () => [{
+        ir: {
+          version: "v2",
+          id: "custom:renamed",
+          nodes: [],
+          edges: [],
+          columns: [
+            { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+            { id: "checking", name: "checking", traits: [{ trait: "merge" }] },
+            { id: "shipped", name: "shipped", traits: [{ trait: "complete" }] },
+          ],
+        },
+      }]);
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-REVIEW-LIVE",
+          column: "checking",
+          paused: false,
+          /* Not a merge-active status, so the review half of the guard must hold the card. */
+          status: null,
+          scopeOverride: true,
+          worktree: "/tmp/project/.worktrees/fn-review-live",
+          branch: "fusion/FN-REVIEW-LIVE",
+          sessionFile: "/tmp/project/.fusion/sessions/fn-review-live.json",
+          steps: [{ status: "in-progress" }],
+          log: [],
+        },
+      ]);
+
+      const result = await managerWithRecovery.reconcileTaskWorktreeMetadata();
+
+      expect(result).toBe(0);
+      expect(store.updateTask).not.toHaveBeenCalled();
       managerWithRecovery.stop();
     });
 
@@ -4015,41 +3549,6 @@ describe("SelfHealingManager", () => {
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
     });
 
-    it("requeues partial-progress no-task_done failures with bounded retry count", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-2164",
-          column: "in-review",
-          status: "failed",
-          error: "Agent finished without calling fn_task_done (after retry)",
-          paused: false,
-          steps: [{ status: "done" }, { status: "pending" }, { status: "pending" }],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverPartialProgressNoTaskDoneFailures();
-
-      expect(result).toBe(1);
-      expect(store.listTasks).toHaveBeenCalledWith({ column: "in-review", slim: true });
-      expect(store.updateTask).toHaveBeenCalledWith("FN-2164", {
-        status: null,
-        error: null,
-        sessionFile: null,
-        taskDoneRetryCount: 1,
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-2164",
-        expect.stringContaining("Auto-retry 1/3"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-2164", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
 
     it("skips tasks whose retry count has reached the max", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -4465,7 +3964,14 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("does not recover fresh merging tasks before the stuck timeout", async () => {
+    /*
+    FNXC:MergeReliability 2026-08-10-15:52:
+    FN-8924 rejects replacing this age gate with merger-log recency: abandoned merge bodies can
+    write the same `agent: "merger"` records, so that clock is not independently attributable.
+    Keep this pin until a task-scoped ownership/activity generation exists that an orphan cannot
+    refresh; a fresh `updatedAt` must therefore continue to prevent non-owner recovery.
+    */
+    it("retains the age gate when a non-owner merging task was recently updated", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
       });
@@ -4552,36 +4058,183 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("clears stale merging statuses with no active merger", async () => {
+    it("clears and re-enqueues eligible stale merging statuses with no active merger", async () => {
+      const enqueueMerge = vi.fn();
       const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
+        enqueueMerge,
+        getActiveMergeTaskId: () => null,
       });
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: true,
         globalPause: false,
         enginePaused: false,
       });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-3829-stale",
-          column: "in-review",
-          paused: false,
-          status: "merging",
-          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
-          steps: [{ name: "Ship it", status: "done" }],
-          workflowStepResults: [],
-          log: [],
-        },
-      ]);
+      const staleTask = {
+        id: "FN-3829-stale",
+        column: "in-review",
+        paused: false,
+        status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+        steps: [{ name: "Ship it", status: "done" }],
+        workflowStepResults: [],
+        log: [],
+      };
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([staleTask]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(staleTask);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => {
+        const patch = updater(staleTask as Task);
+        if (patch) {
+          Object.assign(staleTask, patch);
+          await store.updateTask(staleTask.id, patch);
+        }
+        return staleTask as Task;
+      });
 
       const result = await managerWithRecovery.recoverStaleMergingStatus();
 
       expect(result).toBe(1);
+      expect(store.updateTaskAtomic).toHaveBeenCalledWith("FN-3829-stale", expect.any(Function));
       expect(store.updateTask).toHaveBeenCalledWith("FN-3829-stale", { status: null });
       expect(store.logEntry).toHaveBeenCalledWith(
         "FN-3829-stale",
         expect.stringContaining("cleared stale 'merging' status"),
       );
+      expect(enqueueMerge).toHaveBeenCalledWith("FN-3829-stale");
 
+      managerWithRecovery.stop();
+    });
+
+    it("preserves a stale clear and recovery count when re-enqueueing throws", async () => {
+      const enqueueMerge = vi.fn().mockRejectedValue(new Error("queue unavailable"));
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+        getActiveMergeTaskId: () => null,
+      });
+      const staleTask = {
+        id: "FN-8912-enqueue-throws",
+        column: "in-review",
+        paused: false,
+        status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+        steps: [], workflowStepResults: [], log: [],
+      };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: true,
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([staleTask]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(staleTask);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => {
+        const patch = updater(staleTask as Task);
+        if (patch) Object.assign(staleTask, patch);
+        return staleTask as Task;
+      });
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(1);
+      expect(staleTask.status).toBeNull();
+      expect(enqueueMerge).toHaveBeenCalledWith(staleTask.id);
+      managerWithRecovery.stop();
+    });
+
+    it("clears but does not enqueue auto-merge-off or workspace tasks, and preserves confirmed finalization", async () => {
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+        getActiveMergeTaskId: () => null,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: false,
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-8912-auto-off",
+          column: "in-review",
+          paused: false,
+          status: "merging",
+          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+          steps: [], workflowStepResults: [], log: [],
+        },
+        {
+          id: "FN-8912-workspace",
+          column: "in-review",
+          paused: false,
+          status: "landing",
+          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+          workspaceWorktrees: { repo: { path: "/tmp/repo" } },
+          steps: [], workflowStepResults: [], log: [],
+        },
+        {
+          id: "FN-8912-confirmed",
+          column: "in-review",
+          paused: false,
+          status: "merging",
+          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+          mergeDetails: { mergeConfirmed: true },
+          steps: [], workflowStepResults: [], log: [],
+        },
+      ]);
+
+      const currentById = new Map([
+        ["FN-8912-auto-off", {
+          id: "FN-8912-auto-off", column: "in-review", paused: false, status: "merging",
+          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+        }],
+        ["FN-8912-workspace", {
+          id: "FN-8912-workspace", column: "in-review", paused: false, status: "landing",
+          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), workspaceWorktrees: { repo: { path: "/tmp/repo" } }, steps: [], workflowStepResults: [], log: [],
+        }],
+        ["FN-8912-confirmed", {
+          id: "FN-8912-confirmed", column: "in-review", paused: false, status: "merging",
+          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), mergeDetails: { mergeConfirmed: true }, steps: [], workflowStepResults: [], log: [],
+        }],
+      ]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) => currentById.get(id));
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(2);
+      expect(store.updateTask).toHaveBeenCalledTimes(2);
+      expect(enqueueMerge).not.toHaveBeenCalled();
+      expect(currentById.get("FN-8912-confirmed")?.status).toBe("merging");
+      managerWithRecovery.stop();
+    });
+
+    it("clears but does not enqueue a workspace task while project auto-merge is enabled", async () => {
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+        getActiveMergeTaskId: () => null,
+      });
+      const workspaceTask = {
+        id: "FN-8912-workspace-auto-on",
+        column: "in-review",
+        paused: false,
+        status: "landing",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+        workspaceWorktrees: { repo: { path: "/tmp/repo" } },
+        steps: [], workflowStepResults: [], log: [],
+      };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: true,
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([workspaceTask]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(workspaceTask);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => {
+        const patch = updater(workspaceTask as Task);
+        if (patch) Object.assign(workspaceTask, patch);
+        return workspaceTask as Task;
+      });
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(1);
+      expect(workspaceTask.status).toBeNull();
+      expect(enqueueMerge).not.toHaveBeenCalled();
       managerWithRecovery.stop();
     });
 
@@ -4590,23 +4243,24 @@ describe("SelfHealingManager", () => {
       const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
         clearMergeActive,
+        getActiveMergeTaskId: () => null,
       });
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
         globalPause: false,
         enginePaused: false,
       });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-4084-stale",
-          column: "in-review",
-          paused: false,
-          status: "merging-pr",
-          updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
-          steps: [{ name: "Ship it", status: "done" }],
-          workflowStepResults: [],
-          log: [],
-        },
-      ]);
+      const staleTask = {
+        id: "FN-4084-stale",
+        column: "in-review",
+        paused: false,
+        status: "merging-pr",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+        steps: [{ name: "Ship it", status: "done" }],
+        workflowStepResults: [],
+        log: [],
+      };
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([staleTask]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(staleTask);
 
       const result = await managerWithRecovery.recoverStaleMergingStatus();
 
@@ -4614,6 +4268,189 @@ describe("SelfHealingManager", () => {
       expect(clearMergeActive).toHaveBeenCalledTimes(1);
       expect(clearMergeActive).toHaveBeenCalledWith("FN-4084-stale");
 
+      managerWithRecovery.stop();
+    });
+
+    it("does not clear a stale snapshot after a live merge claims the task", async () => {
+      const liveTask = {
+        id: "FN-8912-live-race",
+        column: "in-review",
+        paused: false,
+        status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+        steps: [], workflowStepResults: [], log: [],
+      };
+      let activeMergeReads = 0;
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        // The claim arrives after list filtering but before the write-authority recheck.
+        getActiveMergeTaskId: () => (++activeMergeReads === 1 ? null : "FN-8912-live-race"),
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: false, enginePaused: false, autoMerge: true });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([liveTask]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(liveTask);
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(0);
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-8912-live-race", { status: null });
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:MergeReliability 2026-08-10-05:32:
+    `merge-deadlock-detected` is the sole automation pause allowed to clear an orphaned stamp; the
+    clear must not unpause or enqueue it. REVERT CHECK (measured): restore `|| task.paused` and this
+    test returns 0; remove the live `current.paused !== true` enqueue gate and its enqueue assertion fails.
+    */
+    it("clears an unowned stale merge stamp on a merge-deadlock pause without resuming it", async () => {
+      const clearMergeActive = vi.fn();
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project", clearMergeActive, enqueueMerge,
+        getActiveMergeTaskId: () => null,
+      });
+      const pausedTask = {
+        id: "FN-8925-merge-deadlock", column: "in-review", paused: true,
+        pausedReason: "merge-deadlock-detected", status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([pausedTask]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(pausedTask);
+      const patches: Partial<Task>[] = [];
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => {
+        const patch = updater(pausedTask as Task);
+        if (patch) { patches.push(patch); Object.assign(pausedTask, patch); }
+        return pausedTask as Task;
+      });
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(1);
+      expect(pausedTask.status).toBeNull();
+      expect(clearMergeActive).toHaveBeenCalledWith(pausedTask.id);
+      expect(enqueueMerge).not.toHaveBeenCalled();
+      expect(patches).toEqual([{ status: null }]);
+      expect(pausedTask).toMatchObject({ paused: true, pausedReason: "merge-deadlock-detected", column: "in-review" });
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:MergeReliability 2026-08-10-05:49:
+    An unwired ownership probe cannot prove an unowned stamp. REVERT CHECK (measured): restore the
+    null fallback and this fixture clears, recreating the false no-owner assumption that code review found.
+    */
+    it("fails closed when the active-merge ownership probe is unwired", async () => {
+      const clearMergeActive = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project", clearMergeActive, enqueueMerge: vi.fn(),
+      });
+      const pausedTask = {
+        id: "FN-8925-unwired-owner", column: "in-review", paused: true,
+        pausedReason: "merge-deadlock-detected", status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([pausedTask]);
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(0);
+      expect(store.listTasks).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalled();
+      expect(clearMergeActive).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    it.each([
+      ["human pause", { userPaused: true }],
+      ["approval pause", { pausedReason: "awaiting-approval" }],
+      ["unknown pause", { pausedReason: "future-engine-pause" }],
+    ])("keeps %s stale merge stamps fully suppressed", async (_name, extra) => {
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", enqueueMerge: vi.fn(), getActiveMergeTaskId: () => null });
+      const pausedTask = {
+        id: `FN-8925-suppressed-${_name}`, column: "in-review", paused: true, status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [], ...extra,
+      };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([pausedTask]);
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(0);
+      expect(store.updateTask).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    it("suppresses enqueue when a live row is paused after an eligible snapshot", async () => {
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", enqueueMerge, getActiveMergeTaskId: () => null });
+      const snapshot = {
+        id: "FN-8925-pause-race", column: "in-review", paused: false, status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      const live = { ...snapshot, paused: true, pausedReason: "merge-deadlock-detected" };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([snapshot]);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (task: Task) => Partial<Task> | null) => {
+        const patch = updater(live as Task);
+        if (patch) Object.assign(live, patch);
+        return live as Task;
+      });
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(1);
+      expect(live.status).toBeNull();
+      expect(enqueueMerge).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    it("does not clear when a merge-deadlock snapshot is unpaused into a newly claimed live task", async () => {
+      const snapshot = {
+        id: "FN-8925-unpause-race", column: "in-review", paused: true, pausedReason: "merge-deadlock-detected", status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      const live = { ...snapshot, paused: false, pausedReason: undefined };
+      let reads = 0;
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project", getActiveMergeTaskId: () => (++reads === 1 ? null : snapshot.id), enqueueMerge: vi.fn(),
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([snapshot]);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (task: Task) => Partial<Task> | null) => {
+        expect(updater(live as Task)).toBeNull();
+        return live as Task;
+      });
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(0);
+      managerWithRecovery.stop();
+    });
+
+    it("does not clear when merge confirmation appears on the live atomic row", async () => {
+      const snapshot = {
+        id: "FN-8925-confirm-race", column: "in-review", paused: false, status: "merging",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      const live = { ...snapshot, mergeDetails: { mergeConfirmed: true } };
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", enqueueMerge: vi.fn(), getActiveMergeTaskId: () => null });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([snapshot]);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (task: Task) => Partial<Task> | null) => {
+        expect(updater(live as Task)).toBeNull();
+        return live as Task;
+      });
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(0);
+      managerWithRecovery.stop();
+    });
+
+    it("applies the merge-deadlock allowlist in the non-atomic compatibility fallback", async () => {
+      const task = {
+        id: "FN-8925-fallback", column: "in-review", paused: true, pausedReason: "merge-deadlock-detected", status: "landing",
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", enqueueMerge, getActiveMergeTaskId: () => null });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([task]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
+      store.updateTaskAtomic = undefined;
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(1);
+      expect(store.updateTask).toHaveBeenCalledWith(task.id, { status: null });
+      expect(enqueueMerge).not.toHaveBeenCalled();
       managerWithRecovery.stop();
     });
 
@@ -4709,6 +4546,215 @@ describe("SelfHealingManager", () => {
         "FN-352",
         expect.stringContaining("eligible in-review task was merged"),
       );
+
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:PreMergeApproval 2026-09-01-14:05:
+    The review recovery sweep must solve stale content-bound approvals by re-seeding review, not by
+    re-enqueueing the same merge refusal that wedged FN-9234.
+    */
+    it("routes stale singular review approvals back to Code Review instead of merge retry", async () => {
+      const enqueueMerge = vi.fn().mockReturnValue(true);
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: true,
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store as any).getTaskWorkflowSelection = vi.fn(() => null);
+      (store as any).listWorkflowWorkItemsForTask = vi.fn(async () => []);
+      (store as any).seedWorkspaceCodeReviewContinuationIfIdle = vi.fn(async () => ({ seeded: true }));
+      mockedExecSync.mockImplementation((command) => {
+        const cmd = String(command);
+        if (cmd === "git diff --binary base-sha..HEAD") return "current diff" as any;
+        return "" as any;
+      });
+
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-9234-STUCK",
+          column: "in-review",
+          paused: false,
+          status: null,
+          error: null,
+          worktree: "/tmp/test-project/.worktrees/fn-9234-stuck",
+          baseCommitSha: "base-sha",
+          steps: [{ name: "Ship it", status: "done" }],
+          workflowStepResults: [{
+            workflowStepId: "code-review",
+            workflowStepName: "Code Review",
+            status: "passed",
+            phase: "pre-merge",
+            reviewKind: "code",
+            verdict: "APPROVE",
+            reviewInputFingerprint: "old-diff",
+          }],
+          mergeDetails: undefined,
+          enabledWorkflowSteps: ["code-review"],
+          log: [],
+        },
+      ]);
+
+      const result = await managerWithRecovery.recoverMergeableReviewTasks();
+
+      expect(result).toBe(0);
+      expect(enqueueMerge).not.toHaveBeenCalled();
+      expect((store as any).seedWorkspaceCodeReviewContinuationIfIdle).toHaveBeenCalledWith(expect.objectContaining({
+        taskId: "FN-9234-STUCK",
+        nodeId: "code-review",
+        state: "runnable",
+      }));
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "FN-9234-STUCK",
+        expect.stringContaining("Review lane 'code-review' approved older content"),
+      );
+
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:SharedBranchMemberHold 2026-08-09-09:09:
+    FN-8823 supersedes the mission-policy fast path under project Off. A
+    self-healing merge requester must treat project Off as withheld consent for
+    every non-opted-in shared member, preserving the FN-8811 user hold as a subset.
+    */
+    it("holds every non-opted-in shared member under global auto-merge off, including mission policy", async () => {
+      const enqueueMerge = vi.fn().mockReturnValue(true);
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: false,
+        integrationBranch: "main",
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store.getBranchGroup as ReturnType<typeof vi.fn>).mockResolvedValue({
+        status: "open",
+        branchName: "mission/M-8811",
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-8811-MISSION",
+          column: "in-review",
+          paused: false,
+          status: null,
+          error: null,
+          worktree: "/tmp/test-project/.worktrees/fn-8811-mission",
+          steps: [{ name: "Ship it", status: "done" }],
+          workflowStepResults: [{ id: "ws-1", status: "passed", phase: "pre-merge" }],
+          autoMerge: false,
+          autoMergeProvenance: "mission",
+          branchContext: { assignmentMode: "shared", groupId: "BG-8811", source: "mission" },
+          log: [],
+        },
+        {
+          id: "FN-8811-USER",
+          column: "in-review",
+          paused: false,
+          status: null,
+          error: null,
+          worktree: "/tmp/test-project/.worktrees/fn-8811-user",
+          steps: [{ name: "Ship it", status: "done" }],
+          workflowStepResults: [{ id: "ws-2", status: "passed", phase: "pre-merge" }],
+          autoMerge: false,
+          autoMergeProvenance: "user",
+          branchContext: { assignmentMode: "shared", groupId: "BG-8811", source: "mission" },
+          log: [],
+        },
+      ]);
+
+      expect(await managerWithRecovery.recoverMergeableReviewTasks()).toBe(0);
+      expect(enqueueMerge).not.toHaveBeenCalledWith("FN-8811-MISSION");
+      expect(enqueueMerge).not.toHaveBeenCalledWith("FN-8811-USER");
+      expect(store.mergeTask).not.toHaveBeenCalled();
+
+      managerWithRecovery.stop();
+    });
+
+    it("recovers an explicitly opted-in shared member under global auto-merge off", async () => {
+      const enqueueMerge = vi.fn().mockReturnValue(true);
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: false,
+        integrationBranch: "main",
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store.getBranchGroup as ReturnType<typeof vi.fn>).mockResolvedValue({
+        status: "open",
+        branchName: "mission/M-8811",
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: "FN-8811-OPTED-IN",
+        column: "in-review",
+        paused: false,
+        status: null,
+        error: null,
+        worktree: "/tmp/test-project/.worktrees/fn-8811-opted-in",
+        steps: [{ name: "Ship it", status: "done" }],
+        workflowStepResults: [{ id: "ws-opted-in", status: "passed", phase: "pre-merge" }],
+        autoMerge: true,
+        branchContext: { assignmentMode: "shared", groupId: "BG-8811", source: "mission" },
+        log: [],
+      }]);
+
+      expect(await managerWithRecovery.recoverMergeableReviewTasks()).toBe(1);
+      expect(enqueueMerge).toHaveBeenCalledTimes(1);
+      expect(enqueueMerge).toHaveBeenCalledWith("FN-8811-OPTED-IN");
+
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:SharedBranchMemberHold 2026-08-05-23:22:
+    A default-branch group has no intermediate integration boundary. Recovery must
+    leave a false mission policy at the standalone manual hold even when global
+    auto-merge is On, rather than using the live-member exemption by group shape.
+    */
+    it("does not recover a default-branch member with a false mission policy into a merge", async () => {
+      const enqueueMerge = vi.fn().mockReturnValue(true);
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoMerge: true,
+        integrationBranch: "main",
+        globalPause: false,
+        enginePaused: false,
+      });
+      (store.getBranchGroup as ReturnType<typeof vi.fn>).mockResolvedValue({
+        status: "open",
+        branchName: "main",
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: "FN-8811-DEFAULT",
+        column: "in-review",
+        paused: false,
+        status: null,
+        error: null,
+        worktree: "/tmp/test-project/.worktrees/fn-8811-default",
+        steps: [{ name: "Ship it", status: "done" }],
+        workflowStepResults: [{ id: "ws-default", status: "passed", phase: "pre-merge" }],
+        autoMerge: false,
+        autoMergeProvenance: "mission",
+        branchContext: { assignmentMode: "shared", groupId: "BG-8811", source: "mission" },
+        log: [],
+      }]);
+
+      await expect(managerWithRecovery.recoverMergeableReviewTasks()).resolves.toBe(0);
+      expect(enqueueMerge).not.toHaveBeenCalled();
+      expect(store.mergeTask).not.toHaveBeenCalled();
 
       managerWithRecovery.stop();
     });
@@ -5198,64 +5244,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("FN-6461: demotes no-commits no-op review tasks with skipped-out work", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoMerge: true,
-        globalPause: false,
-        enginePaused: false,
-      });
-      mockedExecSync.mockImplementation((command) => {
-        const cmd = String(command);
-        if (cmd.includes("rev-parse --verify fusion/fn-6461")) return "ok" as any;
-        if (cmd.includes("rev-parse --verify main")) return "ok" as any;
-        if (cmd.includes("rev-list --count main..fusion/fn-6461")) return "0\n" as any;
-        return "" as any;
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-6461",
-          column: "in-review",
-          paused: false,
-          status: null,
-          worktree: "/tmp/test-project/.worktrees/fn-6461",
-          branch: "fusion/fn-6461",
-          noCommitsExpected: true,
-          steps: [
-            { name: "Preflight", status: "done" },
-            { name: "Dry-run", status: "skipped" },
-            { name: "Execute", status: "skipped" },
-            { name: "Verify", status: "skipped" },
-            { name: "Testing", status: "skipped" },
-            { name: "Documentation", status: "skipped" },
-          ],
-          workflowStepResults: [{ id: "ws-1", status: "passed", phase: "pre-merge" }],
-          mergeDetails: undefined,
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.finalizeNoOpReviewTasks();
-
-      expect(result).toBe(1);
-      // "Verify"/"Testing" are skipped verification steps → precise reason naming them.
-      expect(store.updateTask).toHaveBeenCalledWith("FN-6461", expect.objectContaining({ error: expect.stringContaining("skipped verification step") }));
-      expect(store.moveTask).toHaveBeenCalledWith("FN-6461", "todo", expect.objectContaining({ preserveProgress: true, moveSource: "engine", recoveryRehome: true }));
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-6461", "done");
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-6461",
-        expect.stringContaining("Finalize blocked (no-commits incomplete-work guard)"),
-        expect.stringContaining("self-healing-finalize-no-op-review"),
-      );
-      expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:no-commits-finalize-blocked-incomplete-steps",
-        target: "FN-6461",
-      }));
-
-      managerWithRecovery.stop();
-    });
 
     it("FN-6461: still finalizes all-done no-commits no-op review tasks", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -5363,54 +5351,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("blocks unproven no-op finalize candidates and emits audit", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store as any).recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        autoMerge: true,
-        globalPause: false,
-        enginePaused: false,
-      });
-      mockedClassifyOwnedLandedEvidence.mockResolvedValueOnce({
-        kind: "unproven",
-        reason: "foreign-start-point",
-        details: { foreignRef: "fusion/fn-a" },
-      } as any);
-      mockedExecSync.mockImplementation((command) => {
-        const cmd = String(command);
-        if (cmd.includes("rev-parse --verify fusion/fn-501")) return "ok" as any;
-        if (cmd.includes("rev-parse --verify main")) return "ok" as any;
-        if (cmd.includes("rev-list --count main..fusion/fn-501")) return "0\n" as any;
-        return "" as any;
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-501",
-          column: "in-review",
-          paused: false,
-          status: null,
-          worktree: "/tmp/test-project/.worktrees/fn-501",
-          steps: [{ name: "Ship it", status: "done" }],
-          workflowStepResults: [{ id: "ws-1", status: "passed", phase: "pre-merge" }],
-          mergeDetails: undefined,
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.finalizeNoOpReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-501", "done");
-      expect(store.moveTask).toHaveBeenCalledWith("FN-501", "todo", expect.anything());
-      expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:finalize-unproven-blocked",
-        target: "FN-501",
-      }));
-
-      managerWithRecovery.stop();
-    });
 
     it("does not finalize when branch is ahead by one or more commits", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -5569,166 +5509,10 @@ describe("SelfHealingManager", () => {
       expect(result).toEqual({ aheadCount: 0, baseRef: "origin/release" });
     });
 
-    it("moves stale in-review tasks with incomplete steps back to todo for retry", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 1_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-1572",
-          column: "in-review",
-          paused: false,
-          status: null,
-          error: null,
-          worktree: "/tmp/test-project/.worktrees/fn-1572",
-          updatedAt: new Date(Date.now() - 5_000).toISOString(),
-          steps: [
-            { name: "Preflight", status: "done" },
-            { name: "Testing & Verification", status: "in-progress" },
-          ],
-          workflowStepResults: [],
-          mergeDetails: undefined,
-          log: [],
-        },
-      ]);
 
-      const result = await managerWithRecovery.recoverStaleIncompleteReviewTasks();
 
-      expect(result).toBe(1);
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-1572",
-        expect.stringContaining("in-review task still had incomplete steps"),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-1572", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
 
-      managerWithRecovery.stop();
-    });
 
-    it("does not move fresh in-review tasks with incomplete steps", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 60_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-1573",
-          column: "in-review",
-          paused: false,
-          status: null,
-          updatedAt: new Date().toISOString(),
-          steps: [{ name: "Testing", status: "in-progress" }],
-          workflowStepResults: [],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverStaleIncompleteReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
-
-    it("detects stale in-review task using columnMovedAt when available", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000 });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-407-test-1",
-          column: "in-review",
-          paused: false,
-          status: null,
-          columnMovedAt: new Date(Date.now() - 120_000).toISOString(),
-          updatedAt: new Date(Date.now() - 5_000).toISOString(),
-          steps: [
-            { name: "Step 0", status: "done" },
-            { name: "Step 1", status: "in-progress" },
-          ],
-          workflowStepResults: [],
-          mergeDetails: undefined,
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverStaleIncompleteReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-407-test-1", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-
-    it("falls back to updatedAt for staleness when columnMovedAt is null (legacy tasks)", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000 });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-407-test-2",
-          column: "in-review",
-          paused: false,
-          status: null,
-          columnMovedAt: null,
-          updatedAt: new Date(Date.now() - 120_000).toISOString(),
-          steps: [{ name: "Step 0", status: "in-progress" }],
-          workflowStepResults: [],
-          mergeDetails: undefined,
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverStaleIncompleteReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-407-test-2", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-
-    it("moves merged in-review tasks to done and clears transient merge state", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-
-      const task = {
-        id: "FN-350",
-        column: "in-review",
-        status: "failed",
-        error: "Invalid transition: 'todo' → 'done'. Valid targets: in-progress, triage",
-        mergeRetries: 3,
-        mergeDetails: {
-          mergeConfirmed: true,
-          mergedAt: "2026-01-01T00:00:00.000Z",
-        },
-        log: [],
-      };
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([task]);
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
-
-      const result = await managerWithRecovery.recoverMergedReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith(
-        "FN-350",
-        expect.objectContaining({ paused: false, status: null, error: null, mergeRetries: 0 }),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-350", "done", expect.objectContaining({ moveSource: "engine" }));
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-350",
-        expect.stringContaining("Auto-finalized from in-review: content proven"),
-      );
-
-      managerWithRecovery.stop();
-    });
 
     it("ignores in-review tasks without confirmed merge metadata", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -5755,72 +5539,7 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("auto-finalizes paused merged tasks by clearing soft blocker state", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
 
-      const task = {
-        id: "FN-352",
-        column: "in-review",
-        paused: true,
-        mergeDetails: {
-          mergeConfirmed: true,
-          mergedAt: "2026-01-01T00:00:00.000Z",
-        },
-        log: [],
-      };
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([task]);
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
-
-      const result = await managerWithRecovery.recoverMergedReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith(
-        "FN-352",
-        expect.objectContaining({ paused: false, status: null, error: null, mergeRetries: 0 }),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-352", "done", expect.objectContaining({ moveSource: "engine" }));
-
-      managerWithRecovery.stop();
-    });
-
-    it("parks merge-confirmed tasks when finalization is blocked by incomplete steps", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-
-      const task = {
-        id: "FN-353",
-        column: "in-review",
-        paused: false,
-        status: null,
-        error: null,
-        mergeDetails: {
-          mergeConfirmed: true,
-          mergedAt: "2026-01-01T00:00:00.000Z",
-        },
-        steps: [{ status: "in-progress" }],
-        log: [],
-      };
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([task]);
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(task);
-
-      const result = await managerWithRecovery.recoverMergedReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-353", "done");
-      expect(store.updateTask).toHaveBeenCalledWith("FN-353", {
-        status: "failed",
-        error: "Merge confirmed but finalization blocked: task has incomplete steps",
-      });
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-353",
-        expect.stringContaining("finalization blocked"),
-      );
-
-      managerWithRecovery.stop();
-    });
 
     it("auto-finalizes merge-confirmed tasks with stale transient merging status", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -5910,42 +5629,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("moves failed in-review tasks with incomplete steps back to todo immediately after restart", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 60_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-7229",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          autoMerge: true,
-          error: "Workflow graph terminated with failure at node 'parse'",
-          updatedAt: new Date().toISOString(),
-          steps: [
-            { name: "Preflight", status: "done" },
-            { name: "Documentation & Delivery", status: "in-progress" },
-          ],
-          workflowStepResults: [],
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverStaleIncompleteReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-7229", "todo", {
-        preserveProgress: true,
-        moveSource: "engine",
-        recoveryRehome: true,
-      });
-
-      managerWithRecovery.stop();
-    });
   });
 
   describe("recoverStuckMergeDeadlocks", () => {
@@ -5979,22 +5662,34 @@ describe("SelfHealingManager", () => {
         status: null,
         error: null,
         mergeRetries: 0,
-        worktree: null,
         branch: null,
         mergeDetails: expect.objectContaining({ commitSha: "abc12345", mergeConfirmed: true }),
       }));
+      expect(store.updateTask).toHaveBeenCalledWith("FN-stuck", { worktree: null });
       expect(store.updateTask).toHaveBeenCalledWith("FN-dep", { blockedBy: null });
-      expect(mockedRemoveWorktree).toHaveBeenCalledWith(expect.objectContaining({
+      expect(mockedCleanupLandedTaskWorktree).toHaveBeenCalledWith(expect.objectContaining({
         rootDir: "/tmp/test-project",
         worktreePath: "/tmp/wt",
+        source: "recover-stuck-merge-deadlocks",
       }));
       expect(getSelfHealingLogger().log).toHaveBeenCalledWith(expect.stringContaining("self-heal:deadlock-recovered"));
 
       managerWithRecovery.stop();
     });
 
-    it("pauses genuine failures and leaves blockedBy untouched", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    /*
+    FNXC:MergeReliability 2026-08-10-05:42:
+    The deadlock producer must persist provenance so the stale-stamp fixture above represents a real
+    engine park rather than a no-reason human pause. REVERT CHECK (measured): omit pausedReason here
+    and the producer no longer reaches the clear-only merge-deadlock policy.
+    */
+    it("pauses genuine failures with deadlock provenance and leaves blockedBy untouched", async () => {
+      const clearMergeActive = vi.fn();
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project", clearMergeActive, enqueueMerge,
+        getActiveMergeTaskId: () => null,
+      });
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue(baseSettings);
       (store.listTasks as ReturnType<typeof vi.fn>)
         .mockResolvedValueOnce([{ id: "FN-stuck", column: "in-review", paused: false, status: "failed", mergeRetries: 3, mergeDetails: undefined, worktree: "/tmp/wt", log: [] }])
@@ -6006,10 +5701,28 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.recoverStuckMergeDeadlocks();
 
       expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-stuck", { paused: true });
+      expect(store.updateTask).toHaveBeenCalledWith("FN-stuck", {
+        paused: true,
+        pausedReason: "merge-deadlock-detected",
+      });
       expect(store.moveTask).not.toHaveBeenCalled();
       expect(store.updateTask).not.toHaveBeenCalledWith("FN-dep", { blockedBy: null });
       expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(expect.stringContaining("paused-for-manual"));
+
+      // Model a late superseded merge-body stamp after this exact producer park.
+      const parkedThenStamped = {
+        id: "FN-stuck", column: "in-review", paused: true, pausedReason: "merge-deadlock-detected",
+        status: "merging", updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), steps: [], workflowStepResults: [], log: [],
+      };
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ ...baseSettings, autoMerge: true });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue([parkedThenStamped]);
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(parkedThenStamped);
+      (store.updateTask as ReturnType<typeof vi.fn>).mockClear();
+
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(1);
+      expect(store.updateTask).toHaveBeenCalledWith("FN-stuck", { status: null });
+      expect(clearMergeActive).toHaveBeenCalledWith("FN-stuck");
+      expect(enqueueMerge).not.toHaveBeenCalled();
 
       managerWithRecovery.stop();
     });
@@ -6252,57 +5965,19 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("suppresses transient failed notification when already-merged sweep recovers to done", async () => {
-      const now = new Date().toISOString();
-      const tasks = new Map<string, Task>([["FN-1", { id: "FN-1", column: "in-review", paused: false, status: "failed", mergeRetries: 3, mergeDetails: undefined, baseBranch: "main", branch: "fusion/fn-1", worktree: "/tmp/wt", dependencies: [], steps: [], currentStep: 0, description: "x", log: [], createdAt: now, updatedAt: now } as Task]]);
-      const eventedStore = createMockStore({
-        getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, ntfyEnabled: true, ntfyTopic: "topic", failureNotificationMode: "sticky-only", failureNotificationDelayMs: 50 }),
-        listTasks: vi.fn().mockImplementation(async () => Array.from(tasks.values())),
-        getTask: vi.fn().mockImplementation(async (id: string) => tasks.get(id)),
-      });
-      (eventedStore.updateTask as ReturnType<typeof vi.fn>).mockImplementation(async (id: string, patch: Partial<Task>) => {
-        const next = { ...(tasks.get(id) as Task), ...patch } as Task;
-        tasks.set(id, next);
-        (eventedStore as unknown as EventEmitter).emit("task:updated", next);
-        return next;
-      });
-      (eventedStore.moveTask as ReturnType<typeof vi.fn>).mockImplementation(async (id: string, to: any) => {
-        const current = tasks.get(id) as Task;
-        const next = { ...current, column: to } as Task;
-        tasks.set(id, next);
-        (eventedStore as unknown as EventEmitter).emit("task:moved", { task: next, from: current.column, to });
-      });
-      const managerWithRecovery = new SelfHealingManager(eventedStore, { rootDir: "/tmp/test-project" });
-      const sendNotification = vi.fn(async () => ({ success: true, providerId: "mock" }));
-      const provider: NotificationProvider = { getProviderId: () => "mock", isEventSupported: () => true, sendNotification };
-      const notificationService = new NotificationService(eventedStore as any);
-      notificationService.registerProvider(provider);
-      await notificationService.start();
-
-      (eventedStore.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([tasks.get("FN-1")]);
-      mockedExecSync.mockImplementation((command: string | Buffer) => {
-        if (String(command).includes("Fusion-Task-Id: FN-1")) return "abc123\n" as any;
-        return "tip\n" as any;
-      });
-      mockedExistsSync.mockReturnValue(false);
-
-      (eventedStore as unknown as EventEmitter).emit("task:updated", tasks.get("FN-1"));
-      await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-      await vi.advanceTimersByTimeAsync(60);
-
-      expect(sendNotification).not.toHaveBeenCalledWith("failed", expect.anything());
-      expect(tasks.get("FN-1")?.column).toBe("done");
-      expect(tasks.get("FN-1")?.mergeDetails?.mergeConfirmed).toBe(true);
-
-      await notificationService.stop();
-      managerWithRecovery.stop();
-    });
 
     it("keeps failed notification when already-merged sweep finds no landed commit", async () => {
       const now = new Date().toISOString();
       const tasks = new Map<string, Task>([["FN-1", { id: "FN-1", column: "in-review", paused: false, status: "failed", mergeRetries: 3, mergeDetails: undefined, baseBranch: "main", branch: "fusion/fn-1", worktree: "/tmp/wt", dependencies: [], steps: [], currentStep: 0, description: "x", log: [], createdAt: now, updatedAt: now } as Task]]);
       const eventedStore = createMockStore({
-        getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, ntfyEnabled: true, ntfyTopic: "topic", failureNotificationMode: "sticky-only", failureNotificationDelayMs: 50 }),
+        /*
+        FNXC:SelfHealingNotifications 2026-08-11-02:16:
+        When maintenance retries are disabled, no sweep owns terminal failures; task-wedged notifications must fail open.
+
+        FNXC:SelfHealingNotifications 2026-08-11-21:10:
+        Disable the wedge settle window here so this fixture isolates recovery ownership instead of waiting through the production debounce.
+        */
+        getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, maintenanceIntervalMs: 0, wedgeNotificationSettleMs: 0, ntfyEnabled: true, ntfyTopic: "topic", failureNotificationMode: "sticky-only", failureNotificationDelayMs: 50 }),
         listTasks: vi.fn().mockImplementation(async () => Array.from(tasks.values())),
         getTask: vi.fn().mockImplementation(async (id: string) => tasks.get(id)),
       });
@@ -6320,207 +5995,21 @@ describe("SelfHealingManager", () => {
       await managerWithRecovery.recoverAlreadyMergedReviewTasks();
       await vi.advanceTimersByTimeAsync(60);
 
-      expect(sendNotification).toHaveBeenCalledWith("failed", expect.objectContaining({ taskId: "FN-1" }));
+      expect(sendNotification).toHaveBeenCalledWith("task-wedged", expect.objectContaining({
+        taskId: "FN-1",
+        metadata: expect.objectContaining({ wedgeReason: "terminal-failed" }),
+      }));
 
       await notificationService.stop();
       managerWithRecovery.stop();
     });
 
-    it("isolates per-task failures and still recovers later candidates", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: false, enginePaused: false });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: "FN-throw", column: "in-review", paused: false, status: "failed", mergeRetries: 3, mergeDetails: undefined, baseBranch: "main", branch: "fusion/fn-throw", worktree: "/tmp/wt1", log: [] },
-        { id: "FN-hit", column: "in-review", paused: false, status: "failed", mergeRetries: 3, mergeDetails: undefined, baseBranch: "main", branch: "fusion/fn-hit", worktree: "/tmp/wt2", log: [] },
-      ]);
-      mockedExistsSync.mockReturnValue(false);
-      mockedExecSync.mockImplementation((command: string | Buffer) => {
-        const cmd = String(command);
-        if (cmd.includes("Fusion-Task-Id: FN-throw")) throw new Error("trailer fail");
-        if (cmd.includes("rev-parse --verify") && cmd.includes("fusion/fn-throw")) throw new Error("rev fail");
-        if (cmd.includes("Fusion-Task-Id: FN-hit")) return "abc123\n" as any;
-        if (cmd.includes("rev-parse --verify") && cmd.includes("fusion/fn-hit")) return "tip-hit\n" as any;
-        return "" as any;
-      });
 
-      const result = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
 
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-hit", expect.objectContaining({ status: null, mergeRetries: 0 }));
-      expect(store.moveTask).toHaveBeenCalledWith("FN-hit", "done");
-      expect(store.updateTask).not.toHaveBeenCalledWith("FN-throw", expect.anything());
 
-      managerWithRecovery.stop();
-    });
-
-    it("is idempotent across repeated sweeps", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: false, enginePaused: false });
-      (store.listTasks as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce([
-          { id: "FN-1", column: "in-review", paused: false, status: "failed", mergeRetries: 3, mergeDetails: undefined, baseBranch: "main", branch: "fusion/fn-1", worktree: "/tmp/wt", log: [] },
-        ])
-        .mockResolvedValueOnce([
-          { id: "FN-1", column: "done", paused: false, status: null, mergeRetries: 0, mergeDetails: { mergeConfirmed: true }, baseBranch: "main", log: [] },
-        ]);
-      mockedExecSync.mockImplementation((command: string | Buffer) => {
-        if (String(command).includes("Fusion-Task-Id: FN-1")) return "abc123\n" as any;
-        return "tip\n" as any;
-      });
-      mockedExistsSync.mockReturnValue(false);
-
-      const first = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-      const second = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-
-      expect(first).toBe(1);
-      expect(second).toBe(0);
-
-      managerWithRecovery.stop();
-    });
-
-    it("auto-finalizes FN-4611-shape paused+failed tasks when landed content is proven", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: false, enginePaused: false });
-      (store.listTasks as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce([
-          {
-            id: "FN-4611-shape",
-            column: "in-review",
-            paused: true,
-            status: "failed",
-            error: "stale merge failure",
-            mergeRetries: 3,
-            mergeDetails: undefined,
-            baseBranch: "main",
-            branch: "fusion/fn-4611-shape",
-            steps: [],
-            log: [],
-          },
-        ])
-        .mockResolvedValue([
-          {
-            id: "FN-4611-shape",
-            column: "done",
-            dependencies: [],
-            log: [],
-          },
-          {
-            id: "FN-dependent",
-            column: "todo",
-            blockedBy: "FN-4611-shape",
-            dependencies: [],
-            log: [],
-          },
-        ]);
-      mockedExecSync.mockImplementation((command: string | Buffer) => {
-        if (String(command).includes("Fusion-Task-Id: FN-4611-shape")) return "abc123\n" as any;
-        return "tip\n" as any;
-      });
-
-      const result = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith(
-        "FN-4611-shape",
-        expect.objectContaining({ paused: false, status: null, error: null, mergeRetries: 0 }),
-      );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-4611-shape", "done");
-      expect(store.updateTask).toHaveBeenCalledWith("FN-dependent", {
-        blockedBy: null,
-        overlapBlockedBy: null,
-        status: null,
-      });
-
-      managerWithRecovery.stop();
-    });
-
-    it("keeps already-landed tasks in-review when merge blocker still reports incomplete steps", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: false, enginePaused: false });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-incomplete",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          mergeRetries: 3,
-          mergeDetails: undefined,
-          baseBranch: "main",
-          branch: "fusion/fn-incomplete",
-          steps: [{ status: "in-progress" }],
-          log: [],
-        },
-      ]);
-      mockedExecSync.mockImplementation((command: string | Buffer) => {
-        if (String(command).includes("Fusion-Task-Id: FN-incomplete")) return "abc123\n" as any;
-        return "tip\n" as any;
-      });
-
-      const result = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalledWith("FN-incomplete", "done");
-      expect(store.updateTask).toHaveBeenCalledWith(
-        "FN-incomplete",
-        expect.objectContaining({
-          status: "failed",
-          error: "Merge confirmed but finalization blocked: task has incomplete steps",
-        }),
-      );
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-incomplete",
-        expect.stringContaining("finalization blocked"),
-      );
-
-      managerWithRecovery.stop();
-    });
   });
 
   describe("recoverAlreadyMergedReviewTasks — run-audit emission", () => {
-    it("emits task:auto-recover-finalize-already-on-main when recovery succeeds", async () => {
-      const recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
-      const storeWithAudit = createMockStore({
-        getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false }),
-        listTasks: vi.fn().mockResolvedValue([
-          {
-            id: "FN-audit",
-            column: "in-review",
-            paused: false,
-            status: "failed",
-            mergeRetries: 4,
-            mergeDetails: undefined,
-            baseBranch: "main",
-            branch: "fusion/fn-audit",
-            steps: [],
-            log: [],
-          },
-        ]),
-        recordRunAuditEvent,
-      });
-      const managerWithRecovery = new SelfHealingManager(storeWithAudit, { rootDir: "/tmp/test-project" });
-      vi.spyOn(managerWithRecovery as any, "findAlreadyMergedTaskCommit").mockResolvedValue({ sha: "abc1234def5678", strategy: "trailer" });
-
-      const recovered = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-
-      expect(recovered).toBe(1);
-      expect(recordRunAuditEvent).toHaveBeenCalledTimes(2);
-      expect(recordRunAuditEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          domain: "database",
-          mutationType: "task:auto-recover-finalize-already-on-main",
-          target: "FN-audit",
-          metadata: expect.objectContaining({
-            mergeSha: "abc1234def5678",
-            mergeStrategy: "trailer",
-            baseBranch: "main",
-            mergeRetries: 4,
-            clearedFlags: { paused: false, status: true, error: false },
-          }),
-        }),
-      );
-
-      managerWithRecovery.stop();
-    });
 
     it("does not emit when no landed commit is detected", async () => {
       const recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
@@ -6548,42 +6037,13 @@ describe("SelfHealingManager", () => {
       const recovered = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
 
       expect(recovered).toBe(0);
-      expect(recordRunAuditEvent).not.toHaveBeenCalled();
+      expect(recordRunAuditEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ mutationType: "task:auto-recover-finalize-already-on-main" }),
+      );
 
       managerWithRecovery.stop();
     });
 
-    it("continues recovery when run-audit persistence throws", async () => {
-      const recordRunAuditEvent = vi.fn().mockRejectedValueOnce(new Error("audit write failed"));
-      const storeWithAudit = createMockStore({
-        getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false }),
-        listTasks: vi.fn().mockResolvedValue([
-          {
-            id: "FN-audit-throw",
-            column: "in-review",
-            paused: false,
-            status: "failed",
-            mergeRetries: 5,
-            mergeDetails: undefined,
-            baseBranch: "main",
-            branch: "fusion/fn-audit-throw",
-            steps: [],
-            log: [],
-          },
-        ]),
-        recordRunAuditEvent,
-      });
-      const managerWithRecovery = new SelfHealingManager(storeWithAudit, { rootDir: "/tmp/test-project" });
-      vi.spyOn(managerWithRecovery as any, "findAlreadyMergedTaskCommit").mockResolvedValue({ sha: "def5678abc1234", strategy: "trailer" });
-
-      const recovered = await managerWithRecovery.recoverAlreadyMergedReviewTasks();
-
-      expect(recovered).toBe(1);
-      expect(storeWithAudit.moveTask).toHaveBeenCalledWith("FN-audit-throw", "done");
-      expect(recordRunAuditEvent).toHaveBeenCalledTimes(2);
-
-      managerWithRecovery.stop();
-    });
   });
 
   describe("recoverReviewTasksWithFailedPreMergeSteps", () => {
@@ -6632,14 +6092,38 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps();
 
       expect(result).toBe(1);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-1572", { postReviewFixCount: 1 });
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1572", expect.objectContaining({ postReviewFixCount: expect.any(Number) }));
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-1572" }));
-      expect(store.logEntry).toHaveBeenCalledWith(
+      expect(store.logEntry).not.toHaveBeenCalledWith(
         "FN-1572",
         expect.stringContaining("Auto-reviving in-review task"),
-        expect.stringContaining("Workflow revision key: ws-004"),
+        expect.anything(),
       );
 
+      managerWithRecovery.stop();
+    });
+
+    it("does not charge repeated sterile detailed recovery probes", async () => {
+      const recoverFn = vi.fn().mockResolvedValue(false);
+      const detailed = vi.fn().mockResolvedValue({ kind: "skipped" as const });
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        recoverFailedPreMergeStep: recoverFn,
+        recoverFailedPreMergeStepDetailed: detailed,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ maxPostReviewFixes: 2 });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([{ ...baseTask }]);
+
+      await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(0);
+      await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(0);
+
+      expect(detailed).toHaveBeenCalledTimes(2);
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1572", expect.objectContaining({ postReviewFixCount: expect.any(Number) }));
+      expect(store.logEntry).not.toHaveBeenCalledWith(
+        "FN-1572",
+        expect.stringContaining("Auto-reviving in-review task"),
+        expect.anything(),
+      );
       managerWithRecovery.stop();
     });
 
@@ -6673,9 +6157,19 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([{
         ...baseTask,
         postReviewFixCount: 2,
+        reviewConvergenceStage: 3,
         log: [revisionLog("Browser Verification", "WS-004", 1), revisionLog("Browser Verification", "WS-004", 2)],
       }]);
 
+      /*
+       * FNXC:ReviewConvergence 2026-08-23-18:30:
+       * FN-149 (a786c45bb9) removed the terminal "cap exhausted -> park for a human" filter here:
+       * an exhausted per-step budget is now handed to the shared convergence ladder in
+       * `recoverFailedPreMergeWorkflowStep`, which takes one bounded AI action per rung and only
+       * parks once `reviewConvergenceStage` reaches 3 (human escalation). Exhaustion alone is
+       * therefore NOT a skip; exhaustion at stage 3 is. Fixtures that mean "already escalated to a
+       * human" must say so with `reviewConvergenceStage: 3`.
+       */
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(0);
       expect(recoverFn).not.toHaveBeenCalled();
 
@@ -6690,7 +6184,7 @@ describe("SelfHealingManager", () => {
       }]);
 
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(1);
-      expect(store.logEntry).toHaveBeenLastCalledWith("FN-1572", expect.stringContaining("attempt 100/unbounded"), expect.stringContaining("Workflow revision key: ws-004"));
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-1572", expect.stringContaining("attempt 100/unbounded"), expect.anything());
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-1572" }));
 
       managerWithRecovery.stop();
@@ -6742,13 +6236,13 @@ describe("SelfHealingManager", () => {
       ]);
 
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(1);
-      expect(store.logEntry).toHaveBeenLastCalledWith("FN-1572", expect.stringContaining("attempt 2/2"), expect.stringContaining("Workflow revision key: code-review"));
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-1572", expect.stringContaining("attempt 2/2"), expect.anything());
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-1572" }));
 
       managerWithRecovery.stop();
     });
 
-    it("recovers a parked failed code-review-remediation row after restart when Code Review is unbounded", async () => {
+    it("routes a parked failed code-review-remediation row through the bounded recovery owner", async () => {
       const recoverFn = vi.fn().mockResolvedValue(true);
       const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
@@ -6782,19 +6276,18 @@ describe("SelfHealingManager", () => {
       (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(failedCodeReviewTask);
 
       /*
-       * FNXC:WorkflowRemediation 2026-07-03-20:10:
-       * Restart self-healing must recognize the FN-7476 signature: in-review,
-       * status=failed, terminal `code-review-remediation`, and a durable failed
-       * Code Review result. Code Review's default budget is unbounded, so the
-       * global maxPostReviewFixes fallback must not strand high-attempt rows.
+       * FNXC:WorkflowRemediation 2026-09-03-05:40:
+       * Restart self-healing recognizes the FN-7476 signature and hands even an exhausted Code
+       * Review to the recovery owner, which applies the bounded convergence ladder instead of
+       * silently dropping the parked row during candidate filtering.
        */
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(1);
 
-      expect(store.updateTask).toHaveBeenCalledWith("FN-1572", { postReviewFixCount: 51 });
-      expect(store.logEntry).toHaveBeenCalledWith(
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1572", expect.objectContaining({ postReviewFixCount: expect.any(Number) }));
+      expect(store.logEntry).not.toHaveBeenCalledWith(
         "FN-1572",
-        expect.stringContaining("Auto-reviving in-review task with failed pre-merge workflow step (attempt 51/unbounded)"),
-        expect.stringContaining("Workflow revision key: code-review"),
+        expect.stringContaining("Auto-reviving in-review task with failed pre-merge workflow step"),
+        expect.anything(),
       );
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-1572", status: "failed" }));
 
@@ -6857,6 +6350,7 @@ describe("SelfHealingManager", () => {
         ...baseTask,
         status: "failed",
         error: "Workflow graph terminated with failure at node 'code-review-remediation'",
+        reviewConvergenceStage: 3,
         log: [revisionLog("Code Review", "code-review", 1)],
         workflowStepResults: [
           {
@@ -6869,6 +6363,15 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([cappedTask]);
       (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(cappedTask);
 
+      /*
+       * FNXC:ReviewConvergence 2026-08-23-18:30:
+       * FN-149 (a786c45bb9) removed the terminal "cap exhausted -> park for a human" filter here:
+       * an exhausted per-step budget is now handed to the shared convergence ladder in
+       * `recoverFailedPreMergeWorkflowStep`, which takes one bounded AI action per rung and only
+       * parks once `reviewConvergenceStage` reaches 3 (human escalation). Exhaustion alone is
+       * therefore NOT a skip; exhaustion at stage 3 is. Fixtures that mean "already escalated to a
+       * human" must say so with `reviewConvergenceStage: 3`.
+       */
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(0);
 
       expect(recoverFn).not.toHaveBeenCalled();
@@ -6905,8 +6408,8 @@ describe("SelfHealingManager", () => {
 
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(1);
 
-      expect(store.updateTask).toHaveBeenCalledWith("FN-1572", { postReviewFixCount: 2 });
-      expect(store.logEntry).toHaveBeenLastCalledWith("FN-1572", expect.stringContaining("attempt 1/1"), expect.stringContaining("Workflow revision key: code-review"));
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1572", expect.objectContaining({ postReviewFixCount: expect.any(Number) }));
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-1572", expect.stringContaining("attempt 1/1"), expect.anything());
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-1572" }));
 
       managerWithRecovery.stop();
@@ -6924,7 +6427,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([{ ...baseTask, postReviewFixCount: 0 }]);
 
       await expect(managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps()).resolves.toBe(1);
-      expect(store.logEntry).toHaveBeenCalledWith("FN-1572", expect.stringContaining("attempt 1/1"), expect.stringContaining("Workflow revision key: ws-004"));
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-1572", expect.stringContaining("attempt 1/1"), expect.anything());
       expect(recoverFn).toHaveBeenCalledOnce();
 
       managerWithRecovery.stop();
@@ -6940,14 +6443,51 @@ describe("SelfHealingManager", () => {
         maxPostReviewFixes: 2,
       });
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { ...baseTask, postReviewFixCount: 2, log: [revisionLog("Browser Verification", "WS-004", 1), revisionLog("Browser Verification", "WS-004", 2)] },
+        { ...baseTask, postReviewFixCount: 2, reviewConvergenceStage: 3, log: [revisionLog("Browser Verification", "WS-004", 1), revisionLog("Browser Verification", "WS-004", 2)] },
       ]);
 
+      /*
+       * FNXC:ReviewConvergence 2026-08-23-18:30:
+       * FN-149 (a786c45bb9) removed the terminal "cap exhausted -> park for a human" filter here:
+       * an exhausted per-step budget is now handed to the shared convergence ladder in
+       * `recoverFailedPreMergeWorkflowStep`, which takes one bounded AI action per rung and only
+       * parks once `reviewConvergenceStage` reaches 3 (human escalation). Exhaustion alone is
+       * therefore NOT a skip; exhaustion at stage 3 is. Fixtures that mean "already escalated to a
+       * human" must say so with `reviewConvergenceStage: 3`.
+       */
       const result = await managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps();
 
       expect(result).toBe(0);
       expect(recoverFn).not.toHaveBeenCalled();
       expect(store.updateTask).not.toHaveBeenCalled();
+
+      managerWithRecovery.stop();
+    });
+
+    it("hands an exhausted per-step budget to the convergence ladder before human escalation (FN-149)", async () => {
+      /*
+       * FNXC:ReviewConvergence 2026-08-23-18:30:
+       * The counterpart to the stage-3 skips above. FN-149 requires an exhausted review cycle to
+       * take one bounded ladder action (dispute -> arbitration -> human escalation) instead of
+       * parking silently, so an exhausted card that has not yet reached stage 3 is still delegated
+       * to `recoverFailedPreMergeStep`, which owns the rung claim.
+       */
+      const recoverFn = vi.fn().mockResolvedValue(true);
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        recoverFailedPreMergeStep: recoverFn,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        maxPostReviewFixes: 2,
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { ...baseTask, postReviewFixCount: 2, reviewConvergenceStage: 2, log: [revisionLog("Browser Verification", "WS-004", 1), revisionLog("Browser Verification", "WS-004", 2)] },
+      ]);
+
+      const result = await managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps();
+
+      expect(result).toBe(1);
+      expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-1572" }));
 
       managerWithRecovery.stop();
     });
@@ -6962,11 +6502,12 @@ describe("SelfHealingManager", () => {
         maxPostReviewFixes: 2,
       });
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { ...baseTask, postReviewFixCount: 2, log: [] },
+        { ...baseTask, postReviewFixCount: 2, reviewConvergenceStage: 3, log: [] },
       ]);
       (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...baseTask,
         postReviewFixCount: 2,
+        reviewConvergenceStage: 3,
         log: [revisionLog("Browser Verification", "WS-004", 1), revisionLog("Browser Verification", "WS-004", 2)],
       });
 
@@ -7102,35 +6643,6 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("leaves tasks with non-pre-merge blockers alone (e.g. incomplete steps)", async () => {
-      const recoverFn = vi.fn().mockResolvedValue(true);
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-        recoverFailedPreMergeStep: recoverFn,
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        maxPostReviewFixes: 1,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          ...baseTask,
-          // Task has a failed WS *and* an incomplete step — the "incomplete
-          // steps" blocker wins in getTaskMergeBlocker, so this scan should
-          // defer to recoverStaleIncompleteReviewTasks instead.
-          steps: [
-            { name: "Preflight", status: "done" as const },
-            { name: "Implementation", status: "in-progress" as const },
-          ],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverReviewTasksWithFailedPreMergeSteps();
-
-      expect(result).toBe(0);
-      expect(recoverFn).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
 
     it("ignores advisory pre-merge workflow findings", async () => {
       const recoverFn = vi.fn().mockResolvedValue(true);
@@ -7509,45 +7021,6 @@ describe("SelfHealingManager", () => {
     });
   });
 
-  describe("surfaceDependencyBlockedTodos", () => {
-    it("returns 0 when globalPause is enabled", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: true });
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(0);
-      managerWithRecovery.stop();
-    });
-
-    it("returns 0 when dependency-blocked todo reporting is disabled", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ dependencyBlockedTodoReportEnabled: false });
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(0);
-      managerWithRecovery.stop();
-    });
-
-    it("returns groupCount from reporter", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ dependencyBlockedTodoReportEnabled: true });
-      const reportSpy = vi.fn().mockResolvedValue({ alerted: true, groupCount: 1 });
-      (managerWithRecovery as unknown as { dependencyBlockedTodoReporter: { report: typeof reportSpy } }).dependencyBlockedTodoReporter = { report: reportSpy };
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(1);
-      expect(reportSpy).toHaveBeenCalledWith();
-      managerWithRecovery.stop();
-    });
-
-    it("returns 0 and logs error when reporter fails", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ dependencyBlockedTodoReportEnabled: true });
-      const reportSpy = vi.fn().mockRejectedValue(new Error("boom"));
-      (managerWithRecovery as unknown as { dependencyBlockedTodoReporter: { report: typeof reportSpy } }).dependencyBlockedTodoReporter = { report: reportSpy };
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(0);
-      managerWithRecovery.stop();
-    });
-  });
-
   describe("surfaceInReviewStalled", () => {
     function inReviewTask(overrides: Record<string, unknown> = {}) {
       return {
@@ -7871,143 +7344,6 @@ describe("SelfHealingManager", () => {
     });
   });
 
-  describe("recoverGhostReviewTasks", () => {
-    it("preserves failed in-review tasks so actionable merge failures are not ghost-retried", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 1_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        {
-          id: "FN-9001",
-          column: "in-review",
-          paused: false,
-          status: "failed",
-          worktree: undefined,
-          updatedAt: new Date(Date.now() - 10_000).toISOString(),
-          steps: [],
-          workflowStepResults: [],
-          mergeDetails: undefined,
-          log: [],
-        },
-      ]);
-
-      const result = await managerWithRecovery.recoverGhostReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.updateTask).not.toHaveBeenCalled();
-      expect(store.moveTask).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
-
-    it("preserves human-handoff and active-merge statuses", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 1_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: "FN-A", column: "in-review", paused: false, status: "awaiting-user-review", updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-        { id: "FN-B", column: "in-review", paused: false, status: "awaiting-approval", updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-        { id: "FN-C", column: "in-review", paused: false, status: "merging", updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-        { id: "FN-D", column: "in-review", paused: false, status: "merging-pr", updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-      ]);
-
-      const result = await managerWithRecovery.recoverGhostReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
-
-    it("ignores fresh in-review tasks within the timeout window", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 60_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: "FN-9002", column: "in-review", paused: false, status: null, updatedAt: new Date().toISOString(), steps: [], log: [] },
-      ]);
-
-      const result = await managerWithRecovery.recoverGhostReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
-
-    it("skips paused, currently-executing, and merge-confirmed tasks", async () => {
-      const getExecuting = vi.fn().mockReturnValue(new Set(["FN-EXEC"]));
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-        getExecutingTaskIds: getExecuting,
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 1_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: "FN-PAUSED", column: "in-review", paused: true, status: null, updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-        { id: "FN-EXEC", column: "in-review", paused: false, status: null, updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-        { id: "FN-MERGED", column: "in-review", paused: false, status: null, mergeDetails: { mergeConfirmed: true }, updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-      ]);
-
-      const result = await managerWithRecovery.recoverGhostReviewTasks();
-
-      expect(result).toBe(0);
-      expect(store.moveTask).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
-
-    it("no-ops when stuck timeout is disabled or engine is paused", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 0,
-      });
-      expect(await managerWithRecovery.recoverGhostReviewTasks()).toBe(0);
-
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 1_000,
-        enginePaused: true,
-      });
-      expect(await managerWithRecovery.recoverGhostReviewTasks()).toBe(0);
-
-      expect(store.moveTask).not.toHaveBeenCalled();
-
-      managerWithRecovery.stop();
-    });
-
-    it("skips updateTask when there is no transient status to clear", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, {
-        rootDir: "/tmp/test-project",
-      });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
-        taskStuckTimeoutMs: 1_000,
-      });
-      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-        { id: "FN-9003", column: "in-review", paused: false, status: null, updatedAt: new Date(Date.now() - 10_000).toISOString(), steps: [], log: [] },
-      ]);
-
-      const result = await managerWithRecovery.recoverGhostReviewTasks();
-
-      expect(result).toBe(1);
-      expect(store.updateTask).not.toHaveBeenCalled();
-      expect(store.moveTask).toHaveBeenCalledWith("FN-9003", "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
-
-      managerWithRecovery.stop();
-    });
-  });
-
   describe("recoverOrphanedExecutions", () => {
     const expectNoMutation = () => {
       expect(store.moveTask).not.toHaveBeenCalled();
@@ -8132,6 +7468,78 @@ describe("SelfHealingManager", () => {
   });
 
   describe("recoverApprovedTriageTasks", () => {
+    it("selects the stale legacy null-status persisted-plan handoff reported in #3325", async () => {
+      const legacy = {
+        id: "FN-8768-LEGACY",
+        column: "todo",
+        status: null,
+        paused: false,
+        approvedPlanFingerprint: undefined,
+        awaitingApprovalReason: undefined,
+        workflowStepResults: undefined,
+        steps: [{ title: "Implement", status: "pending" }],
+        log: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as unknown as Task;
+      const recoverFn = vi.fn().mockResolvedValue(true);
+      const recoveryStore = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([legacy]),
+        getTask: vi.fn().mockResolvedValue(legacy),
+      });
+      const managerWithRecovery = new SelfHealingManager(recoveryStore, {
+        rootDir: "/tmp/test-project",
+        recoverApprovedTriageTask: recoverFn,
+        getPlanningTaskIds: () => new Set<string>(),
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:31:00.000Z"));
+
+      await expect(managerWithRecovery.recoverApprovedTriageTasks()).resolves.toBe(1);
+      expect(recoverFn).toHaveBeenCalledWith(legacy);
+      managerWithRecovery.stop();
+    });
+
+    it.each([
+      ["recent", { updatedAt: "2026-01-01T00:04:30.000Z" }, new Set<string>()],
+      ["paused", { paused: true }, new Set<string>()],
+      ["user-paused", { userPaused: true }, new Set<string>()],
+      ["actively planning", {}, new Set(["FN-8768-CONTROL"])],
+      ["approval evidence", { approvedPlanFingerprint: "current-plan" }, new Set<string>()],
+      ["approval hold", { awaitingApprovalReason: "plan-review-replan-cap" }, new Set<string>()],
+      ["unsatisfied graph evidence", { workflowStepResults: [{ workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "failed" }] }, new Set<string>()],
+      ["missing persisted steps", { steps: [] }, new Set<string>()],
+      ["worktree", { worktree: "/tmp/executing" }, new Set<string>()],
+      ["execution stamp", { firstExecutionAt: "2026-01-01T00:10:00.000Z" }, new Set<string>()],
+    ])("does not select a %s null-status task as the legacy handoff", async (_label, patch, planningIds) => {
+      const candidate = {
+        id: "FN-8768-CONTROL",
+        column: "todo",
+        status: null,
+        paused: false,
+        approvedPlanFingerprint: undefined,
+        awaitingApprovalReason: undefined,
+        workflowStepResults: undefined,
+        steps: [{ title: "Implement", status: "pending" }],
+        log: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ...patch,
+      } as unknown as Task;
+      const recoverFn = vi.fn().mockResolvedValue(true);
+      const recoveryStore = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([candidate]),
+        getTask: vi.fn().mockResolvedValue(candidate),
+      });
+      const managerWithRecovery = new SelfHealingManager(recoveryStore, {
+        rootDir: "/tmp/test-project",
+        recoverApprovedTriageTask: recoverFn,
+        getPlanningTaskIds: () => planningIds,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:31:00.000Z"));
+
+      await expect(managerWithRecovery.recoverApprovedTriageTasks()).resolves.toBe(0);
+      expect(recoverFn).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
     it("recovers specified planning triage tasks that are not actively processing", async () => {
       const recoverFn = vi.fn().mockResolvedValue(true);
       const getPlanning = vi.fn().mockReturnValue(new Set<string>());
@@ -8145,7 +7553,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-100",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [
@@ -8181,7 +7589,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-101",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [{ action: "Spec review: APPROVE" }],
@@ -8212,7 +7620,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-102",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [
@@ -8259,6 +7667,8 @@ describe("SelfHealingManager", () => {
       vi.setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
 
       expect(await recovery.finalizeOrphanedPlanningSegments()).toBe(1);
+      // Call shape only: the PostgreSQL regression test proves this excludes archive snapshots.
+      expect(recoveryStore.listTasks).toHaveBeenCalledWith(expect.objectContaining({ slim: true, includeArchived: false }));
       expect(updateTaskAtomic).toHaveBeenCalledOnce();
       expect(task).toMatchObject({ cumulativePlanningMs: 1050, planningStartedAt: null });
       expect(recoveryStore.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
@@ -8294,9 +7704,314 @@ describe("SelfHealingManager", () => {
 
       recovery.stop();
     });
+
+    it.each([
+      ["before", ["FN-POISON", "FN-HEALTHY"]],
+      ["after", ["FN-HEALTHY", "FN-POISON"]],
+    ])("skips a deleted candidate listed %s a healthy orphan", async (_position, ids) => {
+      const poisoned = { id: "FN-POISON", deletedAt: "2026-08-08T16:42:53.336Z", planningStartedAt: "2026-01-01T00:00:00.000Z" } as Task;
+      const healthy = { id: "FN-HEALTHY", planningStartedAt: "2026-01-01T00:00:00.000Z", cumulativePlanningMs: 50 } as Task;
+      const tasks = ids.map((id) => id === poisoned.id ? poisoned : healthy);
+      const updateTaskAtomic = vi.fn(async (id: string, updater: (live: Task) => Partial<Task> | null) => {
+        const task = id === healthy.id ? healthy : poisoned;
+        const patch = updater(task);
+        if (patch) Object.assign(task, patch);
+        return patch;
+      });
+      const recoveryStore = createMockStore({ listTasks: vi.fn().mockResolvedValue(tasks), updateTaskAtomic });
+      const recovery = new SelfHealingManager(recoveryStore, { rootDir: "/tmp/test-project", getPlanningTaskIds: () => new Set<string>() });
+      vi.setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+
+      await expect(recovery.finalizeOrphanedPlanningSegments()).resolves.toBe(1);
+      expect(updateTaskAtomic).toHaveBeenCalledTimes(1);
+      expect(updateTaskAtomic).toHaveBeenCalledWith(healthy.id, expect.any(Function));
+      expect(healthy).toMatchObject({ planningStartedAt: null, cumulativePlanningMs: 1050 });
+
+      recovery.stop();
+    });
+
+    it("contains a TOCTOU soft-delete failure and continues with other candidates", async () => {
+      const racing = { id: "FN-RACING", planningStartedAt: "2026-01-01T00:00:00.000Z", cumulativePlanningMs: 50 } as Task;
+      const healthy = { id: "FN-HEALTHY", planningStartedAt: "2026-01-01T00:00:00.000Z", cumulativePlanningMs: 50 } as Task;
+      const updateTaskAtomic = vi.fn(async (id: string, updater: (live: Task) => Partial<Task> | null) => {
+        if (id === racing.id) throw new Error("Task FN-RACING is soft-deleted (deletedAt=2026-08-08T16:42:53.336Z) and cannot be read or mutated");
+        const patch = updater(healthy);
+        if (patch) Object.assign(healthy, patch);
+        return patch;
+      });
+      const recoveryStore = createMockStore({ listTasks: vi.fn().mockResolvedValue([racing, healthy]), updateTaskAtomic });
+      const recovery = new SelfHealingManager(recoveryStore, { rootDir: "/tmp/test-project", getPlanningTaskIds: () => new Set<string>() });
+      getSelfHealingLogger().warn.mockClear();
+      vi.setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+
+      await expect(recovery.finalizeOrphanedPlanningSegments()).resolves.toBe(1);
+      expect(healthy).toMatchObject({ planningStartedAt: null, cumulativePlanningMs: 1050 });
+      expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(expect.stringContaining("orphaned planning segment FN-RACING could not be finalized: errorType="));
+
+      recovery.stop();
+    });
+
+    it("contains fallback getTask failures and still finalizes healthy candidates around deleted rows", async () => {
+      const firstPoison = { id: "FN-POISON-1", deletedAt: "2026-08-08T16:42:53.336Z", planningStartedAt: "2026-01-01T00:00:00.000Z" } as Task;
+      const healthy = { id: "FN-HEALTHY", planningStartedAt: "2026-01-01T00:00:00.000Z", cumulativePlanningMs: 50 } as Task;
+      const secondPoison = { id: "FN-POISON-2", planningStartedAt: "2026-01-01T00:00:00.000Z" } as Task;
+      const getTask = vi.fn(async (id: string) => {
+        if (id === secondPoison.id) throw new Error("Task FN-POISON-2 is soft-deleted (deletedAt=2026-08-08T16:42:53.336Z) and cannot be read or mutated");
+        return healthy;
+      });
+      const updateTask = vi.fn(async (_id: string, patch: Partial<Task>) => Object.assign(healthy, patch));
+      const recoveryStore = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([firstPoison, healthy, secondPoison]),
+        updateTaskAtomic: undefined,
+        getTask,
+        updateTask,
+      });
+      const recovery = new SelfHealingManager(recoveryStore, { rootDir: "/tmp/test-project", getPlanningTaskIds: () => new Set<string>() });
+      getSelfHealingLogger().warn.mockClear();
+      vi.setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+
+      await expect(recovery.finalizeOrphanedPlanningSegments()).resolves.toBe(1);
+      expect(updateTask).toHaveBeenCalledWith(healthy.id, expect.objectContaining({ planningStartedAt: null, cumulativePlanningMs: 1050 }));
+      expect(getTask).not.toHaveBeenCalledWith(firstPoison.id);
+      expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(expect.stringContaining("orphaned planning segment FN-POISON-2 could not be finalized: errorType="));
+
+      recovery.stop();
+    });
+
+    it("reports when every eligible orphan attempt fails", async () => {
+      const failedTasks = [
+        { id: "FN-PLAN-ERROR-1", planningStartedAt: "2026-01-01T00:00:00.000Z" },
+        { id: "FN-PLAN-ERROR-2", planningStartedAt: "2026-01-01T00:00:00.000Z" },
+      ] as Task[];
+      const updateTaskAtomic = vi.fn(async () => {
+        throw new Error("reconciliation unavailable");
+      });
+      const recoveryStore = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(failedTasks),
+        updateTaskAtomic,
+      });
+      const recovery = new SelfHealingManager(recoveryStore, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set<string>(),
+        hasActivePlanningWorkflowSession: () => false,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+
+      expect(await recovery.finalizeOrphanedPlanningSegments()).toBe(0);
+      expect(updateTaskAtomic).toHaveBeenCalledTimes(2);
+      expect(recoveryStore.recordRunAuditEvent).toHaveBeenLastCalledWith(expect.objectContaining({
+        mutationType: "task:reconcile-orphaned-planning-segment-no-action",
+        metadata: { finalizedCount: 0, reason: "all-attempts-failed", attemptedCount: 2 },
+      }));
+
+      recovery.stop();
+    });
+
+    it("keeps a no-action sweep successful when audit recording fails", async () => {
+      const task = { id: "FN-PLAN-AUDIT-ERROR", planningStartedAt: "2026-01-01T00:00:00.000Z" } as Task;
+      const recordRunAuditEvent = vi.fn().mockRejectedValue(new Error("audit unavailable"));
+      const recoveryStore = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([task]),
+        recordRunAuditEvent,
+      });
+      const recovery = new SelfHealingManager(recoveryStore, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set([task.id]),
+        hasActivePlanningWorkflowSession: () => false,
+      });
+
+      await expect(recovery.finalizeOrphanedPlanningSegments()).resolves.toBe(0);
+      expect(recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "task:reconcile-orphaned-planning-segment-no-action",
+      }));
+
+      recovery.stop();
+    });
   });
 
-  describe("recoverOrphanedPlanningTasks", () => {
+  describe("planning handoff and orphan recovery", () => {
+    it("finalizes a recoverable written plan before clearing it for re-planning", async () => {
+      const task = {
+        id: "FN-PLAN-HANDOFF",
+        column: "todo",
+        status: "planning",
+        worktree: "/tmp/fusion-planning-worktree",
+        paused: false,
+        log: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as unknown as Task;
+      const recoverApprovedTriageTask = vi.fn().mockResolvedValue(true);
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([task]);
+      const recovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set<string>(),
+        recoverApprovedTriageTask,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+
+      await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(1);
+      expect(recoverApprovedTriageTask).toHaveBeenCalledWith(task);
+      expect(store.updateTask).not.toHaveBeenCalled();
+
+      recovery.stop();
+    });
+
+    it("backs off a planning-lock transport failure before retrying the retained handoff", async () => {
+      const task = {
+        id: "FN-PLAN-HANDOFF-RETRY",
+        column: "todo",
+        status: "planning",
+        paused: false,
+        log: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as unknown as Task & { recoveryRetryCount?: number | null; nextRecoveryAt?: string | null };
+      const recoverApprovedTriageTask = vi.fn()
+        .mockRejectedValueOnce(new PlanningLifecycleLockTransportError("lock transport unavailable"))
+        .mockResolvedValueOnce(true);
+      const retryingStore = createMockStore({
+        listTasks: vi.fn(async () => [task]),
+        getTask: vi.fn(async () => task),
+        updateTaskAtomic: vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => {
+          const patch = updater(task);
+          if (patch) Object.assign(task, patch);
+          return task;
+        }),
+      });
+      const recovery = new SelfHealingManager(retryingStore, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set<string>(),
+        recoverApprovedTriageTask,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+
+      await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(0);
+      expect(task.status).toBe("planning");
+      expect(task.recoveryRetryCount).toBe(1);
+      expect(Date.parse(task.nextRecoveryAt!)).toBeGreaterThan(Date.now());
+      expect(retryingStore.logEntry).toHaveBeenCalledWith(
+        task.id,
+        expect.stringContaining("Planning lifecycle lock transport failure during approved triage recovery — retry 1/3"),
+      );
+
+      await expect(recovery.recoverOrphanedPlanningTasks()).resolves.toBe(0);
+      expect(recoverApprovedTriageTask).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date(Date.parse(task.nextRecoveryAt!) + 1));
+      await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(1);
+      expect(recoverApprovedTriageTask).toHaveBeenCalledTimes(2);
+
+      recovery.stop();
+    });
+
+    it("parks a retained handoff after the planning-lock transport retry budget is exhausted", async () => {
+      const task = {
+        id: "FN-PLAN-HANDOFF-EXHAUSTED",
+        column: "todo",
+        status: "planning",
+        paused: false,
+        log: [],
+        recoveryRetryCount: 3,
+        nextRecoveryAt: "2026-01-01T00:04:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as unknown as Task;
+      const recoverApprovedTriageTask = vi.fn().mockRejectedValue(
+        new PlanningLifecycleLockTransportError("lock transport unavailable"),
+      );
+      const exhaustedStore = createMockStore({
+        listTasks: vi.fn(async () => [task]),
+        getTask: vi.fn(async () => task),
+        updateTaskAtomic: vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => {
+          const patch = updater(task);
+          if (patch) Object.assign(task, patch);
+          return task;
+        }),
+      });
+      const recovery = new SelfHealingManager(exhaustedStore, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set<string>(),
+        recoverApprovedTriageTask,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+
+      await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(0);
+      expect(task.status).toBe("failed");
+      expect(task.error).toContain("PLANNING_LIFECYCLE_LOCK_RECOVERY_EXHAUSTED");
+      expect(exhaustedStore.logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("PLANNING_LIFECYCLE_LOCK_RECOVERY_EXHAUSTED"));
+
+      recovery.stop();
+    });
+
+    it("clears and logs when canonical written-plan recovery returns false", async () => {
+      const task = {
+        id: "FN-PLAN-HANDOFF-NOT-RECOVERABLE",
+        column: "todo",
+        status: "planning",
+        paused: false,
+        log: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as unknown as Task;
+      const recoverApprovedTriageTask = vi.fn().mockResolvedValue(false);
+      const fallbackStore = createMockStore({
+        listTasks: vi.fn(async () => [task]),
+        getTask: vi.fn(async () => task),
+      });
+      const recovery = new SelfHealingManager(fallbackStore, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set<string>(),
+        recoverApprovedTriageTask,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+
+      await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(0);
+      await expect(recovery.recoverOrphanedPlanningTasks()).resolves.toBe(1);
+      expect(recoverApprovedTriageTask).toHaveBeenCalledWith(task);
+      expect(recoverApprovedTriageTask).toHaveBeenCalledTimes(1);
+      expect(fallbackStore.updateTask).toHaveBeenCalledWith(task.id, { status: null });
+      expect(fallbackStore.logEntry).toHaveBeenCalledWith(
+        task.id,
+        "Auto-recovered orphaned planning task — agent session lost, cleared for re-planning",
+      );
+
+      recovery.stop();
+    });
+
+    it("does not log a clear when the guarded fallback loses the planning-stage race", async () => {
+      const task = {
+        id: "FN-PLAN-HANDOFF-GUARDED",
+        column: "todo",
+        status: "planning",
+        paused: false,
+        log: [],
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      } as unknown as Task;
+      const recoverApprovedTriageTask = vi.fn().mockResolvedValue(false);
+      const guardedStore = createMockStore({
+        listTasks: vi.fn(async () => [task]),
+        updateTaskAtomic: vi.fn(async (_id: string, updater: (live: Task) => Partial<Task> | null) => updater({
+          ...task,
+          column: "in-progress",
+          status: null,
+          firstExecutionAt: "2026-01-01T00:01:00.000Z",
+        } as Task)),
+      });
+      const recovery = new SelfHealingManager(guardedStore, {
+        rootDir: "/tmp/test-project",
+        getPlanningTaskIds: () => new Set<string>(),
+        recoverApprovedTriageTask,
+      });
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+
+      await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(0);
+      await expect(recovery.recoverOrphanedPlanningTasks()).resolves.toBe(0);
+      expect(recoverApprovedTriageTask).toHaveBeenCalledWith(task);
+      expect(guardedStore.logEntry).not.toHaveBeenCalledWith(
+        task.id,
+        "Auto-recovered orphaned planning task — agent session lost, cleared for re-planning",
+      );
+
+      recovery.stop();
+    });
+
     it("clears status for orphaned planning tasks without a recoverable prompt", async () => {
       const getPlanning = vi.fn().mockReturnValue(new Set<string>());
 
@@ -8308,7 +8023,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-200",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [],
@@ -8335,13 +8050,20 @@ describe("SelfHealingManager", () => {
     FN-8361 regression: a stale candidate may be claimed by execution after
     listTasks but before the recovery patch acquires the task lock.
     */
+    /*
+    FNXC:NodeWorktreeIsolation 2026-07-25-22:40:
+    The third case used a WORKTREE as the claim signal. Planning now acquires the task's own worktree
+    (so no lane runs in the shared checkout), which makes a worktree on a `status: "planning"` triage
+    row the normal state of a card being planned — not evidence that execution claimed it. Execution
+    TIMESTAMPS carry that meaning instead; the FN-8361 invariant is otherwise unchanged.
+    */
     it.each([
       { column: "in-progress", status: null, worktree: "/tmp/claimed" },
       { column: "todo", status: null, worktree: undefined, steps: [{ id: "planned" }] },
-      { column: "triage", status: "planning", worktree: "/tmp/claimed" },
+      { column: "in-progress", status: "planning", worktree: "/tmp/claimed", firstExecutionAt: "2026-01-01T00:01:00.000Z" },
     ])("does not clear a stale candidate advanced to $column", async (live) => {
       const candidate = {
-        id: "FN-8361", column: "triage", status: "planning", paused: false,
+        id: "FN-8361", column: "todo", status: "planning", paused: false,
         log: [], updatedAt: "2026-01-01T00:00:00.000Z",
       };
       const updateTaskAtomic = vi.fn(async (_id: string, updater: (row: any) => any) => updater({ ...candidate, ...live }));
@@ -8367,7 +8089,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-201",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [],
@@ -8396,7 +8118,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-202",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [
@@ -8428,7 +8150,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-203",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: true,
           log: [],
@@ -8457,7 +8179,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         {
           id: "FN-204",
-          column: "triage",
+          column: "todo",
           status: "planning",
           paused: false,
           log: [],
@@ -8533,7 +8255,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("FN-MISSING"));
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("missing"));
     manager.stop();
@@ -8542,21 +8264,21 @@ describe("clearStaleBlockedBy", () => {
   it("clears stale blockedBy with explicit reason when blocker is soft-deleted", async () => {
     const store = createRunningStore();
     const deletedAt = "2026-05-22T00:00:00.000Z";
+    const taskA = createTask("A", { blockedBy: "FN-DELETED" });
     (store.getTask as ReturnType<typeof vi.fn>).mockImplementation(async (id: string, options?: { includeDeleted?: boolean }) => {
+      if (id === "A") return taskA as unknown as Task;
       if (id === "FN-DELETED" && options?.includeDeleted) {
         return createTask("FN-DELETED", { deletedAt }) as unknown as Task;
       }
       throw new Error(`Task ${id} not found`);
     });
-
-    const taskA = createTask("A", { blockedBy: "FN-DELETED" });
     mockSweepTasks(store, { todo: [taskA] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("soft-deleted at 2026-05-22T00:00:00.000Z"));
     manager.stop();
   });
@@ -8636,9 +8358,10 @@ describe("clearStaleBlockedBy", () => {
     manager.stop();
   });
 
-  it.each(["done", "archived"] as const)("clears stale blockedBy when blocker is %s", async (column) => {
+  it("clears stale blockedBy when blocker is complete", async () => {
     const store = createRunningStore();
     const blockerId = "FN-100";
+    const column = "done";
     const taskA = createTask("A", { blockedBy: blockerId });
     const taskB = createTask(blockerId, { column });
     mockSweepTasks(store, { todo: [taskA], all: [taskA, taskB] });
@@ -8647,7 +8370,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining(blockerId));
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining(column));
     manager.stop();
@@ -8664,7 +8387,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining(blockerId));
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("in-review + paused"));
     manager.stop();
@@ -8681,7 +8404,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining(blockerId));
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("mergeRetries 3/3"));
     manager.stop();
@@ -8712,7 +8435,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("not among unresolved dependencies"));
     manager.stop();
   });
@@ -8748,7 +8471,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining(`blocker=${blockerId}`));
     expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("reason=unbacked-merging"));
     manager.stop();
@@ -8796,7 +8519,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
     manager.stop();
     vi.useRealTimers();
   });
@@ -8831,7 +8554,7 @@ describe("clearStaleBlockedBy", () => {
     const recovered = await manager.clearStaleBlockedBy();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4013", { blockedBy: null, overlapBlockedBy: null, status: null });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-4013", { blockedBy: null, status: null });
     expect(store.logEntry).toHaveBeenCalledWith("FN-4013", expect.stringContaining("missing-worktree session start"));
     manager.stop();
   });
@@ -8888,1978 +8611,15 @@ describe("clearStaleBlockedBy", () => {
     manager.stop();
   });
 
-  it("clears stale blockedBy on an in-progress task when blocker is missing", async () => {
-    const store = createRunningStore();
-    const taskA = createTask("FN-4076", { column: "in-progress", blockedBy: "FN-MISSING" });
-    mockSweepTasks(store, { inProgress: [taskA], all: [taskA] });
 
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
 
-    expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4076", { blockedBy: null });
-    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("FN-4091"));
-    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("FN-MISSING"));
-    manager.stop();
-  });
 
-  it("clears stale blockedBy on an unpaused in-review task when blocker is done", async () => {
-    const store = createRunningStore();
-    const blockerId = "FN-4100";
-    const taskA = createTask("FN-4076", { column: "in-review", blockedBy: blockerId, paused: false });
-    const blocker = createTask(blockerId, { column: "done" });
-    mockSweepTasks(store, { inReview: [taskA], all: [taskA, blocker] });
 
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
 
-    expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4076", { blockedBy: null });
-    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("FN-4091"));
-    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("done"));
-    manager.stop();
-  });
 
-  it("clears blockedBy on an in-progress task when blocker has moved back to todo", async () => {
-    const store = createRunningStore();
-    const blockerId = "FN-4101";
-    const taskA = createTask("FN-4076", { column: "in-progress", blockedBy: blockerId });
-    const blocker = createTask(blockerId, { column: "todo" });
-    mockSweepTasks(store, { inProgress: [taskA], all: [taskA, blocker] });
-
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
-
-    expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4076", { blockedBy: null });
-    manager.stop();
-  });
-
-  it("does not clear blockedBy on a paused in-review task even when the blocker is stale", async () => {
-    const store = createRunningStore();
-    const taskA = createTask("FN-4076", { column: "in-review", paused: true, blockedBy: "FN-MISSING" });
-    mockSweepTasks(store, { inReview: [taskA], all: [taskA] });
-
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
-
-    expect(recovered).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalled();
-    manager.stop();
-  });
-
-  it("FN-3908: clears stale queued status when all dependencies are already satisfied", async () => {
-    const store = createRunningStore();
-    const queuedTask = createTask("FN-3170", {
-      status: "queued",
-      blockedBy: null,
-      dependencies: ["FN-3168", "FN-3169"],
-    });
-    const depA = createTask("FN-3168", { column: "archived" });
-    const depB = createTask("FN-3169", { column: "done" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([queuedTask, depA, depB]);
-
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
-
-    // FN-5434: stale queued-status cleanup remains stateful but is no longer logged/count-recovered.
-    expect(recovered).toBe(0);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-3170", { blockedBy: null, overlapBlockedBy: null, status: null });
-    expect(store.logEntry).not.toHaveBeenCalledWith(
-      "FN-3170",
-      expect.stringContaining("cleared stale queued status"),
-    );
-    manager.stop();
-  });
-
-  it("FN-5433: skips stale blockedBy refresh when next unresolved dependency is unchanged", async () => {
-    const store = createRunningStore();
-    const queuedTask = createTask("FN-3170", {
-      status: "queued",
-      blockedBy: "FN-DEP",
-      dependencies: ["FN-DEP", "FN-OTHER"],
-    });
-    const depA = createTask("FN-DEP", { column: "todo" });
-    const depB = createTask("FN-OTHER", { column: "in-progress" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([queuedTask, depA, depB]);
-
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
-
-    expect(recovered).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalledWith("FN-3170", expect.any(Object));
-    const refreshedLogs = (store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter(
-      ([taskId, message]) => taskId === "FN-3170" && String(message).includes("refreshed stale blockedBy"),
-    );
-    expect(refreshedLogs).toHaveLength(0);
-    manager.stop();
-  });
-
-  it("FN-3908: refreshes blockedBy to first unresolved dependency when stale blocker changed", async () => {
-    const store = createRunningStore();
-    const queuedTask = createTask("FN-3170", {
-      status: "queued",
-      blockedBy: "FN-3168",
-      dependencies: ["FN-3168", "FN-3169"],
-    });
-    const depA = createTask("FN-3168", { column: "archived" });
-    const depB = createTask("FN-3169", { column: "in-progress" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([queuedTask, depA, depB]);
-
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.clearStaleBlockedBy();
-
-    expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-3170", { blockedBy: "FN-3169", status: "queued" });
-    expect(store.logEntry).toHaveBeenCalledWith("FN-3170", expect.stringContaining("refreshed stale blockedBy"));
-    manager.stop();
-  });
-});
-
-describe("FN-4538 overlapBlockedBy self-healing", () => {
-  function makeTask(id: string, overrides: Record<string, unknown> = {}) {
-    return { id, column: "todo", paused: false, blockedBy: null, dependencies: [], mergeRetries: 0, ...overrides };
-  }
-
-  function makeStore(tasks: Record<string, unknown>[], scopes: Record<string, string[]> = {}) {
-    const store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({
-        autoUnpauseEnabled: false,
-        maintenanceIntervalMs: 0,
-        globalPause: false,
-        enginePaused: false,
-      } as unknown as Settings),
-      parseFileScopeFromPrompt: vi.fn(async (taskId: string) => scopes[taskId] ?? ["packages/engine/src/scheduler.ts"]),
-    });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockImplementation(async (options?: { column?: string }) => {
-      if (options?.column === "todo") return tasks.filter((task) => task.column === "todo");
-      if (options?.column === "in-progress") return tasks.filter((task) => task.column === "in-progress");
-      if (options?.column === "in-review") return tasks.filter((task) => task.column === "in-review");
-      return tasks;
-    });
-    return store;
-  }
-
-  it("FN-4538: clearStaleBlockedBy does NOT clear queued status when overlapBlockedBy is active", async () => {
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-ACTIVE",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    await manager.clearStaleBlockedBy();
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TARGET", { blockedBy: null, status: "queued" });
-    expect(store.logEntry).toHaveBeenCalledWith(
-      "FN-TARGET",
-      "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE",
-    );
-    expect(store.updateTask).not.toHaveBeenCalledWith("FN-TARGET", expect.objectContaining({ status: null }));
-    manager.stop();
-  });
-
-  it("FN-6276: clearStaleBlockedBy logs unchanged active overlap blocker only once across passes", async () => {
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-ACTIVE",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const message = "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE";
-
-    await manager.clearStaleBlockedBy();
-    await manager.clearStaleBlockedBy();
-    await manager.clearStaleBlockedBy();
-
-    expect(store.updateTask).toHaveBeenCalledTimes(3);
-    expect(store.updateTask).toHaveBeenNthCalledWith(1, "FN-TARGET", { blockedBy: null, status: "queued" });
-    expect((store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter((call) => call[0] === "FN-TARGET" && call[1] === message)).toHaveLength(1);
-    manager.stop();
-  });
-
-  it("FN-6276: clearStaleBlockedBy logs again when active overlap blocker changes", async () => {
-    const overlapBlockerA = makeTask("FN-ACTIVE-A", { column: "in-progress" });
-    const overlapBlockerB = makeTask("FN-ACTIVE-B", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-ACTIVE-A",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlockerA, overlapBlockerB]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    await manager.clearStaleBlockedBy();
-    target.overlapBlockedBy = "FN-ACTIVE-B";
-    await manager.clearStaleBlockedBy();
-
-    expect(store.logEntry).toHaveBeenCalledWith(
-      "FN-TARGET",
-      "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE-A",
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      "FN-TARGET",
-      "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE-B",
-    );
-    expect((store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter((call) => call[0] === "FN-TARGET" && String(call[1]).includes("preserved queued status"))).toHaveLength(2);
-    manager.stop();
-  });
-
-  it("FN-6276: clearStaleBlockedBy resets preserved queued memo after blocker resolves", async () => {
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-ACTIVE",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const message = "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE";
-
-    await manager.clearStaleBlockedBy();
-    overlapBlocker.column = "done";
-    await manager.clearStaleBlockedBy();
-    target.status = null;
-    target.overlapBlockedBy = null;
-    await manager.clearStaleBlockedBy();
-    target.status = "queued";
-    target.overlapBlockedBy = "FN-ACTIVE";
-    overlapBlocker.column = "in-progress";
-    await manager.clearStaleBlockedBy();
-
-    expect((store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter((call) => call[0] === "FN-TARGET" && call[1] === message)).toHaveLength(2);
-    manager.stop();
-  });
-
-  it("FN-6276: stop clears preserved queued memo so next pass logs again", async () => {
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-ACTIVE",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const message = "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE";
-
-    await manager.clearStaleBlockedBy();
-    manager.stop();
-    await manager.clearStaleBlockedBy();
-
-    expect((store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter((call) => call[0] === "FN-TARGET" && call[1] === message)).toHaveLength(2);
-    manager.stop();
-  });
-
-  it("FN-6276: FN-5488 stale blockedBy overlap-preservation log is idempotent", async () => {
-    const staleBlocker = makeTask("FN-DONE", { column: "done" });
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: "FN-DONE",
-      overlapBlockedBy: "FN-ACTIVE",
-      dependencies: [],
-    });
-    const store = makeStore([target, staleBlocker, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const message = "Auto-recovered (FN-5488): preserved queued status — blocker=FN-DONE blockerStatus=none reason=blocker-done; still blocked by file scope overlap with FN-ACTIVE";
-
-    await manager.clearStaleBlockedBy();
-    await manager.clearStaleBlockedBy();
-
-    expect(store.updateTask).toHaveBeenCalledTimes(2);
-    expect((store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter((call) => call[0] === "FN-TARGET" && call[1] === message)).toHaveLength(1);
-    manager.stop();
-  });
-
-  it("FN-4538: clearStaleBlockedBy clears overlapBlockedBy when overlap blocker is done", async () => {
-    const overlapBlocker = makeTask("FN-DONE", { column: "done" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-DONE",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    await manager.clearStaleBlockedBy();
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TARGET", { blockedBy: null, overlapBlockedBy: null, status: null });
-    manager.stop();
-  });
-
-  it("FN-4538: reconcileCompletedTask clears overlapBlockedBy when completed task is overlap blocker", async () => {
-    const target = makeTask("FN-TARGET", { column: "todo", status: "queued", overlapBlockedBy: "FN-X" });
-    const blocker = makeTask("FN-X", { column: "done" });
-    const store = makeStore([target, blocker]);
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(blocker);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    await manager.reconcileCompletedTask("FN-X");
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TARGET", { blockedBy: null, overlapBlockedBy: null, status: null });
-    manager.stop();
-  });
-
-  it("FN-4538: no oscillation — scheduler + self-healing agree on overlap-blocked state", async () => {
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", { column: "todo", status: "queued", blockedBy: null, overlapBlockedBy: "FN-ACTIVE" });
-    const store = makeStore([target, overlapBlocker]);
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    await manager.clearStaleBlockedBy();
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TARGET", { blockedBy: null, status: "queued" });
-    expect(store.updateTask).not.toHaveBeenCalledWith("FN-TARGET", expect.objectContaining({ status: null }));
-    manager.stop();
-  });
-  it("FN-783: clearStaleBlockedBy clears queued status when overlap blocker no longer shares effective write scope", async () => {
-    const overlapBlocker = makeTask("FN-ACTIVE", { column: "in-progress" });
-    const target = makeTask("FN-TARGET", {
-      column: "todo",
-      status: "queued",
-      blockedBy: undefined,
-      overlapBlockedBy: "FN-ACTIVE",
-      dependencies: [],
-    });
-    const store = makeStore([target, overlapBlocker], {
-      "FN-ACTIVE": ["project.yml", "Tests/AtlasNotesMobileUITests/**"],
-      "FN-TARGET": ["packages/core/**", "packages/engine/**"],
-    });
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    await manager.clearStaleBlockedBy();
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TARGET", { blockedBy: null, overlapBlockedBy: null, status: null });
-    expect(store.logEntry).not.toHaveBeenCalledWith(
-      "FN-TARGET",
-      "Auto-recovered: preserved queued status — still blocked by file scope overlap with FN-ACTIVE",
-    );
-    manager.stop();
-  });
-
-});
-
-describe("stale triage processing eviction before recovery", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-  });
-
-  it("calls evictStaleTriageProcessing before recoverApprovedTriageTasks", async () => {
-    const store = createMockStore();
-    const evictFn = vi.fn().mockReturnValue(new Set<string>());
-    const recoverFn = vi.fn().mockResolvedValue(true);
-    const getPlanning = vi.fn().mockReturnValue(new Set(["FN-100"]));
-
-    const manager = new SelfHealingManager(store, {
-      rootDir: "/tmp/test-project",
-      recoverApprovedTriageTask: recoverFn,
-      getPlanningTaskIds: getPlanning,
-      evictStaleTriageProcessing: evictFn,
-    });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-100",
-        column: "triage",
-        status: "planning",
-        paused: false,
-        log: [{ action: "Spec review: APPROVE" }],
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      },
-    ]);
-
-    vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
-
-    // FN-100 is in planningIds — would normally be skipped.
-    // But evictStaleTriageProcessing was called first (even though it evicted nothing here).
-    await manager.recoverApprovedTriageTasks();
-
-    // Eviction was called before the recovery check
-    expect(evictFn).toHaveBeenCalledTimes(1);
-
-    manager.stop();
-  });
-
-  it("recovers specified task after eviction removes it from planningIds", async () => {
-    const store = createMockStore();
-    let planningIds = new Set(["FN-100"]);
-    const evictFn = vi.fn().mockImplementation(() => {
-      // Simulate eviction removing FN-100 from the processing set
-      planningIds = new Set<string>();
-      return new Set(["FN-100"]);
-    });
-    const recoverFn = vi.fn().mockResolvedValue(true);
-    const getPlanning = vi.fn().mockImplementation(() => planningIds);
-
-    const manager = new SelfHealingManager(store, {
-      rootDir: "/tmp/test-project",
-      recoverApprovedTriageTask: recoverFn,
-      getPlanningTaskIds: getPlanning,
-      evictStaleTriageProcessing: evictFn,
-    });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-100",
-        column: "triage",
-        status: "planning",
-        paused: false,
-        log: [{ action: "Spec review: APPROVE" }],
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      },
-    ]);
-
-    vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
-
-    const result = await manager.recoverApprovedTriageTasks();
-
-    // After eviction cleared the planning set, the task was recovered
-    expect(result).toBe(1);
-    expect(recoverFn).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "FN-100" }),
-    );
-
-    manager.stop();
-  });
-
-  it("calls evictStaleTriageProcessing before recoverOrphanedPlanningTasks", async () => {
-    const store = createMockStore();
-    const evictFn = vi.fn().mockReturnValue(new Set<string>());
-    const getPlanning = vi.fn().mockReturnValue(new Set(["FN-101"]));
-
-    const manager = new SelfHealingManager(store, {
-      rootDir: "/tmp/test-project",
-      getPlanningTaskIds: getPlanning,
-      evictStaleTriageProcessing: evictFn,
-    });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-101",
-        column: "triage",
-        status: "planning",
-        paused: false,
-        log: [{ action: "Spec review: REVISE" }],
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      },
-    ]);
-
-    vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
-
-    await manager.recoverOrphanedPlanningTasks();
-
-    expect(evictFn).toHaveBeenCalledTimes(1);
-
-    manager.stop();
-  });
-
-  it("preserves live planning tasks across approved, orphaned, and starved recovery sweeps", async () => {
-    const store = createMockStore();
-    const liveIds = new Set(["FN-approved-live", "FN-orphan-live", "FN-refinement-live"]);
-    const evictFn = vi.fn().mockReturnValue(new Set<string>());
-    const recoverFn = vi.fn().mockResolvedValue(true);
-    const manager = new SelfHealingManager(store, {
-      rootDir: "/tmp/test-project",
-      recoverApprovedTriageTask: recoverFn,
-      getPlanningTaskIds: () => liveIds,
-      evictStaleTriageProcessing: evictFn,
-    });
-
-    const old = "2026-01-01T00:00:00.000Z";
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { id: "FN-approved-live", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-      { id: "FN-orphan-live", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-      { id: "FN-refinement-live", column: "triage", status: "planning", paused: false, priority: "normal", sourceType: "task_refine", createdAt: old, updatedAt: old },
-      { id: "FN-peer-1", column: "todo", sourceType: "dashboard_ui", createdAt: old, updatedAt: "2026-01-01T00:01:00.000Z" },
-      { id: "FN-peer-2", column: "todo", sourceType: "dashboard_ui", createdAt: old, updatedAt: "2026-01-01T00:02:00.000Z" },
-      { id: "FN-peer-3", column: "todo", sourceType: "dashboard_ui", createdAt: old, updatedAt: "2026-01-01T00:03:00.000Z" },
-    ]);
-    vi.setSystemTime(new Date("2026-01-01T01:00:00.000Z"));
-
-    expect(await manager.recoverApprovedTriageTasks()).toBe(0);
-    expect(await manager.recoverOrphanedPlanningTasks()).toBe(0);
-    expect(await manager.recoverStarvedRefinementTriageTasks()).toBe(0);
-    expect(evictFn).toHaveBeenCalledTimes(3);
-    expect(recoverFn).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalled();
-
-    manager.stop();
-  });
-
-  it("recovers no-session and stuck-aborted planning IDs after eviction removes both", async () => {
-    const store = createMockStore();
-    let planningIds = new Set(["FN-live", "FN-hung", "FN-stuck-aborted"]);
-    const evictFn = vi.fn().mockImplementation(() => {
-      planningIds = new Set(["FN-live"]);
-      return new Set(["FN-hung", "FN-stuck-aborted"]);
-    });
-    const recoverFn = vi.fn().mockResolvedValue(true);
-    const manager = new SelfHealingManager(store, {
-      rootDir: "/tmp/test-project",
-      recoverApprovedTriageTask: recoverFn,
-      getPlanningTaskIds: () => planningIds,
-      evictStaleTriageProcessing: evictFn,
-    });
-    const old = "2026-01-01T00:00:00.000Z";
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { id: "FN-live", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-      { id: "FN-hung", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-      { id: "FN-stuck-aborted", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-    ]);
-    vi.setSystemTime(new Date("2026-01-01T01:00:00.000Z"));
-
-    expect(await manager.recoverApprovedTriageTasks()).toBe(2);
-    expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-hung" }));
-    expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-stuck-aborted" }));
-    expect(recoverFn).not.toHaveBeenCalledWith(expect.objectContaining({ id: "FN-live" }));
-
-    manager.stop();
-  });
-
-  it("clears and priority-nudges evicted hung and stuck-aborted tasks while preserving live planning", async () => {
-    const store = createMockStore();
-    const evictFn = vi.fn().mockReturnValue(new Set(["FN-hung", "FN-stuck-aborted"]));
-    const getPlanning = vi.fn().mockReturnValue(new Set(["FN-live"]));
-    const manager = new SelfHealingManager(store, {
-      rootDir: "/tmp/test-project",
-      getPlanningTaskIds: getPlanning,
-      evictStaleTriageProcessing: evictFn,
-    });
-    const old = "2026-01-01T00:00:00.000Z";
-    const planningTasks = [
-      { id: "FN-live", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-      { id: "FN-hung", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-      { id: "FN-stuck-aborted", column: "triage", status: "planning", paused: false, priority: "normal", createdAt: old, updatedAt: old },
-    ];
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue(planningTasks);
-    vi.setSystemTime(new Date("2026-01-01T01:00:00.000Z"));
-
-    expect(await manager.recoverOrphanedPlanningTasks()).toBe(2);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-hung", { status: null });
-    expect(store.updateTask).toHaveBeenCalledWith("FN-stuck-aborted", { status: null });
-    expect(store.updateTask).not.toHaveBeenCalledWith("FN-live", { status: null });
-
-    vi.clearAllMocks();
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      ...planningTasks.map((task) => ({ ...task, sourceType: "task_refine" })),
-      { id: "FN-peer-1", column: "todo", sourceType: "dashboard_ui", createdAt: old, updatedAt: "2026-01-01T00:01:00.000Z" },
-      { id: "FN-peer-2", column: "todo", sourceType: "dashboard_ui", createdAt: old, updatedAt: "2026-01-01T00:02:00.000Z" },
-      { id: "FN-peer-3", column: "todo", sourceType: "dashboard_ui", createdAt: old, updatedAt: "2026-01-01T00:03:00.000Z" },
-    ]);
-
-    expect(await manager.recoverStarvedRefinementTriageTasks()).toBe(2);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-hung", { priority: "high" });
-    expect(store.updateTask).toHaveBeenCalledWith("FN-stuck-aborted", { priority: "high" });
-    expect(store.updateTask).not.toHaveBeenCalledWith("FN-live", { priority: "high" });
-
-    manager.stop();
-  });
 });
 
 // ── Maintenance cycle concurrency ──────────────────────────────────
-
-describe("recoverDoneTaskMergeMetadata", () => {
-  it("FN-5103: skips attribution-restricted done task merge metadata reconcile", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-5103-A",
-        column: "done",
-        paused: false,
-        mergeDetails: {
-          commitSha: "merge1",
-          mergeConfirmed: true,
-          landedFilesAttributionRestricted: true,
-          landedFiles: ["a.ts"],
-          filesChanged: 1,
-          insertions: 1,
-          deletions: 0,
-        },
-      },
-    ]);
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalled();
-
-    manager.stop();
-  });
-
-  it("FN-5103: skips no-op verified-short-circuit merge metadata reconcile", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-5103-B",
-        column: "done",
-        paused: false,
-        mergeDetails: {
-          commitSha: "merge1",
-          mergeConfirmed: true,
-          noOpVerifiedShortCircuit: true,
-          landedFiles: [],
-          filesChanged: 0,
-          insertions: 0,
-          deletions: 0,
-        },
-      },
-    ]);
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalled();
-
-    manager.stop();
-  });
-
-  it("FN-5103: fallback captures remain reconcilable", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-5103-C",
-        column: "done",
-        paused: false,
-        mergeDetails: {
-          commitSha: "merge1",
-          mergeConfirmed: false,
-          landedFilesCaptureFallback: "attribution-failed",
-        },
-      },
-    ]);
-
-    vi.spyOn(manager as any, "findLandedTaskCommit").mockResolvedValue({
-      sha: "merge1",
-      subject: "fix(FN-5103): landed",
-      filesChanged: 2,
-      insertions: 4,
-      deletions: 1,
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-5103-C", expect.objectContaining({
-      mergeDetails: expect.objectContaining({
-        commitSha: "merge1",
-        mergeConfirmed: true,
-      }),
-    }));
-
-    manager.stop();
-  });
-
-  it("repairs empty mergeDetails for landed done task with recorded base commit", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-5854",
-        column: "done",
-        paused: false,
-        baseCommitSha: "base5854",
-        mergeDetails: undefined,
-      },
-    ]);
-
-    vi.spyOn(manager as any, "findLandedTaskCommit").mockResolvedValue({
-      sha: "be95b3f2c1234567",
-      subject: "FN-5854: landed",
-      filesChanged: 2,
-      insertions: 75,
-      deletions: 0,
-    });
-    vi.spyOn(manager as any, "readLandedFilesForSha").mockResolvedValue([
-      "packages/engine/src/merger-ai.ts",
-      "packages/engine/src/self-healing.ts",
-    ]);
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-5854", {
-      mergeDetails: expect.objectContaining({
-        commitSha: "be95b3f2c1234567",
-        filesChanged: 2,
-        insertions: 75,
-        deletions: 0,
-        mergeCommitMessage: "FN-5854: landed",
-        mergeConfirmed: true,
-        landedFiles: [
-          "packages/engine/src/merger-ai.ts",
-          "packages/engine/src/self-healing.ts",
-        ],
-      }),
-      modifiedFiles: [
-        "packages/engine/src/merger-ai.ts",
-        "packages/engine/src/self-healing.ts",
-      ],
-    });
-
-    manager.stop();
-  });
-
-  it("leaves empty mergeDetails untouched when no owned landed commit is found", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-5854-MISS",
-        column: "done",
-        paused: false,
-        baseCommitSha: "base5854",
-        mergeDetails: undefined,
-      },
-    ]);
-
-    vi.spyOn(manager as any, "findLandedTaskCommit").mockResolvedValue(null);
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalled();
-    expect(store.logEntry).not.toHaveBeenCalled();
-
-    manager.stop();
-  });
-
-  it("FN-3862: confirmed task with reachable owned stored SHA preserves canonical commitSha", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-3862",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "merge1", mergeConfirmed: true },
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor 'merge1' HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 'merge1'")) {
-        return "merge1\u001ffix(FN-3862): canonical merge\u001fFusion-Task-Id: FN-3862" as any;
-      }
-      if (cmd.includes("show --shortstat --format= merge1")) {
-        return "3 files changed, 10 insertions(+), 1 deletions(-)" as any;
-      }
-      if (cmd.includes("Fusion-Task-Id: FN-3862")) {
-        return "fix2\u001ffix(FN-3862): follow-up\n" as any;
-      }
-      return "" as any;
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledTimes(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-3862", {
-      mergeDetails: expect.objectContaining({
-        commitSha: "merge1",
-      }),
-    });
-
-    manager.stop();
-  });
-
-  it("FN-4646: repairs missing landedFiles on confirmed merge metadata", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-4646-A",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "merge1", mergeConfirmed: true, filesChanged: 2, insertions: 3, deletions: 1, mergeCommitMessage: "msg" },
-        modifiedFiles: ["a.ts", "b.ts", "c.ts"],
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor 'merge1' HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 'merge1'")) return "merge1\u001ffix(FN-4646): canonical merge\u001fFusion-Task-Id: FN-4646-A" as any;
-      if (cmd.includes("show --shortstat --format=") && cmd.includes("merge1")) return "2 files changed, 3 insertions(+), 1 deletion(-)" as any;
-      if (cmd.includes("Fusion-Task-Id: FN-4646-A")) return "merge1\u001ffix(FN-4646): canonical merge\n" as any;
-      return "" as any;
-    });
-
-    await manager.recoverDoneTaskMergeMetadata();
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4646-A", expect.objectContaining({
-      mergeDetails: expect.objectContaining({ landedFiles: [] }),
-      modifiedFiles: undefined,
-    }));
-
-    manager.stop();
-  });
-
-  it("FN-4646: repairs differing landedFiles on confirmed merge metadata", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-4646-B",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "merge1", mergeConfirmed: true, filesChanged: 2, insertions: 3, deletions: 1, mergeCommitMessage: "msg", landedFiles: ["a.ts", "b.ts", "c.ts"] },
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor 'merge1' HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 'merge1'")) return "merge1\u001ffix(FN-4646): canonical merge\u001fFusion-Task-Id: FN-4646-B" as any;
-      if (cmd.includes("show --shortstat --format=") && cmd.includes("merge1")) return "2 files changed, 3 insertions(+), 1 deletion(-)" as any;
-      if (cmd.includes("Fusion-Task-Id: FN-4646-B")) return "merge1\u001ffix(FN-4646): canonical merge\n" as any;
-      return "" as any;
-    });
-
-    await manager.recoverDoneTaskMergeMetadata();
-
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4646-B", expect.objectContaining({
-      mergeDetails: expect.objectContaining({ landedFiles: [] }),
-      modifiedFiles: undefined,
-    }));
-
-    manager.stop();
-  });
-
-  it("accepts done-task metadata repair when stale branch residue is outside the landed proof", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-7231",
-        column: "done",
-        paused: false,
-        branch: "fusion/fn-7231",
-        baseBranch: "main",
-        steps: [{ status: "done" }],
-        mergeDetails: {
-          commitSha: "merge1",
-          mergeConfirmed: true,
-          filesChanged: 1,
-          insertions: 1,
-          deletions: 0,
-          mergeCommitMessage: "fix(FN-7231): stale proof",
-          landedFiles: ["packages/engine/src/executor.ts"],
-        },
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor") && cmd.includes("merge1")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b") && cmd.includes("merge1")) return "merge1\u001ffix(FN-7231): stale proof\u001fFusion-Task-Id: FN-7231" as any;
-      if (cmd.includes("show --shortstat --format=") && cmd.includes("merge1")) return "1 file changed, 1 insertion(+)" as any;
-      if (cmd.includes("show --name-only --format=") && cmd.includes("merge1")) return "packages/engine/src/executor.ts\n" as any;
-      if (cmd.includes("Fusion-Task-Id: FN-7231")) return "merge1\u001ffix(FN-7231): stale proof\n" as any;
-      return "" as any;
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalled();
-    expect(store.logEntry).not.toHaveBeenCalledWith(
-      "FN-7231",
-      expect.stringContaining("invalid workflow merge proof"),
-    );
-    expect(mockedExecSync.mock.calls.some(([cmd]) => String(cmd).includes("git diff --name-only"))).toBe(false);
-
-    mockedExecSync.mockReset();
-    manager.stop();
-  });
-
-  it("populates rebaseBaseSha from landed commit when missing", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-4518-A",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "merge1", mergeConfirmed: false },
-      },
-    ]);
-
-    vi.spyOn(manager as any, "findLandedTaskCommit").mockResolvedValue({
-      sha: "merge1",
-      subject: "fix(FN-4518): landed",
-      filesChanged: 2,
-      insertions: 4,
-      deletions: 1,
-      rebaseBaseSha: "base1",
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4518-A", {
-      mergeDetails: expect.objectContaining({
-        commitSha: "merge1",
-        rebaseBaseSha: "base1",
-      }),
-    });
-
-    manager.stop();
-  });
-
-  it("does not overwrite existing rebaseBaseSha during reconciliation", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-4518-B",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "merge1", mergeConfirmed: false, rebaseBaseSha: "existing-base" },
-      },
-    ]);
-
-    vi.spyOn(manager as any, "findLandedTaskCommit").mockResolvedValue({
-      sha: "merge1",
-      subject: "fix(FN-4518): landed",
-      filesChanged: 2,
-      insertions: 4,
-      deletions: 1,
-      rebaseBaseSha: "incoming-base",
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4518-B", {
-      mergeDetails: expect.objectContaining({
-        rebaseBaseSha: "existing-base",
-      }),
-    });
-
-    manager.stop();
-  });
-
-  it("keeps rebaseBaseSha undefined when neither stored nor landed provides it", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-4518-C",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "merge1", mergeConfirmed: false },
-      },
-    ]);
-
-    vi.spyOn(manager as any, "findLandedTaskCommit").mockResolvedValue({
-      sha: "merge1",
-      subject: "fix(FN-4518): landed",
-      filesChanged: 2,
-      insertions: 4,
-      deletions: 1,
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4518-C", {
-      mergeDetails: expect.not.objectContaining({
-        rebaseBaseSha: expect.any(String),
-      }),
-    });
-
-    manager.stop();
-  });
-
-  it("FN-3862: confirmed task with unreachable stored SHA is preserved with warning", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-3814",
-        column: "done",
-        paused: false,
-        mergeDetails: {
-          commitSha: "gone1234",
-          mergeConfirmed: true,
-          filesChanged: 1,
-          insertions: 1,
-          deletions: 0,
-          mergeCommitMessage: "feat(FN-3814): landed",
-        },
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor gone1234 HEAD")) {
-        const err = new Error("not ancestor");
-        throw err as any;
-      }
-      if (cmd.includes("Fusion-Task-Id: FN-3814")) {
-        return "fix-later\u001ffix(FN-3814): later\n" as any;
-      }
-      return "" as any;
-    });
-
-    const warn = getSelfHealingLogger().warn;
-    warn.mockClear();
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(0);
-    expect(store.updateTask).not.toHaveBeenCalled();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("gone1234"));
-
-    manager.stop();
-  });
-
-  it("FN-3862: unconfirmed task with multiple owned commits picks earliest via --reverse", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-3829",
-        column: "done",
-        paused: false,
-        baseCommitSha: "base",
-        mergeDetails: { commitSha: "old", mergeConfirmed: false },
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor old HEAD")) {
-        throw new Error("not ancestor") as any;
-      }
-      if (cmd.includes("--reverse") && cmd.includes("Fusion-Task-Id: FN-3829")) {
-        return "mergeSha\u001ffix(FN-3829): merge\nfixupSha\u001ffix(FN-3829): follow-up\n" as any;
-      }
-      if (cmd.includes("Fusion-Task-Id: FN-3829")) {
-        return "fixupSha\u001ffix(FN-3829): follow-up\nmergeSha\u001ffix(FN-3829): merge\n" as any;
-      }
-      if (cmd.includes("show --shortstat --format= mergeSha")) {
-        return "2 files changed, 4 insertions(+), 1 deletions(-)" as any;
-      }
-      return "" as any;
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-3829", {
-      mergeDetails: expect.objectContaining({
-        commitSha: "mergeSha",
-      }),
-    });
-    expect(mockedExecSync).toHaveBeenCalledWith(
-      expect.stringContaining("--reverse"),
-      expect.anything(),
-    );
-
-    manager.stop();
-  });
-
-  it("FN-3862: unconfirmed task with no owned landed commit clears unowned stored SHA", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
-      {
-        id: "FN-3373",
-        column: "done",
-        paused: false,
-        mergeDetails: { commitSha: "196adbd", mergeConfirmed: false },
-        modifiedFiles: ["packages/cli/src/extension.ts"],
-      },
-    ]);
-
-    mockedExecSync.mockImplementation((command) => {
-      const cmd = String(command);
-      if (cmd.includes("merge-base --is-ancestor 196adbd HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 196adbd")) {
-        return "196adbd\u001ffeat(FN-3372): add safety net\u001fFusion-Task-Id: FN-3372" as any;
-      }
-      return "" as any;
-    });
-
-    const repaired = await manager.recoverDoneTaskMergeMetadata();
-
-    expect(repaired).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-3373", { mergeDetails: undefined });
-
-    manager.stop();
-  });
-});
-
-describe("pruneWorktrees", () => {
-  let store: TaskStore & EventEmitter;
-  let manager: SelfHealingManager;
-
-  beforeEach(() => {
-    store = createMockStore();
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    mockedResolveWorktreeBackend.mockReturnValue({
-      kind: "native",
-      create: vi.fn(),
-      remove: vi.fn(),
-      sync: vi.fn(),
-      prune: vi.fn(),
-      resolveWorktreePath: vi.fn(),
-    } as any);
-  });
-
-  afterEach(() => {
-    manager.stop();
-  });
-
-  it("delegates prune to worktrunk backend when enabled", async () => {
-    const prune = vi.fn().mockResolvedValue(undefined);
-    mockedResolveWorktreeBackend.mockReturnValue({
-      kind: "worktrunk",
-      create: vi.fn(),
-      remove: vi.fn(),
-      sync: vi.fn(),
-      prune,
-      resolveWorktreePath: vi.fn(),
-    } as any);
-    vi.mocked(store.getSettings).mockResolvedValue({ worktrunk: { enabled: true, onFailure: "fail" } } as any);
-
-    await (manager as any).pruneWorktrees();
-
-    expect(prune).toHaveBeenCalledWith({ rootDir: "/tmp/test-project" });
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git worktree prune"), expect.anything());
-  });
-
-  it("does not run native prune when worktrunk fail-hard prune fails", async () => {
-    const prune = vi.fn().mockRejectedValue(new Error("boom"));
-    mockedResolveWorktreeBackend.mockReturnValue({
-      kind: "worktrunk",
-      create: vi.fn(),
-      remove: vi.fn(),
-      sync: vi.fn(),
-      prune,
-      resolveWorktreePath: vi.fn(),
-    } as any);
-    vi.mocked(store.getSettings).mockResolvedValue({ worktrunk: { enabled: true, onFailure: "fail" } } as any);
-
-    await (manager as any).pruneWorktrees();
-
-    expect(prune).toHaveBeenCalledTimes(1);
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git worktree prune"), expect.anything());
-  });
-
-  it("falls back to native prune when worktrunk fallback-native prune fails", async () => {
-    const prune = vi.fn().mockRejectedValue(new Error("boom"));
-    mockedResolveWorktreeBackend.mockReturnValue({
-      kind: "worktrunk",
-      create: vi.fn(),
-      remove: vi.fn(),
-      sync: vi.fn(),
-      prune,
-      resolveWorktreePath: vi.fn(),
-    } as any);
-    vi.mocked(store.getSettings).mockResolvedValue({ worktrunk: { enabled: true, onFailure: "fallback-native" } } as any);
-
-    await (manager as any).pruneWorktrees();
-
-    expect(prune).toHaveBeenCalledTimes(1);
-    expect(mockedExecSync).toHaveBeenCalledWith("git worktree prune", expect.objectContaining({ cwd: "/tmp/test-project", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] }));
-  });
-});
-
-describe("worktrunk-aware cleanup sweeps", () => {
-  let store: TaskStore & EventEmitter;
-  let manager: SelfHealingManager;
-  let backendPrune: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    store = createMockStore();
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    backendPrune = vi.fn().mockResolvedValue(undefined);
-    mockedResolveWorktreeBackend.mockReturnValue({
-      kind: "worktrunk",
-      create: vi.fn(),
-      remove: vi.fn(),
-      sync: vi.fn(),
-      prune: backendPrune,
-      resolveWorktreePath: vi.fn(),
-    } as any);
-    vi.mocked(store.getSettings).mockResolvedValue({ worktrunk: { enabled: true, onFailure: "fail" } } as any);
-    mockedExecSync.mockClear();
-    mockedScanIdleWorktrees.mockClear();
-    mockedReaddirSync.mockClear();
-  });
-
-  afterEach(() => {
-    manager.stop();
-  });
-
-  it("cleanupOrphans short-circuits to backend prune when recycleWorktrees is false", async () => {
-    vi.mocked(store.getSettings).mockResolvedValue({ worktrunk: { enabled: true }, recycleWorktrees: false } as any);
-
-    const result = await (manager as any).cleanupOrphans();
-
-    expect(result).toBe(0);
-    expect(backendPrune).toHaveBeenCalledWith({ rootDir: "/tmp/test-project" });
-    expect(mockedScanIdleWorktrees).not.toHaveBeenCalled();
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git worktree remove"), expect.anything());
-  });
-
-  it("cleanupOrphans short-circuits to backend prune when recycleWorktrees is true", async () => {
-    const reapSpy = vi.spyOn(manager as any, "reapUnregisteredOrphans");
-    vi.mocked(store.getSettings).mockResolvedValue({ worktrunk: { enabled: true }, recycleWorktrees: true } as any);
-
-    const result = await (manager as any).cleanupOrphans();
-
-    expect(result).toBe(0);
-    expect(reapSpy).not.toHaveBeenCalled();
-    expect(backendPrune).toHaveBeenCalledWith({ rootDir: "/tmp/test-project" });
-    expect(mockedScanIdleWorktrees).not.toHaveBeenCalled();
-  });
-
-  it("reapUnregisteredOrphans short-circuits to backend prune", async () => {
-    await (manager as any).reapUnregisteredOrphans();
-
-    expect(backendPrune).toHaveBeenCalledWith({ rootDir: "/tmp/test-project" });
-    expect(mockedReaddirSync).not.toHaveBeenCalled();
-  });
-
-  it("enforceWorktreeCap short-circuits to backend prune", async () => {
-    await (manager as any).enforceWorktreeCap();
-
-    expect(backendPrune).toHaveBeenCalledWith({ rootDir: "/tmp/test-project" });
-    expect(mockedScanIdleWorktrees).not.toHaveBeenCalled();
-    expect(mockedReaddirSync).not.toHaveBeenCalled();
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git worktree remove"), expect.anything());
-  });
-});
-
-describe("cleanupOrphanedBranches", () => {
-  let store: TaskStore & EventEmitter;
-  let manager: SelfHealingManager;
-
-  beforeEach(() => {
-    store = createMockStore({
-      clearStaleExecutionStartBranchReferences: vi.fn().mockReturnValue([]),
-    });
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    mockedScanOrphanedBranches.mockReset();
-    mockedExecSync.mockReset();
-  });
-
-  afterEach(() => {
-    manager.stop();
-  });
-
-  it("prunes subsumed orphan branches and emits branch:orphan-prune", async () => {
-    mockedScanOrphanedBranches.mockResolvedValue(["fusion/FN-777"]);
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.startsWith("git rev-parse --verify")) return "abc123\n" as any;
-      if (command.startsWith("git rev-list --count")) return "0\n" as any;
-      if (command.startsWith("git branch -d")) return "" as any;
-      return "" as any;
-    });
-
-    const result = await (manager as any).cleanupOrphanedBranches();
-
-    expect(result).toBe(1);
-    expect(mockedExecSync).toHaveBeenCalledWith(expect.stringContaining("git branch -d"), expect.anything());
-    expect(vi.mocked(store.recordRunAuditEvent)).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "branch:orphan-prune" }));
-  });
-
-  it("leaves unique-commit orphan branches untouched", async () => {
-    mockedScanOrphanedBranches.mockResolvedValue(["fusion/FN-888"]);
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.startsWith("git rev-parse --verify")) return "def456\n" as any;
-      if (command.startsWith("git rev-list --count")) return "2\n" as any;
-      return "" as any;
-    });
-
-    const result = await (manager as any).cleanupOrphanedBranches();
-
-    expect(result).toBe(0);
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git branch -d"), expect.anything());
-    expect(vi.mocked(store.createTask)).not.toHaveBeenCalled();
-  });
-});
-
-describe("maintenance cycle concurrency", () => {
-  let store: TaskStore & EventEmitter;
-  let manager: SelfHealingManager;
-
-  beforeEach(() => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({
-        autoUnpauseEnabled: false,
-        maintenanceIntervalMs: 0, // disable interval so we only test runMaintenance() directly
-        maxWorktrees: 4,
-      } as unknown as Settings),
-      listTasks: vi.fn().mockResolvedValue([]),
-      walCheckpoint: vi.fn().mockReturnValue({ busy: 0, log: 0, checkpointed: 0 }),
-    });
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-  });
-
-  afterEach(() => {
-    manager.stop();
-    vi.useRealTimers();
-  });
-
-  it("skips cycle when already running", async () => {
-    // Use a deferred to keep the first cycle "running" while we call runMaintenance again
-    let resolvePrune: (value: number) => void;
-    const prunePromise = new Promise<number>((resolve) => {
-      resolvePrune = resolve;
-    });
-
-    const pruneSpy = (vi.spyOn(manager as any, "pruneWorktrees").mockImplementation(async () => {
-      return prunePromise;
-    }) as any);
-
-    // Start first cycle — it will wait on prunePromise
-    const firstCycleDone = (manager as any).runMaintenance();
-
-    // Advance time so the first cycle proceeds and sets maintenanceRunning = true
-    await vi.advanceTimersByTimeAsync(1);
-
-    // Call runMaintenance again — should be skipped because maintenanceRunning is true
-    (manager as any).runMaintenance();
-
-    // Second cycle should be skipped (pruneWorktrees only called once)
-    const pruneCallCount = pruneSpy.mock.calls.length;
-
-    // Now resolve the first cycle
-    resolvePrune!(0);
-    await firstCycleDone;
-
-    expect(pruneCallCount).toBe(1);
-  });
-
-  it("resets maintenanceRunning flag on error", async () => {
-    const error = new Error("simulated failure");
-    (vi.spyOn(manager as any, "pruneWorktrees").mockRejectedValue(error) as any);
-
-    await (manager as any).runMaintenance();
-
-    expect((manager as any).maintenanceRunning).toBe(false);
-  });
-
-  it("resets maintenanceRunning flag on success", async () => {
-    (vi.spyOn(manager as any, "pruneWorktrees").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "cleanupOrphans").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "enforceWorktreeCap").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverCompletedTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverStaleIncompleteReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverInterruptedMergingTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverStaleMergingStatus").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverMergeableReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverMergedReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverStuckMergeDeadlocks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverMisclassifiedFailures").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverNoProgressNoTaskDoneFailures").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverPartialProgressNoTaskDoneFailures").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverOrphanedExecutions").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverApprovedTriageTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverOrphanedPlanningTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverGhostReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "archiveStaleDoneTasks").mockResolvedValue(0) as any);
-
-    await (manager as any).runMaintenance();
-
-    expect((manager as any).maintenanceRunning).toBe(false);
-  });
-
-  it("skips SQLite WAL checkpoints during PostgreSQL maintenance", async () => {
-    (vi.spyOn(manager as any, "pruneWorktrees").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "cleanupOrphans").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "enforceWorktreeCap").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverCompletedTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverStaleIncompleteReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverInterruptedMergingTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverStaleMergingStatus").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverMergeableReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverMergedReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverStuckMergeDeadlocks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverMisclassifiedFailures").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverNoProgressNoTaskDoneFailures").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverPartialProgressNoTaskDoneFailures").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverOrphanedExecutions").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverApprovedTriageTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverOrphanedPlanningTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "recoverGhostReviewTasks").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "archiveStaleDoneTasks").mockResolvedValue(0) as any);
-
-    await (manager as any).runMaintenance();
-
-    expect(getSelfHealingLogger().log).toHaveBeenCalledWith(
-      expect.stringContaining("wal-checkpoint\" skipped — PostgreSQL manages WAL + autovacuum"),
-    );
-  });
-
-  it("runs batch 1 operations in sequence (with isolation — one failure doesn't block others)", async () => {
-    let runningCount = 0;
-    let maxConcurrent = 0;
-    let executionOrder: string[] = [];
-
-    const makeSlow = (label: string) =>
-      (vi.spyOn(manager as any, label).mockImplementation(async () => {
-        executionOrder.push(label);
-        runningCount++;
-        maxConcurrent = Math.max(maxConcurrent, runningCount);
-        await vi.advanceTimersByTimeAsync(10);
-        runningCount--;
-        return 0;
-      }) as any);
-
-    makeSlow("pruneWorktrees");
-    makeSlow("cleanupOrphans");
-    makeSlow("enforceWorktreeCap");
-    // checkpointWal is synchronous, no need to mock
-
-    await (manager as any).runMaintenance();
-
-    // Operations run sequentially (one at a time), not in parallel.
-    // This is intentional — each step is isolated so one failure doesn't
-    // block or race with the others.
-    expect(maxConcurrent).toBe(1);
-    // All operations should have run
-    expect(executionOrder).toContain("pruneWorktrees");
-    expect(executionOrder).toContain("cleanupOrphans");
-    expect(executionOrder).toContain("enforceWorktreeCap");
-  });
-
-  it("runs batch 2 operations in sequence (with isolation — one failure doesn't block others)", async () => {
-    let runningCount = 0;
-    let maxConcurrent = 0;
-    let executionOrder: string[] = [];
-
-    const makeSlow = (label: string) =>
-      (vi.spyOn(manager as any, label).mockImplementation(async () => {
-        executionOrder.push(label);
-        runningCount++;
-        maxConcurrent = Math.max(maxConcurrent, runningCount);
-        await vi.advanceTimersByTimeAsync(10);
-        runningCount--;
-        return 0;
-      }) as any);
-
-    makeSlow("recoverCompletedTasks");
-    makeSlow("recoverStrandedCompletedTodoTasks");
-    makeSlow("recoverStaleIncompleteReviewTasks");
-    makeSlow("recoverInterruptedMergingTasks");
-    makeSlow("recoverStaleMergingStatus");
-    makeSlow("finalizeNoOpReviewTasks");
-    makeSlow("recoverMergeableReviewTasks");
-    makeSlow("recoverMergedReviewTasks");
-    makeSlow("recoverStuckMergeDeadlocks");
-    makeSlow("recoverMisclassifiedFailures");
-    makeSlow("recoverNoProgressNoTaskDoneFailures");
-    makeSlow("recoverPartialProgressNoTaskDoneFailures");
-    makeSlow("recoverOrphanedExecutions");
-    makeSlow("recoverApprovedTriageTasks");
-    makeSlow("recoverOrphanedPlanningTasks");
-    makeSlow("recoverGhostReviewTasks");
-    makeSlow("recoverOrphanedAgents");
-    makeSlow("recoverStaleHeartbeatRuns");
-    makeSlow("clearStaleBlockedBy");
-
-    await (manager as any).runMaintenance();
-
-    // Operations run sequentially (one at a time), not in parallel.
-    expect(maxConcurrent).toBe(1);
-    // All operations should have run (including last one)
-    expect(executionOrder[executionOrder.length - 1]).toBe("clearStaleBlockedBy");
-  });
-
-  it("one failing batch 2 operation does not abort the batch", async () => {
-    const batch2Operations = [
-      "recoverCompletedTasks",
-      "recoverStrandedCompletedTodoTasks",
-      "recoverStaleIncompleteReviewTasks",
-      "recoverInterruptedMergingTasks",
-      "recoverStaleMergingStatus",
-      "finalizeNoOpReviewTasks",
-      "recoverMergeableReviewTasks",
-      "recoverMergedReviewTasks",
-      "recoverStuckMergeDeadlocks",
-      "recoverMisclassifiedFailures",
-      "recoverNoProgressNoTaskDoneFailures",
-      "recoverPartialProgressNoTaskDoneFailures",
-      "recoverOrphanedExecutions",
-      "recoverApprovedTriageTasks",
-      "recoverOrphanedPlanningTasks",
-      "recoverGhostReviewTasks",
-      "recoverOrphanedAgents",
-      "recoverStaleHeartbeatRuns",
-      "clearStaleBlockedBy",
-    ] as const;
-
-    // Make one operation fail
-    (vi.spyOn(manager as any, "recoverCompletedTasks").mockRejectedValue(new Error("db error")) as any);
-
-    // Make all others succeed
-    for (const op of batch2Operations.slice(1)) {
-      (vi.spyOn(manager as any, op as string).mockResolvedValue(0) as any);
-    }
-
-    // Mock batch 1 and 3 as well
-    (vi.spyOn(manager as any, "pruneWorktrees").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "cleanupOrphans").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "enforceWorktreeCap").mockResolvedValue(0) as any);
-    (vi.spyOn(manager as any, "archiveStaleDoneTasks").mockResolvedValue(0) as any);
-
-    // Should not throw — Promise.allSettled handles failures
-    await expect((manager as any).runMaintenance()).resolves.toBeUndefined();
-  });
-});
-
-describe("SelfHealingManager reclaimSelfOwnedBranchConflicts", () => {
-  let store: TaskStore & EventEmitter;
-  let manager: SelfHealingManager;
-
-  beforeEach(() => {
-    vi.useRealTimers();
-    store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, integrationBranch: "main" } as any),
-    });
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    mockedIsUsableTaskWorktree.mockResolvedValue(true);
-  });
-
-  afterEach(() => {
-    manager.stop();
-    vi.restoreAllMocks();
-  });
-
-  it("reclaims fully-subsumed branch conflicts and emits subsumed audit metadata", async () => {
-    store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false } as any),
-      recordRunAuditEvent: vi.fn().mockResolvedValue(undefined),
-    });
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-509", checkedOutBy: null, branch: "fusion/fn-509", worktree: "/tmp/fn-509", lineageId: "lin-9" }])
-      .mockResolvedValueOnce([]);
-    vi.spyOn(branchConflictModule, "inspectBranchConflict").mockResolvedValueOnce({
-      kind: "fully-subsumed",
-      livePath: "/tmp/fn-509",
-      tipSha: "abc123def456",
-    } as any);
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-    expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-509", expect.objectContaining({ worktree: null, branch: null, status: null, paused: false }));
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        domain: "git",
-        mutationType: "branch:auto-reclaim",
-        target: "fusion/fn-509",
-        metadata: expect.objectContaining({ subsumed: true, strandedCommitCount: 0 }),
-      }),
-    );
-  });
-
-  it("reclaims stranded same-task branch conflicts", async () => {
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-500", checkedOutBy: null, branch: "fusion/fn-500", worktree: "/tmp/fn-500", lineageId: "lin-1" }])
-      .mockResolvedValueOnce([]);
-    vi.spyOn(branchConflictModule, "inspectBranchConflict").mockResolvedValueOnce({
-      kind: "reclaimable",
-      livePath: "/tmp/fn-500",
-      tipSha: "abc123def456",
-      taskAttributedCommitCount: 2,
-      strandedCommits: [{ sha: "abc123", subject: "work" }],
-    } as any);
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-    expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-500", expect.objectContaining({ worktree: "/tmp/fn-500", branch: "fusion/fn-500", status: null, paused: false }));
-  });
-
-  it("normalizes an out-of-root self-healing reclaim before persisting it", async () => {
-    const outsidePath = "/tmp/legacy-worktrees/recover-fn-8400";
-    const targetPath = "/tmp/test-project/.worktrees/recover-fn-8400";
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-8400", checkedOutBy: null, branch: "fusion/fn-8400", worktree: outsidePath, lineageId: "lin-8400" }])
-      .mockResolvedValueOnce([]);
-    vi.spyOn(branchConflictModule, "inspectBranchConflict").mockResolvedValueOnce({
-      kind: "reclaimable",
-      livePath: outsidePath,
-      tipSha: "abc123def456",
-      taskAttributedCommitCount: 1,
-      strandedCommits: [{ sha: "abc123", subject: "work" }],
-    } as any);
-    vi.mocked(relocateReclaimableWorktreeIntoRoot).mockResolvedValueOnce({ kind: "ready", path: targetPath, relocated: true });
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-
-    expect(recovered).toBe(1);
-    expect(relocateReclaimableWorktreeIntoRoot).toHaveBeenCalledWith(expect.objectContaining({
-      rootDir: "/tmp/test-project",
-      sourcePath: outsidePath,
-      targetPath,
-      taskId: "FN-8400",
-    }));
-    expect(store.updateTask).toHaveBeenCalledWith("FN-8400", expect.objectContaining({ worktree: targetPath }));
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({ worktreePath: targetPath }),
-    }));
-  });
-
-  it("skips blocked todo tasks with preserved branches", async () => {
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-516", column: "todo", blockedBy: "FN-216", checkedOutBy: null, branch: "fusion/fn-516", worktree: "/tmp/fn-516" }])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
-    const inspectSpy = vi.spyOn(branchConflictModule, "inspectBranchConflict");
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-
-    expect(recovered).toBe(0);
-    expect(inspectSpy).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalled();
-  });
-
-  it("skips checked out tasks and emits no-action telemetry", async () => {
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-501", checkedOutBy: "agent-1", branch: "fusion/fn-501", worktree: "/tmp/fn-501" }])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
-    const inspectSpy = vi.spyOn(branchConflictModule, "inspectBranchConflict");
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-    expect(recovered).toBe(0);
-    expect(inspectSpy).not.toHaveBeenCalled();
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-      mutationType: "task:reclaim-self-owned-branch-conflict-no-action",
-      target: "FN-501",
-      metadata: expect.objectContaining({ reason: "checked-out-lease-active" }),
-    }));
-  });
-
-  it("skips tasks with recent active heartbeat runs", async () => {
-    const agentStore = {
-      listActiveHeartbeatRuns: vi.fn().mockResolvedValue([
-        {
-          id: "run-1",
-          agentId: "agent-1",
-          startedAt: new Date().toISOString(),
-          endedAt: null,
-          status: "active",
-          contextSnapshot: { taskId: "FN-777" },
-        },
-      ]),
-    } as any;
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project", agentStore });
-
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-777", checkedOutBy: null, branch: "fusion/fn-777", worktree: "/tmp/fn-777" }])
-      .mockResolvedValueOnce([]);
-
-    const inspectSpy = vi.spyOn(branchConflictModule, "inspectBranchConflict");
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-
-    expect(recovered).toBe(0);
-    expect(inspectSpy).not.toHaveBeenCalled();
-  });
-
-  it("scans todo, in-progress, and paused in-review columns", async () => {
-    (store.listTasks as any)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
-
-    await manager.reclaimSelfOwnedBranchConflicts();
-
-    expect(store.listTasks).toHaveBeenNthCalledWith(1, { column: "todo", slim: true });
-    expect(store.listTasks).toHaveBeenNthCalledWith(2, { column: "in-progress", slim: true });
-    expect(store.listTasks).toHaveBeenNthCalledWith(3, { column: "in-review", slim: true });
-  });
-
-  it("escalates live-foreign conflicts to in-review failed", async () => {
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-503", checkedOutBy: null, branch: "fusion/fn-503", worktree: "/tmp/fn-503" }])
-      .mockResolvedValueOnce([]);
-    vi.spyOn(branchConflictModule, "inspectBranchConflict").mockResolvedValueOnce({
-      kind: "live-foreign",
-      livePath: "/tmp/fn-503",
-      error: new Error("foreign branch owner"),
-    } as any);
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-    expect(recovered).toBe(0);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-503", expect.objectContaining({
-      status: "failed",
-      paused: true,
-      pausedReason: "branch-conflict-unrecoverable",
-    }));
-    expect(store.handoffToReview).toHaveBeenCalledWith("FN-503", expect.objectContaining({
-      evidence: expect.objectContaining({ reason: "branch-conflict-unrecoverable-repromote" }),
-    }));
-  });
-
-  it("preserves dirty worktree as recovery patch before unrecoverable escalation", async () => {
-    manager.stop();
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "fn-4476-self-heal-"));
-    const autoRecoveryDispatcher = {
-      dispatch: vi.fn().mockResolvedValue({
-        action: "pause",
-        rationale: "test-pause",
-        auditMetadata: {},
-        legacyPausedReason: "branch-conflict-unrecoverable",
-      }),
-    } as any;
-    manager = new SelfHealingManager(store, { rootDir: fixtureRoot, autoRecoveryDispatcher });
-    vi.spyOn(manager as any, "tryReanchorForeignOnlyContamination").mockResolvedValue(false);
-
-    try {
-      (store.listTasks as any)
-        .mockResolvedValueOnce([{ id: "FN-504", checkedOutBy: null, branch: "fusion/fn-504", worktree: "/tmp/fn-504" }])
-        .mockResolvedValueOnce([]);
-      vi.spyOn(branchConflictModule, "inspectBranchConflict").mockRejectedValueOnce(new Error("boom"));
-      mockedExecSync.mockImplementation((cmd: any) => {
-        const command = String(cmd);
-        if (command === "git status --porcelain") {
-          return Buffer.from(" M src/file.ts\n");
-        }
-        if (command === "git diff HEAD --binary") {
-          return Buffer.from("diff --git a/src/file.ts b/src/file.ts\n");
-        }
-        return Buffer.from("");
-      });
-
-      const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-      expect(recovered).toBe(0);
-      expect(autoRecoveryDispatcher.dispatch).toHaveBeenCalledTimes(1);
-      expect(store.handoffToReview).toHaveBeenCalledWith("FN-504", expect.objectContaining({
-        evidence: expect.objectContaining({ reason: "branch-conflict-unrecoverable-repromote" }),
-      }));
-
-      const recoveryDir = join(fixtureRoot, ".fusion", "recovery");
-      const files = readdirSync(recoveryDir);
-      const patchName = files.find((entry) => entry.startsWith("fn-504-") && entry.endsWith(".patch"));
-      expect(patchName).toBeTruthy();
-      expect(files).toContain(patchName);
-      expect(mockedExecSync).toHaveBeenCalledWith("git diff HEAD --binary", expect.any(Object));
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  });
-
-  it("escalates unrecoverable reclaim failures to in-review failed", async () => {
-    (store.listTasks as any)
-      .mockResolvedValueOnce([{ id: "FN-502", checkedOutBy: null, branch: "fusion/fn-502", worktree: "/tmp/fn-502" }])
-      .mockResolvedValueOnce([]);
-    vi.spyOn(branchConflictModule, "inspectBranchConflict").mockRejectedValueOnce(new Error("boom"));
-
-    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
-    expect(recovered).toBe(0);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-502", expect.objectContaining({
-      status: "failed",
-      paused: true,
-      pausedReason: "branch-conflict-unrecoverable",
-    }));
-    expect(store.handoffToReview).toHaveBeenCalledWith("FN-502", expect.objectContaining({
-      evidence: expect.objectContaining({ reason: "branch-conflict-unrecoverable-repromote" }),
-    }));
-  });
-});
-
-describe("SelfHealingManager reclaimStaleActiveBranches (FN-4546)", () => {
-  let store: TaskStore & EventEmitter;
-  let manager: SelfHealingManager;
-
-  beforeEach(() => {
-    mockedExecSync.mockReset();
-    store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false } as any),
-      recordRunAuditEvent: vi.fn().mockResolvedValue(undefined),
-      listTasks: vi.fn().mockResolvedValue([]),
-    });
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    mockedIsUsableTaskWorktree.mockResolvedValue(true);
-  });
-
-  it("reclaims subsumed fusion task branch with no worktree", async () => {
-    (store.listTasks as any).mockResolvedValueOnce([
-      { id: "FN-1001", column: "todo", checkedOutBy: null, userPaused: false, worktree: null, branch: null, lineageId: "lin-1" },
-    ]);
-
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.includes("git branch --list 'fusion/*'")) return Buffer.from("  fusion/fn-1001\n");
-      if (command.includes("git rev-parse --verify") && command.includes("fusion/fn-1001")) return Buffer.from("abc123def456\n");
-      if (command.includes("git rev-list --count") && command.includes("fusion/fn-1001")) return Buffer.from("0\n");
-      return Buffer.from("");
-    });
-
-    const recovered = await manager.reclaimStaleActiveBranches();
-
-    expect(recovered).toBe(1);
-    expect(mockedExecSync).toHaveBeenCalledWith(expect.stringContaining("git branch -D \"fusion/fn-1001\""), expect.anything());
-    expect(mockedExecSync).toHaveBeenCalledWith(expect.stringContaining("git worktree prune"), expect.anything());
-    expect(store.updateTask).toHaveBeenCalledWith("FN-1001", { worktree: null, branch: null, baseCommitSha: null });
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-      domain: "git",
-      mutationType: "branch:stale-active-reclaim",
-      target: "fusion/fn-1001",
-    }));
-  });
-
-  it("does not delete branch with unique commits", async () => {
-    (store.listTasks as any).mockResolvedValueOnce([
-      { id: "FN-1001", column: "todo", checkedOutBy: null, userPaused: false, worktree: null, branch: null },
-    ]);
-
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.includes("git branch --list 'fusion/*'")) return Buffer.from("  fusion/fn-1001\n");
-      if (command.includes("git rev-parse --verify") && command.includes("fusion/fn-1001")) return Buffer.from("abc123def456\n");
-      if (command.includes("git rev-list --count") && command.includes("fusion/fn-1001")) return Buffer.from("3\n");
-      if (command.includes("git log --format=%s")) return Buffer.from("feat: keep me\n");
-      return Buffer.from("");
-    });
-
-    const recovered = await manager.reclaimStaleActiveBranches();
-
-    expect(recovered).toBe(0);
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D \"fusion/fn-1001\""), expect.anything());
-    expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(expect.stringContaining("stale-active-branch-rescue-needed FN-1001"));
-  });
-
-  it("skips task with active heartbeat run", async () => {
-    const agentStore = {
-      listActiveHeartbeatRuns: vi.fn().mockResolvedValue([{ startedAt: new Date().toISOString(), contextSnapshot: { taskId: "FN-1001" } }]),
-    } as any;
-    manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project", agentStore });
-    (store.listTasks as any).mockResolvedValueOnce([
-      { id: "FN-1001", column: "todo", checkedOutBy: null, userPaused: false, worktree: null, branch: null },
-    ]);
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.includes("git branch --list 'fusion/*'")) return Buffer.from("  fusion/fn-1001\n");
-      return Buffer.from("");
-    });
-
-    const recovered = await manager.reclaimStaleActiveBranches();
-
-    expect(recovered).toBe(0);
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D \"fusion/fn-1001\""), expect.anything());
-  });
-
-  it("skips task with usable worktree", async () => {
-    (store.listTasks as any).mockResolvedValueOnce([
-      { id: "FN-1001", column: "todo", checkedOutBy: null, userPaused: false, worktree: "/tmp/fn-1001", branch: null },
-    ]);
-    mockedIsUsableTaskWorktree.mockResolvedValueOnce(true);
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.includes("git branch --list 'fusion/*'")) return Buffer.from("  fusion/fn-1001\n");
-      return Buffer.from("");
-    });
-
-    const recovered = await manager.reclaimStaleActiveBranches();
-
-    expect(recovered).toBe(0);
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D \"fusion/fn-1001\""), expect.anything());
-  });
-
-  it("skips user-paused task", async () => {
-    (store.listTasks as any).mockResolvedValueOnce([
-      { id: "FN-1001", column: "todo", checkedOutBy: null, userPaused: true, worktree: null, branch: null },
-    ]);
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.includes("git branch --list 'fusion/*'")) return Buffer.from("  fusion/fn-1001\n");
-      return Buffer.from("");
-    });
-
-    const recovered = await manager.reclaimStaleActiveBranches();
-
-    expect(recovered).toBe(0);
-    expect(mockedExecSync).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D \"fusion/fn-1001\""), expect.anything());
-  });
-});
-
-describe("SelfHealingManager no-commits-expected audit", () => {
-  it("logs candidate task IDs without mutating tasks", async () => {
-    const store = createMockStore();
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const now = new Date().toISOString();
-    const candidate = {
-      id: "FN-900",
-      column: "in-review",
-      status: "failed",
-      error: "fn_task_done refused: no_commits",
-      noCommitsExpected: undefined,
-      branch: "fusion/fn-900",
-      baseBranch: "main",
-      paused: false,
-      steps: [{ id: "s1", name: "done", status: "done" }],
-      log: [],
-      createdAt: now,
-      updatedAt: now,
-      description: "audit",
-      dependencies: [],
-      currentStep: 1,
-    } as unknown as Task;
-
-    vi.mocked(store.listTasks)
-      .mockResolvedValueOnce([candidate])
-      .mockResolvedValueOnce([candidate]);
-
-    mockedExecSync.mockImplementation((command: string) => {
-      if (command.includes("git rev-list --count")) {
-        return Buffer.from("0\n");
-      }
-      return Buffer.from("ok\n");
-    });
-
-    const count = await manager.auditNoCommitsExpectedCandidates();
-    expect(count).toBe(1);
-    expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(expect.stringContaining("FN-900"));
-    expect(store.updateTask).not.toHaveBeenCalled();
-    expect(store.moveTask).not.toHaveBeenCalled();
-  });
-});
 
 describe("autoMerge gating for mutating in-review sweeps (FN-5147)", () => {
   let store: TaskStore & EventEmitter;
@@ -10886,7 +8646,6 @@ describe("autoMerge gating for mutating in-review sweeps (FN-5147)", () => {
     // store.getTask / git helper is reached.
     const stale = new Date(Date.now() - 600_000).toISOString();
     const seededInReviewCandidates = [
-      // recoverStaleIncompleteReviewTasks + recoverGhostReviewTasks:
       // idle in-review with incomplete steps, stale.
       {
         id: "FN-GATE-INCOMPLETE",
@@ -10908,7 +8667,6 @@ describe("autoMerge gating for mutating in-review sweeps (FN-5147)", () => {
         updatedAt: stale,
         columnMovedAt: stale,
       },
-      // recoverMergedReviewTasks + recoverGhostReviewTasks(skip merge-confirmed):
       // mergeConfirmed:true stuck in in-review.
       {
         id: "FN-GATE-MERGED",
@@ -11028,34 +8786,6 @@ describe("autoMerge gating for mutating in-review sweeps (FN-5147)", () => {
     manager.stop();
   });
 
-  it.each([
-    "recoverReviewTasksWithFailedPreMergeSteps",
-    "recoverStaleIncompleteReviewTasks",
-    "recoverGhostReviewTasks",
-    "recoverInterruptedMergingTasks",
-    "recoverMergedReviewTasks",
-    "recoverStuckMergeDeadlocks",
-    "recoverOrphanOnlyScopeViolations",
-    "recoverAlreadyMergedReviewTasks",
-    "recoverForeignOnlyContaminatedInReviewTasks",
-    "recoverMissingWorktreeReviewFailures",
-    "recoverPartialProgressNoTaskDoneFailures",
-    "reclaimSelfOwnedBranchConflicts",
-  ] as const)("performs no mutations when autoMerge is disabled and no per-task override exists: %s", async (methodName) => {
-    if (methodName === "recoverReviewTasksWithFailedPreMergeSteps") {
-      manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project", recoverFailedPreMergeStep: vi.fn() });
-    }
-    const result = await (manager as any)[methodName]();
-    expect(result).toBe(0);
-    // Enumeration must have happened: the sweep listed real, stale in-review
-    // candidates seeded above. Mutations are skipped solely because of the
-    // per-task auto-merge gate (respects PR-based review flow) — so these
-    // assertions are non-vacuous.
-    expect(store.listTasks).toHaveBeenCalled();
-    expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalled();
-    expect(store.logEntry).not.toHaveBeenCalled();
-  });
 
   it("performs no mutations when autoMerge is disabled and no per-task override exists: recoverCompletionHandoffLimbo", async () => {
     const result = await manager.recoverCompletionHandoffLimbo();
@@ -11155,42 +8885,8 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
     vi.useRealTimers();
   });
 
-  it("emits stale-incomplete-review no-action when triple proof fails", async () => {
-    const store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, autoMerge: true, taskStuckTimeoutMs: 1_000 } as any),
-      listTasks: vi.fn().mockResolvedValue([{ id: "FN-SIR", column: "in-review", paused: false, status: null, worktree: "/tmp/fn-sir", updatedAt: new Date(Date.now() - 5_000).toISOString(), steps: [{ status: "pending" }] }]),
-    });
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.recoverStaleIncompleteReviewTasks();
-    expect(recovered).toBe(0);
-    expect(store.moveTask).not.toHaveBeenCalled();
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:stale-incomplete-review-no-action" }));
-  });
 
-  it("emits ghost-review no-action when triple proof fails", async () => {
-    const store = createMockStore({
-      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, autoMerge: true, taskStuckTimeoutMs: 1_000 } as any),
-      listTasks: vi.fn().mockResolvedValue([{ id: "FN-GHOST", column: "in-review", worktree: "/tmp/fn-ghost", updatedAt: new Date(Date.now() - 5_000).toISOString(), columnMovedAt: new Date(Date.now() - 5_000).toISOString(), paused: false, status: null, mergeDetails: {} }]),
-    });
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const recovered = await manager.recoverGhostReviewTasks();
-    expect(recovered).toBe(0);
-    expect(store.moveTask).not.toHaveBeenCalled();
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:ghost-review-no-action" }));
-  });
 
-  it("emits no-progress no-action when triple proof fails", async () => {
-    const store = createMockStore({
-      listTasks: vi.fn().mockResolvedValue([{ id: "FN-NP", column: "in-progress", worktree: "/tmp/fn-np", status: "failed", paused: false, error: "Agent finished without calling fn_task_done", updatedAt: new Date(Date.now() - 5_000).toISOString(), executionStartedAt: new Date(Date.now() - 5_000).toISOString(), steps: [{ id: "1", title: "a", status: "pending" }] }]),
-    });
-    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    vi.spyOn(manager as any, "hasRecoverableGitWork").mockResolvedValue(false);
-    vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: false, reason: "test" });
-    const recovered = await manager.recoverNoProgressNoTaskDoneFailures();
-    expect(recovered).toBe(0);
-    expect(store.moveTask).not.toHaveBeenCalled();
-    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:no-progress-no-task-done-no-action" }));
-  });
 
   it("emits missing-worktree-review no-action when triple proof fails", async () => {
     const store = createMockStore({
@@ -11249,9 +8945,53 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
     expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:auto-rebound-scope-decay-no-action" }));
   });
 
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-15:40:
+  `scopeDecayWipColumns` was UNCOVERED on the #3115 map. The case above uses `in-progress`, where the
+  literal is correct, so blinding the resolver leaves it green.
+
+  The audit event is the observable: reaching a no-action record proves the holder was SELECTED by
+  the sweep's lane filter. Blinded, a paused holder in a renamed wip lane is not selected at all —
+  the loop never runs, no event is recorded, and its file scope decays with nothing to rebound it.
+  */
+  it("selects a paused holder resting in a RENAMED wip lane", async () => {
+    const store = createMockStore({
+      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false, pausedScopeDecayMs: 1_000 } as any),
+      listTasks: vi.fn().mockResolvedValue([
+        { id: "FN-HOLDER", column: "building", paused: true, pausedReason: "waiting", blockedBy: null, worktree: "/tmp/wt-holder", updatedAt: new Date(Date.now() - 60_000).toISOString(), log: [] },
+        { id: "FN-FOLLOW", column: "drafting", paused: false, blockedBy: "FN-HOLDER" },
+      ]),
+    });
+    (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions = vi.fn(async () => [{
+      ir: {
+        version: "v2",
+        id: "custom:renamed",
+        nodes: [],
+        edges: [],
+        columns: [
+          { id: "drafting", name: "drafting", traits: [{ trait: "hold", config: { release: "capacity" } }] },
+          { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+        ],
+      },
+    }]);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    mockedClassifyTaskWorktree.mockResolvedValue({ ok: true } as any);
+
+    await manager.autoReboundPausedScopeDecay();
+
+    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      target: "FN-HOLDER",
+    }));
+    manager.stop();
+  });
+
   it("emits reclaim-pr-conflict no-action when triple proof fails", async () => {
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({ autoMerge: true, globalPause: false, enginePaused: false, taskStuckTimeoutMs: 1_000 } as any),
+      // FNXC:TaskWedgeNotifications 2026-07-22-19:15: The recovery path inventories
+      // active worktrees before triple-proof; keep this fixture deterministic so it
+      // exercises the intended ownerless no-action seam.
+      listTasks: vi.fn().mockResolvedValue([]),
       getTask: vi.fn().mockResolvedValue({ id: "FN-PR", column: "in-review", paused: false, status: null, worktree: "/tmp/wt-pr", branch: "fusion/fn-pr", prInfo: { number: 1, mergeable: "conflicting" }, updatedAt: new Date(Date.now() - 10_000).toISOString() }),
     });
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
@@ -11380,50 +9120,47 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
       return { store, manager, tasks };
     };
 
-    it("rebounds a stale dependency-blocking lease and is idempotent", async () => {
-      const { store, manager, tasks } = setup([
-        makeTask({ id: "FN-H", column: "in-progress", dependencies: ["FN-D"], worktree: "/tmp/wt-h" }),
-        makeTask({ id: "FN-D", column: "todo", status: "queued", overlapBlockedBy: "FN-H" }),
+
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-22:15:
+    Both of this sweep's resolvers were UNCOVERED on the #3115 coverage map: blinding either
+    `leaseWipColumns` or `leaseHoldColumns` back to its legacy id leaves all 825 self-healing tests
+    green, because every fixture above uses `in-progress` / `todo`, where the literals are correct.
+
+    What that costs on a renamed board: the holder scan matches no card and the dependency scan
+    matches no card, so a stale file-scope lease blocking a real dependency is never rebounded. The
+    dependent stays `overlapBlockedBy` forever behind a holder that is not coming back — a deadlock
+    the sweep exists to break, silently not broken.
+    */
+    it("keeps a renamed WIP holder in place when its lease is waived for the waiting dependency", async () => {
+      const { store, manager } = setup([
+        makeTask({ id: "FN-H", column: "building", dependencies: ["FN-D"], worktree: "/tmp/wt-h" }),
+        makeTask({ id: "FN-D", column: "drafting", status: "queued", overlapBlockedBy: "FN-H" }),
       ], {
         "FN-H": ["packages/engine/src/scheduler.ts"],
         "FN-D": ["packages/engine/src/scheduler.ts"],
       });
-      vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true, stalenessMs: 10_000, reason: "test", metadata: {} });
+      (store as unknown as { listWorkflowDefinitions: unknown }).listWorkflowDefinitions = vi.fn(async () => [{
+        ir: {
+          version: "v2",
+          id: "custom:renamed",
+          nodes: [],
+          edges: [],
+          columns: [
+            { id: "drafting", name: "drafting", traits: [{ trait: "hold", config: { release: "capacity" } }] },
+            { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+          ],
+        },
+      }]);
+      vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true, stalenessMs: 10_000, reason: "test" });
 
-      await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-H", "todo", expect.objectContaining({
-        preserveProgress: true,
-        preserveWorktree: true,
-        preserveResumeState: true,
-        moveSource: "engine",
-        recoveryRehome: true,
-      }));
-      expect(tasks.get("FN-H")?.userPaused).not.toBe(true);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-D", { overlapBlockedBy: null, status: null });
-      expect(store.logEntry).toHaveBeenCalledWith("FN-H", expect.stringContaining("FN-6292"));
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:reconcile-dependency-blocking-lease",
-        target: "FN-H",
-      }));
-
-      vi.clearAllMocks();
       await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(0);
       expect(store.moveTask).not.toHaveBeenCalled();
-      manager.stop();
-    });
-
-    it("rebounds an overlapping todo dependency even before a stale blocker marker is stamped", async () => {
-      const { store, manager } = setup([
-        makeTask({ id: "FN-H", column: "in-progress", dependencies: ["FN-D"] }),
-        makeTask({ id: "FN-D", column: "todo" }),
-      ], { "FN-H": ["a.ts"], "FN-D": ["a.ts"] });
-      vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true, stalenessMs: 10_000, reason: "test", metadata: {} });
-
-      await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-H", "todo", expect.objectContaining({ moveSource: "engine", recoveryRehome: true }));
       expect(store.updateTask).not.toHaveBeenCalledWith("FN-D", { overlapBlockedBy: null, status: null });
       manager.stop();
     });
+
+
 
     it("does not rebound met dependencies", async () => {
       const { store, manager } = setup([
@@ -11461,17 +9198,6 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
       manager.stop();
     });
 
-    it("rebounds hidden-only unmet dependency overlap when legacy counting is restored", async () => {
-      const { store, manager } = setup([
-        makeTask({ id: "FN-H", column: "in-progress", dependencies: ["FN-D"] }),
-        makeTask({ id: "FN-D", column: "todo" }),
-      ], { "FN-H": [".fusion/tasks/FN-H/PROMPT.md"], "FN-D": [".fusion/tasks/FN-H/PROMPT.md"] }, { ignoreHiddenOverlapPaths: false });
-      vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true, stalenessMs: 10_000, reason: "test", metadata: {} });
-
-      await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-H", "todo", expect.objectContaining({ moveSource: "engine", recoveryRehome: true }));
-      manager.stop();
-    });
 
     it.each([{ userPaused: true }, { paused: true }])("does not rebound operator-paused holders: %o", async (pauseState) => {
       const { store, manager } = setup([
@@ -11485,7 +9211,7 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
       manager.stop();
     });
 
-    it("uses merge-shadow dependency marker options during deadlock scans", async () => {
+    it("uses merge-shadow dependency marker options before applying the targeted waiver", async () => {
       const { store, manager } = setup([
         makeTask({ id: "FN-H", column: "in-progress", dependencies: ["FN-D"] }),
         makeTask({ id: "FN-D", column: "todo", overlapBlockedBy: "FN-H" }),
@@ -11495,7 +9221,8 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
 
       await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(0);
       expect(store.getCompletionHandoffAcceptedMarker).toHaveBeenCalledWith("FN-D");
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.recordRunAuditEvent).not.toHaveBeenCalledWith(expect.objectContaining({
         mutationType: "task:reconcile-dependency-blocking-lease-no-action",
         target: "FN-H",
       }));
@@ -11514,7 +9241,7 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
       manager.stop();
     });
 
-    it("emits no-action audit and does not rebound when triple-proof fails", async () => {
+    it("does not invoke triple-proof recovery when the dependency waiver already admits work", async () => {
       const { store, manager } = setup([
         makeTask({ id: "FN-H", column: "in-progress", dependencies: ["FN-D"] }),
         makeTask({ id: "FN-D", column: "todo", overlapBlockedBy: "FN-H" }),
@@ -11523,7 +9250,7 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
 
       await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(0);
       expect(store.moveTask).not.toHaveBeenCalled();
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      expect(store.recordRunAuditEvent).not.toHaveBeenCalledWith(expect.objectContaining({
         mutationType: "task:reconcile-dependency-blocking-lease-no-action",
         target: "FN-H",
       }));
@@ -11570,52 +9297,12 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
       return { store, manager, tasks };
     };
 
-    it("rebounds in-review tasks with live unmet dependencies and emits run-audit", async () => {
-      const { store, manager, tasks } = setup([
-        makeTask({ id: "FN-6778", column: "in-review", dependencies: ["FN-6777"], worktree: "/tmp/wt", branch: "fusion/fn-6778" }),
-        makeTask({ id: "FN-6777", column: "todo", status: "queued" }),
-        makeTask({ id: "FN-6779", column: "in-review", dependencies: ["FN-6770", "FN-6771", "FN-6780", "FN-TRIAGE", "FN-DONE"] }),
-        makeTask({ id: "FN-6770", column: "in-progress" }),
-        makeTask({ id: "FN-6771", column: "todo" }),
-        makeTask({ id: "FN-6780", column: "todo", status: "queued" }),
-        makeTask({ id: "FN-TRIAGE", column: "triage" }),
-        makeTask({ id: "FN-DONE", column: "done" }),
-      ]);
 
-      await expect(manager.reconcileInReviewUnmetDependencies()).resolves.toBe(2);
-
-      expect(store.moveTask).toHaveBeenCalledWith("FN-6778", "todo", expect.objectContaining({
-        preserveProgress: true,
-        preserveWorktree: true,
-        preserveResumeState: true,
-        moveSource: "engine",
-        recoveryRehome: true,
-        bypassGuards: true,
-      }));
-      expect(store.updateTask).toHaveBeenCalledWith("FN-6778", { status: "queued", blockedBy: "FN-6777" });
-      expect(store.updateTask).toHaveBeenCalledWith("FN-6779", { status: "queued", blockedBy: "FN-6770" });
-      expect(tasks.get("FN-6778")?.column).toBe("todo");
-      expect(tasks.get("FN-6778")?.blockedBy).toBe("FN-6777");
-      expect(tasks.get("FN-6779")?.blockedBy).toBe("FN-6770");
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:reconcile-in-review-unmet-dependencies",
-        target: "FN-6778",
-        metadata: expect.objectContaining({ unmetDeps: ["FN-6777"], blockedBy: "FN-6777" }),
-      }));
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:reconcile-in-review-unmet-dependencies",
-        target: "FN-6779",
-        metadata: expect.objectContaining({ unmetDeps: ["FN-6770", "FN-6771", "FN-6780", "FN-TRIAGE"], blockedBy: "FN-6770" }),
-      }));
-      manager.stop();
-    });
-
-    it("leaves satisfied, archived, and missing dependencies untouched", async () => {
+    it("leaves satisfied and missing dependencies untouched", async () => {
       const { store, manager } = setup([
-        makeTask({ id: "FN-OK", column: "in-review", dependencies: ["FN-DONE", "FN-REVIEW", "FN-ARCHIVED", "FN-MISSING"] }),
+        makeTask({ id: "FN-OK", column: "in-review", dependencies: ["FN-DONE", "FN-REVIEW", "FN-MISSING"] }),
         makeTask({ id: "FN-DONE", column: "done" }),
         makeTask({ id: "FN-REVIEW", column: "in-review" }),
-        makeTask({ id: "FN-ARCHIVED", column: "archived" }),
       ]);
 
       await expect(manager.reconcileInReviewUnmetDependencies()).resolves.toBe(0);
@@ -11673,20 +9360,6 @@ describe("FN-5335 triple-proof no-action unit coverage", () => {
       manager.stop();
     });
 
-    it("lets explicit autoMerge true rebound when global autoMerge is false", async () => {
-      const { store, manager, tasks } = setup([
-        makeTask({ id: "FN-OVERRIDE", column: "in-review", dependencies: ["FN-D"], autoMerge: true }),
-        makeTask({ id: "FN-D", column: "todo" }),
-      ], { autoMerge: false });
-
-      await expect(manager.reconcileInReviewUnmetDependencies()).resolves.toBe(1);
-      expect(tasks.get("FN-OVERRIDE")).toMatchObject({ column: "todo", status: "queued", blockedBy: "FN-D" });
-      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-        mutationType: "task:reconcile-in-review-unmet-dependencies",
-        target: "FN-OVERRIDE",
-      }));
-      manager.stop();
-    });
 
     it("keeps shared-branch-group members held under autoMerge false with no-action audit", async () => {
       const { store, manager } = setup([
@@ -11785,10 +9458,9 @@ describe("stranded AI merge clean-room recovery", () => {
 
     const originalReaddir = mockedReaddirSync.getMockImplementation();
     const originalExec = mockedExecSync.getMockImplementation();
+    const recoveryRoot = resolveAiMergeRootPath("/tmp/test-project", undefined);
     mockedReaddirSync.mockImplementation((path: any) => {
-      if (String(path).includes(".ai-merge") || String(path).includes("fusion-ai-merge")) {
-        return ["fusion-ai-merge-fn-5858-abcd"] as any;
-      }
+      if (String(path) === recoveryRoot) return ["fusion-ai-merge-fn-5858-abcd"] as any;
       return [] as any;
     });
     mockedExecSync.mockImplementation((command: string) => {

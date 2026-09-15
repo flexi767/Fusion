@@ -22,6 +22,7 @@ vi.mock("lucide-react", () => ({
   Trash2: () => null,
   RotateCw: () => null,
   Zap: () => null,
+  ShieldCheck: () => null,
   AlertTriangle: () => null,
   ArrowDown: ({ style }: { style?: React.CSSProperties }) => <svg className="lucide-arrow-down" style={style} />,
   Flag: ({ style }: { style?: React.CSSProperties }) => <svg className="lucide-flag" style={style} />,
@@ -29,6 +30,7 @@ vi.mock("lucide-react", () => ({
   TriangleAlert: ({ style }: { style?: React.CSSProperties }) => <svg className="lucide-triangle-alert" style={style} />,
   Eye: () => null,
   MoreHorizontal: () => null,
+  Sparkles: () => null,
 }));
 
 vi.mock("../ProviderIcon", () => ({
@@ -62,6 +64,7 @@ vi.mock("../../hooks/useToast", () => ({
 const noop = () => {};
 const resolvedChipHeightPattern = /^(var\(--card-chip-height\)|22px)$/;
 const centeredIdNudgePattern = /^translateY\(calc\(var\(--space-xs\) \/ 4\)\)$/;
+const centeredSizeBadgeOffset = "transform: translateY(calc((var(--space-xs) * 3) / 4));";
 
 function expectSharedHeaderBaseline(container: HTMLElement) {
   const header = container.querySelector(".card-header") as HTMLElement;
@@ -160,7 +163,14 @@ function expectHeaderActionsControlCenterline(container: HTMLElement, expected: 
     expect(menuStyles.alignItems).toBe("center");
     expect(menuStyles.justifyContent).toBe("center");
     expect(menuStyles.lineHeight).toBe("1");
-    expect(menuStyles.minHeight).toBe("");
+    /*
+    FNXC:TaskCardBadges 2026-07-30-09:30:
+    `auto` IS the unset value. `.card-menu-btn` declares no `min-height` (TaskCard.css:1645), and
+    `auto` is the CSS initial value for it — jsdom 29 reports that spec-correct initial where jsdom 27
+    returned the empty string. The intent here is "nothing constrains the button's height", which
+    `auto` states; asserting `""` was pinning a jsdom-27 quirk rather than a style fact.
+    */
+    expect(menuStyles.minHeight).toBe("auto");
   } else {
     expect(menu).toBeNull();
   }
@@ -184,7 +194,12 @@ function expectSizeBadgeAfterTaskId(container: HTMLElement, expected: boolean) {
   const sizeStyles = getComputedStyle(sizeBadge!);
   expect(sizeStyles.display).toBe("inline-flex");
   expect(sizeStyles.alignItems).toBe("center");
+  expect(sizeStyles.alignSelf).toBe("flex-start");
   expect(sizeStyles.lineHeight).toBe("1");
+  expect(sizeStyles.height).toBe("auto");
+  expect(sizeStyles.minHeight).toBe("auto");
+  expect(sizeStyles.maxHeight).toBe("none");
+  expect(sizeStyles.transform).toBe("translateY(calc((var(--space-xs) * 3) / 4))");
   expect(sizeBadge!.parentElement).toBe(header);
   expect(cardId.nextElementSibling).toBe(sizeBadge);
   expect(actions?.contains(sizeBadge)).toBe(false);
@@ -271,6 +286,60 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
     expect(container.querySelector(".card-header-actions")).toBeNull();
   });
 
+  it.each([
+    ["fast alone", { priority: "normal", plannerOversightLevel: "off" }],
+    ["fast with priority", { priority: "urgent", plannerOversightLevel: "off" }],
+    ["fast with oversight", { priority: "normal", plannerOversightLevel: "steer" }],
+    ["fast with priority and oversight", { priority: "urgent", plannerOversightLevel: "steer" }],
+  ] as const)("keeps %s beside a queued-to-plan status chip in the shared wrap context", (_name, meta) => {
+    const { container: queuedContainer } = render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          status: undefined,
+          steps: [],
+          executionMode: "fast",
+          ...meta,
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const headerBadges = queuedContainer.querySelector(".card-header-badges") as HTMLElement;
+    const statusBadge = queuedContainer.querySelector(".card-status-badge") as HTMLElement;
+    const metaBadges = queuedContainer.querySelector('[data-testid="card-meta-badges"]') as HTMLElement;
+    const fastBadge = queuedContainer.querySelector(".card-execution-mode-badge") as HTMLElement;
+
+    expect(headerBadges).toBeTruthy();
+    expect(statusBadge).toHaveTextContent("Queued to plan");
+    expect(metaBadges).toBeTruthy();
+    expect(fastBadge).toBeTruthy();
+    expect(metaBadges.parentElement).toBe(headerBadges);
+    expect(headerBadges.contains(statusBadge)).toBe(true);
+    expect(headerBadges.contains(fastBadge)).toBe(true);
+    expect(getComputedStyle(metaBadges).display).toBe("contents");
+    expect(getComputedStyle(fastBadge).flexShrink).toBe("0");
+    const priorityBadge = queuedContainer.querySelector(".card-priority-badge") as HTMLElement | null;
+    if (priorityBadge) expect(getComputedStyle(priorityBadge).flexShrink).toBe("0");
+  });
+
+  it("keeps the layout-transparent meta wrapper contract in the mobile badge context", () => {
+    const mobileSection = getCssBlocks(loadedCss, "max-width: 768px").join("\n");
+
+    expectCssRuleToContain(loadedCss, ".card-meta-badges", "display: contents;");
+    expectCssRuleToContain(mobileSection, ".card-header-badges", "gap: calc(var(--space-xs) / 2);");
+    expect(mobileSection).not.toMatch(/\.card-meta-badges\s*\{/);
+  });
+
+  it("keeps right-side breathing room around queued reason icons at tablet widths", () => {
+    expectCssRuleToContain(
+      loadedCss,
+      ".card-status-badge--queued-with-reason",
+      "padding-inline-end: var(--space-xs);",
+    );
+  });
+
   it("places a fast-mode size badge after the task id before wrapping header badges", () => {
     const { container: sizedContainer } = render(
       <TaskCard
@@ -293,7 +362,6 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         })}
         onOpenDetail={noop}
         addToast={noop}
-        onArchiveTask={async () => makeTask()}
         workflowBadge={{ workflowId: "wf-fast-size", workflowName: "Fast size workflow" }}
       />,
     );
@@ -338,6 +406,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -393,6 +462,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -402,7 +472,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
 
     /*
      * FNXC:BoardCardActions 2026-07-16-02:24:
-     * FN-8080 preserves the FN-8035 done-card contract: Archive/Revert live in the three-dot
+     * FN-8080 preserves the done-card contract: Revert lives in the three-dot
      * card-menu-btn TaskContextMenu, so the trailing header actions expose the menu only.
      */
     const { container: doneContainer } = render(
@@ -412,10 +482,11 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
           column: "done",
           status: "done" as Task["status"],
           size: "S",
+          mergeDetails: { commitSha: "abc123" } as Task["mergeDetails"],
         })}
         onOpenDetail={noop}
+        onRevertTask={async () => ({ mode: "git", clean: true, revertCommitSha: "deadbeef" }) as any}
         addToast={noop}
-        onArchiveTask={async () => makeTask()}
       />,
     );
 
@@ -470,6 +541,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetail={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -489,6 +561,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
         onOpenDetailWithTab={noop}
         addToast={noop}
         onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
       />,
     );
 
@@ -519,11 +592,71 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
     expect(loadedCss).toContain("min-height: var(--card-chip-height-mobile);");
   });
 
-  it("derives the size badge height from shared header-badge geometry", () => {
+  it("anchors the size badge to the first header chip row across desktop and mobile", () => {
     const sizeBadgeRule = loadedCss.match(/\.card-size-badge\s*\{(?<body>[^}]*)\}/)?.groups?.body ?? "";
+    const mobileSection = getCssBlocks(loadedCss, "max-width: 768px").join("\n");
+    const shortLandscapeSection = getCssBlocks(loadedCss, "max-height: 480px").join("\n");
 
-    expect(sizeBadgeRule).toContain("align-self: center;");
-    expect(sizeBadgeRule).not.toContain("min-height:");
+    /*
+     * FNXC:TaskCardLayout 2026-08-01-06:46 (FN-8675):
+     * The direct size chip retains intrinsic badge dimensions for FN-8665 parity, then uses this
+     * token-derived offset to occupy the same first-row centerline as chips centered by the group.
+     * Check every responsive section because jsdom does not evaluate media queries during render.
+     */
+    expect(sizeBadgeRule).toContain("align-self: flex-start;");
+    expect(sizeBadgeRule).toContain("box-sizing: border-box;");
+    expect(sizeBadgeRule).toContain(centeredSizeBadgeOffset);
+    expect(sizeBadgeRule).not.toContain("align-self: center;");
+    for (const declaration of ["\n  height:", "\n  min-height:", "\n  max-height:"]) {
+      expectCssRuleNotToContain(loadedCss, ".card-size-badge", declaration);
+    }
+    for (const section of [mobileSection, shortLandscapeSection]) {
+      expectCssRuleToContain(section, ".card-size-badge", "align-self: flex-start;");
+      expectCssRuleToContain(section, ".card-size-badge", centeredSizeBadgeOffset);
+      for (const declaration of ["\n  height:", "\n  min-height:", "\n  max-height:"]) {
+        expectCssRuleNotToContain(section, ".card-size-badge", declaration);
+      }
+    }
+  });
+
+  it("keeps the size chip beside the id when paused and reviewing badges fill the wrapping group", () => {
+    const { container: pausedContainer } = render(
+      <TaskCard
+        task={makeTask({
+          id: "FN-8599-PAUSED",
+          status: "planning" as Task["status"],
+          size: "M",
+          paused: true,
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+    const { container: reviewingContainer } = render(
+      <TaskCard
+        task={makeTask({
+          id: "FN-8599-REVIEWING",
+          column: "triage",
+          status: "planning" as Task["status"],
+          size: "M",
+          enabledWorkflowSteps: ["plan-review"],
+          workflowStepResults: [{
+            workflowStepId: "plan-review",
+            workflowStepName: "Plan Review",
+            status: "pending",
+            startedAt: "2026-07-26T08:29:00.000Z",
+          }],
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(pausedContainer.querySelectorAll(".card-status-badge")).toHaveLength(1);
+    expect(reviewingContainer.querySelectorAll(".card-status-badge")).toHaveLength(2);
+    expect(reviewingContainer.querySelector('[data-testid="card-reviewing-FN-8599-REVIEWING"]')).toHaveTextContent("Plan Review");
+    expectSizeBadgeAfterTaskId(pausedContainer, true);
+    expectSizeBadgeAfterTaskId(reviewingContainer, true);
   });
 
   it("locks the mobile three-dot menu, size, and Promote controls to the card rhythm", () => {
@@ -631,7 +764,7 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
     expect(agentBadge.getAttribute("title")).toBe("Created by agent: agent-badge-wrap");
     expect(agentBadge.getAttribute("aria-label")).toBe("Created by agent: agent-badge-wrap");
     expect(agentBadge.querySelector(".visually-hidden")?.textContent).toBe("Created by agent: agent-badge-wrap");
-    expect(agentBadge.querySelector("span[aria-hidden='true']")?.textContent).toBe("agent-badge-...");
+    expect(agentBadge.querySelector("span[aria-hidden='true']")?.textContent).toBe("by agent-badge-...");
 
     const styles = getComputedStyle(agentRow);
     expect(styles.display).toBe("flex");
@@ -697,5 +830,45 @@ describe("TaskCard badge wrapping (FN-5162)", () => {
     expect(styles.display).toBe("flex");
     expect(styles.justifyContent).toBe("flex-start");
     expect(styles.minWidth).toBe("0px");
+  });
+
+  it("contains minimal and populated cards when a host narrows below the mobile breakpoint", () => {
+    const { container: minimalContainer } = render(
+      <TaskCard task={makeTask({ id: "FN-8802-MINIMAL", title: undefined, description: "" })} onOpenDetail={noop} addToast={noop} />,
+    );
+    const { container: populatedContainer } = render(
+      <TaskCard
+        task={makeTask({
+          id: "FN-8802-POPULATED",
+          title: "A deliberately long task title that must shrink inside a very narrow card without moving controls outside its boundary",
+          priority: "urgent" as Task["priority"],
+          executionMode: "fast",
+          size: "L",
+          sourceType: "agent_heartbeat",
+          sourceAgentId: "agent-badge-wrap",
+          noCommitsExpected: true,
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+        onMoveTask={async () => makeTask()}
+        onDuplicateTask={async () => makeTask()}
+        workflowBadge={{ workflowId: "wf-narrow", workflowName: "A workflow badge with an intentionally long name" }}
+      />,
+    );
+
+    for (const card of [
+      minimalContainer.querySelector(".card"),
+      populatedContainer.querySelector(".card"),
+    ] as HTMLElement[]) {
+      expect(card).toBeTruthy();
+      const styles = getComputedStyle(card);
+      expect(styles.minWidth).toBe("0px");
+      expect(styles.maxWidth).toBe("100%");
+      expect(styles.boxSizing).toBe("border-box");
+    }
+
+    expect(populatedContainer.querySelector(".card-menu-btn")).toBeTruthy();
+    expect(populatedContainer.querySelector(".card-size-badge")).toBeTruthy();
+    expect(populatedContainer.querySelector(".card-title")).toHaveTextContent("A deliberately long task title");
   });
 });

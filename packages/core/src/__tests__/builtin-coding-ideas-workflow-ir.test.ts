@@ -3,11 +3,10 @@ import {
   BUILTIN_CODING_IDEAS_WORKFLOW_IR,
   parseWorkflowIr,
   serializeWorkflowIr,
-  getBuiltinWorkflow,
   resolveEntryColumnId,
 } from "../index.js";
-import { resolveColumnFlags } from "../trait-registry.js";
-import type { WorkflowIrV2 } from "../workflow-ir-types.js";
+import { resolveColumnFlags } from "../workflows/trait-registry.js";
+import type { WorkflowIrV2 } from "../workflows/workflow-ir-types.js";
 
 describe("builtin coding-ideas workflow ir", () => {
   it("parses and round-trips", () => {
@@ -17,16 +16,12 @@ describe("builtin coding-ideas workflow ir", () => {
     expect(parsed.version).toBe("v2");
   });
 
-  it("is registered in the builtin catalog as a selectable workflow", () => {
-    const workflow = getBuiltinWorkflow("builtin:coding-ideas");
-    expect(workflow).toBeDefined();
-    expect(workflow!.id).toBe("builtin:coding-ideas");
-    expect(workflow!.name).toBe("Coding (Ideas)");
-    expect(workflow!.kind).toBe("workflow");
-    expect(workflow!.ir).toBe(BUILTIN_CODING_IDEAS_WORKFLOW_IR);
+  it("remains a validated composition base outside the builtin catalog", () => {
+    expect(parseWorkflowIr(BUILTIN_CODING_IDEAS_WORKFLOW_IR)).toBe(BUILTIN_CODING_IDEAS_WORKFLOW_IR);
+    expect(BUILTIN_CODING_IDEAS_WORKFLOW_IR.name).toBe("builtin-coding-ideas");
   });
 
-  it("declares the five-stage Ideas → Todo → In-progress → In-review → Done board shape plus archived", () => {
+  it("declares the five-stage Ideas → Todo → In-progress → In-review → Done board shape", () => {
     const ir = BUILTIN_CODING_IDEAS_WORKFLOW_IR as WorkflowIrV2;
     expect(ir.columns.map((c) => c.id)).toEqual([
       "ideas",
@@ -34,7 +29,6 @@ describe("builtin coding-ideas workflow ir", () => {
       "in-progress",
       "in-review",
       "done",
-      "archived",
     ]);
   });
 
@@ -82,14 +76,31 @@ describe("builtin coding-ideas workflow ir", () => {
   });
 
   it("retains the default-on optional plan/code review groups from the default coding graph", () => {
-    const workflow = getBuiltinWorkflow("builtin:coding-ideas")!;
-    const byId = new Map(workflow.ir.nodes.map((n) => [n.id, n]));
+    const byId = new Map(BUILTIN_CODING_IDEAS_WORKFLOW_IR.nodes.map((n) => [n.id, n]));
     const planReview = byId.get("plan-review");
     expect(planReview?.kind).toBe("optional-group");
     expect(planReview?.config?.defaultOn).toBe(true);
     const codeReview = byId.get("code-review");
     expect(codeReview?.kind).toBe("optional-group");
     expect(codeReview?.config?.defaultOn).toBe(true);
+  });
+
+  it("keeps each activity in the column named for that activity", () => {
+    const ir = BUILTIN_CODING_IDEAS_WORKFLOW_IR as WorkflowIrV2;
+    const nodeColumn = (id: string) => ir.nodes.find((node) => node.id === id)?.column;
+    expect(nodeColumn("plan")).toBe("todo");
+    expect(nodeColumn("plan-review")).toBe("todo");
+    expect(nodeColumn("parse")).toBe("in-progress");
+    expect(nodeColumn("steps")).toBe("in-progress");
+    expect(nodeColumn("code-review")).toBe("in-review");
+    expect(nodeColumn("code-review-remediation")).toBe("in-progress");
+    expect(nodeColumn("completion-summary")).toBe("in-review");
+    for (const node of ir.nodes.filter((candidate) => candidate.id.startsWith("merge-"))) {
+      expect(node.column, `${node.id} should remain in review`).toBe("in-review");
+    }
+    expect(ir.nodes.some((node) => node.id === "browser-verification")).toBe(false);
+    expect(ir.nodes.some((node) => node.id === "browser-verification-remediation")).toBe(false);
+    expect(ir.nodes.some((node) => node.id === "post-merge-verification")).toBe(false);
   });
 
   it("never leaves a node in a column the workflow does not declare", () => {

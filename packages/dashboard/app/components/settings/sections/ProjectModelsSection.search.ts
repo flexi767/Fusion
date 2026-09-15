@@ -11,6 +11,16 @@ import type { SettingsSearchEntry } from "../search/types";
 export const projectModelsSearchEntries: SettingsSearchEntry[] = [
   {
     sectionId: "project-models",
+    key: "executorEscalationModel",
+    labelKey: "settings.projectModels.executorEscalationModel",
+    labelFallback: "Executor Escalation Model",
+    helpKey: "settings.projectModels.executorEscalationModelHelp",
+    helpFallback:
+      "Alternate model used once tool-failure retries are exhausted. No default — unset means no alternate model; configure escalation policy and an optional node target in Scheduling.",
+    keywords: ["tool failure", "alternate model", "retry model", "provider", "executor"],
+  },
+  {
+    sectionId: "project-models",
     key: "tokenCap",
     labelKey: "settings.projectModels.tokenCap",
     labelFallback: "Token Cap",
@@ -18,16 +28,6 @@ export const projectModelsSearchEntries: SettingsSearchEntry[] = [
     helpFallback:
       "Automatically compact context when approaching this token count. Leave empty for no cap (compact only on overflow errors). Set a number to proactively compact when reaching this token count. No default — unset (no cap).",
     keywords: ["context window", "limit", "budget"],
-  },
-  {
-    sectionId: "project-models",
-    key: "chatNewSessionMode",
-    labelKey: "settings.projectModels.chatNewSessionMode",
-    labelFallback: "New Chat behavior",
-    helpKey: "settings.projectModels.chatNewSessionModeHelp",
-    helpFallback:
-      "Prompt mode opens New Chat with this default preselected. Always-default mode skips the dialog when the configured default is complete.",
-    keywords: ["direct chat", "skip dialog"],
   },
   {
     sectionId: "project-models",
@@ -44,22 +44,21 @@ export const projectModelsSearchEntries: SettingsSearchEntry[] = [
   },
   {
     sectionId: "project-models",
-    key: "taskDefinitionInInputLanguage",
-    labelKey: "settings.projectModels.taskDefinitionInInputLanguage",
-    labelFallback: "Write task definitions in the operator's input language",
-    helpKey: "settings.projectModels.taskDefinitionInInputLanguageHelp",
-    helpFallback:
-      "When enabled, generated task-definition prose uses supported detectable input languages (Spanish, French, Korean, or Chinese as zh-CN). Headings, markers, and code stay English. Unsupported or undetectable input stays English. Default: disabled.",
-    keywords: ["task definition", "prompt language", "localized prose", "Spanish", "French", "Korean", "Chinese"],
+    key: "taskOutputLanguage",
+    labelKey: "settings.projectModels.taskOutputLanguage",
+    labelFallback: "AI-authored task language",
+    helpKey: "settings.projectModels.taskOutputLanguageHelp",
+    helpFallback: "Choose the language for AI-authored task plans, titles, steps, summaries, and recommendations. No stored default — unset resolves English. Changes apply to new generation sessions only.",
+    keywords: ["task", "output", "language", "English", "input", "interface", "plans", "summaries"],
   },
   {
     sectionId: "project-models",
     key: "autoSummarizeTitles",
     labelKey: "settings.projectModels.autoSummarizeLongDescriptionsAsTitles",
-    labelFallback: " Auto-summarize long descriptions as titles ",
+    labelFallback: " Auto-summarize task titles ",
     helpKey: "settings.projectModels.whenEnabledTasksCreatedWithoutATitleBut",
     helpFallback:
-      " When enabled, tasks created without a title but with descriptions over 200 characters will automatically get an AI-generated title (max 60 characters). The same model is also used to generate fallback merge commit message bodies when the branch's commit log is empty (e.g. squash merges with no unique commits), and GitHub tracking issue titles when a tracked task has no title yet. Default: disabled. ",
+      " When enabled, every non-empty task description created without a title receives an AI-generated title (max 60 characters). Explicit titles are preserved, and manual or explicit force requests remain available when this is disabled. The same model is also used for merge commit summaries and GitHub tracking issue titles. Default: disabled. ",
   },
   {
     sectionId: "project-models",
@@ -89,5 +88,14 @@ export const projectModelsSearchEntries: SettingsSearchEntry[] = [
     helpFallback:
       "Guides the AI-generated Create PR summary, changes, and testing sections. Leave blank to use the default PR metadata prompt. No default — unset.",
     keywords: ["pull request", "body"],
+  },
+  {
+    sectionId: "project-models",
+    key: "fastCheapModelId",
+    labelKey: "settings.globalModels.fastAndCheapModel",
+    labelFallback: "Fast & Cheap Model",
+    helpKey: "settings.globalModels.fastAndCheapModelHelp",
+    helpFallback: "Select a cheap model here for quick edits. It is used for Fast Mode when creating a task.",
+    keywords: ["fast", "cheap", "fast mode"],
   },
 ];

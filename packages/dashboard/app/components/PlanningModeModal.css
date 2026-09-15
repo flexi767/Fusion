@@ -46,7 +46,6 @@
   min-height: 480px;
   max-height: calc(100dvh - var(--overlay-padding-top, 10vh) - 16px);
   overflow: hidden;
-  resize: both;
 }
 
 /*
@@ -54,7 +53,7 @@ FNXC:PlanningMode 2026-06-21-00:00:
 FN-6886 promotes Planning Mode into the main app content area. The embedded shell fills the available content pane and intentionally disables modal-only sizing/resizing so the left sidebar owns navigation and no backdrop shell remains.
 */
 /*
-FNXC:Planning 2026-06-23-02:00:
+FNXC:Planning 2026-08-16-14:48:
 The embedded Planning wrapper matches Missions' shell: NO outer padding. Missions' inline shell (mission-manager--inline) has no wrapper inset — its header supplies the top/side padding (var(--space-lg) var(--space-xl)) and the split body fills edge-to-edge below. Mirroring that here removes the previous extra var(--space-lg) inset so Planning's header and two-pane body align with Missions.
 */
 .planning-view {
@@ -108,13 +107,28 @@ The embedded planning header must be a visual SIBLING of MissionManager's inline
 - gap icon<->title: var(--space-sm) (= 8px), identical to .mission-manager__header-title. Scoped to the embedded planning header so the shared .detail-title-row (TaskDetailModal) keeps its own 10px gap.
 */
 /* FNXC:ViewHeader 2026-06-23-04:15: Pin canonical --view-header-min-height (≈61px border-box) + box-sizing + vertical centering so embedded Planning's header matches the shared ViewHeader/Missions height exactly. */
+/*
+FNXC:StandardizedViewLayout 2026-09-14-05:58:
+Planning's header is a full-width bar over BOTH the session rail and the interview, exactly like Mailbox and Agents.
+It kept `border-bottom: none` from its modal past, so the title row bled into the panes below and the destination did
+not read as header-over-content the way every other collection does.
+
+The separator is declared on the LAYOUT, not on the modal wrapper: the embedded destination renders
+`.planning-modal-body > .view-header` and a rule scoped to the modal ancestor alone left the standalone/host cases
+without a bar.
+*/
+.planning-modal-body > .view-header {
+  border-bottom: var(--btn-border-width) solid var(--border);
+  background: var(--surface);
+}
+
 .planning-modal--embedded .modal-header--embedded {
   box-sizing: border-box;
   align-items: center;
   min-height: var(--view-header-min-height);
   padding: var(--space-lg) var(--space-xl);
   background: var(--surface);
-  border-bottom: none;
+  border-bottom: var(--btn-border-width) solid var(--border);
 }
 
 .planning-modal--embedded .modal-header--embedded .detail-title-row {
@@ -205,32 +219,26 @@ The embedded planning header must be a visual SIBLING of MissionManager's inline
   border-bottom: solid var(--btn-border-width) var(--border);
 }
 
+/*
+FNXC:StandardizedViewLayout 2026-09-13-22:40:
+FN-379: the shared header owns the history title row; only its stacked hint keeps local metrics.
+*/
+.planning-history-header .view-header__title-content {
+  overflow: visible;
+  white-space: normal;
+}
+
 .planning-history-heading {
   display: flex;
-  align-items: flex-start;
-  gap: var(--space-md);
+  flex-direction: column;
   min-width: 0;
 }
 
-.planning-history-heading > svg {
-  flex-shrink: 0;
-  margin-top: var(--space-xs);
-  color: var(--todo);
-}
-
-.planning-history-heading h4,
-.planning-history-heading p {
-  margin: 0;
-}
-
-.planning-history-heading h4 {
-  text-wrap: balance;
-}
-
-.planning-history-heading p {
+.planning-history-hint {
   margin-top: var(--space-xs);
   color: var(--text-muted);
   font-size: var(--font-size-sm);
+  font-weight: 400;
   line-height: 1.5;
   text-wrap: pretty;
 }
@@ -247,6 +255,10 @@ The embedded planning header must be a visual SIBLING of MissionManager's inline
   padding: var(--space-xl);
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.planning-history-scroll .planning-session-prompt {
+  margin-bottom: var(--space-lg);
 }
 
 .planning-history-scroll .conversation-history {
@@ -279,8 +291,26 @@ The embedded planning header must be a visual SIBLING of MissionManager's inline
   text-wrap: pretty;
 }
 
-.planning-modal-body--split {
-  flex-direction: row;
+/*
+FNXC:StandardizedPlanningLayout 2026-09-13-16:30:
+ViewLayout owns the outer column and its body owns the list/detail row. Planning's business panes fill those shared slots without retaining a second width, divider, or resize authority.
+*/
+.planning-modal-body--split .view-layout__content {
+  position: relative;
+}
+
+.planning-modal-body--split .view-sidebar__panel > .planning-sidebar {
+  width: 100%;
+  height: 100%;
+  border-right: 0;
+}
+
+.planning-sidebar-filter {
+  display: flex;
+  justify-content: flex-end;
+  flex: none;
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: var(--btn-border-width) solid var(--border);
 }
 
 .planning-detail {
@@ -294,67 +324,17 @@ The embedded planning header must be a visual SIBLING of MissionManager's inline
 }
 
 /*
-FNXC:Planning 2026-06-23-01:15:
-Embedded Planning is a real two-pane view mirroring Missions (mission-manager__split): the left sidebar is a full-height flex column (list scrolls, footer pinned to bottom) and the right detail pane fills the remaining width AND height. The sidebar surface/border/width treatment matches mission-manager__sidebar — var(--surface) background, a single border-right divider — so the two views read consistently. The flex chain planning-view -> planning-modal--embedded -> planning-modal-body keeps the whole layout filling the main-content pane to the bottom.
+FNXC:StandardizedViewSidebar 2026-09-13-21:43:
+Planning's session rail is a full-height flex column inside the shared sidebar: the list scrolls beneath its archive filter while the detail pane fills the remaining width and height. Width, separator, and persistence belong to the shared rail authority, so no local geometry or bottom creation footer remains.
 */
 .planning-sidebar {
-  width: calc(var(--space-lg) * 18.75);
-  flex-shrink: 0;
-  border-right: var(--btn-border-width) solid var(--border);
+  flex: 1 1 auto;
+  inline-size: 100%;
   background: var(--surface);
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-}
-
-/*
-FNXC:Planning 2026-06-23-02:00:
-Sidebar resize handle — identical treatment to MissionManager's mission-manager__sidebar-resize-handle: a thin (var(--space-sm)) col-resize strip whose ::before center bar tints with var(--todo) on hover/active, plus a focus ring for keyboard resize. touch-action:none keeps the pointer drag from scrolling on trackpads.
-*/
-.planning-sidebar-resize-handle {
-  position: relative;
-  width: var(--space-sm);
-  flex-shrink: 0;
-  cursor: col-resize;
-  background: transparent;
-  touch-action: none;
-  transition: background var(--transition-fast);
-}
-
-.planning-sidebar-resize-handle::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: var(--space-xs);
-  transform: translateX(-50%);
-}
-
-.planning-sidebar-resize-handle:hover::before,
-.planning-sidebar-resize-handle:active::before {
-  background: color-mix(in srgb, var(--todo) 30%, transparent);
-}
-
-.planning-sidebar-resize-handle:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring-strong);
-}
-
-/*
-FNXC:Planning 2026-06-23-02:00:
-Footer matches MissionManager's mission-manager__sidebar-footer EXACTLY: padding var(--space-md), a single border-top divider (var(--btn-border-width) solid var(--border)), gap var(--space-sm), centered. Missions has no separate footer band styling beyond the centered CTA, so we mirror that — no extra bottom padding/margin and no empty space. The column direction is the only deviation, required because Planning carries the show/hide-archived link beneath the CTA (Missions has a single child); align-items stays stretch so the full-width CTA fills the footer like Missions'.
-*/
-.planning-sidebar-footer {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  justify-content: center;
-  gap: var(--space-sm);
-  padding: var(--space-md);
-  border-top: var(--btn-border-width) solid var(--border);
-  flex-shrink: 0;
 }
 
 .planning-sidebar-toggle-archived-link {
@@ -378,8 +358,8 @@ Footer matches MissionManager's mission-manager__sidebar-footer EXACTLY: padding
 }
 
 /*
-FNXC:Planning 2026-06-23-02:00:
-The New session button must look EXACTLY like Missions' primary sidebar create button (mission-manager__sidebar-cta with btn btn-primary): same full-width fill, same min-height (calc(--space-lg * 2 + --space-xs)), centered icon+label gap, inherited font-size. The earlier .active "inset ring" outline is REMOVED — Missions' CTA has no ring in any state, so the no-session-selected (.active) state now relies solely on the empty/initial detail pane to signal the new-session view, keeping the two buttons visually identical.
+FNXC:Planning 2026-08-16-14:48:
+Planning intentionally retains this bottom-pinned New session button at its current metrics. Missions now anchors its slightly taller CTA at the top of its sidebar; both controls reuse the shared primary button treatment without requiring exact height parity. The earlier .active "inset ring" outline is REMOVED so the no-session-selected (.active) state relies solely on the empty/initial detail pane.
 */
 .planning-sidebar-new {
   width: 100%;
@@ -587,11 +567,12 @@ The New session button must look EXACTLY like Missions' primary sidebar create b
   padding: 0 8px;
 }
 
-.planning-mobile-back {
-  /* Visible only on mobile (see media query below). On desktop the sidebar
-     is always visible alongside the detail pane, so a back button is never
-     needed. */
-  display: none;
+.planning-session-back {
+  display: inline-flex;
+  min-width: calc(var(--space-md) * 2.25);
+  min-height: calc(var(--space-md) * 2.25);
+  align-items: center;
+  justify-content: center;
   background: none;
   border: none;
   color: var(--text);
@@ -602,11 +583,11 @@ The New session button must look EXACTLY like Missions' primary sidebar create b
   transition: background var(--transition-fast), box-shadow var(--transition-fast);
 }
 
-.planning-mobile-back:hover {
+.planning-session-back:hover {
   background: var(--card-hover);
 }
 
-.planning-mobile-back:focus-visible {
+.planning-session-back:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring-strong);
 }
@@ -696,9 +677,6 @@ The New session button must look EXACTLY like Missions' primary sidebar create b
   .planning-sidebar-skeleton-row {
     padding-inline: var(--space-md);
   }
-  .planning-modal-body--show-list .planning-sidebar-footer {
-    flex-shrink: 0;
-  }
   .planning-modal-body--show-detail .planning-sidebar {
     display: none;
   }
@@ -706,18 +684,10 @@ The New session button must look EXACTLY like Missions' primary sidebar create b
   FNXC:PlanningModeMobile 2026-07-20-10:30:
   FN-8427 gives session-list mode exclusive ownership of the compact body. JS unmounts
   RunningPlanPane; this selector is a layout backstop for future render paths so session
-  rows stay scrollable above the New session footer instead of sharing height with a plan.
+  rows keep the full compact height instead of sharing it with a plan.
   */
   .planning-modal-body--show-list .planning-detail {
     display: none;
-  }
-  /* The rendered Back control needs a full touch target and must not be squeezed out of the title row. */
-  .planning-mobile-back {
-    display: inline-flex;
-    min-width: calc(var(--space-md) * 2.25);
-    min-height: calc(var(--space-md) * 2.25);
-    align-items: center;
-    justify-content: center;
   }
   /* Always keep action buttons visible on mobile (no hover) */
   .planning-sidebar-item-delete,
@@ -1050,16 +1020,21 @@ An empty footer must NOT reserve vertical space or paint its divider band. When 
 }
 
 /* Question View */
+/*
+FNXC:PlanningMode 2026-07-21-16:47:
+The interview workspace no longer insets the question/plan panes with outer padding or inter-pane gap.
+That gutter read as dead space around the framed cards; panes now sit flush edge-to-edge with a single column divider, matching Missions split layout and the desktop flush rules below.
+*/
 .planning-workspace {
   position: relative;
   display: grid;
   grid-template-areas: "question plan";
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.18fr);
-  gap: var(--space-lg);
+  gap: 0;
   flex: 1;
   min-width: 0;
   min-height: 0;
-  padding: var(--space-lg);
+  padding: 0;
   overflow: hidden;
   background: color-mix(in srgb, var(--card) 40%, var(--surface));
 }
@@ -1075,10 +1050,10 @@ An empty footer must NOT reserve vertical space or paint its divider band. When 
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border: solid var(--btn-border-width) color-mix(in srgb, var(--border) 82%, transparent);
-  border-radius: var(--radius-xl);
+  border: none;
+  border-radius: 0;
   background: var(--surface);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
 }
 
 .planning-plan-pane {
@@ -1092,6 +1067,7 @@ An empty footer must NOT reserve vertical space or paint its divider band. When 
 
 .planning-question-pane {
   grid-area: question;
+  border-right: solid var(--btn-border-width) color-mix(in srgb, var(--border) 82%, transparent);
 }
 
 .planning-workspace--generating > .planning-plan-pane,
@@ -1113,6 +1089,13 @@ An empty footer must NOT reserve vertical space or paint its divider band. When 
   padding: var(--space-xl);
   color: var(--text);
   text-align: center;
+  /*
+  FNXC:PlanningThinkingVisibility 2026-07-23-23:10:
+  The loader now hosts the streamed-thinking pane on follow-up turns. On short viewports
+  (landscape phones fall in the mobile breakpoint) the centered column can exceed the overlay,
+  so the overlay itself must scroll instead of clipping the Stop button and thinking output.
+  */
+  overflow-y: auto;
   background: color-mix(in srgb, var(--surface) 72%, transparent);
   backdrop-filter: blur(var(--space-xs));
 }
@@ -1124,6 +1107,30 @@ An empty footer must NOT reserve vertical space or paint its divider band. When 
 .planning-workspace-loader span {
   color: var(--text-secondary);
   font-size: var(--font-size-sm);
+}
+
+/*
+FNXC:PlanningMultiTask 2026-07-24-00:20:
+Plan-review banner linking the latest task created from this plan; the plan remains a live,
+editable work surface after creation.
+*/
+.planning-linked-task-note {
+  display: flex;
+  align-items: center;
+  /* FNXC:PlanningMultiTask 2026-07-24-01:40: wrap on narrow/mobile viewports so the View task action never clips (review finding). */
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--success, var(--accent)) 8%, var(--card));
+  color: var(--text);
+  font-size: var(--font-size-sm);
+}
+
+.planning-linked-task-note span {
+  flex: 1;
+  min-width: 0;
 }
 
 .planning-question {
@@ -1368,6 +1375,20 @@ margins so paragraphs and lists do not create unintended gaps.
   margin-left: auto;
 }
 
+/*
+FNXC:StandardizedViewActions 2026-09-14-02:47:
+History sits immediately left of the primary Next action rather than in the view header. The trigger owns the free
+space so the pair stays right-aligned as one cluster, and the primary drops its own auto margin so no gap opens
+between them.
+*/
+.planning-actions .planning-history-trigger {
+  margin-left: auto;
+}
+
+.planning-actions .planning-history-trigger + .planning-actions-primary {
+  margin-left: 0;
+}
+
 .planning-back-btn {
   display: inline-flex;
   align-items: center;
@@ -1529,7 +1550,6 @@ its refinement menu remain reachable at the bottom of bounded desktop and mobile
   color: var(--text-muted);
 }
 
-/* Taller description textarea in subtask breakdown */
 .planning-summary-form .form-group textarea {
   min-height: 120px;
   resize: vertical;
@@ -1662,6 +1682,62 @@ its refinement menu remain reachable at the bottom of bounded desktop and mobile
   min-height: calc(var(--space-2xl) + var(--space-sm));
 }
 
+/*
+FNXC:PlanningMode 2026-07-21-09:15:
+Desktop Planning panes already own their framed surfaces, so their scroll content must sit flush and their action rows must share a compact baseline. Scope these overrides to Planning's pane wrappers and desktop breakpoint so shared Mission/Milestone interview classes and compact safe-area padding retain their existing presentation.
+
+FNXC:PlanningMode 2026-07-21-18:41:
+Tablet (769–1024) keeps the same two-pane shell as desktop but previously fell below the 1025px flush gate, so the right plan pane still stacked scroll padding + card chrome. Lower the gate to 769px so tablet inherits the flush pane treatment; phone (≤768) keeps its own mobile flush block.
+
+FNXC:PlanningSidebar 2026-09-12-05:41:
+Desktop and tablet keep the session sidebar, resize handle, and detail pane visible together even in a short viewport. These width-gated rules override the short-shell phone paint without removing compact internal form adaptations.
+*/
+@media (min-width: 769px) {
+  /*
+  FNXC:StandardizedViewLayout 2026-09-14-06:12:
+  This class used to sit on the split CONTAINER that held the session rail beside the interview, so forcing a row was
+  right. It now sits on the shared ViewLayout SHELL, which must stay a column: header on top, then the body that owns
+  the rail/content row. Forcing a row here laid the header beside the body, so Planning showed neither a full-width
+  header nor a left rail. The shell keeps its own direction; only the body is a row.
+  */
+
+  .planning-modal-body--show-detail .planning-sidebar,
+  .planning-modal-body--show-list .planning-sidebar {
+    display: flex;
+  }
+
+  .planning-modal-body--show-list .planning-detail {
+    display: flex;
+  }
+
+  .planning-question-pane .planning-question-scroll,
+  .planning-plan-pane .planning-plan-scroll {
+    padding: 0;
+  }
+
+  .planning-question-pane .planning-question-panel {
+    background: var(--surface);
+    border: none;
+    border-radius: 0;
+  }
+
+  .planning-plan-pane .planning-plan-document {
+    width: 100%;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  .planning-question-pane .planning-actions,
+  .planning-plan-actions {
+    padding: var(--space-sm) var(--space-xl);
+  }
+
+  .planning-question-pane .planning-actions .btn,
+  .planning-plan-actions .btn {
+    min-height: calc(var(--space-2xl) + var(--space-sm));
+  }
+}
+
 .planning-refine-menu {
   position: absolute;
   right: var(--space-xl);
@@ -1726,6 +1802,95 @@ its refinement menu remain reachable at the bottom of bounded desktop and mobile
   min-width: 0;
 }
 
+/*
+FNXC:PlanningComments 2026-07-23-12:00:
+Contextual comments remain transient review controls: render the capture/editor only after a
+selection, and render the tray only after a valid comment exists so an empty plan review keeps
+its established Refine and Proceed action hierarchy.
+*/
+/*
+FNXC:PlanningComments 2026-07-25-10:20:
+Single Add-comment trigger, living in the plan action rail at every breakpoint. The former
+--document / --mobile variant pair is gone: both rendered in the DOM and read as duplicate buttons.
+*/
+.planning-add-comment {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  margin-top: 0;
+}
+
+.planning-comment-editor,
+.planning-comment-tray {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  min-width: 0;
+}
+
+.planning-comment-editor {
+  margin-top: var(--space-lg);
+  padding: var(--space-lg);
+  border: solid var(--btn-border-width) var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+}
+
+/*
+FNXC:PlanningComments 2026-07-23-17:05:
+Desktop (≥1025px) keeps the in-document trigger under the plan markdown. Tablet and phone
+(≤1024px) use the action-rail counterpart so selection comments are not lost under the plan fold.
+
+FNXC:PlanningComments 2026-07-24-05:50:
+Phone and tablet both place that rail control as a full-width row above Refine/Proceed. A
+viewport-fixed bar above the mobile nav sat under the action buttons and required an awkward
+reach past Proceed — match the tablet in-flow stack on phone too.
+*/
+
+.planning-comment-quote,
+.planning-comment-tray blockquote,
+.planning-comment-tray p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.planning-comment-quote,
+.planning-comment-tray blockquote {
+  padding-inline-start: var(--space-md);
+  border-inline-start: solid var(--btn-border-width) var(--todo);
+  color: var(--text-muted);
+}
+
+.planning-comment-tray {
+  flex: 1;
+}
+
+.planning-comment-tray ul {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.planning-comment-tray li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-sm);
+  align-items: start;
+}
+
+.planning-comment-tray li > p {
+  grid-column: 1;
+}
+
+.planning-comment-tray .btn-icon {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
 .planning-summary-actions-right {
   display: flex;
   gap: var(--space-sm);
@@ -1752,6 +1917,55 @@ its refinement menu remain reachable at the bottom of bounded desktop and mobile
     min-height: calc(var(--space-2xl) + var(--space-md));
   }
 
+  .planning-comment-tray {
+    grid-column: 1 / -1;
+  }
+
+  /*
+  FNXC:PlanningComments 2026-07-25-10:20:
+  Tablet and phone give the sole action-rail trigger the full footer width above Refine/Proceed so a
+  selection always exposes Add comment without leaving the plan action baseline.
+  */
+  .planning-plan-actions .btn.planning-add-comment {
+    display: flex;
+    grid-column: 1 / -1;
+    margin-top: 0;
+    justify-content: center;
+    gap: var(--space-sm);
+  }
+
+  /*
+  FNXC:PlanningComments 2026-07-24-05:55:
+  Pin the MessageSquarePlus glyph to the same token size used by other compact rail CTAs so
+  tablet and phone share the mobile icon scale (default lucide size can dwarf the label in the
+  full-width rail row).
+  */
+  .planning-plan-actions .btn.planning-add-comment svg {
+    width: var(--space-lg);
+    height: var(--space-lg);
+    flex-shrink: 0;
+  }
+
+  /*
+  FNXC:PlanningComments 2026-07-24-06:05:
+  Tablet and phone pin the selection composer as a fixed panel. Tablet previously left it in
+  the plan document foot (keyboard opened while the panel stayed off-screen). Phone previously
+  fixed above the nav only and did not lift for the first keyboard open. Base bottom clears
+  chrome; .planning-comment-editor--keyboard-open / inline style lifts above the soft keyboard.
+  */
+  .planning-comment-editor {
+    position: fixed;
+    left: var(--space-md);
+    right: var(--space-md);
+    bottom: calc(var(--space-md) + env(safe-area-inset-bottom, 0px));
+    z-index: calc(var(--z-popover) + 1);
+    margin-top: 0;
+    max-height: min(50dvh, calc(var(--space-2xl) * 12));
+    overflow: auto;
+    padding: var(--space-md);
+    box-shadow: var(--shadow-lg);
+  }
+
   .planning-refine-menu {
     right: var(--space-lg);
     left: var(--space-lg);
@@ -1768,43 +1982,38 @@ Tablet embedded Planning keeps the desktop two-pane shell. The question Next act
 Refine/Proceed actions share one compact bottom baseline; equal footer/button heights, non-wrapping
 plan actions, and a token-sized bottom inset keep all three controls inline without extra space.
 */
+@media (max-width: 768px) {
+  /*
+  FNXC:PlanningComments 2026-07-24-05:50:
+  Phone keeps the ≤1024 in-flow full-width Add-comment row above Refine/Proceed.
+
+  FNXC:PlanningComments 2026-07-24-06:05:
+  When the keyboard is closed, clear the bottom nav; keyboard-open uses the shared lift style
+  from the TS keyboard metrics so the panel is not trapped under the first OS keyboard frame.
+  */
+  .planning-comment-tray li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .planning-comment-editor:not(.planning-comment-editor--keyboard-open) {
+    bottom: calc(
+      var(--mobile-nav-height, 44px)
+      + max(env(safe-area-inset-bottom, 0px), 12px)
+      + var(--space-md)
+    );
+  }
+
+  /*
+  FNXC:PlanningComments 2026-07-24-06:40:
+  Keyboard-open phone composer is positioned via inline `top`/`max-height` from visualViewport.
+  Clear CSS `bottom` so it cannot fight the JS pin and leave the panel under the keyboard.
+  */
+  .planning-comment-editor.planning-comment-editor--keyboard-open {
+    bottom: auto;
+  }
+}
+
 @media (min-width: 769px) and (max-width: 1024px) {
-  /* FNXC:PlanningModeMobile 2026-07-20-10:30: tablet uses the same compact list destination as phone and short shells, so summary/compose detail cannot remain beside saved session rows. */
-  .planning-modal-body--show-list {
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
-  }
-
-  .planning-modal-body--show-list .planning-sidebar {
-    flex: 1 1 auto;
-    height: 100%;
-    min-height: 0;
-    max-height: 100%;
-  }
-
-  .planning-modal-body--show-list .planning-sidebar-list {
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow-y: auto;
-  }
-
-  .planning-modal-body--show-list .planning-sidebar-footer {
-    flex-shrink: 0;
-  }
-
-  .planning-modal-body--show-list .planning-detail {
-    display: none;
-  }
-
-  .planning-mobile-back {
-    display: inline-flex;
-    min-width: calc(var(--space-md) * 2.25);
-    min-height: calc(var(--space-md) * 2.25);
-    align-items: center;
-    justify-content: center;
-  }
-
   .planning-summary-actions {
     flex-wrap: wrap;
     align-items: flex-start;
@@ -1843,10 +2052,38 @@ plan actions, and a token-sized bottom inset keep all three controls inline with
     min-height: calc(var(--space-2xl) + var(--space-md));
   }
 
+  /*
+  FNXC:PlanningModeTablet 2026-07-20-21:50:
+  Refine/Proceed share one compact baseline on tablet.
+
+  FNXC:PlanningComments 2026-07-24-05:55:
+  Do not force flex nowrap on the plan action rail: that pulled Add comment into the same row
+  as Refine/Proceed. Keep the ≤1024 two-column grid so the selection control stays a full-width
+  first row (grid-column 1 / -1) with Refine | Proceed on the second row — same stack as phone.
+  */
   .planning-plan-actions {
-    display: flex;
-    flex-wrap: nowrap;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-md);
+  }
+
+  .planning-plan-actions .btn.planning-add-comment {
+    display: flex;
+    grid-column: 1 / -1;
+    width: 100%;
+    margin-top: 0;
+    justify-content: center;
+    gap: var(--space-sm);
+  }
+
+  .planning-plan-actions .btn.planning-add-comment svg {
+    width: var(--space-lg);
+    height: var(--space-lg);
+    flex-shrink: 0;
+  }
+
+  .planning-comment-tray {
+    grid-column: 1 / -1;
   }
 }
 
@@ -2011,109 +2248,6 @@ mobile and desktop offer the same View task / Return to sessions choices.
   color: var(--text-muted);
 }
 
-/* Subtask Drag-and-Drop Styles */
-.subtask-item {
-  transition: opacity var(--transition-fast), transform var(--transition-fast);
-}
-
-.subtask-item-dragging {
-  opacity: 0.5;
-  transform: scale(0.98);
-}
-
-.subtask-item-drop-target {
-  background: color-mix(in srgb, var(--todo) 12%, transparent);
-  border-color: var(--todo);
-}
-
-.subtask-item-drop-before {
-  position: relative;
-}
-
-.subtask-item-drop-before::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: var(--todo);
-  z-index: 1;
-}
-
-.subtask-item-drop-after {
-  position: relative;
-}
-
-.subtask-item-drop-after::after {
-  content: '';
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: var(--todo);
-  z-index: 1;
-}
-
-.subtask-item-header {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-}
-
-.subtask-drag-handle {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-  cursor: grab;
-  color: var(--text-dim);
-  transition: color var(--transition-fast);
-  user-select: none;
-}
-
-.subtask-drag-handle:hover {
-  color: var(--text-muted);
-}
-
-.subtask-item-dragging .subtask-drag-handle {
-  cursor: grabbing;
-  color: var(--todo);
-}
-
-.subtask-item-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--space-xs);
-}
-
-.subtask-item-actions .btn-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  color: var(--text-dim);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-@media (hover: hover) {
-  .subtask-item-actions .btn-icon:hover:not(:disabled) {
-    background: var(--card-hover);
-    border-color: var(--border);
-    color: var(--text);
-  }
-}
-
-.subtask-item-actions .btn-icon:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
 
 /* Responsive */
 @media (max-width: 768px) {
@@ -2136,7 +2270,7 @@ mobile and desktop offer the same View task / Return to sessions choices.
   /*
   FNXC:PlanningModeMobile 2026-07-20-21:50:
   The Planning detail header keeps Back, the lightbulb, a single-line truncated title, and Edit on
-  one row. Fixed icon controls may not shrink; only the title yields space before Sessions/History.
+  one row. Fixed icon controls may not shrink; only the title yields space before History.
   */
 
   .planning-modal--embedded .modal-header--embedded .detail-title-row {
@@ -2158,7 +2292,7 @@ mobile and desktop offer the same View task / Return to sessions choices.
 
   .planning-modal--embedded .modal-header--embedded .detail-title-row > svg,
   .planning-modal--embedded .modal-header--embedded .detail-title-row > .btn-icon,
-  .planning-modal--embedded .modal-header--embedded .planning-mobile-back {
+  .planning-modal--embedded .modal-header--embedded .planning-session-back {
     flex: 0 0 auto;
   }
 
@@ -2169,7 +2303,7 @@ mobile and desktop offer the same View task / Return to sessions choices.
 
   .planning-header-controls {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
     width: 100%;
   }
 
@@ -2188,10 +2322,23 @@ mobile and desktop offer the same View task / Return to sessions choices.
     padding: var(--space-lg);
   }
 
+  .planning-history-scroll .planning-session-prompt {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  /*
+  FNXC:PlanningMode 2026-07-21-18:34:
+  Mobile question and plan-review panes were double-inset: workspace gutter + scroll padding + nested card chrome on top of the pane frame. Drop the outer gutter and pane chrome so content sits flush edge-to-edge like desktop, keep a light tab strip inset, and leave readable content padding on the question panel / plan document only. Clear the desktop column divider so a solo question/plan card is not edged by a right border.
+  */
   .planning-workspace {
     grid-template-columns: minmax(0, 1fr);
-    gap: var(--space-md);
-    padding: var(--space-md);
+    gap: 0;
+    padding: 0;
+  }
+
+  .planning-question-pane {
+    border-right: none;
   }
 
   .planning-workspace--mobile-tab-question,
@@ -2207,6 +2354,7 @@ mobile and desktop offer the same View task / Return to sessions choices.
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-xs);
+    margin: var(--space-sm) var(--space-sm) 0;
     padding: var(--space-xs);
     border: solid var(--btn-border-width) var(--border);
     border-radius: var(--radius-lg);
@@ -2254,7 +2402,33 @@ mobile and desktop offer the same View task / Return to sessions choices.
 
   .planning-plan-pane,
   .planning-question-pane {
-    border-radius: var(--radius-lg);
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  /*
+  FNXC:PlanningMode 2026-07-21-18:34:
+  Scope flush scroll overrides to Planning's pane wrappers so shared Mission/Milestone interview
+  classes keep their existing mobile view-scroll padding.
+  */
+  .planning-question-pane .planning-question-scroll,
+  .planning-plan-pane .planning-plan-scroll {
+    padding: 0;
+  }
+
+  .planning-question-pane .planning-question-panel {
+    background: var(--surface);
+    border: none;
+    border-radius: 0;
+    padding: var(--space-md) var(--space-lg) var(--space-lg);
+  }
+
+  .planning-plan-pane .planning-plan-document {
+    width: 100%;
+    padding: var(--space-lg);
+    border-radius: 0;
+    box-shadow: none;
   }
 
   /* FNXC:PlanningMode 2026-06-22-15:30: this legacy full-viewport sheet sizing
@@ -2270,6 +2444,28 @@ mobile and desktop offer the same View task / Return to sessions choices.
     max-width: 100%;
     max-height: 100%;
     border-radius: 0;
+  }
+
+  /*
+  FNXC:PlanningMode 2026-07-31-20:33:
+  THE SHEET IS NO LONGER THE VIEWPORT. The rule above sizes dialog Planning as a full-viewport
+  sheet, which was true until the modal branch moved inside `FloatingWindow`
+  (`FNXC:ModalTouchGeometry 2026-07-26-14:10`). Its host body is shorter than the viewport — it sits
+  below a title bar — so `min-height: 100dvh` now asks the sheet to be TALLER than the box it lives
+  in. `min-height` beats `max-height: 100%`, so the sheet cannot shrink to its host and simply
+  overflows.
+
+  Measured at 768x900: host body 763px tall, sheet forced to 900px, and the plan action rail
+  carrying "Add comment to selection" landed at top=928 — 28px past the fold. The control was
+  unreachable without scrolling, which is the one thing `planning-browser-e2e`'s placement case
+  exists to prevent. Embedded Planning was never affected: it is excluded from the rule above.
+
+  Scoped to the floating host rather than editing the rule above, so a Planning sheet rendered
+  outside `FloatingWindow` keeps its full-viewport sizing.
+  */
+  .floating-window .planning-modal:not(.planning-modal--embedded) {
+    height: 100%;
+    min-height: 0;
   }
 
   .planning-error {
@@ -2419,27 +2615,8 @@ mobile and desktop offer the same View task / Return to sessions choices.
     padding: 12px;
   }
 
-  /* Subtask breakdown: touch-friendly drag handles with padding */
-  .subtask-drag-handle {
-    min-width: 36px;
-    min-height: 36px;
-    padding: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
 
-  /* Subtask action buttons: mobile-friendly sizing */
-  .subtask-item-actions .btn-icon {
-    min-width: 36px;
-    min-height: 36px;
-  }
 
-  /* Subtask items: prevent overflow */
-  .subtask-item-header {
-    flex-wrap: wrap;
-    gap: var(--space-xs);
-  }
 
   /* Dependency chips: touch-friendly */
   .planning-dep-chip {
@@ -2475,6 +2652,31 @@ mobile and desktop offer the same View task / Return to sessions choices.
   /* Model selection: prevent iOS zoom on select elements */
   .planning-modal-body select {
     font-size: 16px;
+  }
+}
+
+/*
+FNXC:PlanningModeMobile 2026-07-23-12:00:
+Plan selection actions must be visible before document scrolling in phone portrait and width-independent short landscape. Keep this scoped to the review pane: its Markdown scroll sibling may shrink, but the existing action rail remains a non-shrinking, safe-area-padded footer in both embedded and dialog hosts.
+*/
+@media (max-width: 768px), (max-height: 480px) {
+  .planning-plan-review,
+  .planning-plan-review > .planning-plan-pane {
+    min-height: 0;
+  }
+
+  .planning-plan-review > .planning-plan-pane {
+    flex: 1 1 0;
+  }
+
+  .planning-plan-pane > .planning-plan-scroll {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .planning-plan-pane > .planning-plan-actions {
+    flex: 0 0 auto;
   }
 }
 
@@ -2580,9 +2782,4 @@ mobile and desktop offer the same View task / Return to sessions choices.
 }
 .model-selector-current--spaced {
   margin-top: var(--space-sm);
-}
-
-/* Subtask header override */
-.subtask-item-header--between {
-  justify-content: space-between;
 }

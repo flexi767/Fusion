@@ -25,8 +25,7 @@ import { describe, it, expect, afterEach, beforeAll } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
-import { execSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   applySchemaBaseline,
@@ -74,20 +73,118 @@ import {
   TASK_DECLARED_SYMBOLS_VERSION,
   PLANNING_ACTIVE_TIMING_VERSION,
   SQLITE_MIGRATION_RUNTIME_READ_VERSION,
+  WORKFLOW_TASK_CONTINUATIONS_VERSION,
+  LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+  TASK_WEDGE_NOTIFICATION_VERSION,
+  MILESTONE_ASSERTION_PROVENANCE_VERSION,
+  MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
+  DROP_GLOBAL_CONCURRENCY_VERSION,
+  MISSION_TASK_PREFIX_VERSION,
+  CREDENTIAL_INSTANCE_SELECTION_VERSION,
+  TASK_LIFECYCLE_OUTBOX_VERSION,
+  TASK_LIFECYCLE_CONSUMERS_VERSION,
+  VALIDATOR_INPUT_FINGERPRINT_VERSION,
+  UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION,
+  QUEUED_EPISODE_SIGNATURE_VERSION,
+  MULTI_ROLE_WORKFLOW_AGENTS_VERSION,
+  WORKFLOW_PRINCIPAL_FENCE_VERSION,
+  TASK_RECOMMENDATIONS_VERSION,
+  GITHUB_CHECK_STATES_VERSION,
+  AGENT_ACTIVITY_EVENTS_VERSION,
+  SPEC_LOCK_DRIFT_REPORT_VERSION,
+  SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION,
+  MEMORY_RECALL_RECORDS_VERSION,
+  MISSION_FEATURE_SPEC_ALIGNMENT_VERSION,
+  AGENT_RATING_PROJECT_ISOLATION_VERSION,
+  AGENT_RATINGS_PROJECT_PARTITION_VERSION,
+  PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION,
+  PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION,
+  MESSAGE_ARCHIVE_SCHEMA_VERSION,
+  TASK_SOURCE_AGENT_INDEX_VERSION,
+  WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION,
+  ACTIVITY_LOG_TASK_ID_INDEX_VERSION,
+  REMOVE_TASK_SUBTASK_SPLITTING_VERSION,
+  AI_MERGE_REVIEW_RECONCILIATION_VERSION,
+  TASK_REPOSITORY_SCOPE_VERSION,
+  REVIEW_CONVERGENCE_STAGE_VERSION,
+  CHAT_SESSION_MEMORY_FOCUS_VERSION,
+  SESSION_CONTENTION_WAIT_STATE_VERSION,
+  TASK_STEP_REPORTS_VERSION,
+  TASK_EXTERNAL_BLOCK_VERSION,
+  TASK_REQUIRE_PLAN_APPROVAL_VERSION,
+  PATCHNODE_ENTRIES_VERSION,
+  TASK_PLANNING_FAILURE_VERSION,
+  CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
+  PROJECT_NOTES_VERSION,
+  OVERLAP_WAIT_SYNC_VERSION,
+  WHITEBOARDS_SCHEMA_VERSION,
+  OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION,
+  OVERLAP_REVALIDATION_DRAIN_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
-
-const PG_ADMIN_URL =
-  process.env.FUSION_PG_TEST_ADMIN_URL ?? "postgresql://localhost:5432/postgres";
-const PG_TEST_URL_BASE =
-  process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
-const PG_AVAILABLE =
-  process.env.FUSION_PG_TEST_SKIP !== "1" && Boolean(PG_TEST_URL_BASE);
-
-const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
+import {
+  createBaselinedPgTestDatabase,
+  createEmptyPgTestDatabase,
+  pgDescribe,
+} from "../../__test-utils__/pg-test-harness.js";
 
 describe("schema-applier: immutable migration identities", () => {
+  it("registers the task lifecycle outbox after credential selection", () => {
+    expect(TASK_LIFECYCLE_OUTBOX_VERSION).toBe("0040");
+    expect(TASK_LIFECYCLE_CONSUMERS_VERSION).toBe("0041");
+    expect(VALIDATOR_INPUT_FINGERPRINT_VERSION).toBe("0042");
+    expect(UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION).toBe("0043");
+    expect(QUEUED_EPISODE_SIGNATURE_VERSION).toBe("0044");
+    expect(MULTI_ROLE_WORKFLOW_AGENTS_VERSION).toBe("0045");
+    expect(WORKFLOW_PRINCIPAL_FENCE_VERSION).toBe("0046");
+    expect(TASK_RECOMMENDATIONS_VERSION).toBe("0047");
+    expect(GITHUB_CHECK_STATES_VERSION).toBe("0048");
+    expect(AGENT_ACTIVITY_EVENTS_VERSION).toBe("0049");
+    expect(SPEC_LOCK_DRIFT_REPORT_VERSION).toBe("0050");
+    expect(SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION).toBe("0051");
+    expect(MEMORY_RECALL_RECORDS_VERSION).toBe("0052");
+    expect(MISSION_FEATURE_SPEC_ALIGNMENT_VERSION).toBe("0053");
+    expect(AGENT_RATING_PROJECT_ISOLATION_VERSION).toBe("0054");
+    expect(AGENT_RATINGS_PROJECT_PARTITION_VERSION).toBe("0055");
+    expect(PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION).toBe("0056");
+    expect(PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION).toBe("0057");
+    expect(MESSAGE_ARCHIVE_SCHEMA_VERSION).toBe("0058");
+    /* FNXC:PgSchemaApplier 2026-08-15-22:10: 0059 (FN-9037 recommendation source-agent index) and 0060 (FN-9059 workspace
+       coordination leases/intents) landed first; the 2026-08-20 upstream batch owns 0061-0064 (FN-066..FN-094), FN-149
+       owns 0065, and the RUFU-068 chat_sessions.memory_focus migration is renumbered to 0066 (2026-08-23), advancing the baseline to 0066. */
+    expect(TASK_SOURCE_AGENT_INDEX_VERSION).toBe("0059");
+    expect(WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION).toBe("0060");
+    expect(ACTIVITY_LOG_TASK_ID_INDEX_VERSION).toBe("0061");
+    /*
+    FNXC:ReviewConvergence 2026-08-22-18:58:
+    The tail of this list went stale twice in a row (it still asserted 0063 while the ceiling was
+    0064), so it stopped being the tripwire it exists to be. Assert every identity through the
+    current head and keep the ceiling equal to the newest one — FN-149 shipped 0065 with the marker
+    left at 0064, and that mismatch made the binary reject its own database at startup.
+    */
+    expect(REMOVE_TASK_SUBTASK_SPLITTING_VERSION).toBe("0062");
+    expect(AI_MERGE_REVIEW_RECONCILIATION_VERSION).toBe("0063");
+    expect(TASK_REPOSITORY_SCOPE_VERSION).toBe("0064");
+    expect(REVIEW_CONVERGENCE_STAGE_VERSION).toBe("0065");
+    expect(CHAT_SESSION_MEMORY_FOCUS_VERSION).toBe("0066");
+    expect(SESSION_CONTENTION_WAIT_STATE_VERSION).toBe("0067");
+    expect(TASK_STEP_REPORTS_VERSION).toBe("0068");
+    expect(TASK_EXTERNAL_BLOCK_VERSION).toBe("0069");
+    expect(TASK_REQUIRE_PLAN_APPROVAL_VERSION).toBe("0070");
+    expect(PATCHNODE_ENTRIES_VERSION).toBe("0071");
+    expect(TASK_PLANNING_FAILURE_VERSION).toBe("0072");
+    expect(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION).toBe("0073");
+    expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION));
+    expect(PROJECT_NOTES_VERSION).toBe("0074");
+    expect(OVERLAP_WAIT_SYNC_VERSION).toBe("0075");
+    expect(WHITEBOARDS_SCHEMA_VERSION).toBe("0076");
+    expect(OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION).toBe("0077");
+    expect(OVERLAP_REVALIDATION_DRAIN_VERSION).toBe("0078");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0078");
+  });
+
   it("keeps monitor and approval isolation assigned to version 0003", () => {
     expect(MONITOR_APPROVAL_ISOLATION_SCHEMA_VERSION).toBe("0003");
     expect(Number(SCHEMA_BASELINE_VERSION))
@@ -186,6 +283,16 @@ describe("schema-applier: immutable migration identities", () => {
   });
 
   /*
+  FNXC:LegacyAdoption 2026-07-22-10:45:
+  #2387 requires the runtime-role grants to run as an explicit forward migration;
+  a baseline bump alone would leave already-created embedded clusters warn-spamming.
+  */
+  it("registers runtime drained-marker grants at migration version 0032", () => {
+    expect(LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION).toBe("0032");
+    expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION));
+  });
+
+  /*
   FNXC:PostgresBigintCounters 2026-07-19-12:00:
   0026 widens overflow-prone counters to bigint. Keep identity fixed and at-or-before SCHEMA_BASELINE_VERSION.
 
@@ -208,96 +315,54 @@ describe("schema-applier: immutable migration identities", () => {
 });
 
 /*
-FNXC:Lifecycle 2026-07-16-22:40:
-Migration wiring integrity — the class guard for the FN-8141 crash. Migrations are
-registered EXPLICITLY in schema-applier.ts (not auto-discovered), so a new .sql
-file that is not wired through a version constant + bookkeeping check silently
-never runs (documented hazard). PR #2260 tripped the adjacent trap: it added a
-column to the model + 0000 baseline and bumped nothing, so existing DBs never got
-it. These pure (no-PostgreSQL) assertions run in the merge gate and fail fast when
-the baseline marker and the on-disk migration set drift out of sync.
+FNXC:ReviewConvergence 2026-08-22-18:58:
+The pure "migration wiring integrity" assertions (baseline ceiling == highest migration file, and
+every .sql wired into the applier) MOVED to src/__tests__/migration-wiring-integrity.test.ts. They
+need no PostgreSQL, and living in this integration file kept them out of the merge gate — which is
+how FN-149 shipped migration 0065 with the ceiling left at 0064 and made every startup reject its
+own database. The new home is wired into `test:unit-gate`. Do not re-add them here.
 */
-describe("schema-applier: migration wiring integrity", () => {
-  const migrationsDir = fileURLToPath(new URL("../../postgres/migrations", import.meta.url));
-  const applierSource = readFileSync(
-    fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
-    "utf8",
-  );
-  const migrationFiles = readdirSync(migrationsDir)
-    .filter((f) => /^\d{4}_.*\.sql$/.test(f))
-    .sort();
-
-  it("advances SCHEMA_BASELINE_VERSION to the highest-numbered migration file", () => {
-    const highest = migrationFiles[migrationFiles.length - 1]!.slice(0, 4);
-    // A new column that ships a migration file must also bump the baseline marker
-    // (else the "all markers recorded" fast-path and upgrade bookkeeping drift).
-    expect(SCHEMA_BASELINE_VERSION).toBe(highest);
-  });
-
-  it("wires every migration .sql file into the applier so none silently never runs", () => {
-    // The applier references each migration by its exact basename in a path
-    // constant. A file present on disk but absent from the source is unwired.
-    const unwired = migrationFiles.filter((f) => !applierSource.includes(f));
-    expect(unwired).toEqual([]);
-  });
-});
-
-/**
- * FNXC:PostgresSchema 2026-06-24-04:00:
- * Create a uniquely-named fresh database for each test so tests are hermetic
- * and never touch existing data. Uses the admin connection to CREATE/DROP.
- */
-function uniqueDbName(): string {
-  return `fusion_schema_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/*
-FNXC:PgTestAuthFix 2026-07-14-00:00:
-The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
-*/
-function adminExec(statement: string): void {
-  // psql via execSync for DDL that the postgres.js connection pool can't run
-  // (CREATE/DROP DATABASE cannot run inside a transaction). This is short
-  // deterministic DDL, the acceptable execSync use per AGENTS.md.
-  execSync(`psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`, {
-    stdio: "pipe",
-    env: process.env,
-  });
-}
 
 interface TestContext {
-  dbName: string;
   testUrl: string;
   sqlConn: ReturnType<typeof postgres>;
   db: ReturnType<typeof drizzle>;
+  drop(): Promise<void>;
+}
+
+/*
+FNXC:PgSchemaApplierIsolation 2026-08-16-19:08:
+The loaded core lane runs this file beside other PostgreSQL forks. The private
+CREATE/DROP helper bypassed the shared harness lifecycle and repeated baseline
+DDL in schema-present parity and rekey tests. Keep empty targets for first-apply
+and upgrade contracts, but clone the serialized golden baseline for schema-present
+contracts so their idempotent apply remains a marker check rather than fresh DDL.
+*/
+async function setupTestDb(
+  createDatabase: typeof createEmptyPgTestDatabase,
+): Promise<TestContext> {
+  const fixture = await createDatabase("fusion_schema_test");
+  const sqlConn = postgres(fixture.testUrl, { max: 2, prepare: false, onnotice: () => {} });
+  return {
+    testUrl: fixture.testUrl,
+    sqlConn,
+    db: drizzle(sqlConn),
+    drop: fixture.drop,
+  };
 }
 
 async function setupFreshDb(): Promise<TestContext> {
-  const dbName = uniqueDbName();
-  try {
-    adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch {
-    // ignore — may not exist
-  }
-  adminExec(`CREATE DATABASE "${dbName}"`);
-  const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
-  const sqlConn = postgres(testUrl, { max: 2, prepare: false, onnotice: () => {} });
-  const db = drizzle(sqlConn);
-  return { dbName, testUrl, sqlConn, db };
+  return setupTestDb(createEmptyPgTestDatabase);
+}
+
+async function setupBaselinedDb(): Promise<TestContext> {
+  return setupTestDb(createBaselinedPgTestDatabase);
 }
 
 async function teardownDb(ctx: TestContext | null): Promise<void> {
   if (!ctx) return;
-  try {
-    await ctx.sqlConn.end({ timeout: 5 });
-  } catch {
-    // best-effort
-  }
-  try {
-    adminExec(`DROP DATABASE IF EXISTS "${ctx.dbName}"`);
-  } catch {
-    // best-effort
-  }
+  await ctx.sqlConn.end({ timeout: 5 }).catch(() => {});
+  await ctx.drop().catch(() => {});
 }
 
 /*
@@ -307,6 +372,30 @@ The baseline declares symbol_locks but cannot attach its ownership trigger befor
 installation must therefore prove 0025 leaves the final table forced-RLS with
 its policy and trigger, including actual second-project read/write isolation.
 */
+async function assertTaskLifecycleOutboxOwnershipContract(ctx: TestContext): Promise<void> {
+  const catalog = (await ctx.db.execute(sql`
+    SELECT c.relname AS table_name, c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
+      EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'project' AND tablename = c.relname
+          AND policyname = 'fusion_project_isolation'
+      ) AS policy,
+      EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid = c.oid AND tgname = 'fusion_assign_project_id' AND NOT tgisinternal
+      ) AS trigger
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'project'
+      AND c.relname IN ('task_lifecycle_events', 'task_lifecycle_event_seq')
+    ORDER BY c.relname
+  `)) as unknown as Array<{ table_name: string; rls: boolean; forced: boolean; policy: boolean; trigger: boolean }>;
+  expect(catalog).toEqual([
+    { table_name: 'task_lifecycle_event_seq', rls: true, forced: true, policy: true, trigger: true },
+    { table_name: 'task_lifecycle_events', rls: true, forced: true, policy: true, trigger: true },
+  ]);
+}
+
 async function assertSymbolLocksOwnershipContract(ctx: TestContext): Promise<void> {
   const catalog = (await ctx.db.execute(sql`
     SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
@@ -628,7 +717,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 93 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 120 project tables, 17 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -643,14 +732,27 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       GROUP BY table_schema
     `)) as unknown as Array<{ table_schema: string; n: number }>;
     const bySchema = Object.fromEntries(rows.map((r) => [r.table_schema, r.n]));
-    // Project: 87 typed core tables + 2 lossless legacy preservation tables
-    // + 1 import_translation_cache (FNXC:GitHubImportTranslate 2026-07-15-09:30)
-    // + 1 configuration_revisions (FNXC:ConfigVersioning 2026-07-18-14:00)
-    // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
-    // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305).
-    // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(95);
-    expect(bySchema.central).toBe(18);
+    /*
+    FNXC:PgSchemaApplier 2026-08-03-02:16:
+    Project table count = historical core baseline plus later migrations. 0040 adds 2 lifecycle
+    outbox tables; 0041 adds 4 lifecycle consumer tables; 0043 adds the durable unplanned-dispatch
+    refusal marker (100 → 105); later baseline additions bring the count to 106; and 0048 adds
+    GitHub check state (106 → 107); 0049 adds the agent-activity outbox and counter (→ 109);
+    0050 adds immutable lock, evidence, and report history (109 → 112); 0052 adds recall records (→ 113);
+    0060 adds workspace coordination leases and land intents (→ 115). Plugin tables are added separately
+    by the schema-init hook and are excluded here.
+
+    FNXC:WhiteboardAlpha 2026-09-10-05:42:
+    Subsequent core migrations add step reports, patchnode, project notes, overlap waits, and Whiteboard heads/revisions, bringing the current project total to 120.
+    */
+    expect(bySchema.project).toBe(120);
+    /*
+    FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
+    17, not 18: `central.global_concurrency` is dropped by migration 0037. A fresh
+    database still CREATEs it from the historical 0000 baseline and then drops it,
+    so fresh and upgraded databases converge on the same shape.
+    */
+    expect(bySchema.central).toBe(17);
     expect(bySchema.archive).toBe(1);
   });
 
@@ -669,6 +771,114 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     await applySchemaBaseline(ctx.db);
     const second = await applySchemaBaseline(ctx.db);
     expect(second.applied).toBe(false);
+  });
+
+  /*
+  FNXC:LifecycleOutbox 2026-08-01-11:02:
+  Migration discovery is intentionally disabled, so the writer tables require proof at
+  their fresh, upgrade, and manually-repaired re-execution surfaces. Both tables must
+  retain the ownership contract because lifecycle events cross process boundaries.
+  */
+  it("installs lifecycle outbox ownership on fresh databases and re-executes its SQL safely", async () => {
+    ctx = await setupFreshDb();
+    await expect(applySchemaBaseline(ctx.db, { pluginHooks: [] })).resolves.toMatchObject({ applied: true });
+    await assertTaskLifecycleOutboxOwnershipContract(ctx);
+
+    const migrationSql = readFileSync(
+      fileURLToPath(new URL("../../postgres/migrations/0040_fn_8684_task_lifecycle_outbox.sql", import.meta.url)),
+      "utf8",
+    );
+    await expect(ctx.db.execute(sql.raw(migrationSql))).resolves.toBeDefined();
+    await assertTaskLifecycleOutboxOwnershipContract(ctx);
+    await expect(applySchemaBaseline(ctx.db, { pluginHooks: [] })).resolves.toEqual({ applied: false, pluginHooksRun: 0 });
+  });
+
+  it("upgrades a database recorded through 0039 with both lifecycle outbox tables", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      DELETE FROM public.fusion_schema_migrations WHERE version = '0040';
+      DROP TABLE project.task_lifecycle_events;
+      DROP TABLE project.task_lifecycle_event_seq;
+    `));
+
+    await expect(applySchemaBaseline(ctx.db, { pluginHooks: [] })).resolves.toEqual({ applied: true, pluginHooksRun: 0 });
+    expect(await getAppliedMigrations(ctx.db)).toContain(TASK_LIFECYCLE_OUTBOX_VERSION);
+    await assertTaskLifecycleOutboxOwnershipContract(ctx);
+  });
+
+  /*
+  FNXC:MemoryFocus 2026-08-26-08:31:
+  THE LEDGER CAN LIE ABOUT A RENUMBERED MIGRATION.
+
+  A ledger row asserts "a migration with this NUMBER ran". The memory-focus migration was renumbered
+  four times (0059 → 0060 → 0061 → 0065 → 0066), each time because an upstream batch claimed the
+  sequence first, so a database can carry a row for one numbering while a different migration owned
+  that number on the boot that recorded it. The applier then trusts the ledger absolutely, skips the
+  migration, and reports a successful startup over a schema that does not match it.
+
+  Reproduced from a real dev database: `column "memory_focus" does not exist` on every chat-session
+  read — `select()` emits the binary's full column list — so every chat query 500s and the task
+  planner chat never opens, with nothing wrong at startup.
+
+  The repair is the same one `recommendations` already carries: verify the materialized column, not
+  only the marker, and replay the idempotent `ADD COLUMN IF NOT EXISTS`.
+  */
+  it("repairs a database whose ledger claims memory focus but whose column is missing", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+
+    // The exact drifted state: marker present, column absent.
+    await ctx.db.execute(sql.raw(`ALTER TABLE project.chat_sessions DROP COLUMN memory_focus;`));
+    expect(await getAppliedMigrations(ctx.db)).toContain(CHAT_SESSION_MEMORY_FOCUS_VERSION);
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'project' AND table_name = 'chat_sessions' AND column_name = 'memory_focus'
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(columns, "the replay must materialize the column the ledger already claimed").toHaveLength(1);
+    expect(await getAppliedMigrations(ctx.db)).toContain(CHAT_SESSION_MEMORY_FOCUS_VERSION);
+
+    // Idempotent: a second pass over a healthy schema changes nothing and still succeeds.
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    const afterSecondPass = (await ctx.db.execute(sql`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'project' AND table_name = 'chat_sessions' AND column_name = 'memory_focus'
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(afterSecondPass).toHaveLength(1);
+  });
+
+  /*
+  FNXC:WorkspaceContention 2026-08-26-08:31:
+  The other migration renumbered on this branch (0066 → 0067, because released chat memory focus owns
+  0066) carries the identical hazard and therefore the identical defence.
+  */
+  it("repairs a database whose ledger claims session contention wait state but whose columns are missing", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+
+    await ctx.db.execute(sql.raw(`
+      ALTER TABLE project.tasks
+        DROP COLUMN session_contention_hold_count,
+        DROP COLUMN session_contention_wait_reason;
+    `));
+    expect(await getAppliedMigrations(ctx.db)).toContain(SESSION_CONTENTION_WAIT_STATE_VERSION);
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'project' AND table_name = 'tasks'
+        AND column_name IN ('session_contention_hold_count', 'session_contention_wait_reason')
+      ORDER BY column_name
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(columns.map((row) => row.column_name))
+      .toEqual(["session_contention_hold_count", "session_contention_wait_reason"]);
   });
 
   /*
@@ -735,6 +945,45 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     `)) as unknown as Array<{ column_name: string }>;
     expect(columns).toEqual([{ column_name: "session_advisor_enabled" }]);
     expect(await getAppliedMigrations(ctx.db)).toContain(SESSION_ADVISOR_ENABLED_SCHEMA_VERSION);
+  });
+
+  it("repairs the mixed-case chat-message recency index and stays idempotent", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    const before = await ctx.db.execute(sql`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname = 'project' AND tablename = 'chat_messages'
+        AND indexname = 'idxChatMessagesSessionCreatedAtId'
+    `);
+    expect(before).toHaveLength(1);
+    await ctx.db.execute(sql.raw('DROP INDEX project."idxChatMessagesSessionCreatedAtId"'));
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    const restored = await ctx.db.execute(sql`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname = 'project' AND tablename = 'chat_messages'
+        AND indexname = 'idxChatMessagesSessionCreatedAtId'
+    `);
+    expect(restored).toHaveLength(1);
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
+  });
+
+  it("repairs a recorded 0070 migration when require_plan_approval is missing", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      ALTER TABLE project.tasks DROP COLUMN require_plan_approval;
+    `));
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'tasks'
+        AND column_name = 'require_plan_approval'
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(columns).toEqual([{ column_name: "require_plan_approval" }]);
+    expect(await getAppliedMigrations(ctx.db)).toContain(TASK_REQUIRE_PLAN_APPROVAL_VERSION);
   });
 
   /*
@@ -813,7 +1062,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   the audit trail showed an unidentifiable writer).
   */
   /*
-  FNXC:SymbolLock 2026-07-31-10:00:
+  FNXC:SymbolLock 2026-07-20-10:00:
   Existing databases recorded through 0027 must receive the durable declaration
   column before scheduler admission can resolve task-owned symbol keys.
   */
@@ -1067,7 +1316,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   });
 
   it("promotes a fallback project partition without stranding task satellites", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql`
       CREATE TABLE public.fusion_sqlite_migrations (
@@ -1110,7 +1359,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   });
 
   it("merges dual partitions fallback-wins with NULL-correct catalog unique rules", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql`
       CREATE TABLE project.fn8419_null_unique_probe (project_id text NOT NULL, tag text, payload text NOT NULL);
@@ -1137,7 +1386,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   });
 
   it("retains an inbound non-project dependent for each separate FK constraint", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql`
       CREATE TABLE public.fn8419_external_dependents (
@@ -1169,7 +1418,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
 
   it("refuses deferred UPDATE SET NULL and SET DEFAULT partition mutations", async () => {
     for (const [name, action] of [["set_null", "SET NULL"], ["set_default", "SET DEFAULT"]] as const) {
-      ctx = await setupFreshDb();
+      ctx = await setupBaselinedDb();
       await applySchemaBaseline(ctx.db);
       await ctx.db.execute(sql.raw(`
         CREATE TABLE public.fn8419_${name}_dependent (
@@ -1194,7 +1443,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   });
 
   it("allows a conflict-deletable registered child to be replaced before its parent", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql.raw(`
       CREATE TABLE project.fn8419_replace_parent (project_id text PRIMARY KEY, payload text NOT NULL);
@@ -1223,7 +1472,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       ["set_null", "SET NULL", "parent_id text"],
       ["set_default", "SET DEFAULT", "parent_id text NOT NULL DEFAULT 'registered-project'"],
     ] as const) {
-      ctx = await setupFreshDb();
+      ctx = await setupBaselinedDb();
       await applySchemaBaseline(ctx.db);
       await ctx.db.execute(sql.raw(`
         CREATE TABLE project.fn8419_delete_${name}_parent (project_id text PRIMARY KEY, payload text NOT NULL);
@@ -1256,7 +1505,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       ["deferred", "ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED", undefined],
       ["cascade", "ON UPDATE CASCADE", undefined],
     ] as const) {
-      ctx = await setupFreshDb();
+      ctx = await setupBaselinedDb();
       await applySchemaBaseline(ctx.db);
       await ctx.db.execute(sql.raw(`
         CREATE TABLE project.fn8419_update_${name}_parent (
@@ -1286,7 +1535,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   });
 
   it("quarantines ownerless rows when complete and failed migrations name different projects", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql.raw(`
       DELETE FROM public.fusion_schema_migrations WHERE version IN ('0006', '0007', '0008');
@@ -1316,7 +1565,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
   The ownership migration must repair a stale child partition through the legacy global foreign key before installing composite project-local relationships, so an operator can retry after the former non-transactional cutover failed between parent and child copies.
   */
   it("reconciles stale child ownership before rebuilding project-local foreign keys", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql.raw(`
       CREATE TABLE public.fusion_sqlite_migrations (
@@ -1380,7 +1629,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 index parity (every SQLite index has 
   });
 
   it("every index from the SQLite final schema exists in PostgreSQL", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     // Query every index name across all three application schemas.
     const pgIndexRows = (await ctx.db.execute(sql`
@@ -1420,7 +1669,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 index parity (every SQLite index has 
   });
 
   it("the critical idx_tasks_deletedAt index exists (soft-delete filtering)", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     const rows = (await ctx.db.execute(sql`
       SELECT indexname FROM pg_indexes
@@ -1430,7 +1679,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 index parity (every SQLite index has 
   });
 
   it("all 8 tasks-table lookup indexes exist", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     const rows = (await ctx.db.execute(sql`
       SELECT indexname FROM pg_indexes
@@ -1478,8 +1727,31 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
         created_at text NOT NULL,
         updated_at text NOT NULL
       );
+      /*
+      FNXC:PgSchemaApplier 2026-08-23-00:06:
+      Migration 0061 (activity-log task-id index) builds an index on central.central_activity_log,
+      a table real 0000 databases have from 0000_initial.sql. This historical fixture must retain it
+      so upgrade-from-0000 reaches the current baseline instead of failing on a missing relation.
+      */
+      CREATE TABLE central.central_activity_log (
+        id text PRIMARY KEY,
+        timestamp text NOT NULL,
+        type text NOT NULL,
+        project_id text NOT NULL,
+        project_name text NOT NULL,
+        task_id text,
+        task_title text,
+        details text NOT NULL,
+        metadata jsonb
+      );
       /* FNXC:GitHubImportTranslate 2026-07-16-23:30: Later durable-task migrations run after this historical 0000 fixture, so retain their required task table surface. */
-      CREATE TABLE project.tasks (id text PRIMARY KEY);
+      /*
+      FNXC:PgSchemaApplier 2026-08-15-22:10:
+      Migration 0059 (FN-9037) builds a partial index on tasks(project_id, source_agent_id).
+      Real 0000 databases have source_agent_id (baseline since the PG cutover), so this
+      historical fixture must retain it; project_id arrives via the 0006 ownership migration.
+      */
+      CREATE TABLE project.tasks (id text PRIMARY KEY, source_agent_id text);
       /*
       FNXC:Ideation 2026-07-18-13:25:
       FN-8295 migration 0022 FKs ideation rows to missions/mission_features on (project_id, id).
@@ -1490,6 +1762,42 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CREATE TABLE project.missions (id text PRIMARY KEY);
       /* slice_id required before 0023 research provenance unique index can attach. */
       CREATE TABLE project.mission_features (id text PRIMARY KEY, slice_id text);
+      /*
+      FNXC:MissionValidation 2026-08-03-02:01:
+      Migration 0042 (FN-8694) ALTERs project.mission_validator_runs for input_fingerprint.
+      Real 0000 databases have the table (baseline since the PG cutover), so this
+      historical fixture must retain it or upgrade-from-0000 fails with missing relation.
+      */
+      CREATE TABLE project.mission_validator_runs (id text PRIMARY KEY, feature_id text, project_id text);
+      /*
+      FNXC:MissionValidation 2026-07-23-21:30:
+      Migration 0034 (FN-8542) ALTERs project.mission_contract_assertions and builds
+      the derived-milestone partial unique index on (project_id, milestone_id).
+      Real 0000 databases have the table (baseline since the PG cutover), so this
+      historical fixture must retain milestone_id; project_id arrives via 0006.
+      */
+      CREATE TABLE project.mission_contract_assertions (id text PRIMARY KEY, milestone_id text);
+      /*
+      FNXC:WorkflowContinuations 2026-07-23-21:30:
+      Migration 0031 (#2378) ALTERs project.workflow_work_items and rebuilds its
+      single-active-continuation index. Real 0000 databases have the table (it has
+      been in 0000_initial.sql since the PG cutover), so this historical fixture
+      must retain the column surface 0031 reads: task_id/kind/state for the ranked
+      retirement UPDATE plus lease and updated_at bookkeeping. project_id is added
+      by the 0006 ownership migration before 0031 runs.
+      */
+      CREATE TABLE project.workflow_work_items (
+        id text PRIMARY KEY,
+        task_id text,
+        run_id text,
+        node_id text,
+        kind text,
+        state text,
+        attempt integer,
+        lease_owner text,
+        lease_expires_at text,
+        updated_at text
+      );
       CREATE TABLE project.automations (
         id text PRIMARY KEY,
         name text NOT NULL,
@@ -1580,6 +1888,53 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_DECLARED_SYMBOLS_VERSION,
       PLANNING_ACTIVE_TIMING_VERSION,
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
+      WORKFLOW_TASK_CONTINUATIONS_VERSION,
+      LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      MILESTONE_ASSERTION_PROVENANCE_VERSION,
+      MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
+      DROP_GLOBAL_CONCURRENCY_VERSION,
+      MISSION_TASK_PREFIX_VERSION,
+      CREDENTIAL_INSTANCE_SELECTION_VERSION,
+      TASK_LIFECYCLE_OUTBOX_VERSION,
+      TASK_LIFECYCLE_CONSUMERS_VERSION,
+      VALIDATOR_INPUT_FINGERPRINT_VERSION,
+      UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION,
+      QUEUED_EPISODE_SIGNATURE_VERSION,
+      MULTI_ROLE_WORKFLOW_AGENTS_VERSION,
+      WORKFLOW_PRINCIPAL_FENCE_VERSION,
+      TASK_RECOMMENDATIONS_VERSION,
+      GITHUB_CHECK_STATES_VERSION,
+      AGENT_ACTIVITY_EVENTS_VERSION,
+      SPEC_LOCK_DRIFT_REPORT_VERSION,
+      SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION,
+      MEMORY_RECALL_RECORDS_VERSION,
+      MISSION_FEATURE_SPEC_ALIGNMENT_VERSION,
+      AGENT_RATING_PROJECT_ISOLATION_VERSION,
+      AGENT_RATINGS_PROJECT_PARTITION_VERSION,
+  PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION,
+      PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION,
+      MESSAGE_ARCHIVE_SCHEMA_VERSION,
+      TASK_SOURCE_AGENT_INDEX_VERSION,
+      WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION,
+      ACTIVITY_LOG_TASK_ID_INDEX_VERSION,
+      REMOVE_TASK_SUBTASK_SPLITTING_VERSION,
+      AI_MERGE_REVIEW_RECONCILIATION_VERSION,
+      TASK_REPOSITORY_SCOPE_VERSION,
+      REVIEW_CONVERGENCE_STAGE_VERSION,
+      CHAT_SESSION_MEMORY_FOCUS_VERSION,
+      SESSION_CONTENTION_WAIT_STATE_VERSION,
+      TASK_STEP_REPORTS_VERSION,
+      TASK_EXTERNAL_BLOCK_VERSION,
+      TASK_REQUIRE_PLAN_APPROVAL_VERSION,
+      PATCHNODE_ENTRIES_VERSION,
+      TASK_PLANNING_FAILURE_VERSION,
+      PROJECT_NOTES_VERSION,
+      OVERLAP_WAIT_SYNC_VERSION,
+      WHITEBOARDS_SCHEMA_VERSION,
+      OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION,
+      OVERLAP_REVALIDATION_DRAIN_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1636,6 +1991,54 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_DECLARED_SYMBOLS_VERSION,
       PLANNING_ACTIVE_TIMING_VERSION,
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
+      WORKFLOW_TASK_CONTINUATIONS_VERSION,
+      LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      MILESTONE_ASSERTION_PROVENANCE_VERSION,
+      MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
+      DROP_GLOBAL_CONCURRENCY_VERSION,
+      MISSION_TASK_PREFIX_VERSION,
+      CREDENTIAL_INSTANCE_SELECTION_VERSION,
+      TASK_LIFECYCLE_OUTBOX_VERSION,
+      TASK_LIFECYCLE_CONSUMERS_VERSION,
+      VALIDATOR_INPUT_FINGERPRINT_VERSION,
+      UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION,
+      QUEUED_EPISODE_SIGNATURE_VERSION,
+      MULTI_ROLE_WORKFLOW_AGENTS_VERSION,
+      WORKFLOW_PRINCIPAL_FENCE_VERSION,
+      TASK_RECOMMENDATIONS_VERSION,
+      GITHUB_CHECK_STATES_VERSION,
+      AGENT_ACTIVITY_EVENTS_VERSION,
+      SPEC_LOCK_DRIFT_REPORT_VERSION,
+      SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION,
+      MEMORY_RECALL_RECORDS_VERSION,
+      MISSION_FEATURE_SPEC_ALIGNMENT_VERSION,
+      AGENT_RATING_PROJECT_ISOLATION_VERSION,
+      AGENT_RATINGS_PROJECT_PARTITION_VERSION,
+  PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION,
+      PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION,
+      MESSAGE_ARCHIVE_SCHEMA_VERSION,
+      TASK_SOURCE_AGENT_INDEX_VERSION,
+      WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION,
+      ACTIVITY_LOG_TASK_ID_INDEX_VERSION,
+      REMOVE_TASK_SUBTASK_SPLITTING_VERSION,
+      AI_MERGE_REVIEW_RECONCILIATION_VERSION,
+      TASK_REPOSITORY_SCOPE_VERSION,
+      REVIEW_CONVERGENCE_STAGE_VERSION,
+      CHAT_SESSION_MEMORY_FOCUS_VERSION,
+      SESSION_CONTENTION_WAIT_STATE_VERSION,
+      TASK_STEP_REPORTS_VERSION,
+      TASK_EXTERNAL_BLOCK_VERSION,
+      TASK_REQUIRE_PLAN_APPROVAL_VERSION,
+      PATCHNODE_ENTRIES_VERSION,
+      TASK_PLANNING_FAILURE_VERSION,
+      CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
+      PROJECT_NOTES_VERSION,
+      OVERLAP_WAIT_SYNC_VERSION,
+      WHITEBOARDS_SCHEMA_VERSION,
+      OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION,
+      OVERLAP_REVALIDATION_DRAIN_VERSION,
     ]);
   });
 
@@ -1825,6 +2228,54 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_DECLARED_SYMBOLS_VERSION,
       PLANNING_ACTIVE_TIMING_VERSION,
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
+      WORKFLOW_TASK_CONTINUATIONS_VERSION,
+      LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      MILESTONE_ASSERTION_PROVENANCE_VERSION,
+      MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
+      DROP_GLOBAL_CONCURRENCY_VERSION,
+      MISSION_TASK_PREFIX_VERSION,
+      CREDENTIAL_INSTANCE_SELECTION_VERSION,
+      TASK_LIFECYCLE_OUTBOX_VERSION,
+      TASK_LIFECYCLE_CONSUMERS_VERSION,
+      VALIDATOR_INPUT_FINGERPRINT_VERSION,
+      UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION,
+      QUEUED_EPISODE_SIGNATURE_VERSION,
+      MULTI_ROLE_WORKFLOW_AGENTS_VERSION,
+      WORKFLOW_PRINCIPAL_FENCE_VERSION,
+      TASK_RECOMMENDATIONS_VERSION,
+      GITHUB_CHECK_STATES_VERSION,
+      AGENT_ACTIVITY_EVENTS_VERSION,
+      SPEC_LOCK_DRIFT_REPORT_VERSION,
+      SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION,
+      MEMORY_RECALL_RECORDS_VERSION,
+      MISSION_FEATURE_SPEC_ALIGNMENT_VERSION,
+      AGENT_RATING_PROJECT_ISOLATION_VERSION,
+      AGENT_RATINGS_PROJECT_PARTITION_VERSION,
+  PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION,
+      PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION,
+      MESSAGE_ARCHIVE_SCHEMA_VERSION,
+      TASK_SOURCE_AGENT_INDEX_VERSION,
+      WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION,
+      ACTIVITY_LOG_TASK_ID_INDEX_VERSION,
+      REMOVE_TASK_SUBTASK_SPLITTING_VERSION,
+      AI_MERGE_REVIEW_RECONCILIATION_VERSION,
+      TASK_REPOSITORY_SCOPE_VERSION,
+      REVIEW_CONVERGENCE_STAGE_VERSION,
+      CHAT_SESSION_MEMORY_FOCUS_VERSION,
+      SESSION_CONTENTION_WAIT_STATE_VERSION,
+      TASK_STEP_REPORTS_VERSION,
+      TASK_EXTERNAL_BLOCK_VERSION,
+      TASK_REQUIRE_PLAN_APPROVAL_VERSION,
+      PATCHNODE_ENTRIES_VERSION,
+      TASK_PLANNING_FAILURE_VERSION,
+      CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
+      PROJECT_NOTES_VERSION,
+      OVERLAP_WAIT_SYNC_VERSION,
+      WHITEBOARDS_SCHEMA_VERSION,
+      OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION,
+      OVERLAP_REVALIDATION_DRAIN_VERSION,
     ]);
   });
 
@@ -1895,6 +2346,54 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_DECLARED_SYMBOLS_VERSION,
       PLANNING_ACTIVE_TIMING_VERSION,
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
+      WORKFLOW_TASK_CONTINUATIONS_VERSION,
+      LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      MILESTONE_ASSERTION_PROVENANCE_VERSION,
+      MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
+      DROP_GLOBAL_CONCURRENCY_VERSION,
+      MISSION_TASK_PREFIX_VERSION,
+      CREDENTIAL_INSTANCE_SELECTION_VERSION,
+      TASK_LIFECYCLE_OUTBOX_VERSION,
+      TASK_LIFECYCLE_CONSUMERS_VERSION,
+      VALIDATOR_INPUT_FINGERPRINT_VERSION,
+      UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION,
+      QUEUED_EPISODE_SIGNATURE_VERSION,
+      MULTI_ROLE_WORKFLOW_AGENTS_VERSION,
+      WORKFLOW_PRINCIPAL_FENCE_VERSION,
+      TASK_RECOMMENDATIONS_VERSION,
+      GITHUB_CHECK_STATES_VERSION,
+      AGENT_ACTIVITY_EVENTS_VERSION,
+      SPEC_LOCK_DRIFT_REPORT_VERSION,
+      SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION,
+      MEMORY_RECALL_RECORDS_VERSION,
+      MISSION_FEATURE_SPEC_ALIGNMENT_VERSION,
+      AGENT_RATING_PROJECT_ISOLATION_VERSION,
+      AGENT_RATINGS_PROJECT_PARTITION_VERSION,
+  PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION,
+      PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION,
+      MESSAGE_ARCHIVE_SCHEMA_VERSION,
+      TASK_SOURCE_AGENT_INDEX_VERSION,
+      WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION,
+      ACTIVITY_LOG_TASK_ID_INDEX_VERSION,
+      REMOVE_TASK_SUBTASK_SPLITTING_VERSION,
+      AI_MERGE_REVIEW_RECONCILIATION_VERSION,
+      TASK_REPOSITORY_SCOPE_VERSION,
+      REVIEW_CONVERGENCE_STAGE_VERSION,
+      CHAT_SESSION_MEMORY_FOCUS_VERSION,
+      SESSION_CONTENTION_WAIT_STATE_VERSION,
+      TASK_STEP_REPORTS_VERSION,
+      TASK_EXTERNAL_BLOCK_VERSION,
+      TASK_REQUIRE_PLAN_APPROVAL_VERSION,
+      PATCHNODE_ENTRIES_VERSION,
+      TASK_PLANNING_FAILURE_VERSION,
+      CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
+      PROJECT_NOTES_VERSION,
+      OVERLAP_WAIT_SYNC_VERSION,
+      WHITEBOARDS_SCHEMA_VERSION,
+      OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION,
+      OVERLAP_REVALIDATION_DRAIN_VERSION,
     ]);
   });
 
@@ -1965,6 +2464,54 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_DECLARED_SYMBOLS_VERSION,
       PLANNING_ACTIVE_TIMING_VERSION,
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
+      WORKFLOW_TASK_CONTINUATIONS_VERSION,
+      LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      MILESTONE_ASSERTION_PROVENANCE_VERSION,
+      MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
+      DROP_GLOBAL_CONCURRENCY_VERSION,
+      MISSION_TASK_PREFIX_VERSION,
+      CREDENTIAL_INSTANCE_SELECTION_VERSION,
+      TASK_LIFECYCLE_OUTBOX_VERSION,
+      TASK_LIFECYCLE_CONSUMERS_VERSION,
+      VALIDATOR_INPUT_FINGERPRINT_VERSION,
+      UNPLANNED_EXECUTION_BLOCK_DEDUPE_VERSION,
+      QUEUED_EPISODE_SIGNATURE_VERSION,
+      MULTI_ROLE_WORKFLOW_AGENTS_VERSION,
+      WORKFLOW_PRINCIPAL_FENCE_VERSION,
+      TASK_RECOMMENDATIONS_VERSION,
+      GITHUB_CHECK_STATES_VERSION,
+      AGENT_ACTIVITY_EVENTS_VERSION,
+      SPEC_LOCK_DRIFT_REPORT_VERSION,
+      SPEC_LOCK_SOURCE_REVISION_BIGINT_VERSION,
+      MEMORY_RECALL_RECORDS_VERSION,
+      MISSION_FEATURE_SPEC_ALIGNMENT_VERSION,
+      AGENT_RATING_PROJECT_ISOLATION_VERSION,
+      AGENT_RATINGS_PROJECT_PARTITION_VERSION,
+  PROJECT_OWNERSHIP_DECLARATION_DRIFT_VERSION,
+      PROJECT_OWNERSHIP_DEFAULT_RECONCILIATION_VERSION,
+      MESSAGE_ARCHIVE_SCHEMA_VERSION,
+      TASK_SOURCE_AGENT_INDEX_VERSION,
+      WORKSPACE_COORDINATION_LEASES_SCHEMA_VERSION,
+      ACTIVITY_LOG_TASK_ID_INDEX_VERSION,
+      REMOVE_TASK_SUBTASK_SPLITTING_VERSION,
+      AI_MERGE_REVIEW_RECONCILIATION_VERSION,
+      TASK_REPOSITORY_SCOPE_VERSION,
+      REVIEW_CONVERGENCE_STAGE_VERSION,
+      CHAT_SESSION_MEMORY_FOCUS_VERSION,
+      SESSION_CONTENTION_WAIT_STATE_VERSION,
+      TASK_STEP_REPORTS_VERSION,
+      TASK_EXTERNAL_BLOCK_VERSION,
+      TASK_REQUIRE_PLAN_APPROVAL_VERSION,
+      PATCHNODE_ENTRIES_VERSION,
+      TASK_PLANNING_FAILURE_VERSION,
+      CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
+      PROJECT_NOTES_VERSION,
+      OVERLAP_WAIT_SYNC_VERSION,
+      WHITEBOARDS_SCHEMA_VERSION,
+      OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION,
+      OVERLAP_REVALIDATION_DRAIN_VERSION,
     ]);
   });
 });
@@ -1989,7 +2536,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-006 AUTOINCREMENT → identity with seque
       WHERE n.nspname = 'project' AND a.attidentity = 'a'
       ORDER BY c.relname
     `)) as unknown as Array<{ table_name: string; column_name: string }>;
-    // The 8 AUTOINCREMENT columns from the SQLite schema.
+    // The 9 identity columns include immutable spec-drift report history.
     const identityTables = rows.map((r) => r.table_name);
     expect(identityTables).toEqual(
       expect.arrayContaining([
@@ -2003,7 +2550,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-006 AUTOINCREMENT → identity with seque
         "incidents",
       ]),
     );
-    expect(rows.length).toBe(9);
+    expect(rows.length).toBe(10);
   });
 
   it("sequence continuity: consecutive inserts produce increasing IDs without collision", async () => {
@@ -2020,6 +2567,63 @@ pgDescribe("schema-applier: VAL-SCHEMA-006 AUTOINCREMENT → identity with seque
     `)) as unknown as Array<{ id: number }>;
     expect(rows.length).toBe(2);
     expect(rows[1].id).toBeGreaterThan(rows[0].id);
+  });
+});
+
+pgDescribe("schema-applier: agent ratings project partition", () => {
+  let ctx: TestContext | null = null;
+
+  afterEach(async () => {
+    await teardownDb(ctx);
+    ctx = null;
+  });
+
+  it("creates the composite rating key and reapplying is a no-op", async () => {
+    /*
+    FNXC:AgentRatingsProjectIsolation 2026-08-12-01:00:
+    Fresh baselines and repaired upgrades must agree that duplicate rating IDs are legal only across project partitions. Reapplying after bookkeeping must not mutate the healthy schema.
+    */
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db);
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'project' AND table_name = 'agent_ratings' AND column_name = 'project_id'
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(columns).toEqual([{ column_name: "project_id" }]);
+    const keys = (await ctx.db.execute(sql`
+      SELECT a.attname AS column_name
+      FROM pg_constraint c
+      JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinal) ON true
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+      WHERE c.conrelid = 'project.agent_ratings'::regclass AND c.contype = 'p'
+      ORDER BY k.ordinal
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(keys).toEqual([{ column_name: "project_id" }, { column_name: "id" }]);
+    await expect(applySchemaBaseline(ctx.db)).resolves.toMatchObject({ applied: false });
+  });
+
+  it("repairs a drifted key that contains project_id but omits rating id", async () => {
+    /*
+    FNXC:AgentRatingsProjectPartition 2026-08-12-01:30:
+    Historical drift can leave (project_id, agent_id) as the primary key. The
+    upgrade must replace it because only (project_id, id) protects rating identity.
+    */
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db);
+    await ctx.db.execute(sql`ALTER TABLE project.agent_ratings DROP CONSTRAINT agent_ratings_pkey`);
+    await ctx.db.execute(sql`ALTER TABLE project.agent_ratings ADD CONSTRAINT agent_ratings_pkey PRIMARY KEY (project_id, agent_id)`);
+    await ctx.db.execute(sql`DELETE FROM public.fusion_schema_migrations WHERE version = ${AGENT_RATINGS_PROJECT_PARTITION_VERSION}`);
+
+    await expect(applySchemaBaseline(ctx.db)).resolves.toMatchObject({ applied: true });
+    const keys = (await ctx.db.execute(sql`
+      SELECT a.attname AS column_name
+      FROM pg_constraint c
+      JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinal) ON true
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+      WHERE c.conrelid = 'project.agent_ratings'::regclass AND c.contype = 'p'
+      ORDER BY k.ordinal
+    `)) as unknown as Array<{ column_name: string }>;
+    expect(keys).toEqual([{ column_name: "project_id" }, { column_name: "id" }]);
   });
 });
 
@@ -2048,8 +2652,8 @@ pgDescribe("schema-applier: VAL-SCHEMA-005 CHECK constraints preserved and enfor
     await applySchemaBaseline(ctx.db);
     await expectPgError(
       ctx.db.execute(sql`
-        INSERT INTO project.agent_ratings (id, agent_id, rater_type, score, created_at)
-        VALUES ('r1', 'a1', 'user', 99, '2026-01-01')
+        INSERT INTO project.agent_ratings (project_id, id, agent_id, rater_type, score, created_at)
+        VALUES ('schema-test', 'r1', 'a1', 'user', 99, '2026-01-01')
       `),
       /score_check|check constraint/i,
     );
@@ -2090,7 +2694,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-002 foreign-key cascade rules preserved",
   });
 
   it("ON DELETE CASCADE removes child rows (tasks → merge_queue)", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     // Insert a task then a merge_queue row referencing it.
     await ctx.db.execute(sql`
@@ -2110,7 +2714,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-002 foreign-key cascade rules preserved",
   });
 
   it("ON DELETE SET NULL nulls the referencing column (tasks ← mission_features)", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql`
       INSERT INTO project.tasks (id, description, "column", created_at, updated_at)
@@ -2141,7 +2745,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-002 foreign-key cascade rules preserved",
   });
 
   it("every FK cascade rule from SQLite is present (cascade rule coverage)", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     // At minimum, the cascade FKs must exist. Count cascade ('c') FKs.
     const rows = (await ctx.db.execute(sql`
@@ -2164,7 +2768,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-003 unique indexes preserved", () => {
   });
 
   it("enforces uniqueness on task_documents(task_id, key)", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql`
       INSERT INTO project.tasks (id, description, "column", created_at, updated_at)
@@ -2184,7 +2788,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-003 unique indexes preserved", () => {
   });
 
   it("enforces uniqueness on secrets(key)", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     await ctx.db.execute(sql`
       INSERT INTO project.secrets (id, key, value_ciphertext, nonce, created_at, updated_at)
@@ -2209,7 +2813,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-004 JSON columns round-trip as jsonb", ()
   });
 
   it("tasks.dependencies is jsonb and round-trips nested arrays/objects", async () => {
-    ctx = await setupFreshDb();
+    ctx = await setupBaselinedDb();
     await applySchemaBaseline(ctx.db);
     const colRow = (await ctx.db.execute(sql`
       SELECT data_type FROM information_schema.columns

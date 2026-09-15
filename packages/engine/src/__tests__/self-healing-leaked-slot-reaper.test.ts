@@ -1,14 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 
-const { logger } = vi.hoisted(() => ({ logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+const { logger } = vi.hoisted(() => ({ logger: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn(() => logger),
-  schedulerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  schedulerLog: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock("../worktree-pool.js", () => ({
-  WorktreePool: vi.fn(),
+vi.mock("../worktree/worktree-pool.js", () => ({
   RemovalReason: {},
   scanIdleWorktrees: vi.fn().mockResolvedValue([]),
   cleanupOrphanedWorktrees: vi.fn().mockResolvedValue(0),
@@ -93,6 +92,27 @@ describe("reapLeakedConcurrencySlots", () => {
       "FN-6756",
       expect.stringContaining("released leaked worktree/concurrency slot"),
     );
+  });
+
+  it("does NOT release an externally blocked holder in a planning lane", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(taskRow("FN-209", "todo", {
+      status: "blocked",
+      paused: true,
+      worktree: "/wt/frozen",
+      externalBlock: {
+        origin: "host-environment",
+        code: "ENOSPC",
+        message: "no space left on device, write",
+        source: "agent-declaration",
+        blockedAt: "2026-05-20T12:00:00.000Z",
+        resume: { column: "todo", currentStep: 0, worktree: "/wt/frozen" },
+      },
+    }));
+    const manager = makeManager([{ taskId: "FN-209", worktreePath: "/wt/frozen" }]);
+
+    expect(await manager.reapLeakedConcurrencySlots()).toBe(0);
+    expect(clearPhantomExecutorBinding).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-209", expect.stringContaining("Auto-recovered"));
   });
 
   it("does NOT release a legit in-progress holder", async () => {

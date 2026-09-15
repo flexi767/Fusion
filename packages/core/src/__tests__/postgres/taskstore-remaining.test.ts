@@ -20,17 +20,19 @@
  * gate stays green without a running server.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
-import postgres from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
-import { eq, sql } from "drizzle-orm";
-import { execSync } from "node:child_process";
-import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
-import { createConnectionSetFromUrl } from "../../postgres/connection.js";
-import type { ResolvedBackend } from "../../postgres/backend-resolver.js";
-import { applySchemaBaseline } from "../../postgres/schema-applier.js";
+import { it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
+import { eq } from "drizzle-orm";
+import type { AsyncDataLayer } from "../../postgres/data-layer.js";
+import {
+  pgDescribe,
+  createSharedPgTaskStoreTestHarness,
+} from "../../__test-utils__/pg-test-harness.js";
 import * as schema from "../../postgres/schema/index.js";
-import { insertTaskRow, softDeleteTaskRow } from "../../task-store/async-persistence.js";
+import { insertTaskRow, softDeleteTaskRow } from "../../task-store/async/async-persistence.js";
+import {
+  TaskDocumentPreconditionFailedError,
+  taskDocumentContentHash,
+} from "../../task-document-concurrency.js";
 import {
   upsertArchivedTaskEntry,
   findArchivedTaskEntry,
@@ -39,7 +41,7 @@ import {
   listLiveTaskDocuments,
   listLiveArtifacts,
   listAllTaskDocuments,
-} from "../../task-store/async-archive-lineage.js";
+} from "../../task-store/async/async-archive-lineage.js";
 import {
   createBranchGroup,
   getBranchGroup,
@@ -53,7 +55,7 @@ import {
   listActivePrEntities,
   recordPrThreadOutcome,
   getPrThreadState,
-} from "../../task-store/async-branch-groups.js";
+} from "../../task-store/async/async-branch-groups.js";
 import {
   upsertWorkflowWorkItem,
   transitionWorkflowWorkItem,
@@ -61,139 +63,50 @@ import {
   listDueWorkflowWorkItems,
   recordCompletionHandoff,
   getCompletionHandoffMarker,
-} from "../../task-store/async-workflow-workitems.js";
+} from "../../task-store/async/async-workflow-workitems.js";
 import {
   recordActivityLogEntry,
   getActivityLog,
   queryRunAuditEvents,
-} from "../../task-store/async-audit.js";
+} from "../../task-store/async/async-audit.js";
 import {
   getTaskDocument,
+  getTaskDocumentRevisions,
   upsertTaskDocument,
   listTaskDocuments,
   insertArtifactRow,
   getArtifact,
   getArtifacts,
-} from "../../task-store/async-comments-attachments.js";
+} from "../../task-store/async/async-comments-attachments.js";
 import {
   recordGoalCitations,
   listGoalCitations,
   emitUsageEvent,
   queryUsageEvents,
   recordPluginActivation,
-} from "../../task-store/async-events.js";
+} from "../../task-store/async/async-events.js";
 import {
   sanitizeSearchTokens,
   searchTasksLike,
   countSearchTasksLike,
-} from "../../task-store/async-search.js";
-
-const PG_TEST_URL_BASE =
-  process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
-const PG_AVAILABLE =
-  process.env.FUSION_PG_TEST_SKIP !== "1" && Boolean(PG_TEST_URL_BASE);
-
-const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
+} from "../../task-store/async/async-search.js";
 
 /** FNXC:MultiProjectIsolation 2026-07-16-00:05: the project every harness row is owned by. */
 const TEST_PROJECT_ID = "proj_test_u14";
 
-function uniqueDbName(): string {
-  return `fusion_u14_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 /*
-FNXC:PgTestAuthFix 2026-07-14-00:00:
-The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+FNXC:TaskStoreRemaining 2026-08-15-03:52:
+Slow-test fix: this file hand-rolled CREATE DATABASE + full applySchemaBaseline
+PER TEST (~1.9s/test, 52s for the file). The helpers under test write only data,
+so the shared per-file harness (one golden-template DB + per-test reset) keeps
+isolation with the schema built once. The FNXC:MultiProjectIsolation 2026-07-16
+production-shape binding is preserved by passing `projectId: TEST_PROJECT_ID`
+to the harness, which threads the `fusion.project_id` GUC into the runtime
+connections and the layer exactly as the old inline setup did. `ctx` keeps its
+original `{ layer }` shape so test bodies stay byte-identical.
 */
-function adminExec(statement: string): void {
-  execSync(
-    `psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
-    { stdio: "pipe", env: process.env },
-  );
-}
-
 interface TestCtx {
-  dbName: string;
-  testUrl: string;
   layer: AsyncDataLayer;
-  adminSql: ReturnType<typeof postgres>;
-  adminDb: ReturnType<typeof drizzle>;
-}
-
-async function setupCtx(): Promise<TestCtx> {
-  const dbName = uniqueDbName();
-  try {
-    adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch {
-    // may not exist
-  }
-  adminExec(`CREATE DATABASE "${dbName}"`);
-  const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
-
-  const schemaBackend: ResolvedBackend = {
-    mode: "external",
-    runtimeUrl: testUrl,
-    migrationUrl: testUrl,
-    migrationUrlOverridden: false,
-  };
-  const schemaConnections = await createConnectionSetFromUrl(schemaBackend, {
-    poolMax: 1,
-    connectTimeoutSeconds: 5,
-  });
-  await applySchemaBaseline(schemaConnections.migration);
-  await schemaConnections.close();
-
-  /*
-  FNXC:MultiProjectIsolation 2026-07-16-00:05:
-  Bind the layer to a project, as production does. createConnectionSetFromUrl sets the
-  `fusion.project_id` GUC per connection when given a projectId, and falls back to
-  `fusion.project_bypass=on` when not; an unbound harness therefore ran with RLS bypassed and
-  wrote blank project_ids that the migration-0006 trigger rewrote to '__legacy_unscoped__', so
-  helpers scoping on `layer.projectId ?? ""` never found the rows they had just written. That is
-  a shape production forbids -- AgentStore.backendProjectId throws on an unbound id -- so the
-  tests, not the product, were wrong.
-  */
-  const connections = await createConnectionSetFromUrl(schemaBackend, {
-    poolMax: 5,
-    connectTimeoutSeconds: 5,
-    projectId: TEST_PROJECT_ID,
-  });
-  const layer = createAsyncDataLayer(connections, { projectId: TEST_PROJECT_ID });
-
-  /*
-  FNXC:MultiProjectIsolation 2026-07-16-00:05:
-  The admin connection seeds and inspects rows the bound layer then reads, so it must sit in the
-  SAME partition. Without the GUC its writes are blank, the migration-0006 trigger stamps them
-  __legacy_unscoped__, and the bound layer scoping on TEST_PROJECT_ID cannot see its own fixtures.
-  */
-  const adminSql = postgres(testUrl, {
-    max: 2,
-    prepare: false,
-    onnotice: () => {},
-    connection: { "fusion.project_id": TEST_PROJECT_ID },
-  });
-  const adminDb = drizzle(adminSql);
-  return { dbName, testUrl, layer, adminSql, adminDb };
-}
-
-async function teardownCtx(ctx: TestCtx | null): Promise<void> {
-  if (!ctx) return;
-  try {
-    await ctx.layer.close();
-  } catch {
-    // best-effort
-  }
-  try {
-    await ctx.adminSql.end({ timeout: 5 });
-  } catch {
-    // best-effort
-  }
-  try {
-    adminExec(`DROP DATABASE IF EXISTS "${ctx.dbName}"`);
-  } catch {
-    // best-effort
-  }
 }
 
 /** A minimal task record with the NOT NULL columns filled. */
@@ -210,17 +123,23 @@ function makeMinimalTask(id: string, column = "todo"): Record<string, unknown> {
 }
 
 pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
-  let ctx: TestCtx | null = null;
-
-  afterEach(async () => {
-    await teardownCtx(ctx);
-    ctx = null;
+  const h = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_u14",
+    projectId: TEST_PROJECT_ID,
   });
+  let ctx!: TestCtx;
+
+  beforeAll(h.beforeAll);
+  beforeEach(async () => {
+    await h.beforeEach();
+    ctx = { layer: h.layer() };
+  });
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
 
   // ── VAL-CROSS-014: Soft-deleting a child task allows parent deletion ──
 
   it("soft-deleting a child allows parent deletion (VAL-CROSS-014)", async () => {
-    ctx = await setupCtx();
     // Seed a parent + a live child.
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-PARENT"), { lineageId: null });
     await insertTaskRow(
@@ -252,7 +171,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   // ── VAL-CROSS-015: Archive scopes docs/artifacts out of live views ──
 
   it("archiving a parent scopes documents out of live views but preserves them (VAL-CROSS-015)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-DOC-PARENT"), { lineageId: null });
 
     // Create a document on the live task.
@@ -281,7 +199,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("archiving a parent scopes artifacts out of live views but preserves them (VAL-CROSS-015)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-ART-PARENT"), { lineageId: null });
 
     // Register an artifact on the live task.
@@ -316,7 +233,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   // ── Comments/attachments round-trip on active tasks ──
 
   it("task documents round-trip on active tasks (upsert + read + update)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-DOC-RT"), { lineageId: null });
 
     // Initial create.
@@ -347,8 +263,103 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     expect(docs).toHaveLength(1);
   });
 
+  it("enforces task-document CAS atomically for creates and updates", async () => {
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-DOC-CAS"), { lineageId: null });
+
+    expect(taskDocumentContentHash("line 1\r\nline 2")).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(taskDocumentContentHash("line 1\r\nline 2")).not.toBe(taskDocumentContentHash("line 1\nline 2"));
+    await expect(upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "invalid",
+      content: "x",
+      expectedRevision: -1,
+    })).rejects.toThrow(/non-negative integer/);
+    await expect(upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "invalid",
+      content: "x",
+      expectedContentHash: "sha256:ABC",
+    })).rejects.toThrow(/64 lowercase hex/);
+
+    await expect(upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "missing", content: "x", expectedRevision: 1,
+    })).rejects.toBeInstanceOf(TaskDocumentPreconditionFailedError);
+    await expect(upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "missing", content: "x", expectedContentHash: taskDocumentContentHash("x"),
+    })).rejects.toBeInstanceOf(TaskDocumentPreconditionFailedError);
+
+    const createRace = await Promise.allSettled([
+      upsertTaskDocument(ctx.layer, "KB-DOC-CAS", { key: "evidence", content: "create-a", expectedRevision: 0 }),
+      upsertTaskDocument(ctx.layer, "KB-DOC-CAS", { key: "evidence", content: "create-b", expectedRevision: 0 }),
+    ]);
+    expect(createRace.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const createLoser = createRace.find((result) => result.status === "rejected");
+    expect(createLoser).toMatchObject({ reason: expect.any(TaskDocumentPreconditionFailedError) });
+
+    const created = await getTaskDocument(ctx.layer.db, "KB-DOC-CAS", "evidence", TEST_PROJECT_ID);
+    expect(created).not.toBeNull();
+    expect(created?.contentHash).toBe(taskDocumentContentHash(created!.content));
+    let history = await ctx.layer.db.select().from(schema.project.taskDocumentRevisions).where(eq(schema.project.taskDocumentRevisions.taskId, "KB-DOC-CAS"));
+    expect(history).toHaveLength(0);
+
+    const baseRevision = created!.revision;
+    const baseHash = created!.contentHash;
+    const updateRace = await Promise.allSettled([
+      upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+        key: "evidence", content: "winner-a", expectedRevision: baseRevision, expectedContentHash: baseHash,
+      }),
+      upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+        key: "evidence", content: "winner-b", expectedRevision: baseRevision, expectedContentHash: baseHash,
+      }),
+    ]);
+    expect(updateRace.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const updateLoser = updateRace.find((result) => result.status === "rejected") as PromiseRejectedResult;
+    expect(updateLoser.reason).toBeInstanceOf(TaskDocumentPreconditionFailedError);
+    expect((updateLoser.reason as TaskDocumentPreconditionFailedError).toDetails()).toMatchObject({
+      code: "TASK_DOCUMENT_PRECONDITION_FAILED",
+      projectId: TEST_PROJECT_ID,
+      taskId: "KB-DOC-CAS",
+      key: "evidence",
+      expectedRevision: baseRevision,
+      expectedContentHash: baseHash,
+      currentRevision: baseRevision + 1,
+    });
+    expect((updateLoser.reason as TaskDocumentPreconditionFailedError).toDetails()).not.toHaveProperty("content");
+
+    const current = await getTaskDocument(ctx.layer.db, "KB-DOC-CAS", "evidence", TEST_PROJECT_ID);
+    expect(current?.revision).toBe(baseRevision + 1);
+    expect(["winner-a", "winner-b"]).toContain(current?.content);
+    history = await ctx.layer.db.select().from(schema.project.taskDocumentRevisions).where(eq(schema.project.taskDocumentRevisions.taskId, "KB-DOC-CAS"));
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ revision: baseRevision, content: created!.content });
+
+    await expect(upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "evidence", content: "stale-revision", expectedRevision: baseRevision,
+    })).rejects.toBeInstanceOf(TaskDocumentPreconditionFailedError);
+    await expect(upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "evidence", content: "stale-hash", expectedContentHash: baseHash,
+    })).rejects.toBeInstanceOf(TaskDocumentPreconditionFailedError);
+    let unchangedHistory = await ctx.layer.db.select().from(schema.project.taskDocumentRevisions).where(eq(schema.project.taskDocumentRevisions.taskId, "KB-DOC-CAS"));
+    expect(unchangedHistory).toHaveLength(1);
+
+    const revisionOnly = await upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "evidence", content: "revision-only", expectedRevision: current!.revision,
+    });
+    const hashOnly = await upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+      key: "evidence", content: "hash-only", expectedContentHash: revisionOnly.contentHash,
+    });
+    const identicalRace = await Promise.allSettled([
+      upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+        key: "evidence", content: "same-content", expectedRevision: hashOnly.revision, expectedContentHash: hashOnly.contentHash,
+      }),
+      upsertTaskDocument(ctx.layer, "KB-DOC-CAS", {
+        key: "evidence", content: "same-content", expectedRevision: hashOnly.revision, expectedContentHash: hashOnly.contentHash,
+      }),
+    ]);
+    expect(identicalRace.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    unchangedHistory = await ctx.layer.db.select().from(schema.project.taskDocumentRevisions).where(eq(schema.project.taskDocumentRevisions.taskId, "KB-DOC-CAS"));
+    expect(unchangedHistory).toHaveLength(4);
+  });
+
   it("artifacts round-trip on active tasks (register + read)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-ART-RT"), { lineageId: null });
 
     const artifact = await insertArtifactRow(ctx.layer, {
@@ -373,23 +384,21 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     expect(list).toHaveLength(1);
   });
 
-  it("document upsert is rejected against archived tasks", async () => {
-    ctx = await setupCtx();
-    await insertTaskRow(ctx.layer, makeMinimalTask("KB-ARCH-DOC"), { lineageId: null });
-    await softDeleteTaskRow(ctx.layer, "KB-ARCH-DOC", new Date().toISOString());
+  it("document upsert is rejected against soft-deleted tasks", async () => {
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-DELETED-DOC"), { lineageId: null });
+    await softDeleteTaskRow(ctx.layer, "KB-DELETED-DOC", new Date().toISOString());
 
     await expect(
-      upsertTaskDocument(ctx.layer, "KB-ARCH-DOC", {
+      upsertTaskDocument(ctx.layer, "KB-DELETED-DOC", {
         key: "spec",
         content: "content",
       }),
-    ).rejects.toThrow(/archived|not found/);
+    ).rejects.toThrow(/deleted|historical|not found/);
   });
 
   // ── Audit mutations and run-audit events commit/roll back together ──
 
   it("activity log entries round-trip (record + query)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-ACT"), { lineageId: null });
 
     await recordActivityLogEntry(ctx.layer.db, ctx.layer.projectId ?? "", {
@@ -407,7 +416,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("run-audit events query by taskId", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-AUDIT"), { lineageId: null });
 
     // Record a run-audit event directly.
@@ -434,7 +442,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   // ── Branch groups ──
 
   it("branch groups round-trip (create + read + update + list)", async () => {
-    ctx = await setupCtx();
     const created = await createBranchGroup(ctx.layer.db, {
       sourceType: "mission",
       sourceId: "miss-1",
@@ -464,7 +471,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("ensureBranchGroupForSource reuses existing group for same branch", async () => {
-    ctx = await setupCtx();
     const g1 = await ensureBranchGroupForSource(
       ctx.layer.db,
       "mission",
@@ -482,7 +488,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("PR entities round-trip (ensure + update + list active)", async () => {
-    ctx = await setupCtx();
     const created = await ensurePrEntityForSource(ctx.layer.db, {
       sourceType: "task",
       sourceId: "task-1",
@@ -521,7 +526,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("PR thread outcomes round-trip (record + read)", async () => {
-    ctx = await setupCtx();
     const pr = await ensurePrEntityForSource(ctx.layer.db, {
       sourceType: "task",
       sourceId: "task-thread",
@@ -539,7 +543,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   // ── Workflow work-items ──
 
   it("workflow work items round-trip (upsert + transition + terminal guard)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-WF"), { lineageId: null });
 
     const item = await upsertWorkflowWorkItem(ctx.layer, {
@@ -556,18 +559,18 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     const running = await transitionWorkflowWorkItem(ctx.layer, item.id, "running");
     expect(running.state).toBe("running");
 
-    // Transition to 'completed' (terminal).
-    const completed = await transitionWorkflowWorkItem(ctx.layer, item.id, "completed");
-    expect(completed.state).toBe("completed");
+    // Transition to 'succeeded' (terminal). #2378 renamed the terminal
+    // completion state from 'completed' to 'succeeded' (WORKFLOW_WORK_ITEM_STATES).
+    const completed = await transitionWorkflowWorkItem(ctx.layer, item.id, "succeeded");
+    expect(completed.state).toBe("succeeded");
 
-    // Terminal guard: cannot requeue a completed item.
+    // Terminal guard: cannot requeue a succeeded item.
     await expect(
       transitionWorkflowWorkItem(ctx.layer, item.id, "runnable"),
     ).rejects.toThrow(/terminal/);
   });
 
   it("workflow work item upsert is idempotent on composite key", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-WF-IDEM"), { lineageId: null });
 
     const item1 = await upsertWorkflowWorkItem(ctx.layer, {
@@ -589,7 +592,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("completion handoff markers round-trip (record + read)", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-HANDOFF"), { lineageId: null });
 
     await recordCompletionHandoff(ctx.layer.db, "KB-HANDOFF", "engine");
@@ -598,7 +600,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("listDueWorkflowWorkItems returns items with expired/null leases", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-DUE"), { lineageId: null });
 
     await upsertWorkflowWorkItem(ctx.layer, {
@@ -616,7 +617,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   // ── Goal citations / usage events / plugin activations ──
 
   it("goal citations dedup on (goalId, surface, sourceRef)", async () => {
-    ctx = await setupCtx();
     const inserted1 = await recordGoalCitations(ctx.layer.db, [
       { goalId: "g1", agentId: "a1", surface: "task_document", sourceRef: "doc:1", snippet: "cite 1" },
     ]);
@@ -639,7 +639,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("usage events round-trip (emit + query)", async () => {
-    ctx = await setupCtx();
     const inserted = await emitUsageEvent(ctx.layer.db, ctx.layer.projectId ?? "", {
       kind: "tool_call",
       taskId: "KB-USAGE",
@@ -657,7 +656,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("usage events fail-soft on unknown kind", async () => {
-    ctx = await setupCtx();
     const inserted = await emitUsageEvent(ctx.layer.db, ctx.layer.projectId ?? "", {
       // @ts-expect-error — intentionally invalid kind
       kind: "bogus_kind",
@@ -666,7 +664,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("plugin activations round-trip (record)", async () => {
-    ctx = await setupCtx();
     const activation = await recordPluginActivation(ctx.layer.db, {
       pluginId: "roadmap",
       source: "npm",
@@ -679,7 +676,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   // ── Archive snapshots ──
 
   it("archived task snapshots round-trip (upsert + find + list + filter)", async () => {
-    ctx = await setupCtx();
     const entry = {
       id: "KB-ARCH-SNAP",
       lineageId: "lineage-1",
@@ -702,6 +698,10 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     const filtered = await filterArchivedTaskEntries(ctx.layer.db, ["KB-ARCH-SNAP", "KB-MISSING"]);
     expect(filtered.has("KB-ARCH-SNAP")).toBe(true);
     expect(filtered.has("KB-MISSING")).toBe(false);
+
+    // FNXC:TaskArchiveRemoval 2026-09-04-18:25:
+    // Historical snapshots remain readable for migration/forensics but must never enter a move path.
+    await expect(h.store().readTaskForMove("KB-ARCH-SNAP")).rejects.toThrow("Task KB-ARCH-SNAP not found");
   });
 
   // ── Search query structure ──
@@ -714,7 +714,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("searchTasksLike finds tasks by token and respects soft-delete", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(
       ctx.layer,
       { ...makeMinimalTask("KB-SEARCH-1"), title: "implement auth" },
@@ -740,7 +739,6 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
   });
 
   it("searchTasksLike returns empty for empty queries", async () => {
-    ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-EMPTY"), { lineageId: null });
 
     const results = await searchTasksLike(ctx.layer.db, "");

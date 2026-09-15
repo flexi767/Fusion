@@ -24,12 +24,15 @@ import {
   COLUMN_LABELS,
   type Column,
   countRunningAgentTasks,
+  enrichRunningAgentTaskShape,
+  resolveWorkflowIrForTask,
   readProjectIdentity,
   writeProjectIdentity,
 } from "@fusion/core";
 import { resolve, isAbsolute, relative, basename, join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { promptOutputStream } from "../output.js";
 import { detectProjectFromCwd, setDefaultProject } from "../project-context.js";
 import { maybeInstallClaudeSkillForNewProject } from "./claude-skills-runner.js";
 import { retryOnLock } from "../lock-retry.js";
@@ -102,6 +105,25 @@ function formatDisplayPath(projectPath: string): string {
   return basename(projectPath) || ".";
 }
 
+/*
+FNXC:IntegrationBranchReadiness 2026-08-24-00:57:
+FN-183 keeps `fn project add` transparent about the shared registration result. Only a root
+single-repository entry has one project-level branch to report; a workspace's member entries are
+intentionally not flattened into misleading root output, and unavailable actions stay visible.
+*/
+function logIntegrationBranchReconciliation(integrationBranches: unknown): void {
+  if (!Array.isArray(integrationBranches) || integrationBranches.length !== 1) return;
+  const [entry] = integrationBranches as Array<{ repoRelPath?: unknown; branch?: unknown; action?: unknown }>;
+  if (
+    entry?.repoRelPath !== "."
+    || typeof entry.branch !== "string"
+    || entry.branch.trim().length === 0
+    || typeof entry.action !== "string"
+    || entry.action.trim().length === 0
+  ) return;
+  console.log(`    ✓ Integration branch: ${entry.branch} (${entry.action})`);
+}
+
 /**
  * Format a timestamp for display (relative or absolute).
  */
@@ -162,7 +184,23 @@ async function getTaskCounts(projectPath: string): Promise<TaskCountSummary> {
     for (const task of tasks) {
       counts[task.column] = (counts[task.column] || 0) + 1;
     }
-    return { byColumn: counts, runningAgentCount: countRunningAgentTasks(tasks) };
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-12:20 (Phase B conversion — CLI project counts):
+    ENRICH before counting. `isRunningAgentTask` reads trait-derived fields and falls back to
+    the legacy `in-progress` / `in-review` literals when they are absent — so counting raw
+    rows reported ZERO running agents for a board whose wip column is renamed, in `fn project`
+    output an operator reads to decide whether the board is busy.
+
+    The dashboard's `project-store-resolver` already enriches for exactly this reason
+    (FN-8453). This was the remaining unenriched caller: same helper, same pure predicate, one
+    of two call sites doing it correctly. The `irCache` keeps it one IR read per workflow
+    rather than per task.
+    */
+    const irCache = new Map<string, Awaited<ReturnType<typeof resolveWorkflowIrForTask>>>();
+    const enriched = await Promise.all(tasks.map(async (task) =>
+      enrichRunningAgentTaskShape(task, await resolveWorkflowIrForTask(resolvedStore, task.id, irCache)),
+    ));
+    return { byColumn: counts, runningAgentCount: countRunningAgentTasks(enriched) };
   } catch {
     // Return empty counts if we can't read the project (not-found, corrupt
     // store, or lock-retry exhaustion — all fail soft here by design).
@@ -313,7 +351,8 @@ export async function runProjectAdd(
 
     // Interactive mode if name or path not provided
     if (!projectName || !projectPath || options.interactive) {
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
 
       // Get path if not provided
       if (!projectPath) {
@@ -462,6 +501,7 @@ export async function runProjectAdd(
     if (ensured.gitRepository === "initialized") {
       console.log(`    Git: initialized`);
     }
+    logIntegrationBranchReconciliation(ensured.integrationBranches);
     if (memoryInitialized) {
       console.log(`    Memory: initialized`);
     }
@@ -494,7 +534,7 @@ export async function runProjectRemove(name: string, options: ProjectRemoveOptio
     }
 
     if (!options.force) {
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
       const answer = await rl.question(`Unregister project '${project.name}'? [y/N] `);
       rl.close();
 

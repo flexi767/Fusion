@@ -4,9 +4,9 @@ import { dirname, join } from "node:path";
 import { DefaultResourceLoader, type Skill } from "@earendil-works/pi-coding-agent";
 import type { AgentStore } from "@fusion/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildSessionSkillContext } from "../session-skill-context.js";
-import { createSkillsOverrideFromSelection, resolveSessionSkills } from "../skill-resolver.js";
-import type { PluginRunner } from "../plugin-runner.js";
+import { buildSessionSkillContext } from "../cli-runtime/session-skill-context.js";
+import { createSkillsOverrideFromSelection, resolveSessionSkills } from "../cli-runtime/skill-resolver.js";
+import type { PluginRunner } from "../plugins/plugin-runner.js";
 
 const tempDirs: string[] = [];
 
@@ -50,12 +50,15 @@ describe("plugin skill body delivery", () => {
     const selection = resolveSessionSkills({
       projectRootDir,
       requestedSkillNames: context.skillSelectionContext?.requestedSkillNames,
+      forcedSkillNames: ["plugin-plan"],
       sessionPurpose: "executor",
     });
-    const skillsOverride = createSkillsOverrideFromSelection(selection, {
+    const rawOverride = createSkillsOverrideFromSelection(selection, {
       requestedSkillNames: context.skillSelectionContext?.requestedSkillNames,
+      forcedSkillNames: ["plugin-plan"],
       sessionPurpose: "executor",
     });
+    const skillsOverride = (base: { skills: Skill[]; diagnostics: [] }) => rawOverride(base);
 
     const loader = new DefaultResourceLoader({
       cwd: projectRootDir,
@@ -71,5 +74,8 @@ describe("plugin skill body delivery", () => {
     const pluginSkill = skills.find((skill) => skill.name === "plugin-plan");
     expect(pluginSkill?.filePath).toBe(join(skillDir, "SKILL.md"));
     await expect(readFile(pluginSkill!.filePath, "utf-8")).resolves.toContain("Distinctive body delivered by plugin additionalSkillPaths.");
+    const resolved = rawOverride({ skills, diagnostics: [] });
+    expect(resolved.resolvedForcedSkills).toEqual([{ requestedName: "plugin-plan", skillName: "plugin-plan" }]);
+    expect(resolved.unresolvedForcedSkills).toEqual([]);
   });
 });

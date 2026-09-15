@@ -11,8 +11,8 @@
  * project's tasks through any binding primitive.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
-import { AgentStore } from "../agent-store.js";
-import { AgentTaskRoutingPolicyError } from "../agent-role-policy.js";
+import { AgentStore } from "../agents/agent-store.js";
+import { AgentTaskRoutingPolicyError } from "../agents/agent-role-policy.js";
 import {
   pgDescribe,
   createSharedPgTaskStoreTestHarness,
@@ -23,8 +23,12 @@ import {
 const pgTest = pgDescribe;
 
 pgTest("task→agent routing policy (issue #2015)", () => {
+  // FNXC:WorkflowAgentRouting 2026-08-07-18:40: bind a real projectId so FN-8764 built-in
+  // workflow-owner provisioning in AgentStore.init() has a partition. The cross-project
+  // isolation case below uses a DISTINCT projectId so the two stores are genuinely separate.
   const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_agent_routing",
+    projectId: "proj_agent_routing",
   });
 
   beforeAll(h.beforeAll);
@@ -224,6 +228,22 @@ pgTest("task→agent routing policy (issue #2015)", () => {
   });
 
   describe("selectNextTaskForAgent bind compatibility", () => {
+    it("does not select a remembered-owner todo task when only userPaused remains true", async () => {
+      const executor = await agentStore.createAgent({ name: "Exec", role: "executor" });
+      const task = await h.store().createTask({ description: "manually parked work" });
+      await h.store().updateTask(task.id, { assignedAgentId: executor.id });
+      await h.store().moveTask(task.id, "todo");
+      await h.store().moveTask(task.id, "in-progress");
+      await h.store().moveTask(task.id, "todo", { moveSource: "user" });
+
+      const parked = await h.store().getTask(task.id);
+      expect(parked).toMatchObject({ assignedAgentId: executor.id, userPaused: true });
+      expect(parked?.paused).not.toBe(true);
+      await expect(
+        h.store().selectNextTaskForAgent(executor.id, { id: executor.id, role: executor.role }),
+      ).resolves.toBeNull();
+    });
+
     it("does not re-select a mis-bound in-progress implementation task for a role-incompatible agent", async () => {
       const liaison = await agentStore.createAgent({ name: "Liaison", role: "custom" });
       const task = await h.store().createTask({ description: "mis-bound work" });
@@ -282,7 +302,7 @@ pgTest("task→agent routing policy (issue #2015)", () => {
 
   describe("project isolation", () => {
     it("an agent registered in another project's store can never be bound to this project's tasks", async () => {
-      const otherHarness = await createTaskStoreForTest({ prefix: "fusion_agent_routing_other" });
+      const otherHarness = await createTaskStoreForTest({ prefix: "fusion_agent_routing_other", projectId: "proj_agent_routing_other" });
       const otherAgentStore = new AgentStore({ rootDir: otherHarness.rootDir, asyncLayer: otherHarness.layer, taskStore: otherHarness.store });
       await otherAgentStore.init();
 

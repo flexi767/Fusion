@@ -1,14 +1,19 @@
+import { ModalCloseButton } from "./ModalCloseButton";
+import { ViewHeader } from "./ViewHeader";
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewLayout } from "./ViewLayout";
 import "./MailboxModal.css";
+import { FloatingWindow } from "./FloatingWindow";
 import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import {
-  X,
   Mail,
   Send,
   Inbox as InboxIcon,
   Bot,
   Trash2,
+  Archive,
   CheckCheck,
   Loader2,
   RefreshCw,
@@ -26,6 +31,8 @@ import {
   fetchAllAgentMailbox,
   markMessageRead,
   markAllMessagesRead,
+  archiveMessage,
+  unarchiveMessage,
   deleteMessage,
   fetchConversation,
   fetchMessage,
@@ -40,6 +47,9 @@ import { MailboxArtifactAttachment } from "./MailboxArtifactAttachment";
 import { MailboxRelatedWorkLink, hasRelatedTaskLink } from "./MailboxRelatedWorkLink";
 import { MailboxNativeStructureEmbeds } from "./MailboxNativeStructureEmbeds";
 import { MailboxTaskProposal } from "./MailboxTaskProposal";
+import { MailboxTaskCompletion, isTaskCompletionNotice } from "./MailboxTaskCompletion";
+import { MailboxTaskRecommendations } from "./MailboxTaskRecommendations";
+import { MailboxKindBadge, MailboxStructuralItem, isStructuralMail } from "./MailboxStructuralItem";
 import type { Agent } from "../api";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
@@ -50,7 +60,20 @@ import { getRelativeTimeBucket } from "../utils/relativeTimeAgo";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-type MailboxTab = "inbox" | "outbox" | "agents";
+type MailboxTab = "inbox" | "completions" | "outbox" | "archived" | "agents";
+
+/*
+FNXC:LifecycleColumnCensus 2026-08-13-21:58:
+DELIBERATE-LITERAL — mailbox folder tab, not a board column.
+
+FN-9014 named a folder `archived`. The tab comparison is that folder switch. Converting it to
+resolveLifecycleColumns would ask a workflow which lane a mailbox folder is in. Keep the
+comparison inside this helper so a real board guard that happens to use the name `activeTab`
+still counts in the census.
+*/
+function isMailboxArchivedTab(tab: MailboxTab): boolean {
+  return tab === "archived";
+}
 
 const ALL_AGENTS_MAILBOX_ID = "__all_agents__";
 
@@ -170,6 +193,109 @@ function buildReplyThread(messages: Message[], selectedMessage: Message): Messag
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 }
 
+/*
+FNXC:Mailbox 2026-07-26-20:10:
+Reply-context rows MUST stay a module-scope component, never one declared inside MailboxModal's render.
+A component declared in render is a fresh element type on every render, so React unmounts and remounts the
+whole recursive reply thread on each parent update — expanded rows lose their DOM identity, in-flight focus
+and scroll position are discarded, and every nested level re-mounts on unrelated mailbox state changes.
+The parent's reply state and handlers arrive through `env` so the element type stays stable.
+(Same defect class as FN-8606's Planning/Settings ModalShell, which made those surfaces untypable.)
+*/
+interface ReplyContextEnv {
+  replyContextCache: ReadonlyMap<string, Message>;
+  replyContextExpanded: Record<string, boolean>;
+  replyContextLoading: Record<string, boolean>;
+  replyContextErrors: Record<string, string>;
+  setReplyExpanded: (key: string, isExpanded: boolean) => void;
+  loadReplyMessage: (messageId: string) => Promise<Message | null>;
+  agentNamesById: ReadonlyMap<string, string>;
+  t: TFunction<"app">;
+}
+
+function ReplyContextExpandable({
+  ownerMessageId,
+  replyToId,
+  initialMessage,
+  ancestorIds,
+  testId,
+  env,
+}: {
+  ownerMessageId: string;
+  replyToId: string;
+  initialMessage?: Message;
+  ancestorIds: Set<string>;
+  testId?: string;
+  env: ReplyContextEnv;
+}) {
+  const { replyContextCache, replyContextExpanded, replyContextLoading, replyContextErrors, setReplyExpanded, loadReplyMessage, agentNamesById, t } = env;
+  const cacheMessage = replyContextCache.get(replyToId) ?? initialMessage;
+  const rowKey = `${ownerMessageId}-${replyToId}`;
+  const isExpanded = Boolean(replyContextExpanded[rowKey]);
+  const isLoadingReply = Boolean(replyContextLoading[replyToId]);
+  const errorMessage = replyContextErrors[replyToId];
+  const hasCycle = ancestorIds.has(replyToId);
+
+  const handleToggle = async () => {
+    if (isExpanded) {
+      setReplyExpanded(rowKey, false);
+      return;
+    }
+    setReplyExpanded(rowKey, true);
+    if (!cacheMessage && !hasCycle) {
+      await loadReplyMessage(replyToId);
+    }
+  };
+
+  const nextAncestorIds = new Set(ancestorIds);
+  nextAncestorIds.add(replyToId);
+
+  return (
+    <div className="mailbox-reply-context-wrapper">
+      <button
+        type="button"
+        className="mailbox-reply-context"
+        onClick={() => {
+          void handleToggle();
+        }}
+        aria-expanded={isExpanded}
+        data-testid={testId}
+      >
+        <span className="mailbox-reply-context__chevron" aria-hidden="true">
+          {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </span>
+        <span>
+          ↪ {t("mailbox.replyingTo", "Replying to {{preview}}", { preview: cacheMessage ? messagePreview(cacheMessage.content, 60) : `message ${replyToId}` })}
+        </span>
+        {isLoadingReply && <Loader2 size={14} className="spin" />}
+      </button>
+
+      {isExpanded && (
+        <div className="mailbox-reply-context__nested" data-testid={`mailbox-reply-expanded-${replyToId}`}>
+          {errorMessage && <div className="mailbox-reply-context__error">{errorMessage}</div>}
+          {cacheMessage && (
+            <>
+              <div className="mailbox-conversation-msg-header">
+                <span>{participantLabel(cacheMessage.fromId, cacheMessage.fromType, agentNamesById, t)}</span>
+                <span className="mailbox-message-time">{formatTimestamp(cacheMessage.createdAt, t)}</span>
+              </div>
+              <div className="mailbox-conversation-msg-body">{cacheMessage.content}</div>
+              {cacheMessage.metadata?.replyTo?.messageId && !nextAncestorIds.has(cacheMessage.metadata.replyTo.messageId) && (
+                <ReplyContextExpandable
+                  ownerMessageId={cacheMessage.id}
+                  replyToId={cacheMessage.metadata.replyTo.messageId}
+                  ancestorIds={nextAncestorIds}
+                  env={env}
+                />
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Component ─────────────────────────────────────────────────────────────
 
 export function MailboxModal({
@@ -195,10 +321,13 @@ export function MailboxModal({
   useMobileScrollLock(isOpen);
   const [activeTab, setActiveTab] = useState<MailboxTab>("inbox");
   const [inbox, setInbox] = useState<InboxResponse | null>(() => initialInbox ?? null);
+  const [structuralFilter, setStructuralFilter] = useState<"all" | "structural">("all");
   const [outbox, setOutbox] = useState<OutboxResponse | null>(() => initialOutbox ?? null);
+  const [archivedInbox, setArchivedInbox] = useState<InboxResponse | null>(null);
   const [unreadCount, setUnreadCount] = useState(initialUnreadCount ?? 0);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedMessage, setSelectedMessage] = useState<Message | null>(null);
+  const [pendingDeleteMessageId, setPendingDeleteMessageId] = useState<string | null>(null);
   const [conversationMessages, setConversationMessages] = useState<Message[]>([]);
   const [showComposer, setShowComposer] = useState(false);
   const [composeRecipient, setComposeRecipient] = useState<{ id: string; type: ParticipantType } | null>(null);
@@ -213,6 +342,14 @@ export function MailboxModal({
   const [replyContextCache, setReplyContextCache] = useState<Map<string, Message>>(new Map());
   const consumedDeepLinkedMessageIdRef = useRef<string | null>(null);
   const highlightedDeepLinkedMessageIdRef = useRef<string | null>(null);
+  const renderedProjectIdRef = useRef(projectId);
+  const inboxRequestGenerationRef = useRef(0);
+  renderedProjectIdRef.current = projectId;
+
+  /*
+  FNXC:MailboxProjectIsolation 2026-09-09-20:58:
+  The floating Mailbox shares the project-isolation contract of MailboxView. Only the latest Inbox request for the currently rendered project may publish rows, unread state, or project-keyed cache entries.
+  */
 
   /*
    * FNXC:MailboxMobile 2026-06-23-10:55:
@@ -256,14 +393,25 @@ export function MailboxModal({
 
   // ── Data fetching ─────────────────────────────────────────────────────
 
+  /*
+  FNXC:InboxCategories 2026-09-09-20:02:
+  The legacy floating mailbox inherits the main MailboxView's complete-notification contract. Its active Inbox and read-all action therefore operate across every category while archived history keeps its existing combined-source restore behavior.
+  */
   const loadInbox = useCallback(async () => {
+    const requestProjectId = projectId;
+    const requestGeneration = ++inboxRequestGenerationRef.current;
+    const isCurrentRequest = () => (
+      renderedProjectIdRef.current === requestProjectId
+      && inboxRequestGenerationRef.current === requestGeneration
+    );
     const shouldSkipOpenSpinner = skipOpenSpinnerInboxRef.current;
     if (!shouldSkipOpenSpinner) {
       setIsLoading(true);
     }
     skipOpenSpinnerInboxRef.current = false;
     try {
-      const data = await fetchInbox({ limit: 50 }, projectId);
+      const data = await fetchInbox({ limit: 50 }, requestProjectId);
+      if (!isCurrentRequest()) return;
       setInbox(data);
       setUnreadCount(data.unreadCount);
       writeCache(
@@ -275,9 +423,30 @@ export function MailboxModal({
     } catch {
       // Silently fail — empty state will show
     } finally {
-      setIsLoading(false);
+      if (isCurrentRequest()) {
+        setIsLoading(false);
+      }
     }
   }, [inboxCacheKey, projectId, unreadCountCacheKey]);
+
+  const loadArchivedInbox = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      /*
+      FNXC:MessageArchive 2026-08-12-22:38:
+      Archived mail must remain restorable regardless of whether it originated in the inbox, outbox, or an agent mailbox.
+      Deduplicate the combined source results because aggregate agent queries can overlap a participant-specific response.
+      */
+      const [inbox, outbox, agentMailbox] = await Promise.all([
+        fetchInbox({ limit: 50, archived: true }, projectId),
+        fetchOutbox({ limit: 50, archived: true }, projectId),
+        fetchAllAgentMailbox(projectId, { archived: true }),
+      ]);
+      const messages = [...inbox.messages, ...outbox.messages, ...agentMailbox.messages]
+        .filter((message, index, all) => all.findIndex(({ id }) => id === message.id) === index);
+      setArchivedInbox({ messages, total: messages.length, unreadCount: 0 });
+    } finally { setIsLoading(false); }
+  }, [projectId]);
 
   const loadOutbox = useCallback(async () => {
     const shouldSkipOpenSpinner = skipOpenSpinnerOutboxRef.current;
@@ -327,8 +496,9 @@ export function MailboxModal({
   const refreshUnreadCount = useCallback(async () => {
     try {
       const data = await fetchUnreadCount(projectId);
-      setUnreadCount(data.unreadCount);
-      writeCache(unreadCountCacheKey, data.unreadCount, { maxBytes: 500_000 });
+      const messageUnreadCount = data.categoryUnreadCounts?.message ?? data.unreadCount;
+      setUnreadCount(messageUnreadCount);
+      writeCache(unreadCountCacheKey, messageUnreadCount, { maxBytes: 500_000 });
     } catch {
       // Silently fail
     }
@@ -356,9 +526,10 @@ export function MailboxModal({
   // Load data on tab change
   useEffect(() => {
     if (!isOpen) return;
-    if (activeTab === "inbox") loadInbox();
+    if (activeTab === "inbox" || activeTab === "completions") loadInbox();
     else if (activeTab === "outbox") loadOutbox();
-  }, [isOpen, activeTab, loadInbox, loadOutbox]);
+    else if (isMailboxArchivedTab(activeTab)) loadArchivedInbox();
+  }, [isOpen, activeTab, loadInbox, loadOutbox, loadArchivedInbox]);
 
   // Load agent mailbox when selected
   useEffect(() => {
@@ -385,7 +556,7 @@ export function MailboxModal({
 
     const onMailboxUpdate = () => {
       void refreshUnreadCount();
-      if (activeTab === "inbox") {
+      if (activeTab === "inbox" || activeTab === "completions") {
         void loadInbox();
       } else if (activeTab === "outbox") {
         void loadOutbox();
@@ -398,7 +569,17 @@ export function MailboxModal({
       }
     };
 
+    /*
+    FNXC:MailboxModal 2026-07-26-16:20:
+    Resync contract (see SseSubscription in sse-bus.ts). The modal's message lists and unread count are
+    mutated ONLY by these events, and the stream is lossy: an error/heartbeat reconnect or the >=60s
+    hidden-tab suspend drops the socket and /api/events keeps no replay buffer. Without onReconnect a
+    message sent while the phone was backgrounded never appears and the unread badge under-counts until
+    the operator manually switches tabs. `onMailboxUpdate` is the same authoritative reload the events
+    already trigger, so reusing it needs no new endpoint.
+    */
     return subscribeSse(`/api/events${query}`, {
+      onReconnect: onMailboxUpdate,
       events: {
         "message:sent": onMailboxUpdate,
         "message:received": onMailboxUpdate,
@@ -414,6 +595,14 @@ export function MailboxModal({
   const handleOpenMessage = useCallback(async (message: Message, source: "deep-link" | "user" = "user") => {
     if (source === "user") {
       consumeCurrentDeepLink();
+    }
+    /*
+    FNXC:StructuralMail 2026-08-09-09:57:
+    Deep links read the full inbox, so an ordinary target clears the structural segment rather than
+    leaving the selected detail disconnected from an empty filtered list.
+    */
+    if (source === "deep-link" && activeTab === "inbox" && !isStructuralMail(message.metadata)) {
+      setStructuralFilter("all");
     }
     setSelectedMessage(message);
     setReplyContextExpanded({});
@@ -545,8 +734,28 @@ export function MailboxModal({
     }
   }, [addToast, inboxCacheKey, projectId, unreadCountCacheKey, t]);
 
+  /* FNXC:MessageArchive 2026-08-12-22:14: Archive is the default removal action; deletion is explicit and destructive. */
+  const handleArchiveMessage = useCallback(async (id: string) => {
+    try {
+      await archiveMessage(id, projectId);
+      handleCloseMessage();
+      if (activeTab === "inbox") loadInbox();
+      else if (activeTab === "outbox") loadOutbox();
+      else if (isMailboxArchivedTab(activeTab)) loadArchivedInbox();
+      else if (selectedAgentId === ALL_AGENTS_MAILBOX_ID) loadAllAgentsMailbox();
+      else if (selectedAgentId) loadAgentMailbox(selectedAgentId);
+      void refreshUnreadCount();
+      addToast?.("Message archived", "success");
+    } catch { addToast?.("Failed to archive message", "error"); }
+  }, [projectId, activeTab, selectedAgentId, loadInbox, loadOutbox, loadArchivedInbox, loadAgentMailbox, loadAllAgentsMailbox, refreshUnreadCount, addToast, handleCloseMessage]);
+  const handleUnarchiveMessage = useCallback(async (id: string) => {
+    try { await unarchiveMessage(id, projectId); handleCloseMessage(); loadArchivedInbox(); void refreshUnreadCount(); addToast?.("Message restored", "success"); }
+    catch { addToast?.("Failed to restore message", "error"); }
+  }, [projectId, loadArchivedInbox, refreshUnreadCount, addToast, handleCloseMessage]);
+
   const handleDeleteMessage = useCallback(async (id: string) => {
     consumeCurrentDeepLink();
+    setPendingDeleteMessageId(null);
     try {
       await deleteMessage(id, projectId);
       setSelectedMessage(null);
@@ -635,119 +844,118 @@ export function MailboxModal({
 
   if (!isOpen) return null;
 
-  const ReplyContextExpandable = ({
-    ownerMessageId,
-    replyToId,
-    initialMessage,
-    ancestorIds,
-    testId,
-  }: {
-    ownerMessageId: string;
-    replyToId: string;
-    initialMessage?: Message;
-    ancestorIds: Set<string>;
-    testId?: string;
-  }) => {
-    const cacheMessage = replyContextCache.get(replyToId) ?? initialMessage;
-    const rowKey = `${ownerMessageId}-${replyToId}`;
-    const isExpanded = Boolean(replyContextExpanded[rowKey]);
-    const isLoadingReply = Boolean(replyContextLoading[replyToId]);
-    const errorMessage = replyContextErrors[replyToId];
-    const hasCycle = ancestorIds.has(replyToId);
-
-    const handleToggle = async () => {
-      if (isExpanded) {
-        setReplyExpanded(rowKey, false);
-        return;
-      }
-      setReplyExpanded(rowKey, true);
-      if (!cacheMessage && !hasCycle) {
-        await loadReplyMessage(replyToId);
-      }
-    };
-
-    const nextAncestorIds = new Set(ancestorIds);
-    nextAncestorIds.add(replyToId);
-
-    return (
-      <div className="mailbox-reply-context-wrapper">
-        <button
-          type="button"
-          className="mailbox-reply-context"
-          onClick={() => {
-            void handleToggle();
-          }}
-          aria-expanded={isExpanded}
-          data-testid={testId}
-        >
-          <span className="mailbox-reply-context__chevron" aria-hidden="true">
-            {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          </span>
-          <span>
-            ↪ {t("mailbox.replyingTo", "Replying to {{preview}}", { preview: cacheMessage ? messagePreview(cacheMessage.content, 60) : `message ${replyToId}` })}
-          </span>
-          {isLoadingReply && <Loader2 size={14} className="spin" />}
-        </button>
-
-        {isExpanded && (
-          <div className="mailbox-reply-context__nested" data-testid={`mailbox-reply-expanded-${replyToId}`}>
-            {errorMessage && <div className="mailbox-reply-context__error">{errorMessage}</div>}
-            {cacheMessage && (
-              <>
-                <div className="mailbox-conversation-msg-header">
-                  <span>{participantLabel(cacheMessage.fromId, cacheMessage.fromType, agentNamesById, t)}</span>
-                  <span className="mailbox-message-time">{formatTimestamp(cacheMessage.createdAt, t)}</span>
-                </div>
-                <div className="mailbox-conversation-msg-body">{cacheMessage.content}</div>
-                {cacheMessage.metadata?.replyTo?.messageId && !nextAncestorIds.has(cacheMessage.metadata.replyTo.messageId) && (
-                  <ReplyContextExpandable
-                    ownerMessageId={cacheMessage.id}
-                    replyToId={cacheMessage.metadata.replyTo.messageId}
-                    ancestorIds={nextAncestorIds}
-                  />
-                )}
-              </>
-            )}
-          </div>
-        )}
-      </div>
-    );
+  /*
+  FNXC:Mailbox 2026-07-26-20:10:
+  The reply-context environment is assembled once per render and handed to the module-scope
+  ReplyContextExpandable below, which owns the recursive thread rendering.
+  */
+  const replyContextEnv: ReplyContextEnv = {
+    replyContextCache,
+    replyContextExpanded,
+    replyContextLoading,
+    replyContextErrors,
+    setReplyExpanded,
+    loadReplyMessage,
+    agentNamesById,
+    t,
   };
+
+  const filteredInboxMessages = useMemo(() => structuralFilter === "structural" ? (inbox?.messages.filter((message) => isStructuralMail(message.metadata)) ?? []) : (inbox?.messages ?? []), [inbox, structuralFilter]);
 
   // ── Render ────────────────────────────────────────────────────────────
 
   return (
-    <div
-      className="modal-overlay open"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-      role="dialog"
-      aria-modal="true"
-      data-testid="mailbox-modal-overlay"
-    >
-      <div className="modal modal-lg mailbox-modal" style={containerKeyboardStyle} data-testid="mailbox-modal">
-        {/* Header */}
-        <div className="modal-header mailbox-header">
-          <div className="mailbox-title">
+    <FloatingWindow windowKey="mailbox" title={t("mailbox.title", "Mailbox")} ariaLabel={t("mailbox.title", "Mailbox")} onClose={onClose} hideHeader dragHandleSelector=".mailbox-modal .modal-header" className="floating-window--mailbox" defaultSize={{ width: 860, height: 680 }} minSize={{ width: 480, height: 360 }} persistGeometryKey="floating-window:mailbox" suspendGeometryPersistenceOnMobile suspendGeometryPersistenceOnShortViewport closeOnOutsidePointerDown modal testId="mailbox-modal-overlay">
+      {/* FNXC:ModalTouchGeometry 2026-07-26-16:22: Mailbox is a long-lived workspace; preserve outside dismissal and keep keyboard positioning inside the hosted panel. */}
+      <ViewLayout className="modal modal-lg mailbox-modal" style={containerKeyboardStyle} data-testid="mailbox-modal" contentOwnsScroll header={<>
+        {/* FNXC:StandardizedMailboxLayout 2026-09-13-16:55: The floating mailbox shares the same header action and detail-return primitives as the full destination; its long-lived controller and compose draft remain mounted in this host. */}
+        <ViewHeader
+          className="modal-header mailbox-header"
+          backAction={showComposer
+            ? { label: t("actions.cancel", "Cancel"), onClick: handleComposeCancel, "data-testid": "mailbox-back-to-list" }
+            : selectedMessage
+              ? { label: t("mailbox.backButton", "Back"), onClick: handleCloseMessage, "data-testid": "mailbox-back-to-list" }
+              : undefined}
+          /*
+          FNXC:StandardizedMailboxLayout 2026-09-14-10:24:
+          FN-379 remediation: the floating mailbox hosts the same composer, so its identity and abandon action are
+          carried by this single header instead of a second header row inside the composer body.
+          */
+          title={<div className="mailbox-title">
             <Mail size={18} />
-            <span>{t("mailbox.title", "Mailbox")}</span>
+            <span>{showComposer
+              ? (composeReplyContext ? t("composer.replyTitle", "Reply") : t("composer.newMessageTitle", "New Message"))
+              : t("mailbox.title", "Mailbox")}</span>
             {unreadCount > 0 && (
               <span className="mailbox-unread-badge" data-testid="mailbox-unread-badge">
                 {unreadCount}
               </span>
             )}
-          </div>
-          <div className="mailbox-header-actions">
-            <button
-              className="btn btn-sm btn-primary"
+          </div>}
+          actions={<div className="mailbox-header-actions">
+            {/*
+            FNXC:StandardizedMailboxLayout 2026-09-14-03:31:
+            The floating mailbox is a second full implementation of the same destination, so it carries the same
+            contract: scope controls belong to the header, the rail shows only the resulting collection. The inbox
+            scope filter and the Agents scope picker / Inbox-Outbox tabs move here, and the Agents pane's duplicate
+            Compose button is deleted — this header already owns the single creation action.
+            */}
+            {!showComposer && activeTab === "inbox" && (
+              <div className="mailbox-structural-filter" role="group" aria-label={t("mailbox.inboxFilter", "Inbox filter")}>
+                <button type="button" className="btn btn-sm btn-secondary" aria-pressed={structuralFilter === "all"} data-testid="mailbox-structural-filter-all" onClick={() => setStructuralFilter("all")}>{t("mailbox.all", "All")}</button>
+                <button type="button" className="btn btn-sm btn-secondary" aria-pressed={structuralFilter === "structural"} data-testid="mailbox-structural-filter-structural" onClick={() => setStructuralFilter("structural")}>{t("mailbox.reportsApprovals", "Reports & approvals")}</button>
+              </div>
+            )}
+            {!showComposer && activeTab === "agents" && agents.length > 0 && (
+              <div className="mailbox-agents-header" data-testid="mailbox-agent-scope">
+                <div className="mailbox-agents-dropdown">
+                  <select
+                    className="message-composer-select mailbox-agent-select"
+                    value={selectedAgentId}
+                    onChange={(e) => { consumeCurrentDeepLink(); setSelectedAgentId(e.target.value); setAgentSubTab("inbox"); setSelectedMessage(null); }}
+                    data-testid="mailbox-agent-select"
+                  >
+                    <option value={ALL_AGENTS_MAILBOX_ID}>{t("mailbox.allAgentsOption", "All agents")}</option>
+                    {agents.map((agent) => (
+                      <option key={agent.id} value={agent.id}>
+                        {agent.name || agent.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {selectedAgentId && selectedAgentId !== ALL_AGENTS_MAILBOX_ID && (
+                  <div className="mailbox-agent-subtabs" data-testid="mailbox-agent-subtabs">
+                    <button
+                      className={`btn btn-sm btn-secondary mailbox-agent-subtab ${agentSubTab === "inbox" ? "active" : ""}`}
+                      onClick={() => { consumeCurrentDeepLink(); setAgentSubTab("inbox"); setSelectedMessage(null); }}
+                      data-testid="mailbox-agent-subtab-inbox"
+                    >
+                      <InboxIcon size={12} />
+                      <span>{t("mailbox.inboxTab", "Inbox")}</span>
+                      {agentMailbox && agentMailbox.unreadCount > 0 && (
+                        <span className="mailbox-tab-badge">{agentMailbox.unreadCount}</span>
+                      )}
+                    </button>
+                    <button
+                      className={`btn btn-sm btn-secondary mailbox-agent-subtab ${agentSubTab === "outbox" ? "active" : ""}`}
+                      onClick={() => { consumeCurrentDeepLink(); setAgentSubTab("outbox"); setSelectedMessage(null); }}
+                      data-testid="mailbox-agent-subtab-outbox"
+                    >
+                      <Send size={12} />
+                      <span>{t("mailbox.outboxTab", "Outbox")}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            <ViewActionButton
+              kind="create"
+              icon={MessageSquare}
+              label={t("mailbox.composeButton", "Compose")}
               onClick={handleOpenCompose}
               title={t("mailbox.composeTitle", "Compose message")}
               data-testid="mailbox-header-compose"
-            >
-              <MessageSquare size={14} />
-              <span>{t("mailbox.composeButton", "Compose")}</span>
-            </button>
+            />
             {activeTab === "inbox" && unreadCount > 0 && (
               <button
                 className="btn btn-sm btn-secondary"
@@ -773,17 +981,16 @@ export function MailboxModal({
             >
               {isLoading ? <Loader2 size={14} className="spin" /> : <RefreshCw size={14} />}
             </button>
-            <button
-              className="modal-close"
+            <ModalCloseButton
               onClick={onClose}
               aria-label={t("mailbox.closeAriaLabel", "Close")}
               title={t("mailbox.closeTitle", "Close")}
               data-testid="mailbox-close"
-            >
-              <X size={16} />
-            </button>
-          </div>
-        </div>
+             />
+          </div>}
+        />
+      </>}
+      >
 
         {/* Tabs */}
         <div className="mailbox-tabs" data-testid="mailbox-tabs">
@@ -797,6 +1004,13 @@ export function MailboxModal({
             {unreadCount > 0 && <span className="mailbox-tab-badge">{unreadCount}</span>}
           </button>
           <button
+            className={`btn btn-sm btn-secondary mailbox-tab ${activeTab === "completions" ? "active" : ""}`}
+            onClick={() => { consumeCurrentDeepLink(); setActiveTab("completions"); setSelectedMessage(null); }}
+            data-testid="mailbox-tab-completions"
+          >
+            <span>{t("mailbox.completions", "Completions")}</span>
+          </button>
+          <button
             className={`btn btn-sm btn-secondary mailbox-tab ${activeTab === "outbox" ? "active" : ""}`}
             onClick={() => { consumeCurrentDeepLink(); setActiveTab("outbox"); setSelectedMessage(null); }}
             data-testid="mailbox-tab-outbox"
@@ -804,6 +1018,7 @@ export function MailboxModal({
             <Send size={14} />
             <span>{t("mailbox.outboxTab", "Outbox")}</span>
           </button>
+          <button className={`btn btn-sm btn-secondary mailbox-tab ${isMailboxArchivedTab(activeTab) ? "active" : ""}`} onClick={() => { consumeCurrentDeepLink(); setActiveTab("archived"); setSelectedMessage(null); }} data-testid="mailbox-tab-archived"><Archive size={14} /><span>{t("mailbox.archived", "Archived")}</span></button>
           <button
             className={`btn btn-sm btn-secondary mailbox-tab ${activeTab === "agents" ? "active" : ""}`}
             onClick={() => { consumeCurrentDeepLink(); setActiveTab("agents"); setSelectedMessage(null); }}
@@ -820,15 +1035,9 @@ export function MailboxModal({
           {selectedMessage && !showComposer && (
             <div className="mailbox-message-detail" data-testid="mailbox-message-detail" id={`message-${selectedMessage.id}`}>
               <div className="mailbox-message-detail-header">
-                <button
-                  className="btn btn-sm btn-secondary"
-                  onClick={handleCloseMessage}
-                  data-testid="mailbox-back-to-list"
-                >
-                  {t("mailbox.backButton", "← Back")}
-                </button>
                 <div className="mailbox-message-detail-meta">
                   <span className="mailbox-message-type">{messageTypeLabel(selectedMessage.type, t)}</span>
+                <MailboxKindBadge metadata={selectedMessage.metadata} />
                   <span className="mailbox-message-time">{formatTimestamp(selectedMessage.createdAt, t)}</span>
                 </div>
                 <div className="mailbox-message-detail-actions">
@@ -842,14 +1051,16 @@ export function MailboxModal({
                       <span>{t("mailbox.replyButton", "Reply")}</span>
                     </button>
                   )}
-                  <button
-                    className="btn btn-sm btn-secondary"
-                    onClick={() => handleDeleteMessage(selectedMessage.id)}
-                    data-testid="mailbox-delete"
-                  >
-                    <Trash2 size={14} />
-                    <span>{t("mailbox.deleteButton", "Delete")}</span>
-                  </button>
+                  {selectedMessage.archived ? <button className="btn btn-sm btn-secondary" onClick={() => handleUnarchiveMessage(selectedMessage.id)} data-testid="mailbox-unarchive"><Archive size={14} /><span>{t("mailbox.restore", "Restore")}</span></button> : <button className="btn btn-sm btn-secondary" onClick={() => handleArchiveMessage(selectedMessage.id)} data-testid="mailbox-archive"><Archive size={14} /><span>{t("mailbox.archive", "Archive")}</span></button>}
+                  {pendingDeleteMessageId === selectedMessage.id ? (
+                    <>
+                      {/* FNXC:MessageArchive 2026-08-12-22:51: Deletion requires a second intentional click so archive remains the safe default removal action. */}
+                      <button className="btn btn-sm btn-secondary" onClick={() => void handleDeleteMessage(selectedMessage.id)} data-testid="mailbox-delete-confirm"><Trash2 size={14} /><span>{t("mailbox.confirmDelete", "Confirm delete")}</span></button>
+                      <button className="btn btn-sm btn-secondary" onClick={() => setPendingDeleteMessageId(null)} data-testid="mailbox-delete-cancel"><span>{t("common.cancel", "Cancel")}</span></button>
+                    </>
+                  ) : (
+                    <button className="btn btn-sm btn-secondary" onClick={() => setPendingDeleteMessageId(selectedMessage.id)} data-testid="mailbox-delete"><Trash2 size={14} /><span>{t("mailbox.deleteButton", "Delete")}</span></button>
+                  )}
                 </div>
               </div>
               <div className="mailbox-message-participants">
@@ -896,17 +1107,24 @@ export function MailboxModal({
                             initialMessage={replyToMessage}
                             ancestorIds={new Set([msg.id])}
                             testId={`mailbox-reply-context-${msg.id}`}
+                            env={replyContextEnv}
                           />
                         )}
-                        <MailboxMessageContent
-                          content={msg.content}
-                          className="mailbox-conversation-msg-body"
-                        />
-                        <MailboxRelatedWorkLink
+                        {isTaskCompletionNotice(msg.metadata) ? (
+                          <MailboxTaskCompletion content={msg.content} metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} />
+                        ) : (
+                          <MailboxMessageContent
+                            content={msg.content}
+                            className="mailbox-conversation-msg-body"
+                            onOpenTask={onOpenTask}
+                          />
+                        )}
+                        <MailboxStructuralItem metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} addToast={addToast} onDecided={() => { void loadInbox(); }} />
+                        {!isTaskCompletionNotice(msg.metadata) && <MailboxRelatedWorkLink
                           metadata={msg.metadata}
                           onOpenTask={onOpenTask}
                           onOpenPlanningSession={onOpenPlanningSession}
-                        />
+                        />}
                         <MailboxArtifactAttachment
                           artifactId={msg.metadata?.artifactId}
                           artifactType={msg.metadata?.artifactType}
@@ -919,6 +1137,7 @@ export function MailboxModal({
                         />
                         <MailboxNativeStructureEmbeds message={msg} projectId={projectId} onOpen={onOpenNativeStructure} />
                         <MailboxTaskProposal messageId={msg.id} metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} />
+                        {!isTaskCompletionNotice(msg.metadata) && <MailboxTaskRecommendations metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} />}
                       </div>
                     );
                   })}
@@ -934,18 +1153,25 @@ export function MailboxModal({
                       initialMessage={threadMessages.find((candidate) => candidate.id === selectedMessage.metadata?.replyTo?.messageId)}
                       ancestorIds={new Set([selectedMessage.id])}
                       testId="mailbox-selected-reply-context"
+                      env={replyContextEnv}
                     />
                   )}
-                  <MailboxMessageContent
-                    content={selectedMessage.content}
-                    className="mailbox-message-body"
-                    testId="mailbox-message-body"
-                  />
-                  <MailboxRelatedWorkLink
+                  {isTaskCompletionNotice(selectedMessage.metadata) ? (
+                    <MailboxTaskCompletion content={selectedMessage.content} metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} />
+                  ) : (
+                    <MailboxMessageContent
+                      content={selectedMessage.content}
+                      className="mailbox-message-body"
+                      testId="mailbox-message-body"
+                      onOpenTask={onOpenTask}
+                    />
+                  )}
+                  <MailboxStructuralItem metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} addToast={addToast} onDecided={() => { void loadInbox(); }} />
+                  {!isTaskCompletionNotice(selectedMessage.metadata) && <MailboxRelatedWorkLink
                     metadata={selectedMessage.metadata}
                     onOpenTask={onOpenTask}
                     onOpenPlanningSession={onOpenPlanningSession}
-                  />
+                  />}
                   <MailboxArtifactAttachment
                     artifactId={selectedMessage.metadata?.artifactId}
                     artifactType={selectedMessage.metadata?.artifactType}
@@ -958,6 +1184,7 @@ export function MailboxModal({
                   />
                   <MailboxNativeStructureEmbeds message={selectedMessage} projectId={projectId} onOpen={onOpenNativeStructure} />
                   <MailboxTaskProposal messageId={selectedMessage.id} metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} />
+                  {!isTaskCompletionNotice(selectedMessage.metadata) && <MailboxTaskRecommendations metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} />}
                 </>
               )}
             </div>
@@ -981,6 +1208,18 @@ export function MailboxModal({
           {!selectedMessage && !showComposer && (
             <>
               {/* Inbox Tab */}
+              {isMailboxArchivedTab(activeTab) && (
+                <div className="mailbox-list" data-testid="mailbox-archived-list">
+                  {archivedInbox?.messages.length === 0 && <div className="mailbox-empty" data-testid="mailbox-archived-empty">{t("mailbox.noArchivedMessages", "No archived messages")}</div>}
+                  {archivedInbox?.messages.map((message) => <button type="button" className="mailbox-item" key={message.id} onClick={() => void handleOpenMessage(message)} data-testid={`mailbox-item-${message.id}`}>{message.content}</button>)}
+                </div>
+              )}
+              {activeTab === "completions" && (
+                <div className="mailbox-list" data-testid="mailbox-completions-list">
+                  {inbox?.messages.filter((message) => message.metadata?.kind === "task-completion-notice").map((message) => <button type="button" className={`mailbox-item ${!message.read ? "unread" : ""}`} key={message.id} onClick={() => void handleOpenMessage(message)} data-testid={`mailbox-item-${message.id}`}>{message.content}</button>)}
+                  {inbox && !inbox.messages.some((message) => message.metadata?.kind === "task-completion-notice") && <div className="mailbox-empty" data-testid="mailbox-completions-empty">{t("mailbox.noCompletions", "No task completions yet")}</div>}
+                </div>
+              )}
               {activeTab === "inbox" && (
                 <div className="mailbox-list" data-testid="mailbox-inbox-list">
                   {isLoading && !inbox && <MailboxSkeleton />}
@@ -990,7 +1229,13 @@ export function MailboxModal({
                       <p>{t("mailbox.noInbox", "No messages in your inbox")}</p>
                     </div>
                   )}
-                  {inbox?.messages.map((msg) => (
+                  {inbox && inbox.messages.length > 0 && filteredInboxMessages.length === 0 && (
+                    <div className="mailbox-empty" data-testid="mailbox-structural-filter-empty">
+                      <InboxIcon size={32} />
+                      <p>{t("mailbox.noStructuralMessages", "No reports or approvals in your inbox")}</p>
+                    </div>
+                  )}
+                  {filteredInboxMessages.map((msg) => (
                     <div
                       key={msg.id}
                       id={`message-${msg.id}`}
@@ -1006,6 +1251,7 @@ export function MailboxModal({
                           <span className="mailbox-item-from">
                             {participantLabel(msg.fromId, msg.fromType, agentNamesById, t)}
                           </span>
+                          <MailboxKindBadge metadata={msg.metadata} />
                           <span className="mailbox-item-time">{formatTimestamp(msg.createdAt, t)}</span>
                         </div>
                         <div className="mailbox-item-preview">{msg.content.slice(0, 80)}{msg.content.length > 80 ? "…" : ""}</div>
@@ -1061,56 +1307,11 @@ export function MailboxModal({
                     </div>
                   ) : (
                     <>
-                      <div className="mailbox-agents-header">
-                        <div className="mailbox-agents-dropdown">
-                          <select
-                            className="message-composer-select mailbox-agent-select"
-                            value={selectedAgentId}
-                            onChange={(e) => { consumeCurrentDeepLink(); setSelectedAgentId(e.target.value); setAgentSubTab("inbox"); setSelectedMessage(null); }}
-                            data-testid="mailbox-agent-select"
-                          >
-                            <option value={ALL_AGENTS_MAILBOX_ID}>{t("mailbox.allAgentsOption", "All agents")}</option>
-                            {agents.map((agent) => (
-                              <option key={agent.id} value={agent.id}>
-                                {agent.name || agent.id}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <button
-                          className="btn btn-sm btn-secondary mailbox-compose-btn"
-                          onClick={handleOpenCompose}
-                          data-testid="mailbox-compose-btn"
-                        >
-                          <MessageSquare size={14} />
-                          <span>{t("mailbox.composeButton", "Compose")}</span>
-                        </button>
-                      </div>
-
-                      {/* Agent Sub-Tabs (Inbox/Outbox) */}
-                      {selectedAgentId && selectedAgentId !== ALL_AGENTS_MAILBOX_ID && (
-                        <div className="mailbox-agent-subtabs" data-testid="mailbox-agent-subtabs">
-                          <button
-                            className={`btn btn-sm btn-secondary mailbox-agent-subtab ${agentSubTab === "inbox" ? "active" : ""}`}
-                            onClick={() => { consumeCurrentDeepLink(); setAgentSubTab("inbox"); setSelectedMessage(null); }}
-                            data-testid="mailbox-agent-subtab-inbox"
-                          >
-                            <InboxIcon size={12} />
-                            <span>{t("mailbox.inboxTab", "Inbox")}</span>
-                            {agentMailbox && agentMailbox.unreadCount > 0 && (
-                              <span className="mailbox-tab-badge">{agentMailbox.unreadCount}</span>
-                            )}
-                          </button>
-                          <button
-                            className={`btn btn-sm btn-secondary mailbox-agent-subtab ${agentSubTab === "outbox" ? "active" : ""}`}
-                            onClick={() => { consumeCurrentDeepLink(); setAgentSubTab("outbox"); setSelectedMessage(null); }}
-                            data-testid="mailbox-agent-subtab-outbox"
-                          >
-                            <Send size={12} />
-                            <span>{t("mailbox.outboxTab", "Outbox")}</span>
-                          </button>
-                        </div>
-                      )}
+                      {/*
+                      FNXC:StandardizedMailboxLayout 2026-09-14-03:31:
+                      The agent scope picker, the Inbox/Outbox scope tabs and the duplicate Compose button used to sit
+                      here, inside the collection. They are header-owned now: this pane renders the message list only.
+                      */}
                       <div className="mailbox-agents-content">
                         {selectedAgentId === ALL_AGENTS_MAILBOX_ID && isLoading && !allAgentsMailbox && <MailboxSkeleton />}
                         {selectedAgentId === ALL_AGENTS_MAILBOX_ID && allAgentsMailbox && allAgentsMailbox.messages.length === 0 && (
@@ -1212,8 +1413,8 @@ export function MailboxModal({
           )}
         </div>
 
-      </div>
-    </div>
+      </ViewLayout>
+    </FloatingWindow>
   );
 }
 

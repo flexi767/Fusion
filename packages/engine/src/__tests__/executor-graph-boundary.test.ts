@@ -36,7 +36,52 @@ function benchmarkIr(): WorkflowIr {
   } as WorkflowIr;
 }
 
-function makeExecutor(opts: { selection?: { workflowId: string; stepIds: string[] }; ir?: WorkflowIr; taskColumn?: string }) {
+function foreachIr(): WorkflowIr {
+  return {
+    version: "v2",
+    columns: [{ id: "in-review", name: "In review", traits: [{ trait: "merge" }] }],
+    nodes: [{
+      id: "steps",
+      kind: "foreach",
+      config: {
+        source: "task-steps",
+        template: { nodes: [{ id: "step-execute", kind: "prompt", config: { seam: "step-execute" } }], edges: [] },
+      },
+    }],
+    edges: [],
+  } as WorkflowIr;
+}
+
+function executeIr(): WorkflowIr {
+  return {
+    version: "v2",
+    name: "execute then merge",
+    columns: [
+      { id: "in-progress", name: "In progress", traits: [] },
+      { id: "in-review", name: "In review", traits: [{ trait: "merge" }, { trait: "merge-blocker" }] },
+    ],
+    nodes: [
+      { id: "execute", kind: "prompt", column: "in-progress", config: { seam: "execute" } },
+      { id: "merge", kind: "merge-gate", column: "in-review" },
+    ],
+    edges: [{ from: "execute", to: "merge", condition: "success" }],
+  } as WorkflowIr;
+}
+
+function makeExecutor(opts: {
+  selection?: { workflowId: string; stepIds: string[] };
+  ir?: WorkflowIr;
+  taskColumn?: string;
+  steps?: Array<{ id: string; title: string; status: "pending" | "done" | "skipped" }>;
+  workflowStepResults?: Array<{
+    workflowStepId: string;
+    workflowStepName: string;
+    source: "node";
+    phase: "pre-merge";
+    status: "passed" | "pending";
+    completedAt: string;
+  }>;
+}) {
   const store = createMockStore() as unknown as Record<string, unknown>;
   const liveTask = {
     id: "FN-B1",
@@ -44,7 +89,8 @@ function makeExecutor(opts: { selection?: { workflowId: string; stepIds: string[
     description: "",
     column: opts.taskColumn ?? "in-review",
     dependencies: [],
-    steps: [],
+    steps: opts.steps ?? [],
+    workflowStepResults: opts.workflowStepResults,
     currentStep: 0,
     log: [],
     prompt: "# t",
@@ -108,5 +154,104 @@ describe("U5a — IR-driven merge boundary (scenario 1)", () => {
     );
     const moveTask = store.moveTask as ReturnType<typeof vi.fn>;
     expect(moveTask).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:WorkflowLifecycle 2026-07-26-22:59:
+  Successful pre-merge proof must still project graph-native results onto legacy steps after review handoff has already moved the card into the merge column; the projection must not trigger a redundant move.
+  */
+  it("projects graph-native completion after review handoff already moved the card to the merge column", async () => {
+    const pendingSteps = [
+      { id: "0", title: "Preflight", status: "pending" as const },
+      { id: "1", title: "Implement", status: "pending" as const },
+    ];
+    const { executor, store, liveTask } = makeExecutor({
+      selection: { workflowId: "custom:execute", stepIds: [] },
+      ir: executeIr(),
+      taskColumn: "in-review",
+      steps: pendingSteps,
+      workflowStepResults: [{
+        workflowStepId: "execute",
+        workflowStepName: "Execute",
+        source: "node",
+        phase: "pre-merge",
+        status: "passed",
+        completedAt: new Date().toISOString(),
+      }],
+    });
+
+    await executor.ensureWorkflowMergeBoundaryTask(
+      liveTask,
+      { reason: "workflow-merge-boundary", nodeId: "merge", workflowId: "custom:execute", runId: "r1" },
+    );
+
+    expect(store.updateTask).toHaveBeenCalledWith(
+      "FN-B1",
+      {
+        steps: pendingSteps.map((step) => ({ ...step, status: "done" })),
+        currentStep: 1,
+      },
+      undefined,
+    );
+    expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:WorkflowMerge 2026-08-20-00:50:
+  FN-9157 regression: Review Level 0 deliberately supplies no optional node
+  results, so terminal step-execute coverage must admit the same merge handoff.
+  */
+  it.each([[], undefined] as const)("admits fully terminal foreach coverage without node results (%j)", async (workflowStepResults) => {
+    const doneSteps = [
+      { id: "0", title: "Preflight", status: "done" as const },
+      { id: "1", title: "Implement", status: "done" as const },
+    ];
+    const { executor, store, liveTask } = makeExecutor({
+      selection: { workflowId: "custom:foreach", stepIds: [] },
+      ir: foreachIr(),
+      taskColumn: "in-progress",
+      steps: doneSteps,
+      workflowStepResults: workflowStepResults as never,
+    });
+    const result = await executor.ensureWorkflowMergeBoundaryTask(
+      liveTask,
+      { reason: "workflow-merge-boundary", nodeId: "merge", workflowId: "custom:foreach", runId: "r1" },
+    ) as { task: { column: string }; blocked?: { reason: string } };
+    expect(result.blocked).toBeUndefined();
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-B1", expect.stringContaining("Workflow merge boundary blocked:"), expect.anything(), expect.anything());
+    expect(store.moveTask).toHaveBeenCalledWith("FN-B1", "in-review", expect.anything());
+  });
+
+  it("maps each incomplete merge-boundary proof to a redacted audit code", async () => {
+    const cases = [
+      {
+        steps: [{ id: "0", title: "Implement", status: "pending" as const }],
+        workflowStepResults: [],
+        code: "no-node-result",
+        missingInstanceCount: 1,
+      },
+      {
+        steps: [{ id: "0", title: "Implement", status: "pending" as const }],
+        workflowStepResults: [{ workflowStepId: "review", workflowStepName: "Review", source: "node" as const, phase: "pre-merge" as const, status: "pending" as const, completedAt: "2026-01-01" }],
+        code: "non-terminal-node-result",
+        missingInstanceCount: 1,
+      },
+      {
+        steps: [{ id: "0", title: "Implement", status: "pending" as const }],
+        workflowStepResults: [{ workflowStepId: "review", workflowStepName: "Review", source: "node" as const, phase: "pre-merge" as const, status: "passed" as const, completedAt: "2026-01-01" }],
+        code: "missing-foreach-instances",
+        missingInstanceCount: 1,
+      },
+    ];
+    for (const { steps, workflowStepResults, code, missingInstanceCount } of cases) {
+      const { executor, liveTask } = makeExecutor({
+        selection: { workflowId: "custom:foreach", stepIds: [] }, ir: foreachIr(), steps, workflowStepResults,
+      });
+      const result = await executor.ensureWorkflowMergeBoundaryTask(
+        liveTask,
+        { reason: "workflow-merge-boundary", nodeId: "merge", workflowId: "custom:foreach", runId: "r1" },
+      ) as { blocked?: { code: string; missingInstanceCount: number } };
+      expect(result.blocked).toMatchObject({ code, missingInstanceCount });
+    }
   });
 });

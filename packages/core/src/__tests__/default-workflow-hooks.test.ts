@@ -11,14 +11,14 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   __resetTraitRegistryForTests,
   getTraitRegistry,
-} from "../trait-registry.js";
-import { registerBuiltinTraits } from "../builtin-traits.js";
+} from "../workflows/trait-registry.js";
+import { registerBuiltinTraits } from "../workflows/builtin-traits.js";
 import {
   __resetDefaultWorkflowHooksForTests,
   applyDefaultWorkflowMoveEffects,
   registerDefaultWorkflowHooks,
   type DefaultWorkflowMoveContext,
-} from "../default-workflow-hooks.js";
+} from "../workflows/default-workflow-hooks.js";
 import type { Task } from "../types.js";
 
 function makeCtx(overrides: Partial<DefaultWorkflowMoveContext> = {}): DefaultWorkflowMoveContext {
@@ -103,6 +103,24 @@ describe("default-workflow-hooks registry wiring", () => {
     expect(ctx.task.userPaused).toBe(true);
   });
 
+  /*
+  FNXC:SelfHealing 2026-08-21-16:06:
+  FN-9186 writes the no-progress backoff immediately before its engine wip-to-todo
+  rebound. Only review-origin moves clear this display mirror, so this pins the
+  move-hook contract that keeps the scheduler from immediately redispatching it.
+  */
+  it("preserves no-progress recovery backoff on an engine wip-to-rebound move", () => {
+    registerDefaultWorkflowHooks();
+    const ctx = makeCtx({ fromColumn: "in-progress", toColumn: "todo", moveSource: "engine", options: { recoveryRehome: true } });
+    ctx.task.recoveryRetryCount = 1;
+    ctx.task.nextRecoveryAt = "2026-08-21T16:07:00.000Z";
+
+    applyDefaultWorkflowMoveEffects(ctx);
+
+    expect(ctx.task.recoveryRetryCount).toBe(1);
+    expect(ctx.task.nextRecoveryAt).toBe("2026-08-21T16:07:00.000Z");
+  });
+
   it("preservePause never SETS a pause on an unpaused reopen, and default reopen still clears one", () => {
     registerDefaultWorkflowHooks();
     // preservePause on an unpaused task: nothing appears.
@@ -120,5 +138,91 @@ describe("default-workflow-hooks registry wiring", () => {
     expect(defaultCtx.task.paused).toBeUndefined();
     expect(defaultCtx.task.pausedByAgentId).toBeUndefined();
     expect(defaultCtx.task.pausedReason).toBeUndefined();
+  });
+});
+
+/*
+FNXC:WorkflowReviewGates 2026-07-26-14:40:
+The pre-merge review gates (Code Review, Browser Verification) run with the card in `in-review`, so
+the graph's crossing into the paired remediation node is a routine `in-review -> in-progress` move
+that lands immediately after the gate wrote its `failed` result. The reopen clear used to wipe
+`workflowStepResults` on every such move, destroying the remediation input — and, worse, making
+`getTaskMergeBlocker`'s pending/failed branches vacuously false so a card could return to
+`in-review` and be mergeable with its gate never re-run.
+
+These cases pin BOTH directions of the gate, because a fix that simply stopped clearing on
+`in-progress` would silently change operator-reopen semantics that other recovery paths depend on
+(`executor.performWorkflowRerunBounce` documents that `moveTask(in-review -> todo)` clears results
+for it). Only a graph-owned in-review -> in-progress crossing is exempt.
+*/
+describe("applyReopenFieldClears — graph-owned review-gate remediation crossing", () => {
+  beforeEach(() => {
+    __resetTraitRegistryForTests();
+    __resetDefaultWorkflowHooksForTests();
+    registerBuiltinTraits();
+    registerDefaultWorkflowHooks();
+  });
+
+  function withResults(overrides: Partial<DefaultWorkflowMoveContext>): DefaultWorkflowMoveContext {
+    const ctx = makeCtx(overrides);
+    ctx.task.workflowStepResults = [
+      { workflowStepId: "code-review", workflowStepName: "Code Review", status: "failed", phase: "pre-merge" },
+      { workflowStepId: "browser-verification", workflowStepName: "Browser Verification", status: "passed", phase: "pre-merge" },
+    ] as Task["workflowStepResults"];
+    return ctx;
+  }
+
+  it("RETAINS workflowStepResults on the graph's in-review -> in-progress remediation crossing", () => {
+    const ctx = withResults({
+      fromColumn: "in-review",
+      toColumn: "in-progress",
+      moveSource: "engine",
+      workflowMoveSource: "workflow-graph",
+      options: { preserveProgress: true },
+    });
+    applyDefaultWorkflowMoveEffects(ctx);
+    expect(ctx.task.workflowStepResults).toHaveLength(2);
+    expect(ctx.task.workflowStepResults?.find((r) => r.workflowStepId === "code-review")?.status).toBe("failed");
+  });
+
+  it("retains only review evidence for remediation-owned review -> planning bounce", () => {
+    const ctx = withResults({
+      fromColumn: "in-review",
+      toColumn: "todo",
+      moveSource: "engine",
+      workflowMoveSource: "workflow-remediation",
+    });
+    ctx.task.branch = "fusion/FN-1";
+    applyDefaultWorkflowMoveEffects(ctx);
+    expect(ctx.task.workflowStepResults).toHaveLength(2);
+    expect(ctx.task.branch).toBeUndefined();
+  });
+
+  it("still CLEARS on an operator reopen in-review -> in-progress (no graph provenance)", () => {
+    const ctx = withResults({
+      fromColumn: "in-review",
+      toColumn: "in-progress",
+      moveSource: "user",
+    });
+    applyDefaultWorkflowMoveEffects(ctx);
+    expect(ctx.task.workflowStepResults).toBeUndefined();
+  });
+
+  it("still CLEARS on in-review -> todo even when the graph owns the move (bounce invariant)", () => {
+    const ctx = withResults({
+      fromColumn: "in-review",
+      toColumn: "todo",
+      moveSource: "engine",
+      workflowMoveSource: "workflow-graph",
+      options: { preserveProgress: true },
+    });
+    applyDefaultWorkflowMoveEffects(ctx);
+    expect(ctx.task.workflowStepResults).toBeUndefined();
+  });
+
+  it("still CLEARS on done -> todo reopen", () => {
+    const ctx = withResults({ fromColumn: "done", toColumn: "todo", moveSource: "user" });
+    applyDefaultWorkflowMoveEffects(ctx);
+    expect(ctx.task.workflowStepResults).toBeUndefined();
   });
 });

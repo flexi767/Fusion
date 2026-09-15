@@ -1,11 +1,13 @@
 import {
   getCurrentRepo,
-  resolveDependencyOrder,
-  sortTasksByPriorityFanoutThenAgeAndId,
-  buildUnblockWeightMap,
   computeBlockerFanoutMap,
   compareTasksByPriorityThenAgeAndId,
+  fileScopeLeaseBlocksCandidate,
+  normalizeOverlapScopeForTask,
+  taskHoldsUnmergedCheckout,
   HIGH_FANOUT_BLOCKER_TODO_THRESHOLD,
+  nonExecutableDuplicateRedirectReason,
+  isPlanReviewSatisfied,
   type TaskStore,
   type Task,
   type MissionStore,
@@ -14,42 +16,50 @@ import {
   type PrInfo,
   type AgentStore,
   type Settings,
-  TransitionRejectionError,
-  buildBootstrapPrompt,
+  type FileScopeLeaseClassification,
 } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
-  computeTopLevelConcurrencyClaimed,
   dropPreHeldExecutorSlot,
+  projectAdmissionCoordinator,
+  persistedTopLevelAgentTaskIdsFromStore,
+  persistedWorktreeHolderTaskIdsFromStore,
   recoverIdleSemaphoreLeakCandidate,
   registerPreHeldExecutorSlot,
+  resolveAgentCapacityLimit,
   type AgentSemaphore,
-} from "./concurrency.js";
-import { planTaskWorktreePath, resolveTaskWorkingBranch } from "./worktree-names.js";
+} from "./concurrency/concurrency.js";
+import { planTaskWorktreePath, resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
 import { schedulerLog } from "./logger.js";
-import { type PrMonitor, type PrComment } from "./pr-monitor.js";
-import { reconcileMissionFeatureState } from "./mission-feature-sync.js";
-import { evaluateSpecStaleness, getPromptPath } from "./spec-staleness.js";
-import { resolveEffectiveNode, type EffectiveNode } from "./effective-node.js";
-import { applyUnavailableNodePolicy, decideOwningNodeHandoff } from "./node-routing-policy.js";
-import type { NodeDispatchValidationResult } from "./node-dispatch-validation.js";
-import type { MeshLeaseManager } from "./mesh-lease-manager.js";
-import { selectPermanentAgentForTask } from "./agent-assignment.js";
-import type { AutoClaimSnapshotManager } from "./auto-claim-snapshot.js";
-import { StaleTaskReporter } from "./stale-task-reporter.js";
-import { BacklogPressureReporter } from "./backlog-pressure-reporter.js";
-import { UnlinkedMissionsAdvisoryReporter } from "./unlinked-missions-advisory-reporter.js";
-import { createRunAuditor, generateSyntheticRunId } from "./run-audit.js";
-import { isWorkflowColumnsEnabled, DEFAULT_WORKFLOW_POOL_ID, resolveWorkflowIrForTask, resolveWorkflowIrById, resolveColumnFlags } from "@fusion/core";
-import type { WorkflowIr, WorkflowIrV2 } from "@fusion/core";
-import { runHoldReleaseSweep, isUnplannedForExecution, type SlotReservation } from "./hold-release.js";
-import { moveTaskToReplanColumn } from "./replan-target.js";
-import { evaluateParkedAgentTaskLink } from "./task-agent-sync.js";
-import { decideMissionSymbolAdmission, resolveMissionFeatureForTask } from "./mission-symbol-admission.js";
+import { emitBoundedRunAudit } from "./util/emit-bounded-run-audit.js";
+import { createRepeatSuppressedLog } from "./util/repeat-suppressed-log.js";
+import { type PrMonitor, type PrComment } from "./merge/pr-monitor.js";
+import { reconcileMissionState, type MissionReconcileSource } from "./missions/mission-state-reconcile.js";
+import { resolveDedicatedPlannerColumnsForTask } from "./planner-lane-resolution.js";
+import { evaluateSpecStaleness, getPromptPath } from "./execution/spec-staleness.js";
+import { resolveEffectiveNode, type EffectiveNode } from "./project/effective-node.js";
+import { applyUnavailableNodePolicy, decideOwningNodeHandoff } from "./project/node-routing-policy.js";
+import type { NodeDispatchValidationResult } from "./project/node-dispatch-validation.js";
+import type { MeshLeaseManager } from "./project/mesh-lease-manager.js";
+import type { AutoClaimSnapshotManager } from "./scheduling/auto-claim-snapshot.js";
+import { StaleTaskReporter } from "./healing/stale-task-reporter.js";
+import { BacklogPressureReporter } from "./scheduling/backlog-pressure-reporter.js";
+import { UnlinkedMissionsAdvisoryReporter } from "./missions/unlinked-missions-advisory-reporter.js";
+import { createRunAuditor, generateSyntheticRunId } from "./util/run-audit.js";
+import type { TaskMoveLanes } from "@fusion/core";
+import { resolveProjectColumnsForRoles, resolveWorkflowIrForTask, resolveWorkflowIrById, resolveColumnFlags, resolveWorktreeCapacityLimit, resolveMaxConcurrentSetting, resolveLifecycleColumns, isWipColumnRole, isReviewColumnRole, isCompleteColumnRole, isTerminalColumnRole, columnsWithFlag } from "@fusion/core";
+import type { WorkflowIr, WorkflowIrV2, WorkflowSelectionCache } from "@fusion/core";
+import type { ColumnRoleTraitFlags } from "@fusion/core";
+
+import { checkAndRecordUnplannedExecutionBlock, runHoldReleaseSweep, isUnplannedForExecution, type SlotReservation } from "./execution/hold-release.js";
+import { evaluateParkedAgentTaskLink } from "./agents/task-agent-sync.js";
+import { decideMissionSymbolAdmission, resolveMissionFeatureForTask } from "./missions/mission-symbol-admission.js";
+import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "./healing/recovery-policy.js";
 
 const SYMBOL_LOCK_LEASE_MS = 10 * 60_000;
+type TaskUpdatePatch = Parameters<TaskStore["updateTask"]>[1];
 
 /*
 FNXC:WorkflowScheduling 2026-07-15-12:55:
@@ -80,30 +90,36 @@ function shouldRunWorkflowColumnScheduler(_settings: Settings): boolean {
  *
  * Exported for direct unit testing; used internally by {@link Scheduler}.
  */
-export function pathsOverlap(a: string[], b: string[]): boolean {
-  for (const pa of a) {
-    const prefixA = pa.endsWith("/*") ? pa.slice(0, -1) : null;
-    for (const pb of b) {
-      const prefixB = pb.endsWith("/*") ? pb.slice(0, -1) : null;
+export interface FileScopeOverlapMatch {
+  path: string;
+  blockerPath: string;
+}
 
-      // Exact match (ignoring glob suffix)
-      const cleanA = prefixA ? pa.slice(0, -2) : pa;
-      const cleanB = prefixB ? pb.slice(0, -2) : pb;
-      if (cleanA === cleanB) return true;
-
-      // Check prefix overlap
-      if (prefixA && pb.startsWith(prefixA)) return true;
-      if (prefixB && pa.startsWith(prefixB)) return true;
-      if (prefixA && prefixB) {
-        if (prefixA.startsWith(prefixB) || prefixB.startsWith(prefixA))
-          return true;
-      }
-
-      // Exact file path match
-      if (pa === pb) return true;
+/*
+FNXC:OverlapScheduling 2026-08-27-11:06:
+The scheduler's boolean admission predicate and the operator-facing overlap pairs must share one matcher. Returning every sorted, deduplicated match explains an existing blocker without changing whether work is serialized.
+*/
+export function findFileScopeOverlaps(a: string[], b: string[]): FileScopeOverlapMatch[] {
+  const matches = new Map<string, FileScopeOverlapMatch>();
+  for (const path of a) {
+    const prefixA = path.endsWith("/*") ? path.slice(0, -1) : null;
+    for (const blockerPath of b) {
+      const prefixB = blockerPath.endsWith("/*") ? blockerPath.slice(0, -1) : null;
+      const cleanA = prefixA ? path.slice(0, -2) : path;
+      const cleanB = prefixB ? blockerPath.slice(0, -2) : blockerPath;
+      const overlaps = cleanA === cleanB
+        || Boolean(prefixA && blockerPath.startsWith(prefixA))
+        || Boolean(prefixB && path.startsWith(prefixB))
+        || Boolean(prefixA && prefixB && (prefixA.startsWith(prefixB) || prefixB.startsWith(prefixA)))
+        || path === blockerPath;
+      if (overlaps) matches.set(`${path}\u0000${blockerPath}`, { path, blockerPath });
     }
   }
-  return false;
+  return [...matches.values()].sort((left, right) => left.path.localeCompare(right.path) || left.blockerPath.localeCompare(right.blockerPath));
+}
+
+export function pathsOverlap(a: string[], b: string[]): boolean {
+  return findFileScopeOverlaps(a, b).length > 0;
 }
 
 function normalizeOverlapPath(path: string): string {
@@ -136,9 +152,11 @@ function isIgnoredOverlapPath(path: string, ignorePath: string): boolean {
 function computeAutoClaimFingerprint(task: Task): string {
   const dependencies = [...(task.dependencies ?? [])].sort().join(",");
   const sortAt = task.columnMovedAt ?? task.createdAt;
+  /** FNXC:TaskDispatch 2026-07-19-14:40: `userPaused` is a durable operator stop even when legacy `paused` is false; candidacy caching and every dispatch selector must treat either flag as parked. */
   return [
     task.column,
     task.paused === true ? "1" : "0",
+    task.userPaused === true ? "1" : "0",
     task.assignedAgentId ?? "",
     task.checkedOutBy ?? "",
     task.deletedAt ?? "",
@@ -227,14 +245,89 @@ export function isCoordinationOnlyTask(task: Task, scope: string[]): boolean {
   return isCoordinationSafeScope(scope);
 }
 
-function isLegacyDependencySatisfied(dep: Task | undefined): boolean {
-  return !!dep && (dep.column === "done" || dep.column === "in-review" || dep.column === "archived");
+/*
+FNXC:WorkflowLifecycleColumns 2026-07-30-19:05 (fleet — scheduler dependency satisfaction):
+A dependency's satisfaction is decided on ITS OWN board, because a dependency edge may cross
+workflows: the dependent can sit on the default board while the dependency lives on a renamed one.
+
+THE TWO RULES THIS FILE ALREADY HAD, PRESERVED EXACTLY:
+  legacy (live)   satisfied = COMPLETE or the REVIEW lane (mergeBlocker/humanReview)
+  marker (shadow) satisfied = COMPLETE, else the handoff marker decides
+
+They genuinely differ on the review lane. Narrowing the live rule silently would strand every
+dependent of an in-review card.
+
+`columns` is resolved per dependency and passed in by the caller. Omitted (or absent for a given
+dependency) → the legacy literals, i.e. exactly today's behaviour, so no unconverted call site
+changes meaning and an unresolvable workflow fails soft rather than reading as unsatisfied forever.
+*/
+export interface DependencySatisfactionColumns {
+  /** Complete columns for the dependency's own workflow. */
+  terminal: ReadonlySet<string>;
+  /** The dependency's own review lane (mergeBlocker ∪ humanReview). */
+  review: ReadonlySet<string>;
 }
 
-function isMarkerDependencySatisfied(dep: Task | undefined, markerAccepted: boolean): boolean {
+/*
+DELIBERATE-LITERAL — the no-metadata fallback, reviewed 2026-07-30-20:40.
+Resolved columns win when present; the literal answers only when the caller could not resolve the
+dependency's workflow at all. DELETING it does not "finish the conversion" — it makes an
+unresolvable workflow read as `terminal.size === 0`, i.e. NEVER satisfied, which blocks every
+dependent forever. That is strictly worse than the legacy behaviour it would replace.
+*/
+function isTerminalDependencyColumn(dep: Task, columns: DependencySatisfactionColumns | undefined): boolean {
+  if (columns) return columns.terminal.has(dep.column);
+  return dep.column === "done";
+}
+
+/* DELIBERATE-LITERAL — same no-metadata fallback as above, reviewed 2026-07-30-20:40. */
+function isLegacyDependencySatisfied(dep: Task | undefined, columns?: DependencySatisfactionColumns): boolean {
   if (!dep) return false;
-  if (dep.column === "done" || dep.column === "archived") return true;
+  if (isTerminalDependencyColumn(dep, columns)) return true;
+  if (columns) return columns.review.has(dep.column);
+  return dep.column === "in-review";
+}
+
+function isMarkerDependencySatisfied(
+  dep: Task | undefined,
+  markerAccepted: boolean,
+  columns?: DependencySatisfactionColumns,
+): boolean {
+  if (!dep) return false;
+  if (isTerminalDependencyColumn(dep, columns)) return true;
   return markerAccepted;
+}
+
+/**
+ * FNXC:WorkflowLifecycleColumns 2026-07-30-19:05:
+ * Build the per-dependency column vocabulary for {@link getUnmetSchedulingDependencies}.
+ *
+ * `cache` is caller-owned for the reason documented on `resolveTaskLifecycleColumns`: a sweep over
+ * many dependents spanning three workflows must read three IRs, not one per dependency. A
+ * dependency whose workflow cannot be resolved is simply OMITTED from the map, which lands that
+ * dependency on the literal fallback rather than on an empty set (an empty set would read as
+ * "never satisfied" and block the dependent forever — the expensive direction to be wrong in).
+ */
+export async function resolveDependencySatisfactionColumns(
+  store: Parameters<typeof resolveWorkflowIrForTask>[0],
+  dependencies: readonly Task[],
+  cache?: Map<string, WorkflowIr>,
+): Promise<Map<string, DependencySatisfactionColumns>> {
+  const resolved = new Map<string, DependencySatisfactionColumns>();
+  const irCache = cache ?? new Map<string, WorkflowIr>();
+  for (const dep of dependencies) {
+    try {
+      const ir = await resolveWorkflowIrForTask(store, dep.id, irCache);
+      if (!ir) continue;
+      const terminal = new Set(columnsWithFlag(ir, "complete"));
+      const review = new Set([...columnsWithFlag(ir, "mergeBlocker"), ...columnsWithFlag(ir, "humanReview")]);
+      if (terminal.size === 0 && review.size === 0) continue;
+      resolved.set(dep.id, { terminal, review });
+    } catch {
+      // Unresolvable workflow: leave it unmapped so this dependency keeps the legacy literals.
+    }
+  }
+  return resolved;
 }
 
 export function computeShadowLeaseParityState(mergeRequestState: string | null): {
@@ -268,13 +361,23 @@ export function getUnmetSchedulingDependencies(
   options?: {
     markerAcceptedByTaskId?: Map<string, boolean>;
     onParityDiff?: (diff: SchedulingDependencyParityDiff) => void;
+    /**
+     * Per-dependency resolved column vocabulary from
+     * {@link resolveDependencySatisfactionColumns}. Omitted → the legacy literals.
+     */
+    satisfactionColumnsByTaskId?: Map<string, DependencySatisfactionColumns>;
   },
 ): string[] {
   return task.dependencies.filter((depId) => {
     const dep = tasks.find((candidate) => candidate.id === depId);
     if (!dep) return false;
-    const legacySatisfied = isLegacyDependencySatisfied(dep);
-    const markerSatisfied = isMarkerDependencySatisfied(dep, options?.markerAcceptedByTaskId?.get(depId) === true);
+    const satisfactionColumns = options?.satisfactionColumnsByTaskId?.get(depId);
+    const legacySatisfied = isLegacyDependencySatisfied(dep, satisfactionColumns);
+    const markerSatisfied = isMarkerDependencySatisfied(
+      dep,
+      options?.markerAcceptedByTaskId?.get(depId) === true,
+      satisfactionColumns,
+    );
     if (options?.onParityDiff && legacySatisfied !== markerSatisfied) {
       options.onParityDiff({
         taskId: task.id,
@@ -287,48 +390,262 @@ export function getUnmetSchedulingDependencies(
   });
 }
 
-export function isRunnableQueuedOverlapCandidate(
-  task: Task,
-  tasks: Task[],
-  now = Date.now(),
-  activeScopes?: Map<string, string[]>,
-  scope: string[] = [],
-): boolean {
-  if (task.column !== "todo" || task.status !== "queued") return false;
-  if (task.paused || task.userPaused) return false;
-  if (task.nextRecoveryAt && new Date(task.nextRecoveryAt).getTime() > now) return false;
-  if (getUnmetSchedulingDependencies(task, tasks).length > 0) return false;
-  if (!activeScopes || activeScopes.size === 0) return true;
 
-  if (scope.length === 0) return true;
-  for (const activeScope of activeScopes.values()) {
-    if (!activeScope.length) continue;
-    if (pathsOverlap(scope, activeScope)) return false;
-  }
-  return true;
+/*
+FNXC:WorkflowLifecycleColumns 2026-07-28-11:35 (U11 conversion):
+A task's HOLD and INTAKE columns, resolved from its own workflow.
+
+The scheduler's event handlers all ask a variant of "is this the backlog?" and
+answered it with the literal `"todo"`. That silently stops matching for a renamed
+workflow, and stops matching for EVERY workflow once U11 deletes `todo` from the
+builtins. Most of these failures are LATENCY rather than incorrectness — a wake
+that does not fire costs up to one poll interval — which is precisely why they
+would go unnoticed.
+
+Resolution is per task because a board spans workflows. Cost matches existing
+practice in this file, which already resolves per task at the dispatch-diagnostic
+and worktree-capacity sites; these handlers fire per move/update event, not per
+card in a sweep.
+
+Fail-soft to the legacy pair: an unresolvable workflow behaves exactly as before
+this conversion rather than losing the wake entirely.
+*/
+/* SYNCHRONOUS on purpose. These run inside `task:moved` / `task:updated`
+   listeners; introducing a new `await` before their existing synchronous work
+   defers everything after it to a microtask and reorders handlers relative to a
+   synchronous emitter. A file split must not change event ordering, so the
+   resolution uses the store's sync IR path. */
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-10:10 (fleet: scheduler lifecycle roles):
+Widened from {hold,intake} to the full role set. The listeners below ask the same "which lane is
+this?" question about wip, review and the terminal columns, and answered it with literals — so on
+a renamed board PR monitoring never started or stopped, failure bookkeeping never recorded, and
+terminal cleanup never ran. None of those error; they simply stop happening. One resolution per
+event, reusing the SAME sync path and the SAME fail-soft legacy defaults, so event ordering and
+unresolvable-workflow behaviour are both unchanged.
+*/
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-12:30:
+`terminal` is a MEMBERSHIP set, and it is not the same question as `complete`/`archived`.
+
+`resolveLifecycleColumns` answers FIRST MATCH PER ROLE — the right shape for "where should this card
+be moved to", the wrong shape for "did this card just reach a finished lane". A workflow may declare
+more than one complete-trait column (a merged lane and a shipped lane, say); `to === parked.complete`
+sees only the first and silently skips the rest.
+
+Seeded with the legacy ids. For an INCLUSION that is safe in the direction that matters: a superset
+makes the reconciliation below run on a move it would otherwise ignore, which costs one extra query
+and cannot wrongly withhold work. (Seeding a REFUSAL is the bug — see `node-override-guard.ts`.)
+
+Same sync IR path and same fail-soft legacy default as the single-column answers, so event ordering
+and unresolvable-workflow behaviour are unchanged.
+*/
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-21:00 (fleet):
+Overlay emitter-resolved lanes onto the fail-soft defaults. Only fields the emitter actually resolved
+are taken, so a partial payload cannot blank a lane back to a wrong answer.
+*/
+function mergeParkedColumns(
+  base: { hold: string; intake: string; wip: string; wipColumns: ReadonlySet<string>; review: string; complete: string; terminal: ReadonlySet<string> },
+  lanes: TaskMoveLanes | undefined,
+): { hold: string; intake: string; wip: string; wipColumns: ReadonlySet<string>; review: string; complete: string; terminal: ReadonlySet<string> } {
+  if (!lanes) return base;
+  const complete = lanes.complete ?? base.complete;
+  return {
+    hold: lanes.hold ?? base.hold,
+    intake: lanes.intake ?? base.intake,
+    wip: lanes.wip ?? base.wip,
+    /*
+    FNXC:WorkflowScheduling 2026-08-28-21:24:
+    Capacity lanes are a membership question just like terminal lanes. Union the resolved workflow, emitter lane, and legacy fallback so renamed or multi-WIP boards never narrow the set and silently lose the slot-release wake.
+    */
+    wipColumns: new Set([
+      ...base.wipColumns,
+      ...(lanes.wip ? [lanes.wip] : []),
+      ...LEGACY_PARKED_COLUMNS.wipColumns,
+    ]),
+    review: lanes.review ?? base.review,
+    complete,
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-31-11:10 (u12 — the overlay NARROWED a membership set):
+    This rebuilt `terminal` from only one Complete id, which is first-match-per-role. It discarded `base.terminal`, which the sync IR
+    path had already resolved correctly, and it had no way to express a second complete-trait column
+    even when the emitter knew about one.
+
+    Now a UNION of everything either side proved terminal. That is the direction this file already
+    argues for at line ~422: a superset makes the reconciliation run on a move it would otherwise
+    ignore — one extra query — while a subset silently withholds work from a card that is finished.
+    */
+    terminal: new Set([...base.terminal, ...(lanes.terminal ?? []), complete]),
+  };
 }
 
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-06:35 (fleet):
+The ASYNC twin. The sync one below cannot answer for a custom workflow in production, so any guard that
+can reach this one must.
+
+THE CRITERION IS WHETHER THE ANSWER IS CONSUMED SYNCHRONOUSLY, not whether the enclosing listener is
+declared sync — I got that wrong earlier in this program and it cost a revert. The three call sites
+converted to this all fail that test: two only feed `schedule()`, which is itself `async`,
+fire-and-forget and re-entrance-guarded, and the third already sits below an `await getSettings()`.
+Deferring them by a microtask changes nothing observable.
+
+Same fail-soft legacy default as its sync twin, so an unresolvable workflow behaves exactly as before.
+*/
+const LEGACY_PARKED_COLUMNS = {
+  hold: "todo",
+  intake: "triage",
+  wip: "in-progress",
+  wipColumns: new Set(["in-progress"]),
+  review: "in-review",
+  complete: "done",
+  terminal: new Set(["done"]),
+};
+
+async function resolveTaskParkedColumns(store: TaskStore, taskId: string, selectionCache?: WorkflowSelectionCache): Promise<{ hold: string; intake: string; wip: string; wipColumns: ReadonlySet<string>; review: string; complete: string; terminal: ReadonlySet<string>; wake: ReadonlySet<string> }> {
+  try {
+    /*
+    FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073):
+    Thread the caller's per-tick selectionCache so `resolveWorkflowIrForTask` reads workflow_selection AT
+    MOST ONCE per task per scheduler tick, not once per park resolution. `resolveTaskParkedColumns` is
+    composed up to ~6x per task per poll/event cycle (merge/unpause/planning/approval/deleted/rollback),
+    and without a shared cache each composition was its own Drizzle-build + PostgreSQL select of
+    task_workflow_selection (the RUFU-073 query storm: ~232 idx_scan/s nonstop).
+
+    Cache lifecycle honors the FNXC:WorkflowScheduling invariant: PER-CALL/PER-PASS ONLY — the caller
+    creates the Map fresh for one tick/event and throws it away, so a selection WRITE by a later pass
+    is always observed on the NEXT pass' fresh cache. It is never a global/infinite LRU. A throwing
+    selection read is still deliberately not cached (the resolver retries it), and passing no cache
+    keeps the old read-per-call behaviour byte-for-byte.
+    */
+    const ir = await resolveWorkflowIrForTask(store, taskId, undefined, selectionCache);
+    const l = resolveLifecycleColumns(ir);
+    const complete = l?.complete ?? LEGACY_PARKED_COLUMNS.complete;
+    return {
+      hold: l?.hold ?? LEGACY_PARKED_COLUMNS.hold,
+      intake: l?.intake ?? LEGACY_PARKED_COLUMNS.intake,
+      wip: l?.wip ?? LEGACY_PARKED_COLUMNS.wip,
+      wipColumns: new Set([
+        ...columnsWithFlag(ir, "countsTowardWip"),
+        l?.wip ?? LEGACY_PARKED_COLUMNS.wip,
+        ...LEGACY_PARKED_COLUMNS.wipColumns,
+      ]),
+      review: l?.review ?? LEGACY_PARKED_COLUMNS.review,
+      complete,
+      terminal: new Set([
+        ...LEGACY_PARKED_COLUMNS.terminal,
+        ...columnsWithFlag(ir, "complete"),
+        complete,
+      ]),
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-31-06:35 (fleet):
+      The wake set UNIONS the legacy ids rather than replacing them, and that is load-bearing rather
+      than defensive. Post-U11 the default lineage has no `triage` column, so a RESOLVED answer returns
+      `intake: "todo"` where the old inert path fell back to `"triage"`. Converting without the union
+      therefore NARROWS the set and stops waking cards that sit in a legacy-named lane — caught by
+      `scheduler-planning-finished-wake.test.ts` -> "schedules when planning clears in triage".
+
+      A resolved conversion must be a superset of what it replaces, or it is a behaviour change wearing
+      a vocabulary change's clothes.
+      */
+      wake: new Set([l?.hold ?? LEGACY_PARKED_COLUMNS.hold, l?.intake ?? LEGACY_PARKED_COLUMNS.intake, LEGACY_PARKED_COLUMNS.hold, LEGACY_PARKED_COLUMNS.intake]),
+    };
+  } catch {
+    return {
+      ...LEGACY_PARKED_COLUMNS,
+      wipColumns: new Set(LEGACY_PARKED_COLUMNS.wipColumns),
+      terminal: new Set(LEGACY_PARKED_COLUMNS.terminal),
+      wake: new Set([LEGACY_PARKED_COLUMNS.hold, LEGACY_PARKED_COLUMNS.intake]),
+    };
+  }
+}
+
+export interface FileScopeLeaseOptions {
+  mergeRequestContractShadowEnabled?: boolean;
+  handoffAccepted?: boolean;
+  schedulingDependencyOptions?: Parameters<typeof getUnmetSchedulingDependencies>[2];
+  /** Resolved role answers. Omitted → legacy column-id literals. */
+  isWipColumn?: boolean;
+  isReviewColumn?: boolean;
+  isTerminalColumn?: boolean;
+}
+
+/*
+FNXC:OverlapScheduling 2026-08-29-05:49:
+File-scope ownership is a lifetime contract: a task keeps its claim until its work has landed, is
+deleted, or a non-WIP lane has released its checkout. Paused, failed, and external-blocked cards therefore retain their claim while their unmerged singular or per-repository checkout exists; deleting or clearing those checkouts is the explicit escape hatch for a dead holder.
+
+Check every checkout form before granting a non-WIP card an active lease. A workspace task deliberately
+has no singular `task.worktree`, so review and dormant classification must recognize its repository
+checkouts. WIP deliberately skips that check because the scheduler moves a task there before implementation
+persists a checkout; gating that interval would let a second task begin editing the same files.
+
+FNXC:OverlapScheduling 2026-09-01-14:49:
+A card whose only live state is checkout-free planning owns no lease, so overlapping planners remain
+independently dispatchable. A hold-lane card retaining a checkout after a replan bounce still owns
+unmerged work and keeps its dormant lease; never replace this checkout proof with a column exemption.
+*/
+export function classifyFileScopeLease(
+  task: Task,
+  tasks: Task[],
+  options?: FileScopeLeaseOptions,
+): FileScopeLeaseClassification {
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-17:00:
+  Role questions stay parameterized with literal defaults so callers that cannot resolve a workflow
+  retain legacy board semantics rather than silently dropping every overlap lease on renamed boards.
+  */
+  // FNXC:WorkflowLifecycle 2026-08-30-07:27: DELIBERATE-LITERAL — callers without resolved workflow roles require the legacy WIP fallback.
+  const isWipColumn = options?.isWipColumn ?? task.column === "in-progress";
+  // FNXC:WorkflowLifecycle 2026-08-30-07:27: DELIBERATE-LITERAL — callers without resolved workflow roles require the legacy review fallback.
+  const isReviewColumn = options?.isReviewColumn ?? task.column === "in-review";
+  // FNXC:WorkflowLifecycle 2026-08-30-07:27: DELIBERATE-LITERAL — callers without resolved workflow roles require the legacy terminal fallback.
+  const isTerminalColumn = options?.isTerminalColumn ?? task.column === "done";
+
+  if (isTerminalColumn || task.deletedAt) {
+    return { kind: "none", waivedForTaskIds: [] };
+  }
+
+  if (isWipColumn) {
+    return {
+      kind: "active",
+      /*
+      FNXC:OverlapScheduling 2026-08-29-05:49:
+      FN-6292's circular-wait break is a waiver only for the holder's unmet dependencies. The holder
+      remains visible to unrelated overlapping work, so resolving one dependency cannot reopen an
+      unrelated file collision.
+      */
+      waivedForTaskIds: getUnmetSchedulingDependencies(task, tasks, options?.schedulingDependencyOptions),
+    };
+  }
+
+  if (isReviewColumn) {
+    if (options?.mergeRequestContractShadowEnabled === true && options.handoffAccepted === true) {
+      return { kind: "none", waivedForTaskIds: [] };
+    }
+    return { kind: taskHoldsUnmergedCheckout(task) ? "active" : "none", waivedForTaskIds: [] };
+  }
+
+  return { kind: taskHoldsUnmergedCheckout(task) ? "dormant" : "none", waivedForTaskIds: [] };
+}
+
+/**
+ * Compatibility wrapper retained for callers that only need to know whether a task holds any lease.
+ */
 export function shouldHoldActiveFileScopeLease(
   task: Task,
   tasks: Task[],
-  options?: {
-    mergeRequestContractShadowEnabled?: boolean;
-    handoffAccepted?: boolean;
-    schedulingDependencyOptions?: Parameters<typeof getUnmetSchedulingDependencies>[2];
-  },
+  options?: FileScopeLeaseOptions,
 ): boolean {
-  /*
-  FNXC:OverlapScheduling 2026-06-25-04:34:
-  Active file-scope leases are a scheduler contract, not just a column check. Self-healing and repair paths must use this same predicate so stale `overlapBlockedBy` cleanup does not preserve blockers the scheduler would ignore on the next tick.
-  */
-  if (task.paused || task.userPaused) return false;
-  if (task.column === "in-progress") {
-    return getUnmetSchedulingDependencies(task, tasks, options?.schedulingDependencyOptions).length === 0;
-  }
-  if (task.column !== "in-review") return false;
-  if (!task.worktree || task.status === "failed") return false;
-  if (options?.mergeRequestContractShadowEnabled === true && options.handoffAccepted === true) return false;
-  return true;
+  /* FNXC:LaneWiring 2026-08-30-00:20: name the lane answers this wrapper forwards. A bare `options`
+     pass reads as unwired to the lane-wiring census; the spread keeps every other option intact. */
+  return classifyFileScopeLease(task, tasks, {
+    ...options,
+    isWipColumn: options?.isWipColumn,
+    isReviewColumn: options?.isReviewColumn,
+    isTerminalColumn: options?.isTerminalColumn,
+  }).kind !== "none";
 }
 
 export function findHigherPriorityQueuedOverlap(
@@ -379,11 +696,24 @@ interface ConcurrencyGateDiagnostic {
   available: number;
   bindingGates: ConcurrencyGateName[];
   maxConcurrentGate: ConcurrencyGateSnapshot;
-  maxWorktreesGate: ConcurrencyGateSnapshot;
+  /*
+  FNXC:CapacityModel 2026-07-28-11:35:
+  OPTIONAL because worktrees can be turned off as a capacity dimension
+  (`settings.worktreeLimitEnabled === false` → "limit via total agents only").
+
+  When off, this field is ABSENT — there is no worktree gate object, not a gate
+  holding Infinity and not a comparison skipped by convention. That is deliberate
+  and is the operator's explicit requirement: an inert limiter must be incapable
+  of binding, not merely unlikely to. Optionality moves the guarantee into the
+  type system — `diagnostic.maxWorktreesGate.limit` does not compile without a
+  presence check, so a future edit cannot reintroduce a silent worktree
+  comparison in OFF mode. `bindingGates` can never contain "maxWorktrees" there.
+  */
+  maxWorktreesGate?: ConcurrencyGateSnapshot;
   semaphoreGate?: ConcurrencyGateSnapshot;
   holders: {
     maxConcurrent: string[];
-    maxWorktrees: string[];
+    maxWorktrees?: string[];
     semaphore?: string[];
   };
   /** U6: additive per-column capacity gates (flag-ON only; omitted otherwise so
@@ -417,7 +747,15 @@ function computeConcurrencyGateDiagnostic(params: {
   agentSlots: number;
   maxConcurrent: number;
   activeWorktrees: number;
-  maxWorktrees: number;
+  /*
+  FNXC:CapacityModel 2026-07-28-11:35:
+  `null` means worktrees are not a capacity dimension for this project
+  (`settings.worktreeLimitEnabled === false`) — NOT "unlimited". Callers resolve it
+  through `resolveWorktreeCapacityLimit` so the OFF convention has exactly one
+  expression; passing a raw number here cannot accidentally re-enable the gate
+  because the resolver is the only thing that produces this value.
+  */
+  maxWorktrees: number | null;
   semaphore?: AgentSemaphore;
   inProgressTaskIds: string[];
   startedThisTick?: number;
@@ -427,6 +765,8 @@ function computeConcurrencyGateDiagnostic(params: {
    * semaphore gate uses this instead of only in-progress agentSlots.
    */
   topLevelClaimedSlots?: number;
+  /** FNXC:WorktreeCapacity 2026-08-01-04:38: active task ids occupying worktree-capacity slots. */
+  worktreeHolderTaskIds?: string[];
   /** U6: additive per-column capacity gates (flag-ON only). Omitted → the legacy
    *  three-gate report is byte-identical. */
   perColumnGates?: PerColumnCapacityGate[];
@@ -439,11 +779,16 @@ function computeConcurrencyGateDiagnostic(params: {
     limit: params.maxConcurrent,
     slack: params.maxConcurrent - maxConcurrentUsed,
   };
-  const maxWorktreesGate: ConcurrencyGateSnapshot = {
-    used: maxWorktreesUsed,
-    limit: params.maxWorktrees,
-    slack: params.maxWorktrees - maxWorktreesUsed,
-  };
+  // Worktrees off → no gate object at all. See the FNXC on `maxWorktreesGate`.
+  const maxWorktreesLimit = params.maxWorktrees;
+  const maxWorktreesGate: ConcurrencyGateSnapshot | undefined =
+    maxWorktreesLimit === null
+      ? undefined
+      : {
+        used: maxWorktreesUsed,
+        limit: maxWorktreesLimit,
+        slack: maxWorktreesLimit - maxWorktreesUsed,
+      };
   const semaphoreGate = params.semaphore
     ? (() => {
       /*
@@ -462,13 +807,13 @@ function computeConcurrencyGateDiagnostic(params: {
     : undefined;
   const available = Math.min(
     maxConcurrentGate.slack,
-    maxWorktreesGate.slack,
+    maxWorktreesGate?.slack ?? Infinity,
     semaphoreGate?.slack ?? Infinity,
   );
 
   const bindingGates: ConcurrencyGateName[] = [];
   if (maxConcurrentGate.used >= maxConcurrentGate.limit) bindingGates.push("maxConcurrent");
-  if (maxWorktreesGate.used >= maxWorktreesGate.limit) bindingGates.push("maxWorktrees");
+  if (maxWorktreesGate && maxWorktreesGate.used >= maxWorktreesGate.limit) bindingGates.push("maxWorktrees");
   if (semaphoreGate && semaphoreGate.used >= semaphoreGate.limit) bindingGates.push("semaphore");
 
   return {
@@ -479,7 +824,7 @@ function computeConcurrencyGateDiagnostic(params: {
     semaphoreGate,
     holders: {
       maxConcurrent: [...params.inProgressTaskIds],
-      maxWorktrees: [...params.inProgressTaskIds],
+      maxWorktrees: maxWorktreesGate ? [...(params.worktreeHolderTaskIds ?? params.inProgressTaskIds)] : undefined,
       semaphore: semaphoreGate ? [...params.inProgressTaskIds] : undefined,
     },
     // U6: additive only — present when flag-ON, omitted otherwise.
@@ -487,7 +832,7 @@ function computeConcurrencyGateDiagnostic(params: {
   };
 }
 
-function formatConcurrencyLimitReason(diagnostic: ConcurrencyGateDiagnostic): string {
+export function formatConcurrencyLimitReason(diagnostic: ConcurrencyGateDiagnostic): string {
   const holdersText = (gate: ConcurrencyGateName): string => {
     const holders = diagnostic.holders[gate];
     return holders && holders.length > 0 ? holders.join(", ") : "none";
@@ -495,8 +840,20 @@ function formatConcurrencyLimitReason(diagnostic: ConcurrencyGateDiagnostic): st
   const gateLabel = diagnostic.bindingGates.join(", ");
   const details = [
     `maxConcurrent used=${diagnostic.maxConcurrentGate.used}/${diagnostic.maxConcurrentGate.limit} (holders: ${holdersText("maxConcurrent")})`,
-    `maxWorktrees used=${diagnostic.maxWorktreesGate.used}/${diagnostic.maxWorktreesGate.limit} (holders: ${holdersText("maxWorktrees")})`,
   ];
+  /*
+  FNXC:CapacityModel 2026-07-28-11:35:
+  Omit the worktree line entirely when worktrees are off. Printing
+  "maxWorktrees used=2/Infinity" would tell an operator a limiter is present and
+  merely generous, which is the opposite of true — it is not consulted at all.
+  This string is the operator's answer to "why is my card queued?", so an absent
+  dimension must be absent from the answer.
+  */
+  if (diagnostic.maxWorktreesGate) {
+    details.push(
+      `maxWorktrees used=${diagnostic.maxWorktreesGate.used}/${diagnostic.maxWorktreesGate.limit} (holders: ${holdersText("maxWorktrees")})`,
+    );
+  }
   if (diagnostic.semaphoreGate) {
     const semaphoreUsed = Math.max(0, diagnostic.semaphoreGate.used);
     details.push(
@@ -531,6 +888,8 @@ export interface SchedulerOptions {
   hasActiveAgentExecution?: (agentId: string) => boolean;
   /** Called when scheduler starts a task */
   onSchedule?: (task: Task) => void;
+  /** Advisory sibling-lane nudge when a card leaves the WIP membership set. */
+  onCapacityReleased?: (source: "wip-column") => void;
   /** Called when a task is blocked by deps */
   onBlocked?: (task: Task, blockedBy: string[]) => void;
   /** Called when a mission-linked task fails and is queued for retry handling. */
@@ -542,7 +901,7 @@ export interface SchedulerOptions {
   /** Optional lease manager used to recover stale checkout leases before scheduling. */
   leaseManager?: MeshLeaseManager;
   /** Optional MissionAutopilot for autonomous mission progression */
-  missionAutopilot?: import("./mission-autopilot.js").MissionAutopilot;
+  missionAutopilot?: import("./missions/mission-autopilot.js").MissionAutopilot;
   /**
    * Called when a task with a closed/merged PR moves out of in-review
    * and the PrMonitor has buffered actionable comments.
@@ -555,11 +914,11 @@ export interface SchedulerOptions {
     comments: PrComment[]
   ) => void | Promise<void>;
   /** Optional MissionExecutionLoop for validation cycle handling */
-  missionExecutionLoop?: import("./mission-execution-loop.js").MissionExecutionLoop;
+  missionExecutionLoop?: import("./missions/mission-execution-loop.js").MissionExecutionLoop;
   /** Optional NodeHealthMonitor for node health checks during dispatch.
    *  Reserved for FN-2722-C (unavailable node policy enforcement).
    *  Accepted here so the option can be wired at construction time. */
-  nodeHealthMonitor?: import("./node-health-monitor.js").NodeHealthMonitor;
+  nodeHealthMonitor?: import("./project/node-health-monitor.js").NodeHealthMonitor;
   /** Optional dispatch validator used to block dispatch on configuration issues before health policy checks. */
   validateNodeDispatch?: (nodeId: string) => Promise<NodeDispatchValidationResult>;
   /** Local node identifier used to distinguish self-owned leases from foreign-owned leases. Default: "local". */
@@ -596,9 +955,34 @@ export interface SchedulerOptions {
  * itself is also refreshed: if `pollIntervalMs` differs from the active
  * timer, the `setInterval` is transparently restarted.
  */
+function releaseReservedSlot(reservedSlots: number): number {
+  return Math.max(0, reservedSlots - 1);
+}
+
+/**
+ * FNXC:DependencyUnblock 2026-08-10-08:20:
+ * Dependency auto-unblock clears ONLY the `queued` blocked marker it owns — never an arbitrary lifecycle status.
+ *
+ * Both unblock paths used to write `status: null` unconditionally, meaning to undo the `status: "queued"` the
+ * blocked branch sets a few lines up. But `status` is a shared lifecycle channel, and the value most likely to
+ * be sitting there is `needs-replan` — the graph's durable replan signal, and the ONLY thing that re-admits a
+ * hold-column card to planning (`isTaskAwaitingPlanning` refuses a card whose PROMPT.md is already a real spec).
+ *
+ * FN-8923 died exactly here. Its plan node held on principal routing, triage correctly recorded
+ * `needs-replan`, and then its blocker completing nulled that status. From that moment the card was invisible
+ * to BOTH lanes: triage saw a fully-written spec with no replan flag and skipped it, while the executor's
+ * `isUnplannedForExecution` still refused to dispatch because no capacity-boundary continuation existed. It sat
+ * silent in Todo for 7+ hours with zero run-audit rows — not stuck in a retry loop, simply unowned.
+ */
+export function clearBlockedStatusOnly(dependent: Pick<Task, "status">): { status: null } | Record<string, never> {
+  return dependent.status === "queued" || dependent.status == null ? { status: null } : {};
+}
+
 export class Scheduler {
   private running = false;
   private scheduling = false;
+  private schedulingSince = 0;
+  private immediateSchedulePending = false;
   private wasWorktreeLimited = false;
   private wasGlobalPaused = false;
   private wasEnginePaused = false;
@@ -607,6 +991,20 @@ export class Scheduler {
   private activePollMs: number | null = null;
   /** Tracks which task IDs are currently paused, to detect unpause transitions. */
   private pausedTaskIds = new Set<string>();
+  /**
+   * FNXC:CodingIdeasWorkflow 2026-07-25-13:10:
+   * Tracks task IDs last seen with status "planning", so the planning -> dispatchable transition
+   * can trigger an immediate scheduling pass. Plan-in-place workflows clear status without a
+   * task:moved, so this is the only signal that the card just became executable.
+   */
+  private planningTaskIds = new Set<string>();
+  /*
+  FNXC:PlanReviewApproval 2026-08-04-00:26:
+  Wake dispatch on the observed hold edge or the durable approval marker. The latter covers a
+  restart or cross-process update that did not deliver the earlier awaiting-approval event.
+  */
+  private approvalHeldTaskIds = new Set<string>();
+  private approvalReleasedTaskIds = new Set<string>();
   /** Tracks mission-linked tasks observed with status=failed before moveTask clears status/error. */
   private failedTaskIds = new Set<string>();
   /** Tracks tasks blocked by unavailable-node policy to deduplicate block log entries. */
@@ -617,6 +1015,8 @@ export class Scheduler {
   private wasPermanentAgentUnavailable = new Set<string>();
   /** Tracks dispatch-queued reason signatures to avoid per-tick log spam. */
   private wasDispatchQueuedReasonLogged = new Set<string>();
+  /** Tracks per-task symbol-lock renewal outcomes so a persistent loss/error reports once, not once per poll. */
+  private readonly symbolLockRenewalLog = createRepeatSuppressedLog();
   /** Tracks per-task candidacy fingerprints for task:updated auto-claim invalidation gating. */
   private lastAutoClaimFingerprint = new Map<string, string>();
   /** Tracks recent engine-sourced in-progress → todo requeues to prevent immediate re-dispatch races. */
@@ -630,6 +1030,11 @@ export class Scheduler {
   private lastHeartbeatWriteMs = 0;
   private idleSemaphoreLeakCandidateSince: number | null = null;
   private readonly lastHighOverlapFanoutWarningKey = new Map<string, string>();
+  /** Coordinator reservations survive the lane poll that selected them. */
+  private readonly coordinatorAdmittedTaskIds = new Set<string>();
+  /** Durable execute candidates refreshed on each scheduler pass for cross-lane ranking. */
+  private readonly coordinatorReadyTasks = new Map<string, Task>();
+  private unregisterAdmissionProvider?: () => void;
 
   /**
    * Async listener guard convention:
@@ -653,6 +1058,31 @@ export class Scheduler {
       projectId: this.store.getRootDir(),
       logger: schedulerLog,
     });
+    /*
+    FNXC:ConcurrencyAdmission 2026-07-21-22:30:
+    FN-8453's union must outlive a single scheduler poll. A temporary provider
+    was gone before planning/merge asked for capacity, allowing newer work to
+    overtake ready execute work. The refreshed map is the durable lane view.
+    */
+    const projectId = this.store.getRootDir();
+    this.unregisterAdmissionProvider = projectAdmissionCoordinator.registerProvider(`execute:${projectId}`, {
+      projectId,
+      refresh: async () => [...this.coordinatorReadyTasks.values()]
+        .filter((task) => !this.coordinatorAdmittedTaskIds.has(task.id))
+        .map((task) => ({
+          taskId: task.id,
+          projectId,
+          lane: "execute",
+          consumesWorktree: true,
+          createdAt: task.createdAt,
+          reserve: () => registerPreHeldExecutorSlot(task.id, this.options.semaphore !== undefined),
+          start: async () => {
+            this.coordinatorReadyTasks.delete(task.id);
+            this.coordinatorAdmittedTaskIds.add(task.id);
+            this.requestImmediateSchedule();
+          },
+        })),
+    });
     /**
      * Event-driven scheduling: when a task is created, trigger a scheduling
      * pass immediately instead of waiting for the next poll interval.
@@ -661,8 +1091,13 @@ export class Scheduler {
     this.store.on("task:created", (task) => {
       this.lastAutoClaimFingerprint.set(task.id, computeAutoClaimFingerprint(task));
       this.options.snapshotManager?.invalidate("task:created");
-      schedulerLog.log("Task created — triggering scheduling");
-      this.schedule();
+      /*
+      FNXC:EngineDiagnostics 2026-08-03-05:54:
+      Event-driven schedule triggers fire on every create/done; the card transition is already
+      visible on the board and via task:moved logs. Keep the trigger line debug-only.
+      */
+      schedulerLog.debug("Task created — triggering scheduling");
+      this.requestImmediateSchedule();
     });
 
     /**
@@ -671,12 +1106,12 @@ export class Scheduler {
      * for the next poll interval (up to 15 s). Only reacts to true→false
      * transitions — no-ops on false→false and true→true.
      *
-     * The re-entrance guard (`this.scheduling`) inside `schedule()` safely
-     * drops the call if a poll-based pass is already in flight.
+     * The coalesced immediate-schedule primitive preserves one follow-up pass
+     * when a poll-based pass is already in flight.
      */
     this.store.on("settings:updated", ({ settings, previous }) => {
       if (previous.globalPause && !settings.globalPause && this.running) {
-        this.schedule();
+        this.requestImmediateSchedule();
       }
     });
 
@@ -688,7 +1123,7 @@ export class Scheduler {
      */
     this.store.on("settings:updated", ({ settings, previous }) => {
       if (previous.enginePaused && !settings.enginePaused && this.running) {
-        this.schedule();
+        this.requestImmediateSchedule();
       }
     });
 
@@ -699,20 +1134,43 @@ export class Scheduler {
      * Also handles mission auto-advance: when a linked task completes,
      * update feature status and potentially activate next pending slice.
      */
-    this.store.on("task:moved", async ({ task, from, to, source }) => {
+    this.store.on("task:moved", async ({ task, from, to, source, lanes }) => {
+      /*
+      FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073):
+      A fresh per-event selectionCache shared by every park-resolution in this handler. The same task
+      can be parked-resolved up to 4x in one move (merge, unpause, planning-finished, approval-cleared)
+      and each used to be a separate DB read of task_workflow_selection. One Map per task:moved event
+      collapses them to a single read. Must not outlive this event: a selection write in a later poll
+      is observed on that poll's OWN fresh cache.
+      */
+      const movedSelectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
       this.lastAutoClaimFingerprint.set(task.id, computeAutoClaimFingerprint(task));
-      if (from === "todo" || to === "todo") {
+      /*
+      FNXC:WorkflowResolvedColumns 2026-08-01-05:01:
+      The synchronous prologue must remain in the emitter tick: snapshot invalidation, PR monitor
+      transitions, mission hand-off, and failure tracking are ordered by
+      `scheduler-auto-claim-invalidation.test.ts`. It therefore reads emitter-carried lanes over
+      legacy defaults without awaiting. The two SQLite polling-replica emitters that carry no lanes
+      retain that legacy behavior; PostgreSQL emitters carry lanes.
+
+      Every later arm is already behind an await, so it resolves the task's workflow asynchronously
+      instead of consulting the production-inert sync resolver. This covers forwarded or lane-less
+      payloads without changing synchronous ordering. Terminal remains a membership union so a second
+      complete-trait column reconciles dependents too.
+      */
+      const parked = mergeParkedColumns(LEGACY_PARKED_COLUMNS, lanes);
+      if (from === parked.hold || to === parked.hold) {
         this.options.snapshotManager?.invalidate(`task:moved:${from}->${to}`);
       }
       // PR Monitoring
       if (this.options.prMonitor) {
-        if (to === "in-review" && task.prInfo) {
+        if (to === parked.review && task.prInfo) {
           // Start monitoring existing PR
           const repo = getCurrentRepo(this.store.getRootDir());
           if (repo) {
             this.options.prMonitor.startMonitoring(task.id, repo.owner, repo.repo, task.prInfo);
           }
-        } else if (from === "in-review" && to !== "in-review") {
+        } else if (from === parked.review && to !== parked.review) {
           // If task has a closed/merged PR, drain buffered comments before
           // stopping monitoring (drainComments needs the tracked PR to still exist)
           if (task.prInfo && (task.prInfo.status === "closed" || task.prInfo.status === "merged")) {
@@ -741,7 +1199,7 @@ export class Scheduler {
 
       // Mission failure tracking: status/error are cleared during moveTask(in-progress → todo),
       // so we pair this with failedTaskIds captured from task:updated events.
-      if (task.sliceId && to === "todo" && this.options.onTaskFailed) {
+      if (task.sliceId && to === parked.hold && this.options.onTaskFailed) {
         if (task.status === "failed" || this.failedTaskIds.has(task.id)) {
           this.failedTaskIds.delete(task.id);
           void Promise.resolve(this.options.onTaskFailed(task.id)).catch((err) => {
@@ -750,14 +1208,54 @@ export class Scheduler {
         }
       }
 
+      /*
+      FNXC:SchedulerDispatchOscillation 2026-08-02-17:20:
+      The settle-window ledger (`recentEngineTodoRequeues`) and the dispatch-oscillation reset are
+      CONSUMED SYNCHRONOUSLY, so they must stay in the emitter tick with the rest of the synchronous
+      prologue — reading the sync, emitter-lane-aware `parked`, never the async `resolvedParked`.
+      FN-8656 moved these two arms behind `await resolveTaskParkedColumns` while converting lane
+      lookups; that broke the ordering against the synchronous `task:deleted`/`task:updated`
+      handlers, which also mutate `recentEngineTodoRequeues`/oscillation state. Concretely: a card
+      requeued to hold then deleted in the same tick had its settle-window SET run a microtask AFTER
+      the delete's synchronous CLEAR, so the guard survived deletion and the card never re-dispatched
+      (todo-inprogress-flapping.test.ts "clears the settle-window guard when the task is deleted" and
+      "resets dispatch oscillation state on forward transition to in-review"). This obeys FN-8656's
+      own stated rule: convert to the async resolver ONLY where the answer is consumed asynchronously.
+      Production emitters carry lanes, so `parked` resolves renamed hold/wip/review columns here too;
+      the lane-less SQLite polling emitters retain the legacy fallback exactly as before.
+      */
+      if (from === parked.wip && to === parked.hold) {
+        if (source === "engine") {
+          this.recentEngineTodoRequeues.set(task.id, task.columnMovedAt ?? new Date().toISOString());
+        } else {
+          this.recentEngineTodoRequeues.delete(task.id);
+        }
+      } else if (to === parked.review || parked.terminal.has(to)) {
+        this.recentEngineTodoRequeues.delete(task.id);
+        if (task.dispatchStormCount != null || task.lastDispatchAt != null || task.executeRequeueLoopCount != null || task.executeRequeueLoopSignature != null) {
+          void this.store.updateTask(task.id, {
+            dispatchStormCount: null,
+            lastDispatchAt: null,
+            executeRequeueLoopCount: null,
+            executeRequeueLoopSignature: null,
+          }).catch((error) => {
+            schedulerLog.warn(`Failed to reset dispatch oscillation state for ${task.id} on move to ${to}: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
+      }
+
+      const resolvedParked = mergeParkedColumns(await resolveTaskParkedColumns(this.store, task.id, movedSelectionCache), lanes);
+
       // FN-3895/FN-3924: complement periodic stale-blockedBy self-healing with immediate
       // blocker reconciliation when a potential blocker reaches a terminal completion column.
       // Invariant: blockedBy must reference a *current* unresolved blocker, else be null.
-      if (to === "done" || to === "archived") {
+      if (resolvedParked.terminal.has(to)) {
         try {
           const settings = await this.store.getSettings();
           if (!settings.globalPause && !settings.enginePaused) {
-            const todoTasks = await this.store.listTasks({ column: "todo", slim: true });
+            const todoTasks = await this.store.listTasks({ column: resolvedParked.hold, slim: true });
+            /* One IR cache for the whole reconciliation, per the caller-owned-cache contract. */
+            const dependencySatisfactionIrCache = new Map<string, WorkflowIr>();
             for (const dependent of todoTasks) {
               const mentionsCompletedTask = dependent.dependencies.includes(task.id);
               const currentlyBlockedByCompletedTask = dependent.blockedBy === task.id;
@@ -773,17 +1271,25 @@ export class Scheduler {
               const dependencyTasks = (await Promise.all(
                 dependent.dependencies.map((dependencyId) => this.store.getTask(dependencyId).catch(() => null)),
               )).filter((candidate) => candidate !== null);
+              const satisfactionColumnsByTaskId = await resolveDependencySatisfactionColumns(
+                this.store,
+                [task, ...dependencyTasks],
+                dependencySatisfactionIrCache,
+              );
               const unresolvedDeps = getUnmetSchedulingDependencies(
                 dependent,
                 [dependent, task, ...dependencyTasks],
-                markerAcceptedByTaskId
-                  ? {
-                    markerAcceptedByTaskId,
-                    onParityDiff: (diff) => {
-                      this.emitDependencyParityDiff(diff);
-                    },
-                  }
-                  : undefined,
+                {
+                  satisfactionColumnsByTaskId,
+                  ...(markerAcceptedByTaskId
+                    ? {
+                      markerAcceptedByTaskId,
+                      onParityDiff: (diff: SchedulingDependencyParityDiff) => {
+                        this.emitDependencyParityDiff(diff);
+                      },
+                    }
+                    : {}),
+                },
               );
 
               try {
@@ -797,7 +1303,7 @@ export class Scheduler {
                     `Auto-reblocked: unresolved dependency ${unresolvedDeps[0]} remains after ${task.id} reached ${to}`,
                   );
                 } else {
-                  await this.store.updateTask(dependent.id, { blockedBy: null, status: null });
+                  await this.store.updateTask(dependent.id, { blockedBy: null, ...clearBlockedStatusOnly(dependent) });
                   const unblockMessage = currentlyBlockedByCompletedTask
                     ? `Auto-unblocked: blocker ${task.id} reached ${to}`
                     : `Auto-unblocked: blocker ${task.id} reached ${to} — all dependencies satisfied`;
@@ -816,32 +1322,28 @@ export class Scheduler {
         }
       }
 
-      if (from === "in-progress" && to === "todo") {
-        if (source === "engine") {
-          this.recentEngineTodoRequeues.set(task.id, task.columnMovedAt ?? new Date().toISOString());
-        } else {
-          this.recentEngineTodoRequeues.delete(task.id);
-        }
-      } else if (to === "in-review" || to === "done" || to === "archived") {
-        this.recentEngineTodoRequeues.delete(task.id);
-        if (task.dispatchStormCount != null || task.lastDispatchAt != null || task.executeRequeueLoopCount != null || task.executeRequeueLoopSignature != null) {
-          void this.store.updateTask(task.id, {
-            dispatchStormCount: null,
-            lastDispatchAt: null,
-            executeRequeueLoopCount: null,
-            executeRequeueLoopSignature: null,
-          }).catch((error) => {
-            schedulerLog.warn(`Failed to reset dispatch oscillation state for ${task.id} on move to ${to}: ${error instanceof Error ? error.message : String(error)}`);
-          });
+      /*
+      FNXC:WorkflowScheduling 2026-08-28-21:24:
+      A card leaving the resolved capacity-column membership frees a project slot. Wake the execution lane and nudge the planning sibling at that event rather than waiting for the timer backstop; the normal admission coordinator and lifecycle gates still decide whether any card can start.
+      */
+      const vacatedCapacitySlot = resolvedParked.wipColumns.has(from) && !resolvedParked.wipColumns.has(to);
+      if (vacatedCapacitySlot && this.running) {
+        try {
+          this.options.onCapacityReleased?.("wip-column");
+        } catch (error) {
+          schedulerLog.warn(`Capacity-release wake listener failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 
-      // Event-driven scheduling: when a task moves to "done" (completion) or "todo" (retry/manual move),
-      // trigger scheduling immediately so waiting tasks can start without waiting
-      // for the next poll interval (up to 15 seconds).
-      if (to === "done" || to === "todo") {
-        schedulerLog.log(`Task moved to ${to} — triggering scheduling`);
-        this.schedule();
+      // Event-driven scheduling: terminal, hold, or capacity-vacating moves trigger one pass.
+      const shouldWakeForCapacity = vacatedCapacitySlot && this.running;
+      if (resolvedParked.terminal.has(to) || to === resolvedParked.hold || shouldWakeForCapacity) {
+        /*
+        FNXC:EngineDiagnostics 2026-08-03-05:54:
+        Duplicate of the column-move lifecycle line; schedule side-effect is not operator-facing.
+        */
+        schedulerLog.debug(`Task moved to ${to} — triggering scheduling`);
+        this.requestImmediateSchedule();
       }
     });
 
@@ -849,16 +1351,34 @@ export class Scheduler {
      * PR Monitoring: Start monitoring when PR is linked to an in-review task.
      * Also detects task-level unpause transitions and triggers immediate scheduling.
      */
-    this.store.on("task:updated", (task) => {
+    this.store.on("task:updated", (task, meta) => {
+      /*
+      FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073):
+      A fresh per-update selectionCache shared by every park-resolution wake in this handler (unpause,
+      planning-finished, approval-cleared). One task:updated can clear all three trackers for the same
+      task in a single event, and each wake used to be its own DB read of task_workflow_selection. One
+      Map per task:updated event collapses them to a single read per task per event. Fresh per event so a
+      selection write in a later event/poll is observed on that event's own cache — never a global/infinite LRU.
+      */
+      const updatedSelectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
       const nextFingerprint = computeAutoClaimFingerprint(task);
       const previousFingerprint = this.lastAutoClaimFingerprint.get(task.id);
       if (!previousFingerprint || previousFingerprint !== nextFingerprint) {
         this.lastAutoClaimFingerprint.set(task.id, nextFingerprint);
         this.options.snapshotManager?.invalidate("task:updated");
       }
+      /*
+      FNXC:WorkflowEvents 2026-08-01-07:14:
+      TaskStore decorates `task:updated` with its cache-warmed lanes, letting the failure and PR
+      edge-trigger guards remain synchronous on renamed boards. A missing payload is unknown, not a
+      legacy claim, so its fallback stays literal instead of consulting PostgreSQL's default-only sync
+      resolver; that preserves existing bridge and cold-cache behaviour without reordering listeners.
+      */
+      const eventLanes = meta?.lanes;
+      // DELIBERATE-LITERAL — absent event metadata is unknown, so the legacy wip fallback stays explicit.
       // Track mission failure signals before moveTask clears failure metadata.
       if (task.sliceId && task.status === "failed") {
-        if (task.column === "in-progress") this.failedTaskIds.add(task.id);
+        if (eventLanes ? task.column === eventLanes.wip : task.column === "in-progress") this.failedTaskIds.add(task.id);
         /*
         FNXC:MissionReconciliation 2026-08-01-00:00:
         In-place failure parks do not emit task:moved, but they release the
@@ -876,7 +1396,7 @@ export class Scheduler {
       // When a previously-paused task is unpaused in a schedulable column,
       // trigger a scheduling pass immediately instead of waiting for the next
       // poll interval (up to 15 seconds).
-      if (task.paused) {
+      if (task.paused || task.userPaused) {
         this.pausedTaskIds.add(task.id);
       } else if (this.pausedTaskIds.has(task.id)) {
         // Task was paused, now unpaused — trigger scheduling
@@ -891,14 +1411,89 @@ export class Scheduler {
             schedulerLog.warn(`Failed to reset dispatch oscillation state for ${task.id} on unpause: ${error instanceof Error ? error.message : String(error)}`);
           });
         }
-        if (this.running && (task.column === "todo" || task.column === "triage")) {
-          schedulerLog.log(`Task ${task.id} unpaused — triggering scheduling`);
-          this.schedule();
-        }
+        /* FNXC:WorkflowResolvedColumns 2026-07-31-06:35 (fleet): the answer only gates `schedule()`,
+           which is async and fire-and-forget, so resolving it properly costs nothing observable. */
+        void (async () => {
+          const unpausedParked = await resolveTaskParkedColumns(this.store, task.id, updatedSelectionCache);
+          if (this.running && unpausedParked.wake.has(task.column)) {
+            schedulerLog.log(`Task ${task.id} unpaused — triggering scheduling`);
+            this.requestImmediateSchedule();
+          }
+        })();
+      }
+
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-25-13:10:
+      Dispatch the moment planning finishes, instead of waiting out the poll timer.
+
+      This closes the second half of the "started card does nothing" gap. Triage's finalize clears
+      `status` in place (it deliberately skips the triage->todo move for plan-in-place workflows), so
+      the card becomes dispatchable via a bare task:updated with no task:moved and no pause
+      transition — none of the existing event wakes above fire for it. The operator therefore paid
+      pollIntervalMs (15s default) for planning to start AND another one for execution to start.
+
+      Same shape as the pausedTaskIds tracker above: remember ids seen mid-planning, then fire once
+      on the transition back to a dispatchable state. Guarded on `!task.status` so a planning ->
+      failed/awaiting-approval park does not trigger a pointless pass, and on column so a card
+      finishing planning somewhere unschedulable is ignored. The immediate request coalesces one
+      follow-up when a poll-based pass is already running.
+      */
+      if (task.status === "planning") {
+        this.planningTaskIds.add(task.id);
+      } else if (this.planningTaskIds.has(task.id)) {
+        this.planningTaskIds.delete(task.id);
+        /* FNXC:WorkflowResolvedColumns 2026-07-31-06:35 (fleet): as with the unpause wake above, the
+           answer only gates `schedule()`. The `planningTaskIds.delete` stays SYNCHRONOUS — it is the
+           edge-trigger bookkeeping, and deferring it would let a second update re-enter this branch. */
+        void (async () => {
+          const planningParked = await resolveTaskParkedColumns(this.store, task.id, updatedSelectionCache);
+          if (
+            this.running
+            && !task.status
+            && !task.paused
+            && !task.userPaused
+            && planningParked.wake.has(task.column)
+          ) {
+            schedulerLog.log(`Task ${task.id} finished planning — triggering scheduling`);
+            this.requestImmediateSchedule();
+          }
+        })();
+      }
+
+      if (task.status === "awaiting-approval") {
+        this.approvalHeldTaskIds.add(task.id);
+        this.approvalReleasedTaskIds.delete(task.id);
+      } else if (
+        !task.status
+        && !task.paused
+        && !task.userPaused
+        && (
+          this.approvalHeldTaskIds.delete(task.id)
+          || (
+            (Boolean(task.approvedPlanFingerprint) || task.workflowStepResults?.some(isPlanReviewSatisfied) === true)
+            && !this.approvalReleasedTaskIds.has(task.id)
+          )
+        )
+      ) {
+        this.approvalReleasedTaskIds.add(task.id);
+        void (async () => {
+          const approvalParked = await resolveTaskParkedColumns(this.store, task.id, updatedSelectionCache);
+          if (
+            this.running
+            && !task.status
+            && !task.paused
+            && !task.userPaused
+            && approvalParked.wake.has(task.column)
+          ) {
+            schedulerLog.log(`Task ${task.id} plan approval cleared — triggering scheduling`);
+            this.requestImmediateSchedule();
+          }
+        })();
       }
 
       if (!this.options.prMonitor) return;
-      if (task.column !== "in-review") return;
+      // DELIBERATE-LITERAL — runtime bridges drop lanes; never replace this unknown fallback with the sync resolver.
+      if (eventLanes ? task.column !== eventLanes.review : task.column !== "in-review") return;
       if (!task.prInfo) return;
 
       // Check if we're already monitoring this task
@@ -918,6 +1513,11 @@ export class Scheduler {
       this.lastAutoClaimFingerprint.delete(task.id);
       this.options.snapshotManager?.invalidate("task:deleted");
       this.pausedTaskIds.delete(task.id);
+      // FNXC:CodingIdeasWorkflow 2026-07-25-13:10: drop planning tracking with the other per-task
+      // sets so a deleted-mid-planning id cannot leak or fire a stale wake if the id is reused.
+      this.planningTaskIds.delete(task.id);
+      this.approvalHeldTaskIds.delete(task.id);
+      this.approvalReleasedTaskIds.delete(task.id);
       this.failedTaskIds.delete(task.id);
       this.recentEngineTodoRequeues.delete(task.id);
       this.wasNodeDispatchValidationBlocked.delete(task.id);
@@ -932,9 +1532,30 @@ export class Scheduler {
             return;
           }
 
-          const todoTasks = await this.store.listTasks({ column: "todo", slim: true });
-          const inProgressTasks = await this.store.listTasks({ column: "in-progress", slim: true });
+          /* FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073): per-deleted-event selection cache. */
+          const deletedSelectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
+          const deletedParked = await resolveTaskParkedColumns(this.store, task.id, deletedSelectionCache);
+          /*
+          FNXC:WorkflowLifecycleColumns 2026-07-30-20:55:
+          A HALF-CONVERTED PAIR, one line apart. The hold read above already resolved its lane while
+          the wip read below stayed on the literal, so on a renamed board this dependent sweep saw
+          the queued cards and none of the running ones — a dependency held by an in-flight task was
+          never reconciled when that task was deleted.
+
+          Two reads of the same board, one resolved and one not, is the shape this program keeps
+          finding; that they are adjacent is what makes it easy to miss in review rather than easy to
+          catch.
+          */
+          const deletedWipColumns = await resolveProjectColumnsForRoles(this.store, ["countsTowardWip"]);
+          const todoTasks = await this.store.listTasks({ column: deletedParked.hold, slim: true });
+          const inProgressById = new Map<string, Task>();
+          for (const column of deletedWipColumns) {
+            for (const task of await this.store.listTasks({ column, slim: true })) inProgressById.set(task.id, task);
+          }
+          const inProgressTasks = [...inProgressById.values()];
           const dependents = [...todoTasks, ...inProgressTasks];
+          /* One IR cache for the whole reconciliation, per the caller-owned-cache contract. */
+          const deletedDependencyIrCache = new Map<string, WorkflowIr>();
 
           for (const dependent of dependents) {
             const mentionsDeletedTask = dependent.dependencies.includes(task.id);
@@ -947,17 +1568,25 @@ export class Scheduler {
             const dependencyTasks = (await Promise.all(
               dependent.dependencies.map((dependencyId) => this.store.getTask(dependencyId).catch(() => null)),
             )).filter((candidate) => candidate !== null);
+            const satisfactionColumnsByTaskId = await resolveDependencySatisfactionColumns(
+              this.store,
+              dependencyTasks,
+              deletedDependencyIrCache,
+            );
             const unresolvedDeps = getUnmetSchedulingDependencies(
               dependent,
               [dependent, ...dependencyTasks],
-              markerAcceptedByTaskId
-                ? {
-                  markerAcceptedByTaskId,
-                  onParityDiff: (diff) => {
-                    this.emitDependencyParityDiff(diff);
-                  },
-                }
-                : undefined,
+              {
+                satisfactionColumnsByTaskId,
+                ...(markerAcceptedByTaskId
+                  ? {
+                    markerAcceptedByTaskId,
+                    onParityDiff: (diff: SchedulingDependencyParityDiff) => {
+                      this.emitDependencyParityDiff(diff);
+                    },
+                  }
+                  : {}),
+              },
             );
 
             try {
@@ -971,8 +1600,8 @@ export class Scheduler {
                   dependent.id,
                   `Auto-reblocked (FN-5496): unresolved dependency ${nextBlocker} remains after blocker ${task.id} was soft-deleted`,
                 );
-              } else if (dependent.column === "todo") {
-                await this.store.updateTask(dependent.id, { blockedBy: null, status: null });
+              } else if (dependent.column === deletedParked.hold) {
+                await this.store.updateTask(dependent.id, { blockedBy: null, ...clearBlockedStatusOnly(dependent) });
                 await this.store.logEntry(dependent.id, `Auto-unblocked (FN-5496): blocker ${task.id} was soft-deleted`);
               } else {
                 await this.store.updateTask(dependent.id, { blockedBy: null });
@@ -983,7 +1612,7 @@ export class Scheduler {
             }
           }
 
-          this.schedule();
+          this.requestImmediateSchedule();
         } catch (error) {
           schedulerLog.error(`Failed event-driven soft-delete blocker reconciliation for ${task.id}`, error);
         }
@@ -995,10 +1624,25 @@ export class Scheduler {
    * Validate that a task's filesystem state is intact.
    * Checks that the task directory exists and PROMPT.md is present and non-empty.
    * 
-   * @param id - The task ID to validate
+   * @param task - The task (id + title) to validate
    * @returns Object with `valid: true` if checks pass, or `valid: false` with a `reason` string if they fail
    */
-  private async validateTaskFilesystem(id: string): Promise<{ valid: boolean; reason?: string }> {
+  private async validateTaskFilesystem(task: Pick<Task, "id" | "title">): Promise<{ valid: boolean; reason?: string }> {
+    const id = task.id;
+    /*
+    FNXC:DuplicateIntake 2026-08-09-01:02:
+    A title redirect is available without filesystem capability or PROMPT.md I/O. Refuse it first
+    so minimal stores and missing artifacts cannot dispatch a task the operator explicitly marked
+    DUPLICATE.
+
+    FNXC:DuplicateIntake 2026-08-23-23:20:
+    RESTORED. Wave 18's "behavior-preserving" peel (1cf86baa1c) reverted this parameter back to a
+    bare id, which silently dropped both the title-first refusal and the title argument below, so a
+    title-only redirect became dispatchable again. `scheduler-explicit-duplicate-marker.test.ts` is
+    the guard that caught it.
+    */
+    const titleRedirect = nonExecutableDuplicateRedirectReason(null, task.title);
+    if (titleRedirect) return { valid: false, reason: titleRedirect };
     if (typeof this.store.getTasksDir !== "function") {
       /*
       FNXC:WorkflowScheduling 2026-06-23-11:38:
@@ -1023,6 +1667,15 @@ export class Scheduler {
       const content = await readFile(promptPath, "utf-8");
       if (!content || content.trim().length === 0) {
         return { valid: false, reason: "missing or empty PROMPT.md" };
+      }
+      /*
+      FNXC:DuplicateIntake 2026-08-01-19:24:
+      Non-empty is not enough: a sole `DUPLICATE: FN-####` line is a triage redirect, not a
+      plan. Admitting it (FN-8704) fails the graph at `parse` and parks failed WIP in a loop.
+      */
+      const duplicateOnly = nonExecutableDuplicateRedirectReason(content, task.title);
+      if (duplicateOnly) {
+        return { valid: false, reason: duplicateOnly };
       }
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1062,6 +1715,7 @@ export class Scheduler {
 
   stop(): void {
     this.running = false;
+    this.immediateSchedulePending = false;
     if (this.pollInterval) {
       clearInterval(this.pollInterval);
       this.pollInterval = null;
@@ -1075,11 +1729,15 @@ export class Scheduler {
     if (this.options.missionAutopilot) {
       this.options.missionAutopilot.stop();
     }
+    this.unregisterAdmissionProvider?.();
+    this.unregisterAdmissionProvider = undefined;
+    this.coordinatorReadyTasks.clear();
     this.failedTaskIds.clear();
     this.wasNodeBlocked.clear();
     this.wasNodeDispatchValidationBlocked.clear();
     this.wasPermanentAgentUnavailable.clear();
     this.wasDispatchQueuedReasonLogged.clear();
+    this.symbolLockRenewalLog.reset();
     schedulerLog.log("Stopped");
   }
 
@@ -1089,6 +1747,33 @@ export class Scheduler {
         this.wasDispatchQueuedReasonLogged.delete(key);
       }
     }
+  }
+
+  private async transitionQueuedEpisode(
+    task: Task,
+    input: { signature: string; blockedBy: string | null; overlapBlockedBy: string | null; action: string },
+  ): Promise<boolean> {
+    /*
+    FNXC:RUFU-075 2026-08-13-03:16:
+    The review-lease and dependency overlap-queue writes historically went straight through
+    `store.updateTask(…, { status: "queued", …, overlapBlockedBy })`. FN-8785 moved them onto the
+    store's atomic `transitionQueuedEpisode` helper (advisory-locked, edge-triggered queue logging).
+    A minimal/legacy store that does not implement `transitionQueuedEpisode` (as several scheduler
+    test mocks and older store shims do not) must still receive a correct queue write, or the lease
+    overlap / dependency block is silently dropped. Mirror the FN-8806 convention already used by
+    `executor/dependency-dispatch-gate.ts`: require the method before using it, and fall back to the
+    pre-FN-8785 `updateTask` + `logEntry` contract otherwise, so `overlapBlockedBy` reaches the row.
+    */
+    if (typeof this.store.transitionQueuedEpisode === "function") {
+      return (await this.store.transitionQueuedEpisode(task.id, input)).appended;
+    }
+    await this.store.updateTask(task.id, {
+      status: "queued",
+      blockedBy: input.blockedBy ?? null,
+      overlapBlockedBy: input.overlapBlockedBy ?? null,
+    });
+    await this.logDispatchQueuedReason(task.id, input.action);
+    return true;
   }
 
   private async logDispatchQueuedReason(taskId: string, reason: string, memoKey?: string): Promise<boolean> {
@@ -1104,7 +1789,7 @@ export class Scheduler {
   }
 
   private emitDependencyParityDiff(diff: SchedulingDependencyParityDiff): void {
-    void this.store.recordRunAuditEvent?.({
+    void emitBoundedRunAudit(this.store, {
       taskId: diff.taskId,
       agentId: "scheduler",
       runId: generateSyntheticRunId("scheduler", diff.taskId),
@@ -1116,7 +1801,7 @@ export class Scheduler {
         legacyResult: diff.legacySatisfied,
         markerResult: diff.markerSatisfied,
       },
-    });
+    }, { log: schedulerLog });
   }
 
   private async emitNodeUnreachableRecoveryAudit(
@@ -1158,7 +1843,99 @@ export class Scheduler {
   }
 
   private async emitHighOverlapFanoutWarnings(tasks: Task[]): Promise<void> {
-    const fanoutMap = computeBlockerFanoutMap(tasks, 3);
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-11:10:
+    WIRING THE ESCALATION LANES — the option existed and nothing in production filled it.
+
+    `computeBlockerFanoutMap`'s `escalationColumns` was added as an optional resolved answer and this,
+    its only production caller, passed nothing. So on a renamed board `shouldEscalate` was false for
+    every blocker and the warning below reported a long-standing bottleneck as `temporary` forever.
+    The fan-out COUNT was correct throughout, which is what makes it quiet: the message names a real
+    problem and mis-states its age.
+
+    FLAT SET, DELIBERATELY, and the limit is worth naming: `escalationColumns` is board-wide, so on a
+    board spanning workflows this unions every workflow's active lanes. An id one workflow calls wip
+    and another calls something else is therefore treated as active for both. That over-approximates
+    in the CHEAP direction here — the cost is a bottleneck warning reading `long-lived` slightly too
+    eagerly, never a missed one — and it matches how `terminalColumns`/`reviewColumns` are already
+    passed in this file. A per-task answer would need the `classify`-shaped option this module
+    documents for the cases where the distinction actually bites.
+
+    One IR cache for the sweep, per the caller-owned-cache contract.
+    */
+    const escalationIrCache = new Map<string, Awaited<ReturnType<typeof resolveWorkflowIrForTask>>>();
+    /* FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073): per-sweep selection cache shared by every
+       task in this board-wide fanout loop, so workflow_selection is read once per task per sweep
+       (the sweep is one poll pass). Must not outlive the pass — a selection write in a later poll
+       is observed on that poll's OWN fresh cache — never a global/infinite LRU. */
+    const escalationSelectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
+    /* Per-task, keyed by id — see the `escalationClassify` note in blocker-fanout.ts. The flat set is
+       still built alongside it as the legacy fallback for tasks whose workflow will not resolve. */
+    const escalationByTaskId = new Map<string, boolean>();
+    const escalationColumns = new Set<string>();
+    const holdByTaskId = new Map<string, boolean>();
+    const terminalByTaskId = new Map<string, boolean>();
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-31-18:40:
+    The REVIEW half was still unwired after the escalation fix, and I only found it by auditing the
+    rest of the flat-set class rather than by any guard.
+
+    `computeBlockerFanoutMap` feeds `reviewColumns` to `isStaleBlockedByBlocker`, which decides
+    whether a paused or retry-exhausted review blocker still counts as blocking its dependents. This
+    call passed `classify`, `escalationClassify` and `escalationColumns` and NOT this one, so that
+    half ran on the legacy `{in-review}` while everything beside it was resolved — the
+    half-converted-pair shape, inside a call site I had already converted twice.
+
+    Notably my own unwired-parameter guard cannot see it: `reviewColumns` is mentioned in
+    `task-priority.ts`, so the name reads as used. That blind spot is documented in the guard's header.
+    */
+    const blockerReviewColumns = new Set<string>();
+    for (const task of tasks) {
+      const ir = await resolveWorkflowIrForTask(this.store, task.id, escalationIrCache, escalationSelectionCache).catch(() => undefined);
+      if (!ir) continue;
+      for (const id of columnsWithFlag(ir, "countsTowardWip")) escalationColumns.add(id);
+      for (const id of columnsWithFlag(ir, "mergeOrchestration")) escalationColumns.add(id);
+      for (const id of columnsWithFlag(ir, "mergeBlocker")) escalationColumns.add(id);
+      for (const id of columnsWithFlag(ir, "humanReview")) escalationColumns.add(id);
+      escalationByTaskId.set(task.id, [
+        ...columnsWithFlag(ir, "countsTowardWip"),
+        ...columnsWithFlag(ir, "mergeOrchestration"),
+        ...columnsWithFlag(ir, "mergeBlocker"),
+        ...columnsWithFlag(ir, "humanReview"),
+      ].includes(task.column));
+      for (const id of columnsWithFlag(ir, "mergeOrchestration")) blockerReviewColumns.add(id);
+      for (const id of columnsWithFlag(ir, "mergeBlocker")) blockerReviewColumns.add(id);
+      for (const id of columnsWithFlag(ir, "humanReview")) blockerReviewColumns.add(id);
+      holdByTaskId.set(task.id, columnsWithFlag(ir, "hold").includes(task.column));
+      terminalByTaskId.set(
+        task.id,
+        columnsWithFlag(ir, "complete").includes(task.column),
+      );
+    }
+    const fanoutMap = computeBlockerFanoutMap(tasks, 3, {
+      ...(escalationColumns.size > 0 ? { escalationColumns } : {}),
+      ...(blockerReviewColumns.size > 0 ? { reviewColumns: blockerReviewColumns } : {}),
+      /* Per-task answer where the workflow resolved; the flat set above covers the rest. */
+      escalationClassify: (task: Task) => escalationByTaskId.get(task.id) ?? escalationColumns.has(task.column),
+      /*
+      `classify` is PER TASK, which this module documents as the only correct option on a board
+      spanning workflows — and it is required here for a reason the escalation half alone would have
+      hidden: `overlapBlockedTodoCount` counts dependents in the HOLD lane, whose flat default is
+      `"todo"`. On a renamed board that count was ZERO, so the threshold check below skipped every
+      blocker and no warning was emitted AT ALL. Wiring only `escalationColumns` would have fixed the
+      long-lived/temporary label on a message that never printed.
+
+      A task whose workflow did not resolve is absent from both maps and falls back to the legacy
+      answer, matching the documented default.
+      */
+      /* DELIBERATE-LITERAL — the unresolvable-workflow default for both halves, reviewed
+         2026-07-31-11:10. A task absent from the maps above had no readable workflow, so it keeps
+         the answer `computeBlockerFanoutMap` would have given it with no options at all. */
+      classify: (task: Task) => ({
+        isHold: holdByTaskId.get(task.id) ?? task.column === "todo",
+        isTerminal: terminalByTaskId.get(task.id) ?? task.column === "done",
+      }),
+    });
     const seenBlockers = new Set<string>();
 
     for (const [blockerId, fanout] of fanoutMap) {
@@ -1191,13 +1968,35 @@ export class Scheduler {
     const runningAgents = await agentStore.listAgents({ state: "running", includeEphemeral: false });
     const linkedAgents = runningAgents.filter((agent) => agent.taskId === taskId);
 
+    /* FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073): per-invocation selection cache — one read per task even when several agents link to it. */
+    const rollbackSelectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
+
     for (const agent of linkedAgents) {
       const activeRun = await agentStore.getActiveHeartbeatRun?.(agent.id);
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-29-17:45 (PR #2518 self-review — CORRECTED):
+      The synthetic column here stands for "this task is parked in the backlog",
+      which is what `evaluateParkedAgentTaskLink` gates on via
+      `isParkedTaskColumn(linkedTask, parkedColumns)`.
+
+      An earlier version of this note claimed the literal made a renamed workflow
+      read as UNPARKED and drop a live agent's link. THAT WAS WRONG, and the
+      mutation test proved it: the literal passed `{column:"todo"}` together with
+      the helper's LEGACY default parked list, so the pair was self-consistent and
+      read as parked either way. This conversion is behaviour-NEUTRAL here.
+
+      What is load-bearing is the pair travelling TOGETHER. The dangerous state is
+      drift — a resolved column checked against the legacy list (or the reverse),
+      which reads as unparked and clears a live agent's link. That invariant, not
+      the conversion, is what the agent-link tests pin.
+      */
+      const rollbackParked = await resolveTaskParkedColumns(this.store, taskId, rollbackSelectionCache);
       const proof = evaluateParkedAgentTaskLink({
         agent,
-        linkedTask: { column: "todo" } as Pick<Task, "column">,
+        linkedTask: { column: rollbackParked.hold } as Pick<Task, "column">,
         activeRun,
         hasActiveAgentExecution: this.options.hasActiveAgentExecution,
+        parkedColumns: [rollbackParked.hold, rollbackParked.intake],
       });
       if (proof.shouldPreserveParkedLink) {
         schedulerLog.log(
@@ -1230,7 +2029,7 @@ export class Scheduler {
     schedulerLog.log(`Poll interval updated to ${newIntervalMs}ms`);
   }
 
-  getMissionAutopilot(): import("./mission-autopilot.js").MissionAutopilot | undefined {
+  getMissionAutopilot(): import("./missions/mission-autopilot.js").MissionAutopilot | undefined {
     return this.options.missionAutopilot;
   }
 
@@ -1245,13 +2044,42 @@ export class Scheduler {
       return;
     }
 
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-20:40 (fleet — PR-monitor startup hydration):
+    Startup rehydration of PR monitoring resolves the review lane per task.
+
+    Keyed on `column !== "in-review"`, a renamed board hydrated NOTHING on engine restart: every
+    open PR silently stopped being watched, so merges, review comments and closures went unnoticed
+    until something else moved the card. The failure is invisible precisely because it is a missing
+    background watcher rather than an error.
+
+    This is a one-shot startup pass over an already-fetched list, and it is already off the hot path
+    (`void ... .then(...)`), so a per-task resolution with a shared IR cache costs one read per
+    distinct workflow. Fail-soft: an unresolvable workflow falls back to the legacy literal via
+    `isReviewColumnRole`'s documented no-metadata behaviour rather than dropping the watcher.
+    */
     void this.store.listTasks({ slim: true, includeArchived: false, startupMemo: true })
-      .then((tasks) => {
+      .then(async (tasks) => {
         const repo = getCurrentRepo(this.store.getRootDir());
         if (!repo) return;
 
+        const hydrationIrCache = new Map<string, WorkflowIr>();
+        /* FNXC:WorkflowScheduling 2026-08-12-20:00 (RUFU-073): per-hydration-pass selection cache shared by
+           every task in the startup PR-hydration sweep, so workflow_selection is read once per task
+           per pass. Fresh for the pass, discarded at its end — a selection write in a later pass is
+           observed there, never a global/infinite LRU. */
+        const hydrationSelectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
         for (const task of tasks) {
-          if (task.column !== "in-review" || !task.prInfo) continue;
+          if (!task.prInfo) continue;
+          let flags: ColumnRoleTraitFlags | undefined;
+          try {
+            const ir = await resolveWorkflowIrForTask(this.store, task.id, hydrationIrCache, hydrationSelectionCache);
+            const column = (ir as WorkflowIrV2).columns?.find((candidate) => candidate.id === task.column);
+            if (column) flags = resolveColumnFlags(column);
+          } catch {
+            // Unresolvable workflow: `isReviewColumnRole` falls back to the legacy id below.
+          }
+          if (!isReviewColumnRole(flags, task.column)) continue;
           options.prMonitor!.startMonitoring(task.id, repo.owner, repo.repo, task.prInfo);
         }
       })
@@ -1268,20 +2096,38 @@ export class Scheduler {
    * or `null` if the task should start from HEAD (default).
    *
    * Priority: explicit dep in-review (first with worktree) > blockedBy in-review.
+   *
+   * FNXC:WorkflowLifecycleColumns 2026-07-30-20:40 (fleet — scheduler base-branch stacking):
+   * `isReviewColumn` is a REQUIRED resolved answer, not an optional one with a literal default.
+   *
+   * This decides whether a starting task stacks its branch on a predecessor still in review. Keyed
+   * on the literal, a renamed board resolved every predecessor as "not in review" and the task
+   * started from HEAD instead of from its dependency's branch — so the dependent silently rebuilt
+   * work its predecessor had already done, and the first merge of the two conflicted. That is a
+   * quiet wrong answer, not a crash, which is why it would survive unnoticed.
+   *
+   * Required rather than optional because this method has exactly ONE caller, inside
+   * `runHoldReleaseSweepPass`, which has already resolved per-task trait flags for the whole board.
+   * An optional parameter with a literal default would let a future caller reintroduce the bug by
+   * omission; making it required means the compiler asks the question.
    */
-  private resolveBaseBranch(task: Task, allTasks: Task[]): string | null {
-    // Check explicit dependencies for in-review tasks with worktrees
+  private resolveBaseBranch(
+    task: Task,
+    allTasks: Task[],
+    isReviewColumn: (candidate: Task) => boolean,
+  ): string | null {
+    // Check explicit dependencies for review-lane tasks with worktrees
     for (const depId of task.dependencies) {
       const dep = allTasks.find((t) => t.id === depId);
-      if (dep && dep.column === "in-review" && dep.worktree) {
+      if (dep && isReviewColumn(dep) && dep.worktree) {
         return resolveTaskWorkingBranch(dep);
       }
     }
 
-    // Check implicit blockedBy for in-review task with worktree
+    // Check implicit blockedBy for a review-lane task with worktree
     if (task.blockedBy) {
       const blocker = allTasks.find((t) => t.id === task.blockedBy);
-      if (blocker && blocker.column === "in-review" && blocker.worktree) {
+      if (blocker && isReviewColumn(blocker) && blocker.worktree) {
         return resolveTaskWorkingBranch(blocker);
       }
     }
@@ -1300,13 +2146,28 @@ export class Scheduler {
    * Reserve the worktree path a task will use before it enters in-progress.
    * This prevents tasks from appearing active without an assigned worktree.
    */
-  private planWorktreePath(
-    task: Task,
-    naming: string | undefined,
-    reservedNames: Set<string>,
-    settings: Partial<Settings>,
-  ): string {
-    return planTaskWorktreePath(task, this.store.getRootDir(), naming, reservedNames, settings);
+  private planWorktreePath(task: Task, settings: Partial<Settings>): string | null {
+    // Workspace tasks acquire their configured child worktrees at graph/planning entry; never
+    // publish a singular coordinator path that points at the non-Git workspace root.
+    if (task.repositoryScope?.confirmedBy === "workspace") return null;
+    return planTaskWorktreePath(task, this.store.getRootDir(), undefined, settings);
+  }
+
+  /**
+   * Request an event-driven pass without losing a wake that arrives during an active pass.
+   *
+   * FNXC:OverlapScheduling 2026-09-07-14:23:
+   * A terminal move can wake the scheduler before completion fan-out commits its overlap clear.
+   * Preserve one coalesced follow-up request until the active pass finishes so the post-commit wake
+   * observes durable state, while `stop()` cancels pending work and normal pause guards remain authoritative.
+   */
+  requestImmediateSchedule(): void {
+    if (!this.running) return;
+    if (this.scheduling) {
+      this.immediateSchedulePending = true;
+      return;
+    }
+    void this.schedule();
   }
 
   /**
@@ -1321,8 +2182,14 @@ export class Scheduler {
    */
   async schedule(): Promise<void> {
     if (!this.running) return;
-    if (this.scheduling) return;
+    if (this.scheduling) {
+      /* FNXC:PumpWatchdog 2026-08-01-02:00: one hung pass leaves the guard closed forever and every later tick/wake drops SILENTLY (the triage-poll death, 00769fad7c/e51ebff381). Past the threshold, warn with the stuck duration and force the guard open; the hung pass's own finally re-clearing it later is harmless. Dispatch prep runs real git work per candidate, so the threshold is generous. */
+      const stuckMs = this.schedulingSince > 0 ? Date.now() - this.schedulingSince : 0;
+      if (stuckMs < 600_000) return;
+      schedulerLog.warn(`schedule watchdog: previous pass still marked in-flight after ${Math.round(stuckMs / 1000)}s — forcing the guard open so dispatch resumes`);
+    }
     this.scheduling = true;
+    this.schedulingSince = Date.now();
 
     try {
       let tasks = await this.store.listTasks({ slim: true, includeArchived: false, startupMemo: false });
@@ -1420,870 +2287,15 @@ export class Scheduler {
         }
         return;
       }
-
-      const maxConcurrent = settings.maxConcurrent ?? this.options.maxConcurrent ?? 2;
-      const maxWorktrees = settings.maxWorktrees ?? this.options.maxWorktrees ?? 4;
-
-      // Count only in-progress tasks toward the worktree limit.
-      // In-review tasks with worktrees are idle (waiting to merge) and
-      // should not block new tasks from starting.
-      const activeWorktrees = tasks.filter(
-        (t) => t.column === "in-progress",
-      ).length;
-
-      if (activeWorktrees >= maxWorktrees) {
-        if (!this.wasWorktreeLimited) {
-          schedulerLog.log(`Worktree limit reached (${activeWorktrees}/${maxWorktrees})`);
-          this.wasWorktreeLimited = true;
-        }
-        return;
-      }
-
-      this.wasWorktreeLimited = false;
-
-      const inProgress = tasks.filter((t) => t.column === "in-progress");
-
-      // Execution tasks occupy concurrency slots governed by maxConcurrent.
-      // Triage/specification tasks have their own limit (maxTriageConcurrent)
-      // and do not count against this slot.
-      const agentSlots = inProgress.length;
-
-      // When a semaphore is provided, factor in its available slots so we
-      // don't schedule more tasks than the global limit allows.
-      const inProgressTaskIds = inProgress.map((task) => task.id);
-      const computeDispatchCapacityDiagnostic = (startedThisTick: number): ConcurrencyGateDiagnostic => {
-        const started = Math.max(0, Math.floor(startedThisTick));
-        // U6 (KTD-10): report the default workflow's in-progress capacity as a
-        // per-column gate — the generalization of the legacy maxConcurrent gate
-        // (which reads through to the same value).
-        const perColumnGates = isWorkflowColumnsEnabled(settings)
-          ? [{
-            workflowId: DEFAULT_WORKFLOW_POOL_ID,
-            columnId: "in-progress",
-            used: agentSlots + started,
-            limit: maxConcurrent,
-            slack: maxConcurrent - (agentSlots + started),
-          }]
-          : undefined;
-        return computeConcurrencyGateDiagnostic({
-          agentSlots,
-          maxConcurrent,
-          activeWorktrees,
-          maxWorktrees,
-          semaphore: this.options.semaphore,
-          inProgressTaskIds,
-          topLevelClaimedSlots: computeTopLevelConcurrencyClaimed({
-            tasks,
-            semaphoreActiveCount: this.options.semaphore?.activeCount,
-          }),
-          startedThisTick: started,
-          perColumnGates,
-        });
-      };
-      if (computeDispatchCapacityDiagnostic(0).available <= 0) return;
-
-      const now = Date.now();
-      let todo = tasks.filter((t) => {
-        if (t.column !== "todo" || t.paused) return false;
-        // Skip tasks with a recovery backoff that hasn't elapsed yet
-        if (t.nextRecoveryAt && new Date(t.nextRecoveryAt).getTime() > now) return false;
-        // FNXC:CodingIdeasWorkflow 2026-07-04-10:45: a todo task with status "planning" is being specified in place by the triage service (merged planner/capacity column in Coding (Ideas)); it must not be dispatched until planning finishes and the status clears.
-        if (t.status === "planning") return false;
-        return true;
-      });
-      /*
-      FNXC:CodingIdeasWorkflow 2026-07-04-10:46:
-      Exclude unplanned todo tasks whose PROMPT.md is still the bootstrap stub. In a merged planner/capacity column a freshly promoted card has no real spec yet; dispatching it would execute the stub. Normal-workflow todo tasks always carry a real spec (triage writes it before moving them to todo), so this filter is a no-op for them. This closes the gap between the operator promoting a card and the triage service picking it up.
-      */
-      todo = (
-        await Promise.all(
-          todo.map(async (t) => {
-            try {
-              const content = await readFile(getPromptPath(this.store.getTasksDir(), t.id), "utf-8");
-              if (content === buildBootstrapPrompt(t.id, t.title, t.description)) return null;
-            } catch {
-              // Missing prompt is handled by filesystem validation below; keep the candidate.
-            }
-            return t;
-          }),
-        )
-      ).filter((t): t is Task => t !== null);
-
-
-      // Filter out tasks belonging to blocked missions
-      if (todo.length > 0 && this.options.missionStore) {
-        const blockedSliceIds = new Set<string>();
-        for (const t of todo) {
-          if (t.sliceId && !blockedSliceIds.has(t.sliceId)) {
-            try {
-              const slice = await this.options.missionStore.getSlice(t.sliceId);
-              if (slice) {
-                const milestone = await this.options.missionStore.getMilestone(slice.milestoneId);
-                if (milestone) {
-                  const mission = await this.options.missionStore.getMission(milestone.missionId);
-                  if (mission && mission.status === "blocked") {
-                    blockedSliceIds.add(t.sliceId);
-                  }
-                }
-              }
-            } catch (err: unknown) {
-              const errorMessage = err instanceof Error ? err.message : String(err);
-              schedulerLog.warn(
-                `Mission/slice lookup failed during scheduling (task ${t.id}): ${errorMessage} — proceeding without blocked-slice check`,
-              );
-              // If lookup fails, don't block the task
-            }
-          }
-        }
-        if (blockedSliceIds.size > 0) {
-          todo = todo.filter((t) => !t.sliceId || !blockedSliceIds.has(t.sliceId));
-        }
-      }
-
-      if (todo.length === 0) return;
-
-      const maxAutoMergeRetries =
-        typeof settings.maxAutoMergeRetries === "number" ? settings.maxAutoMergeRetries : undefined;
-      const unblockWeights = buildUnblockWeightMap(tasks, {
-        maxAutoMergeRetries,
-      });
-      todo = sortTasksByPriorityFanoutThenAgeAndId(todo, unblockWeights);
-      const topWeightedTask = todo.find((candidate) => (unblockWeights.get(candidate.id) ?? 0) >= 1);
-      if (topWeightedTask) {
-        schedulerLog.log(
-          `Dispatch ordering: priority+fanout (top: ${topWeightedTask.id}=${unblockWeights.get(topWeightedTask.id) ?? 0})`,
-        );
-      }
-
-      const mergeShadowEnabled = settings.mergeRequestContractShadowEnabled === true;
-      const markerAcceptedByTaskId = new Map<string, boolean>();
-      if (mergeShadowEnabled) {
-        const dependencyIds = new Set(tasks.flatMap((candidate) => candidate.dependencies));
-        for (const depId of dependencyIds) {
-          markerAcceptedByTaskId.set(depId, (await this.store.getCompletionHandoffAcceptedMarker(depId)) !== null);
-        }
-      }
-      const schedulingDependencyOptions = mergeShadowEnabled
-        ? {
-          markerAcceptedByTaskId,
-          onParityDiff: (diff: SchedulingDependencyParityDiff) => {
-            this.emitDependencyParityDiff(diff);
-          },
-        }
-        : undefined;
-
-      /**
-       * Pre-compute file scopes for all currently active tasks (in-progress
-       * AND in-review with unmerged worktrees) so that todo tasks are never
-       * started when their files overlap with work already underway or
-       * awaiting merge.
-       *
-       * Including in-review tasks prevents a blocked task from starting on
-       * main HEAD when the blocker's changes haven't been merged yet.
-       *
-       * The re-entrance guard on this method ensures that this snapshot
-       * stays consistent throughout the pass — without it, a concurrent
-       * pass could read stale state and start conflicting tasks.
-       *
-       * Newly started tasks are appended to this map further below so that
-       * subsequent todo tasks in the same pass also see them.
-       */
-      const activeScopes = new Map<string, string[]>();
-      const activeScopeColumns = new Map<string, Task["column"]>();
-      const setActiveScopeLease = (taskId: string, scope: string[], column: Task["column"]): void => {
-        activeScopes.set(taskId, scope);
-        activeScopeColumns.set(taskId, column);
-      };
-      const queuedHigherPriorityScopes: QueuedOverlapCandidate[] = [];
-      const queuedHigherPriorityTaskById = new Map<string, Task>();
-      const overlapIgnorePaths = settings.overlapIgnorePaths ?? [];
-      const filteredScopeByTaskId = new Map<string, string[]>();
-      const getFilteredFileScope = async (taskId: string): Promise<string[]> => {
-        const cached = filteredScopeByTaskId.get(taskId);
-        if (cached !== undefined) return cached;
-        const scope = await this.store.parseFileScopeFromPrompt(taskId);
-        const filteredScope = filterPathsByIgnoreList(scope, overlapIgnorePaths, { ignoreHiddenOverlapPaths: settings.ignoreHiddenOverlapPaths });
-        filteredScopeByTaskId.set(taskId, filteredScope);
-        return filteredScope;
-      };
-      if (settings.groupOverlappingFiles) {
-        // In-progress tasks
-        for (const t of inProgress) {
-          if (!shouldHoldActiveFileScopeLease(t, tasks, { schedulingDependencyOptions })) continue;
-          const filteredScope = await getFilteredFileScope(t.id);
-          if (isCoordinationOnlyTask(t, filteredScope)) continue;
-          if (filteredScope.length === 0) continue;
-          setActiveScopeLease(t.id, filteredScope, "in-progress");
-        }
-        // Only live in-review tasks with a worktree belong in activeScopes.
-        // Paused in-review tasks (e.g., failed-merge tasks awaiting human triage) cannot
-        // make progress, so they must not contribute to overlap blockers; including them
-        // caused a deadlock pattern where a paused task indefinitely re-stamped
-        // `blockedBy` on overlapping todo tasks every scheduler tick. (FN-3867 / FN-3857)
-        // Permanently-failed in-review tasks from SelfHealingManager.checkStuckBudget()
-        // also keep their worktree, but after the stuck-kill budget is exhausted they
-        // will never merge, so superseding re-implementation tasks (for example FN-4177
-        // replaced by FN-4198) must not stay queued behind them. (FN-4200)
-        // FNXC:PostgresCutover 2026-06-27-09:30:
-        // Pre-compute handoff markers before the .filter() because
-        // getCompletionHandoffAcceptedMarker is async and cannot be awaited
-        // inside a synchronous filter callback. Without this, the Promise
-        // object is always !== null, making handoffAccepted incorrectly true.
-        const handoffMarkerMap = new Map<string, boolean>();
-        if (settings.mergeRequestContractShadowEnabled === true) {
-          for (const t of tasks) {
-            if (t.column === "in-review") {
-              handoffMarkerMap.set(t.id, (await this.store.getCompletionHandoffAcceptedMarker(t.id)) !== null);
-            }
-          }
-        }
-        const inReviewWithWorktree = tasks.filter(
-          (t) => t.column === "in-review" && shouldHoldActiveFileScopeLease(t, tasks, {
-            mergeRequestContractShadowEnabled: settings.mergeRequestContractShadowEnabled,
-            handoffAccepted: handoffMarkerMap.get(t.id) ?? false,
-            schedulingDependencyOptions,
-          }),
-        );
-        for (const t of inReviewWithWorktree) {
-          const filteredScope = await getFilteredFileScope(t.id);
-          if (isCoordinationOnlyTask(t, filteredScope)) continue;
-          if (filteredScope.length === 0) continue;
-
-          const handoffAccepted = settings.mergeRequestContractShadowEnabled === true
-            ? (await this.store.getCompletionHandoffAcceptedMarker(t.id)) !== null
-            : false;
-          if (!handoffAccepted) {
-            setActiveScopeLease(t.id, filteredScope, "in-review");
-          }
-
-          if (settings.mergeRequestContractShadowEnabled === true) {
-            const mergeRequestRecord = await this.store.getMergeRequestRecordAsync(t.id);
-            const { shadowExecutorLeaseApplied, shadowMergeLockApplied, shadowLeaseApplied } =
-              computeShadowLeaseParityState(mergeRequestRecord?.state ?? null);
-            if (shadowLeaseApplied !== !handoffAccepted) {
-              void this.store.recordRunAuditEvent?.({
-                taskId: t.id,
-                agentId: "scheduler",
-                runId: generateSyntheticRunId("scheduler", t.id),
-                domain: "database",
-                mutationType: "merge:lease-parity-diff",
-                target: t.id,
-                metadata: {
-                  taskId: t.id,
-                  legacyLeaseColumn: "in-review",
-                  legacyLeaseApplied: !handoffAccepted,
-                  shadowLeaseApplied,
-                  shadowExecutorLeaseApplied,
-                  shadowMergeLockApplied,
-                  mergeRequestState: mergeRequestRecord?.state ?? null,
-                },
-              });
-            }
-          }
-        }
-
-        for (const t of todo) {
-          const filteredScope = await getFilteredFileScope(t.id);
-          if (isCoordinationOnlyTask(t, filteredScope)) continue;
-          if (filteredScope.length === 0) continue;
-          if (!isRunnableQueuedOverlapCandidate(t, tasks, now, activeScopes, filteredScope)) continue;
-          queuedHigherPriorityScopes.push({
-            id: t.id,
-            priority: t.priority,
-            createdAt: t.createdAt,
-            scope: filteredScope,
-          });
-          queuedHigherPriorityTaskById.set(t.id, t);
-        }
-      }
-
-      // Resolve dependency order among todo tasks
-      const ordered = resolveDependencyOrder(todo);
-      let started = 0;
-      let loggedMissingAgentStoreThisPass = false;
-
-      for (const taskId of ordered) {
-        const task = tasks.find((t) => t.id === taskId)!;
-
-        if (task.checkedOutBy && this.options.leaseManager) {
-          const recovered = await this.options.leaseManager.recoverAbandonedLease(
-            task.id,
-            "scheduler detected stale todo lease",
-            { preserveProgress: true },
-          );
-          if (!recovered) {
-            await this.options.leaseManager.reconcileLeaseRow(task.id);
-            await this.store.updateTask(task.id, { status: "queued" });
-            await this.logDispatchQueuedReason(task.id, "queued — checkout lease recovery blocked dispatch");
-            continue;
-          }
-        }
-
-        // Check all deps are satisfied (done, in-review, or archived)
-        const unmetDeps = getUnmetSchedulingDependencies(task, tasks, schedulingDependencyOptions);
-
-        if (unmetDeps.length > 0) {
-          await this.store.updateTask(task.id, {
-            status: "queued",
-            blockedBy: unmetDeps[0],
-          });
-          await this.logDispatchQueuedReason(task.id, `queued — unmet dependencies: ${unmetDeps.join(", ")}`);
-          this.options.onBlocked?.(task, unmetDeps);
-          continue;
-        }
-
-        if (task.userPaused === true) {
-          if (task.status !== "queued") {
-            await this.store.updateTask(task.id, { status: "queued" });
-          }
-          await this.logDispatchQueuedReason(task.id, "queued — user paused (manual move to todo)");
-          continue;
-        }
-
-        // Validate filesystem state before starting (only for tasks with satisfied deps)
-        const validation = await this.validateTaskFilesystem(task.id);
-        if (!validation.valid) {
-          schedulerLog.warn(`Task ${task.id} filesystem validation failed: ${validation.reason}`);
-          /*
-          FNXC:WorkflowScheduling 2026-07-13-11:25:
-          The filesystem-validation rebound must set `needs-replan`, not just move. For a
-          plan-in-place workflow the replan column IS "todo", so the move is a no-op — without
-          the status write triage cannot rediscover the card (its PROMPT.md is missing or
-          unreadable, so the seed check throws and skips it) and this branch re-fires every
-          scheduler tick forever, appending a misleading log line each time.
-          */
-          const replanColumn = await moveTaskToReplanColumn(this.store, task);
-          await this.store.updateTask(task.id, { status: "needs-replan" });
-          await this.store.logEntry(task.id, `Task rebounded to ${replanColumn} for re-specification — filesystem validation failed`, validation.reason);
-          continue;
-        }
-
-        // Stale spec enforcement: check if PROMPT.md has aged beyond the configured threshold.
-        // When enabled, stale tasks are rebounded to the workflow-aware replan column with
-        // status "needs-replan" so they receive fresh specification before execution
-        // (workflows without a "triage" column replan in place in todo). This guard runs
-        // after filesystem validation so missing/unreadable files skip staleness checks entirely.
-        const promptPath = getPromptPath(this.store.getTasksDir(), task.id);
-        const staleness = await evaluateSpecStaleness({ settings, promptPath, task });
-        if (staleness.isStale) {
-          schedulerLog.warn(`Task ${task.id} specification is stale — ${staleness.reason}`);
-          await moveTaskToReplanColumn(this.store, task);
-          await this.store.updateTask(task.id, { status: "needs-replan" });
-          await this.store.logEntry(task.id, staleness.reason);
-          continue;
-        }
-        // If staleness evaluation was skipped (missing/unreadable file), continue to
-        // existing scheduler logic which handles filesystem validation separately.
-
-        // FNXC:MissionSymbolAdmission 2026-08-01-00:00: Apply the same three-way
-        // admission before the early overlap/priority pass and the final release
-        // reservation. Otherwise this pass would serialize approved disjoint symbols
-        // (or misdiagnose unapproved mission work as an overlap) before lock admission.
-        const earlyMissionAdmission = await decideMissionSymbolAdmission(
-          task,
-          this.options.missionStore,
-          { planApprovalRequired: settings.planApprovalMode === "require-all" },
-        );
-        if (earlyMissionAdmission.kind === "lineage-blocked") {
-          await this.store.updateTask(task.id, { status: "queued", blockedBy: null, overlapBlockedBy: null });
-          await this.logDispatchQueuedReason(task.id, `queued — mission lineage blocked: ${earlyMissionAdmission.reason}`);
-          continue;
-        }
-
-        // Check file scope overlap when enabled. Approved, resolvable mission work
-        // bypasses this coarse pass and is mutually excluded by its durable symbols.
-        if (settings.groupOverlappingFiles && earlyMissionAdmission.kind === "coarse-fallback") {
-          const taskScope = await getFilteredFileScope(task.id);
-          const coordinationOnlyTask = isCoordinationOnlyTask(task, taskScope);
-          if (taskScope.length > 0 && !coordinationOnlyTask) {
-            const activeScopeEntries = Array.from(activeScopes.entries()).sort(([aId], [bId]) => aId.localeCompare(bId));
-            const overlapBlockerId = task.overlapBlockedBy || task.blockedBy;
-            const currentBlockerScope = overlapBlockerId ? activeScopes.get(overlapBlockerId) : undefined;
-            const hasValidCurrentBlocker =
-              Boolean(overlapBlockerId)
-              && Boolean(currentBlockerScope)
-              && this.pathsOverlap(taskScope, currentBlockerScope!);
-
-            /**
-             * blockedBy stamping invariants:
-             * - sticky when still valid: preserve an existing active overlapping blocker
-             * - deterministic when changing: pick the first overlapping active task by sorted taskId
-             * - idempotent writes only: update DB only when blockedBy/status must change
-             */
-            const overlappingTaskId = hasValidCurrentBlocker
-              ? overlapBlockerId
-              : activeScopeEntries.find(([, ipScope]) => this.pathsOverlap(taskScope, ipScope))?.[0] ?? null;
-
-            const runnableQueuedHigherPriorityScopes = queuedHigherPriorityScopes.filter((queuedCandidate) => {
-              const queuedTask = queuedHigherPriorityTaskById.get(queuedCandidate.id);
-              if (!queuedTask) return false;
-              return isRunnableQueuedOverlapCandidate(queuedTask, tasks, now, activeScopes, queuedCandidate.scope);
-            });
-
-            const higherPriorityQueuedOverlap = findHigherPriorityQueuedOverlap(
-              {
-                id: task.id,
-                priority: task.priority,
-                createdAt: task.createdAt,
-                scope: taskScope,
-              },
-              runnableQueuedHigherPriorityScopes,
-              this.pathsOverlap.bind(this),
-            );
-
-            if (higherPriorityQueuedOverlap) {
-              const dependencyBlocker = unmetDeps[0] ?? null;
-              if (
-                task.status !== "queued"
-                || task.blockedBy !== dependencyBlocker
-                || task.overlapBlockedBy !== higherPriorityQueuedOverlap.id
-              ) {
-                await this.store.updateTask(task.id, {
-                  status: "queued",
-                  blockedBy: dependencyBlocker,
-                  overlapBlockedBy: higherPriorityQueuedOverlap.id,
-                });
-              }
-              await this.rollbackRunningAgentsForQueuedTodoTask(task.id);
-              await this.logDispatchQueuedReason(
-                task.id,
-                `queued — deferred for higher-priority runnable queued task ${higherPriorityQueuedOverlap.id} (overlap)`,
-              );
-              continue;
-            }
-
-            if (overlappingTaskId) {
-              const dependencyBlocker = unmetDeps[0] ?? null;
-              if (
-                task.status !== "queued"
-                || task.blockedBy !== dependencyBlocker
-                || task.overlapBlockedBy !== overlappingTaskId
-              ) {
-                await this.store.updateTask(task.id, {
-                  status: "queued",
-                  blockedBy: dependencyBlocker,
-                  overlapBlockedBy: overlappingTaskId,
-                });
-              }
-
-              const overlapBlockerTask = tasks.find((candidate) => candidate.id === overlappingTaskId);
-              await this.rollbackRunningAgentsForQueuedTodoTask(task.id);
-              const activeLeaseColumn = activeScopeColumns.get(overlappingTaskId) ?? overlapBlockerTask?.column ?? "unknown";
-              await this.logDispatchQueuedReason(
-                task.id,
-                `queued — blocked by active file-scope lease ${overlappingTaskId} (column=${activeLeaseColumn})`,
-              );
-              continue;
-            }
-
-            if (task.overlapBlockedBy) {
-              await this.store.updateTask(task.id, { overlapBlockedBy: null });
-            }
-          } else if (coordinationOnlyTask && task.overlapBlockedBy) {
-            await this.store.updateTask(task.id, { overlapBlockedBy: null });
-            await this.store.logEntry(
-              task.id,
-              "coordination/no-commit task bypassed non-implementation overlap lease",
-            );
-          }
-        }
-
-        /**
-         * FNXC:Scheduler-Concurrency 2026-06-13-20:08:
-         * FN-6423 fixes the FN-6420 evidence where queue logs reported `gate=maxWorktrees` with `maxWorktrees used=1/3` and `semaphore used=-9/3`. Recompute capacity at the queue decision point, including tasks already started this tick, so the gate label, memo key, and `started` decision share one authoritative snapshot.
-         */
-        const queuePointCapacity = computeDispatchCapacityDiagnostic(started);
-        if (queuePointCapacity.available <= 0) {
-          const reason = formatConcurrencyLimitReason(queuePointCapacity);
-          const concurrencySignature = formatConcurrencyLimitMemoKey(queuePointCapacity);
-          await this.logDispatchQueuedReason(
-            task.id,
-            reason,
-            concurrencySignature,
-          );
-          continue;
-        }
-
-        // Dependencies met — resolve base branch from in-review deps.
-        // Worktree allocation is deferred to moveTask below, where it
-        // runs under TaskStore's cross-task allocation lock so it can't
-        // race against a concurrent manual-move.
-        const baseBranch = this.resolveBaseBranch(task, tasks);
-
-        // Compare-and-swap: re-read the task to verify it's still in "todo" before dispatching.
-        // This prevents dispatching a task twice if another schedule() call or user action
-        // moved it away from "todo" between our initial snapshot and this dispatch attempt.
-        // The re-entrance guard prevents overlapping schedule() passes, but external events
-        // (user moves, API calls) can still trigger concurrent state changes.
-        const freshTask = await this.store.getTask(task.id);
-        if (!freshTask || freshTask.column !== "todo") {
-          schedulerLog.log(`Task ${task.id} no longer in "todo" (column=${freshTask?.column ?? "N/A"}) — skipping dispatch`);
-          continue;
-        }
-        if (freshTask.paused) {
-          schedulerLog.log(`Task ${task.id} is paused — skipping dispatch`);
-          continue;
-        }
-
-        const latestSettings = await this.store.getSettings();
-        const oscillationSettings = latestSettings as Settings & {
-          dispatchOscillationSettleMs?: number;
-          dispatchOscillationThreshold?: number;
-          dispatchOscillationWindowMs?: number;
-        };
-        const dispatchSettleMs = oscillationSettings.dispatchOscillationSettleMs
-          ?? DEFAULT_DISPATCH_OSCILLATION_SETTLE_MS;
-        const dispatchOscillationThreshold = oscillationSettings.dispatchOscillationThreshold
-          ?? DEFAULT_DISPATCH_OSCILLATION_THRESHOLD;
-        const dispatchOscillationWindowMs = oscillationSettings.dispatchOscillationWindowMs
-          ?? DEFAULT_DISPATCH_OSCILLATION_WINDOW_MS;
-        const recentEngineTodoMovedAt = this.recentEngineTodoRequeues.get(task.id);
-        if (recentEngineTodoMovedAt) {
-          if (freshTask.columnMovedAt !== recentEngineTodoMovedAt) {
-            this.recentEngineTodoRequeues.delete(task.id);
-          } else {
-            const movedAtMs = Date.parse(recentEngineTodoMovedAt);
-            const settleAgeMs = Number.isFinite(movedAtMs) ? Math.max(0, Date.now() - movedAtMs) : dispatchSettleMs;
-            if (settleAgeMs < dispatchSettleMs) {
-              schedulerLog.log(`Task ${task.id} was engine-requeued ${settleAgeMs}ms ago — waiting ${dispatchSettleMs}ms settle window before redispatch`);
-              continue;
-            }
-            this.recentEngineTodoRequeues.delete(task.id);
-          }
-        }
-        if (latestSettings.globalPause) {
-          schedulerLog.log(`Task ${task.id} dispatch aborted — globalPause became active mid-pass`);
-          continue;
-        }
-        if (latestSettings.enginePaused) {
-          schedulerLog.log(`Task ${task.id} dispatch aborted — enginePaused became active mid-pass`);
-          continue;
-        }
-
-        // Resolve effective node for routing
-        let effectiveNode = resolveEffectiveNode(freshTask, settings);
-        logTaskRouting(task.id, effectiveNode);
-
-        // Enforce dispatch configuration validation before node-health fallback logic.
-        if (effectiveNode.nodeId !== undefined && this.options.validateNodeDispatch) {
-          const validation = await this.options.validateNodeDispatch(effectiveNode.nodeId);
-          if (!validation.allowed) {
-            if (!this.wasNodeDispatchValidationBlocked.has(task.id)) {
-              this.wasNodeDispatchValidationBlocked.add(task.id);
-              schedulerLog.log(`Task ${task.id} dispatch blocked — ${validation.reason}`);
-              await this.store.logEntry(task.id, validation.reason);
-            }
-            continue;
-          }
-
-          this.wasNodeDispatchValidationBlocked.delete(task.id);
-        }
-
-        // Enforce unavailable-node policy + owning-node handoff policy
-        // FN-4832: this guard currently applies only when node routing is explicit; local routing still relies on checkout 409 claim backstops.
-        if (effectiveNode.nodeId !== undefined && this.options.nodeHealthMonitor) {
-          const localNodeId = this.options.localNodeId ?? "local";
-          if (freshTask.checkoutNodeId && freshTask.checkedOutBy && freshTask.checkoutNodeId !== localNodeId) {
-            const ownerNodeHealth = this.options.nodeHealthMonitor.getNodeHealth(freshTask.checkoutNodeId);
-            // FN-4832 + AGENTS.md Checkout Leasing: never dispatch tasks with active foreign ownership; policy decides park/reassign.
-            const handoffDecision = decideOwningNodeHandoff({
-              task: freshTask,
-              ownerNodeId: freshTask.checkoutNodeId,
-              ownerNodeHealth,
-              localNodeId,
-              handoffPolicy: settings.owningNodeHandoffPolicy,
-            });
-
-            if (handoffDecision.action === "park") {
-              if (!this.wasNodeBlocked.has(task.id)) {
-                this.wasNodeBlocked.add(task.id);
-                if (ownerNodeHealth === "offline" || ownerNodeHealth === "error" || ownerNodeHealth === "online") {
-                  await this.emitNodeUnreachableRecoveryAudit(freshTask, {
-                    ownerNodeId: freshTask.checkoutNodeId,
-                    ownerNodeHealth,
-                    handoffAction: handoffDecision.action,
-                    handoffReason: handoffDecision.reason,
-                    decisionPath: "scheduler-handoff-park",
-                    newColumn: freshTask.column,
-                    dispatchNodeBefore: effectiveNode.nodeId,
-                    dispatchNodeAfter: effectiveNode.nodeId,
-                  });
-                }
-                const reason = `Owning-node handoff parked dispatch: ${handoffDecision.reason}`;
-                schedulerLog.log(`Task ${task.id} dispatch blocked — ${reason}`);
-                await this.store.logEntry(task.id, reason);
-                try {
-                  await this.store.recordRunAuditEvent?.({
-                    taskId: freshTask.id,
-                    agentId: "scheduler",
-                    runId: generateSyntheticRunId("scheduler", freshTask.id),
-                    domain: "database",
-                    mutationType: "node:handoff:parked",
-                    target: freshTask.id,
-                    metadata: {
-                      taskId: freshTask.id,
-                      ownerNodeId: freshTask.checkoutNodeId,
-                      ownerNodeHealth:
-                        ownerNodeHealth === "offline" || ownerNodeHealth === "error" || ownerNodeHealth === "online"
-                          ? ownerNodeHealth
-                          : "unknown",
-                      localNodeId,
-                      handoffPolicy: settings.owningNodeHandoffPolicy,
-                      decisionReason: handoffDecision.reason,
-                      source: "scheduler.dispatch",
-                    },
-                  });
-                } catch (error) {
-                  schedulerLog.warn(`Task ${task.id} failed to emit node:handoff:parked audit: ${error instanceof Error ? error.message : String(error)}`);
-                }
-              }
-              continue;
-            }
-
-            await this.store.logEntry(task.id, `Owning-node handoff applied: ${handoffDecision.reason}`);
-            try {
-              await this.store.recordRunAuditEvent?.({
-                taskId: freshTask.id,
-                agentId: "scheduler",
-                runId: generateSyntheticRunId("scheduler", freshTask.id),
-                domain: "database",
-                mutationType: handoffDecision.action === "reassign-local" ? "node:handoff:reassign-local" : "node:handoff:reassign-any",
-                target: freshTask.id,
-                metadata: {
-                  taskId: freshTask.id,
-                  ownerNodeId: freshTask.checkoutNodeId,
-                  ownerNodeHealth:
-                    ownerNodeHealth === "offline" || ownerNodeHealth === "error" || ownerNodeHealth === "online"
-                      ? ownerNodeHealth
-                      : "unknown",
-                  localNodeId,
-                  handoffPolicy: settings.owningNodeHandoffPolicy,
-                  decisionReason: handoffDecision.reason,
-                  source: "scheduler.dispatch",
-                },
-              });
-            } catch (error) {
-              schedulerLog.warn(`Task ${task.id} failed to emit node:handoff audit: ${error instanceof Error ? error.message : String(error)}`);
-            }
-            const dispatchNodeBefore = effectiveNode.nodeId;
-            if (handoffDecision.action === "reassign-local") {
-              effectiveNode = { nodeId: undefined, source: "local" };
-            }
-            if (ownerNodeHealth === "offline" || ownerNodeHealth === "error" || ownerNodeHealth === "online") {
-              await this.emitNodeUnreachableRecoveryAudit(freshTask, {
-                ownerNodeId: freshTask.checkoutNodeId,
-                ownerNodeHealth,
-                handoffAction: handoffDecision.action,
-                handoffReason: handoffDecision.reason,
-                decisionPath:
-                  handoffDecision.action === "reassign-local"
-                    ? "scheduler-handoff-reassign-local"
-                    : "scheduler-handoff-reassign-any",
-                newColumn: freshTask.column,
-                dispatchNodeBefore,
-                dispatchNodeAfter: effectiveNode.nodeId,
-              });
-            }
-          }
-
-          const nodeHealth = effectiveNode.nodeId
-            ? this.options.nodeHealthMonitor.getNodeHealth(effectiveNode.nodeId)
-            : undefined;
-          const decision = applyUnavailableNodePolicy({
-            effectiveNode,
-            nodeHealth,
-            policy: settings.unavailableNodePolicy,
-          });
-
-          if (!decision.allowed) {
-            if (!this.wasNodeBlocked.has(task.id)) {
-              this.wasNodeBlocked.add(task.id);
-              schedulerLog.log(`Task ${task.id} dispatch blocked — ${decision.reason}`);
-              await this.store.logEntry(task.id, decision.reason);
-            }
-            continue;
-          }
-
-          this.wasNodeBlocked.delete(task.id);
-
-          if (decision.fallbackToLocal) {
-            schedulerLog.log(`Task ${task.id} falling back to local — ${decision.reason}`);
-            await this.store.logEntry(task.id, decision.reason);
-            effectiveNode = { nodeId: undefined, source: "local" };
-          }
-        }
-
-        if (latestSettings.ephemeralAgentsEnabled === false && !freshTask.assignedAgentId) {
-          if (!this.options.agentStore) {
-            if (!loggedMissingAgentStoreThisPass) {
-              loggedMissingAgentStoreThisPass = true;
-              schedulerLog.warn("ephemeralAgentsEnabled=false but scheduler has no agentStore; falling back to legacy dispatch behavior");
-            }
-          } else {
-            const selectedAgent = await selectPermanentAgentForTask({
-              task: freshTask,
-              agentStore: this.options.agentStore,
-              taskStore: this.store,
-            });
-
-            if (!selectedAgent) {
-              await this.store.updateTask(task.id, { status: "queued" });
-              if (!this.wasPermanentAgentUnavailable.has(task.id)) {
-                await this.logDispatchQueuedReason(
-                  task.id,
-                  "queued — no permanent executor available (ephemeral agents disabled)",
-                );
-                this.wasPermanentAgentUnavailable.add(task.id);
-              }
-              continue;
-            }
-
-            await this.store.updateTask(task.id, { assignedAgentId: selectedAgent.id });
-            await this.store.logEntry(
-              task.id,
-              `Auto-assigned to permanent agent ${selectedAgent.id} (ephemeral agents disabled)`,
-            );
-            this.wasPermanentAgentUnavailable.delete(task.id);
-          }
-        } else {
-          this.wasPermanentAgentUnavailable.delete(task.id);
-        }
-
-        // Clear status, reserve worktree path, and then move to in-progress.
-        // Reset mergeRetries so a fresh execution gets a fresh merge budget —
-        // otherwise a task whose previous run exhausted its 3 retries (e.g.
-        // verification failure that was later cleared) lands back in in-review
-        // with mergeRetries=MAX, the merger refuses it (canMergeTask false),
-        // and the ghost-review fallback bounces it back to todo every 10 min
-        // before the 30-min cooldown can elapse — infinite loop. See FN-3305.
-        const dispatchTimestamp = new Date().toISOString();
-        const lastDispatchAtMs = freshTask.lastDispatchAt ? Date.parse(freshTask.lastDispatchAt) : Number.NaN;
-        const priorDispatchWithinWindow = Number.isFinite(lastDispatchAtMs)
-          && Date.now() - lastDispatchAtMs <= dispatchOscillationWindowMs;
-        const nextDispatchStormCount = priorDispatchWithinWindow
-          ? (freshTask.dispatchStormCount ?? 0) + 1
-          : 1;
-
-        if (nextDispatchStormCount > dispatchOscillationThreshold) {
-          const oscillationError = freshTask.error
-            ?? `DISPATCH_OSCILLATION: detected ${nextDispatchStormCount} todo↔in-progress cycles within ${dispatchOscillationWindowMs}ms. Task auto-paused for operator review.`;
-          await this.store.updateTask(task.id, {
-            dispatchStormCount: nextDispatchStormCount,
-            lastDispatchAt: dispatchTimestamp,
-            paused: true,
-            pausedReason: "dispatch-oscillation",
-            status: freshTask.status ?? "queued",
-            error: oscillationError,
-          });
-          await this.store.logEntry(
-            task.id,
-            `Dispatch oscillation auto-paused after ${nextDispatchStormCount} cycles within ${dispatchOscillationWindowMs}ms`,
-          );
-          await this.store.appendAgentLog?.(
-            task.id,
-            "Dispatch oscillation detected — task auto-paused for operator review",
-            "text",
-            `cycleCount=${nextDispatchStormCount} windowMs=${dispatchOscillationWindowMs}`,
-          );
-          await this.store.recordRunAuditEvent?.({
-            taskId: task.id,
-            agentId: "scheduler",
-            runId: generateSyntheticRunId("scheduler-dispatch-oscillation", task.id),
-            domain: "database",
-            mutationType: "task:dispatch-oscillation-terminalized",
-            target: task.id,
-            metadata: {
-              taskId: task.id,
-              cycleCount: nextDispatchStormCount,
-              windowMs: dispatchOscillationWindowMs,
-              lastMoveSource: recentEngineTodoMovedAt ? "engine" : "scheduler",
-            },
-          });
-          schedulerLog.warn(`Task ${task.id} auto-paused after dispatch oscillation threshold ${dispatchOscillationThreshold} was exceeded (${nextDispatchStormCount} cycles)`);
-          continue;
-        }
-
-        schedulerLog.log(`Starting ${task.id}: ${task.title || task.id} (deps satisfied)`);
-        await this.store.updateTask(task.id, {
-          status: null,
-          blockedBy: null,
-          executionStartBranch: baseBranch ?? undefined,
-          effectiveNodeId: effectiveNode.nodeId ?? null,
-          effectiveNodeSource: effectiveNode.source,
-          mergeRetries: 0,
-        });
-        try {
-          await this.store.moveTask(task.id, "in-progress", {
-            moveSource: "scheduler",
-            allocateWorktree: (reservedNames) =>
-              this.planWorktreePath(task, settings.worktreeNaming, reservedNames, settings),
-          });
-        } catch (error) {
-          if (error instanceof TransitionRejectionError && error.rejection.code === "capacity-exhausted") {
-            await this.store.updateTask(task.id, { status: "queued" });
-            const reason = error.message || "queued — in-progress column at capacity";
-            await this.logDispatchQueuedReason(task.id, reason, `capacity-exhausted:${reason}`);
-            continue;
-          }
-          throw error;
-        }
-        await this.store.updateTask(task.id, {
-          dispatchStormCount: nextDispatchStormCount,
-          lastDispatchAt: dispatchTimestamp,
-        });
-        this.recentEngineTodoRequeues.delete(task.id);
-        this.wasNodeBlocked.delete(task.id);
-        this.wasNodeDispatchValidationBlocked.delete(task.id);
-        this.wasPermanentAgentUnavailable.delete(task.id);
-        this.clearDispatchQueuedReasonMemo(task.id);
-        await this.store.logEntry(task.id, `Node routing resolved: ${effectiveNode.nodeId ?? "local"} (source: ${effectiveNode.source})`);
-        this.options.onSchedule?.(task);
-        started++;
-
-        // Track newly started task's file scope for overlap with remaining todo tasks
-        if (settings.groupOverlappingFiles) {
-          const scope = await getFilteredFileScope(task.id);
-          if (scope.length > 0 && !isCoordinationOnlyTask(task, scope)) setActiveScopeLease(task.id, scope, "in-progress");
-        }
-      }
-
-      await this.emitHighOverlapFanoutWarnings(tasks);
-
-      const staleWarningWindows = [settings.staleInProgressWarningMs, settings.staleInReviewWarningMs]
-        .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
-      const minWarningMs = staleWarningWindows.length > 0 ? Math.min(...staleWarningWindows) : 0;
-      if (minWarningMs > 0 && Date.now() - this.lastStaleTaskReportAt >= minWarningMs) {
-        try {
-          await this.staleTaskReporter.report();
-          this.lastStaleTaskReportAt = Date.now();
-        } catch (error) {
-          schedulerLog.warn("Stale task reporter failed", error);
-        }
-      }
-
-      if (settings.backlogPressureAlertEnabled !== false && Date.now() - this.lastBacklogPressureReportAt >= 60_000) {
-        try {
-          await this.backlogPressureReporter.report();
-        } catch (error) {
-          schedulerLog.warn("Backlog pressure reporter failed", error);
-        } finally {
-          this.lastBacklogPressureReportAt = Date.now();
-        }
-      }
-
-      if (Date.now() - this.lastUnlinkedMissionsAdvisoryReportAt >= 60_000) {
-        try {
-          await this.unlinkedMissionsAdvisoryReporter.report();
-        } catch (error) {
-          schedulerLog.warn("Unlinked missions advisory reporter failed", error);
-        } finally {
-          this.lastUnlinkedMissionsAdvisoryReportAt = Date.now();
-        }
-      }
     } catch (err) {
       schedulerLog.error("Scheduling error:", err);
     } finally {
       this.scheduling = false;
+      this.schedulingSince = 0;
+      if (this.running && this.immediateSchedulePending) {
+        this.immediateSchedulePending = false;
+        void this.schedule();
+      }
     }
   }
 
@@ -2299,6 +2311,9 @@ export class Scheduler {
    */
   private async renewActiveMissionSymbolLocks(tasks: Task[]): Promise<void> {
     for (const task of tasks) {
+      /* DELIBERATE-LITERAL — seeds the trait resolution immediately below, which overwrites it
+         whenever the workflow resolves; the literal survives only as the documented fallback for an
+         unresolvable workflow. Reviewed 2026-07-30-20:40. */
       let isImplementationColumn = task.column === "in-progress";
       try {
         const ir = await resolveWorkflowIrForTask(this.store, task.id);
@@ -2322,30 +2337,74 @@ export class Scheduler {
         try {
           missionLinked = Boolean(await this.options.missionStore.getFeatureByTaskId(task.id));
         } catch (error) {
-          schedulerLog.warn(`Symbol-lock renewal lineage lookup failed for ${task.id}:`, error);
+          const message = error instanceof Error ? error.message : String(error);
+          this.symbolLockRenewalLog.logOnce(
+            schedulerLog,
+            task.id,
+            `lineage-lookup-failed:${message}`,
+            `Symbol-lock renewal lineage lookup failed for ${task.id}: ${message}`,
+            "warn",
+          );
           continue;
         }
       }
       if (!missionLinked) continue;
 
+      /*
+      FNXC:EngineDiagnostics 2026-08-10-17:13:
+      Renewal re-runs every poll for every implementation-column task that declares symbols, and a LOST lock never
+      recovers by renewing — `renewSymbolLocks` reports the same `lost` set on every subsequent pass, so the warning and
+      its `logEntry` companion repeated forever: log-pane spam plus an unbounded activityLog append for a stuck task.
+      Report a lost set (and a persistent renewal error) once per task per distinct signature — a changed set of lost
+      symbols or a new error message is a real transition and reports again — and clear the memo on a clean renewal so a
+      later loss is reported afresh. The `logEntry` write is gated on the SAME first-occurrence decision, so the task's
+      activity log records the transition rather than one row per poll.
+      */
       try {
         const result = await this.store.renewSymbolLocks(symbols, task.id, SYMBOL_LOCK_LEASE_MS);
         if (result.lost.length > 0) {
-          schedulerLog.warn(`Symbol-lock renewal lost ownership for ${task.id}: ${result.lost.join(", ")}`);
-          await this.store.logEntry(task.id, `symbol-lock renewal lost: ${result.lost.join(", ")}`);
+          const lost = [...result.lost].sort();
+          const appended = this.symbolLockRenewalLog.logOnce(
+            schedulerLog,
+            task.id,
+            `lost:${lost.join(",")}`,
+            `Symbol-lock renewal lost ownership for ${task.id}: ${result.lost.join(", ")}`,
+            "warn",
+          );
+          if (appended) {
+            await this.store.logEntry(task.id, `symbol-lock renewal lost: ${result.lost.join(", ")}`);
+          }
+        } else {
+          this.symbolLockRenewalLog.clear(task.id);
         }
       } catch (error) {
         // Do not abort capacity admission for unrelated tasks; the durable expiry
         // and self-healing reconciliation remain the crash-safe backstop.
-        schedulerLog.warn(`Symbol-lock renewal failed for ${task.id}:`, error);
+        const message = error instanceof Error ? error.message : String(error);
+        this.symbolLockRenewalLog.logOnce(
+          schedulerLog,
+          task.id,
+          `renewal-failed:${message}`,
+          `Symbol-lock renewal failed for ${task.id}: ${message}`,
+          "warn",
+        );
       }
     }
   }
 
   private async runHoldReleaseSweepPass(tasks: Task[], settings: Settings): Promise<void> {
     try {
-      const maxWorktrees = settings.maxWorktrees ?? this.options.maxWorktrees ?? 4;
-      const maxConcurrent = settings.maxConcurrent ?? this.options.maxConcurrent ?? 2;
+      // FNXC:CapacityModel 2026-07-28-11:35: null = worktrees are not a capacity
+      // dimension for this project (worktreeLimitEnabled false), NOT unlimited.
+      /* FNXC:CapacityModel 2026-08-21-15:25: live project settings are authoritative;
+       * scheduler boot options remain fallback-only when a setting is absent. */
+      const capacitySettings = {
+        ...this.options,
+        ...settings,
+      };
+      const maxWorktrees = resolveWorktreeCapacityLimit(capacitySettings);
+      const maxConcurrent = resolveMaxConcurrentSetting(capacitySettings);
+      const activeTaskLimit = resolveAgentCapacityLimit(capacitySettings);
       /*
       FNXC:WorkflowScheduling 2026-07-19-02:35 (U4/KTD-9):
       Count active WIP reservations by the `wip` trait, not the literal
@@ -2366,59 +2425,138 @@ export class Scheduler {
       falls back to the legacy literal "in-progress" check per task.
       */
       const wipIrCache = new Map<string, WorkflowIr>();
+      // FNXC:WorkflowScheduling 2026-08-09-06:07: Share this pass-local selection cache with the hold sweep and reservation path; a persistent cache would hide mutable selection writes.
+      const selectionCache = new Map<string, { workflowId: string; stepIds: string[] } | undefined>();
       const workflowIdByTaskId = new Map<string, string>();
-      await Promise.all(tasks.map(async (task) => {
-        try {
-          const selection = await this.store.getTaskWorkflowSelectionAsync(task.id);
-          workflowIdByTaskId.set(task.id, selection?.workflowId ?? "builtin:coding");
-        } catch {
-          // Same degradation as resolveWorkflowIrForTask: selection failure → default coding workflow.
-          workflowIdByTaskId.set(task.id, "builtin:coding");
+      const taskIds = [...new Set(tasks.map((task) => task.id))];
+      try {
+        if (this.store.getTaskWorkflowSelectionsAsync) {
+          const selections = await this.store.getTaskWorkflowSelectionsAsync(taskIds);
+          for (const taskId of taskIds) selectionCache.set(taskId, selections.get(taskId));
+        } else {
+          await Promise.all(taskIds.map(async (taskId) => {
+            try { selectionCache.set(taskId, await this.store.getTaskWorkflowSelectionAsync(taskId)); } catch { /* default below */ }
+          }));
         }
-      }));
-      // Per distinct workflow: columnId → countsTowardWip flag; null when the IR
-      // failed to resolve or has no v2 columns (forces the literal fallback).
-      const wipFlagsByWorkflowId = new Map<string, Map<string, boolean> | null>();
+      } catch {
+        // FNXC:WorkflowScheduling 2026-08-09-08:16: a batch transport failure
+        // must retain the legacy per-task retry path. Defaulting the entire pass
+        // merges distinct capacity pools before the sweep can retry each row.
+        await Promise.all(taskIds.map(async (taskId) => {
+          try { selectionCache.set(taskId, await this.store.getTaskWorkflowSelectionAsync(taskId)); } catch { /* default below */ }
+        }));
+      }
+      for (const task of tasks) workflowIdByTaskId.set(task.id, selectionCache.get(task.id)?.workflowId ?? "builtin:coding");
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-15:40 (fleet conversion, scheduler.ts):
+      Per distinct workflow: columnId → resolved trait flags; null when the IR failed to resolve or
+      has no v2 columns, which leaves every lookup undefined and defers to the helper's documented
+      degraded mode.
+
+      Was a hand-rolled copy of `isWipColumnRole`: it stored only `countsTowardWip` as a boolean and
+      re-implemented flags-first-then-legacy-id inline. Storing the flags object instead lets the
+      shared predicate decide, so this scheduler and the role helpers cannot drift on what "counts as
+      WIP" means. Behaviour is identical in all four states — column present with the flag true or
+      false (flags win), column absent from a resolved IR, and IR resolution failed (both fall back
+      to the legacy id).
+      */
+      const columnFlagsByWorkflowId = new Map<string, Map<string, ColumnRoleTraitFlags> | null>();
       for (const workflowId of new Set(workflowIdByTaskId.values())) {
         try {
           const ir = await resolveWorkflowIrById(this.store, workflowId, wipIrCache);
           const columns = (ir as WorkflowIrV2).columns;
-          wipFlagsByWorkflowId.set(
+          columnFlagsByWorkflowId.set(
             workflowId,
-            columns ? new Map(columns.map((c) => [c.id, resolveColumnFlags(c).countsTowardWip === true])) : null,
+            columns ? new Map(columns.map((c) => [c.id, resolveColumnFlags(c)])) : null,
           );
         } catch {
-          wipFlagsByWorkflowId.set(workflowId, null);
+          columnFlagsByWorkflowId.set(workflowId, null);
         }
       }
-      const isWipColumnTask = (task: Task): boolean => {
-        const flags = wipFlagsByWorkflowId.get(workflowIdByTaskId.get(task.id) ?? "builtin:coding");
-        const wip = flags?.get(task.column);
-        if (wip !== undefined) return wip;
-        return task.column === "in-progress";
-      };
-      const wipTaskIds = tasks.filter(isWipColumnTask).map((task) => task.id);
-      let reservedWorktreeSlots = wipTaskIds.length;
-      let reservedConcurrentSlots = reservedWorktreeSlots;
-      const inProgressTaskIds = wipTaskIds;
+      const columnFlagsForTask = (task: Task): ColumnRoleTraitFlags | undefined =>
+        columnFlagsByWorkflowId.get(workflowIdByTaskId.get(task.id) ?? "builtin:coding")?.get(task.column);
+      const isWipColumnTask = (task: Task): boolean =>
+        isWipColumnRole(columnFlagsForTask(task), task.column);
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-30-19:05:
+      The review-lane twin of `isWipColumnTask`, over the SAME resolved flags map.
+
+      The file-scope lease sweep below had a renamed-board hole in the shape 2026-07-30-16:30 already
+      fixed for the wip half: the review pass gated on the literal `column === "in-review"`, so on a
+      renamed board no review card entered `activeScopes` and its worktree's files read as free while
+      the merge was still in flight. Fixing only the wip half left the two halves of one registry
+      disagreeing. Same predicate, same flags, so they cannot drift.
+      */
+      const isReviewColumnTask = (task: Task): boolean =>
+        isReviewColumnRole(columnFlagsForTask(task), task.column);
+      const isTerminalColumnTask = (task: Task): boolean =>
+        isTerminalColumnRole(columnFlagsForTask(task), task.column);
+      /*
+      FNXC:ConcurrencyIndicators 2026-08-01-19:22:
+      Failed WIP is not a live holder (isRunningAgentTask). Keep the WIP list aligned so
+      same-sweep executor reservation arithmetic does not re-count stranded failed parks.
+      */
+      const wipTaskIds = tasks
+        .filter((task) => isWipColumnTask(task) && task.status !== "failed")
+        .map((task) => task.id);
+      /*
+      FNXC:CapacityModel 2026-09-01-14:49:
+      Worktree capacity counts canonically live tasks that are in WIP or retain an unmerged singular
+      or workspace checkout. Checkout-free planning is excluded, while WIP counts before acquisition
+      to close the dispatch-to-persistence window and a live replan card retains its real disk slot.
+      Same-sweep reservations below keep newly released execution candidates visible immediately.
+      */
+      /*
+      FNXC:WorkflowScheduling 2026-08-09-11:01:
+      The active-worktree count resolves every task's IR before the hold sweep. It
+      must read the same pass-scoped selection cache rather than silently adding
+      one selection query per card after the batch; otherwise this production
+      path recreates issue #3364's three-connection-pool saturation.
+      */
+      const selectionCachedStore = new Proxy(this.store, {
+        get: (target, property, receiver) => {
+          if (property === "getTaskWorkflowSelectionAsync") {
+            return async (taskId: string) => selectionCache.has(taskId)
+              ? selectionCache.get(taskId)
+              : await target.getTaskWorkflowSelectionAsync(taskId);
+          }
+          if (property === "getTaskWorkflowSelection") {
+            return (taskId: string) => selectionCache.has(taskId)
+              ? selectionCache.get(taskId)
+              : target.getTaskWorkflowSelection(taskId);
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const activeWorktreeTaskIds = await persistedWorktreeHolderTaskIdsFromStore(selectionCachedStore, tasks);
+      let reservedWorktreeSlots = activeWorktreeTaskIds.length;
+      let reservedConcurrentSlots = wipTaskIds.length;
       const dispatchPrepByTaskId = new Map<string, {
         baseBranch: string | null;
         dispatchStormCount: number;
         dispatchTimestamp: string;
         effectiveNodeId: string | null;
         effectiveNodeSource: string;
+        observedOverlapBlockedBy: string | null;
         task: Task;
       }>();
       const activeScopes = new Map<string, string[]>();
       const activeScopeColumns = new Map<string, Task["column"]>();
+      const dormantScopes = new Map<string, QueuedOverlapCandidate>();
+      const dormantScopeColumns = new Map<string, Task["column"]>();
+      const leaseWaiverIds = new Map<string, readonly string[]>();
       const overlapIgnorePaths = settings.overlapIgnorePaths ?? [];
       const filteredScopeByTaskId = new Map<string, string[]>();
-      const getFilteredFileScope = async (taskId: string): Promise<string[]> => {
-        const cached = filteredScopeByTaskId.get(taskId);
+      const getFilteredFileScope = async (task: Pick<Task, "id" | "workspaceWorktrees">): Promise<string[]> => {
+        const cached = filteredScopeByTaskId.get(task.id);
         if (cached !== undefined) return cached;
-        const scope = await this.store.parseFileScopeFromPrompt(taskId);
-        const filteredScope = filterPathsByIgnoreList(scope, overlapIgnorePaths, { ignoreHiddenOverlapPaths: settings.ignoreHiddenOverlapPaths });
-        filteredScopeByTaskId.set(taskId, filteredScope);
+        const scope = await this.store.parseFileScopeFromPrompt(task.id);
+        const filteredScope = normalizeOverlapScopeForTask(
+          task,
+          filterPathsByIgnoreList(scope, overlapIgnorePaths, { ignoreHiddenOverlapPaths: settings.ignoreHiddenOverlapPaths }),
+        );
+        filteredScopeByTaskId.set(task.id, filteredScope);
         return filteredScope;
       };
 
@@ -2430,66 +2568,215 @@ export class Scheduler {
           markerAcceptedByTaskId.set(depId, (await this.store.getCompletionHandoffAcceptedMarker(depId)) !== null);
         }
       }
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-30-19:05:
+      Resolved ONCE per sweep, over the dependency cards actually referenced — not per dependent,
+      and not over the whole board. `tasks` is already in memory, so this adds workflow-IR reads
+      bounded by the number of distinct workflows, not by the number of dependency edges.
+      */
+      const referencedDependencyIds = new Set(tasks.flatMap((candidate) => candidate.dependencies));
+      const satisfactionColumnsByTaskId = await resolveDependencySatisfactionColumns(
+        this.store,
+        tasks.filter((candidate) => referencedDependencyIds.has(candidate.id)),
+        new Map<string, WorkflowIr>(),
+      );
       const schedulingDependencyOptions = mergeShadowEnabled
         ? {
+          satisfactionColumnsByTaskId,
           markerAcceptedByTaskId,
           onParityDiff: (diff: SchedulingDependencyParityDiff) => {
             this.emitDependencyParityDiff(diff);
           },
         }
-        : undefined;
+        : { satisfactionColumnsByTaskId };
 
-      if (settings.groupOverlappingFiles) {
+      // Handoff reads are asynchronous, so resolve them before classifying review holders.
+      const reviewHandoffMarkerMap = new Map<string, boolean>();
+      if (mergeShadowEnabled) {
         for (const task of tasks) {
-          if (task.column !== "in-progress") continue;
-          if (!shouldHoldActiveFileScopeLease(task, tasks, { schedulingDependencyOptions })) continue;
-          const filteredScope = await getFilteredFileScope(task.id);
-          if (isCoordinationOnlyTask(task, filteredScope)) continue;
-          if (filteredScope.length === 0) continue;
-          activeScopes.set(task.id, filteredScope);
-          activeScopeColumns.set(task.id, task.column);
-        }
-
-        // FNXC:PostgresCutover 2026-06-27-09:30:
-        // Pre-compute handoff markers before the .filter() because
-        // getCompletionHandoffAcceptedMarker is async.
-        const reviewHandoffMarkerMap = new Map<string, boolean>();
-        if (settings.mergeRequestContractShadowEnabled === true) {
-          for (const t of tasks) {
-            if (t.column === "in-review") {
-              reviewHandoffMarkerMap.set(t.id, (await this.store.getCompletionHandoffAcceptedMarker(t.id)) !== null);
-            }
-          }
-        }
-        const inReviewWithWorktree = tasks.filter(
-          (task) => task.column === "in-review" && shouldHoldActiveFileScopeLease(task, tasks, {
-            mergeRequestContractShadowEnabled: settings.mergeRequestContractShadowEnabled,
-            handoffAccepted: reviewHandoffMarkerMap.get(task.id) ?? false,
-            schedulingDependencyOptions,
-          }),
-        );
-        for (const task of inReviewWithWorktree) {
-          const filteredScope = await getFilteredFileScope(task.id);
-          if (isCoordinationOnlyTask(task, filteredScope)) continue;
-          if (filteredScope.length > 0) {
-            activeScopes.set(task.id, filteredScope);
-            activeScopeColumns.set(task.id, task.column);
+          if (isReviewColumnTask(task)) {
+            reviewHandoffMarkerMap.set(task.id, (await this.store.getCompletionHandoffAcceptedMarker(task.id)) !== null);
           }
         }
       }
 
+      if (settings.groupOverlappingFiles) {
+        for (const task of tasks) {
+          const classification = classifyFileScopeLease(task, tasks, {
+            mergeRequestContractShadowEnabled: mergeShadowEnabled,
+            handoffAccepted: reviewHandoffMarkerMap.get(task.id) ?? false,
+            schedulingDependencyOptions,
+            isWipColumn: isWipColumnTask(task),
+            isReviewColumn: isReviewColumnTask(task),
+            isTerminalColumn: isTerminalColumnTask(task),
+          });
+          // Classification intentionally precedes prompt parsing: idle backlog cards do not own a lease.
+          if (classification.kind === "none") continue;
+          const filteredScope = await getFilteredFileScope(task);
+          if (isCoordinationOnlyTask(task, filteredScope) || filteredScope.length === 0) continue;
+
+          leaseWaiverIds.set(task.id, classification.waivedForTaskIds);
+          if (classification.kind === "active") {
+            activeScopes.set(task.id, filteredScope);
+            activeScopeColumns.set(task.id, task.column);
+          } else {
+            dormantScopes.set(task.id, {
+              id: task.id,
+              priority: task.priority,
+              createdAt: task.createdAt,
+              scope: filteredScope,
+            });
+            dormantScopeColumns.set(task.id, task.column);
+          }
+        }
+      }
+
+      const findOverlappingFileScopeLease = (
+        candidate: Task,
+        candidateScope: string[],
+      ): { id: string; kind: "active" | "dormant"; column: Task["column"] } | null => {
+        const activeHolderId = Array.from(activeScopes.entries())
+          .sort(([aId], [bId]) => aId.localeCompare(bId))
+          .find(([holderId, holderScope]) =>
+            holderId !== candidate.id
+            && leaseWaiverIds.get(holderId)?.includes(candidate.id) !== true
+            && this.pathsOverlap(candidateScope, holderScope),
+          )?.[0];
+        if (activeHolderId) {
+          return {
+            id: activeHolderId,
+            kind: "active",
+            column: activeScopeColumns.get(activeHolderId) ?? "in-progress",
+          };
+        }
+
+        const dormantHolder = findHigherPriorityQueuedOverlap(
+          {
+            id: candidate.id,
+            priority: candidate.priority,
+            createdAt: candidate.createdAt,
+            scope: candidateScope,
+          },
+          Array.from(dormantScopes.values()).filter(
+            (holder) => holder.id !== candidate.id && leaseWaiverIds.get(holder.id)?.includes(candidate.id) !== true,
+          ),
+          this.pathsOverlap,
+        );
+        if (!dormantHolder) return null;
+        return {
+          id: dormantHolder.id,
+          kind: "dormant",
+          column: dormantScopeColumns.get(dormantHolder.id) ?? "todo",
+        };
+      };
+
+      const freshOverlapBlockerStillBlocks = async (
+        candidate: Task,
+        blockerId: string,
+      ): Promise<boolean> => {
+        const freshSettings = await this.store.getSettings();
+        if (freshSettings.groupOverlappingFiles !== true) return false;
+        const blocker = await this.store.getTask(blockerId).catch(() => null);
+        if (!blocker) return false;
+        const liveTasks = tasks.map((entry) => {
+          if (entry.id === candidate.id) return candidate;
+          if (entry.id === blocker.id) return blocker;
+          return entry;
+        });
+        if (!liveTasks.some((entry) => entry.id === blocker.id)) liveTasks.push(blocker);
+        if (!liveTasks.some((entry) => entry.id === candidate.id)) liveTasks.push(candidate);
+        const classification = classifyFileScopeLease(blocker, liveTasks, {
+          mergeRequestContractShadowEnabled: freshSettings.mergeRequestContractShadowEnabled === true,
+          handoffAccepted: freshSettings.mergeRequestContractShadowEnabled === true && isReviewColumnTask(blocker)
+            ? (await this.store.getCompletionHandoffAcceptedMarker(blocker.id)) !== null
+            : false,
+          schedulingDependencyOptions,
+          isWipColumn: isWipColumnTask(blocker),
+          isReviewColumn: isReviewColumnTask(blocker),
+          isTerminalColumn: isTerminalColumnTask(blocker),
+        });
+        if (!fileScopeLeaseBlocksCandidate(blocker, candidate, classification)) return false;
+        const freshIgnorePaths = freshSettings.overlapIgnorePaths ?? [];
+        const candidateScope = normalizeOverlapScopeForTask(candidate, filterPathsByIgnoreList(
+          await this.store.parseFileScopeFromPrompt(candidate.id),
+          freshIgnorePaths,
+          { ignoreHiddenOverlapPaths: freshSettings.ignoreHiddenOverlapPaths },
+        ));
+        if (candidateScope.length === 0 || isCoordinationOnlyTask(candidate, candidateScope)) return false;
+        const blockerScope = normalizeOverlapScopeForTask(blocker, filterPathsByIgnoreList(
+          await this.store.parseFileScopeFromPrompt(blocker.id),
+          freshIgnorePaths,
+          { ignoreHiddenOverlapPaths: freshSettings.ignoreHiddenOverlapPaths },
+        ));
+        if (blockerScope.length === 0 || isCoordinationOnlyTask(blocker, blockerScope)) return false;
+        return this.pathsOverlap(candidateScope, blockerScope);
+      };
+      const clearObservedOverlapIfStillStale = async (
+        candidate: Task,
+        observedBlockerId: string | null | undefined,
+      ): Promise<boolean> => {
+        if (typeof observedBlockerId !== "string" || observedBlockerId.trim().length === 0) return false;
+        if (await freshOverlapBlockerStillBlocks(candidate, observedBlockerId)) return false;
+        let cleared = false;
+        const clearIfUnchanged = (live: Task): TaskUpdatePatch | null => {
+          if (live.deletedAt != null || (live.overlapBlockedBy ?? null) !== observedBlockerId) return null;
+          cleared = true;
+          return { overlapBlockedBy: null };
+        };
+        if (typeof this.store.updateTaskAtomic === "function") {
+          await this.store.updateTaskAtomic(candidate.id, clearIfUnchanged);
+          return cleared;
+        }
+        // Compatibility only for structural test/extension stores; production TaskStore is atomic.
+        const live = await this.store.getTask(candidate.id).catch(() => null);
+        if (!live) return false;
+        const patch = clearIfUnchanged(live);
+        if (patch) await this.store.updateTask(candidate.id, patch);
+        return cleared;
+      };
+
       const result = await runHoldReleaseSweep(this.store, {
         now: () => Date.now(),
+        selectionCache,
         reserveSlot: async (task): Promise<SlotReservation | null> => {
           let reservedScope = false;
+          let priorActiveScope: string[] | undefined;
+          let priorActiveScopeColumn: Task["column"] | undefined;
+          let priorDormantScope: QueuedOverlapCandidate | undefined;
+          let priorDormantScopeColumn: Task["column"] | undefined;
+          let priorLeaseWaiverIds: readonly string[] | undefined;
+          const releaseReservedScope = (): void => {
+            if (!reservedScope) return;
+            if (priorActiveScope) {
+              activeScopes.set(task.id, priorActiveScope);
+              activeScopeColumns.set(task.id, priorActiveScopeColumn ?? task.column);
+            } else {
+              activeScopes.delete(task.id);
+              activeScopeColumns.delete(task.id);
+            }
+            if (priorDormantScope) {
+              dormantScopes.set(task.id, priorDormantScope);
+              dormantScopeColumns.set(task.id, priorDormantScopeColumn ?? task.column);
+            } else {
+              dormantScopes.delete(task.id);
+              dormantScopeColumns.delete(task.id);
+            }
+            if (priorLeaseWaiverIds !== undefined) {
+              leaseWaiverIds.set(task.id, priorLeaseWaiverIds);
+            } else {
+              leaseWaiverIds.delete(task.id);
+            }
+            reservedScope = false;
+          };
 
           /*
           FNXC:WorkflowScheduling 2026-07-07-00:00:
           The workflow-column dispatch path is the only dispatcher when the flag is on, so the planning/bootstrap guards from the legacy todo filter must also apply here — and they must be TRAIT-based, not keyed on the literal "todo" column id. A custom workflow's intake/planning column can be renamed (`ideas`, `Inbox`, the default workflow's renamed "Planning"), so gating this guard on `task.column === "todo"` alone let an unplanned card in a renamed intake column bypass the stub check and release straight into execution (FN-7648). `isUnplannedForExecution` resolves the intake trait on the task's OWN resolved workflow IR so every renamed variant is covered.
           */
           try {
-            const ir = await resolveWorkflowIrForTask(this.store, task.id);
+            const ir = await resolveWorkflowIrForTask(this.store, task.id, wipIrCache, selectionCache);
             if (await isUnplannedForExecution(this.store, task, ir)) {
+              await checkAndRecordUnplannedExecutionBlock(this.store, task, ir);
               return null;
             }
           } catch {
@@ -2499,11 +2786,26 @@ export class Scheduler {
 
           const unmetDeps = getUnmetSchedulingDependencies(task, tasks, schedulingDependencyOptions);
           if (unmetDeps.length > 0) {
-            await this.store.updateTask(task.id, {
-              status: "queued",
-              blockedBy: unmetDeps[0],
+            const normalizedUnmetDeps = [...new Set(unmetDeps)].sort();
+            /*
+            FNXC:WorkflowScheduling 2026-08-05-06:22:
+            Dependency blocking and file-scope blocking are independent display truths. Keep the unfinished dependency authoritative while re-deriving overlapBlockedBy from the same active-scope registry used for dispatch, so paused/re-scoped leases disappear and resumed or replacement leases reappear without waiting for the dependency to finish.
+            */
+            let activeOverlapBlockedBy: string | null = null;
+            try {
+              const taskScope = await getFilteredFileScope(task);
+              if (taskScope.length > 0 && !isCoordinationOnlyTask(task, taskScope)) {
+                activeOverlapBlockedBy = findOverlappingFileScopeLease(task, taskScope)?.id ?? null;
+              }
+            } catch (error) {
+              schedulerLog.warn(`Failed to refresh file-scope overlap blocker for dependency-blocked task ${task.id}`, error);
+            }
+            await this.transitionQueuedEpisode(task, {
+              signature: `dependency:${normalizedUnmetDeps.join(",")}`,
+              blockedBy: unmetDeps[0] ?? null,
+              overlapBlockedBy: activeOverlapBlockedBy,
+              action: `queued — unmet dependencies: ${unmetDeps.join(", ")}`,
             });
-            await this.logDispatchQueuedReason(task.id, `queued — unmet dependencies: ${unmetDeps.join(", ")}`);
             this.options.onBlocked?.(task, unmetDeps);
             return null;
           }
@@ -2530,24 +2832,56 @@ export class Scheduler {
           FNXC:WorkflowScheduling 2026-06-23-11:12:
           The workflow sweep is the only dispatcher, so the scheduler-only pre-dispatch gates must run before a capacity hold moves to an execution column. Keep dependency, filesystem, node-routing, permanent-agent, and oscillation checks on this path instead of relying on the retired todo loop.
           */
-          const validation = await this.validateTaskFilesystem(task.id);
+          const validation = await this.validateTaskFilesystem(task);
           if (!validation.valid) {
             schedulerLog.warn(`Task ${task.id} filesystem validation failed: ${validation.reason}`);
-            // See the FNXC:WorkflowScheduling 2026-07-13-11:25 note in the legacy loop: the
-            // status write is what makes triage rediscover a card whose replan column equals
-            // its current column.
-            const replanColumn = await moveTaskToReplanColumn(this.store, task);
-            await this.store.updateTask(task.id, { status: "needs-replan" });
-            await this.store.logEntry(task.id, `Task rebounded to ${replanColumn} for re-specification — filesystem validation failed`, validation.reason);
+            /*
+            FNXC:WorkflowScheduling 2026-08-01-18:47:
+            Missing/empty PROMPT used to rebound with unbounded needs-replan writes (FN-8704
+            storm twin). Share the planning recovery budget: backoff while attempts remain,
+            then park failed so a broken task dir cannot spin forever. The status write is
+            still what makes triage rediscover a card whose replan column equals its current column.
+            */
+            const decision = computeRecoveryDecision({
+              recoveryRetryCount: task.recoveryRetryCount,
+              nextRecoveryAt: task.nextRecoveryAt,
+            });
+            if (!decision.shouldRetry) {
+              const error = `REQUIRED_ARTIFACT_RECOVERY_EXHAUSTED: filesystem validation failed (${validation.reason}) after ${MAX_RECOVERY_RETRIES} automatic planning retries.`;
+              await this.store.updateTask(task.id, {
+                status: "failed",
+                error,
+                recoveryRetryCount: null,
+                nextRecoveryAt: null,
+              });
+              await this.store.logEntry(task.id, error, validation.reason);
+              return null;
+            }
+            const attempt = decision.nextState.recoveryRetryCount ?? MAX_RECOVERY_RETRIES;
+            await this.store.updateTask(task.id, {
+              status: "needs-replan",
+              error: null,
+              recoveryRetryCount: decision.nextState.recoveryRetryCount,
+              nextRecoveryAt: decision.nextState.nextRecoveryAt,
+            });
+            await this.store.logEntry(
+              task.id,
+              `Task retained in ${task.column} for in-place specification repair — filesystem validation failed (attempt ${attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)})`,
+              validation.reason,
+            );
             return null;
           }
 
           if (typeof this.store.getTasksDir === "function") {
             const promptPath = getPromptPath(this.store.getTasksDir(), task.id);
-            const staleness = await evaluateSpecStaleness({ settings, promptPath, task });
+            const staleness = await evaluateSpecStaleness({
+              settings,
+              promptPath,
+              task,
+              plannerColumns: await resolveDedicatedPlannerColumnsForTask(this.store, task.id),
+            });
             if (staleness.isStale) {
               schedulerLog.warn(`Task ${task.id} specification is stale — ${staleness.reason}`);
-              await moveTaskToReplanColumn(this.store, task);
               await this.store.updateTask(task.id, { status: "needs-replan" });
               await this.store.logEntry(task.id, staleness.reason);
               return null;
@@ -2562,6 +2896,7 @@ export class Scheduler {
             }
             return null;
           }
+          let observedOverlapBlockedBy = freshTask.overlapBlockedBy ?? null;
 
           if (freshTask.checkedOutBy && this.options.leaseManager) {
             const recovered = await this.options.leaseManager.recoverAbandonedLease(
@@ -2634,7 +2969,7 @@ export class Scheduler {
                   schedulerLog.log(`Task ${task.id} dispatch blocked — ${reason}`);
                   await this.store.logEntry(task.id, reason);
                   try {
-                    await this.store.recordRunAuditEvent?.({
+                    await emitBoundedRunAudit(this.store, {
                       taskId: freshTask.id,
                       agentId: "scheduler",
                       runId: generateSyntheticRunId("scheduler", freshTask.id),
@@ -2653,7 +2988,7 @@ export class Scheduler {
                         decisionReason: handoffDecision.reason,
                         source: "scheduler.dispatch",
                       },
-                    });
+                    }, { log: schedulerLog });
                   } catch (error) {
                     schedulerLog.warn(`Task ${task.id} failed to emit node:handoff:parked audit: ${error instanceof Error ? error.message : String(error)}`);
                   }
@@ -2663,7 +2998,7 @@ export class Scheduler {
 
               await this.store.logEntry(task.id, `Owning-node handoff applied: ${handoffDecision.reason}`);
               try {
-                await this.store.recordRunAuditEvent?.({
+                await emitBoundedRunAudit(this.store, {
                   taskId: freshTask.id,
                   agentId: "scheduler",
                   runId: generateSyntheticRunId("scheduler", freshTask.id),
@@ -2682,7 +3017,7 @@ export class Scheduler {
                     decisionReason: handoffDecision.reason,
                     source: "scheduler.dispatch",
                   },
-                });
+                }, { log: schedulerLog });
               } catch (error) {
                 schedulerLog.warn(`Task ${task.id} failed to emit node:handoff audit: ${error instanceof Error ? error.message : String(error)}`);
               }
@@ -2731,48 +3066,7 @@ export class Scheduler {
             }
           }
 
-          if (latestSettings.ephemeralAgentsEnabled === false && !freshTask.assignedAgentId) {
-            /*
-            FNXC:WorkflowScheduling 2026-06-23-22:33:
-            The workflow cutover path must not silently dispatch unassigned work when ephemeral agents are disabled. Queue until permanent-agent selection is available so upgrades preserve the executor contract instead of falling through to local execution.
-            */
-            if (!this.options.agentStore) {
-              await this.store.updateTask(task.id, { status: "queued" });
-              if (!this.wasPermanentAgentUnavailable.has(task.id)) {
-                await this.logDispatchQueuedReason(
-                  task.id,
-                  "queued — permanent executor selection unavailable (ephemeral agents disabled)",
-                );
-                this.wasPermanentAgentUnavailable.add(task.id);
-              }
-              return null;
-            }
-
-            const selectedAgent = await selectPermanentAgentForTask({
-              task: freshTask,
-              agentStore: this.options.agentStore,
-              taskStore: this.store,
-            });
-            if (!selectedAgent) {
-              await this.store.updateTask(task.id, { status: "queued" });
-              if (!this.wasPermanentAgentUnavailable.has(task.id)) {
-                await this.logDispatchQueuedReason(
-                  task.id,
-                  "queued — no permanent executor available (ephemeral agents disabled)",
-                );
-                this.wasPermanentAgentUnavailable.add(task.id);
-              }
-              return null;
-            }
-            await this.store.updateTask(task.id, { assignedAgentId: selectedAgent.id });
-            await this.store.logEntry(
-              task.id,
-              `Auto-assigned to permanent agent ${selectedAgent.id} (ephemeral agents disabled)`,
-            );
-            this.wasPermanentAgentUnavailable.delete(task.id);
-          } else {
-            this.wasPermanentAgentUnavailable.delete(task.id);
-          }
+          this.wasPermanentAgentUnavailable.delete(task.id);
 
           const oscillationSettings = latestSettings as Settings & {
             dispatchOscillationSettleMs?: number;
@@ -2828,7 +3122,7 @@ export class Scheduler {
               "text",
               `cycleCount=${nextDispatchStormCount} windowMs=${dispatchOscillationWindowMs}`,
             );
-            await this.store.recordRunAuditEvent?.({
+            await emitBoundedRunAudit(this.store, {
               taskId: task.id,
               agentId: "scheduler",
               runId: generateSyntheticRunId("scheduler-dispatch-oscillation", task.id),
@@ -2841,7 +3135,7 @@ export class Scheduler {
                 windowMs: dispatchOscillationWindowMs,
                 lastMoveSource: recentEngineTodoMovedAt ? "engine" : "scheduler",
               },
-            });
+            }, { log: schedulerLog });
             schedulerLog.warn(`Task ${task.id} auto-paused after dispatch oscillation threshold ${dispatchOscillationThreshold} was exceeded (${nextDispatchStormCount} cycles)`);
             return null;
           }
@@ -2859,42 +3153,56 @@ export class Scheduler {
             { planApprovalRequired: latestSettings.planApprovalMode === "require-all" },
           );
           if (missionAdmission.kind === "lineage-blocked") {
-            await this.store.updateTask(task.id, { status: "queued", blockedBy: null, overlapBlockedBy: null });
+            if (observedOverlapBlockedBy) {
+              const cleared = await clearObservedOverlapIfStillStale(freshTask, observedOverlapBlockedBy);
+              if (cleared) observedOverlapBlockedBy = null;
+            }
+            await this.store.updateTask(task.id, { status: "queued", blockedBy: null });
             await this.logDispatchQueuedReason(task.id, `queued — mission lineage blocked: ${missionAdmission.reason}`);
             return null;
           }
 
           if (settings.groupOverlappingFiles && missionAdmission.kind === "coarse-fallback") {
-            const taskScope = await getFilteredFileScope(task.id);
+            const taskScope = await getFilteredFileScope(task);
             if (taskScope.length > 0 && !isCoordinationOnlyTask(task, taskScope)) {
-              const overlappingTaskId = Array.from(activeScopes.entries())
-                .sort(([aId], [bId]) => aId.localeCompare(bId))
-                .find(([, activeScope]) => this.pathsOverlap(taskScope, activeScope))?.[0] ?? null;
+              const overlapLease = findOverlappingFileScopeLease(task, taskScope);
 
-              if (overlappingTaskId) {
-                const activeLeaseColumn = activeScopeColumns.get(overlappingTaskId) ?? "in-progress";
-                await this.store.updateTask(task.id, {
-                  status: "queued",
+              if (overlapLease) {
+                await this.transitionQueuedEpisode(task, {
+                  signature: `file-scope:${overlapLease.id}`,
                   blockedBy: null,
-                  overlapBlockedBy: overlappingTaskId,
+                  overlapBlockedBy: overlapLease.id,
+                  action: `queued — waiting for ${overlapLease.kind} file-scope lease ${overlapLease.id} (column=${overlapLease.column}, lease=${overlapLease.kind})`,
                 });
                 await this.rollbackRunningAgentsForQueuedTodoTask(task.id);
-                await this.logDispatchQueuedReason(
-                  task.id,
-                  `queued — blocked by active file-scope lease ${overlappingTaskId} (column=${activeLeaseColumn})`,
-                );
                 return null;
               }
 
-              if (task.overlapBlockedBy) {
-                await this.store.updateTask(task.id, { overlapBlockedBy: null });
+              if (observedOverlapBlockedBy) {
+                const cleared = await clearObservedOverlapIfStillStale(freshTask, observedOverlapBlockedBy);
+                if (cleared) observedOverlapBlockedBy = null;
               }
 
+              priorActiveScope = activeScopes.get(task.id);
+              priorActiveScopeColumn = activeScopeColumns.get(task.id);
+              priorDormantScope = dormantScopes.get(task.id);
+              priorDormantScopeColumn = dormantScopeColumns.get(task.id);
+              priorLeaseWaiverIds = leaseWaiverIds.get(task.id);
+              dormantScopes.delete(task.id);
+              dormantScopeColumns.delete(task.id);
+              /*
+              FNXC:OverlapScheduling 2026-08-29-05:49:
+              The in-pass reservation is active before the executor creates a worktree. Remove any
+              dormant predecessor first so a promoted holder cannot occupy both tiers and accidentally
+              block a peer twice during the same scheduling pass.
+              */
               activeScopes.set(task.id, taskScope);
               activeScopeColumns.set(task.id, "in-progress");
+              leaseWaiverIds.set(task.id, []);
               reservedScope = true;
-            } else if (task.overlapBlockedBy) {
-              await this.store.updateTask(task.id, { overlapBlockedBy: null });
+            } else if (observedOverlapBlockedBy) {
+              const cleared = await clearObservedOverlapIfStillStale(freshTask, observedOverlapBlockedBy);
+              if (cleared) observedOverlapBlockedBy = null;
               if (isCoordinationOnlyTask(task, taskScope)) {
                 await this.store.logEntry(
                   task.id,
@@ -2904,122 +3212,170 @@ export class Scheduler {
             }
           }
 
-          const topLevelClaimedSlots = computeTopLevelConcurrencyClaimed({
-            tasks,
-            // Prior tryAcquire reservations in this sweep already bump activeCount.
-            semaphoreActiveCount: this.options.semaphore?.activeCount,
-          });
-          const concurrencyDiagnostic = computeConcurrencyGateDiagnostic({
-            agentSlots: reservedConcurrentSlots,
-            maxConcurrent,
-            activeWorktrees: reservedWorktreeSlots,
-            maxWorktrees,
-            semaphore: this.options.semaphore,
-            inProgressTaskIds,
-            topLevelClaimedSlots,
-          });
           /*
-          FNXC:WorkflowScheduling 2026-06-23-20:58:
-          The workflow hold/release sweep is the only todo pickup path, so it must honor the same maxConcurrent, maxWorktrees, and shared semaphore pressure before releasing a task to in-progress.
-
-          FNXC:GlobalConcurrencyControls 2026-07-14-18:30:
-          Preflight is no longer non-mutating for the shared semaphore: tryAcquire reserves a real slot before the move so triage cannot fill the global cap while this card is already counted as an in-progress runner. On move failure the reservation is released; on success the pre-held slot is transferred to the executor/graph run.
+          FNXC:WorktreeCapacity 2026-08-01-04:38:
+          Serialize the workflow scheduler's direct hold release with planning and merge admission.
+          All three lanes count the same active population, so independent snapshots must not each
+          claim the final slot. The reservation remains until the executor observes the persisted
+          WIP row and takes the handoff.
           */
-          if (concurrencyDiagnostic.available <= 0) {
-            if (reservedScope) {
-              activeScopes.delete(task.id);
-              activeScopeColumns.delete(task.id);
-            }
-            const reason = formatConcurrencyLimitReason(concurrencyDiagnostic);
+          let finalClaimSnapshot: Promise<{
+            agent: { count: number; ids: string[] };
+            worktree: { count: number; ids: string[] };
+          }> | undefined;
+          const getFinalClaimSnapshot = () => finalClaimSnapshot ??= (async () => {
+            /*
+            FNXC:CapacityModel 2026-09-01-14:49:
+            Re-read full rows inside the serialized drain and derive each dimension from its own
+            canonical predicate. Reservations bridge both persistence transfers without making
+            checkout-free planners appear in the worktree holder set.
+            */
+            const liveTasks = await this.store.listTasks({ slim: false, includeArchived: false });
+            const [agentIds, worktreeIds] = await Promise.all([
+              persistedTopLevelAgentTaskIdsFromStore(this.store, liveTasks),
+              persistedWorktreeHolderTaskIdsFromStore(this.store, liveTasks),
+            ]);
+            return {
+              agent: { count: agentIds.length, ids: agentIds },
+              worktree: { count: worktreeIds.length, ids: worktreeIds },
+            };
+          })();
+          let projectSlotReserved = false;
+          const admittedTaskId = await projectAdmissionCoordinator.admitNext({
+            projectId: this.store.getRootDir(),
+            maxConcurrent: activeTaskLimit,
+            claimed: async () => (await getFinalClaimSnapshot()).agent.count,
+            claimedTaskIds: async () => (await getFinalClaimSnapshot()).agent.ids,
+            ...(maxWorktrees === null ? {} : {
+              worktreeGate: {
+                limit: maxWorktrees,
+                claimed: async () => (await getFinalClaimSnapshot()).worktree.count,
+                claimedTaskIds: async () => (await getFinalClaimSnapshot()).worktree.ids,
+              },
+            }),
+            semaphore: this.options.semaphore,
+            refresh: async () => [{
+              taskId: task.id,
+              projectId: this.store.getRootDir(),
+              lane: "execute",
+              consumesWorktree: true,
+              createdAt: task.createdAt,
+              reserve: () => registerPreHeldExecutorSlot(task.id, this.options.semaphore !== undefined),
+              start: async () => {
+                projectSlotReserved = true;
+                return true;
+              },
+            }],
+          });
+          if (!projectSlotReserved) {
+            releaseReservedScope();
+            /*
+            FNXC:WorktreeCapacity 2026-08-08-04:17:
+            A scheduler candidate can lose one serialized admission pass because a higher-priority
+            merge/planning provider was selected, even with a free slot. Only call it exhaustion
+            after the coordinator admitted nobody and report the fresh canonical holder snapshot
+            that made that decision; the pre-sweep snapshot is diagnostic-only and can be stale.
+            */
+            const freshClaims = await getFinalClaimSnapshot();
+            const exhausted = admittedTaskId === undefined;
+            const freshDiagnostic = computeConcurrencyGateDiagnostic({
+              agentSlots: freshClaims.agent.count,
+              maxConcurrent,
+              activeWorktrees: freshClaims.worktree.count,
+              maxWorktrees,
+              worktreeHolderTaskIds: freshClaims.worktree.ids,
+              semaphore: this.options.semaphore,
+              inProgressTaskIds: freshClaims.agent.ids,
+              topLevelClaimedSlots: freshClaims.agent.count,
+            });
+            const reason = exhausted
+              ? formatConcurrencyLimitReason(freshDiagnostic)
+              : `queued — higher-priority lifecycle admission started: task=${admittedTaskId}`;
             await this.store.updateTask(task.id, { status: "queued" });
-            await this.logDispatchQueuedReason(task.id, reason, formatConcurrencyLimitMemoKey(concurrencyDiagnostic));
+            await this.logDispatchQueuedReason(task.id, reason);
             return null;
           }
 
+          // admitNext acquired and registered the host slot atomically with the
+          // project reservation, so this handoff cannot bypass review candidates.
           const sem = this.options.semaphore;
-          if (sem && !sem.tryAcquire()) {
-            if (reservedScope) {
-              activeScopes.delete(task.id);
-              activeScopeColumns.delete(task.id);
-            }
-            const reason = formatConcurrencyLimitReason({
-              ...concurrencyDiagnostic,
-              available: 0,
-              bindingGates: [...new Set([...concurrencyDiagnostic.bindingGates, "semaphore" as const])],
-            });
-            await this.store.updateTask(task.id, { status: "queued" });
-            await this.logDispatchQueuedReason(task.id, reason, formatConcurrencyLimitMemoKey(concurrencyDiagnostic));
-            return null;
-          }
-          if (sem) {
-            registerPreHeldExecutorSlot(task.id);
-          }
 
           let acquiredSymbols: string[] | undefined;
-          if (missionAdmission.kind === "symbol-lock") {
+          try {
+            if (missionAdmission.kind === "symbol-lock") {
             /*
             FNXC:MissionSymbolAdmission 2026-07-31-12:00:
             Acquire after all capacity gates and immediately before hold release;
             the reservation release path below returns this lock if moveTask
             rejects, while a successful move transfers ownership to the task.
             */
-            const lockResult = await this.store.acquireSymbolLocks(
-              missionAdmission.symbols,
-              { ownerTaskId: task.id, missionId: freshTask.missionId, featureId: missionAdmission.feature.id, agentId: "scheduler" },
-              SYMBOL_LOCK_LEASE_MS,
-            );
-            if (!lockResult.acquired) {
-              dropPreHeldExecutorSlot(task.id, sem);
-              if (reservedScope) {
-                activeScopes.delete(task.id);
-                activeScopeColumns.delete(task.id);
-              }
-              const conflict = lockResult.conflicts[0];
-              await this.store.updateTask(task.id, { status: "queued", blockedBy: null, overlapBlockedBy: null });
-              await this.logDispatchQueuedReason(
-                task.id,
-                `queued — symbol contention: symbol=${conflict?.symbolKey ?? "unknown"} holder=${conflict?.ownerTaskId ?? "unknown"}`,
+              const lockResult = await this.store.acquireSymbolLocks(
+                missionAdmission.symbols,
+                { ownerTaskId: task.id, missionId: freshTask.missionId, featureId: missionAdmission.feature.id, agentId: "scheduler" },
+                SYMBOL_LOCK_LEASE_MS,
               );
-              return null;
+              if (!lockResult.acquired) {
+                if (dropPreHeldExecutorSlot(task.id)) sem?.release();
+                releaseReservedScope();
+                const conflict = lockResult.conflicts[0];
+                if (observedOverlapBlockedBy) {
+                  const cleared = await clearObservedOverlapIfStillStale(freshTask, observedOverlapBlockedBy);
+                  if (cleared) observedOverlapBlockedBy = null;
+                }
+                await this.store.updateTask(task.id, { status: "queued", blockedBy: null });
+                await this.logDispatchQueuedReason(
+                  task.id,
+                  `queued — symbol contention: symbol=${conflict?.symbolKey ?? "unknown"} holder=${conflict?.ownerTaskId ?? "unknown"}`,
+                );
+                return null;
+              }
+              acquiredSymbols = missionAdmission.symbols;
+              await this.store.logEntry(task.id, `symbol-lock admission acquired: ${missionAdmission.symbols.join(", ")}`);
             }
-            acquiredSymbols = missionAdmission.symbols;
-            await this.store.logEntry(task.id, `symbol-lock admission acquired: ${missionAdmission.symbols.join(", ")}`);
+
+            dispatchPrepByTaskId.set(task.id, {
+              baseBranch: this.resolveBaseBranch(freshTask, tasks, isReviewColumnTask),
+              dispatchStormCount: nextDispatchStormCount,
+              dispatchTimestamp,
+              effectiveNodeId: effectiveNode.nodeId ?? null,
+              effectiveNodeSource: effectiveNode.source,
+              observedOverlapBlockedBy,
+              task: freshTask,
+            });
+
+            reservedWorktreeSlots += 1;
+            reservedConcurrentSlots += 1;
+            let released = false;
+            return {
+              release: () => {
+                if (released) return;
+                released = true;
+                releaseReservedScope();
+                reservedWorktreeSlots = releaseReservedSlot(reservedWorktreeSlots);
+                reservedConcurrentSlots = releaseReservedSlot(reservedConcurrentSlots);
+                dispatchPrepByTaskId.delete(task.id);
+                if (dropPreHeldExecutorSlot(task.id)) sem?.release();
+                if (acquiredSymbols) {
+                  void this.store.releaseSymbolLocks(acquiredSymbols, task.id);
+                }
+              },
+            };
+          } catch (error) {
+            if (dropPreHeldExecutorSlot(task.id)) sem?.release();
+            releaseReservedScope();
+            if (acquiredSymbols) {
+              await this.store.releaseSymbolLocks(acquiredSymbols, task.id).catch(() => undefined);
+            }
+            throw error;
           }
-
-          dispatchPrepByTaskId.set(task.id, {
-            baseBranch: this.resolveBaseBranch(freshTask, tasks),
-            dispatchStormCount: nextDispatchStormCount,
-            dispatchTimestamp,
-            effectiveNodeId: effectiveNode.nodeId ?? null,
-            effectiveNodeSource: effectiveNode.source,
-            task: freshTask,
-          });
-
-          reservedWorktreeSlots += 1;
-          reservedConcurrentSlots += 1;
-          let released = false;
-          return {
-            release: () => {
-              if (released) return;
-              released = true;
-              if (reservedScope) {
-                activeScopes.delete(task.id);
-                activeScopeColumns.delete(task.id);
-              }
-              reservedWorktreeSlots = Math.max(0, reservedWorktreeSlots - 1);
-              reservedConcurrentSlots = Math.max(0, reservedConcurrentSlots - 1);
-              dispatchPrepByTaskId.delete(task.id);
-              dropPreHeldExecutorSlot(task.id, sem);
-              if (acquiredSymbols) {
-                void this.store.releaseSymbolLocks(acquiredSymbols, task.id);
-              }
-            },
-          };
         },
-        allocateWorktree: (task, reservedNames) =>
-          this.planWorktreePath(task, settings.worktreeNaming, reservedNames, settings),
+        allocateWorktree: (task, _reservedNames) =>
+          this.planWorktreePath(task, settings),
       });
       for (const taskId of result.released) {
+        // The authoritative move has made this task visible to canonical live-task
+        // counting; the transient project reservation no longer needs to bridge it.
+        projectAdmissionCoordinator.releaseReservation(taskId);
         const prep = dispatchPrepByTaskId.get(taskId);
         if (!prep) continue;
         /*
@@ -3031,30 +3387,70 @@ export class Scheduler {
         */
         schedulerLog.log(`Starting ${taskId}: ${prep.task.title || taskId} (deps satisfied)`);
         const latest = await this.store.getTask(taskId).catch(() => null);
-        const dispatchUpdate = {
+        const dispatchUpdate: TaskUpdatePatch = {
           status: null,
           blockedBy: null,
           executionStartBranch: prep.baseBranch ?? undefined,
           effectiveNodeId: prep.effectiveNodeId,
-          effectiveNodeSource: prep.effectiveNodeSource,
+          effectiveNodeSource: prep.effectiveNodeSource as Task["effectiveNodeSource"],
           mergeRetries: 0,
           dispatchStormCount: prep.dispatchStormCount,
           lastDispatchAt: prep.dispatchTimestamp,
         };
-        const scheduledTask = {
-          ...(latest?.id === taskId ? latest : prep.task),
-          ...dispatchUpdate,
-          status: undefined,
-          blockedBy: undefined,
-          effectiveNodeId: prep.effectiveNodeId ?? undefined,
-          effectiveNodeSource: prep.effectiveNodeSource as Task["effectiveNodeSource"],
-          column: "in-progress" as const,
+        const observedOverlapBlockedBy = prep.observedOverlapBlockedBy;
+        const mayClearObservedOverlap = typeof observedOverlapBlockedBy === "string"
+          && observedOverlapBlockedBy.trim().length > 0
+          && latest?.id === taskId
+          && (latest.overlapBlockedBy ?? null) === observedOverlapBlockedBy
+          && !await freshOverlapBlockerStillBlocks(latest, observedOverlapBlockedBy);
+        let overlapClearApplied = false;
+        let persistedTask = latest?.id === taskId ? latest : prep.task;
+        const buildDispatchPatch = (live: Task): TaskUpdatePatch => {
+          const clearObservedOverlap = mayClearObservedOverlap
+            && live.deletedAt == null
+            && (live.overlapBlockedBy ?? null) === observedOverlapBlockedBy;
+          if (clearObservedOverlap) overlapClearApplied = true;
+          return {
+            ...dispatchUpdate,
+            ...(clearObservedOverlap ? { overlapBlockedBy: null } : {}),
+          };
         };
+        /*
+        FNXC:OverlapScheduling 2026-09-02-04:46:
+        Hold → WIP has no workflow-hook overlap clear, so the committed dispatch must scrub the stale
+        blocker it actually reserved against. Build the whole metadata patch under the task lock and
+        clear only that exact observed id: the executor pre-dispatch gate can stamp a different fresh
+        in-place hold between reservation and commit, and that newer edge must reach onSchedule intact.
+        */
         try {
-          await this.store.updateTask(taskId, dispatchUpdate);
+          if (typeof this.store.updateTaskAtomic === "function") {
+            persistedTask = await this.store.updateTaskAtomic(taskId, buildDispatchPatch);
+          } else {
+            // Compatibility only for structural test/extension stores; production TaskStore is atomic.
+            persistedTask = await this.store.updateTask(taskId, buildDispatchPatch(persistedTask));
+          }
         } catch (error) {
+          overlapClearApplied = false;
           schedulerLog.error(`Post-release dispatch metadata update failed for ${taskId}:`, error);
         }
+        /*
+        DELIBERATE-LITERAL — runHoldReleaseSweep has committed this task to its WIP lane before it
+        appears in `released`. Keep the legacy WIP fallback on the synthetic handoff shape so an
+        isolated post-release read/update failure cannot hand the executor the task's stale hold lane.
+        */
+        const scheduledTask: Task = {
+          ...persistedTask,
+          status: undefined,
+          blockedBy: undefined,
+          executionStartBranch: prep.baseBranch ?? undefined,
+          effectiveNodeId: prep.effectiveNodeId ?? undefined,
+          effectiveNodeSource: prep.effectiveNodeSource as Task["effectiveNodeSource"],
+          mergeRetries: 0,
+          dispatchStormCount: prep.dispatchStormCount,
+          lastDispatchAt: prep.dispatchTimestamp,
+          ...(overlapClearApplied ? { overlapBlockedBy: undefined } : {}),
+          column: "in-progress",
+        };
         try {
           this.options.onSchedule?.(scheduledTask);
         } catch (error) {
@@ -3093,9 +3489,27 @@ export class Scheduler {
         return;
       }
 
-      const feature = await this.resolveMissionFeatureForTask(missionStore, task);
+      /*
+      FNXC:MissionAutoReconcile 2026-08-15-23:43:
+      Reconciliation is best-effort repair. Its pre-resolution and post-resolution boundaries
+      degrade independently so either failure cannot suppress the FN-5715 mission-execution
+      completion trigger, which FN-8948 accidentally stalled.
+      */
+      if (task.missionId) {
+        try {
+          await reconcileMissionState({ taskStore: this.store, missionStore }, { missionId: task.missionId, source: "task-move" });
+        } catch (error) {
+          schedulerLog.warn(`Mission reconciliation failed before resolving task ${taskId}; continuing mission completion handling:`, error);
+        }
+      }
+      const feature = await resolveMissionFeatureForTask(missionStore, task);
       if (!feature) {
-        schedulerLog.log(`No linked feature found for task ${taskId} (sliceId=${task.sliceId ?? "none"}) — skipping mission status update`);
+        /*
+        FNXC:EngineDiagnostics 2026-08-03-05:54:
+        Most tasks are not mission-linked. Skipping mission status is the expected steady-state path,
+        not an operator-visible event — keep it off the default TUI unless FUSION_DEBUG=scheduler.
+        */
+        schedulerLog.debug(`No linked feature found for task ${taskId} (sliceId=${task.sliceId ?? "none"}) — skipping mission status update`);
         return;
       }
 
@@ -3106,72 +3520,63 @@ export class Scheduler {
         return;
       }
 
-      const hasLinkedAssertions = (await missionStore.listAssertionsForFeature(feature.id)).length > 0;
-
-      const reconciliation = await reconcileMissionFeatureState(
-        this.store,
-        { ...task, column: toColumn },
-        feature,
-        { hasLinkedAssertions },
-      );
-
-      if (reconciliation.kind === "blocked") {
-        schedulerLog.warn(`Task ${taskId} mission update blocked — ${reconciliation.reason}`);
-        return;
-      }
-
-      if (reconciliation.kind === "failure") {
-        schedulerLog.warn(`Task ${taskId} mission update reported failure — ${reconciliation.reason}`);
-        return;
-      }
-
       const sliceIdBeforeUpdate = feature.sliceId;
-
-      if (reconciliation.kind === "update") {
-        await missionStore.updateFeatureStatus(feature.id, reconciliation.status);
-        schedulerLog.log(
-          `Feature ${feature.id} marked ${reconciliation.status} (${reconciliation.reason})`,
-        );
+      /*
+      FNXC:RUFU-075 2026-08-13-03:16:
+      FN-8948 routed the task-move feature-status reconciliation through a resolve-missionId ->
+      reconcileMissionState authority. That block is a maintenance side-channel and must not gate the
+      mission-completion advance below: a missionStore that cannot resolve the mission (does not
+      implement getSlice/getMilestone, or genuinely has no mission) should skip reconcile rather than
+      abort the completion check. Pre-FN-8948 the completion check ran directly from the resolved
+      feature, which is what the scheduler contract (and minimal missionStore mocks) still require.
+      */
+      let missionId = task.missionId;
+      try {
+        if (!missionId && typeof missionStore.getSlice === "function") {
+          const featureSlice = await missionStore.getSlice(feature.sliceId);
+          const milestone =
+            featureSlice && typeof missionStore.getMilestone === "function"
+              ? await missionStore.getMilestone(featureSlice.milestoneId)
+              : undefined;
+          missionId = milestone?.missionId;
+        }
+        if (!missionId) {
+          schedulerLog.warn(`Task ${taskId} feature ${feature.id} has no resolvable mission; skipping reconciliation`);
+        } else if (missionId !== task.missionId) {
+          await reconcileMissionState({ taskStore: this.store, missionStore }, { missionId, source: "task-move" });
+        }
+      } catch (error) {
+        // Best-effort reconcile — a partial missionStore (missing getSlice/getMilestone or the
+        // reconcile probes) must not gate the completion advance below.
+        schedulerLog.warn(`Task ${taskId} feature ${feature.id} mission reconcile skipped (${String(error)}); continuing to completion check`);
       }
 
-      if (toColumn === "done") {
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-30-20:40 (fleet — mission completion advance):
+      "Did this task just COMPLETE?" resolved from the destination column's own trait.
+
+      Keyed on `toColumn === "done"`, a renamed board never advanced mission execution: the feature
+      status above was reconciled (that path already resolves traits), but the follow-on completion
+      never fired, so the mission stalled with its roadmap showing the work finished. The two halves
+      of one handler disagreed about whether the same move was a completion.
+
+      Fail-soft to the legacy literal via `isCompleteColumnRole`'s documented no-metadata behaviour —
+      an unresolvable workflow keeps today's behaviour rather than stalling the mission.
+      */
+      let completionFlags: ColumnRoleTraitFlags | undefined;
+      try {
+        const ir = await resolveWorkflowIrForTask(this.store, taskId);
+        const column = (ir as WorkflowIrV2).columns?.find((candidate) => candidate.id === toColumn);
+        if (column) completionFlags = resolveColumnFlags(column);
+      } catch {
+        // Unresolvable workflow: fall back to the legacy `done` literal below.
+      }
+      if (isCompleteColumnRole(completionFlags, toColumn)) {
         await this.handleMissionTaskCompletion(taskId, sliceIdBeforeUpdate);
       }
     } catch (err) {
       schedulerLog.error(`Error handling mission task move for ${taskId}:`, err);
     }
-  }
-
-  private async resolveMissionFeatureForTask(missionStore: MissionStore | AsyncMissionStore, task: Task): Promise<MissionFeature | undefined> {
-    const linkedFeature = await resolveMissionFeatureForTask(missionStore, task);
-    if (linkedFeature) {
-      return linkedFeature;
-    }
-
-    if (!task.sliceId || !task.title) {
-      return undefined;
-    }
-
-    const normalizedTaskTitle = this.normalizeMissionFeatureTitle(task.title);
-    const matchingFeature = (await missionStore
-      .listFeatures(task.sliceId))
-      .find((feature) =>
-        !feature.taskId
-        && this.normalizeMissionFeatureTitle(feature.title) === normalizedTaskTitle
-      );
-
-    if (!matchingFeature) {
-      return undefined;
-    }
-
-    schedulerLog.warn(
-      `Repairing one-way mission link: task ${task.id} matched unlinked feature ${matchingFeature.id}`,
-    );
-    return missionStore.linkFeatureToTask(matchingFeature.id, task.id);
-  }
-
-  private normalizeMissionFeatureTitle(title: string): string {
-    return title.trim().replace(/\s+/g, " ").toLowerCase();
   }
 
   /**
@@ -3269,17 +3674,6 @@ export class Scheduler {
         return;
       }
 
-      const missionHierarchy = await missionStore.getMissionWithHierarchy(mission.id);
-      const hasActiveSlice = missionHierarchy?.milestones.some((candidateMilestone) =>
-        candidateMilestone.slices.some((candidateSlice) =>
-          candidateSlice.id !== slice.id && candidateSlice.status === "active"
-        )
-      );
-      if (hasActiveSlice) {
-        schedulerLog.log(`Mission ${mission.id} already has an active slice; skipping auto-advance`);
-        return;
-      }
-
       const nextSlice = await this.activateNextPendingSlice(mission.id);
       if (nextSlice) {
         schedulerLog.log(`Auto-advanced: activated slice ${nextSlice.id} for mission ${mission.id}`);
@@ -3303,36 +3697,15 @@ export class Scheduler {
     const missionStore = this.options.missionStore;
 
     try {
-      const mission = await missionStore.getMissionWithHierarchy(missionId);
-      if (!mission || mission.status !== "active") {
-        schedulerLog.log(`Mission ${missionId}: not active, skipping slice activation`);
-        return null;
-      }
-
-      const sortedMilestones = [...mission.milestones].sort((a, b) => a.orderIndex - b.orderIndex);
-
-      for (const milestone of sortedMilestones) {
-        const dependenciesMet = milestone.dependencies.every((dependencyId) => {
-          const dependency = mission.milestones.find((candidate) => candidate.id === dependencyId);
-          return dependency?.status === "complete";
-        });
-        if (!dependenciesMet) {
-          continue;
-        }
-
-        const pendingSlice = [...milestone.slices]
-          .sort((a, b) => a.orderIndex - b.orderIndex)
-          .find((slice) => slice.status === "pending");
-        if (!pendingSlice) {
-          continue;
-        }
-
-        const activated = await missionStore.activateSlice(pendingSlice.id);
+      // The store atomically re-reads the hierarchy and claims the candidate.
+      // A duplicate signal is an expected no-op, not a scheduler error.
+      const activated = await missionStore.tryActivateNextPendingSlice(missionId);
+      if (activated) {
         schedulerLog.log(`Activated slice ${activated.id} for mission ${missionId}`);
         return activated;
       }
 
-      schedulerLog.log(`Mission ${missionId}: no pending slices to activate`);
+      schedulerLog.log(`Mission ${missionId}: no serially eligible slice to activate`);
       return null;
     } catch (err) {
       schedulerLog.error(`Error activating next slice for mission ${missionId}:`, err);
@@ -3350,197 +3723,85 @@ export class Scheduler {
    *
    * @returns The total number of fixes applied across all missions
    */
-  async reconcileAllMissionFeatures(): Promise<number> {
-    if (!this.options.missionStore) {
-      return 0;
-    }
-
+  async reconcileAllMissionFeatures(source: MissionReconcileSource = "self-healing"): Promise<number> {
+    if (!this.options.missionStore) return 0;
+    /*
+    FNXC:MissionAutoReconcile 2026-08-11-02:39:
+    Correction scans every non-archived mission and slice, but never activates or triages work.
+    Those autonomy actions remain in their dedicated active-mission paths; this shared service only
+    projects deterministic task ground truth into existing roadmap state.
+    */
     const missionStore = this.options.missionStore;
-    let totalFixed = 0;
+    /*
+    FNXC:MissionAutoReconcile 2026-08-11-03:10:
+    Reconcile unique title matches before the active-only triage tier. Otherwise an unlinked
+    feature with an already-existing delivery task is triaged into a duplicate before correction
+    can restore its guarded task link.
+    */
+    const result = await reconcileMissionState({ taskStore: this.store, missionStore }, { source });
+    const activationFixes = await this.reconcileActiveMissionAutomation(missionStore);
+    return result.statusUpdates + result.badgeRepairs + result.terminalRepairs + activationFixes;
+  }
 
+  /*
+  FNXC:MissionAutoReconcile 2026-08-11-02:39:
+  Correction intentionally scans non-archived history, but this activation tier remains limited
+  to active missions and active slices. It retains generated-fix recovery and triage without
+  creating work while correcting an idle, blocked, or complete roadmap.
+  */
+  private async reconcileActiveMissionAutomation(missionStore: MissionStore | AsyncMissionStore): Promise<number> {
+    let fixed = 0;
     try {
-      const missions = await missionStore.listMissions();
-      const activeMissions = missions.filter((m) => m.status === "active");
-      const activeMissionIds = new Set(activeMissions.map((mission) => mission.id));
-      const taskBySliceAndTitle = new Map<string, Task | null>();
-      const missionTasks = await this.store.listTasks({ slim: true, includeArchived: false });
-
-      for (const task of missionTasks) {
-        if (!task.missionId || !task.sliceId || !task.title || !activeMissionIds.has(task.missionId)) {
-          continue;
-        }
-
-        const key = this.getMissionFeatureTitleKey(task.sliceId, task.title);
-        taskBySliceAndTitle.set(
-          key,
-          taskBySliceAndTitle.has(key) ? null : task,
-        );
-      }
-
-      for (const mission of activeMissions) {
+      const missions = (await missionStore.listMissions()).filter((mission) => mission.status === "active");
+      for (const mission of missions) {
         const hierarchy = await missionStore.getMissionWithHierarchy(mission.id);
         if (!hierarchy) continue;
-
-        const activeSlices = hierarchy.milestones
-          .flatMap((milestone) => milestone.slices)
-          .filter((slice) => slice.status === "active");
-
-        for (const slice of activeSlices) {
-          const missionAutoTriageEnabled = mission.autopilotEnabled === true || mission.autoAdvance === true;
-          const supersededFixes = await missionStore.reconcileSupersededGeneratedFixFeatures(slice.id);
-          if (supersededFixes.supersededCount > 0) {
-            totalFixed += supersededFixes.supersededCount;
-            schedulerLog.warn(
-              `Superseded ${supersededFixes.supersededCount} stale generated fix feature(s) during mission reconciliation for slice ${slice.id}`,
-            );
-          }
-          const features = supersededFixes.supersededCount > 0
-            ? await missionStore.listFeatures(slice.id)
-            : slice.features;
-          const supersededFeatureIds = new Set(supersededFixes.featureIds);
-
-          if (supersededFixes.supersededCount > 0) {
-            const refreshedSlice = await missionStore.getSlice(slice.id);
-            if (refreshedSlice?.status === "complete") {
-              /*
-              FNXC:Missions 2026-07-11-12:35:
-              Startup reconciliation can terminalize every stale generated-fix feature in an active slice before the scheduler loop runs no-task recovery.
-              Treat the recomputed complete slice as complete immediately so stale fixes do not keep an active slice from advancing after restart.
-              */
-              await this.onSliceComplete(refreshedSlice);
-              continue;
+        for (const slice of hierarchy.milestones.flatMap((milestone) => milestone.slices).filter((slice) => slice.status === "active")) {
+          try {
+            const superseded = await missionStore.reconcileSupersededGeneratedFixFeatures(slice.id);
+            fixed += superseded.supersededCount + (superseded.repairedCount ?? 0);
+            if (superseded.supersededCount > 0) {
+              const refreshed = await missionStore.getSlice(slice.id);
+              if (refreshed?.status === "complete") { await this.onSliceComplete(refreshed); continue; }
             }
-          }
-
-          for (const feature of features) {
-            let featureForReconciliation = feature;
-            let task: Task | undefined;
-            if (supersededFeatureIds.has(feature.id)) {
+            const listFeatures = (missionStore as unknown as { listFeatures?: (sliceId: string) => Promise<MissionFeature[]> | MissionFeature[] }).listFeatures;
+            /*
+            FNXC:MissionAutoReconcile 2026-08-12-21:58:
+            Mission-store methods use their receiver, so optional-capability probing must invoke listFeatures with missionStore.
+            Per-slice containment logs a failed slice but lets remaining slices and missions reconcile in the same pass.
+            */
+            const features = listFeatures ? await listFeatures.call(missionStore, slice.id) : slice.features;
+            const supersededFeatureIds = new Set(superseded.featureIds ?? []);
+            const autoTriage = mission.autopilotEnabled === true || mission.autoAdvance === true;
+            for (const feature of features) {
               /*
-              FNXC:Missions 2026-07-11-12:35:
-              The title-to-task map is built before generated-fix supersedence detaches stale task ownership.
-              Skip freshly superseded features so pre-reconciliation task links cannot be restored in the same startup sweep.
+              FNXC:MissionAutoReconcile 2026-09-05-22:07:
+              Per-pass IDs disappear when the idempotent supersede writer is called a second time.
+              A terminal done state is the durable guard that prevents writer B re-blocking it (issue #3574).
               */
-              continue;
-            }
-            if (feature.status === "done" && this.isGeneratedFixFeature(feature) && !feature.taskId) {
-              /*
-              FNXC:Missions 2026-07-11-12:35:
-              Done generated-fix features with no task ownership are terminal after supersedence clears their board links.
-              Keep any done feature that still has task ownership in startup self-healing so linked task drift can still be repaired.
-              */
-              continue;
-            }
-            if (feature.taskId) {
-              task = await this.store.getTask(feature.taskId);
-            } else {
-              const matchedTask = taskBySliceAndTitle.get(
-                this.getMissionFeatureTitleKey(feature.sliceId, feature.title),
-              );
-              if (matchedTask) {
-                schedulerLog.warn(
-                  `Repairing one-way mission link during reconciliation: task ${matchedTask.id} matched unlinked feature ${feature.id}`,
-                );
-                featureForReconciliation = await missionStore.linkFeatureToTask(feature.id, matchedTask.id);
-                task = matchedTask;
-                totalFixed++;
-                await this.emitStrandedFeatureTriageAudit(mission.id, slice.id, feature.id, matchedTask.id);
-              } else if (
-                missionAutoTriageEnabled
-                && feature.status !== "blocked"
-              ) {
-                if (feature.status !== "defined" && this.isGeneratedFixFeature(feature)) {
-                  try {
-                    schedulerLog.warn(
-                      `Blocking stranded generated fix feature ${feature.id}: no linked task and no title-matched task available`,
-                    );
-                    await missionStore.updateFeature(feature.id, {
-                      status: "blocked",
-                      loopState: "blocked",
-                      taskId: undefined,
-                    });
-                    totalFixed++;
-                  } catch (error) {
-                    schedulerLog.warn(
-                      `Failed to block stranded fix feature ${feature.id} during reconciliation: ${error instanceof Error ? error.message : String(error)}`,
-                    );
-                  }
-                } else if (feature.status === "defined" || feature.status === "triaged" || feature.status === "in-progress") {
-                  try {
-                    const featureToTriage = feature.status === "defined"
-                      ? feature
-                      : await missionStore.updateFeature(feature.id, {
-                        status: "defined",
-                        loopState: "idle",
-                        taskId: undefined,
-                      });
-                    if (featureToTriage.status !== feature.status) {
-                      totalFixed++;
-                    }
-                    featureForReconciliation = await missionStore.triageFeature(featureToTriage.id);
-                    task = featureForReconciliation.taskId
-                      ? await this.store.getTask(featureForReconciliation.taskId)
-                      : undefined;
-                    totalFixed++;
-                    if (featureForReconciliation.taskId) {
-                      await this.emitStrandedFeatureTriageAudit(
-                        mission.id,
-                        slice.id,
-                        featureForReconciliation.id,
-                        featureForReconciliation.taskId,
-                      );
-                    }
-                  } catch (error) {
-                    schedulerLog.warn(
-                      `Failed to triage stranded feature ${feature.id} during reconciliation: ${error instanceof Error ? error.message : String(error)}`,
-                    );
-                  }
-                } else {
-                  schedulerLog.warn(
-                    `Skipping stranded feature ${feature.id} with terminal status ${feature.status}: no linked task and no title-matched task available`,
-                  );
-                }
+              if (supersededFeatureIds.has(feature.id) || feature.taskId || !autoTriage || feature.status === "blocked" || feature.status === "done") continue;
+              if (feature.status !== "defined" && this.isGeneratedFixFeature(feature)) {
+                schedulerLog.warn(`Parking stranded generated Fix feature ${feature.id} from ${feature.status}: not triageable without a defined state`);
+                await missionStore.updateFeature(feature.id, { status: "blocked", loopState: "blocked", taskId: undefined });
+                fixed++;
+                continue;
               }
+              if (feature.status !== "defined" && feature.status !== "triaged" && feature.status !== "in-progress") continue;
+              const ready = feature.status === "defined" ? feature : await missionStore.updateFeature(feature.id, { status: "defined", loopState: "idle", taskId: undefined });
+              if (ready !== feature) fixed++;
+              const triaged = await missionStore.triageFeature(ready.id);
+              fixed++;
+              if (triaged.taskId) await this.emitStrandedFeatureTriageAudit(mission.id, slice.id, triaged.id, triaged.taskId);
             }
-
-            if (!task) continue;
-
-            const hasLinkedAssertions = (await missionStore.listAssertionsForFeature(featureForReconciliation.id)).length > 0;
-            const reconciliation = await reconcileMissionFeatureState(this.store, task, featureForReconciliation, {
-              hasLinkedAssertions,
-            });
-
-            if (reconciliation.kind === "failure") {
-              if (this.options.onTaskFailed) {
-                await this.options.onTaskFailed(task.id);
-                totalFixed++;
-              } else {
-                schedulerLog.warn(`Skipping failed feature reconciliation for ${feature.id} — ${reconciliation.reason}`);
-              }
-              continue;
-            }
-
-            if (reconciliation.kind === "blocked") {
-              schedulerLog.warn(`Skipping feature ${feature.id} reconciliation — ${reconciliation.reason}`);
-              continue;
-            }
-
-            if (reconciliation.kind === "update") {
-              await missionStore.updateFeatureStatus(featureForReconciliation.id, reconciliation.status);
-              totalFixed++;
-            }
+          } catch (error) {
+            schedulerLog.error(`Error during active mission recovery reconciliation for slice ${slice.id}:`, error);
           }
         }
       }
-
-      if (totalFixed > 0) {
-        schedulerLog.log(`Mission feature reconciliation: fixed ${totalFixed} inconsistencies`);
-      }
-    } catch (err) {
-      schedulerLog.error("Error during mission feature reconciliation:", err);
+    } catch (error) {
+      schedulerLog.error("Error during active mission recovery reconciliation:", error);
     }
-
-    return totalFixed;
+    return fixed;
   }
 
   private async emitStrandedFeatureTriageAudit(
@@ -3572,10 +3833,6 @@ export class Scheduler {
         `Feature ${featureId} failed to emit stranded-feature triage audit: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-  }
-
-  private getMissionFeatureTitleKey(sliceId: string, title: string): string {
-    return `${sliceId}\0${this.normalizeMissionFeatureTitle(title)}`;
   }
 
   private isGeneratedFixFeature(feature: Pick<MissionFeature, "generatedFromFeatureId" | "generatedFromRunId">): boolean {

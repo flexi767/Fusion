@@ -1,7 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { loadAllAppCss, loadAllAppCssBaseOnly } from "../test/cssFixture";
-import { readFileSync } from "fs";
-import { resolve } from "path";
+import { loadAllAppCss, loadAllAppCssBaseOnly, readAppFile } from "../test/cssFixture";
 
 /**
  * Stylesheet regression tests for the footer-safe project workspace layout.
@@ -56,11 +54,25 @@ describe("footer-safe project workspace layout", () => {
   // ── .project-content--with-footer (desktop) ────────────────────────
 
   describe(".project-content--with-footer desktop", () => {
-    const footerBlock = loadAllAppCssBaseOnly().match(
-      /\.project-content--with-footer\s*\{[^}]*\}/,
-    )?.[0];
+    /*
+    FNXC:ViewportChrome 2026-08-03-00:13:
+    Match the unscoped base rule only. Mode-scoped overrides
+    (`html[data-viewport-mode=…] .project-content--with-footer`) also contain the
+    class name and would otherwise win a first-match scan. Require both the 36px
+    token and padding-bottom so token-only mode overrides cannot satisfy this contract.
+    */
+    const baseCss = loadAllAppCssBaseOnly();
+    const footerBlock = [...baseCss.matchAll(/\.project-content--with-footer\s*\{[^}]*\}/g)]
+      .map((match) => match[0])
+      .find(
+        (block) =>
+          block.includes("--executor-footer-height: 36px") &&
+          block.includes("padding-bottom: var(--executor-footer-height)") &&
+          !block.includes("data-viewport-mode"),
+      );
 
     it("defines --executor-footer-height token as 36px", () => {
+      expect(footerBlock).toBeTruthy();
       expect(footerBlock).toContain("--executor-footer-height: 36px");
     });
 
@@ -85,13 +97,36 @@ describe("footer-safe project workspace layout", () => {
 
   // ── Child views use height: 100% ───────────────────────────────────
 
+  describe("Board boundary and scroll ownership", () => {
+    const alphaCss = readAppFile("alpha-ui.css");
+
+    it("keeps both Alpha boundary states layout-transparent", () => {
+      expect(alphaCss).toMatch(/\[data-alpha-surface\]\s*\{[^}]*display:\s*contents/);
+      expect(alphaCss).not.toMatch(/\[data-alpha-surface="true"\]\s*\{[^}]*display:\s*contents/);
+    });
+
+    it("keeps horizontal overflow on Board and vertical overflow in column bodies", () => {
+      const boardBlock = css.match(/\.board\s*\{[^}]*\}/)?.[0] ?? "";
+      const bodyBlock = css.match(/\.column-body\s*\{[^}]*\}/)?.[0] ?? "";
+      expect(boardBlock).toContain("overflow-x: auto");
+      expect(boardBlock).toContain("overflow-y: hidden");
+      expect(bodyBlock).toContain("overflow-y: auto");
+      expect(bodyBlock).toContain("overflow-x: hidden");
+    });
+  });
+
   describe("child views use height: 100% (not viewport calc)", () => {
-    it(".board uses height: 100%", () => {
-      const boardBlock = css.match(/\.board\s*\{[^}]*\}/)?.[0];
-      expect(boardBlock).toBeTruthy();
+    it(".board and every workflow state fill the parent-defined safe height", () => {
+      const boardBlock = css.match(/\.board\s*\{[^}]*\}/)?.[0] ?? "";
+      const workflowViewBlock = css.match(/\.board-workflow-view\s*\{[^}]*\}/)?.[0] ?? "";
+      const skeletonBlock = css.match(/\.board\.board-workflows-skeleton\s*\{[^}]*\}/)?.[0] ?? "";
       expect(boardBlock).toContain("height: 100%");
-      // Should NOT have viewport-based calc
-      expect(boardBlock).not.toContain("100vh");
+      expect(boardBlock).toContain("min-height: 0");
+      expect(workflowViewBlock).toContain("height: 100%");
+      expect(workflowViewBlock).toContain("min-height: 0");
+      expect(skeletonBlock).toContain("height: 100%");
+      expect(skeletonBlock).toContain("min-height: 0");
+      expect(`${boardBlock}${workflowViewBlock}${skeletonBlock}`).not.toMatch(/100d?vh/);
     });
 
     it(".list-view uses height: 100%", () => {
@@ -108,6 +143,55 @@ describe("footer-safe project workspace layout", () => {
 
       expect(agentsContentBlock).toContain("padding: var(--space-md) var(--space-md) calc(var(--space-md) + env(safe-area-inset-bottom, 0px) + var(--standalone-bottom-gap));");
       expect(agentsContentBlock).not.toContain("var(--mobile-nav-height)");
+    });
+  });
+
+  // ── Footer-height token consumers outside the declaring scope ──────
+
+  /*
+  FNXC:DashboardFooterLayout 2026-09-11-23:41:
+  `:root` floors --executor-footer-height at 0px (styles.css) and only
+  .dashboard-project-shell / .project-content--with-footer raise it to 36px.
+  A bottom-edge surface rendered OUTSIDE those scopes therefore inherits 0px.
+  That silently collapsed the Alpha desktop navigation footer to zero height:
+  mounted and focusable, but invisible, after it had already replaced the left
+  sidebar. Assert the general invariant rather than that one bar — any rule that
+  sizes its own box from the token must declare the token in the same block.
+  */
+  describe("--executor-footer-height consumers that size themselves", () => {
+    // Comments carry braces and at-rule prose, so strip them before parsing rules.
+    const baseCss = loadAllAppCssBaseOnly().replace(/\/\*[\s\S]*?\*\//g, "");
+    const ruleBlocks = [...baseCss.matchAll(/(^|\})\s*([^{}@]+?)\s*\{([^{}]*)\}/g)].map((match) => ({
+      selector: match[2].trim(),
+      body: match[3],
+    }));
+
+    it("floors the token at 0px on :root, which is what makes redeclaration mandatory", () => {
+      expect(baseCss).toMatch(/:root\s*\{[^}]*--executor-footer-height:\s*0px/);
+    });
+
+    it("every rule sizing its own box from the token also declares the token", () => {
+      const selfSizing = ruleBlocks.filter((rule) =>
+        /(?:^|;|\s)(?:block-size|height):\s*var\(--executor-footer-height\b/.test(rule.body),
+      );
+      expect(selfSizing.length).toBeGreaterThan(0);
+      const collapsingToZero = selfSizing
+        .filter((rule) => !/--executor-footer-height:\s*(?!0px)[^;]+;/.test(rule.body))
+        .map((rule) => rule.selector);
+      expect(collapsingToZero).toEqual([]);
+    });
+
+    it("gives the Alpha desktop navigation footer a non-zero height outside the shell scope", () => {
+      const bar = ruleBlocks.find((rule) => rule.selector === ".alpha-desktop-action-bar");
+      expect(bar).toBeTruthy();
+      expect(bar!.body).toContain("--executor-footer-height: 36px");
+      expect(bar!.body).toContain("block-size: var(--executor-footer-height)");
+    });
+
+    it("keeps the sibling pinned-terminal host redeclaring the token for the same reason", () => {
+      const terminalCss = readAppFile("components/TerminalModal.css").replace(/\/\*[\s\S]*?\*\//g, "");
+      const host = terminalCss.match(/\.terminal-below-host--with-footer\s*\{([^{}]*)\}/)?.[1] ?? "";
+      expect(host).toContain("--executor-footer-height: 36px");
     });
   });
 

@@ -1,4 +1,7 @@
 import { and, eq, gt, inArray, sql } from "drizzle-orm";
+import { columnsWithFlag, declaresAnyLifecycleTrait } from "../workflows/workflow-lifecycle-traits.js";
+import { resolveWorkflowIrForTask } from "../workflows/workflow-ir-resolver.js";
+import type { WorkflowIr } from "../workflows/workflow-ir-types.js";
 import * as schema from "../postgres/schema/index.js";
 import { projectOwnershipPartition, recordRunAuditEventWithinTransaction } from "../postgres/data-layer.js";
 import type { DbTransaction } from "../postgres/data-layer.js";
@@ -12,7 +15,7 @@ import type {
   SymbolLockConflict,
   SymbolLockIdentity,
   SymbolLockOwner,
-} from "../symbol-lock-types.js";
+} from "../tasks/symbol-lock-types.js";
 
 /**
  * FNXC:SymbolLock 2026-07-30-14:00:
@@ -209,9 +212,35 @@ export async function reconcileStaleSymbolLocksAsync(store: TaskStore): Promise<
   const held = await layer.db.select().from(schema.project.symbolLocks).where(and(eq(schema.project.symbolLocks.projectId, projectId), eq(schema.project.symbolLocks.status, "held")));
   const stale: Array<{ symbolKey: string; ownerTaskId: string; expiresAt: string }> = [];
   const skipped: string[] = [];
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-16:05 (batch-core):
+  "Is the lock OWNER finished?" resolved from that owner's own workflow. Keyed on the literal pair, a
+  renamed board never recognised a finished owner, so its symbol lock was never reclaimed — held until
+  expiry while every other task needing that symbol waited behind a task that had already completed.
+
+  Resolved per OWNER, because owners can run different workflows, and through a shared IR cache so a
+  sweep over N locks costs one workflow read per distinct workflow rather than per lock.
+
+  A workflow expressing no trait at all is a v1 upgrade rather than a board without terminal lanes, so
+  it keeps the built-in `done` fallback. Soft deletion is detected separately through `deletedAt`.
+  */
+  const terminalIrCache = new Map<string, WorkflowIr>();
+  const terminalLanesFor = async (taskId: string): Promise<ReadonlySet<string>> => {
+    const lanes = new Set<string>(["done"]);
+    try {
+      const ir = await resolveWorkflowIrForTask(store, taskId, terminalIrCache);
+      if (ir && declaresAnyLifecycleTrait(ir)) {
+        for (const id of columnsWithFlag(ir, "complete")) lanes.add(id);
+      }
+    } catch { /* degraded: built-in Complete fallback */ }
+    return lanes;
+  };
+
   for (const lock of held) {
     const owner = await store.getTask(lock.ownerTaskId, { includeDeleted: true }).catch(() => undefined);
-    const terminal = !owner || owner.deletedAt != null || owner.column === "done" || owner.column === "archived" || owner.status === "failed";
+    const terminal = !owner || owner.deletedAt != null
+      || (await terminalLanesFor(lock.ownerTaskId)).has(owner.column)
+      || owner.status === "failed";
     if (lock.expiresAt <= nowIso || terminal) {
       stale.push({ symbolKey: lock.symbolKey, ownerTaskId: lock.ownerTaskId, expiresAt: lock.expiresAt });
     } else {

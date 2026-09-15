@@ -1,15 +1,7 @@
+import { type ResumeTrigger } from "../../src/shared/resume-triggers";
 import { pushTrace } from "./dashboardTraceBuffer";
 
-export type ResumeTrigger =
-  | "visibility"
-  | "pageshow"
-  | "sse-error"
-  | "sse-reconnect"
-  | "sse-open"
-  | "remount"
-  | "route-active"
-  | "route-inactive"
-  | "project-context-change";
+export type { ResumeTrigger };
 
 export type ResumeEvent = {
   ts: string;

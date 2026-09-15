@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Settings, Task, TaskStore } from "@fusion/core";
-import { GridlockDetector } from "../gridlock-detector.js";
-import type { GridlockEvent } from "../gridlock-detector.js";
+import { GridlockDetector } from "../healing/gridlock-detector.js";
+import type { GridlockEvent } from "../healing/gridlock-detector.js";
+import { RENAMED_VOCAB, lifecycleIr } from "./_workflow-vocabulary-fixture.js";
 
 function createTask(id: string, overrides: Partial<Task> = {}): Task {
   return {
@@ -76,6 +77,74 @@ describe("GridlockDetector", () => {
     expect(onGridlock).toHaveBeenCalledTimes(1);
   });
 
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-11:05 (batch-engine tail):
+  The dependency-satisfaction gate resolved by ROLE. Every other case in this file omits a workflow, so
+  `resolveWorkflowIrForTask` degrades to the built-in coding IR and they all assert the LEGACY answer —
+  they pass before and after this conversion, and would pass for a broken one too.
+
+  A FALSE ALARM is the failure being fixed: on a renamed board no dependency ever satisfied the three
+  literal comparisons, so the detector reported dependency gridlock for tasks that are not blocked and
+  `notifyGridlock` paged the operator about it.
+
+  REVERT CHECK, measured: with `dep.column !== "done" && dep.column !== "in-review" && dep.column !==
+  "archived"` restored, this fails — a gridlock event is raised naming FN-1 blocked by FN-10.
+  */
+  it("does not report dependency gridlock when the blocker sits in a RENAMED complete lane", async () => {
+    const ir = lifecycleIr(RENAMED_VOCAB, "gridlock-lifecycle");
+    store = {
+      listTasks: vi.fn(async () => tasks),
+      getSettings: vi.fn(async () => settings),
+      parseFileScopeFromPrompt: vi.fn(async (taskId: string) => scopes[taskId] ?? []),
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: "gridlock-lifecycle", stepIds: [] })),
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "gridlock-lifecycle", stepIds: [] })),
+      getWorkflowDefinition: vi.fn(async (id: string) => (id === "gridlock-lifecycle" ? { ir } : undefined)),
+    } as unknown as TaskStore;
+    detector = new GridlockDetector(store, { onGridlock, onGridlockCleared });
+
+    tasks = [
+      // Schedulable: sits in the renamed HOLD lane, blocked by a card that has SHIPPED.
+      createTask("FN-1", { column: RENAMED_VOCAB.hold, dependencies: ["FN-10"] }),
+      createTask("FN-10", { column: RENAMED_VOCAB.complete }),
+      // Keeps the ACTIVE set non-empty; an empty one is its own early return and would
+      // make this pass without the dependency gate ever being consulted.
+      createTask("FN-9", { column: RENAMED_VOCAB.wip }),
+    ];
+
+    const event = await detector.detectGridlock();
+
+    expect(event).toBeNull();
+    expect(onGridlock).not.toHaveBeenCalled();
+  });
+
+  it("still reports dependency gridlock when the blocker is mid-flight on a RENAMED board", async () => {
+    /*
+    Non-vacuous companion: without it, a gate that treated EVERY dependency as satisfied would pass the
+    case above. Same renamed board, same shape — only the blocker's lane changes.
+    */
+    const ir = lifecycleIr(RENAMED_VOCAB, "gridlock-lifecycle");
+    store = {
+      listTasks: vi.fn(async () => tasks),
+      getSettings: vi.fn(async () => settings),
+      parseFileScopeFromPrompt: vi.fn(async (taskId: string) => scopes[taskId] ?? []),
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: "gridlock-lifecycle", stepIds: [] })),
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "gridlock-lifecycle", stepIds: [] })),
+      getWorkflowDefinition: vi.fn(async (id: string) => (id === "gridlock-lifecycle" ? { ir } : undefined)),
+    } as unknown as TaskStore;
+    detector = new GridlockDetector(store, { onGridlock, onGridlockCleared });
+
+    tasks = [
+      createTask("FN-1", { column: RENAMED_VOCAB.hold, dependencies: ["FN-10"] }),
+      createTask("FN-10", { column: RENAMED_VOCAB.wip }),
+      createTask("FN-9", { column: RENAMED_VOCAB.wip }),
+    ];
+
+    const event = await detector.detectGridlock();
+
+    expect(event?.blockedTaskIds).toEqual(["FN-1"]);
+    expect(event?.reasons).toEqual({ "FN-1": "dependency" });
+  });
+
   it("detects gridlock when all todo tasks are blocked by file overlap", async () => {
     tasks = [
       createTask("FN-1", { column: "todo" }),
@@ -93,6 +162,47 @@ describe("GridlockDetector", () => {
     expect(event?.blockedTaskIds).toEqual(["FN-1", "FN-2"]);
     expect(event?.reasons).toEqual({ "FN-1": "overlap", "FN-2": "overlap" });
     expect(event?.blockingTaskIds).toEqual(["FN-9"]);
+  });
+
+  it("detects a workspace review holder through its repository checkout and normalized scope", async () => {
+    tasks = [
+      createTask("FN-1", { column: "todo" }),
+      createTask("FN-WORKSPACE", {
+        column: "in-review",
+        workspaceWorktrees: { "repo-a": { worktreePath: "/wt/fn-workspace/repo-a" } } as Task["workspaceWorktrees"],
+      }),
+    ];
+    scopes = {
+      "FN-1": ["repo-a/src/shared.ts"],
+      "FN-WORKSPACE": ["src/shared.ts"],
+    };
+
+    const event = await detector.detectGridlock();
+
+    expect(event?.reasons).toEqual({ "FN-1": "overlap" });
+    expect(event?.blockingTaskIds).toEqual(["FN-WORKSPACE"]);
+  });
+
+  it("reports a higher-priority dormant worktree holder as the overlap blocker", async () => {
+    tasks = [
+      createTask("FN-1", { column: "todo", priority: "normal" }),
+      createTask("FN-DORMANT", {
+        column: "triage",
+        priority: "high",
+        worktree: "/wt/fn-dormant",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    ];
+    scopes = {
+      "FN-1": ["packages/core/src/store.ts"],
+      "FN-DORMANT": ["packages/core/src/store.ts"],
+    };
+
+    const event = await detector.detectGridlock();
+
+    expect(event?.blockedTaskIds).toEqual(["FN-1"]);
+    expect(event?.reasons).toEqual({ "FN-1": "overlap" });
+    expect(event?.blockingTaskIds).toEqual(["FN-DORMANT"]);
   });
 
   it("does not detect gridlock when there are no schedulable tasks", async () => {

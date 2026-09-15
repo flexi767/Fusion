@@ -4,12 +4,26 @@
 
 See the [2026-07-14 PostgreSQL runtime cutover review](./postgres-migration-review-2026-07-14.md) for the audited authority inventory, exact authorized legacy readers, and deployment/rollback checklist.
 
+## Overlap wait synchronization episodes
+
+File-scope contention keeps its durable synchronization obligation in `project.task_overlap_waits`, independently of the transient `tasks.overlap_blocked_by` display marker. Each row is partitioned by `(project_id, task_id, episode_id)`, snapshots the predecessor identity, and advances through observation, freshness, ready, delivery, or cancellation phases with revision/owner compare-and-set fencing. Clearing or replacing the marker therefore cannot erase an unconsumed predecessor; Reset cancels active generations in the same task-locked publication transaction. The obsolete model-verdict phases are drained to `ready` by migration 0077 without deleting delivery proof.
+
+Receipts contain the deterministic decision and delivery/freshness references. They are authoritative after restart; the task log and best-effort run audit are diagnostic projections, not alternate state. The owner task uses a composite foreign key, while predecessor identity intentionally remains after predecessor archival or deletion.
+
 ## SQLite→PostgreSQL cutover status
 
 - During a first-boot cutover, `fn dashboard`, `fn serve`, and `fn daemon --port <port>` keep their known HTTP port available with a migration holding page. Open dashboard tabs poll `/api/health` and show the migration banner with live progress.
 - After a successful cutover, the usual dismissible data-migrated notice may appear. If the durable cutover marker remains `running` or `failed`, real-server `/api/health` reports `status: "degraded"` with migration detail and the dashboard keeps the migration banner visible. Do not delete retained legacy `.fusion/fusion.db` backups; check logs and run `fn db migrate` after fixing a failure.
+- Retained `fusion.db`, `archive.db`, and `fusion-central.db` files are migration inputs and operator backups only. Startup reads a source only while its matching `fusion_sqlite_migrations` key is incomplete: `project:<projectId>` gates core/archive/identity work, `central:legacy-sqlite` gates central work, and `project-plugins:<canonical project path>` independently gates plugin adoption. A completed core marker never suppresses a still-incomplete plugin bridge.
+- Root-directory startup resolves a core key from an explicit project ID or the PostgreSQL `central.projects` rootDir mapping before using the deterministic fallback. A migration that learns an ID from legacy central SQLite must first materialize the same canonical rootDir-to-ID mapping in PostgreSQL before recording completion, so future boots never need the retained database to rediscover identity.
 
 ## Embedded PostgreSQL startup resources
+
+### Windows owned-cluster recovery (FN-8522)
+
+- Windows readiness uses bounded TCP probes. Runner-log reads are diagnostic open/read/close snapshots only; Fusion keeps no persistent runner-log handle, so PostgreSQL can retain its own `pg_ctl` log without a Fusion-induced sharing-violation retry.
+- Each Windows PostgreSQL child gets the bundled native `bin` directory prepended to its own case-insensitive `PATH`; Fusion does not mutate the dashboard process environment.
+- After readiness, an **owned** cluster that logs the complete `0xC0000142` backend exception plus PostgreSQL shutdown sequence gets one lifecycle-scoped restart on the same initialized data directory and port. Joiners are never restarted or stopped. A second incident, shutdown, or failed recovery is terminal and leaves the original data directory intact.
 
 - The zero-config embedded PostgreSQL lifecycle uses mmap-backed primary shared memory to avoid exhausted SysV shared-memory IDs on constrained hosts.
 - The supported, tested constrained-host floor is **64MB `/dev/shm`**. Both `fn serve` and boot smoke inherit this lifecycle default; an explicit later PostgreSQL `-c shared_memory_type=…` flag remains an operator override.
@@ -27,46 +41,71 @@ See the [2026-07-14 PostgreSQL runtime cutover review](./postgres-migration-revi
 - `project.symbol_locks` is the project-scoped, lease-based admission seam for later mission-lineage scheduling. Its composite `(project_id, symbol_key)` identity permits only one current lock row per normalized symbol in a project; ownership records task ID plus optional mission, feature, lineage, node, and agent IDs.
 - Lock acquire is all-or-nothing over normalized keys. Held unexpired rows owned by another task return their owner as a conflict, while expired/released rows may be reclaimed. Renewal and release are owner-scoped and release is idempotent.
 - The `0000_initial.sql` baseline defines the table and indexes only. The later `0025_symbol_locks.sql` migration enables and forces RLS, creates `fusion_project_isolation`, and attaches `fusion_assign_project_id` after `0006_project_ownership.sql` creates that function/policy machinery. Both fresh full-applier and upgrade paths therefore end with the same project-isolation contract.
+- `project.agent_ratings` is project-owned with composite `(project_id, id)` identity, allowing the same rating id in separate projects without cross-project reads or deletes. The dynamic `0006_project_ownership.sql` migration reconciles the physical table; `0055_fn_8988_agent_ratings_project_partition.sql` repeats that guarantee idempotently for historical drift. Bound `addRating`, `getRatings`, and `deleteRating` apply the project ownership partition, while unbound compatibility layers retain trigger-stamped writes and unscoped reads/deletes.
+- FN-8997 audited `workflow_steps`, `chat_room_members`, and `chat_room_messages`: their Drizzle declarations now model 0006's `project_id` and composite keys, and bound workflow/chat helpers scope reads and mutations on that partition. Chat isolation requires both membership/message predicates **and** the parent `chat_rooms.project_id` predicate; either leg alone can resolve a foreign row when room IDs collide. `plugins` remains an intentionally unmodeled compatibility table because it has no runtime Drizzle path. Migration `0056_fn_8997_project_ownership_declaration_drift.sql` is idempotent and adds only partition-prefixed predicate indexes; it does not rewrite healthy 0006 ownership columns or keys.
+- FN-9004 reconciles the post-0006 `project.github_check_states` ownership default. Migration `0057_fn_9004_project_ownership_default_reconciliation.sql` idempotently restores the `0006` GUC/legacy-fallback default without rewriting rows, keys, RLS, or triggers; the `config`, `automations`, `deployments`, and `incidents` Drizzle declarations now also model their catalog-proven project-leading keys.
+- `project.workflows` has project-local `(project_id, id)` identity. Bound definition reads, updates, deletes, companion workflow settings/prompt-override deletes, and analytics name prefetches use `projectScopeFor`; blank/unbound layers deliberately retain cross-project compatibility reads. The per-project workflow-id counter intentionally scans occupancy across every partition before allocation, because burning a colliding ID is safer than reusing a legacy or stale-counter ID held elsewhere.
+- FN-9002 makes the `0006_project_ownership.sql` partition expressible for `artifacts`, `secrets`, `branch_groups`, `plugin_activations`, `chat_messages`, `run_audit_events`, `verification_cache`, and `approval_requests`: each declaration retains the database default and models its project-leading identity (plus the artifacts task FK and secrets/branch-name unique keys).
+- FN-9000 scopes every load-bearing runtime Drizzle read, update, and delete for those eight tables with the bound `projectId`; blank/unbound layers intentionally retain cross-project compatibility reads. Chat message operations scope both `chat_messages` and their parent `chat_sessions` row. The `central.secrets_global` dispatch remains global, while `project.plugins` has no runtime Drizzle path and pre-cutover SQLite compatibility paths remain unchanged. Verification-cache entries now remain inside their owning project rather than being shared across projects.
 - Startup and Batch 1 self-healing expire locks when their lease elapsed or the owner task is terminal/missing. They never move a task or alter scheduler, worktree, semaphore, or verification state. Run-audit events are `symbol-lock:acquired`, `symbol-lock:acquire-conflict`, `symbol-lock:renewed`, `symbol-lock:released`, `symbol-lock:reconcile-stale`, and deduplicated `symbol-lock:reconcile-stale-no-action`; metadata uses only counts/outcomes and normalized opaque keys.
-- FN-8405 adds `Task.declaredSymbols` as the durable, normalized task declaration source. `## Declared Symbols` in PROMPT.md is parsed only on create/update writes: an absent key may hydrate from the prompt, while a present `undefined`, `null` (update), or `[]` clears and suppresses hydration; a non-empty explicit array wins. Store resolution (`resolveTaskSymbols` and `resolveTaskSymbolsForWorkItem({ taskId })`) reads only the durable field, and slim projections plus archive/restore retain it. Scheduler admission remains a separate FN-8306 consumer; File Scope is never treated as a symbol source.
+- FN-8405 adds `Task.declaredSymbols` as the durable, normalized task declaration source. `## Declared Symbols` in PROMPT.md is parsed only on create/update writes: an absent key may hydrate from the prompt, while a present `undefined`, `null` (update), or `[]` clears and suppresses hydration; a non-empty explicit array wins. Store resolution (`resolveTaskSymbols` and `resolveTaskSymbolsForWorkItem({ taskId })`) reads only the durable field, and slim projections plus legacy archive snapshots retain it during reintegration. Scheduler admission remains a separate FN-8306 consumer; File Scope is never treated as a symbol source.
+
+## Legacy archive snapshot authority
+
+PostgreSQL `project.tasks` is the sole live authority. `archive.archived_tasks.task_json` is a temporary compatibility/recovery snapshot: reintegration reads it under the project/task advisory transaction, writes or revives the project-scoped live row, and deletes the cold snapshot only after the live write succeeds.
+
+The merge is non-destructive. Present live values—including `0`, `false`, and empty arrays—win; cold values fill only fields whose live representation is absent. Historical timing, token usage, review/merge evidence, and modified-file provenance are recoverable when present. Worktrees, workspace leases/checkouts, active sessions, status/blocker/pause state, and active runtime errors are never restored from cold history. If neither PostgreSQL, a retained authoritative task artifact, nor durable task-to-commit evidence proves a value, repair tooling reports it as unavailable instead of storing zero.
+
+The operational `scripts/reconcile-archived-task-history.mjs` command boots the canonical PostgreSQL backend for an exact project root. It is dry-run by default and delegates `--apply` to TaskStore reconciliation plus commit-association evidence backfill; it never reads a retained SQLite database as runtime authority.
 
 ## Soft-deleted tasks (FN-5105)
 
+### History ledger (FN-227)
+
+`project.patchnode_entries` is a permanent, project-scoped, append-only delivery ledger. This storage identifier and `reconcilePatchnodeLedger` intentionally retain their stable names. It deliberately has no foreign key to `project.tasks`, no row-expiry job or size cap, and its feed query never joins or filters through task rows. Those deviations let captured titles and completion summaries remain readable after a task is soft-deleted or removed from live task storage.
+
+Both completion writers insert the entry inside the same transaction that persists the completion-lane move. The occurrence key is that delivery's `columnMovedAt`: the next move overwrites this scalar, changes the lane, and permits later summary edits, so a post-commit or best-effort capture could become unrecoverable immediately. The transactional insert therefore fails the move when it cannot commit; retrying an uncommitted move is safer than silently losing shipped history.
+
+Legacy archive snapshots may preserve deliveries that predate the live completion writer. `reconcilePatchnodeLedger` is insert-only and re-arms every 15 minutes to backfill current completion rows, latest-only legacy revert markers, and historical snapshots whose `preArchiveColumn` proves completion. It is a backlog convenience, not the live guarantee. A delivery completed and superseded before Patchnode existed left no reliable lane, occurrence, or point-in-time summary evidence and is intentionally not fabricated.
+
 - User-initiated `TaskStore.deleteTask` is a **soft delete**: the task row stays in `tasks` and `deletedAt` is set.
 - Active task readers (`getTask`, `listTasks`, search, dependency scans, scheduler/watcher reads, mission task aggregations) must filter with `deletedAt IS NULL`.
-- Archived-task flows (`archiveTask`, archived cleanup/migration) hard-delete from the active `tasks` table after copying to PostgreSQL cold storage. Legacy `archive.db` files are import-only.
+- Task archiving no longer exists as a live write path. Legacy cold-storage rows and `archive.db` files are migration inputs; store open reintegrates non-deleted historical tasks into their workflow Complete columns.
 - ID reservation is unchanged: soft-deleted IDs remain reserved. `distributed-task-id` and `task-id-integrity` intentionally scan all task rows (including soft-deleted rows), and must not filter on `deletedAt`.
+- The legacy SQLite polling replica for cross-process task lifecycle observation no longer exists. PostgreSQL stores configured with an explicit durable consumer identity use the transactional outbox described in [PostgreSQL cross-process `task:deleted` observation](./solutions/architecture/postgres-cross-process-task-deleted-observation.md); stores without an identity remain observation-disabled. Observers must not recreate writer-owned delete run-audit or mailbox effects.
 
 ### Orphaned task-dir reconciliation (FN-6783)
 
 - PostgreSQL-backed `TaskStore` instances reconcile `.fusion/tasks/{ID}/task.json` compatibility artifacts against the PostgreSQL `project.tasks` table on store open and during `SelfHealingManager` Batch 1 maintenance (`reconcile-orphaned-task-dirs`). This closes the visibility gap where a heartbeat-created task could exist on disk but be absent from `getTask`/`listTasks` and the dashboard board.
-- The reconcile is non-destructive: when an ID already exists anywhere the create path would reserve it (active task row, soft-deleted row, archived table/archive DB, or tombstone), the scan skips the directory and never overwrites or resurrects that ID. Only a valid live `task.json` with no DB record anywhere is re-imported.
+- The reconcile is non-destructive: when an ID already exists anywhere the create path would reserve it (active task row, soft-deleted row, historical table/archive DB, or tombstone), the scan skips the directory and never overwrites or resurrects that ID. Only a valid live `task.json` with no DB record anywhere is re-imported.
 - Recovered rows preserve the on-disk task metadata, including `column`, `status`, dependencies, steps, and log, after the same defensive disk normalization used by task JSON fallback reads. Malformed or unparseable `task.json` files are skipped with a warning instead of failing store open or maintenance.
 - Recovery is visible: each inserted orphan emits a store warning, a `task:reconcile-orphaned-task-dir` run-audit event, and a `task:created` lifecycle event so live boards can render the recovered card.
-- On-disk retention matters for scan safety. `deleteTask()` leaves `.fusion/tasks/{ID}/task.json` and `agent-log.jsonl` on disk for forensics while marking the row `deletedAt`; the reconcile must skip those soft-deleted IDs. `archiveTask(id)` with the default cleanup removes the task directory, but `archiveTask(id, false)` and legacy archives can leave a `task.json` behind, so archived IDs are also guarded and skipped.
+- On-disk retention matters for scan safety. `deleteTask()` leaves `.fusion/tasks/{ID}/task.json` and `agent-log.jsonl` on disk for forensics while marking the row `deletedAt`; the reconcile must skip those soft-deleted IDs. Legacy archive snapshots can also leave a `task.json` behind, so their reserved IDs remain guarded.
 
 ### Agent log storage + soft-delete visibility (FN-5143 / FN-5911)
 
 - Agent logs are stored outside PostgreSQL. Each task appends newline-delimited JSON records to `<rootDir>/.fusion/tasks/{ID}/agent-log.jsonl`.
-- Tool arguments and successful `tool_result` detail remain opt-in through `persistAgentToolOutput`; failed `tool_error` detail always persists as bounded diagnostic signal so task Activity transcripts can reveal the underlying failure.
+- Tool arguments and successful `tool_result` detail persist by default through `persistAgentToolOutput`; failed `tool_error` detail always persists as bounded diagnostic signal so task Activity transcripts can reveal the underlying failure. Set `persistAgentToolOutput: false` explicitly to retain the previous low-volume behavior; every stored detail remains redacted and bounded per row.
+- Agent run-log JSONL uses the same bounded tool-detail policy before its existing larger general-entry guard. The durable run row and its live `run:log` event carry the identical normalized detail, so reload and streaming viewers reconcile without duplicates.
 - Agent-log JSONL rows may include optional numeric timing metadata: `timeToFirstTokenMs` on the first visible model-output row for a request, and `durationMs` on tool/request completion rows such as `tool_result` or `tool_error`. These fields are additive, non-sensitive millisecond values; legacy rows may omit them and readers must continue to treat omission as normal.
 - `TaskStore.deleteTask` keeps that JSONL file on disk for forensics, but all live read APIs (`getAgentLogs*`, `getAgentLogCount`) gate on task liveness and return zero entries once `deletedAt` is set.
-- Archived-task snapshot behavior (`taskToArchiveEntry` / `archiveTask`) embeds a capped agent-log snapshot sourced from JSONL.
-- Retention is independent from PostgreSQL operational-log pruning. `settings.agentLogFileRetentionDays` controls age-based pruning of JSONL entries for soft-deleted and archived tasks only. Default: `0` (disabled).
+- Legacy archive snapshots may contain a capped agent-log copy sourced from JSONL; this is retained solely for migration and forensic reads.
+- Retention is independent from PostgreSQL operational-log pruning. `settings.agentLogFileRetentionDays` controls age-based pruning of JSONL entries for soft-deleted and historical task data. Default: `0` (disabled).
 - PostgreSQL operational-log pruning is controlled separately by `settings.operationalLogRetentionDays`. It prunes `activityLog`, `runAuditEvents`, `agentHeartbeats`, terminal `agentRuns` rows by `endedAt`, and `agentConfigRevisions` by `createdAt`.
+- `project.agent_activity_events` is a separate 30-day, 50,000-row-per-project durable monitoring outbox. Its `agent_activity_event_seq` companion allocates transactional bigint cursors; `agent_activity_events` uses deterministic `(project_id, event_id)` uniqueness for replay-safe activity delivery.
 - Safety invariants for operational pruning: in-flight `agentRuns` (`endedAt IS NULL`) are never deleted, and the most-recent `agentConfigRevisions` row per agent is always preserved even when older than the retention window.
 
-### Archived-column pagination (FN-7659)
+### Completed-task pagination
 
-- The Archived board column no longer loads the full archive into memory. `ArchiveDatabase.listPage(limit, offset)` reads a bounded page ordered `archivedAt DESC, rowid DESC` via SQL `LIMIT/OFFSET`, backed by the existing `idxArchivedTasksArchivedAt` index.
-- `TaskStore.listArchivedTasks({ limit, offset, slim })` is a dedicated, archive-only read path (default page size 100) that maps paged entries through `archiveEntryToTask` and returns `{ tasks, total, hasMore }` in `archivedAt DESC` order. It intentionally does **not** run the `createdAt ASC` sort used by the merged `listTasks({ includeArchived: true })` path — that merged path (and its non-board consumers: github-tracking reconciler, signal routes, agent-token-usage, self-healing) is unchanged.
-- `GET /tasks/archived?limit=&offset=` exposes the paged read with `projectId` scoping and `limit`/`offset` validation, returning the same `{ tasks, total, hasMore }` shape.
-- The dashboard's `useTasks` hook loads page 1 on first Archived-column expand and fetches subsequent pages only via an explicit "Show more" click (`loadMoreArchivedTasks`); it never re-fetches the whole archive on SSE reconnect, tab-visibility recovery, or repeated expand calls. Fetched pages merge into the board `tasks` array de-duplicated by id, with active PostgreSQL rows authoritative over archive snapshots.
+- `TaskStore.listCompletedTasks({ limit, offset })` resolves all Complete columns for the selected workflows, then returns a project-scoped page plus an exact independent total.
+- Pages are ordered by `columnMovedAt`, falling back to `updatedAt` and `createdAt`, descending with task ID as the deterministic tie-break. Adjacent pages therefore contain no duplicate IDs when the underlying snapshot is unchanged.
+- `GET /tasks/done?limit=&offset=` validates the bounds and returns `{ tasks, total, hasMore }`; the default page size is 50.
+- The dashboard loads the first Done page alongside active tasks and fetches later pages only through the explicit Show more action. The Done header displays the server total, not the number of currently loaded cards.
 
 ### Activity-log no-op `task:moved` cleanup (FN-5940)
 
 - `TaskStore` now defends the invariant that `activityLog` never records a `task:moved` row when `metadata.from === metadata.to`.
-- Defense is layered: the `task:moved` listener skips same-column transitions, and source emitters skip no-op `archived -> archived` / same-column polling re-emits before subscribers see them.
+- Defense is layered: the `task:moved` listener and source emitters skip same-column transitions before subscribers see them.
 - Existing junk rows are removed by a one-time init migration guarded by `__meta.noOpTaskMovedActivityCleanupVersion = "1"`.
 - The cleanup deletes only rows matching `type = 'task:moved'` where `json_extract(metadata, '$.from') = json_extract(metadata, '$.to')`; legitimate distinct-column moves are preserved.
 - Historical migration note: the pre-cutover SQLite cleanup did **not** run `VACUUM` automatically. `fn db --vacuum` applies only while inspecting a retained legacy database and is not part of PostgreSQL operation.
@@ -79,21 +118,34 @@ See the [2026-07-14 PostgreSQL runtime cutover review](./postgres-migration-revi
 
 ### Lineage children (FN-5129)
 
-- `deleteTask` and `archiveTask` now enforce lineage integrity for `sourceParentTaskId` links.
-- Default behavior: if a task still has **live lineage children** (`deletedAt IS NULL` and `column != 'archived'`) that reference it as parent, deletion/archive throws `TaskHasLineageChildrenError`.
-- Opt-in unlink behavior: pass `removeLineageReferences: true` to `deleteTask` or `archiveTask` to clear live children (`sourceParentTaskId = NULL`, `updatedAt` bumped, `task:updated` emitted) before removing the parent.
-- Gate boundary: soft-deleted children and archived-column children do **not** block parent removal; only live non-archived children block.
-- `cleanupArchivedTasks` intentionally tolerates dangling lineage pointers in historical/archive cleanup flows; it does not run lineage rewrites.
+- `deleteTask` enforces lineage integrity for `sourceParentTaskId` links.
+- Default behavior: if a task still has **live lineage children** (`deletedAt IS NULL`) that reference it as parent, deletion throws `TaskHasLineageChildrenError`.
+- Opt-in unlink behavior: pass `removeLineageReferences: true` to `deleteTask` to clear live children (`sourceParentTaskId = NULL`, `updatedAt` bumped, `task:updated` emitted) before removing the parent.
+- Gate boundary: soft-deleted children do **not** block parent removal; only live children block.
 - For forensic reads, soft-deleted parents remain accessible through `readTaskFromDb(id, { includeDeleted: true })`.
-- Agent-facing tool layer (FN-7661): the `fn_task_archive` and `fn_task_delete` pi/CLI tools (`packages/cli/src/extension.ts`) both accept an optional `removeLineageReferences` boolean and forward it to `store.archiveTask` / `store.deleteTask`, so an agent that hits `TaskHasLineageChildrenError` can retry with `{ removeLineageReferences: true }` to clear the block — matching the recovery path the error message already advertises.
+- Agent-facing tool layer: `fn_task_delete` accepts optional `removeLineageReferences` and forwards it to `store.deleteTask`. This clears incoming lineage-parent references (`sourceParentTaskId`) only after the normal `TaskHasLineageChildrenError` refusal.
+- `fn_task_delete` also accepts `removeDependencyReferences`. Normal deletion intentionally refuses live dependents; only an explicit retry with `{ removeDependencyReferences: true }` delegates to `store.deleteTask` to atomically remove incoming dependency edges, clear matching blockers, and return affected dependents to planning. It does not hard-delete the prerequisite or require direct PostgreSQL or `task.json` edits.
 
-### Documents under soft-deleted tasks (FN-5140)
+### Documents under soft-deleted tasks (FN-5140, FX-005)
 
-- Soft-deleting a task preserves its `task_documents` and `task_document_revisions` rows; document storage is not hard-deleted as part of `TaskStore.deleteTask`.
-- Normal live-reader APIs must hide those rows by enforcing the parent-task active filter through `ACTIVE_TASKS_WHERE`: `getAllDocuments`, `getTaskDocuments`, `getTaskDocument`, and `getTaskDocumentRevisions` all treat a soft-deleted parent as out of scope for ordinary reads.
-- The HTTP surface inherits the same contract: `GET /api/documents` excludes documents whose parent task is soft-deleted, while per-task document GET routes behave like "task not found" (`[]` for list/revisions and `404 Document not found` for the single-document read).
-- No public forensic flag is exposed on document read methods or routes. Forensic access remains an internal/operator concern via `readTaskFromDb(id, { includeDeleted: true })` plus direct SQL against the preserved document tables.
-- Write semantics stay intentionally asymmetric: `upsertTaskDocument` still refuses soft-deleted parents, while `deleteTaskDocument` remains allowed so forensic cleanup can scrub preserved document rows when needed.
+- Soft-deleting a task preserves its project-scoped `task_documents` and `task_document_revisions` rows; document storage is not hard-deleted as part of `TaskStore.deleteTask`.
+- Editable registries remain live-only: `getAllDocuments`, `getTaskDocuments`, `GET /api/documents`, and `GET /api/tasks/:id/documents` hide rows whose parent is soft-deleted or still carries the historical archive sentinel.
+- Direct named evidence reads include retained historical rows: `getTaskDocument` / `GET /api/tasks/:id/documents/:key` return the current document, and `getTaskDocumentRevisions` / `GET .../:key/revisions` return immutable history. Missing parents/keys remain `404` for current and `[]` for history; every predicate includes `project_id`.
+- Ordinary writes remain forbidden: `upsertTaskDocument`, `deleteTaskDocument`, comments, artifacts, task moves/updates, and agent `fn_task_document_write` tools cannot mutate a soft-deleted or historical-sentinel parent. There is no archived-document publication route or tool.
+
+### Conditional task-document writes
+
+Current `TaskDocument` responses include `contentHash`, the SHA-256 digest of the exact UTF-8 content formatted as `sha256:<64 lowercase hex>`. Whitespace and line endings are significant; Fusion does not normalize either before hashing.
+
+`TaskDocumentCreateInput`, `PUT /api/tasks/:id/documents/:key`, and the runtime document tools accept optional compare-and-swap expectations:
+
+- omitted expectations preserve legacy unconditional writes;
+- `expectedRevision: 0` requires the document not to exist;
+- a positive `expectedRevision` requires an existing equal revision;
+- `expectedContentHash` requires an existing document with an equal canonical hash;
+- when both are present, both must match. Negative/fractional revisions and non-canonical hashes are validation errors.
+
+The PostgreSQL writer locks the active `(project_id, task_id)` parent row before reading `(project_id, task_id, key)`. The comparison, exact prior-snapshot archive, and current-row replacement occur in one transaction. Thus concurrent creates or updates from the same baseline have exactly one conditional winner. A stale writer receives `TASK_DOCUMENT_PRECONDITION_FAILED` with safe identity, supplied expectations, and current revision/hash (or `null` for absence); it creates no revision, current mutation, task event, citation scan, or success response. Document content is never included in conflict details.
 
 ### Artifact registry (FN-6777)
 
@@ -102,13 +154,15 @@ See the [2026-07-14 PostgreSQL runtime cutover review](./postgres-migration-revi
 - Image task attachments (`image/png`, `image/jpeg`, `image/gif`, `image/webp`) and video task attachments (`video/mp4`, `video/webm`, `video/quicktime`; 100MB cap vs 5MB for other attachments) are bridged into the artifact registry by `TaskStore.addAttachment()` as `image`/`video` rows with `metadata.source: "attachment"` and a relative `attachments/<file>` URI. This keeps one copy of the bytes under `<rootDir>/.fusion/tasks/{ID}/attachments/` while making the image discoverable through artifact list APIs and the Documents/Task Artifacts galleries. Non-image attachments remain attachment-only. Deleting an attachment also deletes its bridged artifact row before removing the attachment file so `/api/artifacts/:id/media` does not point at a deleted attachment.
 - Inline text/document artifacts may store `content` directly in PostgreSQL and therefore have no media file. The dashboard media route streams `GET /api/artifacts/:id/media` from disk when `uri` is present, accepting task-scoped artifact URIs under `artifacts/` and bridged image-attachment URIs under `attachments/`, or returns inline `content` with the persisted MIME type when no `uri` exists.
 - `getArtifact(id)` returns metadata by ID, `getArtifacts(taskId)` returns active-task artifacts newest-first, and `listArtifacts(...)` is the cross-agent query path with type/author/task/search filters and pagination. List reads hide artifacts whose parent task is soft-deleted while preserving task-less artifacts.
-- `updateArtifact(id, { title?, description?, content? })` powers the dashboard Artifacts view's in-place doc editing (`GET`/`PATCH /api/artifacts/:id`). Content edits are only allowed on inline-content rows (no `uri`); binary-backed rows accept metadata edits only, archived-task artifacts stay read-only, and successful updates emit `artifact:updated` for live gallery refresh.
+- `updateArtifact(id, { title?, description?, content? })` powers the dashboard Artifacts view's in-place doc editing (`GET`/`PATCH /api/artifacts/:id`). Content edits are only allowed on inline-content rows (no `uri`); binary-backed rows accept metadata edits only, soft-deleted and historical-sentinel task artifacts stay read-only, and successful updates emit `artifact:updated` for live gallery refresh.
 - `fn_artifact_register` accepts a local file `path` (in addition to inline `content`/`dataBase64`): the tool reads the file (50 MB cap), infers the MIME type from the extension when omitted, signature-validates image payloads (PNG/JPEG/GIF/WebP magic bytes, SVG text sniff), video payloads (mp4/mov `ftyp` box, WebM EBML header), and PDF payloads (`%PDF-` prefix), and persists the bytes through `registerArtifact()`'s managed storage path so the registry row keeps a servable URI after worktrees are cleaned up. Executor-lane registrations resolve relative paths against the task worktree and default `taskId` to the executing task. Every `path` is containment-checked before stat/read: the realpath-canonicalized file (symlinks and `../` segments resolved) must remain inside the session's `baseDir` or the OS temp directory; relative paths require a configured `baseDir`, and lanes without one (dashboard chat, no-task heartbeats) accept only absolute paths under the OS temp directory. HTML mockups register as `type="document"` + `mimeType="text/html"` (via `content` or `path`) and render as live sandboxed previews in the Artifacts view.
 - `GET /api/artifacts/:id/media` serves HTTP byte ranges (`Accept-Ranges: bytes`, 206 + `Content-Range` for single ranges, 416 for unsatisfiable ranges) so `<video>`/`<audio>` seeking works and Safari plays media at all.
-- Task-linked artifact registration requires an active, non-archived task. Archived tasks are read-only for artifact writes; soft-deleted or missing tasks are rejected.
-- Retention follows the existing task lifecycle rather than a separate artifact policy: soft-deleted parent tasks keep artifact rows/files for forensics but normal live-reader APIs hide them; hard deletion from the active `tasks` table cascades artifact metadata through the `taskId` foreign key, and archive cleanup removes the task directory that contains task-scoped artifact binaries. Task-less artifacts live under `<rootDir>/.fusion/artifacts/` and are not tied to task archival cleanup.
+- Task-linked artifact registration requires a live task. Soft-deleted, missing, or historical-sentinel parents are rejected.
+- Retention follows the existing task lifecycle rather than a separate artifact policy: soft-deleted parent tasks keep artifact rows/files for forensics while normal live-reader APIs hide them. Task-less artifacts live under `<rootDir>/.fusion/artifacts/` and are not tied to task lifecycle cleanup.
 - Worktree DB hydration copies task-scoped artifact metadata for the current task/dependency graph alongside task rows and `task_documents`. It intentionally does not copy binary payload files, and it intentionally excludes task-less registry artifacts because dependency hydration is scoped to the active task graph.
-- **Cross-instance live refresh (FN-7544).** A project can have more than one `TaskStore` instance open against the same DB at once (e.g. the dashboard's cached `getOrCreateProjectStore` instance vs. the engine's own internally-constructed store, or two dashboard processes). `registerArtifact()` calls `bumpLastModified()` and `checkForChanges()`'s 1s polling loop diffs the `artifacts` table by a strictly-increasing `rowid` cursor (not a timestamp, to avoid millisecond ties), re-emitting `artifact:registered` on any instance that did not perform the write itself. Without this, an already-open Documents/task Artifacts gallery served by a different store instance than the one an agent wrote through would never receive the live event and would show a stale list until a full reload re-ran the initial fetch.
+- **Cross-instance live refresh boundary (FN-8683/FN-8685).** A project can have more than one `TaskStore` instance open against the same PostgreSQL DB. A configured task-deletion consumer replays the durable outbox per identity; other lifecycle events and stores without an explicit identity remain process-local. The outbox is the only approved cross-process delivery path, not a revived `checkForChanges()` loop.
+- **Task-deletion consumer storage.** `project.task_lifecycle_consumer_registrations` is the authoritative liveness set (`registered_at`, `last_seen_at`, `active`). Each `(project_id, consumer_id)` has a cursor/lease row containing its acknowledged sequence, retry backoff, fencing token, and expiry; durable receipts suppress already-committed redelivery. Dead letters are unique on `(project_id, consumer_id, event_id)`, so their insert, fenced cursor advance, retry reset, and `task-deleted-outbox:dead-letter` audit record commit as one transaction.
+- **Task-deletion outbox retention.** `pruneTaskLifecycleEvents` is the only pruning seam, invoked by the engine self-healing maintenance sweep at most once per project every six hours with a 5,000-row budget. It deletes only 30-day-old rows acknowledged by every live registered consumer; an active registration without a cursor prevents pruning. Stale/inactive registrations do not pin retention. With zero live identities it age-prunes only rows older than 30 days, preserving within-bound restart catch-up; per-project prune failures are non-fatal and retry on the next sweep.
 
 Agent-facing registration tools are documented in [Artifact registry tools](./agents.md#artifact-registry-tools), and the dashboard browsing surface is documented in [Artifacts View](./dashboard-guide.md#artifacts-view).
 
@@ -283,18 +337,18 @@ High-level finding: the dashboard currently uses localStorage extensively for UX
 | `kb-dashboard-current-project` | `hooks/useCurrentProject.ts` | JSON `ProjectInfo` object (includes id/name/path/status/etc.) | project/identity | **Medium** |
 | `kb-terminal-tabs` | `hooks/useTerminalSessions.ts` | JSON array of tab objects (`id`, `sessionId`, `title`, active state, timestamp) | UI preference (operational session state) | **High** |
 | `fn-agent-tree-expanded` | `hooks/useAgentHierarchy.ts` | JSON string[] of expanded agent ids | UI preference | Low |
-| `kb-planning-last-description` | `hooks/modalPersistence.ts` (used by `PlanningModeModal`) | free-text draft | user draft | Medium |
-| `kb-subtask-last-description` | `hooks/modalPersistence.ts` (used by `SubtaskBreakdownModal`) | free-text draft | user draft | Medium |
-| `kb-mission-last-goal` | `hooks/modalPersistence.ts` (used by `MissionInterviewModal`) | free-text draft | user draft | Medium |
+| `kb-planning-last-description` | `hooks/modalPersistence.ts` (used by `PlanningModeModal`) | free-text draft (best-effort; 64,000-byte cap) | user draft | Medium |
+| `kb-subtask-last-description` | `hooks/modalPersistence.ts` (used by `SubtaskBreakdownModal`) | free-text draft (best-effort; 64,000-byte cap) | user draft | Medium |
+| `kb-mission-last-goal` | `hooks/modalPersistence.ts` (used by `MissionInterviewModal`) | free-text draft (best-effort; 64,000-byte cap) | user draft | Medium |
 | `kb-dashboard-view-mode` | `App.tsx` | enum string (`overview`/`project`) | UI preference | Low |
 | `kb-dashboard-task-view` | `App.tsx` | enum string (`board`/`list`/`agents`) | UI preference | Low |
 | `kb-dashboard-list-columns` | `components/ListView.tsx` | JSON array of visible list columns | UI preference | Low |
 | `kb-dashboard-hide-done` | `components/ListView.tsx` | boolean string (`"true"`/`"false"`) | UI preference | Low |
 | `kb-dashboard-list-collapsed` | `components/ListView.tsx` | JSON array of collapsed column ids | UI preference | Low |
 | `kb-dashboard-selected-tasks` | `components/ListView.tsx` | JSON array of selected task IDs | UI preference | **Medium** |
-| `kb-quick-entry-text` | `components/QuickEntryBox.tsx` | free-text task draft | user draft | Medium |
+| `kb-quick-entry-text` | `components/QuickEntryBox.tsx` | free-text task draft (best-effort; 64,000-byte cap) | user draft | Medium |
 | `kb-quick-entry-expanded` | `components/QuickEntryBox.tsx` (legacy cleanup via `removeItem`) | legacy bool key (no longer used) | UI preference | Low |
-| `kb-inline-create-text` | `components/InlineCreateCard.tsx` | free-text task draft | user draft | Medium |
+| `kb-inline-create-text` | `components/InlineCreateCard.tsx` | free-text task draft (best-effort; 64,000-byte cap) | user draft | Medium |
 | `fn-agent-view` | `components/AgentsView.tsx`, `components/AgentListModal.tsx` | enum string (`board`/`list`/`tree` in view; modal supports board/list) | UI preference | Medium |
 | `kb-usage-view-mode` | `components/UsageIndicator.tsx` | enum string (`used`/`remaining`) | UI preference | Low |
 | `kb-dashboard-recent-projects` | `components/ProjectOverview.tsx` | JSON array of recent project IDs | project/identity | Low |
@@ -321,6 +375,7 @@ API endpoints reviewed:
 | `themeMode` | Global | `GET/PUT /api/settings/global` (+ merged via `GET /api/settings`) | Theme mode preference |
 | `colorTheme` | Global | `GET/PUT /api/settings/global` | Color/accent theme |
 | `dashboardFontScalePct` | Global | `GET/PUT /api/settings/global` | Dashboard Appearance font scale percentage (85–125, default 100) applied before hydration. |
+| `chatSnippets` | Global | `GET/PUT /api/settings/global` | Ordered reusable chat prompts (`{ name, prompt }`), normalized and validated atomically; the dashboard inserts `/name` into composers without implicit send and keeps its shared cache memory-only. |
 | `defaultProvider` | Global | `GET/PUT /api/settings/global` | Default model provider |
 | `defaultModelId` | Global | `GET/PUT /api/settings/global` | Default model id |
 | `fallbackProvider` | Global | `GET/PUT /api/settings/global` | Fallback model provider |
@@ -338,6 +393,7 @@ API endpoints reviewed:
 | `favoriteProviders` | Global | `GET/PUT /api/settings/global` | Favorited providers |
 | `favoriteModels` | Global | `GET/PUT /api/settings/global` | Favorited models |
 | `openrouterModelSync` | Global | `GET/PUT /api/settings/global` | Startup model sync behavior |
+| `orcarouterModelSync` | Global | `GET/PUT /api/settings/global` | OrcaRouter startup model sync behavior |
 | `modelOnboardingComplete` | Global | `GET/PUT /api/settings/global` | Onboarding completion flag |
 | `executionGlobalProvider` | Global | `GET/PUT /api/settings/global` | Global baseline AI provider for task execution |
 | `executionGlobalModelId` | Global | `GET/PUT /api/settings/global` | Global baseline AI model ID for task execution |
@@ -355,7 +411,7 @@ API endpoints reviewed:
 | `globalPause` | Project | `GET/PUT /api/settings` | Hard stop for engine activity |
 | `enginePaused` | Project | `GET/PUT /api/settings` | Soft pause for dispatch |
 | `maxConcurrent` | Project | `GET/PUT /api/settings` | Max concurrent task-lane agents. Utility AI workflows bypass this limit. |
-| `maxWorktrees` | Project | `GET/PUT /api/settings` | Worktree cap |
+| `maxWorktrees` | Project | `GET/PUT /api/settings` | Execution-checkout holder cap; does not include planning |
 | `pollIntervalMs` | Project | `GET/PUT /api/settings` | Scheduler poll interval |
 | `groupOverlappingFiles` | Project | `GET/PUT /api/settings` | Serialize overlapping file work |
 | `overlapIgnorePaths` | Project | `GET/PUT /api/settings` | Project-relative file/directory paths ignored by overlap blocking |
@@ -365,8 +421,6 @@ API endpoints reviewed:
 | `worktreeInitCommand` | Project | `GET/PUT /api/settings` | Command run on worktree init |
 | `testCommand` | Project | `GET/PUT /api/settings` | Project test command |
 | `buildCommand` | Project | `GET/PUT /api/settings` | Project build command |
-| `recycleWorktrees` | Project | `GET/PUT /api/settings` | Worktree pool toggle |
-| `worktreeNaming` | Project | `GET/PUT /api/settings` | Worktree naming strategy |
 | `worktrunk` (`worktrunk.enabled`, `worktrunk.binaryPath`, `worktrunk.onFailure`) | Global + Project | `GET/PUT /api/settings/global` and `GET/PUT /api/settings` | Worktrunk integration settings group. Resolved with field-level project-overrides-global precedence in merged settings. See `docs/settings-reference.md` for key details and defaults. |
 | `worktreesDir` | Project | `GET/PUT /api/settings` | Optional worktree container directory (supports absolute/project-relative paths, `~`, `{repo}` token) |
 | `taskPrefix` | Project | `GET/PUT /api/settings` | Task ID prefix |
@@ -408,7 +462,7 @@ API endpoints reviewed:
 | `autoBackupSchedule` | Project | `GET/PUT /api/settings` | Backup cron schedule |
 | `autoBackupRetention` | Project | `GET/PUT /api/settings` | Backup retention count |
 | `autoBackupDir` | Project | `GET/PUT /api/settings` | Backup directory |
-| `autoSummarizeTitles` | Project | `GET/PUT /api/settings` | Auto-title generation |
+| `autoSummarizeTitles` | Project | `GET/PUT /api/settings` | All-length automatic AI title policy for non-empty untitled task descriptions; default `false`. Explicit titles and manual/force requests are unaffected, and the value is snapshotted per create. |
 | `titleSummarizerProvider` | Project | `GET/PUT /api/settings` | Title model provider |
 | `titleSummarizerModelId` | Project | `GET/PUT /api/settings` | Title model id |
 | `titleSummarizerFallbackProvider` | Project | `GET/PUT /api/settings` | Title fallback provider |
@@ -454,7 +508,7 @@ FN-5240/FN-5241/FN-5242 establish the handoff invariant: the only legal executor
 
 The `tasks.githubTracking` JSON column stores per-task GitHub tracking state (`enabled`, optional `repoOverride`, linked issue metadata, and `unlinkedAt`). It is additive and default-off; imported-source issue metadata remains in `issueInfo` / `sourceIssue`. Behavior wiring (issue creation/lifecycle sync and UI surfacing) lands in FN-3870/FN-3873/FN-3874.
 
-The `tasks.sourceIssueClosedAt` column (migration 122) backs `TaskSourceIssue.closedAt`, a nullable ISO-8601 timestamp for the originating external issue's real close time. Going forward, the GitHub source-issue reconciler fills it when it closes the linked issue itself or observes GitHub's `closed_at`/`closedAt` value. Historical GitHub-imported `done`/`archived` rows that still have `NULL` can be filled retroactively by the optional manual `POST /api/git/github/backfill-source-issue-closed-at` sweep, now exposed as **Backfill exact close times** in the Command Center GitHub area's Fixed by Fusion card. The sweep is idempotent, paginated, writes only real GitHub `closed_at` values, reports `scanned`/`filled`/`skipped`/`errors`, and never overwrites an existing timestamp or runs automatically. Command Center "Fixed by Fusion" analytics read this exact timestamp when available and fall back to `updatedAt` only when it has not been observed.
+The `tasks.sourceIssueClosedAt` column (migration 122) backs `TaskSourceIssue.closedAt`, a nullable ISO-8601 timestamp for the originating external issue's real close time. Going forward, the GitHub source-issue reconciler fills it when it closes the linked issue itself or observes GitHub's `closed_at`/`closedAt` value. Historical GitHub-imported Complete rows or cold-archive snapshots that still have `NULL` can be filled retroactively by the optional manual `POST /api/git/github/backfill-source-issue-closed-at` sweep, now exposed as **Backfill exact close times** in the Command Center GitHub area's Fixed by Fusion card. The sweep is idempotent, paginated, writes only real GitHub `closed_at` values, reports `scanned`/`filled`/`skipped`/`errors`, and never overwrites an existing timestamp or runs automatically. Command Center "Fixed by Fusion" analytics read this exact timestamp when available and fall back to `updatedAt` only when it has not been observed.
 
 The `tasks.tokenUsage*` columns store cumulative per-task token usage for analytics. Reuse/resume-capable sessions capture their cumulative-token snapshot when bound to a task and persist only later deltas, so usage from prior tasks never inflates the current task. `tokenUsageModelProvider` and `tokenUsageModelId` are analytics-only snapshots of the actually-used runtime model recorded when usage is accumulated; they let Command Center group and price resolved-via-settings usage by provider/model without writing the task-level `modelProvider` / `modelId` own-model override fields that control future model resolution. Cost attribution reads the snapshot first and falls back to the legacy own-model columns for pre-snapshot rows.
 
@@ -472,7 +526,7 @@ The `tasks.cumulativeActiveMs` and `tasks.executionCompletedAt` columns are the 
 | `agents` | Agent registry/state/task assignment metadata. |
 | `agentHeartbeats` | Heartbeat run events linked to agents (`agentId` FK cascade). |
 | `approval_requests` | Durable approval request records: requester actor snapshot, target action payload (category/action/resource/context), lifecycle status (`pending`/`approved`/`denied`/`completed`), optional task/run context, and requested/decided/completed timestamps. |
-| `approval_request_audit_events` | Append-only audit trail for approval requests. Each row stores event type (`created`/`approved`/`denied`/`completed`), immutable actor snapshot, optional note, and deterministic per-request ordering by `(createdAt, rowid)`. |
+| `approval_request_audit_events` | Append-only audit trail for approval requests. PostgreSQL uses the physical `(project_id, id)` identity, while public `ApprovalRequestStore.getAuditHistory` scopes bound audit-history reads; Command Center analytics remains intentionally unbound-tolerant. The ownership trigger normalizes only NULL/exact `''`, so a whitespace-only binding is stored literally. IDs are deterministic `aprevt-<eventType>-<requestId>-<createdAt>` values: request identity and lifecycle guards ensure one same-type event per request/timestamp within a partition, while different event types are distinct; history ties use lifecycle rank before ID. Rows store event type (`created`/`approved`/`denied`/`completed`), immutable actor snapshot, and optional note. |
 | `secrets` | Encrypted secret KV rows (`key` unique) with raw BLOB `value_ciphertext` + per-row random `nonce` (AES-256-GCM), per-secret `access_policy` CHECK (`auto`/`prompt`/`deny`), env-materialization metadata (`env_exportable`, `env_export_key`), and read-audit fields (`last_read_at`, `last_read_by`). Plaintext is never written to the database. |
 | `task_documents` | Task-scoped document metadata/content keyed by `(taskId, key)` with current revision pointer. |
 | `task_document_revisions` | Immutable revision history for task documents (content snapshots by revision). |
@@ -496,10 +550,10 @@ The `tasks.cumulativeActiveMs` and `tasks.executionCompletedAt` columns are the 
 | `todo_lists` | Project-scoped todo list metadata (`projectId`, title, created/updated timestamps). |
 | `todo_items` | Todo list items (`listId` FK) with completion state, completion timestamp, and deterministic `sortOrder`. |
 | `ai_sessions` *(migration-created)* | Persisted AI interactive sessions (planning/interview/subtask) with status and conversation history. Deletion is final within a bounded tombstone window (FN-7949) — see below. |
-| `messages` *(migration-created)* | Inter-agent/user message mailbox storage. |
+| `messages` *(migration-created)* | Inter-agent/user message mailbox storage with an `archived` flag; archived mail is retained for restore but excluded from default mailbox reads and unread counts. |
 | `agentRatings` *(migration-created)* | Agent performance ratings (1-5), optional reviewer metadata, and run/task attribution. |
 | `chat_sessions` *(migration-created)* | Chat session metadata (agent/project/model/status/title timestamps). |
-| `chat_messages` *(migration-created)* | Chat message history per session (`role`, `content`, thinking output, metadata). |
+| `chat_messages` *(migration-created)* | Chat message history per session (`role`, `content`, thinking output, metadata). The `(session_id, created_at DESC, id DESC)` recency index serves sidebar previews as one index-backed `LIMIT 1` lookup per session. Content search likewise returns one projected preview row per matching session; its `ILIKE` filter is not index-assisted, so each session walk remains bounded by that session's messages. |
 | `chat_rooms` *(migration-created)* | Room metadata (`name`, `slug`, `description`, `projectId`, `createdBy`, status and timestamps). |
 | `chat_room_members` *(migration-created)* | Room membership map with composite PK `(roomId, agentId)` and role (`owner`/`member`). |
 | `chat_room_messages` *(migration-created)* | Room message history with `senderAgentId`, JSON `mentions`, attachments/metadata blobs, ordered by `createdAt`. |
@@ -572,49 +626,54 @@ The PostgreSQL-era runtime writes `.fusion/project.json`. Startup reads this leg
    - **Problem:** Theme is persisted in both localStorage (`kb-dashboard-theme-mode`, `kb-dashboard-color-theme`) and backend global settings (`themeMode`, `colorTheme`), but app bootstrap uses localStorage-only theme hydration. If backend and browser cache diverge, cross-device consistency breaks.  
    - **Recommended fix:** Make backend global settings the source of truth (or explicitly define local cache precedence + bidirectional sync strategy and conflict resolution).
 
-2. **Project-unscoped localStorage keys in multi-project UX state**  
+2. **Draft persistence quota exhaustion (#3477) — resolved**
+   - **Severity:** Medium
+   - **Affected:** `kb-quick-entry-text`, `kb-inline-create-text`, `kb-planning-last-description`, `kb-subtask-last-description`, `kb-mission-last-goal`
+   - **Resolution:** Scoped writes are throw-safe and retry after exact-key eviction; repeated quota failures reclaim stale other-project volatile drafts and stale dashboard SWR envelopes. Free-text drafts are capped at 64,000 bytes and remain in memory when they cannot be restored, so **Clear local data** is no longer a workaround for draft-driven saturation.
+
+3. **Project-unscoped localStorage keys in multi-project UX state**
    - **Severity:** High  
    - **Affected:** `App.tsx`, `ListView.tsx`, `QuickEntryBox.tsx`, `InlineCreateCard.tsx`, `AgentsView.tsx`, `useTerminalSessions.ts`, `useAgentHierarchy.ts`, `UsageIndicator.tsx`  
    - **Problem:** Many keys are global (`kb-dashboard-task-view`, `kb-dashboard-list-*`, `kb-dashboard-selected-tasks`, `kb-quick-entry-text`, `kb-inline-create-text`, `kb-terminal-tabs`, etc.) and are reused across projects. This can leak preferences/drafts/selections between projects unexpectedly.  
    - **Recommended fix:** Namespace project-specific keys with `projectId` (e.g., `kb:{projectId}:dashboard-list-columns`). Keep only true global prefs unscoped.
 
-3. **`kb-dashboard-selected-tasks` can carry stale selections across projects**  
+4. **`kb-dashboard-selected-tasks` can carry stale selections across projects**
    - **Severity:** Medium  
    - **Affected:** `components/ListView.tsx`  
    - **Problem:** Selected task IDs persist globally. In multi-project setups with overlapping ID patterns, stale selections can reappear and affect bulk operations unexpectedly.  
    - **Recommended fix:** Project-scope this key, and/or treat selection as in-memory/session-only state.
 
-4. **Terminal session persistence stores operational identifiers in localStorage**  
+5. **Terminal session persistence stores operational identifiers in localStorage**
    - **Severity:** Medium  
    - **Affected:** `hooks/useTerminalSessions.ts` (`kb-terminal-tabs`)  
    - **Problem:** Session IDs and tab metadata persist client-side and are not project-scoped. This is operational state better owned by backend/session layer; stale tabs also survive cache until cleanup logic runs.  
    - **Recommended fix:** Move terminal tab/session state to server persistence (or at minimum sessionStorage + project scoping + TTL/versioning).
 
-5. **Current project persistence stores full `ProjectInfo` object (includes filesystem path)**  
+6. **Current project persistence stores full `ProjectInfo` object (includes filesystem path)**
    - **Severity:** Medium  
    - **Affected:** `hooks/useCurrentProject.ts` (`kb-dashboard-current-project`)  
    - **Problem:** Storing full project objects increases drift risk and stores more data than needed (including local path).  
    - **Recommended fix:** Persist only stable `projectId`; resolve current object from backend project list each load.
 
-6. **Draft persistence is local-only (device/browser-bound)**  
+7. **Draft persistence is local-only (device/browser-bound)**
    - **Severity:** Medium  
    - **Affected:** `modalPersistence.ts`, `QuickEntryBox.tsx`, `InlineCreateCard.tsx`  
    - **Problem:** Planning/subtask/mission/task-entry drafts are lost on storage clear or browser/device switch.  
    - **Recommended fix:** Keep local quick-draft behavior, but add optional server-backed drafts (short TTL) for continuity.
 
-7. **Settings scope key lists drift from interfaces**  
+8. **Settings scope key lists drift from interfaces**
    - **Severity:** Medium  
    - **Affected:** `packages/core/src/types.ts`, `store.ts`, `routes.ts`, `SettingsModal.tsx`  
    - **Problem:** `GLOBAL_SETTINGS_KEYS` (14) omits `setupComplete`, `favoriteProviders`, `favoriteModels`; `PROJECT_SETTINGS_KEYS` (52) omits 9 project interface keys (`strictScopeEnforcement`, `buildRetryCount`, `buildTimeoutMs`, `autoUnpause*`, `maintenanceIntervalMs`, `scripts`, `setupScript`). This creates scope-classification and patch-filter inconsistencies.  
    - **Recommended fix:** Generate key lists from schema/interface source (or enforce parity tests) to prevent drift.
 
-8. **`fn-agent-view` shared by two UIs with different supported modes**  
+9. **`fn-agent-view` shared by two UIs with different supported modes**
    - **Severity:** Low  
    - **Affected:** `AgentsView.tsx`, `AgentListModal.tsx`  
    - **Problem:** Both share the same key, but one surface supports `tree` and the modal supports only `board/list`; behavior remains valid but coupling is implicit.  
    - **Recommended fix:** Decide intentional shared behavior and document it; otherwise split keys by surface.
 
-9. **Workflow steps still persisted in config JSON compatibility path (known in-progress work)**  
+10. **Workflow steps still persisted in config JSON compatibility path (known in-progress work)**
    - **Severity:** Low  
    - **Affected:** `config.settings/workflowSteps`, `db.ts` config table  
    - **Problem (historical audit):** Workflow step storage was tied to config blob structure; **FN-1201** moved it to a dedicated table before the PostgreSQL cutover.
@@ -684,7 +743,6 @@ Each git worktree has its own gitignored `.fusion/` directory, so `.fusion/fusio
 
 Fusion now auto-hydrates the worktree DB during executor startup at three points:
 - after fresh worktree creation (including init/setup commands),
-- after pooled worktree acquire/reassignment,
 - when reusing an existing on-disk worktree for resume.
 
 Hydration copies only:
@@ -729,10 +787,7 @@ requires. The real defect was in **project-root resolution** for pi-extension to
 (`packages/cli/src/extension.ts`'s `resolveProjectRoot(cwd)` → `getProjectRootFromWorktree`
 in `packages/core/src/pi-extensions.ts`):
 
-1. `getProjectRootFromWorktree` matches the standard `.worktrees/<id>` and
- `.fusion/worktrees/<id>` path shapes via hardcoded regex. A project with a non-default
- `settings.worktreesDir` (an arbitrary relative/absolute location — common in containerized
- deployments) doesn't match either pattern.
+1. `getProjectRootFromWorktree` matches the standard `.fusion/worktrees/<id>` path shape and the legacy `.worktrees/<id>` shape via hardcoded regex. New worktrees use the former, while the latter remains accepted for pre-existing paths when `worktreesDir` is unset. A project with a non-default `settings.worktreesDir` (an arbitrary relative/absolute location — common in containerized deployments) doesn't match either pattern.
 2. The only remaining resolution path, `getProjectRootFromGitLinkedWorktree`, shelled out to
  `git rev-parse --git-common-dir`/`--git-dir` via `spawnSync`. A failing `git` invocation —
  missing binary in a minimal container image, Docker's "detected dubious ownership"
@@ -772,3 +827,47 @@ exists on disk.
 Configuration changes are immutable `project.configuration_revisions` snapshots. Rows are partitioned by `(project_id, id)` and address resources with structured JSON targets plus a canonical JSON target key; history reads are newest-first by owner, kind, and target. A database identity sequence deterministically breaks same-millisecond timestamp ties. Project settings, workflow setting values, routine definitions, and automation definitions record their PostgreSQL mutations within the same transaction, so a failed revision insert rolls back the configuration write. The legacy SQLite writers reject versioned configuration mutations before side effects: accepting a write without an atomically durable revision would violate the rollback contract.
 
 User-global `~/.fusion/settings.json` history uses the reserved `__fusion_global_configuration__` owner identity rather than the project that initiated the write. Filesystem writes are serialized and stage a durable revision-intent file before replacing settings; a later mutation reconciles an interrupted intent by completing its journal append or restoring the old snapshot. When its revision append fails, the store restores the pre-write raw settings file before rejecting. `TaskStore.rollbackConfiguration()` exactly restores project/global/workflow snapshots; `RoutineStore` and `AutomationStore` expose the same rollback action for their stable-ID resources. Each rollback includes deletion/recreation semantics and appends exactly one forward revision marked `source: "rollback"`, rather than modifying history.
+
+Direct chat tags are stored in the project PostgreSQL schema as `chat_tags` and `chat_session_tags`. Tags are normalized and project-scoped; assignment cleanup does not delete chat sessions.
+
+## Task deletion lifecycle outbox
+
+`project.task_lifecycle_events` is the write-only durable source for cross-process `task:deleted` observation. The delete transaction conditionally claims the first `deleted_at` transition; only its winner writes the audit record and one outbox event. A concurrent loser re-reads the project-scoped deleted task in that transaction and has no writer-side audit, event, emit, or mailbox effect.
+
+Events use `(project_id, seq)` and a deterministic `evt_` SHA-256 identity over project, event type, task ID, and deletion timestamp. `project.task_lifecycle_event_seq` allocates that per-project sequence through a transactional counter upsert. Its lock is held until commit, so allocation order equals commit order, committed rows are in-order and gap-free, and rollback reverts the counter without consuming a number. Payloads contain only task IDs, previous lane/status, deletion timestamp, resurrection/issue action, and actor ID fields.
+
+FN-8685 adds `task_lifecycle_consumer_registrations`, `task_lifecycle_consumer_cursors`, `task_lifecycle_consumer_receipts`, and `task_lifecycle_consumer_dead_letters`. Every table is scoped by project and consumer; receipts and dead letters use `(project_id, consumer_id, event_id)` uniqueness. Registrations provide durable liveness for retention. Retention runs from self-healing at most every six hours per project, is bounded to 5,000 rows per sweep, and does not prune rows unacknowledged by live consumers. If no identity is live, it only age-prunes events older than 30 days so a within-bound restart can catch up.
+
+## Mission validator input memoization (FN-8694)
+
+`project.mission_validator_runs.input_fingerprint` stores a nullable SHA-256 content address for eligible automatic validator runs. The address hashes UTF-8 bytes of `JSON.stringify(["mission-validation-input-v1", landedSha, provider, modelId, systemPrompt, userPrompt])`; the versioned array avoids delimiter ambiguity and ordinary prompt-template changes invalidate naturally. The `(project_id, feature_id, input_fingerprint)` index scopes lookup and admission, so history never crosses projects or features.
+
+Automatic admission locks the project-scoped feature row, records a running row only for an admitted dispatch, and writes one `validation memoized` mission activity event for each suppressed running/pass/budget decision. Matching static passes are reused without fabricating a run. Matching failed rows consume the per-fingerprint budget; exhaustion records `loop_state = blocked` plus fingerprint/run/timestamp provenance and emits exactly one additional `validation-stuck` event for that feature/fingerprint. Repeated unchanged suppressions remain individually auditable but do not repeat the stuck event. Reaped `error` and `blocked` runs are transient and do not seed reuse or the failure count.
+
+`project.agents.roles` is a normalized JSONB role-tag array. Migration `0045_fn_8764_multi_role_workflow_agents.sql` backfills it from legacy singular roles. `workflow_work_items` also persist the routed principal fence fields used for recovery and audit.
+
+### Revision heartbeat and paging (FN-8852)
+
+`engineLastActiveAt` is engine liveness bookkeeping, not operator configuration. It is a non-versioned project-settings key: revision diffs and stored snapshots omit it, while the live project setting remains written normally. Project-settings rollback overlays live non-versioned values over both modern stripped snapshots and legacy snapshots, so rollback cannot delete or resurrect a stale heartbeat. `appendConfigurationRevision` deliberately remains an unfiltered raw writer for migrations and legacy fixtures; a heartbeat-only rollback is rejected as already restored without writing.
+
+Revision listing defaults to 100 rows and clamps `limit` to 1–500. The API accepts `limit` and `offset` and returns `hasMore`, determined by fetching `limit + 1` rows rather than a count query. Rows are ordered `createdAt DESC, sequence DESC`. Since history is append-only, rows appended between offset page requests can shift offsets and be observed twice; they are not silently skipped backwards.
+
+### `project.memory_recall_records`
+
+Project-scoped structured recall records for durable decisions, preferences, and solutions. The table uses the composite `(project_id, id)` key, row-level security, created-at indexes, and a named `(project_id, kind, content_hash)` exact-hash backstop. `graph_node_ids` stores graph cross-references; Memory Keeper merges new IDs under a per-record advisory transaction lock, so identifiers only grow and an unchanged union does not update the row.
+
+- Knowledge-graph artifact: `<rootDir>/.fusion-knowledge/graph/` (`nodes.json`, `edges.json`, and `manifest.json`). This is deliberately outside ignored `.fusion` and may be committed at the operator's discretion.
+
+### Embedded PostgreSQL on Windows — antivirus and the runtime-bin payload
+
+If Windows startup reports `unknown error 4551` while loading an embedded PostgreSQL DLL such as `dict_snowball.dll`, antivirus quarantined part of `%USERPROFILE%\\.fusion\\embedded-postgres`. Add that directory as a Windows Security exclusion, restore the file from Protection history, and restart Fusion. Fusion verifies and automatically re-copies the runtime payload; see [Windows antivirus blocks an embedded PostgreSQL DLL](solutions/database-issues/windows-antivirus-blocks-embedded-postgres-dll.md).
+
+### Bounded task-intake lookups
+
+Recommendation proposal claims use the indexed `findTaskByProposalClaimId` read (`uqTasksProjectProposalClaimId`), and same-agent intake reads only matching source lineage (`idxTasksProjectSourceAgentId` and `idxTasksSourceParentTaskId`). Do not replace either read with a `listTasks()` scan. Workflow terminal flags for intake duplicate checks are derived from workflow definitions, not board rows. Guarded-intake near-duplicate checks must remain bounded to their candidates (the fallback is `limit: 50`) and must not hydrate the full board.
+
+### External-block task metadata
+
+Project task rows persist `external_block` as nullable JSONB. A non-null value records the obstacle origin, code, raw message, source, timestamp, and exact resume coordinates. Legacy/null rows hydrate as `externalBlock: undefined`; lifecycle reset clears the column.
+
+Project task rows also persist `planning_failure` as nullable JSONB engine-owned planning retry evidence. It is never validated against workflow `fields`; legacy/null rows hydrate as `planningFailure: undefined`, and lifecycle reset clears the column.

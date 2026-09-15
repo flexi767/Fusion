@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   applyTestModeOverrides,
+  hasConfiguredFallbackLane,
   resolveExecutionSettingsModel,
+  resolveFastCheapSettingsModel,
+  resolveFastCheapThinkingLevel,
   resolveExecutorFallbackModel,
+  resolvePlanningFallbackModel,
+  resolveValidatorFallbackModel,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
   resolveTaskExecutionModel,
@@ -14,9 +19,30 @@ import {
   resolveTitleSummarizerSettingsModel,
   resolveValidatorSettingsModel,
   TEST_MODE_RESOLVED,
-} from "../model-resolution.js";
+} from "../ai/model-resolution.js";
 
 describe("model-resolution", () => {
+  it("detects complete fallback pairs at the lane, global, and selected-workflow tiers", () => {
+    expect(hasConfiguredFallbackLane({
+      planningFallbackProvider: "project-provider",
+      planningFallbackModelId: "project-model",
+    }, "planning")).toBe(true);
+    expect(hasConfiguredFallbackLane({
+      fallbackProvider: "global-provider",
+      fallbackModelId: "global-model",
+    }, "validation")).toBe(true);
+    expect(hasConfiguredFallbackLane({
+      selectedWorkflowModelLanes: {
+        executionFallbackProvider: "workflow-provider",
+        executionFallbackModelId: "workflow-model",
+      },
+    }, "execution")).toBe(true);
+    expect(hasConfiguredFallbackLane({
+      planningFallbackProvider: "incomplete-provider",
+      selectedWorkflowModelLanes: { planningFallbackModelId: "incomplete-model" },
+    }, "planning")).toBe(false);
+  });
+
   it("uses only a complete task merger pair before settings and preserves test mode", () => {
     const settings = { mergerProvider: "settings-provider", mergerModelId: "settings-model" };
     expect(resolveTaskMergerModel({ mergerModelProvider: "task-provider", mergerModelId: "task-model" }, settings)).toEqual({ provider: "task-provider", modelId: "task-model" });
@@ -46,6 +72,52 @@ describe("model-resolution", () => {
         defaultModelId: "claude-sonnet-4-5",
       }),
     ).toEqual({ provider: "openai", modelId: "gpt-4o" });
+  });
+
+  it("resolves the Fast & Cheap lane as project → global → execution and skips partial pairs", () => {
+    const execution = {
+      executionProvider: "execution-provider",
+      executionModelId: "execution-model",
+    };
+
+    expect(resolveFastCheapSettingsModel({
+      ...execution,
+      fastCheapProvider: "project-provider",
+      fastCheapCredentialInstanceId: "project-credential",
+      fastCheapModelId: "project-model",
+      fastCheapGlobalProvider: "global-provider",
+      fastCheapGlobalModelId: "global-model",
+    })).toEqual({
+      provider: "project-provider",
+      credentialInstanceId: "project-credential",
+      modelId: "project-model",
+    });
+    expect(resolveFastCheapSettingsModel({
+      ...execution,
+      fastCheapProvider: "partial-project-provider",
+      fastCheapGlobalProvider: "global-provider",
+      fastCheapGlobalCredentialInstanceId: "global-credential",
+      fastCheapGlobalModelId: "global-model",
+    })).toEqual({
+      provider: "global-provider",
+      credentialInstanceId: "global-credential",
+      modelId: "global-model",
+    });
+    expect(resolveFastCheapSettingsModel(execution)).toEqual({
+      provider: "execution-provider",
+      modelId: "execution-model",
+    });
+    expect(resolveFastCheapSettingsModel({ ...execution, testMode: true })).toEqual(TEST_MODE_RESOLVED);
+    expect(resolveFastCheapThinkingLevel({
+      fastCheapThinkingLevel: "low",
+      fastCheapGlobalThinkingLevel: "medium",
+      executionThinkingLevel: "high",
+    })).toBe("low");
+    expect(resolveFastCheapThinkingLevel({
+      fastCheapGlobalThinkingLevel: "medium",
+      executionThinkingLevel: "high",
+    })).toBe("medium");
+    expect(resolveFastCheapThinkingLevel({ executionThinkingLevel: "high" })).toBe("high");
   });
 
   it("uses the execution lane before the project default override", () => {
@@ -165,6 +237,49 @@ describe("model-resolution", () => {
       defaultProviderOverride: "project-default-provider",
       defaultModelIdOverride: "project-default-model",
     })).toEqual({ provider: "project-merger-provider", modelId: "project-merger-model" });
+  });
+
+  it.each([
+    ["execution", resolveExecutionSettingsModel, resolveTaskExecutionModel, "executionProvider", "executionModelId", "executionGlobalProvider", "executionGlobalModelId", "modelProvider", "modelId"],
+    ["planning", resolvePlanningSettingsModel, resolveTaskPlanningModel, "planningProvider", "planningModelId", "planningGlobalProvider", "planningGlobalModelId", "planningModelProvider", "planningModelId"],
+    ["validation", resolveValidatorSettingsModel, resolveTaskValidatorModel, "validatorProvider", "validatorModelId", "validatorGlobalProvider", "validatorGlobalModelId", "validatorModelProvider", "validatorModelId"],
+  ] as const)("resolves %s as task → project → global → selected workflow", (_lane, resolveSettings, resolveTask, projectProviderKey, projectModelKey, globalProviderKey, globalModelKey, taskProviderKey, taskModelKey) => {
+    const settings = {
+      [projectProviderKey]: "project-provider",
+      [projectModelKey]: "project-model",
+      [globalProviderKey]: "global-provider",
+      [globalModelKey]: "global-model",
+      selectedWorkflowModelLanes: {
+        [projectProviderKey]: "workflow-provider",
+        [projectModelKey]: "workflow-model",
+      },
+    };
+
+    expect(resolveTask({ [taskProviderKey]: "task-provider", [taskModelKey]: "task-model" }, settings)).toEqual({ provider: "task-provider", modelId: "task-model" });
+    expect(resolveSettings(settings)).toEqual({ provider: "project-provider", modelId: "project-model" });
+    expect(resolveSettings({ ...settings, [projectProviderKey]: undefined, [projectModelKey]: undefined })).toEqual({ provider: "global-provider", modelId: "global-model" });
+    expect(resolveSettings({ ...settings, [projectProviderKey]: undefined, [projectModelKey]: undefined, [globalProviderKey]: undefined, [globalModelKey]: undefined })).toEqual({ provider: "workflow-provider", modelId: "workflow-model" });
+  });
+
+  it.each([
+    ["execution", resolveExecutorFallbackModel, "executionFallbackProvider", "executionFallbackModelId"],
+    ["planning", resolvePlanningFallbackModel, "planningFallbackProvider", "planningFallbackModelId"],
+    ["validation", resolveValidatorFallbackModel, "validatorFallbackProvider", "validatorFallbackModelId"],
+  ] as const)("resolves %s fallback as project → global → selected workflow", (_lane, resolveFallback, projectProviderKey, projectModelKey) => {
+    const settings = {
+      [projectProviderKey]: "project-provider",
+      [projectModelKey]: "project-model",
+      fallbackProvider: "global-provider",
+      fallbackModelId: "global-model",
+      selectedWorkflowModelLanes: {
+        [projectProviderKey]: "workflow-provider",
+        [projectModelKey]: "workflow-model",
+      },
+    };
+
+    expect(resolveFallback(settings)).toEqual({ provider: "project-provider", modelId: "project-model" });
+    expect(resolveFallback({ ...settings, [projectProviderKey]: undefined, [projectModelKey]: undefined })).toEqual({ provider: "global-provider", modelId: "global-model" });
+    expect(resolveFallback({ ...settings, [projectProviderKey]: undefined, [projectModelKey]: undefined, fallbackProvider: undefined, fallbackModelId: undefined })).toEqual({ provider: "workflow-provider", modelId: "workflow-model" });
   });
 
   it("resolves merger fallback project pair, global fallback, partial pairs, and test mode", () => {
@@ -532,5 +647,42 @@ describe("model-resolution", () => {
 
     expect(applyTestModeOverrides(resolved, { testMode: false })).toEqual(resolved);
     expect(applyTestModeOverrides(resolved, {})).toEqual(resolved);
+  });
+});
+
+describe("credential instance selection", () => {
+  it("carries the winning pair's instance without mixing a losing tier", () => {
+    expect(resolveExecutionSettingsModel({
+      executionProvider: "project-provider",
+      executionModelId: "project-model",
+      executionCredentialInstanceId: "project-instance",
+      executionGlobalProvider: "global-provider",
+      executionGlobalModelId: "global-model",
+      executionGlobalCredentialInstanceId: "global-instance",
+    })).toEqual({ provider: "project-provider", modelId: "project-model", credentialInstanceId: "project-instance" });
+
+    expect(resolveExecutionSettingsModel({
+      executionProvider: "project-provider",
+      executionModelId: "project-model",
+      executionGlobalCredentialInstanceId: "losing-instance",
+    })).toEqual({ provider: "project-provider", modelId: "project-model" });
+  });
+
+  it("carries workflow, fallback, and task credential instances with their complete pairs", () => {
+    expect(resolvePlanningSettingsModel({
+      selectedWorkflowModelLanes: {
+        planningProvider: "workflow-provider",
+        planningModelId: "workflow-model",
+        planningCredentialInstanceId: "workflow-instance",
+      },
+    })).toEqual({ provider: "workflow-provider", modelId: "workflow-model", credentialInstanceId: "workflow-instance" });
+    expect(resolveValidatorFallbackModel({
+      validatorFallbackProvider: "fallback-provider",
+      validatorFallbackModelId: "fallback-model",
+      validatorFallbackCredentialInstanceId: "fallback-instance",
+    })).toEqual({ provider: "fallback-provider", modelId: "fallback-model", credentialInstanceId: "fallback-instance" });
+    expect(resolveTaskExecutionModel({
+      modelProvider: "task-provider", modelId: "task-model", credentialInstanceId: "task-instance",
+    })).toEqual({ provider: "task-provider", modelId: "task-model", credentialInstanceId: "task-instance" });
   });
 });

@@ -1,9 +1,10 @@
 import type { Agent } from "@fusion/core";
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AlphaButton, AlphaTextArea } from "./alpha-ui";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowUpToLine, Bot, File, Pencil, Send, TriangleAlert } from "lucide-react";
+import { ArrowUpToLine, Bot, File, Pencil, Reply, Send, TriangleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ChatMessageInfo, FailureInfo, ToolCallInfo } from "../hooks/chatTypes";
 import { linkifyFilePaths, linkifyReactChildren } from "../utils/filePathLinkify";
@@ -13,6 +14,14 @@ import { ProviderIcon } from "./ProviderIcon";
 import { NativeStructurePreview } from "./NativeStructurePreview";
 import { openNativeStructure } from "./nativeStructureNavigation";
 import { nativeStructureChatRefMatcher, parseNativeStructureChatRef, splitNativeStructureChatRefMatch } from "./nativeStructureChatRef";
+import { MicButton } from "./MicButton";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { ToolCallDetails, formatToolArgsPreview, formatToolPreview, hasToolCallDetails } from "./ToolCallDetails";
+import { isInteractiveDisclosureTarget, ThinkingTrace } from "./ThinkingTrace";
+import {
+  createChatInputAutosizeController,
+  type ChatInputAutosizeController,
+} from "../utils/chatInputAutosize";
 
 export interface StandardRoomContext {
   roomName: string;
@@ -28,9 +37,13 @@ export interface StandardChatMessageItemProps {
   activeModelTag: string | null;
   activeModelProvider: string | null;
   activeSessionId: string | null;
+  /** The owning dashboard project keeps voice availability isolated in multi-project views. */
+  projectId?: string;
   mentionAgentsByName?: Map<string, Agent>;
   roomContext?: StandardRoomContext | null;
   copyAction?: ReactNode;
+  /** Direct-chat callers opt in; task planner intentionally leaves quotes unavailable. */
+  onQuoteMessage?: (message: ChatMessageInfo) => void;
   onScrollToTop?: (messageId: string) => void;
   /**
    * FNXC:ChatMessageScrollToTop 2026-07-12-23:09:
@@ -56,6 +69,9 @@ export interface StandardChatMessageItemProps {
    * false or `onEditMessage` is absent, no affordance renders at all — never a disabled/dead one.
    */
   canEdit?: boolean;
+  /** Optional ChatView-only find presentation; omitted consumers remain unchanged. */
+  isSearchMatch?: boolean;
+  isSearchActive?: boolean;
 }
 
 export interface StandardStreamingMessageProps {
@@ -71,6 +87,9 @@ export interface StandardStreamingMessageProps {
   copyAction?: ReactNode;
   onQuestionSubmit?: (answerText: string, structured: Record<string, unknown>) => void;
   toolCallRenderer?: (toolCall: ToolCallInfo, index: number) => ReactNode | undefined;
+  /** Optional ChatView-only find presentation; omitted consumers remain unchanged. */
+  isSearchMatch?: boolean;
+  isSearchActive?: boolean;
 }
 
 export interface StandardChatActionButtonProps {
@@ -145,26 +164,29 @@ export function formatModelTag(provider?: string | null, modelId?: string | null
   return formatted.length > 30 ? `${formatted.slice(0, 30)}…` : formatted;
 }
 
-function truncateToolValue(value: string, maxLength: number): string {
-  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}…`;
-}
-
-function formatToolArgsSummary(args?: Record<string, unknown>): string | null {
-  if (!args) return null;
-  const entries = Object.entries(args);
-  if (entries.length === 0) return null;
-  return entries.map(([key, value]) => {
-    const stringValue = typeof value === "string" ? value : (() => {
-      try { return JSON.stringify(value); } catch { return String(value); }
-    })();
-    return `${key}=${truncateToolValue(stringValue, 50)}`;
-  }).join(", ");
-}
-
 function formatToolResultSummary(result: unknown): string | null {
-  if (result === undefined) return null;
-  if (typeof result === "string") return truncateToolValue(result, 200);
-  try { return truncateToolValue(JSON.stringify(result), 200); } catch { return truncateToolValue(String(result), 200); }
+  return formatToolPreview(result, 200);
+}
+
+/*
+FNXC:ChatDisclosure 2026-08-19-02:42:
+Streaming status is presentation-only: disclosure state belongs to the user and must not be taken over by a running tool or thinking delta. The nested ThinkingTrace owns per-section body interaction while this host disclosure retains its existing default.
+*/
+function StandardThinkingDisclosure({ thinking }: { thinking: string }) {
+  const { t } = useTranslation("app");
+  const [open, setOpen] = useState(false);
+  const handleBodyClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (isInteractiveDisclosureTarget(event.target)) return;
+    // FNXC:ThinkingTrace 2026-08-22-16:56: Per-title bodies own collapse clicks; the shared interactive-target guard also keeps the folded-title Raw trace button inside this disclosure.
+    if (event.target instanceof Element && event.target.closest(".thinking-trace-section-body")) return;
+    setOpen(false);
+  }, []);
+  return (
+    <details className="chat-message-thinking" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>{t("chat.thinking", "Thinking")}</summary>
+      <div onClick={handleBodyClick}><ThinkingTrace className="chat-message-thinking-content" text={thinking} format="plain" /></div>
+    </details>
+  );
 }
 
 function buildFailureReferenceHref(reference: FailureInfo["reference"]): string | null {
@@ -238,22 +260,33 @@ export function renderStandardToolCalls(
     }
     const isRunning = toolCall.status === "running";
     const isError = toolCall.status === "completed" && toolCall.isError;
-    const argsSummary = formatToolArgsSummary(toolCall.args);
+    const argsSummary = formatToolArgsPreview(toolCall.args);
     const resultSummary = formatToolResultSummary(toolCall.result);
     const summaryPreview = isRunning ? argsSummary : resultSummary ? `${t("chat.toolCallResultPrefix", "result")}: ${resultSummary}` : argsSummary ? `${t("chat.toolCallArgsPrefix", "args")}: ${argsSummary}` : null;
     const statusLabel = isRunning ? t("chat.toolCallStatusRunning", "running") : isError ? t("chat.toolCallStatusError", "error") : t("chat.toolCallStatusCompleted", "completed");
+    const className = `chat-tool-call${isRunning ? " chat-tool-call--running" : ""}${isError ? " chat-tool-call--error" : ""}`;
+    const summary = (
+      <>
+        <span className="chat-tool-call-status-dot" aria-hidden="true" />
+        <span className="chat-tool-call-name" title={toolCall.toolName}>{toolCall.toolName}</span>
+        {summaryPreview && <span className="chat-tool-call-preview" title={summaryPreview}>{summaryPreview}</span>}
+        <span className="chat-tool-call-status-text">{statusLabel}</span>
+      </>
+    );
+    if (!hasToolCallDetails(toolCall.args, toolCall.result)) {
+      return <div key={`${toolCall.toolName}-${index}`} className={className}><div className="chat-tool-call-summary">{summary}</div></div>;
+    }
     return (
-      <details key={`${toolCall.toolName}-${index}`} className={`chat-tool-call${isRunning ? " chat-tool-call--running" : ""}${isError ? " chat-tool-call--error" : ""}`} open={isRunning}>
-        <summary>
-          <span className="chat-tool-call-status-dot" aria-hidden="true" />
-          <span className="chat-tool-call-name" title={toolCall.toolName}>{toolCall.toolName}</span>
-          {summaryPreview && <span className="chat-tool-call-preview" title={summaryPreview}>{summaryPreview}</span>}
-          <span className="chat-tool-call-status-text">{statusLabel}</span>
-        </summary>
-        <div className="chat-tool-call-content">
-          {argsSummary && <div className="chat-tool-call-row"><span className="chat-tool-call-label">{t("chat.toolCallArgsPrefix", "args")}</span><span className="chat-tool-call-value">{argsSummary}</span></div>}
-          {resultSummary && <div className={`chat-tool-call-row${isError ? " chat-tool-call-row--error" : ""}`}><span className="chat-tool-call-label">{t("chat.toolCallResultPrefix", "result")}</span><span className="chat-tool-call-value">{resultSummary}</span></div>}
-        </div>
+      <details key={`${toolCall.toolName}-${index}`} className={className}>
+        <summary>{summary}</summary>
+        <ToolCallDetails
+          className="chat-tool-call-content"
+          argumentsValue={toolCall.args}
+          resultValue={toolCall.result}
+          argumentsLabel={t("chat.toolCallArgsPrefix", "args")}
+          resultLabel={t("chat.toolCallResultPrefix", "result")}
+          resultIsError={isError}
+        />
       </details>
     );
   };
@@ -286,7 +319,7 @@ export function renderStandardToolCalls(
     const statusSummary = hasRunning ? `(${runningCount} ${t("chat.toolCallStatusRunning", "running")})` : errorCount > 0 ? `(${errorCount} ${errorCount === 1 ? t("chat.toolCallStatusError", "error") : t("chat.toolCallStatusErrors", "errors")})` : null;
     return (
       <div className="chat-tool-calls" data-testid="chat-tool-calls">
-        <details className="chat-tool-calls-group" data-testid="chat-tool-calls-group" open={hasRunning}>
+        <details className="chat-tool-calls-group" data-testid="chat-tool-calls-group">
           <summary className="chat-tool-calls-group-summary">
             <span className="chat-tool-calls-header-icon" aria-hidden="true">•</span>
             <span className="chat-tool-calls-count">{t("chat.toolCallsCount", "{{count}} tool calls", { count: nonQuestionToolCalls.length })}</span>
@@ -428,10 +461,16 @@ function renderMarkdownBlockWithNativeStructurePreviews(
   return blocks.length === 1 ? blocks[0] : <>{blocks}</>;
 }
 
+/*
+FNXC:ChatStreaming 2026-08-19-13:52:
+Ordinary Chat Markdown links must preserve ReactMarkdown's sanitized href while opening in a separate tab with an explicit reverse-tabnabbing policy. Native structure references remain previews instead of becoming ordinary anchors.
+*/
 function NativeStructureMarkdownAnchor({ children, href, ...props }: React.ComponentProps<"a">) {
   const structureRef = href ? parseNativeStructureChatRef(href) : null;
   if (structureRef) return <NativeStructurePreview ref={structureRef} onOpen={openNativeStructure} />;
-  return <a href={href} {...props}>{children}</a>;
+  /* FNXC:ChatStreaming 2026-08-19-13:52: ReactMarkdown clears unsafe hrefs; do not leave an empty interactive shell. */
+  if (!href) return <span>{children}</span>;
+  return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
 }
 
 function NativeStructureMarkdownCode({ children, ...props }: React.ComponentProps<"code">) {
@@ -502,6 +541,81 @@ export function renderStandardAssistantContent(content: string, forcePlain: bool
   );
 }
 
+/**
+ * FNXC:VoiceInput 2026-07-25-04:15:
+ * Mount dictation only while the correction textarea is open. Message rows must not each poll
+ * voice availability while merely rendering history; this editor remains the shared Quick Chat path.
+ */
+function StandardChatMessageEditComposer({
+  value,
+  onChange,
+  onCancel,
+  onSave,
+  disabled,
+  saveDisabled,
+  messageId,
+  projectId,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onSave: () => void;
+  disabled: boolean;
+  saveDisabled: boolean;
+  messageId: string;
+  projectId?: string;
+}) {
+  const { t } = useTranslation("app");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const autosizeRef = useRef<ChatInputAutosizeController | null>(null);
+  // FNXC:VoiceInput 2026-07-25-12:15: Message correction dictation must resolve availability
+  // within the owning project; falling back to another project's settings can expose the mic incorrectly.
+  const dictation = useComposerDictation({ textareaRef, value, onChange, projectId });
+
+  const handleTextareaRef = useCallback((textarea: HTMLTextAreaElement | null) => {
+    autosizeRef.current?.destroy();
+    autosizeRef.current = null;
+    textareaRef.current = textarea;
+    if (textarea) autosizeRef.current = createChatInputAutosizeController(textarea);
+  }, []);
+
+  useLayoutEffect(() => {
+    autosizeRef.current?.resize();
+  }, [value]);
+
+  useEffect(() => {
+    textareaRef.current?.focus();
+    textareaRef.current?.select();
+  }, []);
+
+  return (
+    <div className="chat-message-edit-editor" data-testid={`chat-message-edit-editor-${messageId}`}>
+      <AlphaTextArea
+        ref={handleTextareaRef}
+        className="input chat-message-edit-textarea"
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            onSave();
+          }
+        }}
+        rows={3}
+      />
+      <div className="chat-message-edit-actions">
+        <MicButton {...dictation.micProps} disabled={disabled} />
+        <AlphaButton type="button" className="btn btn-sm" data-testid={`chat-message-edit-cancel-${messageId}`} disabled={disabled} onClick={onCancel}>{t("chat.editMessageCancel", "Cancel")}</AlphaButton>
+        <AlphaButton type="button" className="btn btn-sm btn-primary" data-testid={`chat-message-edit-save-${messageId}`} disabled={saveDisabled} onClick={onSave}>{t("chat.editMessageSave", "Save")}</AlphaButton>
+      </div>
+    </div>
+  );
+}
+
 export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   message,
   forcePlain,
@@ -514,6 +628,7 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   mentionAgentsByName = new Map(),
   roomContext = null,
   copyAction,
+  onQuoteMessage,
   onScrollToTop,
   isAwaitingQuestionAnswer = false,
   submittedQuestionAnswer,
@@ -522,6 +637,9 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   onEditMessage,
   canEdit = false,
   isTopClipped = false,
+  isSearchMatch = false,
+  isSearchActive = false,
+  projectId,
 }: StandardChatMessageItemProps) {
   const { t } = useTranslation("app");
   const isAssistantMessage = message.role === "assistant";
@@ -538,7 +656,6 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   const [isEditing, setIsEditing] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [editedText, setEditedText] = useState(message.content);
-  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   const startEditing = useCallback(() => {
     setEditedText(message.content);
@@ -572,12 +689,6 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
     }
   }, [editedText, isSavingEdit, message.content, message.id, onEditMessage]);
 
-  useEffect(() => {
-    if (isEditing) {
-      editTextareaRef.current?.focus();
-      editTextareaRef.current?.select();
-    }
-  }, [isEditing]);
   const failureInfo = isAssistantMessage ? message.failureInfo : undefined;
   /*
    * FNXC:ChatEmptyMessage 2026-07-10-00:00:
@@ -654,46 +765,36 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
     }
     return renderStandardAssistantContent(message.content, forcePlain);
   }, [failureInfo, forcePlain, isAssistantMessage, isEmptyAssistantMessage, message.content, t]);
-  const hasAssistantFooterRow = isAssistantMessage && !failureInfo && Boolean(message.thinkingOutput || copyAction || onScrollToTop);
-  const hasVisibleAssistantFooterContent = Boolean(message.thinkingOutput || copyAction || (onScrollToTop && isTopClipped));
+  /* FNXC:ChatQuoteReply 2026-08-23-02:31: A quote action is rendered only for persisted non-empty messages, allowing direct chat to re-mention an agent author without adding controls to streaming or planner surfaces. */
+  const showQuoteAction = Boolean(onQuoteMessage) && !failureInfo && message.content.trim().length > 0;
+  const hasAssistantFooterRow = isAssistantMessage && !failureInfo && Boolean(message.thinkingOutput || copyAction || onScrollToTop || showQuoteAction);
+  const hasVisibleAssistantFooterContent = Boolean(message.thinkingOutput || copyAction || showQuoteAction || (onScrollToTop && isTopClipped));
   const messageTime = <div className="chat-message-time">{formatRelativeTime(message.createdAt, t)}</div>;
   return (
-    <div className={`chat-message chat-message--${message.role}${failureInfo ? " chat-message--failure" : ""}${isEditing ? " chat-message--editing" : ""}`} data-testid={`chat-message-${message.id}`} data-message-id={message.id}>
+    <div className={`chat-message chat-message--${message.role}${failureInfo ? " chat-message--failure" : ""}${isEditing ? " chat-message--editing" : ""}${isSearchMatch ? " chat-message--search-match" : ""}${isSearchActive ? " chat-message--search-active" : ""}`} data-testid={`chat-message-${message.id}`} data-message-id={message.id}>
       {showAssistantIdentity && <div className="chat-message-avatar">{activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="sm" /> : <Bot size={14} />}<span>{agentName}</span>{showAssistantModelTag && activeModelTag && <span className="chat-model-tag">{activeModelTag}</span>}</div>}
       {isEditing ? (
-        <div className="chat-message-edit-editor" data-testid={`chat-message-edit-editor-${message.id}`}>
-          <textarea
-            ref={editTextareaRef}
-            className="input chat-message-edit-textarea"
-            value={editedText}
-            disabled={isSavingEdit}
-            onChange={(event) => setEditedText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                cancelEditing();
-              } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault();
-                void saveEdit();
-              }
-            }}
-            rows={3}
-          />
-          <div className="chat-message-edit-actions">
-            <button type="button" className="btn btn-sm" data-testid={`chat-message-edit-cancel-${message.id}`} disabled={isSavingEdit} onClick={cancelEditing}>{t("chat.editMessageCancel", "Cancel")}</button>
-            <button type="button" className="btn btn-sm btn-primary" data-testid={`chat-message-edit-save-${message.id}`} disabled={isSavingEdit || !editedText.trim() || editedText.trim() === message.content.trim()} onClick={() => void saveEdit()}>{t("chat.editMessageSave", "Save")}</button>
-          </div>
-        </div>
+        <StandardChatMessageEditComposer
+          value={editedText}
+          onChange={setEditedText}
+          onCancel={cancelEditing}
+          onSave={() => void saveEdit()}
+          disabled={isSavingEdit}
+          saveDisabled={isSavingEdit || !editedText.trim() || editedText.trim() === message.content.trim()}
+          messageId={message.id}
+          projectId={projectId}
+        />
       ) : (
         isAssistantMessage ? assistantBody : <div className="chat-message-content">{renderedUserContent}</div>
       )}
       {hasAssistantFooterRow && (
         <div className={`chat-message-thinking-row${hasVisibleAssistantFooterContent ? "" : " chat-message-thinking-row--collapsed"}`}>
-          {message.thinkingOutput && <details className="chat-message-thinking"><summary>{t("chat.thinking", "Thinking")}</summary><pre className="chat-message-thinking-content">{linkifyFilePaths(message.thinkingOutput)}</pre></details>}
-          {(copyAction || onScrollToTop) && (
+          {message.thinkingOutput && <StandardThinkingDisclosure thinking={message.thinkingOutput} />}
+          {(copyAction || onScrollToTop || showQuoteAction) && (
             <div className="chat-message-actions">
               {copyAction}
-              {onScrollToTop && <button type="button" className={`btn-icon chat-message-scroll-to-top-action${isTopClipped ? "" : " chat-message-scroll-to-top-action--hidden"}`} aria-label={t("chat.scrollMessageToTop", "Scroll message to top")} data-testid={`chat-message-scroll-to-top-${message.id}`} onClick={() => onScrollToTop(message.id)}><ArrowUpToLine size={14} /></button>}
+              {showQuoteAction && <AlphaButton type="button" className="btn-icon chat-message-quote-action" aria-label={t("chat.quoteMessage", "Quote message")} data-testid={`chat-message-quote-${message.id}`} onClick={() => onQuoteMessage?.(message)}><Reply size={14} /></AlphaButton>}
+              {onScrollToTop && <AlphaButton type="button" className={`btn-icon chat-message-scroll-to-top-action${isTopClipped ? "" : " chat-message-scroll-to-top-action--hidden"}`} aria-label={t("chat.scrollMessageToTop", "Scroll message to top")} data-testid={`chat-message-scroll-to-top-${message.id}`} onClick={() => onScrollToTop(message.id)}><ArrowUpToLine size={14} /></AlphaButton>}
             </div>
           )}
         </div>
@@ -703,22 +804,23 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
       {isUserMessage ? (
         <div className="chat-message-time-row">
           {messageTime}
-          {showEditAction && !isEditing && <button type="button" className="btn-icon chat-message-edit-action chat-message-edit-action--inline" aria-label={t("chat.editMessage", "Edit message")} data-testid={`chat-message-edit-${message.id}`} onClick={startEditing}><Pencil size={14} /></button>}
+          {showQuoteAction && <AlphaButton type="button" className="btn-icon chat-message-quote-action" aria-label={t("chat.quoteMessage", "Quote message")} data-testid={`chat-message-quote-${message.id}`} onClick={() => onQuoteMessage?.(message)}><Reply size={14} /></AlphaButton>}
+          {showEditAction && !isEditing && <AlphaButton type="button" className="btn-icon chat-message-edit-action chat-message-edit-action--inline" aria-label={t("chat.editMessage", "Edit message")} data-testid={`chat-message-edit-${message.id}`} onClick={startEditing}><Pencil size={14} /></AlphaButton>}
         </div>
       ) : messageTime}
     </div>
   );
 });
 
-export function StandardStreamingMessage({ streamingText, streamingThinking = "", streamingToolCalls = [], forcePlain, agentName, hideAssistantIdentity, showAssistantModelTag, activeModelTag, activeModelProvider, copyAction, onQuestionSubmit, toolCallRenderer }: StandardStreamingMessageProps) {
+export function StandardStreamingMessage({ streamingText, streamingThinking = "", streamingToolCalls = [], forcePlain, agentName, hideAssistantIdentity, showAssistantModelTag, activeModelTag, activeModelProvider, copyAction, onQuestionSubmit, toolCallRenderer, isSearchMatch = false, isSearchActive = false }: StandardStreamingMessageProps) {
   const { t } = useTranslation("app");
   return (
-    <div className="chat-message chat-message--assistant chat-message--streaming" data-testid="chat-message-__streaming__">
+    <div className={`chat-message chat-message--assistant chat-message--streaming${isSearchMatch ? " chat-message--search-match" : ""}${isSearchActive ? " chat-message--search-active" : ""}`} data-testid="chat-message-__streaming__" data-message-id="__streaming__">
       {!hideAssistantIdentity && <div className="chat-message-avatar">{activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="sm" /> : <Bot size={14} />}<span>{agentName}</span>{showAssistantModelTag && activeModelTag && <span className="chat-model-tag">{activeModelTag}</span>}</div>}
       {streamingText ? renderStandardAssistantContent(streamingText, forcePlain) : <div className="chat-message-content chat-message-content--waiting">{streamingThinking ? t("chat.thinkingStatus", "Thinking…") : t("chat.workingStatus", "Working…")}</div>}
       {copyAction}
       {renderStandardToolCalls(streamingToolCalls, t, { isAwaitingAnswer: true, onQuestionSubmit, toolCallRenderer })}
-      {streamingThinking && <details className="chat-message-thinking"><summary>{t("chat.thinking", "Thinking")}</summary><pre className="chat-message-thinking-content">{linkifyFilePaths(streamingThinking)}</pre></details>}
+      {streamingThinking && <StandardThinkingDisclosure thinking={streamingThinking} />}
       <div className="chat-typing-indicator"><span /><span /><span /></div>
     </div>
   );
@@ -764,7 +866,7 @@ export function StandardChatActionButton({ isStreaming, canSend, onSend, onStop,
   // independently of Send's, defaulting to showSendText when the caller doesn't opt in (FN-7655).
   const showStop = showStopText ?? showSendText;
   if (isStreaming) {
-    return <button type="button" className={classNameStop} onPointerDown={(event) => { if (event.pointerType && event.pointerType !== "mouse") { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); onStop?.(); } }} onTouchStart={(event) => { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); onStop?.(); }} onMouseDown={(event) => event.preventDefault()} onClick={() => { if (consumeHandledSendTouch()) return; onStop?.(); }} aria-label={stopLabel ?? t("chat.stopGeneration", "Stop generation")} data-testid={stopTestId} style={{ touchAction: "manipulation" }}><span className="chat-input-stop-icon" aria-hidden="true" />{showStop && <span>{stopLabel ?? t("chat.stopGeneration", "Stop generation")}</span>}</button>;
+    return <AlphaButton type="button" className={classNameStop} onPointerDown={(event) => { if (event.pointerType && event.pointerType !== "mouse") { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); onStop?.(); } }} onTouchStart={(event) => { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); onStop?.(); }} onMouseDown={(event) => event.preventDefault()} onClick={() => { if (consumeHandledSendTouch()) return; onStop?.(); }} aria-label={stopLabel ?? t("chat.stopGeneration", "Stop generation")} data-testid={stopTestId} style={{ touchAction: "manipulation" }}><span className="chat-input-stop-icon" aria-hidden="true" />{showStop && <span>{stopLabel ?? t("chat.stopGeneration", "Stop generation")}</span>}</AlphaButton>;
   }
-  return <button type="button" className={classNameSend} onPointerDown={(event) => { if (event.pointerType && event.pointerType !== "mouse") { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); void onSend(); } }} onTouchStart={(event) => { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); void onSend(); }} onMouseDown={(event) => event.preventDefault()} onClick={() => { if (consumeHandledSendTouch()) return; void onSend(); }} disabled={!canSend} data-testid={sendTestId} aria-label={sendLabel ?? t("chat.send", "Send")} style={{ touchAction: "manipulation" }}><Send size={16} />{showSendText && <span>{sendLabel ?? t("chat.send", "Send")}</span>}</button>;
+  return <AlphaButton type="button" className={classNameSend} onPointerDown={(event) => { if (event.pointerType && event.pointerType !== "mouse") { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); void onSend(); } }} onTouchStart={(event) => { event.preventDefault(); if (!beginTouchActionGesture()) return; markHandledSendTouch(); void onSend(); }} onMouseDown={(event) => event.preventDefault()} onClick={() => { if (consumeHandledSendTouch()) return; void onSend(); }} disabled={!canSend} data-testid={sendTestId} aria-label={sendLabel ?? t("chat.send", "Send")} style={{ touchAction: "manipulation" }}><Send size={16} />{showSendText && <span>{sendLabel ?? t("chat.send", "Send")}</span>}</AlphaButton>;
 }

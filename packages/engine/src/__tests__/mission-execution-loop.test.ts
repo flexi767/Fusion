@@ -10,7 +10,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TEST_MODE_RESOLVED } from "@fusion/core";
+import { TEST_MODE_RESOLVED, ValidatorRunOwnershipLostError } from "@fusion/core";
 import type {
   Mission,
   Milestone,
@@ -43,14 +43,14 @@ vi.mock("../pi.js", () => {
 
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn((_name: string) => ({
-    log: vi.fn(),
+    log: vi.fn(), debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   })),
 }));
 
-vi.mock("../agent-session-helpers.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../agent-session-helpers.js")>();
+vi.mock("../agents/agent-session-helpers.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../agents/agent-session-helpers.js")>();
   return {
     ...actual,
     createResolvedAgentSession: vi.fn(async () => ({
@@ -69,8 +69,8 @@ function resetMockSession() {
 }
 
 // Import AFTER vi.mock so the mock is applied
-import { createResolvedAgentSession } from "../agent-session-helpers.js";
-import { MissionExecutionLoop, loopLog } from "../mission-execution-loop.js";
+import { createResolvedAgentSession } from "../agents/agent-session-helpers.js";
+import { MissionExecutionLoop, loopLog, fingerprintMissionValidationInput } from "../missions/mission-execution-loop.js";
 
 // ── Mock Factories ──────────────────────────────────────────────────────────
 
@@ -207,7 +207,7 @@ function createMockMissionStore() {
       features.set(id, updated);
       return updated;
     }),
-    listAssertionsForFeature: vi.fn((featureId: string) => assertionsByFeature.get(featureId) ?? []),
+    listAssertionsForFeature: vi.fn((featureId: string): NonNullable<ReturnType<typeof assertionsByFeature.get>> | Promise<NonNullable<ReturnType<typeof assertionsByFeature.get>>> => assertionsByFeature.get(featureId) ?? []),
     ensureFeatureAssertionLinked: vi.fn((featureId: string) => {
       const feature = features.get(featureId);
       if (!feature) {
@@ -229,9 +229,11 @@ function createMockMissionStore() {
     }),
 
     // Validator run methods
-    startValidatorRun: vi.fn((featureId: string, _triggerType?: string, _taskId?: string) => {
-      const run = createMockValidatorRun({ featureId });
+    startValidatorRun: vi.fn((featureId: string, _triggerType?: string, _taskId?: string, inputFingerprint?: string) => {
+      const feature = features.get(featureId);
+      const run = createMockValidatorRun({ featureId, inputFingerprint, validatorAttempt: (feature?.validatorAttemptCount ?? 0) + 1 });
       validatorRuns.set(run.id, run);
+      if (feature) features.set(featureId, { ...feature, lastValidatorRunId: run.id, validatorAttemptCount: run.validatorAttempt, loopState: "validating" });
       return run;
     }),
     listStaleRunningValidatorRuns: vi.fn((_maxAgeMs: number) => [...validatorRuns.values()].filter((run) => run.status === "running")),
@@ -265,9 +267,14 @@ function createMockMissionStore() {
       return updated;
     }),
     getValidatorRun: vi.fn((id: string) => validatorRuns.get(id)),
-    completeValidatorRun: vi.fn((id: string, status: MissionValidatorRun["status"], summary?: string) => {
-      const run = validatorRuns.get(id);
+    completeValidatorRun: vi.fn((id: string, status: MissionValidatorRun["status"], summary?: string, _blockedReason?: string, effects?: import("@fusion/core").ValidatorRunCompletionEffects): import("@fusion/core").ValidatorRunCompletion => {
+      const run = store.getValidatorRun(id);
       if (!run) throw new Error(`Validator run ${id} not found`);
+      const feature = store.getFeature(run.featureId);
+      if (effects && (run.status !== "running" || !feature || effects.featureId !== run.featureId
+        || (effects.triggerType && effects.triggerType !== run.triggerType)
+        || feature.lastValidatorRunId !== run.id || feature.validatorAttemptCount !== run.validatorAttempt
+        || feature.loopState !== "validating")) return { ...run, completionApplied: false };
       if (run.status !== "running") {
         throw new Error(`Validator run ${id} is not in 'running' status`);
       }
@@ -280,11 +287,11 @@ function createMockMissionStore() {
       };
       validatorRuns.set(id, updated);
 
-      const feature = features.get(run.featureId);
       if (feature) {
         if (status === "passed") {
           features.set(run.featureId, {
             ...feature,
+            ...(effects ? { status: "done" as const } : {}),
             loopState: "passed",
             lastValidatorStatus: "passed",
             updatedAt: new Date().toISOString(),
@@ -313,7 +320,11 @@ function createMockMissionStore() {
         }
       }
 
-      return updated;
+      for (const verdict of effects?.assertions ?? []) {
+        const assertion = assertionsByFeature.get(run.featureId)?.find((entry) => entry.id === verdict.assertionId);
+        if (assertion) assertion.status = verdict.status;
+      }
+      return effects ? { ...updated, completionApplied: true } : updated;
     }),
     recordValidatorFailures: vi.fn(() => []),
     createGeneratedFixFeature: vi.fn((sourceFeatureId: string, runId: string, _failedAssertionIds: string[]) => {
@@ -523,6 +534,13 @@ function initGitRepo(): string {
 }
 
 describe("MissionExecutionLoop", () => {
+  it("uses canonical UTF-8 tuple hashing for delimiter-bearing and Unicode validator inputs", () => {
+    const baseline = fingerprintMissionValidationInput("sha|one", "provider", "model", "system|π", "user|日本語");
+    expect(baseline).toMatch(/^[a-f0-9]{64}$/);
+    expect(baseline).toBe(fingerprintMissionValidationInput("sha|one", "provider", "model", "system|π", "user|日本語"));
+    expect(baseline).not.toBe(fingerprintMissionValidationInput("sha", "one|provider", "model", "system|π", "user|日本語"));
+    expect(baseline).not.toBe(fingerprintMissionValidationInput("sha|one", "provider", "other", "system|π", "user|日本語"));
+  });
   let loop: MissionExecutionLoop;
   let missionStore: ReturnType<typeof createMockMissionStore>;
   let taskStore: ReturnType<typeof createMockTaskStore>;
@@ -555,6 +573,230 @@ describe("MissionExecutionLoop", () => {
     loop?.stop();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  describe("executeManualValidatorRun", () => {
+    function admitManualRun() {
+      const feature = createMockFeature({ loopState: "validating", lastValidatorRunId: "VR-001", validatorAttemptCount: 1 });
+      missionStore._setFeature(feature);
+      missionStore._setAssertionsForFeature(feature.id, makeAssertions(1));
+      const run = missionStore.startValidatorRun(feature.id);
+      run.triggerType = "manual";
+      missionStore.startValidatorRun.mockClear();
+      mockSessionHolder.session.state.messages = makeMockSession(JSON.stringify({ status: "pass", assertions: [{ assertionId: "CA-1", passed: true }], summary: "Verified contract" })).state.messages;
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      loop.start();
+      return { feature, run };
+    }
+
+    it("waits for an automatic pre-admission owner, then executes the admitted manual row once", async () => {
+      const { feature, run } = admitManualRun();
+      let release!: () => void;
+      let entered!: () => void;
+      const waiting = new Promise<void>((resolve) => { entered = resolve; });
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      missionStore.listAssertionsForFeature.mockImplementationOnce(async () => {
+        entered();
+        await blocked;
+        return makeAssertions(1);
+      });
+      // The automatic fallback loses database admission to the manual row.
+      missionStore.startValidatorRun.mockImplementationOnce(() => { throw new Error("manual row already running"); });
+      const automatic = (loop as any).runFeatureValidation(feature).catch(() => undefined);
+      await waiting;
+      const manual = loop.executeManualValidatorRun(run);
+      await loop.executeManualValidatorRun(run);
+      expect(missionStore.getValidatorRun(run.id)?.status).toBe("running");
+      release();
+      await Promise.all([automatic, manual]);
+      expect(createResolvedAgentSession).toHaveBeenCalledOnce();
+      expect(missionStore.getValidatorRun(run.id)?.status).toBe("passed");
+    });
+
+    it.each(["reaped", "replaced"])("reloads a %s manual admission after the automatic owner releases", async (change) => {
+      const { feature, run } = admitManualRun();
+      let release!: () => void;
+      let entered!: () => void;
+      let checked!: () => void;
+      const ownerEntered = new Promise<void>((resolve) => { entered = resolve; });
+      const ownerBlocked = new Promise<void>((resolve) => { release = resolve; });
+      const admissionChecked = new Promise<void>((resolve) => { checked = resolve; });
+      missionStore.listAssertionsForFeature.mockImplementationOnce(async () => {
+        entered();
+        await ownerBlocked;
+        return makeAssertions(1);
+      });
+      missionStore.startValidatorRun.mockImplementationOnce(() => { throw new Error("manual row already running"); });
+      const automatic = (loop as any).runFeatureValidation(feature).catch(() => undefined);
+      await ownerEntered;
+      const getFeature = missionStore.getFeature.getMockImplementation()!;
+      missionStore.getFeature.mockImplementationOnce((id) => {
+        const snapshot = getFeature(id);
+        checked();
+        return snapshot;
+      });
+      const manual = loop.executeManualValidatorRun(run);
+      await admissionChecked;
+      if (change === "reaped") missionStore.reapValidatorRun(run.id, "reaped while waiting");
+      else missionStore.updateFeature(feature.id, { lastValidatorRunId: "VR-NEW" });
+      release();
+      await Promise.all([automatic, manual]);
+
+      expect(createResolvedAgentSession).not.toHaveBeenCalled();
+      expect(missionStore.completeValidatorRun).not.toHaveBeenCalled();
+      expect(missionStore.getValidatorRun(run.id)?.status).toBe(change === "reaped" ? "error" : "running");
+      expect(missionStore.getFeature(feature.id)?.status).not.toBe("done");
+      expect(missionStore.getAssertionsForFeature(feature.id)).toMatchObject([{ id: "CA-1", status: "pending" }]);
+    });
+
+    it.each(["duplicate", "completed", "foreign-feature", "automatic", "superseded"])("does not execute a %s delivery twice or outside its admission fence", async (kind) => {
+      const { feature, run } = admitManualRun();
+      if (kind === "duplicate") {
+        await Promise.all([loop.executeManualValidatorRun(run), loop.executeManualValidatorRun(run)]);
+        expect(createResolvedAgentSession).toHaveBeenCalledOnce();
+        expect(missionStore.completeValidatorRun).toHaveBeenCalledOnce();
+        await loop.executeManualValidatorRun(run);
+        expect(createResolvedAgentSession).toHaveBeenCalledOnce();
+        return;
+      }
+      if (kind === "completed") run.status = "passed";
+      if (kind === "automatic") run.triggerType = "task_completion";
+      if (kind === "superseded") missionStore.updateFeature(feature.id, { lastValidatorRunId: "VR-NEW" });
+      await loop.executeManualValidatorRun({ id: run.id, featureId: kind === "foreign-feature" ? "F-OTHER" : feature.id });
+      expect(createResolvedAgentSession).not.toHaveBeenCalled();
+      expect(missionStore.completeValidatorRun).not.toHaveBeenCalled();
+    });
+
+    it.each(["run-read", "feature-read", "recovery-read", "recovery-write"])("recovers an admitted dispatch after a transient %s failure", async (failure) => {
+      const { run } = admitManualRun();
+      if (failure === "run-read") missionStore.getValidatorRun.mockImplementationOnce(() => { throw new Error("run read unavailable"); });
+      if (failure === "feature-read") missionStore.getFeature.mockImplementationOnce(() => { throw new Error("feature read unavailable"); });
+      if (failure === "recovery-write") {
+        missionStore.listAssertionsForFeature.mockImplementationOnce(() => { throw new Error("assertions unavailable"); });
+        missionStore.completeValidatorRun.mockImplementationOnce(() => { throw new Error("terminal write unavailable"); });
+      }
+      if (failure === "recovery-read") {
+        missionStore.listAssertionsForFeature.mockImplementationOnce(() => {
+          missionStore.getValidatorRun.mockImplementationOnce(() => { throw new Error("recovery read unavailable"); });
+          throw new Error("assertions unavailable");
+        });
+      }
+      await expect(loop.executeManualValidatorRun(run)).resolves.toBeUndefined();
+      expect(missionStore.getValidatorRun(run.id)?.status).not.toBe("running");
+      expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
+    });
+
+    it.each(["assertion-lookup", "session-setup", "stopped", "empty-assertions"])("terminalizes %s failures on the admitted row without creating a fix", async (failure) => {
+      const { run } = admitManualRun();
+      if (failure === "assertion-lookup") missionStore.listAssertionsForFeature.mockImplementationOnce(() => { throw new Error("lookup unavailable"); });
+      if (failure === "session-setup") vi.mocked(createResolvedAgentSession).mockRejectedValueOnce(new Error("session unavailable"));
+      if (failure === "stopped") loop.stop();
+      if (failure === "empty-assertions") {
+        missionStore.listAssertionsForFeature.mockReturnValue([]);
+        missionStore.ensureFeatureAssertionLinked.mockReturnValue([]);
+      }
+      await loop.executeManualValidatorRun(run);
+      expect(missionStore.getValidatorRun(run.id)).toMatchObject({ status: "error" });
+      expect(missionStore.getFeature(run.featureId)).toMatchObject({ lastValidatorStatus: "error" });
+      expect(missionStore.startValidatorRun).not.toHaveBeenCalled();
+      expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
+    });
+
+    it("fences a replaced run before assertion and feature bookkeeping", async () => {
+      /* FNXC:MissionValidation 2026-09-07-04:52:
+       * A late grade must reach the atomic fence but may not mutate assertions,
+       * complete its replacement, or announce a pass after losing ownership.
+       */
+      const { feature, run } = admitManualRun();
+      const updateContractAssertion = vi.fn();
+      Object.assign(missionStore, { updateContractAssertion });
+      const emitSpy = vi.spyOn(loop, "emit");
+      vi.mocked(createResolvedAgentSession).mockImplementationOnce(async () => {
+        missionStore.updateFeature(feature.id, { lastValidatorRunId: "VR-NEW" });
+        return { session: mockSessionHolder.session as any, sessionFile: undefined, runtimeId: "test-runtime", wasConfigured: true };
+      });
+      await loop.executeManualValidatorRun(run);
+      expect(updateContractAssertion).not.toHaveBeenCalled();
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledExactlyOnceWith(run.id, "passed", "Verified contract", undefined, {
+        featureId: feature.id,
+        assertions: [{ assertionId: "CA-1", status: "passed" }],
+      });
+      expect(missionStore.completeValidatorRun).toHaveReturnedWith(expect.objectContaining({ completionApplied: false }));
+      expect(missionStore.getValidatorRun(run.id)?.status).toBe("running");
+      expect(missionStore.getFeature(feature.id)).toMatchObject({ lastValidatorRunId: "VR-NEW", loopState: "validating" });
+      expect(missionStore.getFeature(feature.id)?.status).not.toBe("done");
+      expect(missionStore.getAssertionsForFeature(feature.id)).toMatchObject([{ id: "CA-1", status: "pending" }]);
+      expect(emitSpy).not.toHaveBeenCalled();
+      expect(mockSessionHolder.session.dispose).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ["manual", "pass"], ["automatic", "pass"],
+      ["manual", "fail"], ["automatic", "fail"],
+      ["manual", "blocked"], ["automatic", "blocked"],
+      ["manual", "inconclusive"], ["automatic", "inconclusive"],
+      ["manual", "error"], ["automatic", "error"],
+    ] as const)("suppresses all posthooks when %s %s completion loses its atomic transition", async (surface, status) => {
+      const { feature, run } = admitManualRun();
+      const updateContractAssertion = vi.fn();
+      Object.assign(missionStore, { updateContractAssertion });
+      const emitSpy = vi.spyOn(loop, "emit");
+      const notifyValidationPass = vi.spyOn(loop as any, "notifyValidationPass");
+      vi.spyOn(loop as any, "runValidation").mockResolvedValue({
+        result: { status, assertions: [{ assertionId: "CA-1", verdict: status === "pass" ? "pass" : "fail", passed: status === "pass", message: "Observed grade" }], summary: "Observed grade" },
+        inspection: { inspectionRoot: "/tmp", fallbackUsed: false, workspaceStale: false },
+      });
+      missionStore.completeValidatorRun.mockImplementationOnce(() => ({ ...run, status: "passed", completionApplied: false }));
+      if (surface === "manual") await loop.executeManualValidatorRun(run);
+      else await (loop as any).runFeatureValidation(feature);
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledOnce();
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(run.id, status === "pass" ? "passed" : status === "fail" ? "failed" : status === "inconclusive" ? "blocked" : status, "Observed grade", undefined, expect.objectContaining({ featureId: feature.id }));
+      expect(updateContractAssertion).not.toHaveBeenCalled();
+      expect(missionStore.updateFeatureStatus).not.toHaveBeenCalled();
+      expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
+      expect(missionStore.triageFeature).not.toHaveBeenCalled();
+      expect(missionStore.recordValidatorFailures).not.toHaveBeenCalled();
+      expect(missionStore.logMissionEvent).not.toHaveBeenCalled();
+      expect(notifyValidationPass).not.toHaveBeenCalled();
+      expect(emitSpy).not.toHaveBeenCalled();
+      expect(missionStore.getFeature(feature.id)?.status).not.toBe("done");
+      expect(missionStore.getAssertionsForFeature(feature.id)).toMatchObject([{ id: "CA-1", status: "pending" }]);
+    });
+
+    it("does not accept the judge's behavioral pass without genuine verification", async () => {
+      const { feature, run } = admitManualRun();
+      missionStore._setAssertionsForFeature(feature.id, makeAssertions(1).map((assertion) => ({ ...assertion, type: "behavioral" })));
+      await loop.executeManualValidatorRun(run);
+      expect(createResolvedAgentSession).toHaveBeenCalledOnce();
+      expect(missionStore.getValidatorRun(run.id)?.status).not.toBe("passed");
+      expect(missionStore.getFeature(feature.id)?.lastValidatorStatus).not.toBe("passed");
+    });
+
+    it("executes the admitted run through the judge and shared completion without readmission", async () => {
+      const feature = createMockFeature({ loopState: "validating", lastValidatorRunId: "VR-001", validatorAttemptCount: 1 });
+      missionStore._setFeature(feature);
+      missionStore._setAssertionsForFeature(feature.id, makeAssertions(1));
+      const run = missionStore.startValidatorRun(feature.id);
+      run.triggerType = "manual";
+      missionStore.startValidatorRun.mockClear();
+      mockSessionHolder.session.state.messages = makeMockSession(JSON.stringify({ status: "pass", assertions: [{ assertionId: "CA-1", passed: true }], summary: "Verified contract" })).state.messages;
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      loop.start();
+
+      await loop.executeManualValidatorRun(run);
+
+      expect(createResolvedAgentSession).toHaveBeenCalledOnce();
+      expect(missionStore.startValidatorRun).not.toHaveBeenCalled();
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(run.id, "passed", "Verified contract", undefined, {
+        featureId: feature.id,
+        assertions: [{ assertionId: "CA-1", status: "passed" }],
+      });
+      expect(missionStore.getFeature(feature.id)).toMatchObject({ status: "done", loopState: "passed", lastValidatorStatus: "passed" });
+      expect(missionStore.getAssertionsForFeature(feature.id)).toMatchObject([{ id: "CA-1", status: "passed" }]);
+      expect(missionStore.updateFeatureStatus).not.toHaveBeenCalled();
+      expect(mockSessionHolder.session.dispose).toHaveBeenCalledOnce();
+      expectNoValidationBoardTaskMutation(taskStore);
+    });
   });
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -657,6 +899,56 @@ describe("MissionExecutionLoop", () => {
 
       expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-STRAND", "task_completion");
       expect(result.recoveredCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it("passes the budget-block recovery checkout into its single validation execution", async () => {
+      const mission = createMockMission({ id: "M-BUDGET", status: "active" });
+      missionStore._setMission(mission);
+      const slice = createMockSlice({ id: "SL-BUDGET", milestoneId: "MS-001", status: "active" });
+      const blocked = createMockFeature({
+        id: "F-BUDGET",
+        sliceId: slice.id,
+        taskId: "FN-BUDGET",
+        status: "done",
+        loopState: "blocked",
+        validationBudgetFingerprint: "previous-fingerprint",
+      });
+      (missionStore as any)._addFeatureWithManagedAssertion(blocked);
+      wireHierarchy(slice, [missionStore.getFeature(blocked.id) as MissionFeature]);
+      taskStore._setTask({
+        id: "FN-BUDGET", title: "Budget task", description: "d", log: [], column: "done",
+        mergeDetails: { commitSha: "landed-budget-sha" },
+      } as any);
+      taskStore.getSettings.mockResolvedValue({
+        missionStaleThresholdMs: 600_000,
+        missionMaxTaskRetries: 3,
+        defaultProvider: "memo-provider",
+        defaultModelId: "memo-model",
+      });
+      const dispose = vi.fn().mockResolvedValue(undefined);
+      const materialize = vi.fn().mockResolvedValue({ dir: "/inspection/budget", dispose });
+      loop = new MissionExecutionLoop({
+        taskStore: taskStore as any,
+        missionStore: missionStore as any,
+        rootDir: "/ambient-root",
+        checkoutMaterializer: { materialize, assertSourceClean: vi.fn() },
+      });
+      loop.start();
+      const runFeatureValidation = vi.spyOn(loop as any, "runFeatureValidation").mockResolvedValue(undefined);
+
+      await loop.recoverActiveMissions();
+
+      expect(materialize).toHaveBeenCalledWith("/ambient-root", "landed-budget-sha");
+      const budgetRecoveryCall = runFeatureValidation.mock.calls.find(
+        ([candidate, prepared]) => candidate.id === blocked.id && prepared,
+      );
+      expect(budgetRecoveryCall?.[1]).toEqual(expect.objectContaining({
+        fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+        checkout: expect.objectContaining({ dir: "/inspection/budget" }),
+      }));
+      // The real execution path owns this checkout; the stub releases it here.
+      await budgetRecoveryCall![1].checkout.dispose();
+      expect(dispose).toHaveBeenCalledOnce();
     });
 
     it("leaves an already-validated done feature untouched", async () => {
@@ -973,7 +1265,7 @@ describe("MissionExecutionLoop", () => {
         rootDir: "/tmp",
       });
       vi.spyOn(loop as any, "runValidation").mockResolvedValue({
-        result: { status: "pass", summary: "ok" },
+        result: { status: "pass", assertions: [{ assertionId: "CA-F-001", verdict: "pass", passed: true }], summary: "ok" },
         inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
       });
       loop.start();
@@ -981,6 +1273,67 @@ describe("MissionExecutionLoop", () => {
       await loop.processTaskOutcome("FN-001");
 
       expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-001", "task_completion", "FN-001");
+    });
+
+    it.each(["running", "budget-exhausted"] as const)("preserves automatic %s admission short-circuit without invoking manual admission", async (outcome) => {
+      /*
+      FNXC:MissionValidation 2026-08-11-05:38:
+      FN-8976 makes a feature-scoped live run report the existing running outcome. The automatic
+      loop must dispose its memoized checkout and return without starting, passing, or manually
+      admitting a validator; budget-exhausted retains the same disposal boundary.
+      */
+      const feature = createMockFeature({ loopState: "implementing", taskId: "FN-001" });
+      missionStore._setFeature(feature);
+      missionStore.getFeatureByTaskId = vi.fn().mockReturnValue(feature);
+      missionStore._setAssertionsForFeature(feature.id, makeAssertions(1));
+      taskStore._setTask({ id: "FN-001", title: "Test", description: "Test task", log: [], mergeDetails: { commitSha: "landed-sha" } } as any);
+      taskStore.getSettings.mockResolvedValue({
+        missionStaleThresholdMs: 600_000,
+        missionMaxTaskRetries: 3,
+        defaultProvider: "memo-provider",
+        defaultModelId: "memo-model",
+      });
+      const admitValidatorRun = vi.fn().mockResolvedValue({ outcome });
+      const startManualValidatorRun = vi.fn();
+      Object.assign(missionStore, { admitValidatorRun, startManualValidatorRun });
+      const dispose = vi.fn().mockResolvedValue(undefined);
+      loop = new MissionExecutionLoop({
+        taskStore: taskStore as any,
+        missionStore: missionStore as any,
+        rootDir: "/tmp",
+        checkoutMaterializer: { materialize: vi.fn().mockResolvedValue({ dir: "/inspection/landed", dispose }), assertSourceClean: vi.fn() },
+      });
+      const handleValidationPass = vi.spyOn(loop as any, "handleValidationPass");
+      loop.start();
+
+      await loop.processTaskOutcome("FN-001");
+
+      expect(admitValidatorRun).toHaveBeenCalledOnce();
+      expect(startManualValidatorRun).not.toHaveBeenCalled();
+      expect(missionStore.startValidatorRun).not.toHaveBeenCalled();
+      expect(handleValidationPass).not.toHaveBeenCalled();
+      expect(createResolvedAgentSession).not.toHaveBeenCalled();
+      expect(dispose).toHaveBeenCalledOnce();
+    });
+
+    it("keeps the non-memo automatic fallback separate from manual admission", async () => {
+      const feature = createMockFeature({ loopState: "implementing", taskId: "FN-001" });
+      missionStore._setFeature(feature);
+      missionStore.getFeatureByTaskId = vi.fn().mockReturnValue(feature);
+      taskStore._setTask({ id: "FN-001", title: "Test", description: "Test task", log: [] });
+      const startManualValidatorRun = vi.fn();
+      Object.assign(missionStore, { startManualValidatorRun });
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      vi.spyOn(loop as any, "runValidation").mockResolvedValue({
+        result: { status: "pass", assertions: [{ assertionId: "CA-F-001", verdict: "pass", passed: true }], summary: "ok" },
+        inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
+      });
+      loop.start();
+
+      await loop.processTaskOutcome("FN-001");
+
+      expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-001", "task_completion", "FN-001");
+      expect(startManualValidatorRun).not.toHaveBeenCalled();
     });
 
     it("requeues needs_fix features back through validation", async () => {
@@ -1013,7 +1366,10 @@ describe("MissionExecutionLoop", () => {
 
       expect(missionStore.transitionLoopState).toHaveBeenCalledWith("F-001", "implementing");
       expect(missionStore.startValidatorRun).toHaveBeenCalled();
-      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(expect.any(String), "passed", "Recovered validation passed");
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(expect.any(String), "passed", "Recovered validation passed", undefined, {
+        featureId: "F-001",
+        assertions: [{ assertionId: "CA-1", status: "passed" }],
+      });
     });
 
     it("lazy-ensures a managed assertion and routes zero-assertion features through validation", async () => {
@@ -1039,7 +1395,7 @@ describe("MissionExecutionLoop", () => {
       });
       const emitSpy = vi.spyOn(loop, "emit");
       vi.spyOn(loop as any, "runValidation").mockResolvedValue({
-        result: { status: "pass", summary: "ok" },
+        result: { status: "pass", assertions: [{ assertionId: "CA-F-001", verdict: "pass", passed: true }], summary: "ok" },
         inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
       });
       loop.start();
@@ -1117,7 +1473,7 @@ describe("MissionExecutionLoop", () => {
       expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-LATER", "task_completion", "FN-LATER");
     });
 
-    it("threads milestone acceptance criteria into validator prompts", () => {
+    it("excludes milestone acceptance criteria from feature validator prompts", () => {
       const feature = createMockFeature({
         id: "F-MILESTONE",
         title: "Feature under milestone",
@@ -1146,13 +1502,20 @@ describe("MissionExecutionLoop", () => {
         rootDir: "/tmp",
       });
 
-      const prompt = (loop as any).buildValidationPrompt(feature, assertions, milestone);
-      const systemPrompt = (loop as any).buildValidationSystemPrompt(feature, assertions, "Task context", milestone);
+      const prompt = (loop as any).buildValidationPrompt(feature, assertions, "feature");
+      const milestonePrompt = (loop as any).buildValidationPrompt(feature, assertions, "milestone");
+      const systemPrompt = (loop as any).buildValidationSystemPrompt(feature, assertions, "Task context", "feature");
 
-      expect(prompt).toContain("Milestone pass bar text");
-      expect(prompt).toContain("must also be satisfied for this feature to pass");
-      expect(systemPrompt).toContain("Milestone pass bar text");
-      expect(systemPrompt).toContain("validator-executed requirements");
+      expect(prompt).not.toContain("Milestone pass bar text");
+      expect(prompt).toContain("only the following linked feature contract assertions");
+      expect(milestonePrompt).toContain("only the following milestone-scoped contract assertions");
+      for (const assertion of assertions) {
+        expect(prompt).toContain(`[${assertion.id}]`);
+        expect(milestonePrompt).toContain(`[${assertion.id}]`);
+      }
+      expect(systemPrompt).not.toContain("Milestone pass bar text");
+      expect(systemPrompt).toContain("linked feature contract assertions");
+      expect(systemPrompt).toContain("The bracketed assertion ID shown for that assertion in the user message");
     });
 
     it("does NOT create a board task for single-feature validation", async () => {
@@ -1425,10 +1788,14 @@ describe("MissionExecutionLoop", () => {
       await loop.processTaskOutcome("FN-ASSERT-PASS");
 
       expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-001", "task_completion", "FN-ASSERT-PASS");
-      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(expect.any(String), "passed", expect.any(String));
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(expect.any(String), "passed", expect.any(String), undefined, {
+        featureId: "F-001",
+        assertions: [{ assertionId: "CA-1", status: "passed" }, { assertionId: "CA-2", status: "passed" }],
+      });
       expect(missionStore.getFeature("F-001")?.loopState).toBe("passed");
       expect(missionStore.getFeature("F-001")?.lastValidatorStatus).toBe("passed");
-      expect(missionStore.updateFeatureStatus).toHaveBeenCalledWith("F-001", "done");
+      expect(missionStore.getFeature("F-001")?.status).toBe("done");
+      expect(missionStore.updateFeatureStatus).not.toHaveBeenCalled();
     });
 
     it("defers failed assertion validation when landed-code inspection is unavailable", async () => {
@@ -1450,7 +1817,10 @@ describe("MissionExecutionLoop", () => {
 
       await loop.processTaskOutcome("FN-ASSERT-FAIL");
 
-      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(expect.any(String), "blocked", expect.any(String));
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(expect.any(String), "blocked", expect.any(String), undefined, {
+        featureId: "F-001",
+        assertions: [],
+      });
       expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
       expect(missionStore.getFeature("F-001")?.lastValidatorStatus).toBe("blocked");
       expect(missionStore.getFeature("F-001")?.loopState).toBe("blocked");
@@ -1591,10 +1961,199 @@ describe("MissionExecutionLoop", () => {
     });
   });
 
+  // ── Validation assertion identity contract ─────────────────────────────────
+
+  describe("validation assertion identity contract", () => {
+    function createValidatorLoop() {
+      return new MissionExecutionLoop({
+        taskStore: taskStore as any,
+        missionStore: missionStore as any,
+        rootDir: "/tmp",
+      });
+    }
+
+    it("keeps correctly keyed and legacy passed-only results canonical", () => {
+      const validatorLoop = createValidatorLoop();
+      const assertions = makeAssertions(2);
+      const results = (validatorLoop as any).extractAssertionResults({
+        assertions: [
+          { assertionId: "CA-1", verdict: "pass", passed: true },
+          { assertionId: "CA-2", passed: true },
+        ],
+      }, assertions);
+
+      expect(results).toMatchObject([
+        { assertionId: "CA-1", verdict: "pass", passed: true },
+        { assertionId: "CA-2", verdict: "pass", passed: true },
+      ]);
+      expect((validatorLoop as any).deriveFeatureValidationStatus({ status: "fail", assertions: results }, false).status).toBe("pass");
+    });
+
+    it("recovers the reported single-assertion pass when the validator did not echo its ID", () => {
+      const validatorLoop = createValidatorLoop();
+      const assertions = makeAssertions(1);
+      const results = (validatorLoop as any).extractAssertionResults({
+        status: "pass",
+        assertions: [{ assertionId: "CA-NOT-ECHOED", verdict: "pass", passed: true, message: "ok" }],
+      }, assertions);
+
+      expect(results).toMatchObject([{
+        assertionId: "CA-1",
+        verdict: "pass",
+        passed: true,
+        message: expect.stringContaining("matched positionally"),
+      }]);
+      expect((validatorLoop as any).deriveFeatureValidationStatus({ status: "fail", assertions: results }, false).status).toBe("pass");
+    });
+
+    it("maps an exact-count zero-ID multi-assertion response positionally", () => {
+      const validatorLoop = createValidatorLoop();
+      const assertions = makeAssertions(2);
+      const results = (validatorLoop as any).extractAssertionResults({
+        assertions: [
+          { assertionId: "unrecognized-first", verdict: "pass", passed: true },
+          { passed: true },
+        ],
+      }, assertions);
+
+      expect(results).toMatchObject([
+        { assertionId: "CA-1", verdict: "pass", passed: true, message: expect.stringContaining("matched positionally") },
+        { assertionId: "CA-2", verdict: "pass", passed: true, message: expect.stringContaining("matched positionally") },
+      ]);
+      expect((validatorLoop as any).deriveFeatureValidationStatus({ status: "fail", assertions: results }, false).status).toBe("pass");
+    });
+
+    it("fails closed for an unrecognized mismatched count or partially recognized IDs", () => {
+      const validatorLoop = createValidatorLoop();
+      const assertions = makeAssertions(2);
+      const wrongCount = (validatorLoop as any).extractAssertionResults({
+        assertions: [{ assertionId: "CA-NOT-ECHOED", passed: true }],
+      }, assertions);
+      const partialMatch = (validatorLoop as any).extractAssertionResults({
+        assertions: [
+          { assertionId: "CA-1", passed: true },
+          { assertionId: "CA-NOT-ECHOED", passed: true },
+        ],
+      }, assertions);
+
+      expect(wrongCount).toMatchObject([
+        { assertionId: "CA-1", passed: false, message: "Validator result IDs did not match any linked assertion ID." },
+        { assertionId: "CA-2", passed: false, message: "Validator result IDs did not match any linked assertion ID." },
+      ]);
+      expect(partialMatch).toMatchObject([
+        { assertionId: "CA-1", passed: true },
+        { assertionId: "CA-2", passed: false, message: "Validator omitted linked assertion result." },
+      ]);
+    });
+
+    it("fails closed when positional fallback receives duplicate unknown or empty IDs", () => {
+      const validatorLoop = createValidatorLoop();
+      const assertions = makeAssertions(2);
+      const duplicateUnknown = (validatorLoop as any).extractAssertionResults({
+        assertions: [
+          { assertionId: "CA-NOT-ECHOED", passed: true },
+          { assertionId: "CA-NOT-ECHOED", passed: true },
+        ],
+      }, assertions);
+      const duplicateEmpty = (validatorLoop as any).extractAssertionResults({
+        assertions: [
+          { assertionId: "", passed: true },
+          { assertionId: "", passed: true },
+        ],
+      }, assertions);
+
+      for (const results of [duplicateUnknown, duplicateEmpty]) {
+        expect(results).toMatchObject([
+          { assertionId: "CA-1", passed: false, message: "Validator result IDs did not match any linked assertion ID." },
+          { assertionId: "CA-2", passed: false, message: "Validator result IDs did not match any linked assertion ID." },
+        ]);
+      }
+    });
+
+    it("preserves duplicate failure, empty/non-array failure, blocked aggregation, and zero assertions", () => {
+      const validatorLoop = createValidatorLoop();
+      const assertions = makeAssertions(1);
+      const duplicate = (validatorLoop as any).extractAssertionResults({
+        assertions: [{ assertionId: "CA-1", passed: true }, { assertionId: "CA-1", passed: true }],
+      }, assertions);
+      const empty = (validatorLoop as any).extractAssertionResults({ assertions: [] }, assertions);
+      const nonArray = (validatorLoop as any).extractAssertionResults({ assertions: "not-an-array" }, assertions);
+      const blocked = (validatorLoop as any).extractAssertionResults({
+        assertions: [{ assertionId: "CA-1", verdict: "blocked", passed: false }],
+      }, assertions);
+      const zeroAssertions = (validatorLoop as any).extractAssertionResults({ assertions: [] }, []);
+
+      expect(duplicate[0]).toMatchObject({ passed: false, message: "Duplicate validator result for linked assertion." });
+      expect(empty[0]).toMatchObject({ passed: false, message: "Validator result IDs did not match any linked assertion ID." });
+      expect(nonArray[0]).toMatchObject({ passed: false, message: "Validator result IDs did not match any linked assertion ID." });
+      expect((validatorLoop as any).deriveFeatureValidationStatus({ status: "fail", assertions: blocked }, false).status).toBe("blocked");
+      expect(zeroAssertions).toEqual([]);
+      expect((validatorLoop as any).deriveFeatureValidationStatus({ status: "pass", assertions: zeroAssertions }, false).status).toBe("fail");
+    });
+  });
+
   // ── parseValidationResult JSON extraction ─────────────────────────────────
 
   describe("parseValidationResult", () => {
-    it("should parse pass result from plain JSON", async () => {
+    const completePassingPayload = JSON.stringify({
+      status: "pass",
+      assertions: [
+        { assertionId: "CA-1", verdict: "pass", passed: true },
+        { assertionId: "CA-2", verdict: "pass", passed: true },
+      ],
+      summary: "All assertions passed",
+    });
+
+    it.each([
+      ["prose braces before a trailing payload", "The inspection called render({ value: 1 }).\n" + completePassingPayload],
+      ["a malformed earlier object before a trailing payload", '{"status": broken}\n' + completePassingPayload],
+      ["an unlabeled fenced payload", "Reasoning follows.\n```\n" + completePassingPayload + "\n```"],
+      ["a trailing comma", completePassingPayload.replace("\n", "").replace("}", ",}")],
+      ["safely truncated closing delimiters", completePassingPayload.slice(0, -1)],
+      ["oversized leading prose while retaining the trailing payload", "x".repeat(256 * 1024) + completePassingPayload],
+      ["more than eight earlier object candidates", Array.from({ length: 12 }, (_, index) => `{"example":${index}}`).join("\n") + "\n" + completePassingPayload],
+    ])("recovers a complete validator payload after %s", async (_name, response) => {
+      const assertions = makeAssertions(2);
+      mockSessionHolder.session.state.messages = [{ role: "assistant", content: response }];
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      await expect((loop as any).parseValidationResult(mockSessionHolder.session, assertions)).resolves.toMatchObject({
+        status: "pass",
+        assertions: [{ assertionId: "CA-1", passed: true }, { assertionId: "CA-2", passed: true }],
+      });
+    });
+
+    it("caps candidate extraction and preserves braces in JSON strings", () => {
+      const candidate = JSON.stringify({ summary: "literal ,} is evidence", status: "pass" });
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      expect((loop as any).extractJsonCandidates("x".repeat(256 * 1024) + candidate)).toEqual([candidate]);
+      expect((loop as any).extractJsonCandidates(Array.from({ length: 12 }, (_, index) => `{"example":${index}}`).join("\n") + candidate)).toHaveLength(8);
+      expect((loop as any).repairJson(candidate)).toBe(candidate);
+    });
+
+    it("keeps recovered payload semantic validation fail-closed", async () => {
+      const assertions = makeAssertions(2);
+      const cases = [
+        { status: "pass", assertions: [{ assertionId: "CA-1", passed: true }, { assertionId: "unknown", passed: true }] },
+        { status: "pass", assertions: [{ assertionId: "CA-1", passed: true }] },
+        { status: "pass", assertions: [{ assertionId: "CA-1", passed: true }, { assertionId: "CA-1", passed: true }] },
+        { status: "unknown", assertions: [{ assertionId: "CA-1", passed: true }, { assertionId: "CA-2", passed: true }] },
+      ];
+
+      for (const candidate of cases) {
+        mockSessionHolder.session.state.messages = [{ role: "assistant", content: `prose {not JSON}\n${JSON.stringify(candidate)}` }];
+        loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+        const result = await (loop as any).parseValidationResult(mockSessionHolder.session, assertions);
+        expect(result.status).not.toBe("pass");
+      }
+
+      mockSessionHolder.session.state.messages = [{ role: "assistant", content: 'prose {not JSON}\n{"status":"pass","summary":"unterminated' }];
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      await expect((loop as any).parseValidationResult(mockSessionHolder.session, assertions)).resolves.toMatchObject({ status: "error" });
+    });
+
+    it("routes a recovered trailing pass payload through processTaskOutcome", async () => {
       const assertions = makeAssertions(2);
       const response = JSON.stringify({
         status: "pass",
@@ -1608,7 +2167,7 @@ describe("MissionExecutionLoop", () => {
       // Set up mock session with AI response
       mockSessionHolder.session.state.messages = [
         { role: "user", content: "Validate this" },
-        { role: "assistant", content: response },
+        { role: "assistant", content: "The implementation uses render({ value: 1 }).\n" + response },
       ];
 
       const feature = createMockFeature({ loopState: "implementing", taskId: "FN-001" });
@@ -1638,9 +2197,56 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "passed",
         expect.any(String),
+        undefined,
+        { featureId: "F-001", assertions: [{ assertionId: "CA-1", status: "passed" }, { assertionId: "CA-2", status: "passed" }] },
       );
       expect(missionStore.updateFeature).not.toHaveBeenCalled();
       expectNoValidationBoardTaskMutation(taskStore);
+    });
+
+    it("derives pass from complete linked assertions despite contradictory model fail", async () => {
+      const assertions = makeAssertions(2);
+      mockSessionHolder.session.state.messages = [{
+        role: "assistant",
+        content: JSON.stringify({
+          status: "fail",
+          summary: "parent milestone work is unfinished",
+          assertions: [
+            { assertionId: "CA-1", passed: true },
+            { assertionId: "CA-2", passed: true },
+            { assertionId: "unknown-parent", passed: false },
+          ],
+        }),
+      }];
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      await expect((loop as any).parseValidationResult(mockSessionHolder.session, assertions)).resolves.toMatchObject({
+        status: "pass",
+        assertions: [{ assertionId: "CA-1", passed: true }, { assertionId: "CA-2", passed: true }],
+      });
+    });
+
+    it("fails closed for omitted and duplicate linked assertion results", async () => {
+      const assertions = makeAssertions(2);
+      mockSessionHolder.session.state.messages = [{
+        role: "assistant",
+        content: JSON.stringify({
+          status: "pass",
+          assertions: [
+            { assertionId: "CA-1", passed: true },
+            { assertionId: "CA-1", passed: true },
+          ],
+        }),
+      }];
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      await expect((loop as any).parseValidationResult(mockSessionHolder.session, assertions)).resolves.toMatchObject({
+        status: "fail",
+        assertions: [
+          { assertionId: "CA-1", passed: false },
+          { assertionId: "CA-2", passed: false },
+        ],
+      });
     });
 
     it("should parse fail result from JSON in markdown code block", async () => {
@@ -1687,6 +2293,8 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "blocked",
         expect.any(String),
+        undefined,
+        { featureId: "F-001", assertions: [] },
       );
 
       // No remediation is created until the judge can inspect landed code.
@@ -1694,10 +2302,53 @@ describe("MissionExecutionLoop", () => {
       expectNoValidationBoardTaskMutation(taskStore);
     });
 
-    it("should handle malformed JSON gracefully", async () => {
+    it("preserves judge-provided evidence references for normalized diagnostics", async () => {
       const assertions = makeAssertions(1);
-      // Malformed JSON with trailing comma
-      const malformedResponse = '{"status":"blocked","assertions":[{"assertionId":"CA-1","passed":false}],"summary":"Blocked","blockedReason":"API down",}';
+      mockSessionHolder.session.state.messages = [{
+        role: "assistant",
+        content: JSON.stringify({
+          status: "fail",
+          assertions: [{
+            assertionId: "CA-1",
+            passed: false,
+            evidence: [{ kind: "test-output", text: "pnpm test: CA-1 failed" }],
+          }],
+          summary: "misleading summary",
+        }),
+      }];
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      await expect((loop as any).parseValidationResult(mockSessionHolder.session, assertions)).resolves.toMatchObject({
+        assertions: [{ evidence: [{ kind: "test-output", text: "pnpm test: CA-1 failed" }] }],
+      });
+    });
+
+    it("preserves blocked assertion verdicts in mixed failed results", async () => {
+      const assertions = makeAssertions(2);
+      mockSessionHolder.session.state.messages = [{
+        role: "assistant",
+        content: JSON.stringify({
+          status: "fail",
+          assertions: [
+            { assertionId: "CA-1", verdict: "fail", passed: false, message: "Observed failure" },
+            { assertionId: "CA-2", verdict: "blocked", passed: false, message: "Service unavailable" },
+          ],
+          summary: "misleading fully satisfied summary",
+        }),
+      }];
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      await expect((loop as any).parseValidationResult(mockSessionHolder.session, assertions)).resolves.toMatchObject({
+        assertions: [
+          { assertionId: "CA-1", verdict: "fail", passed: false },
+          { assertionId: "CA-2", verdict: "blocked", passed: false },
+        ],
+      });
+    });
+
+    it("routes irreparable JSON to a validator error without generated remediation", async () => {
+      const assertions = makeAssertions(1);
+      const malformedResponse = '{"status": broken, "assertions": [';
 
       // Set up mock session with malformed JSON
       mockSessionHolder.session.state.messages = [
@@ -1721,12 +2372,11 @@ describe("MissionExecutionLoop", () => {
 
       await loop.processTaskOutcome("FN-001");
 
-      // When JSON is malformed and cannot be repaired, it should result in an error status
-      // The loop should handle the error gracefully
       expect(emitSpy).toHaveBeenCalledWith(
-        expect.stringMatching(/validation:(passed|failed|blocked|error)/),
-        expect.any(Object),
+        "validation:error",
+        expect.objectContaining({ featureId: "F-001" }),
       );
+      expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
     });
 
     it("should handle AI session returning no messages gracefully", async () => {
@@ -1777,7 +2427,7 @@ describe("MissionExecutionLoop", () => {
       });
       const emitSpy = vi.spyOn(loop, "emit");
       vi.spyOn(loop as any, "runValidation").mockResolvedValue({
-        result: { status: "pass", summary: "ok" },
+        result: { status: "pass", assertions: [{ assertionId: "CA-F-001", verdict: "pass", passed: true }], summary: "ok" },
         inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
       });
       loop.start();
@@ -1813,7 +2463,9 @@ describe("MissionExecutionLoop", () => {
       const feature = createMockFeature({ loopState: "implementing", taskId: "FN-REAPED", id: "F-REAPED" });
       missionStore._setFeature(feature);
       missionStore.getFeatureByTaskId = vi.fn().mockReturnValue(feature);
-      missionStore.listAssertionsForFeature = vi.fn().mockReturnValue(assertions);
+      missionStore._setAssertionsForFeature(feature.id, assertions);
+      const updateContractAssertion = vi.fn();
+      Object.assign(missionStore, { updateContractAssertion });
       taskStore._setTask({ id: "FN-REAPED", title: "Test", description: "Implementation", log: [] });
 
       const originalStartValidatorRun = missionStore.startValidatorRun;
@@ -1833,8 +2485,18 @@ describe("MissionExecutionLoop", () => {
 
       await expect(loop.processTaskOutcome("FN-REAPED")).resolves.not.toThrow();
 
-      expect(missionStore.completeValidatorRun).not.toHaveBeenCalledWith(expect.any(String), "passed", expect.any(String));
-      expect(emitSpy).toHaveBeenCalledWith(
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledExactlyOnceWith("VR-001", "passed", "All assertions passed", undefined, {
+        featureId: feature.id,
+        assertions: [{ assertionId: "CA-1", status: "passed" }],
+      });
+      expect(missionStore.completeValidatorRun).toHaveReturnedWith(expect.objectContaining({ completionApplied: false }));
+      expect(missionStore.getValidatorRun("VR-001")).toMatchObject({ status: "error", summary: "stale" });
+      expect(missionStore.getFeature(feature.id)).toMatchObject({ loopState: "needs_fix", lastValidatorStatus: "error" });
+      expect(missionStore.getFeature(feature.id)?.status).not.toBe("done");
+      expect(missionStore.getAssertionsForFeature(feature.id)).toMatchObject([{ id: "CA-1", status: "pending" }]);
+      expect(updateContractAssertion).not.toHaveBeenCalled();
+      expect(missionStore.updateFeatureStatus).not.toHaveBeenCalled();
+      expect(emitSpy).not.toHaveBeenCalledWith(
         "validation:passed",
         expect.objectContaining({ featureId: "F-REAPED" }),
       );
@@ -1844,6 +2506,72 @@ describe("MissionExecutionLoop", () => {
   // ── handleValidationFail ──────────────────────────────────────────────────
 
   describe("handleValidationFail", () => {
+    it("suppresses remediation posthooks when ownership is lost after failed completion wins", async () => {
+      const feature = createMockFeature({ loopState: "validating", implementationAttemptCount: 1 });
+      missionStore._setFeature(feature);
+      missionStore._setAssertionsForFeature(feature.id, makeAssertions(1));
+      const run = missionStore.startValidatorRun(feature.id, "task_completion");
+      const notifyValidationComplete = vi.fn();
+      loop = new MissionExecutionLoop({
+        taskStore: taskStore as any,
+        missionStore: missionStore as any,
+        rootDir: "/tmp",
+        missionAutopilot: { notifyValidationComplete },
+      });
+      const emitSpy = vi.spyOn(loop, "emit");
+      missionStore.createGeneratedFixFeature.mockImplementationOnce(() => {
+        expect(missionStore.getValidatorRun(run.id)?.status).toBe("failed");
+        missionStore.updateFeature(feature.id, { lastValidatorRunId: "VR-NEW", validatorAttemptCount: run.validatorAttempt + 1, loopState: "validating" });
+        throw new ValidatorRunOwnershipLostError(run.id);
+      });
+
+      await (loop as any).handleValidationFail(feature.id, run.id, {
+        status: "fail",
+        assertions: [{ assertionId: "CA-1", verdict: "fail", passed: false, message: "Expected outcome missing" }],
+        summary: "failed",
+      }, { featureId: feature.id, assertions: [{ assertionId: "CA-1", status: "failed" }] });
+
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledOnce();
+      expect(missionStore.completeValidatorRun).toHaveReturnedWith(expect.objectContaining({ status: "failed", completionApplied: true }));
+      expect(missionStore.createGeneratedFixFeature).toHaveBeenCalledExactlyOnceWith(
+        feature.id, run.id, ["CA-1"], expect.stringContaining("Expected outcome missing"), undefined,
+        expect.objectContaining({ runId: run.id, sourceFeatureId: feature.id, outcome: "fail" }),
+        { requireCurrentRun: true },
+      );
+      expect(missionStore.getFeature(feature.id)).toMatchObject({ lastValidatorRunId: "VR-NEW", loopState: "validating" });
+      expect(missionStore.getAssertionsForFeature(feature.id)).toMatchObject([{ id: "CA-1", status: "failed" }]);
+      expect(missionStore.triageFeature).not.toHaveBeenCalled();
+      expect(emitSpy).not.toHaveBeenCalled();
+      expect(notifyValidationComplete).not.toHaveBeenCalled();
+      expect(missionStore.logMissionEvent).not.toHaveBeenCalledWith(
+        expect.any(String), expect.any(String), expect.any(String), expect.objectContaining({ code: "fix_feature_creation_needs_attention" }),
+      );
+    });
+
+    it("persists failed validation report-only without minting remediation when autonomy is off", async () => {
+      const feature = createMockFeature({ id: "F-REPORT", loopState: "validating", implementationAttemptCount: 1 });
+      missionStore._setFeature(feature);
+      missionStore._setMission(createMockMission({ autopilotEnabled: false, autoAdvance: false }));
+      const run = missionStore.startValidatorRun(feature.id, "task_completion");
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+
+      await (loop as any).handleValidationFail(feature.id, run.id, {
+        status: "fail",
+        assertions: [{ assertionId: "CA-REPORT", verdict: "fail", passed: false, message: "Expected outcome missing" }],
+        summary: "failed",
+      });
+
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledWith(run.id, "failed", "failed", undefined, {
+        featureId: "F-REPORT",
+        failures: [{ featureId: "F-REPORT", assertionId: "CA-REPORT", message: "Expected outcome missing", expected: undefined, actual: undefined }],
+      });
+      expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
+      expect(missionStore.triageFeature).not.toHaveBeenCalled();
+      expect(missionStore.logMissionEvent).toHaveBeenCalledWith(
+        "M-TEST1", "warning", expect.stringContaining("report-only"), expect.objectContaining({ code: "validation_report_only" }),
+      );
+    });
+
     it("should generate fix feature and record failures", async () => {
       const assertions: MissionContractAssertion[] = [
         {
@@ -1897,6 +2625,8 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "blocked",
         expect.any(String),
+        undefined,
+        { featureId: "F-001", assertions: [] },
       );
       expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
       expect(missionStore.triageFeature).not.toHaveBeenCalled();
@@ -2027,6 +2757,8 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "blocked",
         expect.stringContaining("code not merged yet"),
+        undefined,
+        { featureId: "F-001", assertions: [] },
       );
       expect(emitSpy).toHaveBeenCalledWith(
         "validation:inconclusive",
@@ -2159,6 +2891,8 @@ describe("MissionExecutionLoop", () => {
           expect.any(String),
           "blocked",
           expect.stringContaining("predates the merged code"),
+          undefined,
+          { featureId: "F-001", assertions: [] },
         );
         expect(emitSpy).toHaveBeenCalledWith(
           "validation:inconclusive",
@@ -2249,12 +2983,20 @@ describe("MissionExecutionLoop", () => {
         rootDir: "/ambient-root",
         checkoutMaterializer: { materialize, assertSourceClean: vi.fn() },
       });
+      taskStore.getSettings.mockResolvedValue({
+        missionStaleThresholdMs: 600_000,
+        missionMaxTaskRetries: 3,
+        defaultProvider: "memo-provider",
+        defaultModelId: "memo-model",
+      });
       const staleCheck = vi.spyOn(loop as any, "isValidationWorkspaceStale").mockResolvedValue({ workspaceStale: false });
       loop.start();
 
       await loop.processTaskOutcome("FN-001");
 
+      expect(materialize).toHaveBeenCalledOnce();
       expect(materialize).toHaveBeenCalledWith("/ambient-root", "landed-sha");
+      expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-001", "task_completion", "FN-001", expect.stringMatching(/^[a-f0-9]{64}$/));
       expect(createResolvedAgentSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/inspection/landed" }));
       expect(staleCheck).toHaveBeenCalledWith("landed-sha", "/inspection/landed");
       expect(dispose).toHaveBeenCalledOnce();
@@ -2285,6 +3027,7 @@ describe("MissionExecutionLoop", () => {
       await loop.processTaskOutcome("FN-001");
 
       expect(createResolvedAgentSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/ambient-root" }));
+      expect(missionStore.startValidatorRun).toHaveBeenCalledWith("F-001", "task_completion", "FN-001");
       expect(staleCheck).toHaveBeenCalledWith("landed-sha", "/ambient-root");
       expect(inconclusiveHandler).toHaveBeenCalled();
       expect(failHandler).not.toHaveBeenCalled();
@@ -2404,6 +3147,8 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "blocked",
         expect.stringContaining("External API not available"),
+        undefined,
+        { featureId: "F-001", assertions: [{ assertionId: "CA-1", status: "failed" }] },
       );
 
       // createGeneratedFixFeature should NOT be called
@@ -2451,6 +3196,8 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "error",
         "Validation failed due to error: 401 insufficient credits",
+        undefined,
+        { featureId: "F-001", assertions: [{ assertionId: "CA-1", status: "failed" }] },
       );
       expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
       expect(emitSpy).toHaveBeenCalledWith(
@@ -2504,6 +3251,8 @@ describe("MissionExecutionLoop", () => {
         expect.any(String),
         "error",
         "Invalid status in validation response",
+        undefined,
+        { featureId: "F-001", assertions: [{ assertionId: "CA-1", status: "failed" }] },
       );
       expect(emitSpy).toHaveBeenCalledWith(
         "validation:error",
@@ -2523,6 +3272,117 @@ describe("MissionExecutionLoop", () => {
         }),
       );
       expectNoValidationBoardTaskMutation(taskStore);
+    });
+  });
+
+  // ── milestone-only contract readiness ───────────────────────────────────
+
+  describe("milestone-only contract readiness", () => {
+    it("grades milestone assertions directly after all no-assertion feature work completes", async () => {
+      const feature = createMockFeature({
+        id: "F-PARENT-ONLY",
+        loopState: "implementing",
+        taskId: "FN-PARENT-ONLY",
+        acceptanceCriteria: undefined,
+      });
+      missionStore._setFeature(feature);
+      missionStore.getFeatureByTaskId = vi.fn().mockReturnValue(feature);
+      missionStore.listAssertionsForFeature = vi.fn().mockReturnValue([]);
+      missionStore.ensureFeatureAssertionLinked = vi.fn().mockReturnValue([]);
+      missionStore.listSlices = vi.fn().mockReturnValue([createMockSlice({ id: "SL-001", milestoneId: "MS-001" })]);
+      missionStore.listFeatures = vi.fn(() => [missionStore.getFeature("F-PARENT-ONLY")]);
+      missionStore.listContractAssertions = vi.fn().mockReturnValue([{
+        ...makeAssertions(1)[0],
+        id: "CA-MILESTONE",
+        scope: "milestone",
+      }]);
+      missionStore.listFeaturesForAssertion = vi.fn().mockReturnValue([]);
+      missionStore.updateContractAssertion = vi.fn();
+      taskStore._setTask({ id: "FN-PARENT-ONLY", title: "Parent-only feature", description: "done", log: [] });
+
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      vi.spyOn(loop as any, "runValidation").mockResolvedValue({
+        result: {
+          status: "pass",
+          assertions: [{ assertionId: "CA-MILESTONE", passed: true, message: "parent criterion met" }],
+          summary: "parent criterion met",
+        },
+        inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
+      });
+      loop.start();
+
+      await loop.processTaskOutcome("FN-PARENT-ONLY");
+
+      expect(missionStore.startValidatorRun).toHaveBeenCalledExactlyOnceWith(feature.id, "task_completion", feature.taskId);
+      expect(missionStore.completeValidatorRun).toHaveBeenCalledExactlyOnceWith("VR-001", "passed", "No assertions linked to feature", undefined, { featureId: feature.id });
+      expect(missionStore.getValidatorRun("VR-001")?.status).toBe("passed");
+      expect(missionStore.getFeature(feature.id)).toMatchObject({ status: "done", loopState: "passed", lastValidatorStatus: "passed" });
+      expect(missionStore.updateFeatureStatus).not.toHaveBeenCalled();
+      expect(missionStore.updateContractAssertion).toHaveBeenCalledWith("CA-MILESTONE", { status: "passed" });
+    });
+
+    it("runs a parent-only milestone rollup during recovery when no feature can trigger it", async () => {
+      const milestone = createMockMilestone({ id: "MS-NO-FEATURES", missionId: "M-TEST1" });
+      missionStore.getMissionWithHierarchy = vi.fn(() => ({
+        ...missionStore.getMission("M-TEST1"),
+        milestones: [{ ...milestone, slices: [] }],
+      }));
+      missionStore.listSlices = vi.fn().mockReturnValue([]);
+      missionStore.listFeatures = vi.fn().mockReturnValue([]);
+      missionStore.listContractAssertions = vi.fn().mockReturnValue([{
+        ...makeAssertions(1)[0],
+        id: "CA-EMPTY-MILESTONE",
+        milestoneId: milestone.id,
+        scope: "milestone",
+      }]);
+      missionStore.listFeaturesForAssertion = vi.fn().mockReturnValue([]);
+      missionStore.updateContractAssertion = vi.fn();
+
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      vi.spyOn(loop as any, "runValidation").mockResolvedValue({
+        result: {
+          status: "pass",
+          assertions: [{ assertionId: "CA-EMPTY-MILESTONE", passed: true, message: "parent criterion met" }],
+          summary: "parent criterion met",
+        },
+        inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
+      });
+
+      await loop.recoverActiveMissions();
+
+      expect(missionStore.updateContractAssertion).toHaveBeenCalledWith("CA-EMPTY-MILESTONE", { status: "passed" });
+      expect((loop as any).runValidation).toHaveBeenCalledWith(
+        expect.objectContaining({ id: `milestone:${milestone.id}` }),
+        expect.any(Array),
+        expect.any(Object),
+        "milestone",
+      );
+    });
+
+    it("does not persist a failed assertion from an untrusted pre-merge inspection", async () => {
+      const feature = createMockFeature({ id: "F-DEFERRED", loopState: "implementing", taskId: "FN-DEFERRED" });
+      missionStore._setFeature(feature);
+      missionStore.getFeatureByTaskId = vi.fn().mockReturnValue(feature);
+      const assertion = makeAssertions(1)[0];
+      missionStore.listAssertionsForFeature = vi.fn().mockReturnValue([assertion]);
+      missionStore.updateContractAssertion = vi.fn();
+      taskStore._setTask({ id: "FN-DEFERRED", title: "Unmerged", description: "pending merge", log: [], column: "in-review" });
+
+      loop = new MissionExecutionLoop({ taskStore: taskStore as any, missionStore: missionStore as any, rootDir: "/tmp" });
+      vi.spyOn(loop as any, "runValidation").mockResolvedValue({
+        result: {
+          status: "fail",
+          assertions: [{ assertionId: assertion.id, passed: false, message: "not trustworthy yet" }],
+          summary: "not trustworthy yet",
+        },
+        inspection: { inspectionRoot: "/tmp", landedSha: undefined, fallbackUsed: true, workspaceStale: false },
+      });
+      loop.start();
+
+      await loop.processTaskOutcome("FN-DEFERRED");
+
+      expect(missionStore.updateContractAssertion).not.toHaveBeenCalled();
+      expect(missionStore.createGeneratedFixFeature).not.toHaveBeenCalled();
     });
   });
 

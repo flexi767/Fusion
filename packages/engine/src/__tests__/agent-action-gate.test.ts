@@ -4,9 +4,10 @@ import {
   computeApprovalDedupeKey,
   evaluateAgentActionGate,
   getExemptToolNames,
+  hasLiveWorkflowAuthority,
   reloadExemptTools,
   resolveGateOutcome,
-} from "../agent-action-gate.js";
+} from "../agents/agent-action-gate.js";
 import type { AgentPermissionPolicy } from "@fusion/core";
 
 const FN_3548_COORDINATION_TOOLS = [
@@ -14,6 +15,7 @@ const FN_3548_COORDINATION_TOOLS = [
   "fn_task_log",
   "fn_task_document_write",
   "fn_task_document_read",
+  "fn_task_prompt_write",
   "fn_artifact_register",
   "fn_artifact_list",
   "fn_artifact_view",
@@ -27,6 +29,7 @@ const FN_3548_COORDINATION_TOOLS = [
   "fn_memory_get",
   "fn_memory_append",
   "fn_read_evaluations",
+  "fn_agent_read_evaluations",
   "fn_update_identity",
   "fn_reflect_on_performance",
 ] as const;
@@ -79,6 +82,38 @@ describe("agent-action-gate", () => {
   beforeEach(() => {
     reloadExemptTools();
   });
+  it("limits live workflow authority to its fenced task, run, and principal", async () => {
+    const context: any = {
+      agentId: "owner", taskId: "FN-1", runId: "run-1",
+      workflowAuthority: {
+        projectId: "project-a", taskId: "FN-1", runId: "run-1", workItemId: "work-1",
+        nodeInstanceId: "review-1", principalAgentId: "owner", kind: "task-assignee",
+        isLive: () => true,
+      },
+    };
+    await expect(hasLiveWorkflowAuthority(context, { id: "FN-1" })).resolves.toBe(true);
+    await expect(hasLiveWorkflowAuthority(context, { id: "FN-2" })).resolves.toBe(false);
+    await expect(hasLiveWorkflowAuthority({ ...context, runId: "run-2" }, {})).resolves.toBe(false);
+    await expect(hasLiveWorkflowAuthority({ ...context, agentId: "other" }, {})).resolves.toBe(false);
+    await expect(hasLiveWorkflowAuthority({ ...context, workflowAuthority: { ...context.workflowAuthority, isLive: () => false } }, {})).resolves.toBe(false);
+  });
+
+  it("does not elevate board or agent mutations from a task-scoped workflow grant", async () => {
+    const context: any = {
+      agentId: "owner", taskId: "FN-1", runId: "run-1",
+      workflowAuthority: {
+        projectId: "project-a", taskId: "FN-1", runId: "run-1", workItemId: "work-1",
+        nodeInstanceId: "plan-1", principalAgentId: "owner", kind: "task-assignee",
+        isLive: () => true,
+      },
+    };
+    await expect(hasLiveWorkflowAuthority(context, {}, "fn_task_create")).resolves.toBe(false);
+    await expect(hasLiveWorkflowAuthority(context, { id: "FN-1" }, "fn_task_update")).resolves.toBe(true);
+    await expect(hasLiveWorkflowAuthority(context, { id: "FN-2" }, "fn_task_update")).resolves.toBe(false);
+    await expect(hasLiveWorkflowAuthority(context, {}, "fn_workflow_update")).resolves.toBe(false);
+    await expect(hasLiveWorkflowAuthority(context, {}, "fn_agent_create")).resolves.toBe(false);
+  });
+
   it("classifies write/edit as file_write_delete", () => {
     const write = evaluateAgentActionGate({ agentId: "a1", toolName: "write", args: { path: "a.ts" }, permissionPolicy: unrestrictedPolicy });
     const edit = evaluateAgentActionGate({ agentId: "a1", toolName: "edit", args: { path: "a.ts" }, permissionPolicy: unrestrictedPolicy });
@@ -225,6 +260,40 @@ describe("agent-action-gate", () => {
     expect(approvalDecision.disposition).toBe("require-approval");
     expect(blockedDecision.category).toBe("task_agent_mutation");
     expect(blockedDecision.disposition).toBe("block");
+  });
+
+  /*
+  FNXC:AgentGating 2026-07-26-12:00:
+  #2376 greptile P1: project chat has no ambient gate taskId. Approvals for fn_task_delete/archive must key off the invocation target so approving task A cannot authorize task B.
+  */
+  it("scopes task_agent_mutation approval dedupe keys to the param-supplied target task", () => {
+    const deleteA = evaluateAgentActionGate({
+      agentId: "agent-chat",
+      toolName: "fn_task_delete",
+      args: { id: "FN-A" },
+      permissionPolicy: approvalPolicy,
+    });
+    const deleteB = evaluateAgentActionGate({
+      agentId: "agent-chat",
+      toolName: "fn_task_delete",
+      args: { id: "FN-B" },
+      permissionPolicy: approvalPolicy,
+    });
+    const mergeC = evaluateAgentActionGate({
+      agentId: "agent-chat",
+      toolName: "fn_task_merge",
+      args: { task_id: "FN-C" },
+      permissionPolicy: approvalPolicy,
+    });
+
+    expect(deleteA.resourceType).toBe("task");
+    expect(deleteA.resourceId).toBe("FN-A");
+    expect(deleteB.resourceId).toBe("FN-B");
+    expect(mergeC.resourceId).toBe("FN-C");
+    expect(deleteA.approvalDedupeKey).not.toBe(deleteB.approvalDedupeKey);
+    expect(deleteA.approvalDedupeKey).toContain("FN-A");
+    expect(deleteB.approvalDedupeKey).toContain("FN-B");
+    expect(mergeC.approvalDedupeKey).toContain("FN-C");
   });
 
   // FN-7728: fn_task_bypass_review must classify as its own review_gate_bypass category,
@@ -535,10 +604,16 @@ describe("agent-action-gate", () => {
     "fn_task_import_gitlab_group_issues",
     "fn_task_import_gitlab_merge_requests",
   ] as const)("governs task creation/import tool %s as task_agent_mutation", (toolName) => {
-    const args = toolName === "fn_task_create" || toolName === "fn_delegate_task"
-      ? { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } }
-      : {};
-    for (const argsValue of [args, args]) {
+    /*
+    FNXC:EngineTests 2026-07-22-13:07:
+    Freeform creates omit mission_lineage and still follow policy disposition
+    (require-approval / block) rather than a hard mission-admission pre-block.
+    */
+    const argVariants =
+      toolName === "fn_task_create" || toolName === "fn_delegate_task"
+        ? [{}, { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } }]
+        : [{}];
+    for (const argsValue of argVariants) {
       expect(evaluateAgentActionGate({ agentId: "a1", toolName, args: argsValue, permissionPolicy: approvalPolicy })).toMatchObject({
         category: "task_agent_mutation",
         disposition: "require-approval",

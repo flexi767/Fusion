@@ -5,6 +5,8 @@ FN-7306 labels the stable internal `chat` tab as Activity and keeps it as the de
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import i18next from "../../i18n";
+import frApp from "../../../../i18n/locales/fr/app.json";
 import {
   makeTask,
   noop,
@@ -70,7 +72,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -105,7 +106,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ prompt: "# Hello\n\nContent", ...taskOverrides })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -114,12 +114,34 @@ describe("TaskDetailModal", () => {
       );
     }
 
-    async function openAgentLogAndExpandModelDetails(container: HTMLElement) {
+    /*
+    FNXC:TaskDetailModalTests 2026-07-31-15:10:
+    QUERY THE DOCUMENT — TaskDetailModal renders through a portal, so `container` is the wrong root.
+
+    This helper took the `container` from `render()` and asked it for
+    `[data-testid='agent-log-model-header']`. TaskDetailModal mounts inside `FloatingWindow`, which
+    uses `createPortal`, so the modal subtree is attached to `document.body` and NOT beneath the
+    container React handed back. Every `document.querySelector` in this file therefore returns null
+    no matter what renders.
+
+    Probed rather than inferred, because the symptom pointed the wrong way — 30 cases failing on
+    "expected null to be truthy" reads as "the modal never rendered":
+
+      P1_after_tab_click menu=true items=["Live","Feed","Raw","Interventions"]
+      P2_after_select    viewer=true header=true empty=false
+
+    The Activity menu opens, Raw selects, and the viewer AND its model header are both present — via
+    `document`. Only the container-rooted lookup could not see them.
+
+    Note `screen.getByRole(...)` calls in the same helper always worked, because `screen` queries the
+    document. That mix is why this file half-worked and why the failure looked like a render problem.
+    */
+    async function openAgentLogAndExpandModelDetails(_container: HTMLElement) {
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       selectActivityView("raw-logs");
 
       await waitFor(() => {
-        const header = container.querySelector("[data-testid='agent-log-model-header']");
+        const header = document.querySelector("[data-testid='agent-log-model-header']");
         expect(header).toBeTruthy();
       });
 
@@ -128,7 +150,7 @@ describe("TaskDetailModal", () => {
         fireEvent.click(expandButton);
       }
 
-      return container.querySelector("[data-testid='agent-log-model-header']") as HTMLElement;
+      return document.querySelector("[data-testid='agent-log-model-header']") as HTMLElement;
     }
 
     it("uses task effective settings success path for Raw Logs model display", async () => {
@@ -161,7 +183,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -291,7 +312,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -345,7 +365,7 @@ describe("TaskDetailModal", () => {
         vi.mocked(useAgentLogs).mockReturnValue({
           entries: [
             { timestamp: "2026-01-01T00:00:00Z", taskId: "FN-099", text: "hello", type: "text" as const },
-            { timestamp: "2026-01-01T00:00:01Z", taskId: "FN-099", text: "Triage using model: google/gemini-pro (thinking effort: high)", type: "text" as const, agent: "triage" },
+            { timestamp: "2026-01-01T00:00:01Z", taskId: "FN-099", text: "Planning using model: google/gemini-pro (thinking effort: high)", type: "text" as const, agent: "triage" },
           ],
           loading: false,
           clear: vi.fn(),
@@ -360,7 +380,6 @@ describe("TaskDetailModal", () => {
             initialTab="definition"
             task={makeTask({ prompt: "# Hello\n\nContent" })}
             onClose={noop}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -406,7 +425,6 @@ describe("TaskDetailModal", () => {
             initialTab="definition"
             task={makeTask({ prompt: "# Hello\n\nContent" })}
             onClose={noop}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -486,7 +504,6 @@ describe("TaskDetailModal", () => {
               planningModelId: "gemini-2.5-pro",
             })}
             onClose={noop}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -519,7 +536,7 @@ describe("TaskDetailModal", () => {
         vi.mocked(useAgentLogs).mockReturnValue({
           entries: [
             { timestamp: "2026-01-01T00:00:00Z", taskId: "FN-099", text: "hello", type: "text" as const },
-            { timestamp: "2026-01-01T00:00:01Z", taskId: "FN-099", text: "Triage using model: google/gemini-pro", type: "text" as const, agent: "triage" },
+            { timestamp: "2026-01-01T00:00:01Z", taskId: "FN-099", text: "Planning using model: google/gemini-pro", type: "text" as const, agent: "triage" },
           ],
           loading: false,
           clear: vi.fn(),
@@ -534,7 +551,6 @@ describe("TaskDetailModal", () => {
             initialTab="definition"
             task={makeTask({ prompt: "# Hello\n\nContent" })}
             onClose={noop}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -581,7 +597,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ prompt: "# Hello\n\nContent" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -592,14 +607,14 @@ describe("TaskDetailModal", () => {
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       selectActivityView("raw-logs");
       await waitFor(() => {
-        const header = container.querySelector("[data-testid='agent-log-model-header']");
+        const header = document.querySelector("[data-testid='agent-log-model-header']");
         expect(header).toBeTruthy();
       });
       const expandButton = screen.getByTestId("agent-log-model-expand") as HTMLButtonElement;
       if (expandButton.getAttribute("aria-expanded") !== "true") {
         fireEvent.click(expandButton);
       }
-      const header = container.querySelector("[data-testid='agent-log-model-header']") as HTMLElement;
+      const header = document.querySelector("[data-testid='agent-log-model-header']") as HTMLElement;
       expect(header.textContent).toContain("openai/gpt-4o");
       expect(header.textContent).toContain("google/gemini-2.5-pro");
     });
@@ -638,7 +653,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ prompt: "# Hello\n\nContent", assignedAgentId: "agent-1", status: "executing", column: "in-progress" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -649,14 +663,14 @@ describe("TaskDetailModal", () => {
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       selectActivityView("raw-logs");
       await waitFor(() => {
-        const header = container.querySelector("[data-testid='agent-log-model-header']");
+        const header = document.querySelector("[data-testid='agent-log-model-header']");
         expect(header).toBeTruthy();
       });
       const expandButton = screen.getByTestId("agent-log-model-expand") as HTMLButtonElement;
       if (expandButton.getAttribute("aria-expanded") !== "true") {
         fireEvent.click(expandButton);
       }
-      const header = container.querySelector("[data-testid='agent-log-model-header']") as HTMLElement;
+      const header = document.querySelector("[data-testid='agent-log-model-header']") as HTMLElement;
       expect(header.textContent).toContain("openai/gpt-4.1");
     });
 
@@ -672,7 +686,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -680,7 +693,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(container.querySelector(".detail-step-progress")).toBeTruthy();
+      expect(document.querySelector(".detail-step-progress")).toBeTruthy();
       expect(screen.getByText("Progress")).toBeTruthy();
     });
 
@@ -690,7 +703,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ steps: [] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -698,11 +710,11 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(container.querySelector(".detail-step-progress")).toBeTruthy();
+      expect(document.querySelector(".detail-step-progress")).toBeTruthy();
       expect(screen.getByText("(no steps defined)")).toBeTruthy();
     });
 
-    it("renders correct number of segments matching step count", () => {
+    it("renders one labeled list row per step", () => {
       const { container } = render(
         <TaskDetailModal
           initialTab="definition"
@@ -714,7 +726,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -722,11 +733,14 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const segments = container.querySelectorAll(".step-progress-segment");
-      expect(segments).toHaveLength(3);
+      const rows = document.querySelectorAll(".detail-step-item");
+      expect(rows).toHaveLength(3);
+      expect(screen.getByText("Step 1")).toBeInTheDocument();
+      expect(screen.getByText("Step 2")).toBeInTheDocument();
+      expect(screen.getByText("Step 3")).toBeInTheDocument();
     });
 
-    it("segments have correct status modifier classes", () => {
+    it("list rows have correct status modifier classes", () => {
       const { container } = render(
         <TaskDetailModal
           initialTab="definition"
@@ -739,7 +753,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -747,14 +760,14 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const segments = container.querySelectorAll(".step-progress-segment");
-      expect(segments[0].classList.contains("step-progress-segment--done")).toBe(true);
-      expect(segments[1].classList.contains("step-progress-segment--in-progress")).toBe(true);
-      expect(segments[2].classList.contains("step-progress-segment--pending")).toBe(true);
-      expect(segments[3].classList.contains("step-progress-segment--skipped")).toBe(true);
+      const rows = document.querySelectorAll(".detail-step-item");
+      expect(rows[0]).toHaveClass("detail-step-item--done");
+      expect(rows[1]).toHaveClass("detail-step-item--in-progress");
+      expect(rows[2]).toHaveClass("detail-step-item--pending");
+      expect(rows[3]).toHaveClass("detail-step-item--skipped");
     });
 
-    it("renders a segment for each ENABLED workflow step, not only implementation steps", () => {
+    it("renders a labeled row for each ENABLED workflow step, not only implementation steps", () => {
       // Regression: the detail Progress bar must include enabled optional workflow steps.
       const { container } = render(
         <TaskDetailModal
@@ -770,7 +783,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -778,17 +790,52 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const segments = container.querySelectorAll(".step-progress-segment");
-      // 2 impl steps + 2 enabled workflow steps = 4 segments.
-      expect(segments).toHaveLength(4);
-      const workflowSegments = container.querySelectorAll(".step-progress-segment--source-workflow");
-      expect(workflowSegments).toHaveLength(2);
-      // code-review ran (passed → unified "done"); browser-verification enabled-not-run (pending).
-      expect(segments[2].classList.contains("step-progress-segment--done")).toBe(true);
-      expect(segments[3].classList.contains("step-progress-segment--pending")).toBe(true);
+      const rows = document.querySelectorAll(".detail-step-item");
+      expect(rows).toHaveLength(4);
+      expect(screen.getAllByText("Workflow gate")).toHaveLength(2);
+      expect(rows[2]).toHaveClass("detail-step-item--done");
+      expect(rows[3]).toHaveClass("detail-step-item--pending");
     });
 
-    it("segments have correct inline background colors based on status", () => {
+    it("renders progress counts, origins, and statuses from a non-English catalog", async () => {
+      i18next.addResourceBundle("fr", "app", frApp, true, true);
+      await act(async () => {
+        await i18next.changeLanguage("fr");
+      });
+
+      const view = render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({
+            steps: [{ name: "Implémenter", status: "done" }],
+            enabledWorkflowSteps: ["code-review"],
+            workflowStepResults: [],
+          })}
+          onClose={noop}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      try {
+        expect(screen.getByText("1/2 terminées")).toBeInTheDocument();
+        expect(screen.getByText("Implémentation")).toBeInTheDocument();
+        expect(screen.getByText("Étape du workflow")).toBeInTheDocument();
+        expect(screen.getByText("Terminée")).toBeInTheDocument();
+        expect(screen.getByText("En attente")).toBeInTheDocument();
+        expect(screen.queryByText("Workflow gate")).not.toBeInTheDocument();
+      } finally {
+        view.unmount();
+        await act(async () => {
+          await i18next.changeLanguage("en");
+        });
+        i18next.removeResourceBundle("fr", "app");
+      }
+    });
+
+    it("indicators use semantic colors based on status", () => {
       const { container } = render(
         <TaskDetailModal
           initialTab="definition"
@@ -802,7 +849,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -810,12 +856,12 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const segments = container.querySelectorAll(".step-progress-segment");
-      expect((segments[0] as HTMLElement).style.backgroundColor).toBe("var(--color-success)");
-      expect((segments[1] as HTMLElement).style.backgroundColor).toBe("var(--in-progress)");
-      expect((segments[2] as HTMLElement).style.backgroundColor).toBe("var(--border)");
-      expect((segments[3] as HTMLElement).style.backgroundColor).toBe("var(--text-dim)");
-      expect((segments[4] as HTMLElement).style.backgroundColor).toBe("var(--border)");
+      const indicators = document.querySelectorAll<HTMLElement>(".detail-step-indicator");
+      expect(indicators[0].style.color).toBe("var(--color-success)");
+      expect(indicators[1].style.color).toBe("var(--in-progress)");
+      expect(indicators[2].style.color).toBe("var(--border)");
+      expect(indicators[3].style.color).toBe("var(--text-dim)");
+      expect(indicators[4].style.color).toBe("var(--border)");
     });
 
     it("displays singular completion label for one-step tasks", () => {
@@ -826,7 +872,6 @@ describe("TaskDetailModal", () => {
             steps: [{ name: "Step 1", status: "done" }],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -834,8 +879,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText("1/1 step")).toBeTruthy();
-      expect(screen.queryByText("1/1 steps")).toBeNull();
+      expect(screen.getByText("1/1 completed")).toBeTruthy();
     });
 
     it("displays correct completion count", () => {
@@ -851,7 +895,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -859,11 +902,10 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText("2/4 steps")).toBeTruthy();
-      expect(screen.queryByText("2/4 step")).toBeNull();
+      expect(screen.getByText("2/4 completed")).toBeTruthy();
     });
 
-    it("has data-tooltip attribute with step name and status on each segment", () => {
+    it("shows visible names and accessible status text for every row", () => {
       const { container } = render(
         <TaskDetailModal
           initialTab="definition"
@@ -874,7 +916,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -882,9 +923,11 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const segments = container.querySelectorAll(".step-progress-segment");
-      expect(segments[0].getAttribute("data-tooltip")).toBe("Initialize project (done)");
-      expect(segments[1].getAttribute("data-tooltip")).toBe("Add tests (in-progress)");
+      const rows = document.querySelectorAll(".detail-step-item");
+      expect(rows[0]).toHaveTextContent("Initialize project");
+      expect(rows[0]).toHaveTextContent("Completed");
+      expect(rows[1]).toHaveTextContent("Add tests");
+      expect(rows[1]).toHaveTextContent("In progress");
     });
 
     it("step progress only renders in Definition tab, not in Raw Logs segment", () => {
@@ -898,7 +941,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -907,14 +949,14 @@ describe("TaskDetailModal", () => {
       );
 
       // Should be visible in Definition tab
-      expect(container.querySelector(".detail-step-progress")).toBeTruthy();
+      expect(document.querySelector(".detail-step-progress")).toBeTruthy();
 
       // Switch to Activity tab, then Raw Logs segment
       fireEvent.click(screen.getByRole("button", { name: "Activity" }));
       selectActivityView("raw-logs");
 
       // Should not be visible in Raw Logs segment
-      expect(container.querySelector(".detail-step-progress")).toBeNull();
+      expect(document.querySelector(".detail-step-progress")).toBeNull();
     });
 
     it("step progress is hidden in Comments tab", () => {
@@ -928,7 +970,6 @@ describe("TaskDetailModal", () => {
             ],
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -940,7 +981,7 @@ describe("TaskDetailModal", () => {
       fireEvent.click(screen.getByText("Comments"));
 
       // Should not be visible in Comments tab
-      expect(container.querySelector(".detail-step-progress")).toBeNull();
+      expect(document.querySelector(".detail-step-progress")).toBeNull();
     });
   });
 
@@ -956,7 +997,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask(taskOverrides)}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -964,7 +1004,7 @@ describe("TaskDetailModal", () => {
         />,
       );
       expect(screen.queryByText("Commits")).toBeNull();
-      const tabTexts = Array.from(container.querySelectorAll(".detail-tab")).map((t) => t.textContent);
+      const tabTexts = Array.from(document.querySelectorAll(".detail-tab")).map((t) => t.textContent);
       expect(tabTexts).toContain("Changes");
     });
   });
@@ -983,7 +1023,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1017,7 +1056,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1050,7 +1088,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask(taskOverrides)}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1065,7 +1102,8 @@ describe("TaskDetailModal", () => {
       vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
         flagEnabled: true,
         defaultWorkflowId: "wf-edit",
-        workflows: [{ id: "wf-edit", name: "Edit Workflow" }],
+        // FNXC:TaskDetailWorkflow 2026-07-23-22:10: FN-8476 (restore Ideas detail move action) made resolveTaskWorkflowMetadata derive move targets from workflow.columns, so mocked workflows must carry a columns array or metadata resolution throws and the edit-mode optional-steps picker never mounts.
+        workflows: [{ id: "wf-edit", name: "Edit Workflow", columns: [] }],
         taskWorkflowIds: { "FN-099": "wf-edit" },
       } as any);
       vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValueOnce([
@@ -1079,7 +1117,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "todo" as any, enabledWorkflowSteps: ["browser-verification"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1108,7 +1145,8 @@ describe("TaskDetailModal", () => {
       vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
         flagEnabled: true,
         defaultWorkflowId: "wf-edit",
-        workflows: [{ id: "wf-edit", name: "Edit Workflow" }],
+        // FNXC:TaskDetailWorkflow 2026-07-23-22:10: FN-8476 (restore Ideas detail move action) made resolveTaskWorkflowMetadata derive move targets from workflow.columns, so mocked workflows must carry a columns array or metadata resolution throws and the edit-mode optional-steps picker never mounts.
+        workflows: [{ id: "wf-edit", name: "Edit Workflow", columns: [] }],
         taskWorkflowIds: { "FN-099": "wf-edit" },
       } as any);
       vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValueOnce([
@@ -1122,7 +1160,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "todo" as any, title: "Original title", enabledWorkflowSteps: ["browser-verification"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1170,7 +1207,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ enabledWorkflowSteps: ["WS-001"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1188,6 +1224,80 @@ describe("TaskDetailModal", () => {
       expect(await screen.findByText("QA Check", {}, { timeout: 15_000 })).toBeTruthy();
     });
 
+    it("loads workflow reports when Summary opens first", async () => {
+      const { fetchWorkflowResults } = await import("../../api");
+      const mockFetch = vi.mocked(fetchWorkflowResults);
+      mockFetch.mockResolvedValueOnce([
+        { workflowStepId: "plan-review-step", workflowStepName: "Plan Review", reviewKind: "plan", status: "passed", verdict: "APPROVE", output: "Plan approved" },
+        { workflowStepId: "code-review-step", workflowStepName: "Code Review", reviewKind: "code", status: "failed", verdict: "REVISE", output: "Revise implementation" },
+      ] as any);
+
+      render(
+        <TaskDetailModal initialTab="definition" task={makeTask()} onClose={noop} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledWith("FN-099", undefined));
+      expect(await screen.findByTestId("task-history-count-plan")).toHaveTextContent("1");
+      expect(screen.getByTestId("task-history-count-review")).toHaveTextContent("1");
+    });
+
+    it("keeps a successful empty Summary response authoritative over cached task results", async () => {
+      const { fetchWorkflowResults } = await import("../../api");
+      const mockFetch = vi.mocked(fetchWorkflowResults);
+      let resolveFetch!: (results: any[]) => void;
+      const response = new Promise<any[]>((resolve) => {
+        resolveFetch = resolve;
+      });
+      mockFetch.mockReturnValueOnce(response);
+
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ workflowStepResults: [{ workflowStepId: "stale-plan-review", workflowStepName: "Stale Plan Review", reviewKind: "plan", status: "passed", verdict: "APPROVE", output: "Cached stale approval" }] as any })}
+          onClose={noop} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+      await waitFor(() => expect(mockFetch).toHaveBeenCalledWith("FN-099", undefined));
+
+      await act(async () => {
+        resolveFetch([]);
+        await response;
+      });
+
+      expect(screen.getByTestId("task-history-count-plan")).toHaveTextContent("0");
+      expect(screen.queryByText("Cached stale approval")).not.toBeInTheDocument();
+    });
+
+    it("uses task workflow results while the Summary fetch is unavailable", async () => {
+      const { fetchWorkflowResults } = await import("../../api");
+      vi.mocked(fetchWorkflowResults).mockRejectedValueOnce(new Error("offline"));
+      render(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ workflowStepResults: [{ workflowStepId: "plan-review-step", workflowStepName: "Plan Review", reviewKind: "plan", status: "passed", verdict: "APPROVE", output: "Approved" }] as any })}
+          onClose={noop} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+      await waitFor(() => expect(screen.getByTestId("task-history-count-plan")).toHaveTextContent("1"));
+    });
+
+    it("reuses fetched results when switching Workflow to Summary", async () => {
+      const { fetchWorkflowResults } = await import("../../api");
+      const mockFetch = vi.mocked(fetchWorkflowResults);
+      mockFetch.mockResolvedValueOnce([{ workflowStepId: "plan-review-step", workflowStepName: "Plan Review", reviewKind: "plan", status: "passed", verdict: "APPROVE", output: "Approved" }] as any);
+      render(
+        <TaskDetailModal initialTab="definition" task={makeTask()} onClose={noop} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Workflow" }));
+      expect(await screen.findByText("Plan Review")).toBeInTheDocument();
+      const fetchCountBeforeSwitch = mockFetch.mock.calls.length;
+      fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+      expect(screen.getByTestId("task-history-count-plan")).toHaveTextContent("1");
+      expect(mockFetch).toHaveBeenCalledTimes(fetchCountBeforeSwitch);
+    });
+
     it("shows loading state when workflow results are being fetched", async () => {
       const { fetchWorkflowResults } = await import("../../api");
       const mockFetch = vi.mocked(fetchWorkflowResults);
@@ -1199,7 +1309,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ enabledWorkflowSteps: ["WS-001"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1225,7 +1334,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ enabledWorkflowSteps: ["WS-001"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1260,7 +1368,6 @@ describe("TaskDetailModal", () => {
           initialTab="workflow"
           task={makeTask({ id: "FN-099", enabledWorkflowSteps: ["WS-INITIAL"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1323,7 +1430,6 @@ describe("TaskDetailModal", () => {
           initialTab="workflow"
           task={makeTask({ id: "FN-099", enabledWorkflowSteps: ["WS-INITIAL"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1338,7 +1444,6 @@ describe("TaskDetailModal", () => {
           initialTab="workflow"
           task={makeTask({ id: "FN-200", enabledWorkflowSteps: ["WS-NEXT"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1371,7 +1476,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ enabledWorkflowSteps: ["WS-001"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1415,7 +1519,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ enabledWorkflowSteps: ["WS-001", "WS-002"] })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1442,7 +1545,6 @@ describe("TaskDetailModal", () => {
             prompt: "# Test prompt",
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1451,14 +1553,14 @@ describe("TaskDetailModal", () => {
       );
 
       // Definition content visible initially
-      expect(container.querySelector(".markdown-body")).toBeTruthy();
+      expect(document.querySelector(".markdown-body")).toBeTruthy();
 
       // Switch to Workflow tab
       fireEvent.click(screen.getByText("Workflow"));
 
       // Definition content should be hidden
       await waitFor(() => {
-        expect(container.querySelector(".markdown-body")).toBeNull();
+        expect(document.querySelector(".markdown-body")).toBeNull();
       });
     });
   });

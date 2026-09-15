@@ -1,14 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
 
-import { BUILTIN_WORKFLOW_SETTINGS } from "../builtin-workflow-settings.js";
-import type { WorkflowIr } from "../workflow-ir-types.js";
+import { BUILTIN_WORKFLOW_SETTINGS } from "../workflows/builtin-workflow-settings.js";
+import { DEFAULT_CODE_REVIEW_MAX_REVISIONS } from "../workflows/builtin-code-review-group.js";
+import type { WorkflowIr } from "../workflows/workflow-ir-types.js";
 import {
   resolveEffectiveSettings,
   resolveEffectiveSettingsById,
+  resolveEffectiveSettingsDetailedById,
   resolveOptionalReviewRevisionBudget,
   resolveEffectivePlannerOversightLevel,
   type WorkflowSettingsResolverStore,
-} from "../workflow-settings-resolver.js";
+} from "../workflows/workflow-settings-resolver.js";
 
 const PROJECT = "proj-1";
 
@@ -43,6 +45,8 @@ function makeStore(opts: {
   valuesThrows?: boolean;
   projectId?: string;
   projectIdThrows?: boolean;
+  defaultWorkflowId?: string;
+  defaultWorkflowIdThrows?: boolean;
 }): WorkflowSettingsResolverStore {
   const store: WorkflowSettingsResolverStore = {
     getTaskWorkflowSelection: vi.fn((taskId: string) => {
@@ -58,6 +62,10 @@ function makeStore(opts: {
       if (opts.projectIdThrows) throw new Error("identity boom");
       return opts.projectId ?? PROJECT;
     }),
+    getDefaultWorkflowId: vi.fn(async () => {
+      if (opts.defaultWorkflowIdThrows) throw new Error("default workflow boom");
+      return opts.defaultWorkflowId;
+    }),
   };
   if (opts.asyncSelection) {
     store.getTaskWorkflowSelectionAsync = vi.fn(async (taskId: string) => opts.asyncSelection?.[taskId]);
@@ -70,9 +78,9 @@ function makeStore(opts: {
 }
 
 describe("resolveOptionalReviewRevisionBudget", () => {
-  it("treats unset built-in Plan Review and Code Review settings as unbounded", () => {
+  it("keeps Plan Review unbounded and gives unset Code Review the bounded default", () => {
     expect(resolveOptionalReviewRevisionBudget({ optionalGroupId: "plan-review", workflowSettings: {} })).toBe("unbounded");
-    expect(resolveOptionalReviewRevisionBudget({ optionalGroupId: "code-review", workflowSettings: {} })).toBe("unbounded");
+    expect(resolveOptionalReviewRevisionBudget({ optionalGroupId: "code-review", workflowSettings: {} })).toBe(DEFAULT_CODE_REVIEW_MAX_REVISIONS);
   });
 
   it("uses explicit workflow values before node config, including zero", () => {
@@ -222,11 +230,150 @@ describe("resolveEffectiveSettings (per-task)", () => {
     expect(Object.keys(eff)).toHaveLength(0);
   });
 
-  it("new custom workflow with empty settings does NOT inherit another workflow's values", async () => {
+  it("inherits every project model lane from the active default workflow across custom workflows", async () => {
+    const projectModelLanes = {
+      executionProvider: "exec-provider",
+      executionModelId: "exec-model",
+      executionThinkingLevel: "high",
+      executionFallbackProvider: "exec-fallback-provider",
+      executionFallbackModelId: "exec-fallback-model",
+      executionFallbackThinkingLevel: "medium",
+      planningProvider: "plan-provider",
+      planningModelId: "plan-model",
+      planningThinkingLevel: "xhigh",
+      planningFallbackProvider: "plan-fallback-provider",
+      planningFallbackModelId: "plan-fallback-model",
+      planningFallbackThinkingLevel: "low",
+      validatorProvider: "review-provider",
+      validatorModelId: "review-model",
+      validatorThinkingLevel: "minimal",
+      validatorFallbackProvider: "review-fallback-provider",
+      validatorFallbackModelId: "review-fallback-model",
+      validatorFallbackThinkingLevel: "off",
+    };
     const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
       selection: { t1: { workflowId: "wf-new", stepIds: [] } },
       defs: { "wf-new": { ir: CUSTOM_NO_SETTINGS } },
-      // A different workflow has a customized value; the new one must not see it.
+      values: { "builtin:coding::proj-1": projectModelLanes },
+    });
+
+    const eff = await resolveEffectiveSettings(store, { id: "t1" });
+
+    expect(eff).toMatchObject(projectModelLanes);
+  });
+
+  it("keeps project model lanes ahead of selected-workflow values while retaining the workflow fallback", async () => {
+    const customWithModelLanes: WorkflowIr = {
+      ...CUSTOM_NO_SETTINGS,
+      settings: BUILTIN_WORKFLOW_SETTINGS.filter((setting) =>
+        ["executionProvider", "executionModelId", "executionThinkingLevel", "planningProvider", "planningModelId"].includes(setting.id)),
+    };
+    const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
+      selection: { t1: { workflowId: "wf-custom", stepIds: [] } },
+      defs: { "wf-custom": { ir: customWithModelLanes } },
+      values: {
+        "builtin:coding::proj-1": {
+          executionProvider: "project-provider",
+          executionModelId: "project-model",
+          executionThinkingLevel: "medium",
+          planningProvider: "project-plan-provider",
+          planningModelId: "project-plan-model",
+        },
+        "wf-custom::proj-1": {
+          executionProvider: "workflow-provider",
+          executionModelId: "workflow-model",
+          executionThinkingLevel: "high",
+        },
+      },
+    });
+
+    const eff = await resolveEffectiveSettings(store, { id: "t1" });
+
+    expect(eff).toMatchObject({
+      executionProvider: "project-provider",
+      executionModelId: "project-model",
+      executionThinkingLevel: "medium",
+      planningProvider: "project-plan-provider",
+      planningModelId: "project-plan-model",
+      selectedWorkflowModelLanes: {
+        executionProvider: "workflow-provider",
+        executionModelId: "workflow-model",
+        executionThinkingLevel: "high",
+      },
+    });
+  });
+
+  it("applies a custom active-default model baseline to selection-less tasks", async () => {
+    const customDefaultWithModelLanes: WorkflowIr = {
+      ...CUSTOM_NO_SETTINGS,
+      settings: BUILTIN_WORKFLOW_SETTINGS.filter((setting) =>
+        ["validatorProvider", "validatorModelId", "validatorThinkingLevel"].includes(setting.id)),
+    };
+    const store = makeStore({
+      defaultWorkflowId: "wf-project-default",
+      selection: {},
+      defs: { "wf-project-default": { ir: customDefaultWithModelLanes } },
+      values: {
+        "wf-project-default::proj-1": {
+          validatorProvider: "project-review-provider",
+          validatorModelId: "project-review-model",
+          validatorThinkingLevel: "high",
+        },
+      },
+    });
+
+    const eff = await resolveEffectiveSettings(store, { id: "t-none" });
+
+    expect(eff).toMatchObject({
+      validatorProvider: "project-review-provider",
+      validatorModelId: "project-review-model",
+      validatorThinkingLevel: "high",
+    });
+  });
+
+  it("uses authoritative async values for both selected-workflow overrides and the project model baseline", async () => {
+    const customWithPlanningLane: WorkflowIr = {
+      ...CUSTOM_NO_SETTINGS,
+      settings: BUILTIN_WORKFLOW_SETTINGS.filter((setting) =>
+        ["planningProvider", "planningModelId"].includes(setting.id)),
+    };
+    const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
+      selection: {},
+      values: {
+        "builtin:coding::proj-1": { planningProvider: "stale-project", planningModelId: "stale-project-model" },
+        "wf-custom::proj-1": { planningProvider: "stale-workflow", planningModelId: "stale-workflow-model" },
+      },
+      asyncSelection: { t1: { workflowId: "wf-custom", stepIds: [] } },
+      defs: { "wf-custom": { ir: customWithPlanningLane } },
+      asyncValues: {
+        "builtin:coding::proj-1": { planningProvider: "project-provider", planningModelId: "project-model" },
+        "wf-custom::proj-1": { planningProvider: "workflow-provider", planningModelId: "workflow-model" },
+      },
+    });
+
+    const eff = await resolveEffectiveSettings(store, { id: "t1" });
+
+    expect(eff).toMatchObject({
+      planningProvider: "project-provider",
+      planningModelId: "project-model",
+      selectedWorkflowModelLanes: {
+        planningProvider: "workflow-provider",
+        planningModelId: "workflow-model",
+      },
+    });
+    expect(store.getWorkflowSettingValues).not.toHaveBeenCalled();
+    expect(store.getWorkflowSettingValuesAsync).toHaveBeenCalledWith("builtin:coding", PROJECT);
+    expect(store.getWorkflowSettingValuesAsync).toHaveBeenCalledWith("wf-custom", PROJECT);
+  });
+
+  it("does not inherit non-model policy values from the active default workflow", async () => {
+    const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
+      selection: { t1: { workflowId: "wf-new", stepIds: [] } },
+      defs: { "wf-new": { ir: CUSTOM_NO_SETTINGS } },
       values: { "builtin:coding::proj-1": { workflowStepTimeoutMs: 5_000 } },
     });
     const eff = await resolveEffectiveSettings(store, { id: "t1" });
@@ -293,6 +440,78 @@ describe("resolveEffectiveSettings (per-task)", () => {
     const eff = await resolveEffectiveSettings(store, { id: "t1" });
     // The stored 5_000 is unreachable because the project key couldn't be resolved.
     expect(eff.workflowStepTimeoutMs).toBe(900_000);
+  });
+});
+
+describe("resolveEffectiveSettingsDetailedById", () => {
+  it("keeps the default workflow's stored planning lane as the project baseline", async () => {
+    const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
+      values: {
+        "builtin:coding::proj-9": {
+          planningProvider: "project-provider",
+          planningModelId: "project-model",
+        },
+      },
+    });
+
+    const result = await resolveEffectiveSettingsDetailedById(store, "builtin:coding", "proj-9");
+    expect(result.effective).toMatchObject({
+      planningProvider: "project-provider",
+      planningModelId: "project-model",
+    });
+    expect(result.effective.selectedWorkflowModelLanes).toBeUndefined();
+  });
+
+  it("keeps a distinct workflow pair separate from the project baseline", async () => {
+    const customWithPlanningLane: WorkflowIr = {
+      ...CUSTOM_NO_SETTINGS,
+      settings: BUILTIN_WORKFLOW_SETTINGS.filter((setting) =>
+        ["planningProvider", "planningModelId"].includes(setting.id)),
+    };
+    const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
+      defs: { "wf-custom": { ir: customWithPlanningLane } },
+      values: {
+        "builtin:coding::proj-9": {
+          planningProvider: "project-provider",
+          planningModelId: "project-model",
+        },
+        "wf-custom::proj-9": {
+          planningProvider: "workflow-provider",
+          planningModelId: "workflow-model",
+        },
+      },
+    });
+
+    const result = await resolveEffectiveSettingsDetailedById(store, "wf-custom", "proj-9");
+    expect(result.effective).toMatchObject({
+      planningProvider: "project-provider",
+      planningModelId: "project-model",
+      selectedWorkflowModelLanes: {
+        planningProvider: "workflow-provider",
+        planningModelId: "workflow-model",
+      },
+    });
+  });
+
+  it("keeps blank and incomplete selected workflow lanes inheritable", async () => {
+    const customWithPlanningLane: WorkflowIr = {
+      ...CUSTOM_NO_SETTINGS,
+      settings: BUILTIN_WORKFLOW_SETTINGS.filter((setting) =>
+        ["planningProvider", "planningModelId"].includes(setting.id)),
+    };
+    const store = makeStore({
+      defaultWorkflowId: "builtin:coding",
+      defs: { "wf-custom": { ir: customWithPlanningLane } },
+      values: {
+        "wf-custom::proj-9": { planningProvider: "workflow-provider" },
+      },
+    });
+
+    const result = await resolveEffectiveSettingsDetailedById(store, "wf-custom", "proj-9");
+    expect(result.effective.selectedWorkflowModelLanes).toEqual({ planningProvider: "workflow-provider" });
+    expect(result.effective.planningModelId).toBeUndefined();
   });
 });
 

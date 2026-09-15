@@ -114,6 +114,8 @@ const mockTerm = {
   hasSelection: vi.fn(() => false),
   getSelection: vi.fn(() => ""),
   write: vi.fn((_data: string, cb?: () => void) => cb?.()),
+  // xterm's Terminal has reset(); the scrollback handler clears with it before replaying.
+  reset: vi.fn(),
   refresh: vi.fn(),
   dispose: vi.fn(),
   unicode: { activeVersion: "6" },
@@ -245,6 +247,28 @@ describe("SessionTerminal", () => {
     const b64 = Buffer.from("hello", "utf8").toString("base64");
     ws.onmessage?.({ data: JSON.stringify({ type: "scrollback", data: b64 }) });
     await waitFor(() => expect(mockTerm.write).toHaveBeenCalledWith("hello", expect.any(Function)));
+  });
+
+  /*
+  FNXC:TerminalSharing 2026-08-19-04:00:
+  The server sends scrollback as its own frame so the client can CLEAR before replaying it; this
+  handler used to append it exactly like `data`. That is only harmless while every reattach builds a
+  fresh xterm — add an in-place reconnect and a full replay lands on top of history the terminal
+  still shows, which is the duplicated-prompt bug fixed in the PTY terminal.
+  */
+  it("clears before replaying scrollback, but never on live data", async () => {
+    render(<SessionTerminal sessionId="s1" />);
+    await waitFor(() => expect(FakeWS.instances.length).toBe(1));
+    const ws = FakeWS.instances[0];
+
+    ws.onmessage?.({ data: JSON.stringify({ type: "scrollback", data: Buffer.from("history", "utf8").toString("base64") }) });
+    await waitFor(() => expect(mockTerm.reset).toHaveBeenCalledTimes(1));
+
+    mockTerm.reset.mockClear();
+    ws.onmessage?.({ data: JSON.stringify({ type: "data", data: Buffer.from("live", "utf8").toString("base64") }) });
+    await waitFor(() => expect(mockTerm.write).toHaveBeenCalledWith("live", expect.any(Function)));
+    // Live output must never wipe the screen.
+    expect(mockTerm.reset).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -775,6 +799,50 @@ describe("SessionTerminal", () => {
     await waitFor(() => expect(onConfirmAdvance).toHaveBeenCalledWith("not-yet"));
     await waitFor(() => expect(screen.queryByText("Not yet")).toBeNull());
   });
+
+  /*
+  FNXC:TaskDetailTerminalKeepAlive 2026-07-22-13:00:
+  FN remount-churn fix R6/R9: kept-alive hidden terminals must NOT close the WS or dispose xterm; reveal refits and recovers a socket that died while hidden.
+  */
+  describe("keep-alive active gating", () => {
+    it("keeps the WebSocket open and xterm alive across hide/reveal, refitting on reveal", async () => {
+      const { rerender } = render(<SessionTerminal sessionId="s1" active />);
+      await waitFor(() => expect(FakeWS.instances.length).toBe(1));
+      const ws = FakeWS.instances[0];
+
+      rerender(<SessionTerminal sessionId="s1" active={false} />);
+      expect(ws.readyState).toBe(1);
+      expect(mockTerm.dispose).not.toHaveBeenCalled();
+
+      mockFitAddon.fit.mockClear();
+      ws.sent.length = 0;
+      rerender(<SessionTerminal sessionId="s1" active />);
+
+      expect(mockTerm.dispose).not.toHaveBeenCalled();
+      expect(FakeWS.instances.length).toBe(1);
+      expect(apiMock).toHaveBeenCalledTimes(1);
+      // Reveal refit: fit + resize frame so the grid matches any size change that happened while hidden.
+      await waitFor(() => expect(mockFitAddon.fit).toHaveBeenCalled());
+      expect(ws.sent.some((frame) => (JSON.parse(frame) as { type?: string }).type === "resize")).toBe(true);
+    });
+
+    it("re-runs the full attach lifecycle when the WS died while hidden", async () => {
+      const { rerender } = render(<SessionTerminal sessionId="s1" active />);
+      await waitFor(() => expect(FakeWS.instances.length).toBe(1));
+      const ws = FakeWS.instances[0];
+
+      rerender(<SessionTerminal sessionId="s1" active={false} />);
+      // Server closes the socket while the tab is hidden.
+      ws.readyState = 3;
+
+      rerender(<SessionTerminal sessionId="s1" active />);
+
+      // Dead-socket recovery: fresh ticket, fresh WS, old xterm disposed by the lifecycle teardown.
+      await waitFor(() => expect(FakeWS.instances.length).toBe(2));
+      expect(apiMock).toHaveBeenCalledTimes(2);
+      expect(mockTerm.dispose).toHaveBeenCalled();
+    });
+  });
 });
 
 /*
@@ -840,5 +908,35 @@ describe("SessionTerminal — FN-7620 mobile blank render (container geometry re
     });
 
     await waitFor(() => expect(mockFitAddon.fit).toHaveBeenCalled());
+  });
+
+  /*
+  FNXC:Terminal 2026-07-23-21:05:
+  Blank-until-keypress recurrence (shared invariant with TerminalModal): a renderer stalled at init
+  leaves buffered output unpainted, and an observer-driven fit() whose cols/rows come out UNCHANGED
+  triggers no internal xterm repaint. The observer path must therefore always follow fit with an
+  explicit full-viewport refresh(0, rows-1).
+  */
+  it("follows every observer-driven fit with an explicit terminal.refresh so a stalled renderer repaints even when dimensions are unchanged", async () => {
+    render(<SessionTerminal sessionId="s1" />);
+    await waitFor(() => expect(FakeWS.instances.length).toBe(1));
+    await waitFor(() => expect(mockTerm.open).toHaveBeenCalled());
+
+    const container = screen.getByTestId("cli-terminal-viewport");
+    const matches = captured.filter((entry) => entry.target === container);
+    expect(matches.length).toBeGreaterThan(0);
+
+    // Unchanged-geometry notification: fit() will recompute identical
+    // cols/rows, so the repaint must come from the explicit refresh.
+    mockTerm.refresh.mockClear();
+    act(() => {
+      for (const entry of matches) {
+        entry.callback([] as unknown as ResizeObserverEntry[], entry as unknown as ResizeObserver);
+      }
+    });
+
+    await waitFor(() =>
+      expect(mockTerm.refresh).toHaveBeenCalledWith(0, Math.max(0, mockTerm.rows - 1)),
+    );
   });
 });

@@ -1,20 +1,92 @@
+import {
+  isReleaseGateVerdictFresh,
+  RELEASE_GATE_VERDICT_MAX_AGE_MS,
+  releaseGateEvidenceFingerprint,
+} from "../utils/releaseGate";
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Task, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, AgentLogEntry } from "@fusion/core";
-import { normalizeColumnId } from "@fusion/core";
+import type { Task, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, AgentLogEntry, TaskColumnSortMode } from "@fusion/core";
+// FNXC:WorkflowLifecycleColumns 2026-07-30-11:50: these are AGENT ROLE comparisons, not
+// column guards — the planner LANE keeps the name `triage`; U11 removed only the COLUMN.
+import { PLANNER_AGENT_ROLE, normalizeColumnId } from "@fusion/core";
 import * as api from "../api";
+import type { TaskResetOptions } from "../api/tasks/tasks-lifecycle";
 import { subscribeSse } from "../sse-bus";
-import { clearCache, readCache, SWR_CACHE_KEYS, SWR_TASKS_MAX_AGE_MS, writeCache } from "../utils/swrCache";
+import { clearCache, readCache, readCacheSavedAt, SWR_CACHE_KEYS, SWR_TASKS_MAX_AGE_MS, writeCache } from "../utils/swrCache";
 import { pushTrace } from "../utils/dashboardTraceBuffer";
 import { recordResumeEvent } from "../utils/resumeInstrumentation";
+import { isLikelyTabSuspensionError } from "./visibilitySuspension";
+import { isIntakeColumnRole, isHoldColumnRole, type ColumnRoleFlags } from "../utils/columnRoles";
+import { isForeignTaskEvent, readTaskEventProjectId, stripTaskEventProjectId } from "../utils/taskEventProjectScope";
 
 const loggedTaskCacheHitProjects = new Set<string>();
-const TASK_VIEW_REENTRY_FRESHNESS_MS = SWR_TASKS_MAX_AGE_MS;
+
+/*
+FNXC:MobileTabDiscard 2026-07-26-16:40:
+Destroying the task snapshot is only justified when the server actually answered and disagreed with it
+(non-2xx, or a response that would not parse). A transport-level rejection on a waking mobile radio —
+"Load failed" / "Failed to fetch" / an offline navigator — proves nothing about the snapshot's contents.
+
+Before this guard, the mount revalidation's `clearOnError` catch ran on those rejections and both blanked
+the hydrated board and deleted the cache entry, so the NEXT restore also started empty: a suspension
+failure permanently defeated the feature the raised `SWR_TASKS_MAX_AGE_MS` exists to serve. Nine sibling
+hooks (useProjects, useNodes, useMeshState, useExecutorStats, useUsageData, useMeshEngines,
+useManagedDockerNodes, useProjectHealth) already guard this with the same `visibilitySuspension`
+predicate; this reuses it rather than adding a tenth copy.
+
+`navigator.onLine === false` is authoritative for "no request left the device"; `true` is not evidence of
+reachability, so the message check still has to run. `lastRefreshErrorAt` is set either way, so the
+re-entry/visibility retry paths still fire.
+*/
+function didFailureReachServer(error: unknown): boolean {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return !isLikelyTabSuspensionError(message);
+}
+
+/*
+FNXC:MobileTabDiscard 2026-07-26-10:40:
+Snapshot-write budget. `writeCache` drops any payload over `maxBytes`, and it dropped SILENTLY: a board
+with many long-lived tasks (each carrying an unbounded `log` array) serialized past 500KB, so nothing
+was ever cached and the mobile-discard restore had no snapshot to hydrate from at all — the cache
+appeared to "work" while being a no-op exactly on the boards that need it most. The snapshot is a render
+seed, not a data mirror, so `log` is stripped (the board never renders it; task detail fetches its own),
+and on a still-over-budget payload the row count is shrunk until the write lands.
+*/
+const TASK_CACHE_MAX_BYTES = 500_000;
+const TASK_CACHE_ROW_LIMITS = [500, 250, 100, 50] as const;
+
+function toCachedTaskRow(task: Task): Task {
+  const log = (task as Task & { log?: unknown }).log;
+  if ((!Array.isArray(log) || log.length === 0) && task.releaseGate === undefined) return task;
+  const { log: _droppedLog, releaseGate: _transientReleaseGate, ...rest } = task as Task & { log?: unknown };
+  /*
+  FNXC:PromoteVisibility 2026-08-11-21:06:
+  A cached release verdict has no hook-local evidence provenance and may already be expired. Persist
+  the task snapshot without it so cache hydration immediately takes the conservative Promote fallback.
+  */
+  return rest as Task;
+}
+
+/** Persist the board snapshot, shrinking row count until it fits the quota budget. Returns whether anything was written. */
+function writeTaskCacheSnapshot(cacheKey: string, tasks: Task[]): boolean {
+  for (const limit of TASK_CACHE_ROW_LIMITS) {
+    const payload = tasks.length > limit ? tasks.slice(0, limit).map(toCachedTaskRow) : tasks.map(toCachedTaskRow);
+    // `!== false` so a test double that returns undefined is treated as a successful write
+    // rather than driving the shrink loop down to its smallest tier.
+    if (writeCache(cacheKey, payload, { maxBytes: TASK_CACHE_MAX_BYTES }) !== false) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /*
 FNXC:WorkflowColumns 2026-07-19-2b:05 (U12 / R2 / R11):
 Every task the dashboard ingests — initial list, SWR revalidation, and each SSE event — passes
 through here, so this one line decided whether custom columns exist in the UI at all. It used
-`normalizeColumn`, which keeps only the six legacy ids and rewrites everything else to `triage`:
+`normalizeColumn` (since DELETED in U12), which kept only the six legacy ids and rewrote everything else to `triage`:
 a card sitting in a user-authored `Merging` column rendered in Triage, and dragging it appeared to
 do nothing. The move handler below already worked around this for its own `to` id ("normalizeColumn
 alone would drop custom ids"), which fixed the symptom for one event and left the ingest path lossy.
@@ -31,6 +103,22 @@ function normalizeTask(task: Task): Task {
       ? (task as Task & { log?: Task["log"] }).log!
       : [],
   };
+}
+
+/*
+FNXC:PromoteVisibility 2026-08-13-22:23:
+Only GET /api/tasks pairs a release verdict with the complete hold-lane evidence used to evaluate it.
+SSE is a store-derived lifecycle channel, so remove any verdict defensively before every SSE path,
+including reconnect-gap upserts; a producer regression must resolve to the conservative fallback.
+*/
+function stripTransientReleaseGate(task: Task): Task {
+  if (!Object.prototype.hasOwnProperty.call(task, "releaseGate")) return task;
+  const { releaseGate: _transientReleaseGate, ...taskWithoutReleaseGate } = task;
+  return taskWithoutReleaseGate as Task;
+}
+
+function normalizeNonBoardTask(task: Task): Task {
+  return normalizeTask(stripTransientReleaseGate(task));
 }
 
 function isSoftDeleted(task: Task): boolean {
@@ -53,7 +141,33 @@ function hasFreshAgentLog(task: Task, entry: AgentLogActivityEvent): boolean {
 }
 
 function clearInReviewStallForFreshAgentLog(task: Task, entry: AgentLogActivityEvent): Task {
-  if (task.column !== "in-review" || !hasFreshAgentLog(task, entry)) return task;
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-06:20 (batch-dashboard-app — the column check is REDUNDANT,
+  and removing it fixes a live bug):
+
+  THE COLUMN CHECK IS DELETED, not converted, because the line below already implies it. All three
+  stall fields are produced ONLY for review-lane cards — every assignment in `task-store/reads.ts`
+  routes through a producer that gates on review itself:
+
+    inReviewStall    getInReviewStallReason      (gates on the review lane)
+    inReviewStalled  getInReviewStalledSignal    (gates on the review ROLE — already trait-converted)
+    stalledReview    detectStalledReview         (gates on the review lane)
+
+  So `!task.inReviewStall && !task.inReviewStalled && !task.stalledReview` already means "not a
+  review card with a stall badge", and re-asserting the column added nothing a correct board could
+  observe.
+
+  WHAT IT DID ADD WAS A BUG, and it is live today rather than pending anything. `inReviewStalled` is
+  ALREADY resolved by role, so a renamed board DOES produce that badge — and this literal then
+  refused to clear it while a review agent was actively writing logs. The card read "stalled" for
+  the whole time work was visibly happening, which is exactly what this function exists to prevent.
+
+  I previously recorded this as a cross-batch coupling that cancelled out and had to be ordered
+  against core. That was wrong on one of the three signals: the trait-converted one never cancelled.
+  Deleting the check is correct before OR after any core change, and removes the ordering hazard
+  instead of scheduling around it.
+  */
+  if (!hasFreshAgentLog(task, entry)) return task;
   if (!task.inReviewStall && !task.inReviewStalled && !task.stalledReview) return task;
 
   /*
@@ -68,11 +182,53 @@ function clearInReviewStallForFreshAgentLog(task: Task, entry: AgentLogActivityE
   };
 }
 
-function addRecentPlannerActivityForFreshAgentLog(task: Task, entry: AgentLogActivityEvent): Task {
+/*
+FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (U12 — R8 drift conversion):
+This is the SOURCE of the planner-activity signal, and it was the narrowest gate of all:
+it only stamped `recentAgentActivityAt` for cards literally in `triage`. #2515 removed
+that column from the default lineage, so after that merge the stamp never happened for a
+default-workflow card — and every consumer downstream (the pulsing Planning badge, the
+agent-active row border, the column's executing count) had NO DATA to act on, however
+correctly they resolved their own column traits.
+
+Converting the consumers without this would have been cosmetic: they would ask the right
+question of a field nothing ever set.
+
+This hook processes SSE and has no resolved column metadata, so the lane is matched by id
+against BOTH shapes — pre-merge `triage` and post-merge `todo`. Over-stamping a legacy
+hold-lane card is harmless: every consumer additionally requires the column to be an
+INTAKE lane before showing anything, so the extra timestamps are filtered downstream.
+*/
+const PLANNER_ACTIVITY_COLUMN_IDS = new Set(["triage", "todo"]);
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-03:45:
+THE STAMP MISSED RENAMED INTAKE LANES ENTIRELY, which the note above does not cover.
+
+That note argues over-stamping is harmless because every consumer re-checks for an INTAKE lane
+before showing anything. True, and it only protects against false POSITIVES. On a board whose intake
+and hold lanes are renamed, `{triage, todo}` matches nothing, so no stamp is ever written — and a
+correct downstream role check has nothing to filter. The planning border and pulsing badge never
+appear while the planner is actively working the card.
+
+Resolved traits win; the legacy pair stays as the no-flags fallback, so an unconverted caller and the
+remote-node path are byte-identical. Intake OR hold, mirroring what the pair meant: pre-merge
+`triage` was intake and post-merge `todo` is the hold lane.
+*/
+function isPlannerActivityLane(task: Task, flags: ColumnRoleFlags | undefined): boolean {
+  if (!flags) return PLANNER_ACTIVITY_COLUMN_IDS.has(task.column);
+  return isIntakeColumnRole(flags, task.column) || isHoldColumnRole(flags, task.column);
+}
+
+function addRecentPlannerActivityForFreshAgentLog(
+  task: Task,
+  entry: AgentLogActivityEvent,
+  flags: ColumnRoleFlags | undefined,
+): Task {
   if (
-    task.column !== "triage"
+    !isPlannerActivityLane(task, flags)
     || task.status === "planning"
-    || entry.agent !== "triage"
+    || entry.agent !== PLANNER_AGENT_ROLE
     || !hasFreshAgentLog(task, entry)
   ) {
     return task;
@@ -100,48 +256,311 @@ function compareTimestamps(a: string | undefined, b: string | undefined): number
   return a.localeCompare(b);
 }
 
-function mergeSameColumnTask(current: Task, incoming: Task): Task {
-  return {
-    ...incoming,
-    // Preserve stable execution metadata when a same-column live update arrives
-    // without the full task payload (common during status/log-only SSE updates).
-    columnMovedAt: current.columnMovedAt ?? incoming.columnMovedAt,
-    executionStartedAt: current.executionStartedAt ?? incoming.executionStartedAt,
-    executionCompletedAt: current.executionCompletedAt ?? incoming.executionCompletedAt,
-    firstExecutionAt: current.firstExecutionAt ?? incoming.firstExecutionAt,
-    cumulativeActiveMs: incoming.cumulativeActiveMs ?? current.cumulativeActiveMs,
-    worktree: incoming.worktree ?? current.worktree,
-    modifiedFiles: incoming.modifiedFiles ?? current.modifiedFiles,
-    timedExecutionMs: incoming.timedExecutionMs ?? current.timedExecutionMs,
-    workflowStepResults: incoming.workflowStepResults ?? current.workflowStepResults,
-    tokenUsage: incoming.tokenUsage ?? current.tokenUsage,
-    mergeDetails: incoming.mergeDetails ?? current.mergeDetails,
-  };
+/*
+FNXC:CodingIdeasWorkflow 2026-07-26-15:30:
+`awaitingPlanning` is attached by `GET /api/tasks` only — SSE task payloads come straight from the
+store, so a status-only live update would otherwise wipe it and flip TaskCard's badge back to its
+step-count fallback mid-stall. Carry it across same-column updates, but ONLY while the step count is
+unchanged: planning finishing is exactly a step-count change, and a stale `true` surviving that would
+keep claiming "Queued to plan" for a card that is now Ready until the next full board fetch. When it
+is dropped the fallback answers correctly in both directions (steps landed -> Ready, steps cleared ->
+queued), so the degraded state is never the wrong label.
+*/
+function carryAwaitingPlanning(current: Task, incoming: Task): boolean | undefined {
+  if (incoming.awaitingPlanning !== undefined) return incoming.awaitingPlanning;
+  const stepCountUnchanged = (current.steps?.length ?? 0) === (incoming.steps?.length ?? 0);
+  return stepCountUnchanged ? current.awaitingPlanning : undefined;
 }
 
-function mergeIncomingTask(current: Task, incoming: Task): Task {
+/*
+FNXC:PromoteVisibility 2026-08-11-20:38:
+A wrong badge self-corrects, but a wrong Promote decision can start execution. SSE lacks the IR,
+continuation, and prompt inputs, so retain a REST verdict only across identical visible evidence and
+its server row clock, bounded by TTL; every doubt drops to the conservative fallback.
+*/
+function carryReleaseGate(
+  current: Task,
+  incoming: Task,
+  merged: Task,
+  provenance: Map<string, import("../utils/releaseGate").ReleaseGateProvenance> | undefined,
+  now = Date.now(),
+): Task["releaseGate"] {
+  if (incoming.releaseGate !== undefined) {
+    const freshProvenance = { fingerprint: releaseGateEvidenceFingerprint(merged), capturedAt: now };
+    /*
+    FNXC:PromoteVisibility 2026-08-11-21:06:
+    A complete response may arrive after a newer row. Its verdict is evidence only when it was
+    evaluated for the row being rendered, rather than merely being a defined payload field.
+    */
+    if (!isReleaseGateVerdictFresh(incoming.releaseGate, merged, freshProvenance, now)) {
+      provenance?.delete(current.id);
+      return undefined;
+    }
+    provenance?.set(current.id, freshProvenance);
+    return incoming.releaseGate;
+  }
+  if (!current.releaseGate) return undefined;
+  const retained = isReleaseGateVerdictFresh(current.releaseGate, merged, provenance?.get(current.id), now);
+  if (!retained) provenance?.delete(current.id);
+  return retained ? current.releaseGate : undefined;
+}
+
+/*
+FNXC:TaskDetailStateStability 2026-08-05-02:55:
+The scheduler can refresh the board while a task-detail host holds a newer queued dependency or
+file-overlap snapshot. Providers (SWR, SSE, fetchTaskDetail, and local mutations) do not share an
+arrival order, so lifecycle rendering must use the existing timestamp evidence: a later `columnMovedAt`
+owns a real column transition; within that column, a later `updatedAt` owns status. Equal or absent
+clock evidence retains the already-visible known lifecycle state unless a complete server snapshot is
+newer than the row and resolves an equal legacy move clock; sparse SSE patches never receive that tie-break.
+
+This helper intentionally merges only defined sparse fields. A slim or sparse payload's absent, empty, or whitespace-only prompt is not evidence that a loaded plan was cleared, and an empty log is not evidence that a populated journal was cleared; marked full snapshots remain authoritative for both fields. Every open-detail host and useTasks ingestion uses this one boundary so one provider cannot regress a modal, main panel, split detail, dock, or popup independently.
+
+FNXC:TaskDetailStateStability 2026-08-09-07:13:
+`mergeTaskSnapshot` arbitrates server snapshots only. Locally-authored detail patches must use
+`applyLocalTaskPatch`: FN-5148 requires mismatched ids to be ignored while accepting an absent id, and
+FN-8796 showed that an absent or equal local clock is not evidence of staleness.
+
+FNXC:TaskDetailStateStability 2026-08-28-16:07:
+A sparse blank prompt must not add a `prompt` key to a slim task row. Task detail uses key presence to
+distinguish a complete detail from a board snapshot, so synthesizing that key would make a transient
+empty payload look authoritative and could replace the loaded Definition plan with `(no prompt)`.
+*/
+export interface TaskSnapshotMergeOptions {
+  /** Hook-local, non-persisted evidence captured when GET /api/tasks supplied a release verdict. */
+  releaseGateProvenance?: Map<string, import("../utils/releaseGate").ReleaseGateProvenance>;
+  /** A complete board/detail fetch can resolve an otherwise ambiguous legacy column clock. */
+  fullSnapshot?: boolean;
+  /** A canonical task:moved SSE payload names its destination, even when its clock ties the visible row. */
+  authoritativeMove?: boolean;
+  /** A canonical task event owns pause/status fields even when JSON omission represents a cleared value. */
+  authoritativeLifecycle?: boolean;
+}
+
+export function mergeTaskSnapshot<T extends Task>(
+  current: T,
+  incoming: Task,
+  options: TaskSnapshotMergeOptions = {},
+): T {
+  if (current.id !== incoming.id) return current;
+
+  const merged = { ...current } as Record<string, unknown>;
   const updatedAtCompare = compareTimestamps(incoming.updatedAt, current.updatedAt);
-  if (updatedAtCompare < 0) {
+  /*
+  FNXC:TaskStatusConsistency 2026-08-05-04:14:
+  Missing clocks are not authority: a legacy detail row and a sparse SSE patch with neither clock
+  must retain populated metadata rather than letting their arrival order erase queue/workflow state.
+  Only a strictly newer update clock, or an explicitly complete equal-clock fetch below, may replace it.
+  */
+  const acceptsIncomingSnapshot = updatedAtCompare > 0;
+  // A fetch is explicitly marked complete at its call site. Equal clocks can only fill an absent
+  // field from a sparse event; they replace populated fields only for a complete fetch.
+  const acceptsEqualClockFields = options.fullSnapshot === true && updatedAtCompare === 0;
+  for (const [key, value] of Object.entries(incoming)) {
+    const canMergeField = acceptsIncomingSnapshot
+      || acceptsEqualClockFields
+      || (updatedAtCompare === 0 && merged[key] === undefined);
+    if (value !== undefined && canMergeField) {
+      merged[key] = value;
+    }
+  }
+
+  /*
+  FNXC:DashboardPauseState 2026-08-07-14:48:
+  TaskStore clears optional pause lifecycle fields with `undefined`, so JSON omits them from REST and
+  `task:updated` payloads. A newer full task row therefore needs omission to mean "cleared" for these
+  fields; otherwise a passive dashboard retains an older `paused: true` forever. Keep this narrow to
+  pause-owned fields so genuinely sparse payloads still preserve unrelated detail metadata.
+  */
+  const incomingOwnsLifecycleField = (field: "paused" | "userPaused" | "pausedByAgentId" | "pausedReason" | "status") =>
+    options.authoritativeLifecycle === true
+    || options.fullSnapshot === true
+    || Object.prototype.hasOwnProperty.call(incoming, field);
+  const acceptsEqualClockLifecycle = options.authoritativeLifecycle === true && updatedAtCompare === 0;
+  if (acceptsIncomingSnapshot || acceptsEqualClockFields || acceptsEqualClockLifecycle) {
+    if (incomingOwnsLifecycleField("paused")) merged.paused = incoming.paused;
+    if (incomingOwnsLifecycleField("userPaused")) merged.userPaused = incoming.userPaused;
+    if (incomingOwnsLifecycleField("pausedByAgentId")) merged.pausedByAgentId = incoming.pausedByAgentId;
+    if (incomingOwnsLifecycleField("pausedReason")) merged.pausedReason = incoming.pausedReason;
+  }
+
+
+  const columnMovedAtCompare = compareTimestamps(incoming.columnMovedAt, current.columnMovedAt);
+  /*
+  FNXC:BoardBadgeFreshness 2026-08-05-05:26:
+  `task:moved` is the post-commit lifecycle authority and includes its explicit destination. A board
+  fetch can observe the task immediately before the move event, leaving identical clocks when one
+  transition shares the engine's operation timestamp. Accept that equal-clock canonical move so cards,
+  list rows, and open details change promptly; older clocks remain rejected, so delayed stale events
+  cannot roll a newer badge backward.
+  */
+  const incomingMovesColumn = incoming.column !== undefined
+    && (current.column === undefined
+      || columnMovedAtCompare > 0
+      || (options.authoritativeMove === true && columnMovedAtCompare === 0)
+      // A full server snapshot is more complete than an SSE patch, so its newer task clock can
+      // resolve a legacy equal move clock without letting a sparse event move the card.
+      || (options.fullSnapshot === true && columnMovedAtCompare === 0 && updatedAtCompare > 0)
+      // Older rows have no column-move clock. A newer task timestamp is still evidence for a real move.
+      || (!current.columnMovedAt && !incoming.columnMovedAt && updatedAtCompare > 0));
+  // An equal-clock fetch may resolve a stale client-only status only when it describes the same
+  // lifecycle row. Otherwise accepting its status while rejecting its column would tear the pair.
+  const acceptsEqualClockStatus = acceptsEqualClockFields
+    && (incoming.column === undefined || incoming.column === current.column);
+  const incomingUpdatesStatus = incomingOwnsLifecycleField("status")
+    && (acceptsIncomingSnapshot
+      || acceptsEqualClockStatus
+      || acceptsEqualClockLifecycle
+      || (incoming.status !== undefined
+        && (current.status === undefined || incomingMovesColumn)));
+
+  // The lifecycle fields are evidence-owned rather than object-spread-owned.
+  merged.column = incomingMovesColumn ? incoming.column : current.column;
+  merged.columnMovedAt = columnMovedAtCompare > 0 ? incoming.columnMovedAt : current.columnMovedAt;
+  merged.status = incomingUpdatesStatus ? incoming.status : current.status;
+  merged.updatedAt = updatedAtCompare > 0 ? incoming.updatedAt : current.updatedAt;
+  merged.awaitingPlanning = acceptsIncomingSnapshot
+    ? carryAwaitingPlanning(current, incoming)
+    : current.awaitingPlanning;
+  /*
+  FNXC:PromoteVisibility 2026-08-11-21:06:
+  A delayed snapshot cannot attach a defined verdict over a newer task row.
+  */
+  const acceptsReleaseGateSnapshot = acceptsIncomingSnapshot || acceptsEqualClockFields;
+  merged.releaseGate = acceptsReleaseGateSnapshot
+    ? carryReleaseGate(current, incoming, merged as unknown as Task, options.releaseGateProvenance)
+    : current.releaseGate;
+  /*
+  FNXC:TaskStatusConsistency 2026-08-07-06:10:
+  `recentAgentActivityAt` is a client-only bridge from an agent-log event to the next task snapshot.
+  Preserve it while a stale payload is rejected so live Planning does not flash back to Queued. A
+  complete equal-clock fetch clears it only when that same lifecycle row proves the status changed;
+  otherwise an agent-log that arrived while the fetch was in flight remains newer evidence.
+  */
+  const equalClockStatusChanged = (acceptsEqualClockStatus || acceptsEqualClockLifecycle)
+    && incoming.status !== current.status;
+  merged.recentAgentActivityAt = acceptsIncomingSnapshot || equalClockStatusChanged
+    ? incoming.recentAgentActivityAt
+    : current.recentAgentActivityAt;
+
+  const currentHasPrompt = "prompt" in current;
+  const incomingPrompt = incoming.prompt;
+  if (currentHasPrompt) {
+    const currentPrompt = current.prompt;
+    const sparseBlankCannotClear = options.fullSnapshot !== true
+      && Boolean(currentPrompt?.trim())
+      && !incomingPrompt?.trim();
+    if (incomingPrompt === undefined || sparseBlankCannotClear) {
+      merged.prompt = currentPrompt;
+    }
+  } else if (options.fullSnapshot !== true && !incomingPrompt?.trim()) {
+    delete merged.prompt;
+  }
+
+  /*
+  FNXC:TaskActivityFeed 2026-08-28-00:13:
+  FN-205 found `stripTaskListHeavyFields` emits `log: []` for every slim SSE/list task payload. The
+  task journal is append-only and trimmed server-side, so an absent or empty slim log is never evidence
+  that a populated journal was cleared. Retain it independently of prompt presence; board-to-board
+  merges remain inert because both slim rows have empty journals.
+
+  A marked full detail snapshot is authoritative, including an honestly empty journal. It also adopts a
+  populated journal over an empty current row even when its clock is older, because the empty stripped
+  row is not competing journal evidence.
+  */
+  const currentLog = current.log;
+  const incomingLog = incoming.log;
+  if (options.fullSnapshot === true) {
+    merged.log = incomingLog;
+  } else if (currentLog && currentLog.length > 0 && (!incomingLog || incomingLog.length === 0)) {
+    merged.log = currentLog;
+  }
+
+  return merged as T;
+}
+
+/*
+FNXC:TaskReset 2026-09-09-14:48:
+A confirmed Reset response is a complete new-run snapshot, even though JSON serialization omits the
+fields the server cleared to `undefined`. Equal or absent clocks therefore replace the visible row
+instead of sparse-merging old execution state back into it. Only a strictly newer task or column clock
+proves that a post-reset server event already advanced the row; that event still passes through the
+generic freshness merge so Reset cannot overwrite newer SSE state.
+*/
+export function reconcileConfirmedResetSnapshot<T extends Task>(
+  current: T,
+  confirmed: Task,
+  beforeReset?: Task,
+): T {
+  if (current.id !== confirmed.id) return confirmed as T;
+  const currentIsStrictlyNewer = compareTimestamps(current.updatedAt, confirmed.updatedAt) > 0
+    || compareTimestamps(current.columnMovedAt, confirmed.columnMovedAt) > 0;
+  if (!currentIsStrictlyNewer) return confirmed as T;
+
+  // The generic SSE merge may have carried old fields that a sparse newer event omitted. Reapply
+  // only values that demonstrably changed while Reset was pending; the confirmed row owns the rest.
+  const provenNewerSnapshot = beforeReset
+    ? Object.fromEntries(Object.entries(current).filter(([key, value]) =>
+      key === "id" || value !== (beforeReset as unknown as Record<string, unknown>)[key],
+    )) as unknown as Task
+    : current;
+  return mergeTaskSnapshot(confirmed as T, provenNewerSnapshot, {
+    authoritativeMove: true,
+    authoritativeLifecycle: true,
+  });
+}
+
+/*
+FNXC:TaskDetailStateStability 2026-08-09-07:13:
+Open detail views author sparse patches after a PATCH response or derived PR/review refresh. Unlike
+server snapshots, these patches are applied by intent: FN-5148 ignores an explicit foreign id but
+accepts an absent id. FN-8796's stale lifecycle protection remains only when both sides provide a
+clock and the local patch is strictly older; absent and equal clocks are not stale evidence.
+*/
+export function applyLocalTaskPatch<T extends Task>(current: T, patch: Partial<Task>): T {
+  if (patch.id !== undefined && patch.id !== current.id) return current;
+
+  const merged = { ...current } as Record<string, unknown>;
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) merged[key] = value;
+  }
+
+  const hasClock = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+  if (
+    hasClock(patch.columnMovedAt)
+    && hasClock(current.columnMovedAt)
+    && compareTimestamps(patch.columnMovedAt, current.columnMovedAt) < 0
+  ) {
+    merged.column = current.column;
+    merged.columnMovedAt = current.columnMovedAt;
+  }
+  if (
+    hasClock(patch.updatedAt)
+    && hasClock(current.updatedAt)
+    && compareTimestamps(patch.updatedAt, current.updatedAt) < 0
+  ) {
+    merged.status = current.status;
+    merged.updatedAt = current.updatedAt;
+  }
+
+  const mergedKeys = Object.keys(merged);
+  if (mergedKeys.length === Object.keys(current).length && mergedKeys.every((key) => merged[key] === (current as Record<string, unknown>)[key])) {
     return current;
   }
-
-  if (current.column === incoming.column) {
-    return mergeSameColumnTask(current, incoming);
-  }
-
-  const columnTimestampCompare = compareTimestamps(current.columnMovedAt, incoming.columnMovedAt);
-  if (current.columnMovedAt && !incoming.columnMovedAt) {
-    return { ...incoming, column: current.column, columnMovedAt: current.columnMovedAt };
-  }
-
-  if (columnTimestampCompare >= 0) {
-    return { ...incoming, column: current.column, columnMovedAt: current.columnMovedAt };
-  }
-
-  return incoming;
+  return merged as T;
 }
 
 export interface UseTasksOptions {
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-31-03:40:
+  Resolves a task's own column traits, so the planner-activity stamp below is a ROLE question.
+
+  Supplied by App from the board-workflow payload. Absent (remote nodes, pre-load) the stamp falls
+  back to the legacy id pair, which is the behaviour that shipped.
+  */
+  resolveColumnFlags?: (task: Task) => ColumnRoleFlags | undefined;
+  /** Resolves the task's selected workflow, including the project-default fallback. */
+  resolveWorkflowId?: (task: Task) => string | undefined;
   /** 
    * When provided, fetches tasks only for this project.
    * SSE events from other project contexts are ignored.
@@ -163,34 +582,182 @@ export interface UseTasksOptions {
 
 export function useTasks(options?: UseTasksOptions) {
   const projectId = options?.projectId;
+  const resolveColumnFlags = options?.resolveColumnFlags;
+  const resolveColumnFlagsRef = useRef(resolveColumnFlags);
+  resolveColumnFlagsRef.current = resolveColumnFlags;
+  const resolveWorkflowIdRef = useRef(options?.resolveWorkflowId);
+  resolveWorkflowIdRef.current = options?.resolveWorkflowId;
   const searchQuery = options?.searchQuery;
   const sseEnabled = options?.sseEnabled ?? true;
+  /*
+  FNXC:MobileTabDiscard 2026-07-26-10:48:
+  First paint after a mobile tab discard must show the last known board, not an empty one. This
+  initializer is the only thing standing between the restore and a blank board, so it hydrates from a
+  snapshot that may be hours old (`SWR_TASKS_MAX_AGE_MS`). That is safe only because hydration is
+  always paired with revalidation: `isStale` starts true (App renders <TopProgressBar visible> off it)
+  and the mount effect below unconditionally issues one `refreshTasks({ clearOnError: true })`.
+
+  FNXC:MobileTabDiscard 2026-07-26-16:40:
+  CORRECTION to the sentence this note used to end with ("whose failure branch CLEARS this cache entry
+  so a wrong snapshot cannot survive into the next restore"): that is true only of a failure that
+  REACHED THE SERVER. A transport-level rejection (suspended tab, offline radio) now leaves the entry
+  and the painted rows alone, because it is not evidence the snapshot is wrong — and deleting on it made
+  every flaky-radio restore blank, permanently. See the catch branch of `refreshTasks`.
+  */
+  /*
+  FNXC:MobileTabDiscard 2026-07-26-14:12:
+  Captured by the `tasks` initializer below and consumed by the `lastFetchTimeMs` ref initializer on
+  the SAME first render, so the hydrated board is described by the snapshot's real write time from its
+  very first paint. A `useRef` initial value is only honored on first render, which is exactly when the
+  `useState` initializer runs — the two stay in lockstep with no effect-ordering gap. Reading the
+  timestamp in an effect instead would be wrong: the value returned to consumers is `.current` read
+  during render, so the first (restore) frame would still ship `undefined`.
+  It is only read when a snapshot actually hydrated, so a cache miss leaves the clock `undefined`.
+  */
+  let hydratedSnapshotSavedAtMs: number | undefined;
   const [tasks, setTasks] = useState<Task[]>(() => {
     if (!projectId) {
       return [];
     }
-    const cachedTasks = readCache<Task[]>(`${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-    if (Array.isArray(cachedTasks) && cachedTasks.length > 0 && !loggedTaskCacheHitProjects.has(projectId)) {
-      loggedTaskCacheHitProjects.add(projectId);
-      console.info("[swr-cache] hit tasks=", cachedTasks.length, "projectId=", projectId);
+    const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
+    const cachedTasks = readCache<Task[]>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+    if (Array.isArray(cachedTasks)) {
+      hydratedSnapshotSavedAtMs = readCacheSavedAt(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+      if (cachedTasks.length > 0 && !loggedTaskCacheHitProjects.has(projectId)) {
+        loggedTaskCacheHitProjects.add(projectId);
+        console.info("[swr-cache] hit tasks=", cachedTasks.length, "projectId=", projectId);
+      }
     }
-    return Array.isArray(cachedTasks) ? filterActiveTasks(cachedTasks.map(normalizeTask)) : [];
+    return Array.isArray(cachedTasks)
+      ? filterActiveTasks(cachedTasks.map(normalizeTask).map(({ releaseGate: _releaseGate, ...task }) => task as Task))
+      : [];
   });
   const [isStale, setIsStale] = useState(true);
   const [lastRefreshErrorAt, setLastRefreshErrorAt] = useState<number | null>(null);
-  // Once the user expands the archived column, we keep including archived tasks
-  // in subsequent refreshes for the lifetime of this hook instance.
-  /*
-  FNXC:ArchivePagination 2026-07-08-00:00:
-  FN-7659 retired the merged-refresh path this flag used to drive (see the
-  loadArchivedTasks note below): nothing sets it true anymore, so it is kept
-  as a stable `false` constant purely for return-type/back-compat rather
-  than reactive state.
-  */
-  const includeArchived = false;
-  const includeArchivedRef = useRef(includeArchived);
   const tasksRef = useRef(tasks);
+  // Task ids are project-local. Reconciliation may compare ids only after this owner fence holds.
+  const tasksProjectIdRef = useRef<string | undefined>(projectId);
+  /*
+  FNXC:PromoteVisibility 2026-08-11-20:53:
+  This is deliberately hook-local rather than Task state or persistent cache. It records only the
+  browser-visible evidence paired with a REST verdict, so an SSE patch can retain that verdict only
+  while it remains provably valid; task removal and failed retention prune it.
+  */
+  const releaseGateProvenanceRef = useRef(new Map<string, import("../utils/releaseGate").ReleaseGateProvenance>());
   const fetchVersionRef = useRef(0);
+  /*
+  FNXC:DonePagination 2026-09-04-10:36:
+  Done-page requests have a project-generation fence and a dedicated accumulator. Generic board refreshes replace the current lanes plus the newest Done page while preserving pages the operator explicitly loaded.
+
+  FNXC:DonePagination 2026-09-08-23:00:
+  A continuation belongs to the complete project, sort, search, and refresh incarnation. Every authoritative refresh invalidates an in-flight Done continuation before starting page zero, so an older page cannot append cards or replace the new session cursor after search or refresh changes.
+
+  FNXC:DonePagination 2026-09-08-23:00:
+  SSE membership changes must update the aggregate physical-column count and the selected-workflow count together, including moves between two Complete columns. The workflow resolver applies the same explicit-selection/default fallback as Board; display counters never alter the captured server cursor.
+  */
+  type PaginationError = "timeout" | "invalid-continuation" | "request-failed";
+  type PaginationOwner = { controller: AbortController; token: symbol; timedOut: boolean };
+  const PAGINATION_REQUEST_TIMEOUT_MS = 30_000;
+  const currentPageCursorRef = useRef<string | null>(null);
+  const currentPageLoadingRef = useRef(false);
+  const currentPageOwnerRef = useRef<PaginationOwner | null>(null);
+  const currentConsumedCursorsRef = useRef(new Set<string>());
+  const [currentTasksTotal, setCurrentTasksTotal] = useState(0);
+  const [currentTasksHasMore, setCurrentTasksHasMore] = useState(false);
+  const [currentTasksLoadingMore, setCurrentTasksLoadingMore] = useState(false);
+  const [currentTasksPaginationError, setCurrentTasksPaginationError] = useState<PaginationError | null>(null);
+  const [currentTasksProgress, setCurrentTasksProgress] = useState(0);
+  const completedRequestGenerationRef = useRef(0);
+  const completedTasksRef = useRef<Task[]>([]);
+  const completedNextCursorRef = useRef<string | null>(null);
+  const completedLoadingMoreRef = useRef(false);
+  const completedOwnerRef = useRef<PaginationOwner | null>(null);
+  const completedConsumedCursorsRef = useRef(new Set<string>());
+  const refreshAbortRef = useRef<AbortController | null>(null);
+  const completedSortModeRef = useRef<TaskColumnSortMode>("completion-date-desc");
+  const [completedSortMode, setCompletedSortMode] = useState<TaskColumnSortMode>("completion-date-desc");
+  const [completedTotal, setCompletedTotal] = useState(0);
+  const completedTotalRef = useRef(0);
+  const [completedCounts, setCompletedCounts] = useState<NonNullable<api.CompletedTaskPageResponse["counts"]>>({ byColumn: {}, byWorkflow: {} });
+  const [completedHasMore, setCompletedHasMore] = useState(false);
+  const [completedLoadingMore, setCompletedLoadingMore] = useState(false);
+  const [completedPaginationError, setCompletedPaginationError] = useState<PaginationError | null>(null);
+  const [completedProgress, setCompletedProgress] = useState(0);
+
+  const abortPaginationOwners = useCallback(() => {
+    currentPageOwnerRef.current?.controller.abort();
+    completedOwnerRef.current?.controller.abort();
+    currentPageOwnerRef.current = null;
+    completedOwnerRef.current = null;
+    currentPageLoadingRef.current = false;
+    completedLoadingMoreRef.current = false;
+    setCurrentTasksLoadingMore(false);
+    setCompletedLoadingMore(false);
+    setCurrentTasksPaginationError(null);
+    setCompletedPaginationError(null);
+  }, []);
+
+  const mergeIncomingTask = (current: Task, incoming: Task, mergeOptions?: TaskSnapshotMergeOptions): Task =>
+    mergeTaskSnapshot(current, incoming, { ...mergeOptions, releaseGateProvenance: releaseGateProvenanceRef.current });
+
+  /*
+  FNXC:PromoteVisibility 2026-08-11-21:06:
+  Freshness cannot be checked only when SSE or fetch merges a row: an idle board can receive no
+  further snapshots for longer than the verdict TTL. Wake at the earliest expiry and remove each
+  expired or unverifiable verdict, ensuring TaskCard never renders a stale server decision.
+  */
+  useEffect(() => {
+    const now = Date.now();
+    let earliestExpiry = Number.POSITIVE_INFINITY;
+    let needsPrune = false;
+    for (const task of tasks) {
+      if (!task.releaseGate) continue;
+      if (!isReleaseGateVerdictFresh(task.releaseGate, task, releaseGateProvenanceRef.current.get(task.id), now)) {
+        needsPrune = true;
+        continue;
+      }
+      const evaluatedAt = Date.parse(task.releaseGate.evaluatedAt);
+      earliestExpiry = Math.min(earliestExpiry, evaluatedAt + RELEASE_GATE_VERDICT_MAX_AGE_MS);
+    }
+
+    const prune = () => {
+      setTasks((previous) => {
+        let changed = false;
+        const checkedAt = Date.now();
+        const next = previous.map((task) => {
+          if (!task.releaseGate || isReleaseGateVerdictFresh(task.releaseGate, task, releaseGateProvenanceRef.current.get(task.id), checkedAt)) {
+            return task;
+          }
+          changed = true;
+          releaseGateProvenanceRef.current.delete(task.id);
+          return { ...task, releaseGate: undefined };
+        });
+        if (changed) tasksRef.current = next;
+        return changed ? next : previous;
+      });
+    };
+
+    if (needsPrune) {
+      prune();
+      return;
+    }
+    if (!Number.isFinite(earliestExpiry)) return;
+    const timer = window.setTimeout(prune, Math.max(0, earliestExpiry - now) + 1);
+    return () => window.clearTimeout(timer);
+  }, [tasks]);
+
+  /*
+  FNXC:DashboardResume 2026-08-05-18:17:
+  A resumed list request is a point-in-time server snapshot, while task SSE is a later committed
+  mutation. Track the task ids changed after each request begins so its delayed response retains live
+  creates and excludes live deletes instead of replacing the entire board with its older membership.
+  A later successful fetch prunes mutations it already observed; newer mutations remain fenced until
+  their own authoritative response arrives.
+  */
+  const liveMutationVersionRef = useRef(0);
+  const liveTaskMutationsRef = useRef(new Map<string, { version: number; deleted: boolean; task?: Task }>());
+  const mountedRef = useRef(true);
+  const resumeRefreshRef = useRef<{ identity: string; promise: Promise<void> } | null>(null);
   // Tracks the project context version to detect stale SSE events after project switches.
   // Incremented whenever projectId changes, invalidating any in-flight SSE handlers.
   const projectContextVersionRef = useRef(0);
@@ -198,32 +765,75 @@ export function useTasks(options?: UseTasksOptions) {
   const contextVersionAtLastVisibilityRef = useRef(projectContextVersionRef.current);
   const droppedStaleEventsRef = useRef(0);
   const searchQueryRef = useRef(searchQuery);
+  const searchIncarnationRef = useRef(0);
+  const renderedSearchQueryRef = useRef(searchQuery);
   const refreshTasksRef = useRef<typeof refreshTasks>(null!);
   const prevSseEnabledRef = useRef(sseEnabled);
-  // Tracks when task data was last confirmed fresh by the server.
-  // Used to prevent false positives in stuck detection when tab has been in background.
-  const lastFetchTimeMs = useRef<number | undefined>(undefined);
+  // Coordinates the earlier re-entry effect with the project-change fetch effect below.
+  const projectChangeRefreshPendingRef = useRef(false);
+  /*
+  FNXC:MobileTabDiscard 2026-07-26-14:12:
+  "Data as of" clock for everything derived from `tasks` (isTaskStuck / countStuckTasks, TaskCard's
+  isStuck + isAgentActive, Column's activeTaskCount, ExecutorStatusBar's stuck counters, and the
+  taskRecovery affordances). It describes the AGE OF THE ROWS CURRENTLY IN `tasks`, not the age of
+  this hook instance.
+
+  It is seeded from the hydrated snapshot's envelope `savedAt` rather than left `undefined`. When it
+  is `undefined` every consumer falls back to `Date.now()`; combined with the raised
+  `SWR_TASKS_MAX_AGE_MS`, an iOS-PWA restore that hydrated a 2-hour-old board measured hours-old
+  `updatedAt` values against NOW and rendered every in-progress card 'stuck' (and forced
+  isAgentActive false, killing the live pulse) until the mount revalidation resolved — seconds on a
+  waking mobile radio, precisely the restore this cache exists to improve. Seeding makes the first
+  paint honest; `refreshTasks` overwrites it with `Date.now()` the moment real server data lands.
+  */
+  const lastFetchTimeMs = useRef<number | undefined>(hydratedSnapshotSavedAtMs);
+  /*
+  FNXC:MobileTabDiscard 2026-07-26-16:40:
+  True only after a successful full-board fetch has confirmed EVERY row currently in `tasks`. A hydrated
+  snapshot does not confirm anything, so this starts false on mount and is reset to false whenever a
+  project switch repaints from cache.
+
+  It gates the live-update writers of `lastFetchTimeMs` below. Those writers (task:created / task:moved /
+  task:updated, plus `ingestCreatedTasks`) each learn about ONE row, but `lastFetchTimeMs` is read as the
+  as-of time of ALL rows. While a hydrated hours-old board is still waiting for the mount revalidation on
+  a waking radio, a single unrelated task:created event used to stamp the whole board as measured-from-
+  now — re-creating, through a sibling path, the exact "every in-progress card renders stuck" regression
+  the savedAt seeding was added to fix.
+
+  Once a fetch HAS confirmed the board, advancing on a live event stays honest and is deliberately kept:
+  the stream reports every task mutation in the project, so a row that produced no event really has not
+  changed and `now - updatedAt` is its true idle time. Freezing the clock at the last fetch instead would
+  make stuck detection silently stop firing for the rest of a long SSE session (there is no periodic
+  poll in this hook) — a false negative traded for the false positive.
+  */
+  const boardFetchConfirmedRef = useRef(false);
+  /*
+  FNXC:MobileTabDiscard 2026-07-26-16:40:
+  Single seam for the live-update writers of the freshness clock; see `boardFetchConfirmedRef`. Kept as
+  one function so a future fifth writer cannot reintroduce the ungated `lastFetchTimeMs.current =
+  Date.now()` pattern by copy-paste.
+  */
+  const advanceFreshnessClockForLiveUpdate = useCallback(() => {
+    if (!boardFetchConfirmedRef.current) {
+      return;
+    }
+    lastFetchTimeMs.current = Date.now();
+  }, []);
   const lastConfirmedProjectIdRef = useRef<string | undefined>(undefined);
   const lastConfirmedSearchQueryRef = useRef<string | undefined>(undefined);
-  const lastConfirmedIncludeArchivedRef = useRef(false);
   // Track previous projectId to detect changes
   const previousProjectIdRef = useRef<string | undefined>(projectId);
-  /*
-  FNXC:ArchivePagination 2026-07-08-01:30:
-  Declared ahead of `refreshTasks` (rather than alongside the rest of the
-  archived-pagination state below) because `refreshTasks` reads it on every
-  generic refresh to decide whether to carry merged archived rows forward.
-  Code review (FN-7659) found `refreshTasks`'s unconditional
-  `setTasks(normalizedFetchedTasks)` silently discarded the archived page(s)
-  merged in by `loadArchivedTasks`/`loadMoreArchivedTasks` on the very next
-  SSE reconnect, tab-visibility regain, delete-invalidation refresh, or
-  search-then-clear — making `loadArchivedTasks` a permanent no-op
-  (`archivedLoadedRef.current` stays true) and silently emptying the
-  Archived column for the rest of the session.
-  */
-  const archivedLoadedRef = useRef(false);
   tasksRef.current = tasks;
   searchQueryRef.current = searchQuery;
+  if (renderedSearchQueryRef.current !== searchQuery) {
+    /*
+    FNXC:DonePagination 2026-09-08-23:16:
+    Search identity is an incarnation, not only a string value. Increment synchronously on every rendered scope change so A → B → A cannot admit an A continuation started before B while the debounced page-zero refresh is still pending.
+    */
+    renderedSearchQueryRef.current = searchQuery;
+    searchIncarnationRef.current++;
+    completedRequestGenerationRef.current++;
+  }
 
   // Detect project changes and invalidate SSE context.
   // Keep previous tasks visible while the new project's fetch is in flight
@@ -233,86 +843,194 @@ export function useTasks(options?: UseTasksOptions) {
   // projectContextVersionRef before applying events.
   if (previousProjectIdRef.current !== projectId) {
     previousProjectIdRef.current = projectId;
+    // A request begun by the prior render still closes over its old project id. Invalidate it
+    // synchronously, before effects install this context's fetch, so it cannot paint old cards.
+    fetchVersionRef.current++;
+    refreshAbortRef.current?.abort();
+    currentPageOwnerRef.current?.controller.abort();
+    completedOwnerRef.current?.controller.abort();
+    currentPageOwnerRef.current = null;
+    completedOwnerRef.current = null;
+    completedRequestGenerationRef.current++;
     projectContextVersionRef.current++;
+    liveTaskMutationsRef.current.clear();
+    releaseGateProvenanceRef.current.clear();
+    boardFetchConfirmedRef.current = false;
+    projectChangeRefreshPendingRef.current = true;
   }
 
   const VISIBILITY_REFRESH_DEBOUNCE_MS = 1000;
 
-  const refreshTasks = useCallback(async (options?: { clearOnError?: boolean; searchQueryOverride?: string; includeArchivedOverride?: boolean }) => {
+  const refreshTasks = useCallback(async (options?: { clearOnError?: boolean; searchQueryOverride?: string; resetCompletedPages?: boolean }) => {
     const requestVersion = ++fetchVersionRef.current;
+    completedRequestGenerationRef.current++;
+    abortPaginationOwners();
+    refreshAbortRef.current?.abort();
+    const refreshController = new AbortController();
+    refreshAbortRef.current = refreshController;
+    let refreshTimedOut = false;
+    const refreshTimeout = window.setTimeout(() => {
+      refreshTimedOut = true;
+      refreshController.abort();
+    }, PAGINATION_REQUEST_TIMEOUT_MS);
+    const requestLiveMutationVersion = liveMutationVersionRef.current;
     const requestProjectId = projectId; // Capture the projectId for this request
+    const requestCompletedSortMode = completedSortModeRef.current;
     const query = options?.searchQueryOverride ?? searchQueryRef.current;
-    /*
-    FNXC:ArchivePagination 2026-07-08-01:30:
-    When a search query is active and the user has expanded the Archived
-    column at least once this session, include archived rows in the
-    search-scoped fetch by default (unless the caller explicitly overrides).
-    This is bounded — the merged `listTasks`/`searchTasks` archived branch
-    already runs through `archiveDb.search()`'s own limit, not a full-table
-    load — and restores the pre-FN-7659 behavior where, once expanded,
-    search results included archived matches. A cleared/empty query falls
-    back to the narrow legacy `includeArchivedRef` (always false) so an
-    ordinary refresh never re-triggers a merged archived fetch; the Archived
-    column's own rows are instead carried forward below.
-    */
-    const wantArchived = options?.includeArchivedOverride ?? (query ? archivedLoadedRef.current : includeArchivedRef.current);
-
     try {
-      const fetchedTasks = await api.fetchTasks(undefined, undefined, requestProjectId, query, wantArchived);
-      // Reject if project changed (compare against the projectId at request time) or version is stale
-      if (fetchVersionRef.current !== requestVersion || projectId !== requestProjectId) {
+      const [currentPageOrSearch, completedPage] = await Promise.all([
+        api.fetchTaskPage(requestProjectId, { limit: 100, query: query || undefined, signal: refreshController.signal }),
+        query ? Promise.resolve(undefined) : api.fetchCompletedTasks(requestProjectId, 50, undefined, requestCompletedSortMode, { signal: refreshController.signal }),
+      ]);
+      const fetchedTasks = currentPageOrSearch.tasks;
+      // Reject if the project/search scope changed or a newer request superseded this response.
+      if (fetchVersionRef.current !== requestVersion || projectId !== requestProjectId || (searchQueryRef.current ?? "") !== (query ?? "")) {
         return;
       }
-      const normalizedFetchedTasks = filterActiveTasks(fetchedTasks.map(normalizeTask));
+      const fetchedAt = Date.now();
+      const completedPageTasks = completedPage?.tasks.map(normalizeNonBoardTask) ?? [];
+      const fetchedById = new Map<string, Task>();
+      for (const task of [...fetchedTasks, ...completedPageTasks]) fetchedById.set(task.id, task);
+      const normalizedFetchedTasks = filterActiveTasks([...fetchedById.values()].map(normalizeTask)).map((task) => {
+        if (task.releaseGate === undefined) return task;
+        const provenance = { fingerprint: releaseGateEvidenceFingerprint(task), capturedAt: fetchedAt };
+        /*
+        FNXC:PromoteVisibility 2026-08-13-22:02:
+        A first-seen REST row has no current snapshot to merge against. Validate its verdict before
+        render too, so a response evaluated for an older row never flashes an enabled Promote action.
+        */
+        if (!isReleaseGateVerdictFresh(task.releaseGate, task, provenance, fetchedAt)) {
+          releaseGateProvenanceRef.current.delete(task.id);
+          const { releaseGate: _staleReleaseGate, ...taskWithoutReleaseGate } = task;
+          return taskWithoutReleaseGate as Task;
+        }
+        releaseGateProvenanceRef.current.set(task.id, provenance);
+        return task;
+      });
       /*
-      FNXC:ArchivePagination 2026-07-08-01:30:
-      A generic refresh (SSE reconnect resync, tab-visibility regain, delete-
-      fetch invalidation, project switch, or a search that has been cleared
-      back to "") always fetches with `includeArchived=false` and would
-      otherwise blow away any archived page(s) already merged in by
-      `loadArchivedTasks`/`loadMoreArchivedTasks`, making the Archived column
-      go silently empty and `loadArchivedTasks` a permanent no-op for the
-      rest of the session (code review finding, FN-7659). When this fetch
-      did not itself request archived rows and there is no active search
-      filter, carry the previously merged archived rows (`column ===
-      "archived"`) forward from the latest task state instead of discarding
-      them; active/non-archived rows from the fresh fetch stay authoritative
-      by id. A non-empty search query intentionally skips carry-over: `wantArchived`
-      is already derived above from `archivedLoadedRef` for query-bearing
-      fetches, so search results include fresh, query-matched archived rows
-      directly and boundedly (via `archiveDb.search()`'s own limit) rather
-      than re-showing stale, query-unfiltered archived cards from this branch.
-      Carry-over reads from `archivedTasksRef` (the canonical accumulator
-      maintained by `mergeArchivedPage`), not from the previous `tasks`
-      state, so a search that temporarily narrowed `tasks` to only its
-      matches cannot cause previously loaded archived rows to be lost once
-      the query is cleared.
+      FNXC:DonePagination 2026-09-04-10:36:
+      A generic board refresh fetches current work separately from the newest Done page. Preserve older pages the operator explicitly loaded, but let current-work and newest-page rows win by id; search results intentionally replace the visible snapshot without mutating the Done accumulator.
       */
-      const shouldCarryOverArchived = !wantArchived && !query && archivedLoadedRef.current;
-      if (shouldCarryOverArchived) {
-        const freshIds = new Set(normalizedFetchedTasks.map((task) => task.id));
-        const archivedCarryOver = archivedTasksRef.current.filter((task) => !freshIds.has(task.id));
-        setTasks(archivedCarryOver.length > 0 ? [...normalizedFetchedTasks, ...archivedCarryOver] : normalizedFetchedTasks);
-      } else {
-        setTasks(normalizedFetchedTasks);
+      const shouldCarryOverCompleted = !query && completedPage !== undefined;
+      /*
+      FNXC:DashboardResume 2026-08-05-18:36:
+      React may defer a state updater, but the cache and mutation-fence cleanup run in this same
+      callback. Reconcile from the synchronous task/mutation refs before either side effect, so a
+      remount cannot hydrate the older response after an intervening SSE create or delete.
+      */
+      /*
+      FNXC:TaskEventProjectScope 2026-09-01-06:16:
+      `mergeTaskSnapshot` resolves equal ids by freshness, so callers must establish identical project
+      ownership first. Project-local IDs are intentionally reusable and must never arbitrate cross-project rows.
+      */
+      const ownsCurrentRows = tasksProjectIdRef.current === requestProjectId;
+      const previousById = new Map(ownsCurrentRows ? tasksRef.current.map((task) => [task.id, task]) : []);
+      const fetchedIds = new Set(normalizedFetchedTasks.map((task) => task.id));
+      const reconciledFetchedTasks = normalizedFetchedTasks.flatMap((fetched) => {
+        const liveMutation = ownsCurrentRows ? liveTaskMutationsRef.current.get(fetched.id) : undefined;
+        if (liveMutation && liveMutation.version > requestLiveMutationVersion) {
+          return liveMutation.deleted ? [] : [liveMutation.task ?? previousById.get(fetched.id) ?? fetched];
+        }
+        const current = previousById.get(fetched.id);
+        return [current ? mergeIncomingTask(current, fetched, { fullSnapshot: true }) : fetched];
+      });
+      for (const [taskId, liveMutation] of ownsCurrentRows ? liveTaskMutationsRef.current : []) {
+        if (!fetchedIds.has(taskId) && liveMutation.version > requestLiveMutationVersion && !liveMutation.deleted) {
+          const task = liveMutation.task ?? previousById.get(taskId);
+          if (task) reconciledFetchedTasks.push(task);
+        }
       }
+      const freshIds = new Set(reconciledFetchedTasks.map((task) => task.id));
+      const completedCarryOver = shouldCarryOverCompleted && ownsCurrentRows && !options?.resetCompletedPages
+        ? completedTasksRef.current.filter((task) => !freshIds.has(task.id))
+        : [];
+      const nextTasks = completedCarryOver.length > 0
+        ? [...reconciledFetchedTasks, ...completedCarryOver]
+        : reconciledFetchedTasks;
+      const tasksForCache = nextTasks;
+      const currentNextCursor = currentPageOrSearch.nextCursor?.trim() || null;
+      const currentContinuationInvalid = currentPageOrSearch.hasMore && !currentNextCursor;
+      currentPageCursorRef.current = currentContinuationInvalid ? null : currentNextCursor;
+      currentConsumedCursorsRef.current.clear();
+      setCurrentTasksTotal(currentPageOrSearch.total);
+      setCurrentTasksHasMore(currentPageOrSearch.hasMore && !currentContinuationInvalid);
+      setCurrentTasksPaginationError(currentContinuationInvalid ? "invalid-continuation" : null);
+      setCurrentTasksProgress((value) => value + 1);
+      if (completedPage) {
+        const nextById = new Map(nextTasks.map((task) => [task.id, task]));
+        const nextCompleted = [
+          ...completedPageTasks.map((task) => nextById.get(task.id) ?? task),
+          ...completedCarryOver,
+        ];
+        completedTasksRef.current = nextCompleted;
+        const completedNextCursor = completedPage.nextCursor?.trim() || null;
+        const completedContinuationInvalid = completedPage.hasMore && !completedNextCursor;
+        completedNextCursorRef.current = completedContinuationInvalid ? null : completedNextCursor;
+        completedConsumedCursorsRef.current.clear();
+        setCompletedPaginationError(completedContinuationInvalid ? "invalid-continuation" : null);
+        setCompletedProgress((value) => value + 1);
+        if (liveMutationVersionRef.current === requestLiveMutationVersion) {
+          completedTotalRef.current = completedPage.total;
+          setCompletedTotal(completedPage.total);
+          setCompletedCounts(completedPage.counts ?? { byColumn: {}, byWorkflow: {} });
+          setCompletedHasMore(completedPage.hasMore && !completedContinuationInvalid);
+        } else {
+          setCompletedHasMore(completedPage.hasMore && !completedContinuationInvalid);
+        }
+      }
+      const retainedTaskIds = new Set(nextTasks.map((task) => task.id));
+      for (const taskId of releaseGateProvenanceRef.current.keys()) {
+        if (!retainedTaskIds.has(taskId)) releaseGateProvenanceRef.current.delete(taskId);
+      }
+      tasksRef.current = nextTasks;
+      setTasks(nextTasks);
+      for (const [taskId, mutation] of liveTaskMutationsRef.current) {
+        if (mutation.version <= requestLiveMutationVersion) {
+          liveTaskMutationsRef.current.delete(taskId);
+        }
+      }
+      tasksProjectIdRef.current = requestProjectId;
       if (requestProjectId) {
-        const cachedPayload = fetchedTasks.length > 500 ? fetchedTasks.slice(0, 500) : fetchedTasks;
-        writeCache(`${SWR_CACHE_KEYS.TASKS_PREFIX}${requestProjectId}`, cachedPayload, { maxBytes: 500_000 });
+        writeTaskCacheSnapshot(`${SWR_CACHE_KEYS.TASKS_PREFIX}${requestProjectId}`, tasksForCache);
       }
       setIsStale(false);
       setLastRefreshErrorAt(null);
       // Record when we received fresh server data for stuck detection
       lastFetchTimeMs.current = Date.now();
+      // FNXC:MobileTabDiscard 2026-07-26-16:40: every row in `tasks` is now server-confirmed, so live
+      // single-row updates may advance the clock from here on.
+      boardFetchConfirmedRef.current = true;
       lastConfirmedProjectIdRef.current = requestProjectId;
       lastConfirmedSearchQueryRef.current = query;
-      lastConfirmedIncludeArchivedRef.current = wantArchived;
-    } catch {
-      // Reject if project changed or version is stale
-      if (fetchVersionRef.current !== requestVersion || projectId !== requestProjectId) {
+    } catch (error) {
+      // Reject failures from a superseded project/search scope too; they cannot invalidate the active page.
+      if (fetchVersionRef.current !== requestVersion || projectId !== requestProjectId || (searchQueryRef.current ?? "") !== (query ?? "")) {
         return;
       }
+      if (refreshController.signal.aborted && !refreshTimedOut) return;
       setLastRefreshErrorAt(Date.now());
+      setCurrentTasksPaginationError(refreshTimedOut ? "timeout" : "request-failed");
+      if (!query) setCompletedPaginationError(refreshTimedOut ? "timeout" : "request-failed");
+      /*
+      FNXC:MobileTabDiscard 2026-07-26-10:52:
+      Load-bearing for the long hydration TTL: a snapshot is only allowed to outlive a tab discard
+      because a failed revalidation deletes it here. Without this, an unverifiable board could be
+      re-hydrated on every subsequent restore for the whole TTL window. Do not weaken.
+
+      FNXC:MobileTabDiscard 2026-07-26-16:40:
+      CORRECTION — the 10:52 note above claimed "a failed revalidation deletes it", and the code did
+      exactly that for EVERY failure. That was wrong, and it broke the case the cache exists for: the
+      mount revalidation runs on a just-woken mobile radio, where the first fetch routinely rejects at
+      the transport layer. Such a rejection carries no information about the snapshot, yet it deleted
+      the entry AND (with `clearOnError`) blanked the freshly hydrated board — so the restore went white
+      and the next restore had nothing left to hydrate. Only a failure that actually reached the server
+      is allowed to destroy the snapshot; see `didFailureReachServer`. Suspension/offline failures leave
+      both the cache and the on-screen rows intact and rely on the retry paths keyed off
+      `lastRefreshErrorAt`.
+      */
+      if (!didFailureReachServer(error)) {
+        return;
+      }
       if (requestProjectId) {
         clearCache(`${SWR_CACHE_KEYS.TASKS_PREFIX}${requestProjectId}`);
       }
@@ -320,124 +1038,259 @@ export function useTasks(options?: UseTasksOptions) {
         setTasks([]);
         return;
       }
+    } finally {
+      window.clearTimeout(refreshTimeout);
+      if (refreshAbortRef.current === refreshController) refreshAbortRef.current = null;
     }
-  }, [projectId]);
+  }, [abortPaginationOwners, projectId]);
   refreshTasksRef.current = refreshTasks;
 
-  const shouldRefreshOnTaskViewReentry = useCallback(() => {
-    if (lastRefreshErrorAt !== null) return true;
-    if (searchQueryRef.current) return true;
-    if (includeArchivedRef.current) return true;
-    if (lastConfirmedProjectIdRef.current !== projectId) return true;
-    if (lastConfirmedSearchQueryRef.current !== searchQueryRef.current) return true;
-    if (lastConfirmedIncludeArchivedRef.current !== includeArchivedRef.current) return true;
+  /*
+  FNXC:DashboardResume 2026-08-05-18:00:
+  Visibility, focus, pageshow, and an SSE reconnect are independent browser resume signals; any one
+  may be the only signal delivered by a desktop tab, bfcache restore, mobile PWA, or resumed socket.
+  They all enter this seam, which deduplicates only an overlapping request for the same captured
+  project/search identity. A changed context, an unmounted hook, or an older request version
+  cannot write cards after newer server or live-event state, and a failed request clears the in-flight
+  marker so the next resume signal retries without blanking the usable SWR snapshot.
+  */
+  const revalidateAfterResume = useCallback((trigger: "visibility" | "focus" | "pageshow" | "sse-reconnect", reason?: string) => {
+    if (!mountedRef.current) return;
+    const query = searchQueryRef.current;
+    const identity = `${projectContextVersionRef.current}:${projectId ?? "default"}:${query ?? ""}`;
+    const existing = resumeRefreshRef.current;
+    if (existing?.identity === identity) return;
 
-    const lastFetchAt = lastFetchTimeMs.current;
-    if (lastFetchAt === undefined) return true;
+    recordResumeEvent({ view: "useTasks", trigger, projectId, replayAttempted: false, reason });
+    const promise = refreshTasksRef.current();
+    resumeRefreshRef.current = { identity, promise };
+    void promise.finally(() => {
+      if (resumeRefreshRef.current?.promise === promise) {
+        resumeRefreshRef.current = null;
+      }
+    });
+  }, [projectId]);
 
-    return Date.now() - lastFetchAt > TASK_VIEW_REENTRY_FRESHNESS_MS;
-  }, [lastRefreshErrorAt, projectId]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      fetchVersionRef.current++;
+      refreshAbortRef.current?.abort();
+      currentPageOwnerRef.current?.controller.abort();
+      completedOwnerRef.current?.controller.abort();
+      currentPageOwnerRef.current = null;
+      completedOwnerRef.current = null;
+      resumeRefreshRef.current = null;
+    };
+  }, []);
 
   /*
-  FNXC:DashboardTaskCache 2026-06-29-22:35:
-  Brief Board/List returns should reuse fresh in-memory task state instead of issuing another all-task fetch, so the existing task array renders immediately without an empty/loading shell. Stale, missing, failed, project/search, or archived snapshots still perform one catch-up because task SSE is disabled off task-list views and missed events need server confirmation.
+  FNXC:DashboardLiveUpdates 2026-08-04-08:12:
+  Task SSE is disabled outside Board/List, so elapsed time cannot prove that the in-memory snapshot is
+  current: any task lifecycle event may have been missed during that lossy interval. Every genuine
+  false→true task-view return therefore reconciles once with the server, regardless of snapshot age.
 
-  FNXC:DashboardTaskCache 2026-06-29-23:12:
-  The freshness shortcut is scoped only to in-app task-view re-entry. Initial mount, tab visibility recovery, SSE reconnect resync, search refreshes, and delete fetch-version invalidation remain independent safety paths because each represents either a new browser/server gap or a changed query context.
+  The project-change effect is deliberately later in this hook. When a project switch and false→true
+  return occur in one render, it owns the single new-project request; this effect skips that coincident
+  transition rather than issuing a duplicate. Initial true mounts, false→false renders, and Board↔List
+  true→true renders are not re-entries, while a later same-project false→true transition remains eligible.
   */
   useEffect(() => {
     const previous = prevSseEnabledRef.current;
     prevSseEnabledRef.current = sseEnabled;
 
-    if (previous === false && sseEnabled === true && shouldRefreshOnTaskViewReentry()) {
+    if (previous === false && sseEnabled === true && !projectChangeRefreshPendingRef.current) {
       void refreshTasksRef.current();
     }
-  }, [shouldRefreshOnTaskViewReentry, sseEnabled]);
+  }, [sseEnabled]);
 
-  /*
-  FNXC:ArchivePagination 2026-07-08-00:00:
-  FN-7659 — the Archived column must load newest-first (`archivedAt DESC`) in
-  server-backed pages of 100 with an explicit "Show more" affordance, and the
-  full archive must never load into memory in one pass. The prior
-  implementation flipped `includeArchived` and re-ran the merged `refreshTasks`
-  (backed by `listTasks({includeArchived:true})`), which (a) sorted archived
-  rows oldest-first alongside active rows and (b) fetched the ENTIRE archive
-  on every subsequent refresh (SSE reconnect, tab-visibility recovery,
-  search) once the column had ever been expanded. `loadArchivedTasks`/
-  `loadMoreArchivedTasks` now call the dedicated `GET /tasks/archived` page
-  read and merge only the fetched page into `tasks` (de-duplicated by id,
-  active SQLite rows authoritative — mirrors the existing collapse-by-id
-  invariant). `includeArchived` is intentionally left untouched here so it
-  keeps its narrow legacy meaning (an explicit search override) instead of
-  being repurposed to gate a full-archive refetch.
-  */
-  const [archivedHasMore, setArchivedHasMore] = useState(false);
-  const [archivedLoadingMore, setArchivedLoadingMore] = useState(false);
-  const archivedOffsetRef = useRef(0);
-  // Note: archivedLoadedRef is declared earlier (near tasksRef) so refreshTasks can read it.
-  const archivedLoadingMoreRef = useRef(false);
-  /*
-  FNXC:ArchivePagination 2026-07-08-01:30:
-  Canonical store of every archived row merged in so far via
-  `loadArchivedTasks`/`loadMoreArchivedTasks`, independent of the transient
-  `tasks` state. A search-scoped `refreshTasks` fetch can temporarily
-  replace `tasks` with only the query-matched rows (active + matching
-  archived); if the generic-refresh carry-over in `refreshTasks` read
-  archived rows back out of `tasks` at that point, clearing the query would
-  "carry over" only the narrower search-result set and permanently lose any
-  previously loaded archived rows that did not match the last query. Keeping
-  a dedicated accumulator means carry-over always restores the full set of
-  archived rows loaded so far, regardless of what the last fetch's result
-  shape happened to be.
-  */
-  const archivedTasksRef = useRef<Task[]>([]);
+  const completedRequestIsCurrent = useCallback((request: {
+    generation: number;
+    fetchVersion: number;
+    projectId: string | undefined;
+    query: string | undefined;
+    searchIncarnation: number;
+    sort: TaskColumnSortMode;
+  }) => (
+    completedRequestGenerationRef.current === request.generation
+    && fetchVersionRef.current === request.fetchVersion
+    && projectId === request.projectId
+    && searchIncarnationRef.current === request.searchIncarnation
+    && searchQueryRef.current === request.query
+    && completedSortModeRef.current === request.sort
+  ), [projectId]);
 
-  const mergeArchivedPage = useCallback((page: Task[]) => {
-    const normalizedPage = page.map(normalizeTask);
-    const knownArchivedIds = new Set(archivedTasksRef.current.map((task) => task.id));
-    const newArchived = normalizedPage.filter((task) => !knownArchivedIds.has(task.id));
-    if (newArchived.length > 0) {
-      archivedTasksRef.current = [...archivedTasksRef.current, ...newArchived];
-    }
-    setTasks((prev) => {
-      const existingIds = new Set(prev.map((task) => task.id));
-      const additions = normalizedPage.filter((task) => !existingIds.has(task.id));
-      if (additions.length === 0) return prev;
-      return [...prev, ...additions];
+  /* DELIBERATE-LITERAL: the `column === "done"` below is intentional as the degraded fallback when the
+     workflow column resolver is unavailable — `done` is the built-in Complete column id. */
+  const mergeCompletedPage = useCallback((page: Task[], requestLiveMutationVersion: number) => {
+    const normalizedPage = page.map(normalizeNonBoardTask);
+    const knownIds = new Set(completedTasksRef.current.map((task) => task.id));
+    const pageIds = new Set<string>();
+    const additions = normalizedPage.flatMap((task) => {
+      if (knownIds.has(task.id) || pageIds.has(task.id)) return [];
+      pageIds.add(task.id);
+      const liveMutation = liveTaskMutationsRef.current.get(task.id);
+      if (liveMutation && liveMutation.version > requestLiveMutationVersion) {
+        if (liveMutation.deleted || !liveMutation.task) return [];
+        const liveIsCompleted = liveMutation.task.column === "done"
+          || resolveColumnFlagsRef.current?.(liveMutation.task)?.complete === true;
+        return liveIsCompleted ? [liveMutation.task] : [];
+      }
+      return [task];
+    });
+    if (additions.length === 0) return;
+    completedTasksRef.current = [...completedTasksRef.current, ...additions];
+    setTasks((previous) => {
+      const existingIds = new Set(previous.map((task) => task.id));
+      const next = [...previous, ...additions.filter((task) => !existingIds.has(task.id))];
+      tasksRef.current = next;
+      return next;
     });
   }, []);
 
-  /** Lazy-load archived tasks, page 1 (100, newest-first). Called by the Board when the archived column is first expanded. */
-  const loadArchivedTasks = useCallback(async () => {
-    if (archivedLoadedRef.current) return;
-    archivedLoadedRef.current = true;
-    try {
-      const { tasks: page, hasMore } = await api.fetchArchivedTasks(projectId, 100, 0);
-      mergeArchivedPage(page);
-      archivedOffsetRef.current = page.length;
-      setArchivedHasMore(hasMore);
-    } catch {
-      // Allow a future expand attempt to retry the first page.
-      archivedLoadedRef.current = false;
-    }
-  }, [projectId, mergeArchivedPage]);
+  /*
+  FNXC:TaskListPagination 2026-09-09-00:33:
+  A page request owns its lock independently from response freshness. Invalidations abort the owner, and only that exact owner may release itself, so an obsolete finally can neither strand the collection nor unlock a successor.
 
-  /** Fetch the next 100-item page of archived tasks. No-op when there is no further page or a fetch is already in flight. */
-  const loadMoreArchivedTasks = useCallback(async () => {
-    if (!archivedLoadedRef.current || archivedLoadingMoreRef.current) return;
-    if (!archivedHasMore) return;
-    archivedLoadingMoreRef.current = true;
-    setArchivedLoadingMore(true);
+  FNXC:TaskListPagination 2026-09-09-00:33:
+  Progress follows the server's opaque continuation even when every returned ID is already mounted. Terminal hasMore is authoritative; missing, repeated, or cyclic continuations stop automatic loading and require an explicit fresh retry.
+  */
+  const loadMoreCurrentTasks = useCallback(async () => {
+    const cursor = currentPageCursorRef.current;
+    if (currentPageOwnerRef.current || !currentTasksHasMore || !cursor) return;
+    const owner: PaginationOwner = { controller: new AbortController(), token: Symbol("current-page"), timedOut: false };
+    currentPageOwnerRef.current = owner;
+    currentPageLoadingRef.current = true;
+    setCurrentTasksLoadingMore(true);
+    setCurrentTasksPaginationError(null);
+    const requestVersion = fetchVersionRef.current;
+    const requestProjectId = projectId;
+    const requestQuery = searchQueryRef.current;
+    const requestSearchIncarnation = searchIncarnationRef.current;
+    const timeout = window.setTimeout(() => {
+      owner.timedOut = true;
+      owner.controller.abort();
+    }, PAGINATION_REQUEST_TIMEOUT_MS);
     try {
-      const { tasks: page, hasMore } = await api.fetchArchivedTasks(projectId, 100, archivedOffsetRef.current);
-      mergeArchivedPage(page);
-      archivedOffsetRef.current += page.length;
-      setArchivedHasMore(hasMore);
+      const page = await api.fetchTaskPage(requestProjectId, { limit: 100, cursor, query: requestQuery || undefined, signal: owner.controller.signal });
+      if (
+        fetchVersionRef.current !== requestVersion
+        || projectId !== requestProjectId
+        || searchQueryRef.current !== requestQuery
+        || searchIncarnationRef.current !== requestSearchIncarnation
+      ) return;
+      const completedIds = new Set(completedTasksRef.current.map((task) => task.id));
+      const byId = new Map(tasksRef.current.map((task) => [task.id, task]));
+      for (const incoming of page.tasks.map(normalizeNonBoardTask)) {
+        const current = byId.get(incoming.id);
+        byId.set(incoming.id, current ? mergeIncomingTask(current, incoming, { fullSnapshot: true }) : incoming);
+      }
+      /*
+      FNXC:TaskSearchPagination 2026-09-09-01:19:
+      A searched page is a self-contained server-ordered collection. Never append the independent Done-history accumulator to it: those rows may not match the query and would corrupt both filtering and order.
+      */
+      const currentRows = [...byId.values()].filter((task) => !completedIds.has(task.id));
+      const completedRows = completedTasksRef.current.map((task) => byId.get(task.id) ?? task);
+      const next = requestQuery ? [...byId.values()] : [...currentRows, ...completedRows];
+      tasksRef.current = next;
+      setTasks(next);
+      currentConsumedCursorsRef.current.add(cursor);
+      const nextCursor = page.nextCursor?.trim() || null;
+      const invalidContinuation = page.hasMore && (!nextCursor || nextCursor === cursor || currentConsumedCursorsRef.current.has(nextCursor));
+      currentPageCursorRef.current = invalidContinuation ? null : nextCursor;
+      setCurrentTasksTotal(page.total);
+      setCurrentTasksHasMore(page.hasMore && !invalidContinuation);
+      setCurrentTasksPaginationError(invalidContinuation ? "invalid-continuation" : null);
+      setCurrentTasksProgress((value) => value + 1);
+    } catch (error) {
+      const superseded = currentPageOwnerRef.current !== owner
+        || fetchVersionRef.current !== requestVersion
+        || searchIncarnationRef.current !== requestSearchIncarnation;
+      if (!superseded) setCurrentTasksPaginationError(owner.timedOut ? "timeout" : "request-failed");
+      if (!owner.controller.signal.aborted || owner.timedOut) throw error;
     } finally {
-      archivedLoadingMoreRef.current = false;
-      setArchivedLoadingMore(false);
+      window.clearTimeout(timeout);
+      if (currentPageOwnerRef.current === owner) {
+        currentPageOwnerRef.current = null;
+        currentPageLoadingRef.current = false;
+        setCurrentTasksLoadingMore(false);
+      }
     }
-  }, [projectId, archivedHasMore, mergeArchivedPage]);
+  }, [currentTasksHasMore, projectId]);
+
+  /** Fetch the next bounded Done page. No-op when every completed task is already loaded. */
+  const loadMoreCompletedTasks = useCallback(async () => {
+    const cursor = completedNextCursorRef.current;
+    if (completedOwnerRef.current || !completedHasMore || !cursor) return;
+    const owner: PaginationOwner = { controller: new AbortController(), token: Symbol("completed-page"), timedOut: false };
+    completedOwnerRef.current = owner;
+    completedLoadingMoreRef.current = true;
+    setCompletedLoadingMore(true);
+    setCompletedPaginationError(null);
+    const request = {
+      generation: completedRequestGenerationRef.current,
+      fetchVersion: fetchVersionRef.current,
+      projectId,
+      query: searchQueryRef.current,
+      searchIncarnation: searchIncarnationRef.current,
+      sort: completedSortModeRef.current,
+    };
+    const requestLiveMutationVersion = liveMutationVersionRef.current;
+    const timeout = window.setTimeout(() => {
+      owner.timedOut = true;
+      owner.controller.abort();
+    }, PAGINATION_REQUEST_TIMEOUT_MS);
+    try {
+      const page = await api.fetchCompletedTasks(projectId, 50, cursor, request.sort, { signal: owner.controller.signal });
+      if (!completedRequestIsCurrent(request)) return;
+      mergeCompletedPage(page.tasks, requestLiveMutationVersion);
+      completedConsumedCursorsRef.current.add(cursor);
+      const nextCursor = page.nextCursor?.trim() || null;
+      const invalidContinuation = page.hasMore && (!nextCursor || nextCursor === cursor || completedConsumedCursorsRef.current.has(nextCursor));
+      completedNextCursorRef.current = invalidContinuation ? null : nextCursor;
+      if (liveMutationVersionRef.current === requestLiveMutationVersion) {
+        completedTotalRef.current = page.total;
+        setCompletedTotal(page.total);
+        setCompletedCounts(page.counts ?? { byColumn: {}, byWorkflow: {} });
+      }
+      setCompletedHasMore(page.hasMore && !invalidContinuation);
+      setCompletedPaginationError(invalidContinuation ? "invalid-continuation" : null);
+      setCompletedProgress((value) => value + 1);
+    } catch (error) {
+      const superseded = completedOwnerRef.current !== owner || !completedRequestIsCurrent(request);
+      if (!superseded) setCompletedPaginationError(owner.timedOut ? "timeout" : "request-failed");
+      if (!owner.controller.signal.aborted || owner.timedOut) throw error;
+    } finally {
+      window.clearTimeout(timeout);
+      if (completedOwnerRef.current === owner) {
+        completedOwnerRef.current = null;
+        completedLoadingMoreRef.current = false;
+        setCompletedLoadingMore(false);
+      }
+    }
+  }, [completedHasMore, completedRequestIsCurrent, mergeCompletedPage, projectId]);
+
+  /*
+  FNXC:DonePagination 2026-09-04-19:28:
+  A Done sort change resets the accumulated server pages before adopting page zero in the new order.
+  The generation fence rejects an older Show-more response, while the shared refresh keeps current
+  lanes and the exact Done total synchronized in one authoritative snapshot.
+  */
+  const changeCompletedSortMode = useCallback(async (mode: TaskColumnSortMode) => {
+    if (completedSortModeRef.current === mode) return;
+    completedSortModeRef.current = mode;
+    setCompletedSortMode(mode);
+    completedRequestGenerationRef.current++;
+    completedTasksRef.current = [];
+    completedNextCursorRef.current = null;
+    completedConsumedCursorsRef.current.clear();
+    completedLoadingMoreRef.current = false;
+    setCompletedLoadingMore(false);
+    setCompletedPaginationError(null);
+    setCompletedHasMore(false);
+    await refreshTasks({ resetCompletedPages: true });
+  }, [refreshTasks]);
 
   // Debounced search effect - separate from refreshTasks to avoid dependency cycle
   const prevSearchQueryRef = useRef<string | undefined>(searchQuery);
@@ -458,31 +1311,66 @@ export function useTasks(options?: UseTasksOptions) {
       return;
     }
 
-    const cachedTasks = readCache<Task[]>(`${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+    const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
+    const cachedTasks = readCache<Task[]>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
     if (Array.isArray(cachedTasks)) {
       if (cachedTasks.length > 0 && !loggedTaskCacheHitProjects.has(projectId)) {
         loggedTaskCacheHitProjects.add(projectId);
         console.info("[swr-cache] hit tasks=", cachedTasks.length, "projectId=", projectId);
       }
-      setTasks(filterActiveTasks(cachedTasks.map(normalizeTask)));
+      const nextTasks = filterActiveTasks(cachedTasks.map(normalizeNonBoardTask));
+      tasksRef.current = nextTasks;
+      tasksProjectIdRef.current = projectId;
+      setTasks(nextTasks);
+      /*
+      FNXC:MobileTabDiscard 2026-07-26-14:18:
+      A project switch replaces `tasks` with the new project's snapshot, so the freshness clock must
+      be replaced too — the previous project's fetch time no longer describes these rows. Only set it
+      when a snapshot was actually hydrated: on a cache miss the previous project's rows stay on
+      screen (stale-while-revalidate), and their real fetch time remains the honest answer. This runs
+      before the mount/refresh effect below, so the fetch that resolves next still wins.
+      */
+      lastFetchTimeMs.current = readCacheSavedAt(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+      // FNXC:MobileTabDiscard 2026-07-26-16:40: these rows come from cache, not the server — an SSE
+      // event must not stamp them as measured-from-now until this project's fetch confirms them.
+      boardFetchConfirmedRef.current = false;
+    } else if (tasksProjectIdRef.current !== projectId) {
+      // Never retain another project's stale rows when this project's snapshot is absent.
+      tasksRef.current = [];
+      tasksProjectIdRef.current = projectId;
+      setTasks([]);
+      lastFetchTimeMs.current = undefined;
+      boardFetchConfirmedRef.current = false;
     }
     setIsStale(true);
   }, [projectId]);
 
   // Fetch initial tasks and recover when the tab becomes visible again.
+  /*
+  FNXC:MobileTabDiscard 2026-07-26-10:55:
+  The mandatory half of stale-while-revalidate. Runs once per mount (and per projectId change) with no
+  freshness shortcut, so a board hydrated from an hours-old snapshot is always corrected by exactly one
+  immediate fetch, and `isStale` marks the window so the revalidating indicator is visible meanwhile.
+  */
   useEffect(() => {
     setIsStale(true);
     void refreshTasks({ clearOnError: true });
-    // FNXC:ArchivePagination 2026-07-08-00:00: reset archived-page state on
-    // project switch so a new project's Archived column starts collapsed
-    // and re-fetches its own page 1 rather than reusing the previous
-    // project's offset/hasMore.
-    archivedLoadedRef.current = false;
-    archivedOffsetRef.current = 0;
-    archivedLoadingMoreRef.current = false;
-    archivedTasksRef.current = [];
-    setArchivedHasMore(false);
-    setArchivedLoadingMore(false);
+    projectChangeRefreshPendingRef.current = false;
+    completedRequestGenerationRef.current++;
+    completedNextCursorRef.current = null;
+    completedConsumedCursorsRef.current.clear();
+    currentConsumedCursorsRef.current.clear();
+    completedLoadingMoreRef.current = false;
+    currentPageLoadingRef.current = false;
+    completedTasksRef.current = [];
+    completedTotalRef.current = 0;
+    setCompletedTotal(0);
+    setCompletedCounts({ byColumn: {}, byWorkflow: {} });
+    setCompletedHasMore(false);
+    setCompletedLoadingMore(false);
+    setCompletedPaginationError(null);
+    setCurrentTasksLoadingMore(false);
+    setCurrentTasksPaginationError(null);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState !== "visible") {
@@ -501,14 +1389,7 @@ export function useTasks(options?: UseTasksOptions) {
           previousContextVersion,
           currentContextVersion: projectContextVersionRef.current,
         });
-        recordResumeEvent({
-          view: "useTasks",
-          trigger: "visibility",
-          projectId,
-          replayAttempted: false,
-          reason: "context-version-changed",
-        });
-        void refreshTasks();
+        revalidateAfterResume("visibility", "context-version-changed");
         return;
       }
 
@@ -519,21 +1400,37 @@ export function useTasks(options?: UseTasksOptions) {
       }
 
       lastVisibilityRefreshRef.current = now;
-      recordResumeEvent({
-        view: "useTasks",
-        trigger: "visibility",
-        projectId,
-        replayAttempted: false,
-        reason: "debounced-refresh",
-      });
-      void refreshTasks();
+      revalidateAfterResume("visibility", "debounced-refresh");
+    };
+
+    const handleFocus = () => {
+      if (document.visibilityState === "visible") {
+        revalidateAfterResume("focus", "focus-return");
+      }
+    };
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (document.visibilityState !== "hidden") {
+        revalidateAfterResume("pageshow", event.persisted ? "bfcache-restore" : "browser-restore");
+      }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("pageshow", handlePageShow);
     return () => {
+      // Effects clean up before a project replacement or unmount. Invalidate the captured request
+      // so a late server response cannot write to the next context (or a disposed hook).
+      fetchVersionRef.current++;
+      refreshAbortRef.current?.abort();
+      currentPageOwnerRef.current?.controller.abort();
+      completedOwnerRef.current?.controller.abort();
+      currentPageOwnerRef.current = null;
+      completedOwnerRef.current = null;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("pageshow", handlePageShow);
     };
-  }, [refreshTasks]);
+  }, [refreshTasks, revalidateAfterResume]);
 
   // SSE live updates
   // Note: SSE events from stale project contexts are ignored via projectContextVersionRef.
@@ -560,26 +1457,111 @@ export function useTasks(options?: UseTasksOptions) {
     // Guards against reconnect callbacks firing after the effect has cleaned up
     // (e.g., sseEnabled flipped to false during a pending reconnect timer in sse-bus).
     let active = true;
+    const readScopedEvent = <T,>(event: MessageEvent): T | null => {
+      const payload = JSON.parse(event.data) as T;
+      const eventProjectId = readTaskEventProjectId(payload);
+      if (!isForeignTaskEvent(eventProjectId, projectId)) return stripTaskEventProjectId(payload);
+      pushTrace("useTasks", "dropped-foreign-project-event", {
+        eventProjectId,
+        projectId,
+        id: typeof payload === "object" && payload !== null && "id" in payload
+          ? (payload as { id?: unknown }).id
+          : undefined,
+      });
+      return null;
+    };
 
     // Guard against stale callbacks: when sseEnabled flips false or the
     // effect unmounts, these handlers must not fire refreshTasks into a
     // missions-only view where the SSE should be inactive.
+    const recordLiveMutation = (task: Task, deleted: boolean) => {
+      const version = ++liveMutationVersionRef.current;
+      liveTaskMutationsRef.current.set(task.id, { version, deleted, task: deleted ? undefined : task });
+    };
+    const applyLiveTasks = (update: (current: Task[]) => Task[]) => {
+      const nextTasks = update(tasksRef.current);
+      tasksRef.current = nextTasks;
+      setTasks(nextTasks);
+    };
+    /* DELIBERATE-LITERAL: the `column === "done"` below is intentional as the degraded fallback when the
+       workflow column resolver is unavailable — `done` is the built-in Complete column id. */
+    const isCompletedTask = (task: Task, column: ColumnId = task.column): boolean => (
+      resolveColumnFlagsRef.current?.({ ...task, column })?.complete === true || column === "done"
+    );
+    const syncCompletedMembership = (
+      task: Task,
+      previousTask: Task | undefined,
+      previousColumn: ColumnId | undefined,
+      currentColumn: ColumnId | undefined,
+      options?: { countUnknownEntry?: boolean },
+    ) => {
+      const previouslyCompleted = previousTask !== undefined && previousColumn !== undefined
+        ? isCompletedTask(previousTask, previousColumn)
+        : false;
+      const currentlyCompleted = currentColumn !== undefined && isCompletedTask(task, currentColumn);
+      const currentIndex = completedTasksRef.current.findIndex((candidate) => candidate.id === task.id);
+      if (currentlyCompleted) {
+        completedTasksRef.current = currentIndex === -1
+          ? [task, ...completedTasksRef.current]
+          : completedTasksRef.current.map((candidate, index) => index === currentIndex ? task : candidate);
+      } else if (currentIndex !== -1) {
+        completedTasksRef.current = completedTasksRef.current.filter((candidate) => candidate.id !== task.id);
+      }
+
+      const previousWorkflowId = previousTask ? resolveWorkflowIdRef.current?.(previousTask) : undefined;
+      const currentWorkflowId = currentlyCompleted ? resolveWorkflowIdRef.current?.(task) : undefined;
+      setCompletedCounts((current) => {
+        const byColumn = { ...current.byColumn };
+        const byWorkflow = { ...current.byWorkflow };
+        const adjust = (column: ColumnId | undefined, workflowId: string | undefined, delta: number) => {
+          if (!column) return;
+          byColumn[column] = Math.max(0, (byColumn[column] ?? 0) + delta);
+          if (!workflowId) return;
+          const workflowCounts = { ...(byWorkflow[workflowId] ?? {}) };
+          workflowCounts[column] = Math.max(0, (workflowCounts[column] ?? 0) + delta);
+          byWorkflow[workflowId] = workflowCounts;
+        };
+        if (previouslyCompleted) adjust(previousColumn, previousWorkflowId, -1);
+        if (currentlyCompleted && (previousTask !== undefined || options?.countUnknownEntry !== false)) {
+          adjust(currentColumn, currentWorkflowId, 1);
+        }
+        return { byColumn, byWorkflow };
+      });
+
+      const countedCurrentMembership = currentlyCompleted
+        && (previousTask !== undefined || options?.countUnknownEntry !== false);
+      const delta = Number(countedCurrentMembership) - Number(previouslyCompleted);
+      if (delta !== 0) {
+        setCompletedTotal((current) => {
+          const next = Math.max(0, current + delta);
+          completedTotalRef.current = next;
+          // FNXC:DonePagination 2026-09-09-01:19: The last server cursor remains authoritative; live count deltas never manufacture a continuation from mounted membership.
+          return next;
+        });
+      }
+    };
     const handleCreated = (e: MessageEvent) => {
       if (isStale()) {
         traceDroppedStaleEvent();
         return;
       }
-      const task = normalizeTask(JSON.parse(e.data) as Task);
+      const payload = readScopedEvent<Task>(e);
+      if (!payload) return;
+      const task = normalizeTask(stripTransientReleaseGate(payload));
+      recordLiveMutation(task, isSoftDeleted(task));
       if (searchQueryRef.current) {
         void refreshTasksRef.current({ searchQueryOverride: searchQueryRef.current });
         return;
       }
+      const existingCreatedTask = tasksRef.current.find((candidate) => candidate.id === task.id);
       if (isSoftDeleted(task)) {
-        setTasks((prev) => prev.filter((candidate) => candidate.id !== task.id));
+        if (existingCreatedTask) syncCompletedMembership(task, existingCreatedTask, existingCreatedTask.column, undefined);
+        applyLiveTasks((prev) => prev.filter((candidate) => candidate.id !== task.id));
         pushTrace("useTasks", "soft-deleted-task-suppressed", { event: "task:created", id: task.id });
         return;
       }
-      setTasks((prev) => {
+      syncCompletedMembership(task, existingCreatedTask, existingCreatedTask?.column, task.column);
+      applyLiveTasks((prev) => {
         const existingIndex = prev.findIndex((candidate) => candidate.id === task.id);
         if (existingIndex === -1) {
           return [...prev, task];
@@ -595,7 +1577,7 @@ export function useTasks(options?: UseTasksOptions) {
         next[existingIndex] = merged;
         return next;
       });
-      lastFetchTimeMs.current = Date.now();
+      advanceFreshnessClockForLiveUpdate();
     };
 
     const handleMoved = (e: MessageEvent) => {
@@ -603,34 +1585,46 @@ export function useTasks(options?: UseTasksOptions) {
         traceDroppedStaleEvent();
         return;
       }
-      if (searchQueryRef.current) {
+      // #1403: the move event carries `ColumnId` (custom column ids admitted).
+      const payload = readScopedEvent<{ task: Task; from: ColumnId; to: ColumnId }>(e);
+      if (searchQueryRef.current && payload) {
         void refreshTasksRef.current({ searchQueryOverride: searchQueryRef.current });
         return;
       }
-      // #1403: the move event carries `ColumnId` (custom column ids admitted).
-      const { task, to }: { task: Task; from: ColumnId; to: ColumnId } = JSON.parse(e.data);
-      const normalizedTask = normalizeTask(task);
+      if (!payload) return;
+      const { task, from, to } = payload;
+      const normalizedTask = normalizeTask(stripTransientReleaseGate(task));
       if (isSoftDeleted(normalizedTask)) {
-        setTasks((prev) => prev.filter((candidate) => candidate.id !== normalizedTask.id));
+        recordLiveMutation(normalizedTask, true);
+        syncCompletedMembership(normalizedTask, tasksRef.current.find((candidate) => candidate.id === normalizedTask.id) ?? normalizedTask, from, undefined);
+        applyLiveTasks((prev) => prev.filter((candidate) => candidate.id !== normalizedTask.id));
         pushTrace("useTasks", "soft-deleted-task-suppressed", { event: "task:moved", id: normalizedTask.id });
         return;
       }
       // Preserve a custom (non-legacy) target id verbatim; only coerce empty/garbage
-      // back to the task's current column. normalizeColumn alone would drop custom ids.
+      // back to the task's current column. The old normalizeColumn (deleted in U12) would drop custom ids.
       const nextColumn: ColumnId = typeof to === "string" && to ? to : normalizedTask.column;
       const movedTask = { ...normalizedTask, column: nextColumn };
-      setTasks((prev) => {
+      recordLiveMutation(movedTask, false);
+      syncCompletedMembership(movedTask, tasksRef.current.find((candidate) => candidate.id === movedTask.id) ?? normalizedTask, from, nextColumn);
+      applyLiveTasks((prev) => {
         const existingIndex = prev.findIndex((t) => t.id === movedTask.id);
         if (existingIndex === -1) {
           // SSE created event was missed (e.g., reconnect gap); upsert so the
           // task becomes visible instead of being silently dropped.
           return [...prev, movedTask];
         }
+        const current = prev[existingIndex]!;
+        const merged = mergeIncomingTask(current, movedTask, {
+          authoritativeMove: true,
+          authoritativeLifecycle: true,
+        });
+        if (merged === current) return prev;
         const next = [...prev];
-        next[existingIndex] = movedTask;
+        next[existingIndex] = merged;
         return next;
       });
-      lastFetchTimeMs.current = Date.now();
+      advanceFreshnessClockForLiveUpdate();
     };
 
     const handleUpdated = (e: MessageEvent) => {
@@ -638,30 +1632,46 @@ export function useTasks(options?: UseTasksOptions) {
         traceDroppedStaleEvent();
         return;
       }
-      if (searchQueryRef.current) {
+      const payload = readScopedEvent<Task>(e);
+      if (searchQueryRef.current && payload) {
         void refreshTasksRef.current({ searchQueryOverride: searchQueryRef.current });
         return;
       }
-      const incoming = normalizeTask(JSON.parse(e.data) as Task);
+      if (!payload) return;
+      const incoming = normalizeTask(stripTransientReleaseGate(payload));
+      const previousUpdatedTask = tasksRef.current.find((candidate) => candidate.id === incoming.id);
       if (isSoftDeleted(incoming)) {
+        recordLiveMutation(incoming, true);
         // FN-5135: treat deletedAt-bearing task:updated payloads as delete-equivalent.
-        setTasks((prev) => prev.filter((candidate) => candidate.id !== incoming.id));
+        if (previousUpdatedTask) syncCompletedMembership(incoming, previousUpdatedTask, previousUpdatedTask.column, undefined);
+        applyLiveTasks((prev) => prev.filter((candidate) => candidate.id !== incoming.id));
         pushTrace("useTasks", "soft-deleted-task-suppressed", { event: "task:updated", id: incoming.id });
         return;
       }
-      setTasks((prev) => {
-        const existingIndex = prev.findIndex((t) => t.id === incoming.id);
-        if (existingIndex === -1) {
-          return [...prev, incoming];
-        }
-        const current = prev[existingIndex]!;
-        const merged = mergeIncomingTask(current, incoming);
-        if (merged === current) return prev;
+      const authoritativeTask = previousUpdatedTask
+        ? mergeIncomingTask(previousUpdatedTask, incoming, { authoritativeLifecycle: true })
+        : incoming;
+      if (authoritativeTask === previousUpdatedTask) return;
+      /*
+      FNXC:DonePagination 2026-09-08-23:16:
+      Server counts already include unloaded Done rows, so a task:updated event may expose such a row without adding another membership delta. For loaded rows, derive the delta only after snapshot freshness accepts the event; a stale payload must change neither the card nor its exact server-backed counts.
+      */
+      recordLiveMutation(authoritativeTask, false);
+      syncCompletedMembership(
+        authoritativeTask,
+        previousUpdatedTask,
+        previousUpdatedTask?.column,
+        authoritativeTask.column,
+        { countUnknownEntry: false },
+      );
+      applyLiveTasks((prev) => {
+        const existingIndex = prev.findIndex((task) => task.id === authoritativeTask.id);
+        if (existingIndex === -1) return [...prev, authoritativeTask];
         const next = [...prev];
-        next[existingIndex] = merged;
+        next[existingIndex] = authoritativeTask;
         return next;
       });
-      lastFetchTimeMs.current = Date.now();
+      advanceFreshnessClockForLiveUpdate();
     };
 
     const handleDeleted = (e: MessageEvent) => {
@@ -669,12 +1679,17 @@ export function useTasks(options?: UseTasksOptions) {
         traceDroppedStaleEvent();
         return;
       }
+      const payload = readScopedEvent<Task>(e);
+      if (!payload) return;
       if (searchQueryRef.current) {
         void refreshTasksRef.current({ searchQueryOverride: searchQueryRef.current });
         return;
       }
-      const task = normalizeTask(JSON.parse(e.data) as Task);
-      setTasks((prev) => prev.filter((t) => t.id !== task.id));
+      const task = normalizeTask(stripTransientReleaseGate(payload));
+      const previousDeletedTask = tasksRef.current.find((candidate) => candidate.id === task.id);
+      recordLiveMutation(task, true);
+      syncCompletedMembership(task, previousDeletedTask ?? task, previousDeletedTask?.column ?? task.column, undefined);
+      applyLiveTasks((prev) => prev.filter((t) => t.id !== task.id));
     };
 
     const handleMerged = (e: MessageEvent) => {
@@ -682,19 +1697,25 @@ export function useTasks(options?: UseTasksOptions) {
         traceDroppedStaleEvent();
         return;
       }
-      if (searchQueryRef.current) {
+      const payload = readScopedEvent<{ task: Task }>(e);
+      if (searchQueryRef.current && payload) {
         void refreshTasksRef.current({ searchQueryOverride: searchQueryRef.current });
         return;
       }
-      const { task }: { task: Task } = JSON.parse(e.data);
-      const normalizedTask = normalizeTask(task);
+      if (!payload) return;
+      const { task } = payload;
+      const normalizedTask = normalizeTask(stripTransientReleaseGate(task));
       if (isSoftDeleted(normalizedTask)) {
-        setTasks((prev) => prev.filter((candidate) => candidate.id !== normalizedTask.id));
+        recordLiveMutation(normalizedTask, true);
+        applyLiveTasks((prev) => prev.filter((candidate) => candidate.id !== normalizedTask.id));
         pushTrace("useTasks", "soft-deleted-task-suppressed", { event: "task:merged", id: normalizedTask.id });
         return;
       }
       const mergedTask = { ...normalizedTask, column: "done" as Column };
-      setTasks((prev) => {
+      const previousMergedTask = tasksRef.current.find((candidate) => candidate.id === mergedTask.id);
+      recordLiveMutation(mergedTask, false);
+      syncCompletedMembership(mergedTask, previousMergedTask, previousMergedTask?.column, mergedTask.column);
+      applyLiveTasks((prev) => {
         const existingIndex = prev.findIndex((t) => t.id === mergedTask.id);
         if (existingIndex === -1) {
           return [...prev, mergedTask];
@@ -710,16 +1731,14 @@ export function useTasks(options?: UseTasksOptions) {
         traceDroppedStaleEvent();
         return;
       }
-      if (searchQueryRef.current) {
-        return;
-      }
-      const entry = JSON.parse(e.data) as AgentLogActivityEvent;
-      if (!entry.taskId || !entry.timestamp) return;
+      const entry = readScopedEvent<AgentLogActivityEvent>(e);
+      if (searchQueryRef.current) return;
+      if (!entry || !entry.taskId || !entry.timestamp) return;
       setTasks((prev) => {
         let changed = false;
         const next = prev.map((task) => {
           const cleared = clearInReviewStallForFreshAgentLog(task, entry);
-          const updated = addRecentPlannerActivityForFreshAgentLog(cleared, entry);
+          const updated = addRecentPlannerActivityForFreshAgentLog(cleared, entry, resolveColumnFlags?.(cleared));
           if (updated !== task) changed = true;
           return updated;
         });
@@ -739,29 +1758,23 @@ export function useTasks(options?: UseTasksOptions) {
       // Guard onReconnect against stale SSE callbacks: do not call refreshTasks
       // if the SSE was disabled or the effect unmounted while reconnect was pending.
       onReconnect: () => {
-        contextVersionAtStart = projectContextVersionRef.current;
         if (!active) return;
         if (isStale()) {
           traceDroppedStaleEvent();
           return;
         }
-        recordResumeEvent({
-          view: "useTasks",
-          trigger: "sse-reconnect",
-          projectId,
-          replayAttempted: false,
-        });
-        void refreshTasksRef.current();
+        contextVersionAtStart = projectContextVersionRef.current;
+        revalidateAfterResume("sse-reconnect", "stream-reopened");
       },
     });
     return () => {
       active = false;
       unsubscribe();
     };
-  }, [projectId, sseEnabled]);
+  }, [projectId, sseEnabled, revalidateAfterResume]);
 
   const createTask = useCallback(async (input: TaskCreateInput): Promise<Task> => {
-    const task = normalizeTask(await api.createTask(input, projectId));
+    const task = normalizeNonBoardTask(await api.createTask(input, projectId));
     setTasks((prev) => {
       if (prev.some((t) => t.id === task.id)) return prev;
       return [...prev, task];
@@ -769,83 +1782,79 @@ export function useTasks(options?: UseTasksOptions) {
     return task;
   }, [projectId]);
 
+  /*
+  FNXC:DashboardTaskReconciliation 2026-08-30-01:40:
+  Start and Reset must publish their server-confirmed rows before SSE or polling so every task host
+  immediately shows the new column. A stale card invited a second Start that could hard-cancel work,
+  so lifecycle mutations share one reconciliation seam rather than waiting for an eventual refresh.
+  */
+  const reconcileConfirmedTask = useCallback((confirmedTask: Task): Task => {
+    const normalizedConfirmedRow = normalizeNonBoardTask(confirmedTask);
+    // Preserve cleared lifecycle fields as own `undefined` properties so every downstream
+    // snapshot host can distinguish the confirmed deletion from an unrelated sparse update.
+    const confirmedRow: Task = {
+      ...normalizedConfirmedRow,
+      paused: normalizedConfirmedRow.paused,
+      userPaused: normalizedConfirmedRow.userPaused,
+      pausedByAgentId: normalizedConfirmedRow.pausedByAgentId,
+      pausedReason: normalizedConfirmedRow.pausedReason,
+      status: normalizedConfirmedRow.status,
+    };
+    const currentTask = tasksRef.current.find((task) => task.id === confirmedRow.id);
+    // A live event that arrived while the mutation was pending may be newer than its response.
+    // Start from the confirmed row so equal clocks retain the mutation, then admit only newer state.
+    const updatedTask = currentTask ? mergeIncomingTask(confirmedRow, currentTask) : confirmedRow;
+    fetchVersionRef.current++;
+    refreshAbortRef.current?.abort();
+    abortPaginationOwners();
+    const replaceConfirmedTask = (currentTasks: Task[]) =>
+      currentTasks.map((task) => task.id === updatedTask.id ? mergeIncomingTask(updatedTask, task) : task);
+
+    if (projectId) {
+      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
+      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+      if (Array.isArray(cachedTasks)) {
+        const cacheContainsOnlyTaskRows = cachedTasks.every((task) =>
+          Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"),
+        );
+        if (cacheContainsOnlyTaskRows) {
+          const nextCachedTasks = cachedTasks.map((task) =>
+            (task as Task).id === updatedTask.id ? updatedTask : normalizeTask(task as Task),
+          );
+          writeTaskCacheSnapshot(cacheKey, nextCachedTasks);
+        } else {
+          clearCache(cacheKey);
+        }
+      } else if (cachedTasks === null) {
+        writeTaskCacheSnapshot(cacheKey, replaceConfirmedTask(tasksRef.current));
+      } else {
+        clearCache(cacheKey);
+      }
+    }
+
+    setTasks((previousTasks) => {
+      const nextTasks = replaceConfirmedTask(previousTasks);
+      tasksRef.current = nextTasks;
+      return nextTasks;
+    });
+    return updatedTask;
+  }, [projectId]);
+
   const moveTask = useCallback(async (
     id: string,
     column: ColumnId,
-    optionsOrPosition?: { preserveProgress?: boolean } | number,
+    optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
   ): Promise<Task> => {
-    return normalizeTask(await api.moveTask(id, column, projectId, optionsOrPosition));
-  }, [projectId]);
+    return reconcileConfirmedTask(await api.moveTask(id, column, projectId, optionsOrPosition));
+  }, [projectId, reconcileConfirmedTask]);
 
-  /*
-  FNXC:DashboardPauseState 2026-07-12-00:00:
-  FN-7861 makes pause and unpause user-visible state boundaries. After the API confirms either transition, patch shared hook state and the project SWR task cache immediately, mirroring retryTask/bypassReview, so Board/List/right-dock task renderers do not wait for SSE or polling to clear stale paused rendering.
-  */
   const pauseTask = useCallback(async (id: string): Promise<Task> => {
-    const updatedTask = normalizeTask(await api.pauseTask(id, projectId));
-    fetchVersionRef.current++;
-
-    const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? updatedTask : task));
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const cacheContainsOnlyTaskRows = cachedTasks.every((task) => Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"));
-        if (cacheContainsOnlyTaskRows) {
-          const nextCachedTasks = cachedTasks.map((task) => ((task as Task).id === id ? updatedTask : normalizeTask(task as Task)));
-          writeCache(cacheKey, nextCachedTasks.length > 500 ? nextCachedTasks.slice(0, 500) : nextCachedTasks, { maxBytes: 500_000 });
-        } else {
-          clearCache(cacheKey);
-        }
-      } else if (cachedTasks === null) {
-        const nextCurrentTasks = projectUpdatedTasks(tasksRef.current);
-        writeCache(cacheKey, nextCurrentTasks.length > 500 ? nextCurrentTasks.slice(0, 500) : nextCurrentTasks, { maxBytes: 500_000 });
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-
-    setTasks((prev) => {
-      const next = projectUpdatedTasks(prev);
-      tasksRef.current = next;
-      return next;
-    });
-    return updatedTask;
-  }, [projectId]);
+    return reconcileConfirmedTask(await api.pauseTask(id, projectId));
+  }, [projectId, reconcileConfirmedTask]);
 
   const unpauseTask = useCallback(async (id: string): Promise<Task> => {
-    const updatedTask = normalizeTask(await api.unpauseTask(id, projectId));
-    fetchVersionRef.current++;
-
-    const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? updatedTask : task));
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const cacheContainsOnlyTaskRows = cachedTasks.every((task) => Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"));
-        if (cacheContainsOnlyTaskRows) {
-          const nextCachedTasks = cachedTasks.map((task) => ((task as Task).id === id ? updatedTask : normalizeTask(task as Task)));
-          writeCache(cacheKey, nextCachedTasks.length > 500 ? nextCachedTasks.slice(0, 500) : nextCachedTasks, { maxBytes: 500_000 });
-        } else {
-          clearCache(cacheKey);
-        }
-      } else if (cachedTasks === null) {
-        const nextCurrentTasks = projectUpdatedTasks(tasksRef.current);
-        writeCache(cacheKey, nextCurrentTasks.length > 500 ? nextCurrentTasks.slice(0, 500) : nextCurrentTasks, { maxBytes: 500_000 });
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-
-    setTasks((prev) => {
-      const next = projectUpdatedTasks(prev);
-      tasksRef.current = next;
-      return next;
-    });
-    return updatedTask;
-  }, [projectId]);
+    return reconcileConfirmedTask(await api.unpauseTask(id, projectId));
+  }, [projectId, reconcileConfirmedTask]);
 
   const deleteTask = useCallback(async (
     id: string,
@@ -856,20 +1865,22 @@ export function useTasks(options?: UseTasksOptions) {
       allowResurrection?: boolean;
     },
   ): Promise<Task> => {
-    const deletedTask = normalizeTask(await api.deleteTask(id, projectId, options));
+    const deletedTask = normalizeNonBoardTask(await api.deleteTask(id, projectId, options));
     /*
     FNXC:TaskDeletion 2026-06-29-18:52:
-    Local deletes must update the shared useTasks array immediately because the Board and right-dock Tasks list both render from this state and should not wait for SSE or a refetch after the API confirms deletion.
+    Local deletes must update the shared useTasks array immediately because the Board, List, and any shared task consumers render from this state and should not wait for SSE or a refetch after the API confirms deletion.
 
     FNXC:TaskDeletionCache 2026-06-29-20:11:
     Project-scoped SWR hydration must remove the deleted task after the API confirms deletion, otherwise an immediate remount can hydrate a stale row before the next fetch. Only the active project's task cache key is touched; if the cached envelope has an unexpected shape, clear that key instead of writing possibly stale data.
 
     FNXC:TaskDeletionCache 2026-06-29-21:04:
-    Delete success must also invalidate refreshes that began before the API call completed; otherwise a late pre-delete snapshot can rehydrate the removed card in Board and the right-dock Tasks list until the next live update.
+    Delete success must also invalidate refreshes that began before the API call completed; otherwise a late pre-delete snapshot can rehydrate the removed card in Board or List until the next live update.
     */
     // Invalidate refreshes that started before the delete succeeded so an older
     // server snapshot cannot overwrite the locally removed row after this point.
     fetchVersionRef.current++;
+    refreshAbortRef.current?.abort();
+    abortPaginationOwners();
 
     if (projectId) {
       const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
@@ -895,7 +1906,7 @@ export function useTasks(options?: UseTasksOptions) {
   }, [projectId]);
 
   const retryTask = useCallback(async (id: string): Promise<Task> => {
-    const retriedTask = normalizeTask(await api.retryTask(id, projectId));
+    const retriedTask = normalizeNonBoardTask(await api.retryTask(id, projectId));
     /*
     FNXC:DashboardTaskRetry 2026-06-30-12:57:
     Manual retry success is a user-visible state boundary. Replace matching rows in shared hook state and the project SWR cache as soon as the retry API returns so Board/List/detail/right-dock retry affordances do not depend on later SSE, polling, remount, or route re-entry to clear stale failed/stuck state.
@@ -904,6 +1915,8 @@ export function useTasks(options?: UseTasksOptions) {
     Retry success also invalidates refreshes that began before the API returned; a late pre-retry fetch snapshot must not rehydrate the failed card after the operator has already received server confirmation for the retry.
     */
     fetchVersionRef.current++;
+    refreshAbortRef.current?.abort();
+    abortPaginationOwners();
 
     const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? retriedTask : task));
 
@@ -941,8 +1954,10 @@ export function useTasks(options?: UseTasksOptions) {
   failed-step indicator after the operator receives server confirmation.
   */
   const bypassReview = useCallback(async (id: string, reason: string): Promise<Task> => {
-    const bypassedTask = normalizeTask(await api.bypassReview(id, reason, projectId));
+    const bypassedTask = normalizeNonBoardTask(await api.bypassReview(id, reason, projectId));
     fetchVersionRef.current++;
+    refreshAbortRef.current?.abort();
+    abortPaginationOwners();
 
     const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? bypassedTask : task));
 
@@ -973,12 +1988,76 @@ export function useTasks(options?: UseTasksOptions) {
     return bypassedTask;
   }, [projectId]);
 
-  const resetTask = useCallback(async (id: string): Promise<Task> => {
-    return normalizeTask(await api.resetTask(id, projectId));
+  const resetTask = useCallback(async (id: string, options?: TaskResetOptions): Promise<Task> => {
+    const requestProjectId = projectId;
+    const requestOwnedRows = tasksProjectIdRef.current === requestProjectId ? tasksRef.current : [];
+    const beforeReset = requestOwnedRows.find((task) => task.id === id);
+    const confirmedRow = normalizeNonBoardTask(await api.resetTask(id, options, requestProjectId));
+
+    const publishReset = (currentTasks: Task[]): { tasks: Task[]; published: Task } => {
+      const current = currentTasks.find((task) => task.id === confirmedRow.id);
+      const published = current
+        ? reconcileConfirmedResetSnapshot(current, confirmedRow, beforeReset)
+        : confirmedRow;
+      return {
+        tasks: currentTasks.map((task) => task.id === confirmedRow.id ? published : task),
+        published,
+      };
+    };
+
+    /*
+    FNXC:TaskReset 2026-09-09-15:14:
+    Task IDs are project-local, so a Reset response may publish into the current React rows only while
+    they still belong to the project that issued the request. A project switch during cleanup leaves
+    the new project's fetch and pagination owners untouched and publishes confirmation only to the
+    originating project's cache; otherwise an equal ID can replace an unrelated visible task.
+    */
+    const ownsCurrentRows = tasksProjectIdRef.current === requestProjectId;
+    const localPublication = ownsCurrentRows ? publishReset(tasksRef.current) : undefined;
+    if (localPublication) {
+      fetchVersionRef.current++;
+      refreshAbortRef.current?.abort();
+      abortPaginationOwners();
+      tasksRef.current = localPublication.tasks;
+    }
+
+    let publishedRow = localPublication?.published ?? confirmedRow;
+    if (requestProjectId) {
+      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${requestProjectId}`;
+      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+      if (Array.isArray(cachedTasks)) {
+        const cacheContainsOnlyTaskRows = cachedTasks.every((task) =>
+          Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"),
+        );
+        if (cacheContainsOnlyTaskRows) {
+          const normalizedCachedTasks = cachedTasks.map((task) => normalizeTask(task as Task));
+          const cachePublication = localPublication
+            ? {
+                tasks: normalizedCachedTasks.map((task) =>
+                  task.id === confirmedRow.id ? localPublication.published : task),
+                published: localPublication.published,
+              }
+            : publishReset(normalizedCachedTasks);
+          publishedRow = cachePublication.published;
+          writeTaskCacheSnapshot(cacheKey, cachePublication.tasks);
+        } else {
+          clearCache(cacheKey);
+        }
+      } else if (cachedTasks === null) {
+        const cachePublication = localPublication ?? publishReset(requestOwnedRows);
+        publishedRow = cachePublication.published;
+        writeTaskCacheSnapshot(cacheKey, cachePublication.tasks);
+      } else {
+        clearCache(cacheKey);
+      }
+    }
+
+    if (localPublication) setTasks(localPublication.tasks);
+    return publishedRow;
   }, [projectId]);
 
-  const duplicateTask = useCallback(async (id: string): Promise<Task> => {
-    const task = normalizeTask(await api.duplicateTask(id, projectId));
+  const duplicateTask = useCallback(async (id: string, options?: { workflowId?: string }): Promise<Task> => {
+    const task = normalizeNonBoardTask(await api.duplicateTask(id, options, projectId));
     setTasks((prev) => {
       if (prev.some((t) => t.id === task.id)) return prev;
       return [...prev, task];
@@ -1002,7 +2081,7 @@ export function useTasks(options?: UseTasksOptions) {
     }
 
     try {
-      const updatedTask = normalizeTask(await api.updateTask(id, updates, projectId));
+      const updatedTask = normalizeNonBoardTask(await api.updateTask(id, updates, projectId));
       setTasks((prev) =>
         prev.map((t) => (t.id === id ? updatedTask : t))
       );
@@ -1015,25 +2094,6 @@ export function useTasks(options?: UseTasksOptions) {
       }
       throw err;
     }
-  }, [projectId]);
-
-  const archiveTask = useCallback(async (
-    id: string,
-    options?: { removeLineageReferences?: boolean },
-  ): Promise<Task> => {
-    const task = normalizeTask(await api.archiveTask(id, projectId, options));
-    setTasks((prev) =>
-      prev.map((t) => (t.id === id ? task : t))
-    );
-    return task;
-  }, [projectId]);
-
-  const unarchiveTask = useCallback(async (id: string): Promise<Task> => {
-    const task = normalizeTask(await api.unarchiveTask(id, projectId));
-    setTasks((prev) =>
-      prev.map((t) => (t.id === id ? task : t))
-    );
-    return task;
   }, [projectId]);
 
   /*
@@ -1055,18 +2115,6 @@ export function useTasks(options?: UseTasksOptions) {
     return result;
   }, [projectId]);
 
-  const archiveAllDone = useCallback(async (): Promise<Task[]> => {
-    const archived = await api.archiveAllDone(projectId);
-    const normalized = archived.map(normalizeTask);
-    setTasks((prev) =>
-      prev.map((t) => {
-        const updated = normalized.find((archived) => archived.id === t.id);
-        return updated || t;
-      })
-    );
-    return normalized;
-  }, [projectId]);
-
   const ingestCreatedTasks = useCallback((incomingTasks: Task[]): void => {
     if (incomingTasks.length === 0) {
       return;
@@ -1077,7 +2125,7 @@ export function useTasks(options?: UseTasksOptions) {
       return;
     }
 
-    const normalizedTasks = filterActiveTasks(incomingTasks.map(normalizeTask));
+    const normalizedTasks = filterActiveTasks(incomingTasks.map(normalizeNonBoardTask));
     setTasks((prev) => {
       let next = prev;
 
@@ -1105,8 +2153,31 @@ export function useTasks(options?: UseTasksOptions) {
 
       return next;
     });
-    lastFetchTimeMs.current = Date.now();
-  }, []);
+    advanceFreshnessClockForLiveUpdate();
+  }, [advanceFreshnessClockForLiveUpdate]);
 
-  return { tasks, isStale, lastRefreshErrorAt, createTask, moveTask, pauseTask, unpauseTask, deleteTask, mergeTask, retryTask, bypassReview, resetTask, duplicateTask, updateTask, archiveTask, unarchiveTask, revertTask, archiveAllDone, loadArchivedTasks, loadMoreArchivedTasks, archivedHasMore, archivedLoadingMore, includeArchived, refreshTasks, ingestCreatedTasks, lastFetchTimeMs: lastFetchTimeMs.current };
+  const retryCurrentTasksPagination = useCallback(async () => {
+    if (currentTasksPaginationError === "invalid-continuation") {
+      await refreshTasks();
+      return;
+    }
+    await loadMoreCurrentTasks();
+  }, [currentTasksPaginationError, loadMoreCurrentTasks, refreshTasks]);
+
+  const retryCompletedTasksPagination = useCallback(async () => {
+    if (completedPaginationError === "invalid-continuation") {
+      await refreshTasks({ resetCompletedPages: true });
+      return;
+    }
+    await loadMoreCompletedTasks();
+  }, [completedPaginationError, loadMoreCompletedTasks, refreshTasks]);
+
+  return {
+    tasks, isStale, lastRefreshErrorAt, createTask, moveTask, pauseTask, unpauseTask, deleteTask, mergeTask, retryTask, bypassReview, resetTask, duplicateTask, updateTask, revertTask,
+    loadMoreCurrentTasks, retryCurrentTasksPagination, currentTasksTotal, currentTasksHasMore, currentTasksLoadingMore, currentTasksPaginationError,
+    currentTasksProgressKey: `${projectId ?? "default"}:${searchIncarnationRef.current}:${currentTasksProgress}`,
+    loadMoreCompletedTasks, retryCompletedTasksPagination, completedSortMode, changeCompletedSortMode, completedTotal, completedCounts, completedHasMore, completedLoadingMore, completedPaginationError,
+    completedProgressKey: `${projectId ?? "default"}:${completedSortMode}:${completedRequestGenerationRef.current}:${completedProgress}`,
+    refreshTasks, ingestCreatedTasks, lastFetchTimeMs: lastFetchTimeMs.current,
+  };
 }

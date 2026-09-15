@@ -1,14 +1,23 @@
+/*
+FNXC:AgentsOverviewScroll 2026-08-10-10:02:
+Overview owns vertical scrolling when Active Agents exceeds the constrained Agents flex shell, so mobile and short viewports can reach every card without restoring document scrolling. The overview itself clips its flex child while the content scrollport contains overscroll before nested card transcripts can hand it to the page.
+*/
 .agents-overview-bar {
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   padding: var(--space-md) var(--space-lg);
   display: flex;
+  flex: 0 1 auto;
   flex-direction: column;
+  min-height: 0;
+  max-height: 70%;
   gap: var(--space-sm);
+  overflow: hidden;
 }
 
 .agents-overview-bar__toggle {
   width: 100%;
+  flex-shrink: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--card);
@@ -20,6 +29,23 @@
   gap: var(--space-sm);
   cursor: pointer;
   transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+/*
+FNXC:StandardizedViewActions 2026-09-14-02:47:
+The trigger is hosted by the Agents header action cluster, so it sizes to its content there instead of spanning a
+full-width bar. On phones it keeps only its label so the header row stays on one line.
+*/
+.agents-view-controls .agents-overview-bar__toggle {
+  width: auto;
+  flex-shrink: 1;
+  min-inline-size: 0;
+}
+
+@media (max-width: 768px) {
+  .agents-view-controls .agents-overview-bar__meta {
+    display: none;
+  }
 }
 
 .agents-overview-bar__toggle:hover {
@@ -47,8 +73,13 @@
 
 .agents-overview-bar__content {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
+  min-height: 0;
   gap: var(--space-md);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .agents-overview-bar__metrics {

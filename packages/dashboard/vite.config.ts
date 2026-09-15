@@ -93,6 +93,10 @@ function emitVersionJson(): Plugin {
   };
 }
 
+/*
+FNXC:HomemadeAlphaStyles 2026-09-11-16:14:
+Fusion's Alpha controls compile as ordinary scoped CSS. No third-party component or utility compiler participates in the dashboard pipeline, so the emitted styles remain auditable and cannot leak an upstream reset outside Alpha boundaries.
+*/
 function ensureThemeDataStylesheetOrder(): Plugin {
   return {
     name: "fusion-theme-data-link-order",
@@ -134,16 +138,25 @@ export default defineConfig({
       The dashboard core-import scanner enforces this alias boundary for both relative core/src and package-subpath value imports.
       Add a new browser leaf only after its full dependency graph is reviewed and it has a dated entry in scripts/lib/dashboard-browser-safe-core-modules.json.
       */
-      "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/detect-content-language.ts"),
+      "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/i18n/detect-content-language.ts"),
+      /*
+      FNXC:TaskDeleteAttribution 2026-07-26-17:05:
+      The delete-attribution constants (`x-fusion-client` header name + the dashboard-UI token) are shared by the browser client that STAMPS the header and the route that READS it, so both sides cannot drift apart into two spellings of the same string.
+      `task-delete-attribution.ts` imports nothing at all, so it is a safe browser leaf; alias its subpath rather than widening the `@fusion/core` alias, which would drag the Node-heavy index into the client bundle.
+      Ordered before the `@fusion/core` entry because Vite matches aliases in order and the broader key would otherwise swallow this subpath — the exact failure this line was added to fix (`"FUSION_CLIENT_HEADER" is not exported by ../core/src/types.ts`).
+      */
+      "@fusion/core/task-delete-attribution": resolve(__dirname, "../core/src/task-delete-attribution.ts"),
+      "@fusion/core/column-roles": resolve(__dirname, "../core/src/column-roles.ts"),
       "@fusion/core": resolve(__dirname, "../core/src/types.ts"),
       "@fusion/dashboard/app/components/TaskCard": resolve(__dirname, "app/components/TaskCard.tsx"),
-      // FNXC:PluginBuild 2026-06-22-03:50: Bundled plugin source can import the dashboard's shared ViewHeader through the package export; Vite needs the same source alias during dashboard builds so plugin UI normalization does not fail only in CI merge builds.
+      // FNXC:PluginBuild 2026-09-13-16:50: Bundled plugin source can import shared header primitives and the cooperative full-page header through package exports; Vite needs matching source aliases so one-header composition cannot fail only in CI merge builds.
       "@fusion/dashboard/app/components/ViewHeader": resolve(__dirname, "app/components/ViewHeader.tsx"),
+      "@fusion/dashboard/app/plugins/PluginDashboardViewHeader": resolve(__dirname, "app/plugins/PluginDashboardViewHeader.tsx"),
+      "@fusion/dashboard/app/plugins/PluginDashboardViewHost": resolve(__dirname, "app/plugins/PluginDashboardViewHost.tsx"),
       // FNXC:Quality 2026-07-19-12:00: The bundled Quality plugin needs the host's token-appended artifact URL helper because native video loads cannot attach authorization headers.
-      "@fusion/dashboard/app/api/task-content": resolve(__dirname, "app/api/task-content.ts"),
+      "@fusion/dashboard/app/api/tasks/task-content": resolve(__dirname, "app/api/tasks/task-content.ts"),
       "@fusion/dashboard/app/plugins/types": resolve(__dirname, "app/plugins/types.ts"),
       "@fusion/dashboard/app/utils/projectStorage": resolve(__dirname, "app/utils/projectStorage.ts"),
-      "@fusion/dashboard/app/utils/taskStuck": resolve(__dirname, "app/utils/taskStuck.ts"),
       "@fusion-plugin-examples/compound-engineering/dashboard-view": resolve(
         __dirname,
         "../../plugins/fusion-plugin-compound-engineering/src/dashboard-view.tsx",
@@ -175,6 +188,14 @@ export default defineConfig({
       "@fusion-plugin-examples/roadmap/dashboard-view": resolve(
         __dirname,
         "../../plugins/fusion-plugin-roadmap/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/todos/dashboard-view": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-todos/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/todos": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-todos/src/index.ts",
       ),
       "@fusion-plugin-examples/quality/qa-tab": resolve(
         __dirname,

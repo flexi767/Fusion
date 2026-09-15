@@ -11,11 +11,15 @@ const mockFetchScripts = vi.hoisted(() => vi.fn());
 vi.mock("../../hooks/useViewportMode", () => ({
     isFullScreenSheetViewport: () => false,
   isShortViewport: () => false,
+isTabletTouchViewport: (mode?: string) => mode === "tablet",
 useViewportMode: () => viewportModeMock.value,
 }));
 
 vi.mock("../../api", () => ({
   fetchScripts: (...args: unknown[]) => mockFetchScripts(...args),
+  normalizeScriptCatalog: (value: Record<string, string> | Array<{ name: string; command: string; description?: string }>) => Array.isArray(value)
+    ? value
+    : Object.entries(value).map(([name, command]) => ({ name, command })),
 }));
 
 // Mock the useExecutorStats hook
@@ -108,11 +112,11 @@ function makeBackgroundSession(id: string, status: AiSessionSummary["status"]): 
   };
 }
 
+// FNXC:StuckTagRemoval 2026-08-17-22:30: stuck-task tagging removed from the dashboard; stuck coverage deleted with it.
 describe("ExecutorStatusBar", () => {
   const defaultStats: ExecutorStats = {
     runningTaskCount: 2,
     blockedTaskCount: 1,
-    stuckTaskCount: 0,
     queuedTaskCount: 5,
     inReviewCount: 3,
     executorState: "running",
@@ -143,8 +147,8 @@ describe("ExecutorStatusBar", () => {
       const statusBar = screen.getByRole("status");
       expect(statusBar).toHaveTextContent("Running");
       expect(statusBar).toHaveTextContent("Blocked");
-      expect(statusBar).toHaveTextContent("Queued");
-      expect(statusBar).toHaveTextContent("In Review");
+      expect(statusBar).toHaveTextContent("Waiting");
+      expect(statusBar).not.toHaveTextContent("In Review");
       expect(statusBar).not.toHaveTextContent("Done");
       expect(statusBar).not.toHaveTextContent("Escalated");
     });
@@ -157,7 +161,6 @@ describe("ExecutorStatusBar", () => {
           queuedTaskCount: 9,
           runningTaskCount: 2,
           maxConcurrent: 4,
-          stuckTaskCount: 1,
           blockedTaskCount: 2,
           inReviewCount: 1,
         },
@@ -190,12 +193,11 @@ describe("ExecutorStatusBar", () => {
       );
 
       const statusBar = screen.getByRole("status");
-      expectSegmentCount("Queued", "9");
+      expectSegmentCount("Waiting", "9");
       expectSegmentCount("Running", "2");
       expect(within(getSegmentByLabel("Running")).getByText("4")).toHaveClass("executor-status-bar__max");
-      expectSegmentCount("Stuck", "1");
       expectSegmentCount("Blocked", "2");
-      expectSegmentCount("In Review", "1");
+      expect(statusBar).not.toHaveTextContent("In Review");
       expect(statusBar).toHaveTextContent("Overlap queue");
       expect(statusBar).toHaveTextContent("FN-010 · 5 todo");
       expect(statusBar).not.toHaveTextContent("Done");
@@ -229,6 +231,39 @@ describe("ExecutorStatusBar", () => {
       const statusBar = screen.getByRole("status");
       expect(statusBar).toHaveTextContent("Overlap queue");
       expect(statusBar).toHaveTextContent("FN-002 · 5 todo");
+    });
+
+    it("shows the overlap bottleneck on a RENAMED board", () => {
+      /*
+      FNXC:WorkflowResolvedColumns 2026-07-30-23:58:
+      The board above renamed and nothing else. Without resolved traits the fan-out counts
+      `overlapBlockedTodoCount` against the literal `todo`, which no card is in, so the segment this
+      test asserts never rendered — the bottleneck existed and the bar stayed silent about it.
+      */
+      const tasks = [
+        makeTask("FN-010", "building", { columnMovedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }),
+        makeTask("FN-101", "drafting", { blockedBy: "FN-010" }),
+        makeTask("FN-102", "drafting", { blockedBy: "FN-010" }),
+        makeTask("FN-103", "drafting", { blockedBy: "FN-010" }),
+        makeTask("FN-104", "drafting", { blockedBy: "FN-010" }),
+        makeTask("FN-105", "drafting", { blockedBy: "FN-010" }),
+      ];
+      const columnFlagsByTaskId = new Map(tasks.map((task) => [
+        task.id,
+        task.column === "building" ? { countsTowardWip: true } : { hold: true },
+      ]));
+
+      render(
+        <ExecutorStatusBar
+          tasks={tasks}
+          columnFlagsByTaskId={columnFlagsByTaskId}
+          staleHighFanoutBlockerAgeThresholdMs={60 * 60 * 1000}
+        />,
+      );
+
+      const statusBar = screen.getByRole("status");
+      expect(statusBar).toHaveTextContent("Overlap queue");
+      expect(statusBar).toHaveTextContent("FN-010 · 5 todo");
     });
 
     it("does not show overlap queue summary for ordinary chains below threshold", () => {
@@ -274,11 +309,10 @@ describe("ExecutorStatusBar", () => {
       expect(statusBar).toHaveTextContent("5");
     });
 
-    it("displays in-review count", () => {
+    it("does not display the removed in-review footer segment", () => {
       render(<ExecutorStatusBar tasks={emptyTasks} />);
 
-      const statusBar = screen.getByRole("status");
-      expect(statusBar).toHaveTextContent("3");
+      expect(screen.getByRole("status")).not.toHaveTextContent("In Review");
     });
 
     it("renders the terminal launcher in the footer on desktop and opens terminal from the preserved toggle test id", async () => {
@@ -295,6 +329,19 @@ describe("ExecutorStatusBar", () => {
       expect(screen.getByTestId("scripts-btn")).toBeInTheDocument();
       expect(await screen.findByTestId("quick-scripts-dropdown")).toBeInTheDocument();
       await waitFor(() => expect(mockFetchScripts).toHaveBeenCalledWith(undefined));
+    });
+
+    it("runs the enriched catalog command from the desktop footer", async () => {
+      const user = userEvent.setup();
+      const onRunScript = vi.fn();
+      mockFetchScripts.mockResolvedValueOnce([
+        { name: "Build production", command: "pnpm build", description: "Production bundle" },
+      ]);
+      render(<ExecutorStatusBar tasks={emptyTasks} onToggleTerminal={vi.fn()} onOpenScripts={vi.fn()} onRunScript={onRunScript} />);
+      await user.click(screen.getByTestId("scripts-btn"));
+      expect(await screen.findByText("Production bundle")).toBeInTheDocument();
+      await user.click(screen.getByTestId("quick-script-item-Build production"));
+      expect(onRunScript).toHaveBeenCalledWith("Build production", "pnpm build");
     });
 
     it("keeps the footer terminal scripts chevron usable when scripts are empty", async () => {
@@ -318,7 +365,7 @@ describe("ExecutorStatusBar", () => {
           onOpenScripts={vi.fn()}
           onRunScript={vi.fn()}
           quickChatButtonMode="footer"
-          onOpenQuickChat={vi.fn()}
+          onToggleQuickChat={vi.fn()}
         />,
       );
 
@@ -329,7 +376,7 @@ describe("ExecutorStatusBar", () => {
 
     it("renders the Quick Chat footer launcher beside Terminal when footer mode is enabled", async () => {
       const user = userEvent.setup();
-      const onOpenQuickChat = vi.fn();
+      const onToggleQuickChat = vi.fn();
 
       render(
         <ExecutorStatusBar
@@ -338,7 +385,7 @@ describe("ExecutorStatusBar", () => {
           onOpenScripts={vi.fn()}
           onRunScript={vi.fn()}
           quickChatButtonMode="footer"
-          onOpenQuickChat={onOpenQuickChat}
+          onToggleQuickChat={onToggleQuickChat}
         />,
       );
 
@@ -346,7 +393,25 @@ describe("ExecutorStatusBar", () => {
       expect(screen.getByTestId("executor-terminal-launcher-segment")).toBeInTheDocument();
       await user.click(screen.getByTestId("executor-quick-chat-launcher"));
 
-      expect(onOpenQuickChat).toHaveBeenCalledTimes(1);
+      expect(onToggleQuickChat).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["open-quick-chat", "Open Quick Chat"],
+      ["minimize-all", "Minimize all chats"],
+      ["restore-all", "Restore all chats"],
+    ] as const)("announces the %s footer toggle action", (quickChatToggleAction, accessibleName) => {
+      render(
+        <ExecutorStatusBar
+          tasks={emptyTasks}
+          quickChatButtonMode="footer"
+          onToggleQuickChat={vi.fn()}
+          quickChatToggleAction={quickChatToggleAction}
+        />,
+      );
+
+      const launcher = screen.getByRole("button", { name: accessibleName });
+      expect(launcher).toHaveAttribute("data-chat-toggle-action", quickChatToggleAction);
     });
 
     it("keeps Quick Chat and Terminal footer launchers on the same font and color tokens", () => {
@@ -357,7 +422,7 @@ describe("ExecutorStatusBar", () => {
           onOpenScripts={vi.fn()}
           onRunScript={vi.fn()}
           quickChatButtonMode="footer"
-          onOpenQuickChat={vi.fn()}
+          onToggleQuickChat={vi.fn()}
         />,
       );
 
@@ -418,7 +483,7 @@ describe("ExecutorStatusBar", () => {
         <ExecutorStatusBar
           tasks={emptyTasks}
           quickChatButtonMode="floating"
-          onOpenQuickChat={vi.fn()}
+          onToggleQuickChat={vi.fn()}
         />,
       );
 
@@ -428,7 +493,7 @@ describe("ExecutorStatusBar", () => {
         <ExecutorStatusBar
           tasks={emptyTasks}
           quickChatButtonMode="off"
-          onOpenQuickChat={vi.fn()}
+          onToggleQuickChat={vi.fn()}
         />,
       );
       expect(screen.queryByTestId("executor-quick-chat-launcher-segment")).toBeNull();
@@ -438,7 +503,7 @@ describe("ExecutorStatusBar", () => {
         <ExecutorStatusBar
           tasks={emptyTasks}
           quickChatButtonMode="footer"
-          onOpenQuickChat={vi.fn()}
+          onToggleQuickChat={vi.fn()}
         />,
       );
       expect(screen.queryByTestId("executor-quick-chat-launcher-segment")).toBeNull();
@@ -454,40 +519,19 @@ describe("ExecutorStatusBar", () => {
       expect(screen.queryByTestId("scripts-btn")).toBeNull();
     });
 
-    it("does not show stuck tasks segment when count is 0", () => {
-      render(<ExecutorStatusBar tasks={emptyTasks} />);
-
-      expect(screen.queryByText("Stuck")).not.toBeInTheDocument();
-    });
-
-    it("shows stuck tasks segment when count is > 0", () => {
-      vi.mocked(mockUseExecutorStats).mockReturnValue({
-        stats: { ...defaultStats, stuckTaskCount: 2 },
-        loading: false,
-        error: null,
-        refresh: vi.fn(),
-      });
-
-      render(<ExecutorStatusBar tasks={emptyTasks} />);
-
-      const statusBar = screen.getByRole("status");
-      expect(statusBar).toHaveTextContent("Stuck");
-      expect(statusBar).toHaveTextContent("2");
-    });
   });
 
   describe("mobile stat tooltips", () => {
-    const mobileStatIds = ["queued", "running", "blocked", "review"] as const;
+    const mobileStatIds = ["queued", "running", "blocked"] as const;
 
     beforeEach(() => {
       viewportModeMock.value = "mobile";
     });
 
     it.each([
-      ["queued", "Queued"],
+      ["queued", "Waiting"],
       ["running", "Running"],
       ["blocked", "Blocked"],
-      ["review", "In Review"],
     ] as const)("reveals the %s stat name on tap", async (id, label) => {
       const user = userEvent.setup();
       render(<ExecutorStatusBar tasks={emptyTasks} />);
@@ -547,15 +591,8 @@ describe("ExecutorStatusBar", () => {
     it("adds stat tooltips only for conditional segments that exist", async () => {
       const user = userEvent.setup();
       const { rerender } = render(<ExecutorStatusBar tasks={emptyTasks} />);
-      expect(screen.queryByTestId("executor-stat-stuck")).toBeNull();
       expect(screen.queryByTestId("executor-stat-fanout")).toBeNull();
 
-      vi.mocked(mockUseExecutorStats).mockReturnValue({
-        stats: { ...defaultStats, stuckTaskCount: 1 },
-        loading: false,
-        error: null,
-        refresh: vi.fn(),
-      });
       const fanoutTasks = [
         makeTask("FN-010", "in-progress"),
         makeTask("FN-101", "todo", { blockedBy: "FN-010" }),
@@ -566,8 +603,6 @@ describe("ExecutorStatusBar", () => {
       ];
       rerender(<ExecutorStatusBar tasks={fanoutTasks} />);
 
-      await user.click(screen.getByTestId("executor-stat-stuck"));
-      expect(screen.getByRole("tooltip")).toHaveTextContent("Stuck");
       await user.click(screen.getByTestId("executor-stat-fanout"));
       expect(screen.getByRole("tooltip")).toHaveTextContent("Overlap queue");
     });
@@ -578,7 +613,7 @@ describe("ExecutorStatusBar", () => {
 
       const desktopStatus = screen.getByRole("status");
       expect(desktopStatus).not.toHaveClass("executor-status-bar--mobile");
-      expect(getSegmentByLabel("Queued").tagName).toBe("DIV");
+      expect(getSegmentByLabel("Waiting").tagName).toBe("DIV");
       expect(desktopStatus.querySelectorAll("button.executor-status-bar__segment--stat")).toHaveLength(0);
 
       viewportModeMock.value = "tablet";
@@ -756,7 +791,7 @@ describe("ExecutorStatusBar", () => {
 
       const statusBar = screen.getByRole("status");
       expect(statusBar).toHaveTextContent("Idle");
-      expect(statusBar).toHaveTextContent("Queued");
+      expect(statusBar).toHaveTextContent("Waiting");
       expect(statusBar).not.toHaveClass("executor-status-bar--loading");
       expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
       expect(screen.getByTestId("engine-control-menu-trigger")).toBeInTheDocument();
@@ -853,10 +888,10 @@ describe("ExecutorStatusBar", () => {
       render(<ExecutorStatusBar tasks={emptyTasks} />);
 
       const statusBar = screen.getByRole("status");
-      expect(statusBar).toHaveTextContent("Queued");
+      expect(statusBar).toHaveTextContent("Waiting");
       expect(statusBar).toHaveTextContent("Running");
       expect(statusBar).toHaveTextContent("Blocked");
-      expect(statusBar).toHaveTextContent("In Review");
+      expect(statusBar).not.toHaveTextContent("In Review");
       expect(statusBar).not.toHaveClass("executor-status-bar--connecting");
       expect(statusBar.querySelector(".executor-status-bar--connecting")).toBeNull();
       expect(screen.queryByText("Connecting…")).not.toBeInTheDocument();
@@ -932,21 +967,6 @@ describe("ExecutorStatusBar", () => {
       expect(blockedSegment?.parentElement?.querySelector(".executor-status-bar__count")).toHaveClass("executor-status-bar__count--warning");
     });
 
-    it("applies error class to stuck count when stuck tasks exist", () => {
-      vi.mocked(mockUseExecutorStats).mockReturnValue({
-        stats: { ...defaultStats, stuckTaskCount: 1 },
-        loading: false,
-        error: null,
-        refresh: vi.fn(),
-      });
-
-      render(<ExecutorStatusBar tasks={emptyTasks} />);
-
-      const statusBar = screen.getByRole("status");
-      const stuckSegment = statusBar.querySelector(".executor-status-bar__segment--stuck");
-      expect(stuckSegment?.querySelector(".executor-status-bar__count")).toHaveClass("executor-status-bar__count--error");
-    });
-
     it("applies active class to running indicator when tasks are running", () => {
       render(<ExecutorStatusBar tasks={emptyTasks} />);
 
@@ -984,13 +1004,13 @@ describe("ExecutorStatusBar", () => {
       const tasks: any[] = [{ id: "FN-001" }];
       render(<ExecutorStatusBar tasks={tasks} projectId="proj_abc123" />);
 
-      expect(mockUseExecutorStats).toHaveBeenCalledWith(tasks, "proj_abc123", undefined, undefined);
+      expect(mockUseExecutorStats).toHaveBeenCalledWith(tasks, "proj_abc123", undefined);
     });
 
     it("passes tasks and undefined to useExecutorStats when projectId not provided", () => {
       render(<ExecutorStatusBar tasks={emptyTasks} />);
 
-      expect(mockUseExecutorStats).toHaveBeenCalledWith(emptyTasks, undefined, undefined, undefined);
+      expect(mockUseExecutorStats).toHaveBeenCalledWith(emptyTasks, undefined, undefined);
     });
   });
 
@@ -1072,24 +1092,7 @@ describe("ExecutorStatusBar", () => {
       render(<ExecutorStatusBar tasks={tasks} />);
 
       // useExecutorStats receives the tasks array as first argument
-      expect(mockUseExecutorStats).toHaveBeenCalledWith(tasks, undefined, undefined, undefined);
-    });
-
-    it("renders stuck segment with correct count when stuck tasks detected", () => {
-      vi.mocked(mockUseExecutorStats).mockReturnValue({
-        stats: { ...defaultStats, stuckTaskCount: 3, runningTaskCount: 2 },
-        loading: false,
-        error: null,
-        refresh: vi.fn(),
-      });
-
-      render(<ExecutorStatusBar tasks={emptyTasks} />);
-
-      const statusBar = screen.getByRole("status");
-      expect(statusBar).toHaveTextContent("Stuck");
-      const stuckCount = statusBar.querySelector(".executor-status-bar__segment--stuck .executor-status-bar__count");
-      expect(stuckCount).toHaveTextContent("3");
-      expect(stuckCount).toHaveClass("executor-status-bar__count--error");
+      expect(mockUseExecutorStats).toHaveBeenCalledWith(tasks, undefined, undefined);
     });
   });
 
@@ -1109,6 +1112,40 @@ describe("ExecutorStatusBar", () => {
       const status = screen.getByRole("status");
       expect(status).toBeInTheDocument();
       expect(status).not.toHaveClass("executor-status-bar--keyboard-open");
+    });
+
+    it.each([
+      ["error", { loading: false, error: "Stats unavailable", stats: defaultStats }, "executor-status-bar--error"],
+      ["connecting", { loading: false, error: "Failed to fetch", stats: defaultStats }, "executor-status-bar--connecting"],
+      ["initial loading", { loading: true, error: null, stats: { ...defaultStats, runningTaskCount: 0 } }, "executor-status-bar--loading"],
+    ])("applies the keyboard collapse class in the %s branch", (_branch, state, branchClass) => {
+      vi.mocked(mockUseExecutorStats).mockReturnValue({
+        stats: state.stats ?? defaultStats,
+        loading: state.loading,
+        error: state.error,
+        refresh: vi.fn(),
+      });
+
+      render(<ExecutorStatusBar tasks={emptyTasks} keyboardOpen />);
+
+      expect(document.querySelector(".executor-status-bar")).toHaveClass(branchClass, "executor-status-bar--keyboard-open");
+    });
+
+    it.each([
+      ["error", { loading: false, error: "Stats unavailable", stats: defaultStats }],
+      ["connecting", { loading: false, error: "Failed to fetch", stats: defaultStats }],
+      ["initial loading", { loading: true, error: null, stats: { ...defaultStats, runningTaskCount: 0 } }],
+    ])("does not apply the keyboard collapse class in the %s branch when closed", (_branch, state) => {
+      vi.mocked(mockUseExecutorStats).mockReturnValue({
+        stats: state.stats ?? defaultStats,
+        loading: state.loading,
+        error: state.error,
+        refresh: vi.fn(),
+      });
+
+      render(<ExecutorStatusBar tasks={emptyTasks} keyboardOpen={false} />);
+
+      expect(document.querySelector(".executor-status-bar")).not.toHaveClass("executor-status-bar--keyboard-open");
     });
   });
 

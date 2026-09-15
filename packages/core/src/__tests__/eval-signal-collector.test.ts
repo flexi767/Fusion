@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectDeterministicSignals } from "../eval-signal-collector.js";
+import { collectDeterministicSignals } from "../eval/eval-signal-collector.js";
 import type { TaskDetail } from "../types.js";
 
 function makeTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
@@ -48,11 +48,17 @@ describe("collectDeterministicSignals", () => {
   });
 
   it("handles missing optional metadata without throwing", () => {
-    const task = makeTask({ column: "archived", log: [] });
+    const task = makeTask({ column: "done", log: [] });
     const signals = collectDeterministicSignals(task, { runId: "ER-2", startedAt: "2026-05-02T00:00:00.000Z" });
-    expect(signals.column).toBe("archived");
+    expect(signals.column).toBe("done");
     expect(signals.workflowSummary).toEqual({ total: 0, passed: 0, failed: 0, pending: 0 });
     expect(signals.commitSummary.commitCount).toBe(0);
     expect(signals.logSummary).toEqual({ errorCount: 0, warningCount: 0, timingEntries: 0 });
+  });
+
+  it("records completed evidence in the single Done bucket", () => {
+    const task = makeTask({ column: "shipped", log: [] });
+    const signals = collectDeterministicSignals(task, { runId: "ER-3", startedAt: "2026-05-02T00:00:00.000Z" });
+    expect(signals.column).toBe("done");
   });
 });

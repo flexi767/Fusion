@@ -62,14 +62,16 @@ import {
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { createServer, type Server } from "node:net";
-import { dirname, join, basename, sep } from "node:path";
+import { dirname, join, basename, sep, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { createLogger } from "../logger.js";
+import { createLogger } from "../process/logger.js";
 import { redactConnectionString } from "./credential-redact.js";
 import type { ResolvedBackend } from "./backend-resolver.js";
 import {
   isWindowsElevatedAdmin,
   startServerElevatedRestricted,
+  WindowsPostgresFatalDetector,
+  withWindowsNativeBinPath,
   type ElevatedServerHandle,
   type ElevatedStartOptions,
 } from "./embedded-windows-elevated.js";
@@ -200,7 +202,7 @@ const EMBEDDED_PG_BIN_NAMES = new Set([
  * host-local caches always rematerialize after a desktop update that ships a
  * new fingerprinting strategy (e.g. content-hashing lib/share, not path+size).
  */
-const MATERIALIZATION_MARKER_VERSION = 2;
+const MATERIALIZATION_MARKER_VERSION = 3;
 
 /**
  * FNXC:DesktopEmbeddedPostgres 2026-07-14-18:30:
@@ -359,6 +361,40 @@ function hashPayloadTreeContents(
  * binaries instead of reusing the previous release's host-local cache.
  * Legacy path-only markers fail equality and force rematerialization.
  */
+/*
+ * FNXC:PostgresEmbedded 2026-08-20-01:11:
+ * Issue #3489 reports Windows Defender removing dict_snowball.dll while PostgreSQL
+ * initializes. Win32 4550/4551 are the virus-infected/deleted codes, so match both
+ * signatures narrowly; generic library-load errors have unrelated remediation.
+ */
+export function isWindowsBlockedNativeLibraryError(errorOrText: unknown): boolean {
+  const text = errorOrText instanceof Error ? errorOrText.message : String(errorOrText ?? "");
+  return (/could not load library/i.test(text) && /unknown error 455[01]/i.test(text))
+    || /ERROR_VIRUS_(?:INFECTED|DELETED)/i.test(text);
+}
+
+/** Creates the shared, actionable Windows antivirus recovery instruction. */
+export function describeWindowsBlockedNativeLibraryError(errorOrText: unknown): string {
+  const text = errorOrText instanceof Error ? errorOrText.message : String(errorOrText ?? "");
+  const blockedPath = text.match(/could not load library\s+["']([^"']+)["']/i)?.[1];
+  const pathDetail = blockedPath ? ` Blocked file: ${blockedPath}.` : "";
+  return `${pathDetail} HINT: Windows antivirus blocked a bundled PostgreSQL library. Add an exclusion for %USERPROFILE%\\.fusion\\embedded-postgres in Windows Security → Virus & threat protection → Manage settings → Exclusions, restore the quarantined file from Protection history, then restart Fusion. Fusion re-copies the runtime automatically.`;
+}
+
+export function decorateWindowsBlockedNativeLibraryError(error: unknown, destRoot?: string): Error {
+  const recorded = getEmbeddedPayloadIntegrityFailure(destRoot);
+  if (!isWindowsBlockedNativeLibraryError(error) && !recorded) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("Windows antivirus blocked a bundled PostgreSQL library")) {
+    return error instanceof Error ? error : new Error(message);
+  }
+  return new Error(`${message}${recorded ? ` ${recorded.message}` : describeWindowsBlockedNativeLibraryError(error)}`, {
+    cause: error,
+  });
+}
+
 export function buildEmbeddedPostgresMaterializationMarker(nativeRoot: string): string {
   const fingerprint = fingerprintEmbeddedPostgresNativeRoot(nativeRoot);
   return `v${MATERIALIZATION_MARKER_VERSION}\n${nativeRoot}\n${fingerprint}\n`;
@@ -370,6 +406,134 @@ function resolveMaterializedEmbeddedPostgresBinary(filePath: string): string | n
   if (!filePath.includes(`${sep}app.asar`)) return null;
   const candidate = join(embeddedPostgresRuntimeBinRoot(), "bin", name);
   return existsSync(candidate) ? candidate : null;
+}
+
+type PayloadInventoryResult = {
+  readonly acceptable: boolean;
+  readonly mismatches: readonly string[];
+  readonly mismatchCount: number;
+};
+
+/**
+ * FNXC:PostgresEmbedded 2026-08-20-01:11:
+ * A marker fingerprints only the source. Defender can remove a copied DLL after
+ * materialization, leaving that marker truthful but the destination unusable.
+ * Compare the bounded source inventory on reuse; exhaustion and unreadable source
+ * fail open so a healthy host never incurs an unbounded copy or boot refusal.
+ */
+function verifyEmbeddedPostgresPayloadInventory(
+  nativeRoot: string,
+  destRoot: string,
+): PayloadInventoryResult {
+  const budget = { remaining: 4096 };
+  const mismatches: string[] = [];
+  let mismatchCount = 0;
+  let sourceUnreadable = false;
+  const report = (relativePath: string) => {
+    mismatchCount += 1;
+    if (mismatches.length < 10) mismatches.push(relativePath);
+  };
+  const visit = (sourcePath: string, destPath: string, relativePath: string): void => {
+    if (budget.remaining <= 0 || sourceUnreadable) return;
+    let sourceEntries: string[];
+    try {
+      sourceEntries = readdirSync(sourcePath).sort();
+    } catch {
+      sourceUnreadable = true;
+      return;
+    }
+    for (const entry of sourceEntries) {
+      if (budget.remaining <= 0 || sourceUnreadable) return;
+      const sourceEntry = join(sourcePath, entry);
+      const destEntry = join(destPath, entry);
+      const relativeEntry = relativePath ? `${relativePath}/${entry}` : entry;
+      try {
+        const sourceStat = lstatSync(sourceEntry);
+        if (sourceStat.isDirectory()) {
+          visit(sourceEntry, destEntry, relativeEntry);
+        } else if (sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+          budget.remaining -= 1;
+          let destStat: ReturnType<typeof lstatSync>;
+          try {
+            destStat = lstatSync(destEntry);
+          } catch {
+            report(relativeEntry);
+            continue;
+          }
+          if (sourceStat.isFile()) {
+            if (!destStat.isFile() || destStat.size !== sourceStat.size) report(relativeEntry);
+          } else {
+            if (!destStat.isSymbolicLink()) report(relativeEntry);
+          }
+        }
+      } catch {
+        sourceUnreadable = true;
+      }
+    }
+  };
+  for (const tree of ["bin", "lib", "share"] as const) {
+    const sourceTree = join(nativeRoot, tree);
+    try {
+      if (lstatSync(sourceTree).isDirectory()) visit(sourceTree, join(destRoot, tree), tree);
+    } catch {
+      sourceUnreadable = true;
+    }
+  }
+  return {
+    acceptable: sourceUnreadable || budget.remaining <= 0 || mismatchCount === 0,
+    mismatches,
+    mismatchCount,
+  };
+}
+
+export class EmbeddedPostgresPayloadBlockedError extends Error {
+  readonly destRoot: string;
+  readonly nativeRoot: string;
+  readonly affectedPaths: readonly string[];
+  readonly affectedPathCount: number;
+
+  constructor(nativeRoot: string, destRoot: string, verification: PayloadInventoryResult) {
+    const affected = verification.mismatches.join(", ") || "unknown payload entry";
+    super(
+      `Embedded PostgreSQL runtime payload is incomplete (${affected}${verification.mismatchCount > verification.mismatches.length ? ", …" : ""}).${describeWindowsBlockedNativeLibraryError(affected)}`,
+    );
+    this.name = "EmbeddedPostgresPayloadBlockedError";
+    this.nativeRoot = nativeRoot;
+    this.destRoot = destRoot;
+    this.affectedPaths = verification.mismatches;
+    this.affectedPathCount = verification.mismatchCount;
+  }
+}
+
+type EmbeddedPayloadIntegrityFailure = {
+  readonly destRoot: string;
+  readonly error: EmbeddedPostgresPayloadBlockedError;
+  readonly recordedAt: number;
+};
+
+let embeddedPayloadIntegrityFailure: EmbeddedPayloadIntegrityFailure | null = null;
+
+/** Records only the newest root-scoped incomplete-payload diagnosis. */
+export function recordEmbeddedPayloadIntegrityFailure(error: EmbeddedPostgresPayloadBlockedError): void {
+  embeddedPayloadIntegrityFailure = { destRoot: resolve(error.destRoot), error, recordedAt: Date.now() };
+}
+
+/** Returns the diagnostic only for its originating materialized runtime root. */
+export function getEmbeddedPayloadIntegrityFailure(destRoot?: string): EmbeddedPostgresPayloadBlockedError | null {
+  if (!embeddedPayloadIntegrityFailure) return null;
+  if (destRoot && resolve(destRoot) !== embeddedPayloadIntegrityFailure.destRoot) return null;
+  return embeddedPayloadIntegrityFailure.error;
+}
+
+/** Clears the test-resettable, in-memory payload diagnostic. */
+export function clearEmbeddedPayloadIntegrityFailure(): void {
+  embeddedPayloadIntegrityFailure = null;
+}
+
+function clearEmbeddedPayloadIntegrityFailureForRoot(destRoot: string): void {
+  if (embeddedPayloadIntegrityFailure?.destRoot === resolve(destRoot)) {
+    clearEmbeddedPayloadIntegrityFailure();
+  }
 }
 
 export interface MaterializeEmbeddedPostgresOptions {
@@ -411,8 +575,10 @@ export function materializeEmbeddedPostgresRuntimeBinaries(
     existsSync(marker) &&
     readFileSync(marker, "utf8") === sourceMarker &&
     existsSync(join(destBin, process.platform === "win32" ? "postgres.exe" : "postgres")) &&
-    existsSync(join(destRoot, "lib", "postgresql"))
+    existsSync(join(destRoot, "lib", "postgresql")) &&
+    verifyEmbeddedPostgresPayloadInventory(nativeRoot, destRoot).acceptable
   ) {
+    clearEmbeddedPayloadIntegrityFailureForRoot(destRoot);
     return destRoot;
   }
 
@@ -422,6 +588,12 @@ export function materializeEmbeddedPostgresRuntimeBinaries(
    * payload cannot linger beside the updated binaries (force-copy alone does not
    * delete orphans).
    */
+  // Never let a prior marker certify a partially copied payload after a crash or AV action.
+  try {
+    unlinkSync(marker);
+  } catch {
+    // best-effort; recursive destination removal below is the normal cleanup path
+  }
   if (existsSync(destRoot)) {
     rmSync(destRoot, { recursive: true, force: true });
   }
@@ -444,7 +616,19 @@ export function materializeEmbeddedPostgresRuntimeBinaries(
   }
   // Re-apply macOS ABI compatibility links against the materialized lib dir.
   normalizeMacosEmbeddedPostgresDylibSymlinks(destRoot);
+  const verification = verifyEmbeddedPostgresPayloadInventory(nativeRoot, destRoot);
+  if (!verification.acceptable) {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // No marker is the retry contract; ignore an already-absent marker.
+    }
+    const error = new EmbeddedPostgresPayloadBlockedError(nativeRoot, destRoot, verification);
+    recordEmbeddedPayloadIntegrityFailure(error);
+    throw error;
+  }
   writeFileSync(marker, sourceMarker, "utf8");
+  clearEmbeddedPayloadIntegrityFailureForRoot(destRoot);
   return destRoot;
 }
 
@@ -455,6 +639,38 @@ let electronAsarNativePathPatchRestore: (() => void) | null = null;
 type MutableSpawnModule = {
   spawn: (...args: unknown[]) => unknown;
 };
+
+type SpawnOptionsLike = { env?: NodeJS.ProcessEnv; windowsHide?: boolean };
+
+function isWindowsEmbeddedPostgresBinary(command: unknown): command is string {
+  return process.platform === "win32" &&
+    typeof command === "string" &&
+    /[\\/]bin[\\/](?:postgres|initdb|pg_ctl)\.exe$/i.test(command);
+}
+
+/**
+ * Add the sibling bundled bin directory only to a native PostgreSQL spawn.
+ *
+ * FNXC:PostgresEmbedded 2026-07-22-16:10:
+ * `embedded-postgres` copies process.env when it spawns normal Windows
+ * postmasters. Patch that narrow spawn seam rather than mutating process.env,
+ * so npm/pnpm, standalone runtime-bin, and Electron materialized payloads all
+ * give descendants their DLL directory without changing unrelated children.
+ */
+function withWindowsPostgresSpawnEnvironment(command: unknown, rest: unknown[]): unknown[] {
+  if (!isWindowsEmbeddedPostgresBinary(command)) return rest;
+  const args = [...rest];
+  const optionIndex = args.length - 1;
+  const existing = args[optionIndex] as SpawnOptionsLike | undefined;
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) return args;
+  const binDir = dirname(command);
+  const nativeRoot = dirname(binDir);
+  args[optionIndex] = {
+    ...existing,
+    env: withWindowsNativeBinPath(existing.env ?? process.env, nativeRoot),
+  } satisfies SpawnOptionsLike;
+  return args;
+}
 type MutableFsPromisesModule = {
   stat: (...args: unknown[]) => unknown;
   chmod: (...args: unknown[]) => unknown;
@@ -491,7 +707,10 @@ export function installElectronAsarNativePathPatch(): void {
         materializeEmbeddedPostgresRuntimeBinaries(sourceRoot);
       }
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof EmbeddedPostgresPayloadBlockedError) {
+      recordEmbeddedPayloadIntegrityFailure(error);
+    }
     // Materialization is best-effort; path rewrite still helps when possible.
   }
 
@@ -500,7 +719,10 @@ export function installElectronAsarNativePathPatch(): void {
   childProcessMod.spawn = (command: unknown, ...rest: unknown[]) => {
     const fixedCommand =
       typeof command === "string" ? resolveElectronAsarUnpackedPath(command) : command;
-    return originalSpawn(fixedCommand, ...rest);
+    return originalSpawn(
+      fixedCommand,
+      ...withWindowsPostgresSpawnEnvironment(fixedCommand, rest),
+    );
   };
 
   const fsPromisesMod = require("fs/promises") as MutableFsPromisesModule;
@@ -647,6 +869,37 @@ export function defaultEmbeddedPostgresFlagsFor(platform: NodeJS.Platform): read
 export const DEFAULT_EMBEDDED_POSTGRES_FLAGS = defaultEmbeddedPostgresFlagsFor(process.platform);
 
 /*
+ * FNXC:PostgresEmbedded 2026-07-22-23:55:
+ * Issue #2411 (operator-confirmed on 0.73.0-beta.2): on Windows every PostgreSQL
+ * connection is a separate postgres.exe process, and standing up backends against a
+ * max_connections=500 cap exhausts the non-interactive desktop heap during connection
+ * bursts. A forked backend then dies in DLL/session init with exception 0xC0000142,
+ * the postmaster terminates all other backends, and the whole embedded cluster — and
+ * with it the dashboard — goes down. The reporter measured stability at a cap of 100
+ * after repeated crashes at 500. Default the cap platform-aware: 150 on win32 (well
+ * above Fusion's own pool usage of ~3 connections per connection set), 500 elsewhere.
+ * An operator-configured embeddedPostgresMaxConnections is always honored, clamped to
+ * [32, 2000] on every platform — the lower win32 number is only the unset default.
+ * This complements, not replaces, the FN-8522 child PATH hardening and single-restart
+ * recovery for the same 0xC0000142 signature.
+ */
+export const DEFAULT_EMBEDDED_MAX_CONNECTIONS = 500;
+export const DEFAULT_EMBEDDED_MAX_CONNECTIONS_WIN32 = 150;
+export const EMBEDDED_MAX_CONNECTIONS_MIN = 32;
+export const EMBEDDED_MAX_CONNECTIONS_MAX = 2_000;
+
+/** Resolve the effective embedded-cluster max_connections from the optional operator setting. */
+export function resolveEmbeddedMaxConnections(
+  configured: number | undefined,
+  platform: NodeJS.Platform = process.platform,
+): number {
+  if (typeof configured === "number" && Number.isInteger(configured)) {
+    return Math.min(EMBEDDED_MAX_CONNECTIONS_MAX, Math.max(EMBEDDED_MAX_CONNECTIONS_MIN, configured));
+  }
+  return platform === "win32" ? DEFAULT_EMBEDDED_MAX_CONNECTIONS_WIN32 : DEFAULT_EMBEDDED_MAX_CONNECTIONS;
+}
+
+/*
 FNXC:PostgresEmbedded 2026-07-18-00:20:
 GitHub issue #2286: initdb without --encoding inherits the OS locale's
 encoding. On non-UTF-8 Windows locales (Turkish WIN1254 in the report; the
@@ -750,12 +1003,20 @@ export interface EmbeddedDylibNormalization {
   readonly created: boolean;
 }
 
+/*
+FNXC:PostgresEmbedded 2026-07-22-14:34:
+The bundled libicui18n.68.2.dylib records libicuuc.68.dylib as its loader
+name. macOS dyld must find that ABI-specific compatibility name before initdb
+runs, so normalize it only from the packaged libicuuc.68.<patch>.dylib payload
+rather than adding a broad unversioned ICU link or relying on system libraries.
+*/
 const MACOS_EMBEDDED_DYLIB_SYMLINKS: readonly EmbeddedDylibSymlinkSpec[] = [
   { expected: "libpq.5.dylib", candidate: /^libpq\.5\..+\.dylib$/ },
   { expected: "libzstd.1.dylib", candidate: /^libzstd\.1\..+\.dylib$/ },
   { expected: "liblz4.1.dylib", candidate: /^liblz4\.1\..+\.dylib$/ },
   { expected: "libz.1.dylib", candidate: /^libz\.1\..+\.dylib$/ },
   { expected: "libicui18n.dylib", candidate: /^libicui18n\..+\.dylib$/ },
+  { expected: "libicuuc.68.dylib", candidate: /^libicuuc\.68\..+\.dylib$/ },
 ];
 
 function sortDylibCandidates(files: readonly string[], candidate: RegExp): string[] {
@@ -768,10 +1029,11 @@ function sortDylibCandidates(files: readonly string[], candidate: RegExp): strin
  * Normalize macOS embedded-postgres library names before initdb/postgres spawn.
  *
  * The @embedded-postgres/darwin-* packages can contain fully-versioned dylibs
- * (for example libpq.5.15.dylib, libzstd.1.5.7.dylib) while the bundled
- * binaries link against ABI compatibility names such as libpq.5.dylib and
- * libzstd.1.dylib via @loader_path/../lib/.... When the package postinstall
- * symlink hydration is skipped or incomplete, dyld fails before initdb can run.
+ * (for example libpq.5.15.dylib, libzstd.1.5.7.dylib, and
+ * libicuuc.68.2.dylib) while the bundled binaries link against ABI compatibility
+ * names such as libpq.5.dylib, libzstd.1.dylib, and libicuuc.68.dylib via
+ * @loader_path/../lib/.... When the package postinstall symlink hydration is
+ * skipped or incomplete, dyld fails before initdb can run.
  *
  * This is intentionally local to the embedded binary package and idempotent:
  * existing compatibility names are left alone; missing compatibility names are
@@ -893,7 +1155,10 @@ function resolveWindowsEmbeddedPostgresNativeRoot(): string | null {
       return materializeEmbeddedPostgresRuntimeBinaries(
         resolveElectronAsarUnpackedPath(nativeRoot),
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof EmbeddedPostgresPayloadBlockedError) {
+        recordEmbeddedPayloadIntegrityFailure(error);
+      }
       return resolveElectronAsarUnpackedPath(nativeRoot);
     }
   }
@@ -958,6 +1223,40 @@ export function readPortFromPostmasterPid(dataDir: string): number | null {
   }
 }
 
+/** Read the postmaster OS pid from line 1 (index 0) of postmaster.pid, or null. */
+export function readPidFromPostmasterPid(dataDir: string): number | null {
+  try {
+    const lines = readFileSync(join(dataDir, "postmaster.pid"), "utf-8").split("\n");
+    const pid = parseInt((lines[0] ?? "").trim(), 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/*
+FNXC:PostgresEmbedded 2026-07-23-11:50:
+Issue #2411 (stale-pid gap): a hard host crash (SIGKILL, power loss) leaves
+postmaster.pid behind with no postmaster. The optimistic join then handed back
+a URL to a dead port on EVERY subsequent boot, so the dashboard could never
+start again without a manual pid-file delete — the "a plain relaunch just
+repeats the failure" dead shell. Probe the recorded pid: signal 0 raises ESRCH
+for a dead process (dead → the lock is stale and an owned start may proceed —
+PostgreSQL itself re-validates and reclaims a stale lock file on startup, so
+this stays safe even against pid recycling: a recycled live pid keeps today's
+join-then-fail behavior, and a genuinely live postmaster makes our start fail
+with the lock collision we already handle). EPERM means the process exists but
+is not signalable (foreign user) — treat as alive, fail-closed to the join.
+*/
+function isPostmasterProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
+  }
+}
+
 /**
  * Check whether an embedded PG is already running for the given data dir.
  * Uses both the in-process registry AND a probe of the postmaster.pid file
@@ -991,6 +1290,56 @@ function isPostgresLockCollisionError(error: unknown): boolean {
     || /server is already running/i.test(message);
 }
 
+/*
+FNXC:PostgresEmbedded 2026-07-23-10:40:
+Issue #2411 (beta.4 follow-up): a cluster left in interrupted-recovery state
+listens on its TCP port almost immediately but rejects every connection with
+SQLSTATE 57P03 ("the database system is starting up") until crash recovery
+finishes; a joiner racing the owner sees plain ECONNREFUSED instead. Both mean
+"not yet accepting connections — wait", never "verify failed". Treating 57P03
+as fatal is what made beta.4 stop() its own just-launched postmaster ~0.2s into
+recovery and then join the instance it had told to shut down.
+*/
+export function isClusterStartingUpError(error: unknown): boolean {
+  const { code } = (error ?? {}) as { code?: string };
+  // 57P03 cannot_connect_now covers "starting up", "in recovery mode", and
+  // "shutting down" — the cluster is alive but not yet queryable.
+  if (code === "57P03") return true;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /the database system is (starting up|in recovery|shutting down)/i.test(message);
+}
+
+/**
+ * FNXC:PostgresEmbedded 2026-07-23-10:40:
+ * Superset used only by the OWNED start's readiness wait: an owned postmaster
+ * that was just launched may also be in its pre-listen window, so socket-level
+ * connect failures are retryable there too. The JOIN path deliberately does NOT
+ * retry socket errors — a stale pid file from a crash resolves to a dead port,
+ * and the optimistic-join contract (resolve the URL, let the connection layer
+ * report it) must stay instant for that case.
+ */
+export function isClusterNotYetAcceptingError(error: unknown): boolean {
+  if (isClusterStartingUpError(error)) return true;
+  const { code } = (error ?? {}) as { code?: string };
+  if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ETIMEDOUT" || code === "CONNECT_TIMEOUT") {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /ECONNREFUSED|ECONNRESET|CONNECT_TIMEOUT/i.test(message);
+}
+
+/** Poll cadence while waiting for a starting/recovering cluster to accept connections. */
+const CLUSTER_ACCEPTING_POLL_MS = 500;
+/**
+ * FNXC:PostgresEmbedded 2026-07-23-10:40:
+ * Bounded wait a JOINER gives a starting/recovering instance before falling
+ * back to the historical best-effort optimistic join. Recovery on the reported
+ * cluster completes in ~1s once the .pgrunner fsync stall is gone; 15s covers
+ * modest WAL replay without turning a stale-pid join into a long hang (the
+ * startup-factory retry layer bounds the rest).
+ */
+const JOINED_INSTANCE_RECOVERY_WAIT_MS = 15_000;
+
 function isDuplicateDatabaseError(error: unknown): boolean {
   const { code, constraint_name: constraint } = (error ?? {}) as {
     code?: string;
@@ -1000,22 +1349,64 @@ function isDuplicateDatabaseError(error: unknown): boolean {
   return code === "23505" && constraint === "pg_database_datname_index";
 }
 
-function isAlreadyRunning(dataDir: string): { port: number; database: string } | null {
-  // Check in-process registry first
+const POSTMASTER_PID_READ_ATTEMPTS = 3;
+const POSTMASTER_PID_READ_RETRY_MS = 10;
+
+function waitForPostmasterPidReread(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, POSTMASTER_PID_READ_RETRY_MS));
+}
+
+/**
+ * Resolve an instance another lifecycle/process already owns.
+ *
+ * FNXC:PostgresEmbedded 2026-07-21-10:00:
+ * A present `postmaster.pid` is a live-lock signal, not permission to launch a
+ * second postmaster. PostgreSQL can write it while a joiner reads, so retry a
+ * small bounded number of times; if its port remains unreadable, fail closed
+ * instead of turning parser-null into the double-boot collision that exhausts
+ * extension TaskStore's caller budget.
+ *
+ * FNXC:PostgresEmbedded 2026-07-23-11:50:
+ * Issue #2411 (stale-pid gap): the live-lock presumption is rebutted when the
+ * recorded pid is provably dead (see isPostmasterProcessAlive) — then the file
+ * is a crash leftover, joining it can only ever fail, and an owned start (whose
+ * postmaster re-validates the lock itself) is the correct recovery. A readable
+ * pid that is alive-or-unknowable keeps every prior behavior, including the
+ * fail-closed unreadable-port error below.
+ */
+async function isAlreadyRunning(
+  dataDir: string,
+  onLog?: (message: string) => void,
+): Promise<{ port: number; database: string } | null> {
+  // Check in-process registry first.
   const cached = runningInstances.get(dataDir);
   if (cached) return cached;
 
-  // Check postmaster.pid — another process (or a prior call) may have started PG
-  if (!existsSync(join(dataDir, "postmaster.pid"))) return null;
+  const pidPath = join(dataDir, "postmaster.pid");
+  if (!existsSync(pidPath)) return null;
 
-  // Read the port from postmaster.pid
-  const port = readPortFromPostmasterPid(dataDir);
-  if (!port) return null;
+  const pid = readPidFromPostmasterPid(dataDir);
+  if (pid !== null && !isPostmasterProcessAlive(pid)) {
+    onLog?.(
+      `embedded postgres: postmaster.pid in ${dataDir} records pid ${pid}, which is not running (stale lock from a crash); starting an owned postmaster — PostgreSQL reclaims the stale lock file itself`,
+    );
+    return null;
+  }
 
-  // Probe: can we connect to this port?
-  // We return the port optimistically — the connection layer will fail fast
-  // if the port is stale (postmaster.pid left over from a crash).
-  return { port, database: "fusion" };
+  for (let attempt = 0; attempt < POSTMASTER_PID_READ_ATTEMPTS; attempt += 1) {
+    const port = readPortFromPostmasterPid(dataDir);
+    if (port) {
+      // Probe: can we connect to this port? We return it optimistically; the
+      // connection layer reports a stale-but-parseable pid without a second start.
+      return { port, database: "fusion" };
+    }
+    if (!existsSync(pidPath)) return null;
+    if (attempt < POSTMASTER_PID_READ_ATTEMPTS - 1) await waitForPostmasterPidReread();
+  }
+
+  throw new Error(
+    `embedded postgres: postmaster.pid is present but its port could not be read after ${POSTMASTER_PID_READ_ATTEMPTS} attempts; a second postmaster will not be started (data dir ${dataDir})`,
+  );
 }
 
 /**
@@ -1027,11 +1418,19 @@ function isAlreadyRunning(dataDir: string): { port: number; database: string } |
  * is tiny. For the zero-config default this is acceptable; callers needing a
  * fixed port can pass `options.port`.
  */
-function findFreePort(): Promise<number> {
+/*
+ * FNXC:CliAwaitLiveness 2026-08-11-09:17:
+ * Keep this temporary listener ref'd until its listen/close promise settles.
+ * An unref'd sole handle lets Node drain the event loop beneath a pending top-level
+ * await, terminating `fn init` with exit 13 before project registration. Exporting
+ * the helper provides the direct test seam for this listener-liveness contract.
+ */
+export function findFreePort(createServerFn: () => Server = createServer): Promise<number> {
   return new Promise((resolve, reject) => {
-    const srv: Server = createServer();
-    srv.unref();
-    srv.on("error", reject);
+    const srv = createServerFn();
+    srv.on("error", (error) => {
+      srv.close(() => reject(error));
+    });
     srv.listen(0, "127.0.0.1", () => {
       const addr = srv.address();
       if (addr && typeof addr === "object") {
@@ -1090,6 +1489,10 @@ export class EmbeddedPostgresLifecycle {
    * on a failure that is handled before the timeout fires.
    */
   private startTimer: NodeJS.Timeout | null = null;
+  private readonly windowsFatalDetector = new WindowsPostgresFatalDetector();
+  private recoveryAttempts = 0;
+  private recoveryInFlight: Promise<void> | null = null;
+  private stopRequested = false;
 
   constructor(opts: EmbeddedLifecycleOptions) {
     this.options = {
@@ -1106,6 +1509,16 @@ export class EmbeddedPostgresLifecycle {
         opts.onError ?? ((err: string | Error | unknown) => log.error(String(err))),
     };
   }
+
+  /**
+   * Forward native process output to the existing sink, then schedule recovery
+   * only for a confirmed owned Windows fatal shutdown sequence.
+   */
+  private forwardPostgresLog = (message: string): void => {
+    this.options.onLog(message);
+    if (process.platform !== "win32" || !this.running || !this.ownsProcess) return;
+    if (this.windowsFatalDetector.push(message)) void this.recoverWindowsFatalOnce();
+  };
 
   /** The configured or discovered port. Undefined until assigned (explicit or discovered in `start()`). */
   getPort(): number | undefined {
@@ -1202,11 +1615,10 @@ export class EmbeddedPostgresLifecycle {
 
     // FNXC:PostgresCutover 2026-06-27-11:05:
     // Check if PG is already running for this data dir. If so, reuse it.
-    const existing = isAlreadyRunning(this.options.dataDir);
+    const existing = await isAlreadyRunning(this.options.dataDir, this.options.onLog);
     if (existing) {
-      this.options.onLog(
-        `embedded postgres: already running on port ${existing.port} (data dir ${this.options.dataDir}), connecting without starting a new instance`,
-      );
+      // FNXC:EngineDiagnostics 2026-08-03-05:54: multi-process rejoin is expected; keep "starting embedded PostgreSQL" as the boot-visible line.
+      log.debug(`embedded postgres: already running on port ${existing.port} (data dir ${this.options.dataDir}), connecting without starting a new instance`);
       this.resolvedPort = existing.port;
       this.running = false; // We didn't start it, so we won't stop it
       this.ownsProcess = false;
@@ -1222,13 +1634,24 @@ export class EmbeddedPostgresLifecycle {
         runtimeUrl: url,
         migrationUrl: url,
         migrationUrlOverridden: false,
+        directSessionUrl: url,
+        directSessionProvenance: "embedded-lifecycle",
       };
     }
+    return this.startBounded();
+  }
+
+  /**
+   * Start an owned postmaster with the same cancellation and timeout contract
+   * used by public startup. Recovery calls this directly because it must not
+   * join a stale pid file or allocate a new endpoint between pool reconnects.
+   */
+  private async startBounded(preferredPort?: number): Promise<ResolvedBackend> {
     if (this.options.startTimeoutMs <= 0) {
-      return this.startInternal();
+      return this.startInternal(undefined, preferredPort);
     }
     const controller = new AbortController();
-    const startAttempt = this.startInternal(controller.signal);
+    const startAttempt = this.startInternal(controller.signal, preferredPort);
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
@@ -1240,7 +1663,6 @@ export class EmbeddedPostgresLifecycle {
           ),
         );
       }, this.options.startTimeoutMs);
-      // Unref so the timer alone does not keep the event loop alive.
       if (timer && typeof timer.unref === "function") timer.unref();
     });
     this.startTimer = timer ?? null;
@@ -1248,8 +1670,6 @@ export class EmbeddedPostgresLifecycle {
       return await Promise.race([startAttempt, timeout]);
     } catch (err) {
       controller.abort();
-      // On timeout (or any failure), best-effort clean up the partial state so
-      // a retry starts fresh. stop() is safe to call even when not fully running.
       await this.stop().catch(() => undefined);
       throw err;
     } finally {
@@ -1258,12 +1678,15 @@ export class EmbeddedPostgresLifecycle {
     }
   }
 
-  /**
-   * The actual start sequence, with no timeout wrapper. Called by {@link start}
-   * either directly (timeout disabled) or via Promise.race with the timeout.
-   */
-  private async startInternal(signal?: AbortSignal): Promise<ResolvedBackend> {
-    const port = this.options.port ?? (await findFreePort());
+  /** The actual start sequence, invoked only through {@link startBounded}. */
+  private async startInternal(signal?: AbortSignal, preferredPort?: number): Promise<ResolvedBackend> {
+    /*
+    FNXC:PostgresEmbedded 2026-07-22-23:05:
+    A Windows crash recovery must retain the originally resolved endpoint even
+    when no explicit port was configured. Reallocating here strands existing
+    task-store pools on the dead port, so only a first launch may find a port.
+    */
+    const port = this.options.port ?? preferredPort ?? this.resolvedPort ?? (await findFreePort());
     if (signal?.aborted) throw new EmbeddedStartCancelledError(this.options.dataDir);
     this.resolvedPort = port;
 
@@ -1280,7 +1703,7 @@ export class EmbeddedPostgresLifecycle {
       authMethod: "password",
       initdbFlags: [...this.options.initdbFlags],
       postgresFlags: [...this.options.postgresFlags],
-      onLog: this.options.onLog,
+      onLog: this.forwardPostgresLog,
       onError: this.options.onError,
     });
     this.pg = pg;
@@ -1296,7 +1719,11 @@ export class EmbeddedPostgresLifecycle {
       this.options.onLog(
         `embedded postgres: initializing new data directory at ${this.options.dataDir} (initdb)`,
       );
-      await pg.initialise();
+      try {
+        await pg.initialise();
+      } catch (error) {
+        throw decorateWindowsBlockedNativeLibraryError(error, embeddedPostgresRuntimeBinRoot());
+      }
     }
 
     if (signal?.aborted) {
@@ -1337,7 +1764,7 @@ export class EmbeddedPostgresLifecycle {
           dataDir: this.options.dataDir,
           port,
           postgresFlags: this.options.postgresFlags,
-          onLog: this.options.onLog,
+          onLog: this.forwardPostgresLog,
           onError: this.options.onError,
           startTimeoutMs: this.options.startTimeoutMs,
           signal,
@@ -1368,8 +1795,10 @@ export class EmbeddedPostgresLifecycle {
       then failed later read back its OWN postmaster.pid, "join itself" with ownsProcess=false,
       and orphan a live postmaster nothing would ever stop. See isPostgresLockCollisionError.
       */
-      if (!isPostgresLockCollisionError(error)) throw error;
-      const existing = isAlreadyRunning(this.options.dataDir);
+      if (!isPostgresLockCollisionError(error)) {
+        throw decorateWindowsBlockedNativeLibraryError(error, embeddedPostgresRuntimeBinRoot());
+      }
+      const existing = await isAlreadyRunning(this.options.dataDir, this.options.onLog);
       if (!existing) throw error;
 
       /*
@@ -1406,6 +1835,8 @@ export class EmbeddedPostgresLifecycle {
         runtimeUrl,
         migrationUrl: runtimeUrl,
         migrationUrlOverridden: false,
+        directSessionUrl: runtimeUrl,
+        directSessionProvenance: "embedded-lifecycle",
       };
     }
     /*
@@ -1426,6 +1857,18 @@ export class EmbeddedPostgresLifecycle {
     });
 
     try {
+      /*
+      FNXC:PostgresEmbedded 2026-07-23-10:40:
+      Issue #2411 (beta.4 follow-up): an owned start on an interrupted data dir
+      must let crash recovery FINISH before any SQL runs. The elevated Windows
+      launcher declares readiness on a bare TCP accept, which succeeds while
+      recovery still rejects every connection with 57P03 — ensureDatabase then
+      failed, the outer catch called stop(), and Fusion fast-shutdown its own
+      postmaster 0.2s into recovery. Wait (bounded by the start timeout, which
+      also aborts this loop via `signal`) until the cluster genuinely accepts
+      connections; only then verify/create the application database.
+      */
+      await this.waitForClusterAcceptingConnections(port, signal);
       await this.ensureDatabase();
     } catch (error) {
       if (signal?.aborted) {
@@ -1452,7 +1895,47 @@ export class EmbeddedPostgresLifecycle {
       runtimeUrl,
       migrationUrl: runtimeUrl,
       migrationUrlOverridden: false,
+      directSessionUrl: runtimeUrl,
+      directSessionProvenance: "embedded-lifecycle",
     };
+  }
+
+  /**
+   * FNXC:PostgresEmbedded 2026-07-22-16:25:
+   * A 0xC0000142 backend crash shuts down its whole PostgreSQL cluster. One
+   * lifecycle-owned retry reuses the initialized directory and same resolved
+   * port; joiners, stop/detach, and a second incident are deliberately inert.
+   */
+  private async recoverWindowsFatalOnce(): Promise<void> {
+    if (this.recoveryInFlight || this.recoveryAttempts >= 1 || this.stopRequested || !this.ownsProcess) return;
+    this.recoveryAttempts += 1;
+    this.recoveryInFlight = (async () => {
+      this.options.onLog("embedded postgres: detected Windows DLL initialization shutdown; attempting one owned-cluster recovery");
+      try {
+        if (this.nonAdminHandle) await this.nonAdminHandle.stop();
+        else await this.pg?.stop();
+        this.pg = null;
+        this.nonAdminHandle = null;
+        this.running = false;
+        runningInstances.delete(this.options.dataDir);
+        if (this.stopRequested || !this.ownsProcess) return;
+        const recoveryPort = this.resolvedPort;
+        if (recoveryPort === undefined) {
+          throw new Error("embedded postgres: recovery lost its resolved port");
+        }
+        await this.startBounded(recoveryPort);
+        this.options.onLog("embedded postgres: Windows owned-cluster recovery completed; existing pools may reconnect");
+      } catch (error) {
+        this.running = false;
+        runningInstances.delete(this.options.dataDir);
+        this.options.onError(
+          `embedded postgres: Windows DLL initialization recovery failed after one retry; restart Fusion and inspect the System log. ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        this.recoveryInFlight = null;
+      }
+    })();
+    await this.recoveryInFlight;
   }
 
   private async settleCancelledStart(pg: EmbeddedPostgresInstance): Promise<void> {
@@ -1528,12 +2011,93 @@ export class EmbeddedPostgresLifecycle {
    * hard startup failure.
    */
   private async ensureJoinedDatabase(port: number): Promise<void> {
-    try {
-      await this.createDatabaseIfMissing(port);
-    } catch (error) {
-      this.options.onLog(
-        `embedded postgres: could not verify database "${this.options.database}" on joined instance at port ${port} (${error instanceof Error ? error.message : String(error)}); continuing — the connection layer will report an unreachable cluster`,
-      );
+    /*
+    FNXC:PostgresEmbedded 2026-07-23-10:40:
+    Issue #2411 (beta.4 follow-up): a joined instance can be mid crash-recovery,
+    where PostgreSQL listens but rejects every connection with 57P03. A one-shot
+    verify turned that transient state into the "could not verify database on
+    joined instance" give-up path. Retry the RECOVERY signal (57P03 only) within
+    a bounded window; socket-level failures (dead stale-pid port) keep the
+    historical instant best-effort optimistic join (resolve the URL and let the
+    connection layer report the unreachable cluster).
+    */
+    const deadline = Date.now() + JOINED_INSTANCE_RECOVERY_WAIT_MS;
+    let announced = false;
+    for (;;) {
+      try {
+        await this.createDatabaseIfMissing(port);
+        return;
+      } catch (error) {
+        if (isClusterStartingUpError(error) && Date.now() < deadline) {
+          if (!announced) {
+            announced = true;
+            this.options.onLog(
+              `embedded postgres: joined instance at port ${port} is not accepting connections yet (startup or crash recovery in progress); waiting before verifying database "${this.options.database}"`,
+            );
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, CLUSTER_ACCEPTING_POLL_MS));
+          continue;
+        }
+        this.options.onLog(
+          `embedded postgres: could not verify database "${this.options.database}" on joined instance at port ${port} (${error instanceof Error ? error.message : String(error)}); continuing — the connection layer will report an unreachable cluster`,
+        );
+        return;
+      }
+    }
+  }
+
+  /**
+   * Block until the cluster at `port` accepts real connections (a `SELECT 1` on
+   * the maintenance database succeeds), retrying while it reports "starting
+   * up"/"in recovery" (57P03) or is not yet listening.
+   *
+   * FNXC:PostgresEmbedded 2026-07-23-10:40:
+   * Issue #2411: crash recovery on an interrupted cluster must be allowed to
+   * finish instead of being interpreted as a failed start (which shut the
+   * recovering postmaster down). Bounded by the caller's start timeout: the
+   * outer startBounded() race aborts `signal` when it fires, and a local
+   * deadline (the configured timeout, or the default when timeouts are
+   * disabled) backstops callers without a signal.
+   */
+  private async waitForClusterAcceptingConnections(
+    port: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    // FNXC:PostgresEmbedded 2026-07-23-10:40: mirrors the elevated-path skip —
+    // a test-injected mock ctor has no real server to poll, so the wait would
+    // spin against a dead port until the start timeout in every mocked test.
+    if (embeddedPostgresCtorIsTestOverride) return;
+    const budgetMs =
+      this.options.startTimeoutMs > 0 && Number.isFinite(this.options.startTimeoutMs)
+        ? this.options.startTimeoutMs
+        : DEFAULT_START_TIMEOUT_MS;
+    const deadline = Date.now() + budgetMs;
+    let announced = false;
+    for (;;) {
+      if (signal?.aborted) throw new EmbeddedStartCancelledError(this.options.dataDir);
+      const sql = this.openMaintenanceSqlOn(port);
+      let lastError: unknown;
+      try {
+        await sql`SELECT 1 AS one`;
+        return;
+      } catch (error) {
+        lastError = error;
+      } finally {
+        await sql.end({ timeout: 5 }).catch(() => {});
+      }
+      if (!isClusterNotYetAcceptingError(lastError)) throw lastError;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `embedded postgres: cluster on port ${port} did not accept connections within ${budgetMs}ms (crash recovery may still be running); last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+        );
+      }
+      if (!announced) {
+        announced = true;
+        this.options.onLog(
+          `embedded postgres: cluster on port ${port} is still starting up (crash recovery may be in progress); waiting for it to accept connections`,
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, CLUSTER_ACCEPTING_POLL_MS));
     }
   }
 
@@ -1617,6 +2181,7 @@ export class EmbeddedPostgresLifecycle {
   */
   detachWithoutStop(): void {
     this.uninstallShutdownHook();
+    this.nonAdminHandle?.stopMonitoring();
     this.pg = null;
     this.nonAdminHandle = null;
     this.running = false;
@@ -1625,6 +2190,7 @@ export class EmbeddedPostgresLifecycle {
   }
 
   async stop(): Promise<void> {
+    this.stopRequested = true;
     this.uninstallShutdownHook();
 
     // FNXC:PostgresCutover 2026-06-27-11:10:

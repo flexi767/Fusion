@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
-import { createFusionAuthStorage, createFusionCredentialStore, getFusionAuthPath } from "../auth-storage.js";
+import { createFusionAuthStorage, createFusionCredentialStore, getFusionAuthPath } from "../auth/auth-storage.js";
 
 /*
 FNXC:ProviderAuth 2026-07-07-00:00:
@@ -280,6 +280,19 @@ describe("createFusionAuthStorage — concurrent cross-process coordination", ()
     expect(await instanceC.getApiKey("anthropic")).not.toBe("refreshed-from-stale-old-token");
   });
 
+  it("merges concurrent named and bare instance writes for one provider", async () => {
+    const instanceA = createFusionAuthStorage();
+    const instanceB = createFusionAuthStorage();
+    await Promise.all([
+      instanceA.setInstance({ providerId: "openrouter", instanceId: "work" }, { type: "api_key", key: "work-key" }),
+      instanceB.setInstance({ providerId: "openrouter", instanceId: "backup" }, { type: "api_key", key: "backup-key" }),
+    ]);
+    const instanceC = createFusionAuthStorage();
+    expect(instanceC.getInstance({ providerId: "openrouter", instanceId: "work" })).toMatchObject({ key: "work-key" });
+    expect(instanceC.getInstance({ providerId: "openrouter", instanceId: "backup" })).toMatchObject({ key: "backup-key" });
+    expect((readAuthFile(homeDir)["openrouter[work]"])).toBeDefined();
+  });
+
   it("single-flights a rotating Anthropic refresh token across auth storage instances", async () => {
     const now = Date.now();
     const instanceA = createFusionAuthStorage();
@@ -363,5 +376,14 @@ describe("createFusionAuthStorage — concurrent cross-process coordination", ()
       instanceB.getApiKey("anthropic-subscription"),
     ])).resolves.toEqual(["alias-rotated-access", "alias-rotated-access"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    const persisted = readAuthFile(homeDir);
+    expect(persisted.anthropic).toMatchObject({
+      access: "alias-rotated-access",
+      refresh: "next-alias-refresh",
+    });
+    expect(persisted["anthropic-subscription"]).toMatchObject({
+      access: "alias-rotated-access",
+      refresh: "next-alias-refresh",
+    });
   });
 });

@@ -9,6 +9,7 @@ import { CustomModelDropdown } from "./CustomModelDropdown";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { ProviderIcon } from "./ProviderIcon";
 import { AgentGenerationModal } from "./AgentGenerationModal";
+import { ViewHeader } from "./ViewHeader";
 import { AGENT_PRESETS, type AgentPreset } from "./agent-presets";
 import {
   buildAgentCreatePayload,
@@ -22,6 +23,7 @@ import { SkillMultiselect } from "./SkillMultiselect";
 import { AgentAvatar } from "./AgentAvatar";
 import { ExperimentalAgentOnboardingModal } from "./ExperimentalAgentOnboardingModal";
 import { useFavorites } from "../hooks/useFavorites";
+import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 
 export interface NewAgentDialogProps {
   isOpen: boolean;
@@ -83,6 +85,7 @@ export function NewAgentDialog({
   const [title, setTitle] = useState("");
   const [icon, setIcon] = useState("");
   const [role, setRole] = useState<AgentCapability>("custom");
+  const [additionalRoles, setAdditionalRoles] = useState<AgentCapability[]>([]);
   const [reportsTo, setReportsTo] = useState("");
   const [instructionsPath, setInstructionsPath] = useState("");
   const [instructionsText, setInstructionsText] = useState("");
@@ -187,6 +190,7 @@ export function NewAgentDialog({
     setTitle(spec.description);
     setIcon(spec.icon);
     setRole(mappedRole);
+    setAdditionalRoles([]);
     // Map generated systemPrompt to instructionsText
     setInstructionsText(spec.systemPrompt);
     setRuntimeConfig(c => ({
@@ -219,6 +223,7 @@ export function NewAgentDialog({
     setIcon(draft.icon ?? "");
     setTitle(draft.title ?? "");
     setRole(draft.role);
+    setAdditionalRoles([]);
     setSoul(draft.soul ?? "");
     setInstructionsText(draft.instructionsText ?? "");
     // Advance to Step 1 so user can review model selection
@@ -234,6 +239,7 @@ export function NewAgentDialog({
     setTitle(values.title ?? "");
     setIcon(values.icon ?? "");
     setRole(values.role);
+    setAdditionalRoles([]);
     setReportsTo(values.reportsTo ?? "");
     // FNXC:StandingInstructionsTemplate 2026-07-14-00:12:
     // Prefill/onboarding can set custom tab programmatically with empty instructionsText.
@@ -263,8 +269,6 @@ export function NewAgentDialog({
     applyDraftToForm(prefillDraft);
   }, [isOpen, prefillDraft, applyDraftToForm]);
 
-  if (!isOpen) return null;
-
   const handleClose = () => {
     setStep(0);
     setStepZeroTab("presets");
@@ -283,11 +287,19 @@ export function NewAgentDialog({
     setSelectedRuntimeId("");
     setSelectedPresetId(null);
     setSelectedSkills([]);
+    setAdditionalRoles([]);
     setError(null);
     setIsGenerationModalOpen(false);
     setIsInterviewOpen(false);
     onClose();
   };
+  /*
+  FNXC:ModalDismissal 2026-08-15-12:27:
+  A model-menu gesture can end on the overlay after mobile re-anchoring. Preserve outside dismissal only when the press itself started on this overlay.
+  */
+  const overlayDismiss = useOverlayDismiss(handleClose, { enabled: true });
+
+  if (!isOpen) return null;
 
   const handleCreate = async () => {
     if (!name.trim()) return;
@@ -297,6 +309,7 @@ export function NewAgentDialog({
       await createAgent(buildAgentCreatePayload({
         name,
         role,
+        roles: [role, ...additionalRoles],
         title,
         icon,
         reportsTo,
@@ -412,19 +425,19 @@ export function NewAgentDialog({
   // mobile (the header isn't taller than the dialog top — it's just stacked
   // above it because the dialog couldn't escape its container).
   return createPortal(
-    <div className="agent-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) handleClose(); }}>
+    <div className="agent-dialog-overlay" {...overlayDismiss}>
       <div className="agent-dialog" role="dialog" aria-modal="true" aria-label={t("agents.dialogAriaLabel", "Create new agent")}>
-        {/* Header */}
-        <div className="agent-dialog-header">
-          <span className="agent-dialog-header-title">{t("agents.dialogTitle", "New Agent")}</span>
-          <button
-            className="btn-icon"
-            onClick={handleClose}
-            aria-label={t("agents.closeAriaLabel", "Close")}
-          >
-            ×
-          </button>
-        </div>
+        {/*
+        FNXC:StandardizedViewLayout 2026-09-13-22:40:
+        FN-379 remediation: agent creation shares the canonical header instead of its own title row.
+        */}
+        <ViewHeader
+          className="agent-dialog-header"
+          headingLevel={3}
+          title={t("agents.dialogTitle", "New Agent")}
+          onClose={handleClose}
+          closeButtonProps={{ "aria-label": t("agents.closeAriaLabel", "Close") }}
+        />
 
         {/* Step indicator */}
         <div className="agent-dialog-steps">
@@ -563,14 +576,17 @@ export function NewAgentDialog({
                       />
                     </div>
                     <div className="agent-dialog-field">
-                      <label>{t("agents.fieldRole", "Role")}</label>
+                      <label>{t("agents.fieldRole", "Primary role")}</label>
                       <div className="agent-role-grid">
                         {AGENT_ROLES.map(r => (
                           <button
                             key={r.value}
                             type="button"
                             className={`agent-role-option${role === r.value ? " selected" : ""}`}
-                            onClick={() => setRole(r.value)}
+                            onClick={() => {
+                              setRole(r.value);
+                              setAdditionalRoles((current) => current.filter((candidate) => candidate !== r.value));
+                            }}
                           >
                             <span className="agent-role-option-icon" aria-hidden="true">
                               <ProviderIcon provider={selectedModelProvider} size="sm" />
@@ -579,6 +595,21 @@ export function NewAgentDialog({
                           </button>
                         ))}
                       </div>
+                      <fieldset className="agent-dialog-field" aria-label={t("agents.additionalRoles", "Additional workflow roles")}>
+                        <legend>{t("agents.additionalRoles", "Additional workflow roles")}</legend>
+                        {AGENT_ROLES.filter((candidate) => candidate.value !== role).map((candidate) => (
+                          <label key={candidate.value} className="checkbox-label">
+                            <input
+                              type="checkbox"
+                              checked={additionalRoles.includes(candidate.value)}
+                              onChange={() => setAdditionalRoles((current) => current.includes(candidate.value)
+                                ? current.filter((value) => value !== candidate.value)
+                                : [...current, candidate.value])}
+                            />
+                            {getRoleLabel(candidate.value)}
+                          </label>
+                        ))}
+                      </fieldset>
                     </div>
                   </div>
                   <div className="agent-dialog-section">
@@ -704,9 +735,10 @@ export function NewAgentDialog({
                   value={selectedSkills}
                   onChange={setSelectedSkills}
                   projectId={projectId}
+                  ariaDescribedBy="agent-skills-hint"
                 />
-                <p className="agent-dialog-optional agent-dialog-skills-hint">
-                  {t("agents.skillsHint", "Optional skills to assign to this agent")}
+                <p id="agent-skills-hint" className="agent-dialog-optional agent-dialog-skills-hint">
+                  {t("agents.skillsHint", "All enabled skills are available automatically. Select skills to force this agent to read them before starting work.")}
                 </p>
               </div>
             </div>

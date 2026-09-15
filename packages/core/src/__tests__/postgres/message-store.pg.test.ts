@@ -10,6 +10,7 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
+import type { MessageMetadata } from "../../types/messaging/messages.js";
 
 import {
   pgDescribe,
@@ -30,7 +31,7 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
   afterAll(h.afterAll);
 
   it("agent-to-agent send persists and survives a throwing wake-hook", async () => {
-    const { MessageStore } = await import("../../message-store.js");
+    const { MessageStore } = await import("../../stores/message-store.js");
     const store = new MessageStore(null, { asyncLayer: h.layer() });
 
     // Mirror the engine wiring: the agent-delivery hook reads the sync AgentStore
@@ -61,7 +62,7 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
   });
 
   it("a non-agent send (no wake-hook) persists normally", async () => {
-    const { MessageStore } = await import("../../message-store.js");
+    const { MessageStore } = await import("../../stores/message-store.js");
     const store = new MessageStore(null, { asyncLayer: h.layer() });
     const msg = await store.sendMessage({
       fromId: "agent-a",
@@ -74,8 +75,122 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
     expect((await store.getMessage(msg.id))?.content).toBe("hi user");
   });
 
+  it("filters, counts, and marks dashboard inbox notices by category", async () => {
+    const { MessageStore } = await import("../../stores/message-store.js");
+    const store = new MessageStore(null, { asyncLayer: h.layer() });
+    await Promise.all([
+      store.sendMessage({
+        fromId: "system",
+        fromType: "system",
+        toId: "dashboard",
+        toType: "user",
+        content: "Recommendation notice",
+        type: "system",
+        metadata: { kind: "task-recommendation-notice", taskId: "FN-1" },
+      }),
+      store.sendMessage({
+        fromId: "system",
+        fromType: "system",
+        toId: "dashboard",
+        toType: "user",
+        content: "Artifact notice",
+        type: "system",
+        metadata: { artifactId: "artifact-1", artifactType: "document" },
+      }),
+      store.sendMessage({
+        fromId: "agent-a",
+        fromType: "agent",
+        toId: "dashboard",
+        toType: "user",
+        content: "Ordinary message",
+        type: "agent-to-user",
+      }),
+      store.sendMessage({
+        fromId: "system",
+        fromType: "system",
+        toId: "dashboard",
+        toType: "user",
+        content: "Explicit null kind",
+        type: "system",
+        metadata: { kind: null, artifactId: "artifact-2" } as unknown as MessageMetadata,
+      }),
+      store.sendMessage({
+        fromId: "system",
+        fromType: "system",
+        toId: "dashboard",
+        toType: "user",
+        content: "Numeric artifact identifier",
+        type: "system",
+        metadata: { artifactId: 123 },
+      }),
+      store.sendMessage({
+        fromId: "system",
+        fromType: "system",
+        toId: "dashboard",
+        toType: "user",
+        content: "Null artifact identifier",
+        type: "system",
+        metadata: { artifactId: null },
+      }),
+    ]);
+
+    const ordinaryInbox = await store.getInbox("dashboard", "user", { category: "message" });
+    expect(ordinaryInbox.map(({ content }) => content).sort()).toEqual([
+      "Explicit null kind",
+      "Null artifact identifier",
+      "Numeric artifact identifier",
+      "Ordinary message",
+    ]);
+    await expect(store.getDashboardInboxCategoryCounts("dashboard", "user")).resolves.toEqual({
+      message: 4,
+      recommendation: 1,
+      artifact: 1,
+    });
+
+    await expect(store.markAllAsRead("dashboard", "user", "recommendation")).resolves.toBe(1);
+    await expect(store.getDashboardInboxCategoryCounts("dashboard", "user")).resolves.toEqual({
+      message: 4,
+      recommendation: 0,
+      artifact: 1,
+    });
+  });
+
+  it("archives correspondence by default and restores it on unarchive", async () => {
+    const { MessageStore } = await import("../../stores/message-store.js");
+    const store = new MessageStore(null, { asyncLayer: h.layer() });
+    const message = await store.sendMessage({
+      fromId: "agent-a",
+      fromType: "agent",
+      toId: "agent-b",
+      toType: "agent",
+      content: "retain this correspondence",
+      type: "agent-to-agent",
+    });
+
+    await expect(store.archiveMessage(message.id)).resolves.toMatchObject({ id: message.id, archived: true });
+    expect((await store.getInbox("agent-b", "agent")).map(({ id }) => id)).not.toContain(message.id);
+    expect((await store.getOutbox("agent-a", "agent")).map(({ id }) => id)).not.toContain(message.id);
+    expect((await store.getConversation({ id: "agent-a", type: "agent" }, { id: "agent-b", type: "agent" })).map(({ id }) => id)).not.toContain(message.id);
+    expect((await store.getAllAgentToAgentMessages()).map(({ id }) => id)).not.toContain(message.id);
+    expect((await store.getMailbox("agent-b", "agent")).unreadCount).toBe(0);
+    expect((await store.getInbox("agent-b", "agent", { archived: true })).map(({ id }) => id)).toContain(message.id);
+
+    await expect(store.unarchiveMessage(message.id)).resolves.toMatchObject({ id: message.id, archived: false });
+    expect((await store.getInbox("agent-b", "agent")).map(({ id }) => id)).toContain(message.id);
+    await expect(store.archiveMessage("missing-message")).rejects.toThrow("Message missing-message not found");
+  });
+
+  it("treats legacy NULL archive values as active correspondence", async () => {
+    const { MessageStore } = await import("../../stores/message-store.js");
+    const store = new MessageStore(null, { asyncLayer: h.layer() });
+    const id = "legacy-null-archive";
+    await h.adminSql()`INSERT INTO project.messages (project_id, id, from_id, from_type, to_id, to_type, content, type, read, archived, created_at, updated_at)
+      VALUES ('', ${id}, 'agent-a', 'agent', 'agent-b', 'agent', 'legacy', 'agent-to-agent', 0, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`;
+    expect((await store.getInbox("agent-b", "agent")).map(({ id: messageId }) => messageId)).toContain(id);
+  });
+
   it("round-trips native structure embeds through mailbox metadata", async () => {
-    const { MessageStore } = await import("../../message-store.js");
+    const { MessageStore } = await import("../../stores/message-store.js");
     const store = new MessageStore(null, { asyncLayer: h.layer() });
     const nativeStructures = [
       { kind: "mission" as const, id: "M-1", label: "Launch roadmap" },
@@ -100,7 +215,7 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
   Once-only inbox delivery must use PostgreSQL's primary-key conflict handling as the concurrency authority; parallel callers may share the resulting message, but only one may report inserting it.
   */
   it("atomically inserts an idempotent message once under concurrent sends", async () => {
-    const { MessageStore } = await import("../../message-store.js");
+    const { MessageStore } = await import("../../stores/message-store.js");
     const store = new MessageStore(null, { asyncLayer: h.layer() });
     const input = {
       fromType: "system" as const,
@@ -133,7 +248,7 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
   insert — verify a NUL-laden send round-trips instead of throwing.
   */
   it("sendMessage strips a raw U+0000 byte instead of throwing", async () => {
-    const { MessageStore } = await import("../../message-store.js");
+    const { MessageStore } = await import("../../stores/message-store.js");
     const store = new MessageStore(null, { asyncLayer: h.layer() });
 
     const diagnosticDump =

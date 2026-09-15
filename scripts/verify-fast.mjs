@@ -31,6 +31,7 @@ would, instead of reinventing git-diff. Each step is bounded by the existing
 of blocking forever, and we exit nonzero on the first failing step.
 */
 
+import os from "node:os";
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -51,6 +52,37 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const bootSmokeScriptPath = path.join(scriptDir, "boot-smoke.mjs");
 const artifactBootstrapScriptPath = path.join(scriptDir, "ensure-test-artifacts.mjs");
+const packageManifestPath = path.join(repoRoot, "package.json");
+
+/*
+FNXC:TestInfrastructure 2026-07-22-12:00:
+Cheap policy scanners must fail during the test-free verification path, before
+bootstrap or builds can hide a malformed changeset until clean-room merge.
+Read the canonical root pretest composition rather than duplicating validator
+rules or maintaining a second list; default invocations are read-only and never
+use a validator's mutation flags (such as check-routes-modular --update).
+*/
+export function readPretestStaticCheckScripts(manifestPath = packageManifestPath) {
+  const pretest = JSON.parse(readFileSync(manifestPath, "utf8")).scripts?.pretest;
+  if (typeof pretest !== "string" || !pretest.trim()) {
+    throw new Error("package.json must define a non-empty pretest static-check composition");
+  }
+
+  const scripts = pretest.split("&&").map((command) => {
+    const match = /^\s*node\s+(scripts\/check-[\w-]+\.mjs)\s*$/.exec(command);
+    if (!match) {
+      throw new Error(`pretest contains a non-static-check command: ${command.trim()}`);
+    }
+    return match[1];
+  });
+
+  if (scripts.length === 0) {
+    throw new Error("package.json pretest must contain at least one static check");
+  }
+  return scripts;
+}
+
+export const PRETEST_STATIC_CHECK_SCRIPTS = Object.freeze(readPretestStaticCheckScripts());
 
 /*
 FNXC:TestInfrastructure 2026-06-25-00:00:
@@ -60,6 +92,34 @@ policy and skips them with a note rather than failing on an unbuildable filter.
 */
 export const VERIFY_EXCLUDED_PACKAGES = new Set(["@fusion/desktop", "@fusion/mobile"]);
 export const BOOT_SMOKE_REQUIRED_BUILD_PACKAGES = ["@runfusion/fusion"];
+
+/*
+FNXC:TestInfrastructure 2026-08-11-09:38:
+verify:fast ran every step strictly serially, so its wall clock was the SUM of steps
+that have no ordering relationship. Two groups are independent and now run
+concurrently, bounded per group:
+
+  - static checks: ~10 read-only validators, each dominated by node startup rather
+    than work (~5.4s serial on this repo, ~1.6s grouped).
+  - typechecks: one per changed package, `--noEmit` or the package's own script, so
+    no two can collide on an output. This is the dominant cost of a multi-package
+    run — dashboard + engine alone were ~65s of a 96.6s run.
+
+Ordering that MATTERS is preserved: bootstrap, builds, and boot smoke stay serial and
+in plan order (builds consume bootstrap output; the smoke must run against freshly
+built artifacts). Only steps sharing a `parallelGroup` overlap, and a group is a
+barrier — the next step never starts before every member settles.
+
+Limits are conservative on purpose: typechecks are memory-hungry (tsc over this
+workspace), so oversubscribing trades wall clock for swap. Set FUSION_VERIFY_FAST_SERIAL=1
+to force the old fully-serial behavior when interleaved child output makes a failure
+hard to read.
+*/
+const cpuCount = (() => {
+  try { return Math.max(1, os.cpus()?.length ?? 1); } catch { return 1; }
+})();
+export const STATIC_CHECK_PARALLEL_LIMIT = Math.max(2, Math.min(8, cpuCount - 1));
+export const TYPECHECK_PARALLEL_LIMIT = Math.max(1, Math.min(4, Math.floor(cpuCount / 2)));
 
 /**
  * Build the scoped typecheck step for a package. Prefers the package's own
@@ -74,7 +134,11 @@ export function buildTypecheckStep(pkg, meta = {}) {
   const args = meta.hasTypecheck
     ? ["--filter", pkg, "typecheck"]
     : ["--filter", pkg, "exec", "tsc", "--noEmit", "-p", "."];
-  return { id: `typecheck:${pkg}`, kind: "typecheck", pkg, label: `typecheck ${pkg}`, command: "pnpm", args, klass: "changed" };
+  /* Typechecks are per-package and emit nothing (`--noEmit`, or the package's own
+     script writing only its own tsbuildinfo), so sibling packages cannot collide.
+     They are the dominant cost of a multi-package run — grouping them lets the wall
+     clock be the slowest package rather than their sum. */
+  return { id: `typecheck:${pkg}`, kind: "typecheck", pkg, label: `typecheck ${pkg}`, command: "pnpm", args, klass: "changed", parallelGroup: "typecheck", parallelLimit: TYPECHECK_PARALLEL_LIMIT };
 }
 
 /**
@@ -127,25 +191,54 @@ export function buildArtifactBootstrapStep(bootstrapScriptPath, nodeBin = proces
 }
 
 /**
- * Pure planner: turn the affected package set into an ordered step list.
- * bootstrap missing/stale dist artifacts → typecheck (all eligible) → build
- * (eligible with a build script) → required boot-smoke build prerequisites →
- * boot smoke. With no eligible packages this still builds the source-checkout
- * CLI before the smoke so fresh worktrees have `packages/cli/dist/bin.js`.
+ * Build one canonical, read-only root pretest validator invocation.
+ *
+ * @param {string} checkScript repo-relative check script path
+ * @param {string} [root]
+ * @param {string} [nodeBin]
+ */
+export function buildStaticCheckStep(checkScript, root = repoRoot, nodeBin = process.execPath) {
+  const name = path.basename(checkScript, ".mjs");
+  return {
+    id: `static-check:${name}`,
+    kind: "static-check",
+    pkg: null,
+    label: `static check ${name}`,
+    command: nodeBin,
+    args: [path.join(root, checkScript)],
+    klass: "changed",
+    /* Canonical static checks are read-only repo validators with no shared writable
+       state, so they are safe to run concurrently. Each costs more in node startup
+       than in work, which is exactly the shape that wastes wall clock run serially. */
+    parallelGroup: "static-checks",
+    parallelLimit: STATIC_CHECK_PARALLEL_LIMIT,
+  };
+}
+
+/**
+ * Pure planner: turn canonical static checks and the affected package set into
+ * an ordered step list. Static checks → bootstrap missing/stale dist artifacts
+ * → typecheck (all eligible) → build (eligible with a build script) → required
+ * boot-smoke build prerequisites → boot smoke. With no eligible packages this
+ * still builds the source-checkout CLI before the smoke so fresh worktrees have
+ * `packages/cli/dist/bin.js`.
  *
  * @param {object} opts
- * @param {string[]} [opts.packages]  affected package names
+ * @param {string[]} [opts.packages] affected package names
  * @param {Map<string, { dir?: string, hasTypecheck?: boolean, hasTsconfig?: boolean, hasBuild?: boolean }>} [opts.packageMeta]
+ * @param {string[]} [opts.staticCheckScripts] repo-relative canonical pretest validator paths
+ * @param {string} [opts.staticCheckRoot]
  * @param {string} opts.bootSmokeScriptPath
  * @param {string} [opts.artifactBootstrapScriptPath]
  * @param {string} [opts.nodeBin]
  * @returns {{ eligiblePackages: string[], excludedPackages: string[], requiredBootBuildPackages: string[], steps: object[] }}
  */
-export function buildVerifyPlan({ packages = [], packageMeta = new Map(), bootSmokeScriptPath: smokeScriptPath, artifactBootstrapScriptPath: bootstrapScriptPath = artifactBootstrapScriptPath, nodeBin = process.execPath } = {}) {
+export function buildVerifyPlan({ packages = [], packageMeta = new Map(), staticCheckScripts = PRETEST_STATIC_CHECK_SCRIPTS, staticCheckRoot = repoRoot, bootSmokeScriptPath: smokeScriptPath, artifactBootstrapScriptPath: bootstrapScriptPath = artifactBootstrapScriptPath, nodeBin = process.execPath } = {}) {
   const eligiblePackages = packages.filter((pkg) => !VERIFY_EXCLUDED_PACKAGES.has(pkg));
   const excludedPackages = packages.filter((pkg) => VERIFY_EXCLUDED_PACKAGES.has(pkg));
 
-  const steps = [buildArtifactBootstrapStep(bootstrapScriptPath, nodeBin)];
+  const steps = staticCheckScripts.map((checkScript) => buildStaticCheckStep(checkScript, staticCheckRoot, nodeBin));
+  steps.push(buildArtifactBootstrapStep(bootstrapScriptPath, nodeBin));
   for (const pkg of eligiblePackages) {
     const meta = packageMeta.get(pkg) ?? {};
     /*
@@ -252,7 +345,7 @@ export function resolveAffectedForVerify() {
  * child's output (stdio inherit) and throws with an `.exitCode` on the first
  * failure/timeout/signal so the caller exits nonzero immediately.
  */
-export async function runStep(step, { spawnFn = spawn, log = console.log, errLog = console.error } = {}) {
+export async function runStep(step, { spawnFn = spawn, log = console.log, errLog = console.error, cwd = repoRoot } = {}) {
   const budgetMs = deriveBudgetMs({ klass: step.klass ?? "changed" });
   log(`\n[verify:fast] -> ${step.label}`);
   log(`[verify:fast]    ${step.command} ${step.args.join(" ")}  (budget ${Math.round(budgetMs / 1000)}s)`);
@@ -261,7 +354,7 @@ export async function runStep(step, { spawnFn = spawn, log = console.log, errLog
     command: step.command,
     args: step.args,
     env: process.env,
-    cwd: repoRoot,
+    cwd,
     budgetMs,
     label: step.label,
     log: errLog,
@@ -275,6 +368,72 @@ export async function runStep(step, { spawnFn = spawn, log = console.log, errLog
     throw error;
   }
   log(`[verify:fast]    OK ${step.label} (${elapsedS}s)`);
+}
+
+/**
+ * Split a plan into consecutive runs of steps sharing a `parallelGroup`. Steps with
+ * no group (or when serial mode is forced) each become their own single-step batch,
+ * which is what keeps bootstrap → build → boot-smoke ordering intact.
+ *
+ * Grouping is CONSECUTIVE-only: two separated blocks with the same group name stay
+ * separate batches, so a planner reordering can never silently hoist a step across
+ * an intervening serial dependency.
+ *
+ * @param {object[]} steps
+ * @param {boolean} [serial]
+ * @returns {{ group: string|null, limit: number, steps: object[] }[]}
+ */
+export function batchVerifySteps(steps, serial = false) {
+  const batches = [];
+  for (const step of steps) {
+    const group = serial ? null : step.parallelGroup ?? null;
+    const previous = batches[batches.length - 1];
+    if (group && previous && previous.group === group) {
+      previous.steps.push(step);
+      previous.limit = Math.min(previous.limit, step.parallelLimit ?? previous.limit);
+      continue;
+    }
+    batches.push({ group, limit: group ? step.parallelLimit ?? 1 : 1, steps: [step] });
+  }
+  return batches;
+}
+
+/**
+ * Run planned steps, stopping at the first failure. Steps sharing a `parallelGroup`
+ * run concurrently under that group's limit; every other step runs alone and in order.
+ *
+ * A failing group still awaits its in-flight siblings before throwing — killing them
+ * mid-flight would leave partial tsbuildinfo/dist state behind — and reports the
+ * FIRST failure in plan order so the message is stable regardless of which sibling
+ * happened to lose the race.
+ */
+export async function runVerifyPlan(steps, { run = runStep, serial = process.env.FUSION_VERIFY_FAST_SERIAL === "1" } = {}) {
+  for (const batch of batchVerifySteps(steps, serial)) {
+    if (batch.steps.length === 1) {
+      await run(batch.steps[0]);
+      continue;
+    }
+
+    const failures = new Array(batch.steps.length).fill(null);
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const index = next++;
+        if (index >= batch.steps.length) return;
+        try {
+          await run(batch.steps[index]);
+        } catch (error) {
+          failures[index] = error;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.max(1, Math.min(batch.limit, batch.steps.length)) }, worker),
+    );
+
+    const firstFailure = failures.find(Boolean);
+    if (firstFailure) throw firstFailure;
+  }
 }
 
 export async function main() {
@@ -305,9 +464,7 @@ export async function main() {
   }
   console.log(`[verify:fast] plan: ${steps.map((s) => s.id).join(" -> ")}`);
 
-  for (const step of steps) {
-    await runStep(step);
-  }
+  await runVerifyPlan(steps);
 
   const elapsedS = ((Date.now() - overallStart) / 1000).toFixed(1);
   console.log(`\n[verify:fast] PASS — ${steps.length} step(s) green in ${elapsedS}s (no tests run).`);

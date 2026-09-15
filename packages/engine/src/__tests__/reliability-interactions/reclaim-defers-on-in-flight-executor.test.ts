@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { execSync } from "node:child_process";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 import { SelfHealingManager, STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS } from "../../self-healing.js";
-import { activeSessionRegistry } from "../../active-session-registry.js";
+import { activeSessionRegistry } from "../../agents/active-session-registry.js";
 
 function sh(command: string, cwd: string): string {
   return String(execSync(command, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }) ?? "");
@@ -82,7 +82,6 @@ function makeStore(task: Task): TaskStore & EventEmitter & { auditEvents: any[] 
       auditEvents.push(event);
     }),
     walCheckpoint: vi.fn(() => ({ busy: 0, log: 0, checkpointed: 0 })),
-    archiveTaskAndCleanup: vi.fn(async () => ({})),
     mergeTask: vi.fn(async () => undefined),
     getRootDir: vi.fn(() => "/tmp/test"),
     /*

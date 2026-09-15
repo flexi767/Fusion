@@ -20,7 +20,7 @@ import realEnApp from "../../../../../../i18n/locales/en/app.json";
  *    reason each, so a genuinely new setting cannot silently skip documentation.
  *
  * Source of truth for canonical default values: `DEFAULT_GLOBAL_SETTINGS` /
- * `DEFAULT_PROJECT_SETTINGS` / `DEFAULT_SETTINGS` in `packages/core/src/settings-schema.ts`.
+ * `DEFAULT_PROJECT_SETTINGS` / `DEFAULT_SETTINGS` in `packages/core/src/config/settings-schema.ts`.
  * See task document "plan" on FN-7505 for the full field \u2192 default \u2192 i18n-key table.
  */
 
@@ -44,7 +44,7 @@ const DEFAULT_INDICATOR_RE = /default|inherits|unset/i;
  * FN-7505 code review caught GlobalGeneralSection/GeneralSection/MergeSection stating
  * `gitlabEnabled` defaults to "enabled" and GlobalModelsSection stating
  * `openrouterAppAttribution` defaults to a literal URL/title, when both are actually
- * `undefined` in DEFAULT_GLOBAL_SETTINGS/DEFAULT_PROJECT_SETTINGS (settings-schema.ts).
+ * `undefined` in DEFAULT_GLOBAL_SETTINGS/DEFAULT_PROJECT_SETTINGS (`packages/core/src/config/settings-schema.ts`).
  * A generic "mentions the word default" check cannot catch a WRONG default value, only
  * a missing one. `resolveCanonicalDefault` + the checks in the third `it()` below assert
  * the description's stated default agrees with the actual schema default for every mapped
@@ -67,24 +67,42 @@ function resolveCanonicalDefault(settingKey: string): unknown {
  * English description states that setting's default value.
  */
 const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
+  githubNativeAutoMerge: "merge.githubNativeAutoMergeHelp",
+  requiredChecks: "merge.requiredChecksHelp",
+  // AuthenticationSection — Anthropic dual-credential precedence (default api-key)
+  anthropicAuthPreference: "auth.anthropicPreferenceHint",
   // GlobalGeneralSection
   githubTrackingDefaultRepo: "globalGeneral.projectsInheritThisValueWhenTheyDoNot",
   gitlabEnabled: "merge.gitLabAuthDetails",
   gitlabInstanceUrl: "globalGeneral.gitLabInstanceUrlHint",
+  jiraEnabled: "jira.enabledHelp",
+  jiraBaseUrl: "jira.baseUrlHelp",
+  jiraApiBaseUrl: "jira.apiBaseUrlHelp",
+  jiraAuthEmail: "jira.emailHelp",
+  jiraAuthTokenSecretKey: "jira.secretHelp",
+  jiraAuthTokenSecretScope: "jira.scopeHelp",
+  jiraBranchNameTemplate: "jira.templateHelp",
   gitlabApiBaseUrl: "globalGeneral.gitLabApiBaseUrlHint",
   gitlabAuthTokenType: "globalGeneral.gitLabTokenTypeHint",
   gitlabAuthToken: "globalGeneral.gitLabAuthTokenHint",
   dismissModalsOnOutsideClick: "globalGeneral.dismissModalsByClickingOutsideHint",
   skipConfirmationDialogs: "globalGeneral.skipConfirmationDialogsHint",
+  quickAddSubmitOnEnter: "globalGeneral.quickAddSubmitOnEnterHint",
+  chatSubmitOnEnter: "globalGeneral.chatSubmitOnEnterHint",
   persistAgentToolOutput: "globalGeneral.whenDisabledToolRowsAreStillLoggedBut",
+  agentToolOutputMaxChars: "globalGeneral.agentToolOutputLimitHint",
   proactiveTaskChatEnabled: "globalGeneral.enableProactiveTaskChatHint",
   persistAgentThinkingLogPermanent: "globalGeneral.rowsAndDoesNotAffectAssistantTextOr",
   persistAgentThinkingLogEphemeral: "globalGeneral.rowsAndDoesNotAffectAssistantTextOr",
   fnBinaryCheckEnabled: "globalGeneral.disableThisIfYourLocalDevProcessIs",
   updateCheckEnabled: "globalGeneral.andShowsUpdateNoticesInTheCLIAnd",
   updateCheckFrequency: "globalGeneral.controlsHowOftenTheDashboardReFetchesThe",
-  autoReloadOnVersionChange: "globalGeneral.whenEnabledDefaultTheDashboardAutomaticallyReloadsWhen",
+  updateChannel: "globalGeneral.releaseChannelHelp",
+  autoUpdateAndRestart: "globalGeneral.autoUpdateAndRestartHelp",
+  autoUpdateEnabled: "globalGeneral.autoUpdateEnabledHelp",
+  autoRestartAfterUpdate: "globalGeneral.autoRestartAfterUpdateHelp",
   // AppearanceSection
+  chatMessageLayout: "appearance.chatMessageLayoutHelp",
   openTasksInRightSidebar: "appearance.openTasksInRightSidebarHelp",
   openMobileTasksInPopup: "appearance.openMobileTasksInPopupHelp",
   taskPopupsBoardListOnly: "appearance.taskPopupsBoardListOnlyHelp",
@@ -101,6 +119,8 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   defaultThinkingLevel: "globalModels.controlsHowMuchReasoningEffortTheAIModel",
   openrouterModelSync: "globalModels.whenEnabledStartupFetchesTheLatestAvailableModels",
   opencodeGoModelSync: "globalModels.flowAndPublishesThemUnderTheOpencodeGo",
+  /* FNXC:SettingsHelp 2026-08-23-20:45: OrcaRouter catalog sync ships its own SettingsToggleRow help in GlobalModelsSection. */
+  orcarouterModelSync: "globalModels.whenEnabledStartupFetchesTheLatestOrcaRouterModels",
   openrouterAppAttribution: "globalModels.leaveEmptyToOmitThisHeaderDefaultHttps",
   openrouterModelFilters: "globalModels.commaSeparatedValuesSentToOpenRouterModelSync",
   openrouterProviderPreferences: "globalModels.openRouterRoutingOrderHint",
@@ -134,6 +154,7 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
    */
   agentClarificationEnabled: "notifications.agentClarificationHint",
   failureNotificationDelayMs: "notifications.howLongAFailureMustPersistBeforeA",
+  wedgeNotificationSettleMs: "notifications.wedgeNotificationSettleMsHelp",
   failureNotificationMode: "notifications.stickyFailuresOnlyDefault",
   ntfyEnabled: "notifications.ntfyEnabledHint",
   ntfyTopic: "notifications.yourNtfyShTopicName164Alphanumeric",
@@ -166,7 +187,9 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   /*
   FNXC:SettingsDefaults 2026-07-17-13:55:
   FN-8335 restores FN-7505 default-value parity for the surfaced embeddedPostgresMaxConnections
-  control. The English locale description is the canonical rendered SettingsHelpTip copy and states Default: 500.
+  control. Issue #2411 made the schema default undefined (server resolves win32 150 / else 500),
+  so the canonical English copy now uses unset phrasing ("Unset by default — Fusion picks …")
+  and must not make a concrete "Default:" colon claim.
   */
   embeddedPostgresMaxConnections: "database.embeddedConnectionCapHelp",
   // MemorySection
@@ -177,6 +200,13 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   memoryDreamsEnabled: "memory.turnsDailyNotesIntoDREAMSMdAndPromotes",
   memoryDreamsSchedule: "memory.cronExpressionForDreamProcessing",
   memoryBackendType: "memory.agentsGetMemorySearchMemoryGetAndMemory",
+  stashUrl: "memory.stashUrlHelp",
+  /*
+  FNXC:StashSessionCapture 2026-08-19-05:09:
+  (RUFU-122) Task-terminal transcript upload controls (Stash backend only).
+  */
+  executorSessionCaptureEnabled: "memory.uploadTaskAgentLogTranscriptToStash",
+  executorSessionCaptureMaxEvents: "memory.capOnTranscriptEventsUploadedPerTask",
   // MergeSection
   autoMerge: "merge.whenEnabledTasksThatPassReviewAreAutomatically",
   // FN-7557: planApprovalMode defaults to auto-approve-all; the "(default)" marker moved to the auto-approve option.
@@ -204,10 +234,8 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   pushRemote: "merge.gitRemoteToPushToEGOrigin",
   // NodeRouting / node sync covered above
   // SchedulingSection
-  globalMaxConcurrent: "scheduling.maximumConcurrentAgentsAcrossAllProjects",
   maxConcurrent: "scheduling.maxConcurrentTasksHint",
   maxConcurrentVerifications: "scheduling.maxConcurrentVerificationsHint",
-  maxTriageConcurrent: "scheduling.maximumConcurrentPlanningAgents",
   pollIntervalMs: "scheduling.pollIntervalMsHint",
   heartbeatScopeDiscipline: "scheduling.strictDefault",
   engineerBacklogAutoClaim: "scheduling.backlogNoTaskAutoClaimIsExecutorOnly",
@@ -215,18 +243,14 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   executorToolFailureRetryBackoffMs: "scheduling.executorToolFailureRetryBackoffMsHelp",
   executorToolFailureThreshold: "scheduling.executorToolFailureThresholdHelp",
   executorModelEscalationEnabled: "scheduling.executorModelEscalationEnabledHelp",
-  executorEscalationProvider: "scheduling.executorEscalationProviderHelp",
-  executorEscalationModelId: "scheduling.executorEscalationModelIdHelp",
+  executorEscalationProvider: "projectModels.executorEscalationModelHelp",
+  executorEscalationModelId: "projectModels.executorEscalationModelHelp",
   executorEscalationNodeId: "scheduling.executorEscalationNodeIdHelp",
   taskStuckTimeoutMs: "scheduling.timeoutInMinutesForDetectingStuckTasksWhen",
   staleHighFanoutBlockerAgeThresholdMs: "scheduling.escalateHighFanOutBlockersOnlyAfterThey",
   preserveProgressOnStuckRequeue: "scheduling.whenTheStuckDetectorKillsAndReQueues",
   specStalenessEnabled: "scheduling.whenEnabledTasksWithStalePlansPROMPTMd",
   specStalenessMaxAgeMs: "scheduling.maximumAgeInHoursBeforeAPlanIs",
-  autoArchiveDoneTasksEnabled: "scheduling.completedTasksOlderThanTheThresholdAreMoved",
-  autoArchiveDoneAfterMs: "scheduling.numberOfDaysATaskCanStayIn",
-  archiveAgentLogMode: "scheduling.compactModeKeepsArchiveSizeLowWhilePreserving",
-  autoArchiveDuplicateTasksEnabled: "scheduling.autoArchiveDuplicateTasksHelp",
   triageDuplicateResolution: "scheduling.triageDuplicateResolutionHelp",
   maxStuckKills: "scheduling.maximumStuckDetectorRetriesBeforeATaskIs",
   groupOverlappingFiles: "scheduling.whenEnabledTasksThatModifyTheSameFiles",
@@ -234,12 +258,11 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   overlapIgnorePaths: "scheduling.optionalFileOrDirectoryPathsToIgnoreWhen",
   // WorktreesSection
   maxWorktrees: "worktrees.limitsTotalGitWorktreesIncludingInReviewTasks",
+  worktreeLimitEnabled: "worktrees.worktreeLimitEnabledHelp",
   worktreeInitCommand: "worktrees.shellCommandToRunInEachNewWorktree",
-  recycleWorktrees: "worktrees.offByDefaultOptInWhenEnabledCompleted",
   showWorktreeGrouping: "worktrees.showWorktreeGroupingHelp",
   worktreeCopyFiles: "worktrees.copyFilesHelp",
   executorAllowSiblingBranchRename: "worktrees.andCanHidePriorCommitsFromTheDefault",
-  worktreeNaming: "worktrees.howToNameFreshWorktreeDirectories",
   worktreesDir: "worktrees.whenUnsetOnlyAffectsNewlyCreatedWorktrees",
   worktreeRebaseBeforeMerge: "worktrees.whenEnabledTheMergerFetchesFromTheConfigured",
   worktreeRebaseRemote: "worktrees.whichRemoteToFetchForThePreMerge",
@@ -256,7 +279,6 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   completionDocumentationMode: "general.workflowsOrChangelogModeWhenContributorsShouldUpdate",
   reviewArtifacts: "general.reviewArtifactsHint",
   ephemeralAgentTaskCreationPolicy: "general.ephemeralAgentTaskCreationPolicyHint",
-  ephemeralAgentsEnabled: "general.whenEnabledDefaultFusionSpawnsShortLived",
   githubLinkImportedIssuesToTracking: "general.whenEnabledImportedGitHubIssuesUseTheirSource",
   // FNXC:GitHubImportTranslate 2026-07-15-09:30: surfaced as plain rows in
   // GeneralSection beside the other import-scoped GitHub settings.
@@ -267,6 +289,9 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   FN-8335 restores FN-7505 default-value parity for the surfaced reportMode and reportModeByAction
   controls. reportMode states the draft-review default; undefined per-action overrides state that unset actions inherit it.
   */
+  reportTarget: "general.reportTargetHelp",
+  reportTargetByAction: "general.reportTargetByActionHelp",
+  reportDiscussionCategory: "general.reportDiscussionCategoryHelp",
   reportMode: "general.reportModeHelp",
   reportModeByAction: "general.reportModeByActionHelp",
   reportRoadmapDedupeEnabled: "globalGeneral.reportRoadmapDedupeEnabledHelp",
@@ -282,14 +307,19 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   quickChatCloseOnOutsideClick: "general.quickChatCloseOnOutsideClickHint",
   showTaskChatsInCommonFeed: "general.showTaskChatsInCommonFeedHint",
   taskPrefix: "general.prefixForNewTaskIDsEGKB",
+  maxRecommendationsPerTask: "general.maxRecommendationsPerTaskHelp",
+  requireTaskRecommendations: "general.requireTaskRecommendationsHelp",
   workspaceMode: "general.workspaceModeHint",
   defaultWorkflowId: "general.newTasksInheritThisCustomWorkflowsStepsOverridable",
   enabledBuiltinWorkflowIds: "general.disabledFusionWorkflowsAreHiddenFromWorkflow",
   aiUndoTaskWorkflowId: "general.aiUndoTaskWorkflowHelp",
+  // FNXC:OriginWorkflowSelection 2026-07-26-19:40: both default to unset = "Selected workflow".
+  taskCreateWorkflowId: "general.taskCreateWorkflowHelp",
+  refinementTaskWorkflowId: "general.refinementTaskWorkflowHelp",
   // ProjectModelsSection
   autoSelectModelPreset: "projectModels.autoSelectModelPresetHint",
   autoSummarizeTitles: "projectModels.whenEnabledTasksCreatedWithoutATitleBut",
-  taskDefinitionInInputLanguage: "projectModels.taskDefinitionInInputLanguageHelp",
+  taskOutputLanguage: "projectModels.taskOutputLanguageHelp",
   defaultPresetBySize: "projectModels.autoSelectModelPresetHint",
   modelPresets: "projectModels.autoSelectModelPresetHint",
   prDescriptionPromptInstructions: "projectModels.prDescriptionPromptInstructionsHelp",
@@ -306,11 +336,51 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
 
 /** Setting keys intentionally not surfaced as a plain Settings UI description field, with reasons. */
 const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
+  // FNXC:TaskOutputLanguage 2026-08-19-14:56: Legacy compatibility remains persisted but hidden behind the three-mode selector.
+  taskDefinitionInInputLanguage: "legacy task-output-language compatibility flag, not a rendered Settings field",
+  // FNXC:GitHubStarPrompt 2026-08-24-00:34: Internal dismissal timestamp written by useGitHubStarPrompt when the operator dismisses the star ask; runtime bookkeeping state, not a user-editable Settings field.
+  githubStarPromptDismissedAt: "internal star-prompt dismissal timestamp written by useGitHubStarPrompt; not a rendered Settings field",
+  /*
+  FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+  Server-side mirror of the operator's Board workflow lane, written by the dashboard
+  whenever the lane changes so non-browser callers can resolve the "Selected workflow"
+  option. It is UI state echoed into settings, not a user-editable Settings field —
+  there is deliberately no picker for it, so it has no description to document.
+  */
+  boardSelectedWorkflowId: "Board lane mirror written by the dashboard; not a user-editable Settings field",
   // Legacy compatibility input; GeneralSection exposes its policy replacement instead.
   ephemeralAgentsCanCreateTasks: "legacy compatibility input replaced by ephemeralAgentTaskCreationPolicy",
   // Global-only serve/dashboard LAN discovery switch; no Settings UI description field exists.
   localNetworkDiscoveryEnabled: "global-only LAN discovery runtime switch",
-  // Moved to workflow settings (U4) — see MOVED_SETTINGS_KEYS in settings-schema.ts.
+  /*
+  FNXC:VoiceInput 2026-07-25-09:05:
+  Nested Voice Input settings object. DEFAULT_SETTINGS stores voiceInput as undefined
+  (opt-in object); the VoiceInputSection enable toggle documents Default: off for the
+  nested enabled flag rather than a top-level plain description field.
+  */
+  voiceInput: "nested Voice Input section object; enable toggle owns Default: off for voiceInput.enabled",
+  /*
+  FNXC:StashVectorSearch 2026-08-21-13:35:
+  RUFU-146 review (PRRT_kwDOSA-8Y86a7RZs): the duplicate earlier stashApiKey
+  allowlist entry was removed — NOT_SURFACED_ALLOWLIST carried the key twice
+  (the second entry silently overrode the first); the single remaining entry
+  below is the more complete one.
+  */
+  // FNXC:StashVectorSearch 2026-08-20-16:32:
+  // (RUFU-126) schema-only vector search toggle with no Settings UI row
+  // (same treatment as stashApiKey below): config-file-managed knob for the
+  // Stash backend, which is inert without a stashUrl anyway. Registered here
+  // so the FN-7505 guard does not flag the RUFU-126 schema addition.
+  stashVectorSearch: "RUFU-126 schema-only Stash vector search toggle; no Settings UI row",
+  /*
+  FNXC:StashSessionCapture 2026-08-19-05:09:
+  (RUFU-122) Schema-only transcript flag: when enabled, status entries are
+  included in the uploaded agent-log transcript. Deliberately rendered as NO
+  Settings row (operator-managed via the config file), so there is no
+  user-editable description field to document.
+  */
+  executorSessionCaptureIncludeStatus: "schema-only transcript flag (status-entry inclusion); deliberately not rendered as a Settings row",
+  // Moved to workflow settings (U4) — see MOVED_SETTINGS_KEYS in `packages/core/src/config/settings-schema.ts`.
   workflowStepTimeoutMs: "moved to workflow settings (U4)",
   workflowStepScopeEnforcement: "moved to workflow settings (U4)",
   planOnlyScopeLeakEnforcement: "moved to workflow settings (U4)",
@@ -337,6 +407,42 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   validatorModelId: "moved to workflow settings (U4)",
   validatorFallbackProvider: "moved to workflow settings (U4)",
   validatorFallbackModelId: "moved to workflow settings (U4)",
+
+  /*
+  FNXC:SettingsCredentialInstance 2026-08-01-17:06:
+  Credential-instance selectors are inline companions to their provider/model pickers. They inherit the provider default when unset, so each has no standalone Settings description while this narrow inventory keeps the default-description census complete.
+  */
+  defaultCredentialInstanceId: "inline companion for the global default model picker; unset inherits the provider default",
+  fallbackCredentialInstanceId: "inline companion for the global fallback model picker; unset inherits the provider default",
+  executionGlobalCredentialInstanceId: "inline companion for the global execution model picker; unset inherits the provider default",
+  planningGlobalCredentialInstanceId: "inline companion for the global planning model picker; unset inherits the provider default",
+  validatorGlobalCredentialInstanceId: "inline companion for the global validator model picker; unset inherits the provider default",
+  titleSummarizerGlobalCredentialInstanceId: "inline companion for the global title-summarizer model picker; unset inherits the provider default",
+  mergerGlobalCredentialInstanceId: "inline companion for the global merger model picker; unset inherits the provider default",
+  importTranslateGlobalCredentialInstanceId: "inline companion for the global import-translate model picker; unset inherits the provider default",
+  fastCheapGlobalProvider: "configured by the global Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapGlobalModelId: "configured by the global Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapGlobalCredentialInstanceId: "inline companion for the global Fast & Cheap Model picker; unset inherits the provider default",
+  fastCheapGlobalThinkingLevel: "inline thinking companion for the global Fast & Cheap Model picker",
+  fastCheapProvider: "configured by the project Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapModelId: "configured by the project Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapCredentialInstanceId: "inline companion for the project Fast & Cheap Model picker; unset inherits the provider default",
+  fastCheapThinkingLevel: "inline thinking companion for the project Fast & Cheap Model picker",
+  defaultCredentialInstanceIdOverride: "inline companion for the project default model picker; unset inherits the provider default",
+  titleSummarizerCredentialInstanceId: "inline companion for the project title-summarizer model picker; unset inherits the provider default",
+  titleSummarizerFallbackCredentialInstanceId: "inline companion for the project title-summarizer fallback model picker; unset inherits the provider default",
+  importTranslateCredentialInstanceId: "inline companion for the project import-translate model picker; unset inherits the provider default",
+  mergerCredentialInstanceId: "inline companion for the project merger model picker; unset inherits the provider default",
+  mergerFallbackCredentialInstanceId: "inline companion for the project merger fallback model picker; unset inherits the provider default",
+
+  /*
+  FNXC:SettingsDefaults 2026-08-12-01:00:
+  FN-8993 classifies this CLI/engine-owned graph output path as not surfaced: it has
+  zero dashboard render sites and i18n keys, while only `fn knowledge-graph build`
+  and the memory-consolidation tick consume it. Operators can find its default in
+  docs/settings-reference.md and docs/knowledge-graph.md rather than a Settings field.
+  */
+  knowledgeGraphDir: "CLI/engine-owned knowledge-graph output directory (fn knowledge-graph build --dir); no Settings UI field renders it",
 
   // Internal/engine bookkeeping, session state, or reliability telemetry — not
   // rendered as a plain user-facing description field anywhere in Settings.
@@ -441,9 +547,6 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   commitMsgHookEnabled: "not yet exposed as a distinct Settings field",
   autoResolveReviewComments: "not yet exposed as a distinct Settings field",
   mergeRequestContractShadowEnabled: "internal shadow-diagnostic flag, not a Settings field",
-  mergeDiffVolumeMinLines: "not yet exposed as a distinct Settings field",
-  mergeDiffVolumeThreshold: "not yet exposed as a distinct Settings field",
-  mergeDiffVolumeAllowlist: "not yet exposed as a distinct Settings field",
   mergeAuditAutoRecovery: "not yet exposed as a distinct Settings field",
   autoRecovery: "not yet exposed as a distinct Settings field",
   buildTimeoutMs: "not yet exposed as a distinct Settings field",
@@ -459,19 +562,12 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   inReviewStalledThresholdMs: "internal reliability tuning constant, no UI field",
   stalePausedTodoThresholdMs: "internal reliability tuning constant, no UI field",
   pausedScopeDecayMs: "internal reliability tuning constant, no UI field",
-  metaTaskStallAutoCloseMs: "internal reliability tuning constant, no UI field",
-  metaTaskActiveExecutionGraceMs: "internal reliability tuning constant, no UI field",
   boardStallSweepWindowMs: "internal reliability tuning constant, no UI field",
   boardStallBlockedGrowthThreshold: "internal reliability tuning constant, no UI field",
   backlogPressureAlertEnabled: "internal reliability tuning constant, no UI field",
   backlogPressureRatioThreshold: "internal reliability tuning constant, no UI field",
   backlogPressureMinTodoCount: "internal reliability tuning constant, no UI field",
   backlogPressureAlertCooldownMs: "internal reliability tuning constant, no UI field",
-  dependencyBlockedTodoReportEnabled: "internal reliability tuning constant, no UI field",
-  dependencyBlockedTodoFreshAgeMs: "internal reliability tuning constant, no UI field",
-  dependencyBlockedTodoStaleAgeMs: "internal reliability tuning constant, no UI field",
-  dependencyBlockedTodoMinCount: "internal reliability tuning constant, no UI field",
-  dependencyBlockedTodoReportCooldownMs: "internal reliability tuning constant, no UI field",
   staleInProgressWarningMs: "internal reliability tuning constant, no UI field",
   staleInProgressCriticalMs: "internal reliability tuning constant, no UI field",
   staleInReviewWarningMs: "internal reliability tuning constant, no UI field",
@@ -484,7 +580,6 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   maxBranchConflictRecoveries: "internal reliability tuning constant, no UI field",
   maxTotalRetriesBeforeFail: "internal reliability tuning constant, no UI field",
   maintenanceIntervalMs: "internal engine maintenance interval, no UI field",
-  doneAutoArchiveDays: "legacy alias superseded by autoArchiveDoneAfterMs, no UI field",
   autoClaimCandidatesInPrompt: "internal prompt-shaping constant, no UI field",
   tombstoneStickyWindowDays: "internal tombstone-retention constant, no UI field",
   heartbeatMultiplier: "internal scheduler tuning constant, no UI field",
@@ -561,19 +656,73 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   prerebaseAutoEnabled: "internal pre-rebase tuning constant, no UI field",
   prerebaseHotFiles: "internal pre-rebase tuning constant, no UI field",
   prerebaseDivergenceThreshold: "internal pre-rebase tuning constant, no UI field",
-  maxSpawnedAgentsPerParent: "internal spawn-limit constant, no UI field",
-  maxSpawnedAgentsGlobal: "internal spawn-limit constant, no UI field",
-  // FNXC:Round10 2026-07-13: FN-7907/FN-7908 added chat default model/agent/session settings.
-  // These are configured via the chat New Session defaults picker, not plain description fields.
-  chatNewSessionMode: "chat new-session default mode, configured via the chat defaults picker, not a plain description field",
-  chatDefaultKind: "chat default agent kind, configured via the chat defaults picker, not a plain description field",
-  chatDefaultAgentId: "chat default agent id, configured via the chat defaults picker, not a plain description field",
-  chatDefaultModelProvider: "chat default model provider, configured via the chat defaults picker, not a plain description field",
-  chatDefaultModelId: "chat default model id, configured via the chat defaults picker, not a plain description field",
-  chatDefaultThinkingLevel: "chat default thinking level, configured via the chat defaults picker, not a plain description field",
+  /*
+   * FNXC:SettingsDefaults 2026-09-01-14:52:
+   * Chat defaults are rendered by ProjectModelsSection's Chat group, where help is
+   * attached to the shared SettingsHelpTip "?" affordance instead of a plain
+   * description field. chatNewSessionMode is retained schema-parity state with no
+   * rendered control.
+   */
+  chatNewSessionMode: "retired create-time mode flag with no rendered control, retained in DEFAULT_SETTINGS for settings parity",
+  chatSnippets: "global slash-command content managed by the Skills view rather than a plain Settings description field",
+  chatDefaultKind: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultAgentId: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultModelProvider: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultModelId: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultThinkingLevel: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  /*
+   * FNXC:Rufu043MemoryBackends 2026-08-08-17:38:
+   * RUFU-040 foundation commit 8c595f5cd added three project-scoped Stash/TencentDB
+   * memory-backend settings keys to DEFAULT_PROJECT_SETTINGS without registering them
+   * here, breaking this guard's "every DEFAULT_SETTINGS key is either mapped to a
+   * description or explicitly allowlisted" assertion on any base carrying the
+   * foundation. They are allowlisted (not mapped) because their canonical schema
+   * default is the empty string `""` (meaning "use the runtime localhost constant"),
+   * so a description-field `Default:` claim would be a fabricated-default defect that
+   * the guard's canonical-default assertion rejects; their concrete defaults are the
+   * http://127.0.0.1 runtime fallbacks conveyed by each row's placeholder/help, not a
+   * description-field claim.
+   *
+   * FNXC:StashSessionCapture 2026-08-19-05:09:
+   * (RUFU-122) stashUrl left this allowlist: it is now a genuinely rendered
+   * Settings row whose help copy accurately states its empty-string canonical
+   * default ("Default: empty (uses the built-in default Stash URL)"), so it is
+   * mapped in SETTING_DESCRIPTION_KEYS instead — a key in BOTH maps fails the
+   * overlap assertion below.
+   */
+  memoryBackendUrl: "project-scoped TencentDB gateway URL row (rendered in MemorySection only for the tencentdb backend); canonical schema default is empty (`''`) = use the runtime DEFAULT_GATEWAY_URL (http://127.0.0.1:8420), conveyed by the row's placeholder/help, not a description-field claim",
+  stashApiKey: "Stash API-key secret override, not rendered as a settings field (the primary key lives in the global secrets store `stash-api-key` per MemorySection help, never in settings); canonical schema default is empty (`''`) = use the resolved global secret",
 };
 
+const CHAT_DEFAULT_ALLOWLIST_KEYS = [
+  "chatNewSessionMode",
+  "chatDefaultKind",
+  "chatDefaultAgentId",
+  "chatDefaultModelProvider",
+  "chatDefaultModelId",
+  "chatDefaultThinkingLevel",
+] as const;
+
+const RETIRED_CHAT_FLOW_PHRASES = [
+  "New Chat dialog",
+  "New Chat picker",
+  "chat defaults picker",
+  "New Session defaults picker",
+] as const;
+
 describe("FN-7505 settings default-value description guard", () => {
+  it("uses the active English catalog's first-error tool retry default", () => {
+    /*
+     * FNXC:ExecutorToolFailureRetry 2026-08-06-14:56:
+     * Import the active runtime English catalog rather than inspecting a
+     * component fallback. A stale translation otherwise overrides the correct
+     * form value and tells desktop and mobile operators the retired default.
+     */
+    expect(resolveDescription(realEnApp.settings as SettingsDict, "scheduling.executorToolFailureThresholdHelp"))
+      .toBe("Terminal tool errors required before retrying. Default: 1.");
+    expect(DEFAULT_PROJECT_SETTINGS.executorToolFailureThreshold).toBe(1);
+  });
+
   it("every surfaced setting's resolved English description states its default", () => {
     const missing: string[] = [];
     const noIndicator: string[] = [];
@@ -605,6 +754,51 @@ describe("FN-7505 settings default-value description guard", () => {
       unaccounted,
       `Settings keys with no default-value description mapping and no allowlist reason:\n${unaccounted.join("\n")}`,
     ).toEqual([]);
+  });
+
+  /*
+  FNXC:SettingsDefaults 2026-08-12-01:00:
+  FN-8993 prevents knowledgeGraphDir from silently returning to the unaccounted-default
+  census failure. The CLI/engine-owned path belongs only in the not-surfaced allowlist.
+  */
+  it("pins FN-8993 knowledgeGraphDir as an allowlisted, non-Settings field", () => {
+    expect(
+      DEFAULT_SETTINGS,
+      "FN-8993 requires knowledgeGraphDir to remain a DEFAULT_SETTINGS key",
+    ).toHaveProperty("knowledgeGraphDir");
+    expect(
+      NOT_SURFACED_ALLOWLIST.knowledgeGraphDir,
+      "FN-8993 requires knowledgeGraphDir's non-empty not-surfaced allowlist reason",
+    ).toEqual(expect.any(String));
+    expect(
+      NOT_SURFACED_ALLOWLIST.knowledgeGraphDir,
+      "FN-8993 requires a non-empty knowledgeGraphDir allowlist reason",
+    ).not.toBe("");
+    expect(
+      SETTING_DESCRIPTION_KEYS,
+      "FN-8993 requires knowledgeGraphDir to stay out of SETTING_DESCRIPTION_KEYS",
+    ).not.toHaveProperty("knowledgeGraphDir");
+  });
+
+  it("chat default allowlist reasons name their real host and carry no retired-flow claim", () => {
+    for (const settingKey of CHAT_DEFAULT_ALLOWLIST_KEYS) {
+      expect(DEFAULT_SETTINGS).toHaveProperty(settingKey);
+
+      const reason = NOT_SURFACED_ALLOWLIST[settingKey];
+      expect(reason).toEqual(expect.any(String));
+      expect(reason).not.toBe("");
+
+      for (const retiredPhrase of RETIRED_CHAT_FLOW_PHRASES) {
+        expect(reason).not.toMatch(new RegExp(retiredPhrase, "i"));
+      }
+
+      if (settingKey === "chatNewSessionMode") {
+        expect(reason).toMatch(/\b(retired|inert)\b/i);
+        expect(reason).toMatch(/no rendered control/i);
+      } else {
+        expect(reason).toContain("ProjectModelsSection");
+      }
+    }
   });
 
   it("does not allowlist a key that is also mapped to a description (would mask real coverage gaps)", () => {

@@ -1,5 +1,5 @@
 import type { Request, RequestHandler, Router } from "express";
-import type { AutomationStore, RoutineStore, TaskStore } from "@fusion/core";
+import type { AutomationStore, PluginLoader, RoutineStore, TaskStore } from "@fusion/core";
 import type { ServerOptions } from "../server.js";
 import type { RuntimeLogger } from "../runtime-logger.js";
 
@@ -45,12 +45,31 @@ export interface ApiRoutesContext {
   /** Narrow multipart seam for routes that must accept local binary artifacts. */
   reportUpload?: { single(fieldName: string): RequestHandler };
   options?: ServerOptions;
+  /*
+  FNXC:ApprovalDecisionAuthority 2026-07-26-16:10:
+  Whether the daemon bearer-token auth middleware is installed in front of these routes.
+  Security-sensitive routes (approval decisions) use it to decide whether to log the
+  local single-operator trust assumption on each privileged action. Optional: when absent,
+  consumers fall back to `options.isDaemonAuthEnabled` and then to
+  `isDaemonAuthActive(options)` so direct `createApiRoutes` callers keep working.
+  */
+  isDaemonAuthEnabled?: boolean;
   runtimeLogger: RuntimeLogger;
   planningLogger: RuntimeLogger;
   chatLogger: RuntimeLogger;
   getProjectIdFromRequest(req: Request): string | undefined;
   getScopedStore(req: Request): Promise<TaskStore>;
   getProjectContext(req: Request): Promise<ProjectContext>;
+  /*
+  FNXC:PluginEnablementScope 2026-07-22-20:30:
+  Single per-request plugin-loader resolution shared by plugin management/introspection
+  routes AND plugin-defined HTTP route dispatch, so navigation (dashboard-views) and the
+  routes it calls can never disagree about which plugins exist for a project.
+  */
+  getProjectPluginLoader(
+    scopedStore: TaskStore,
+    engine?: { getPluginRunner?: () => { getLoader?: () => PluginLoader } | undefined },
+  ): Promise<PluginLoader | undefined>;
   prioritizeProjectsForCurrentDirectory<T extends { path: string }>(projects: T[]): T[];
   emitRemoteRouteDiagnostic(input: RemoteRouteDiagnosticInput): void;
   emitAuthSyncAuditLog(input: AuthSyncAuditLogInput): void;

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
-import { runAiMerge } from "../../merger-ai.js";
+import { runAiMerge } from "../../merge/merger-ai.js";
 import { hasGit } from "./_helpers.js";
 
 const tracked = new Set<string>();
@@ -47,6 +47,8 @@ function makeStore(taskId: string, branch: string) {
     worktree: null,
     title: "AI merge cleanup ENOENT fixture",
     steps: [{ title: "ready", status: "done" }],
+    /* FNXC:MergeFixtures 2026-08-23-18:40: this fixture exercises AI-merge cleanup mechanics, not review gating. The merge door refuses a task whose ENABLED optional pre-merge groups produced no result, and the built-in workflow enables Plan/Code Review by default, so declare no enabled steps. */
+    enabledWorkflowSteps: [],
   };
   const audits: any[] = [];
   const logs: string[] = [];
@@ -59,10 +61,17 @@ function makeStore(taskId: string, branch: string) {
       merger: { mode: "ai", maxReviewPasses: 1 },
     })),
     updateTask: vi.fn(async (_id: string, patch: Record<string, unknown>) => { Object.assign(task, patch); return task; }),
+    /* FNXC:MergeFixtures 2026-08-23-18:56: runAiMerge persists AI-merge review reconciliation through updateTaskAtomic; a fake store without it throws mid-merge. Faithful read-modify-write over the fixture task, matching merger-ai.test.ts. */
+    updateTaskAtomic: vi.fn(async (_id: string, updater: (current: typeof task) => Record<string, unknown> | undefined) => {
+      const patch = await updater(task);
+      if (patch) Object.assign(task, patch);
+      return task;
+    }),
     moveTask: vi.fn(async (_id: string, column: string) => { task.column = column; return task; }),
     emit: vi.fn(),
     logEntry: vi.fn(async (_id: string, message: string) => { logs.push(message); }),
     appendAgentLog: vi.fn(async (_id: string, message: string) => { logs.push(message); }),
+    emitUsageEvent: vi.fn(async () => true),
     recordRunAuditEvent: vi.fn(async (event: any) => { audits.push(event); }),
   };
   return { store, task, audits, logs };

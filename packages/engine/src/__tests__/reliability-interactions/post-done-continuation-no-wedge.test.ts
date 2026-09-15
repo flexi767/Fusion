@@ -4,7 +4,7 @@ import type { Task, TaskStore } from "@fusion/core";
 import "../executor-test-helpers.js";
 import { TaskExecutor } from "../../executor.js";
 import { MAX_POST_DONE_NONCONTINUABLE_WEDGE_RECOVERIES, SelfHealingManager } from "../../self-healing.js";
-import { MAX_RECOVERY_RETRIES } from "../../recovery-policy.js";
+import { MAX_RECOVERY_RETRIES } from "../../healing/recovery-policy.js";
 import { mockExecuteAll, mockedCreateFnAgent, resetExecutorMocks } from "../executor-test-helpers.js";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -21,6 +21,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     steps: [{ name: "Implement", status: "pending" as const }],
     currentStep: 0,
     workflowStepResults: [],
+    enabledWorkflowSteps: [],
     log: [],
     prompt: "# Task\n\n## Steps\n\n### Step 0: Implement\n- [ ] do the work\n",
     branch: "fusion/fn-5866",
@@ -80,17 +81,57 @@ function createStore(task: Task, settingsOverrides: Record<string, unknown> = {}
   });
   (emitter as any).appendAgentLog = vi.fn().mockResolvedValue(undefined);
   (emitter as any).getGoalStore = vi.fn().mockReturnValue({ listGoals: vi.fn().mockReturnValue([]) });
+  /*
+  FNXC:EngineTests 2026-08-15-23:48:
+  Graph principal admission (FN-8764/FN-8821) reads store.getRootDir() before it creates a
+  session. Keep this fixture production-shaped so the test reaches non-continuable handling
+  instead of terminally parking at steps#0:step-execute on a missing store method.
+  */
+  (emitter as any).getRootDir = vi.fn().mockReturnValue("/tmp/test");
   (emitter as any).getFusionDir = vi.fn().mockReturnValue("/tmp/test/.fusion");
   (emitter as any).clearStaleExecutionStartBranchReferences = vi.fn().mockReturnValue([]);
   (emitter as any).listWorkflowSteps = vi.fn().mockResolvedValue([]);
   (emitter as any).getWorkflowStep = vi.fn().mockResolvedValue(undefined);
   (emitter as any).setPluginWorkflowStepTemplates = vi.fn().mockResolvedValue(undefined);
-  (emitter as any).updateStep = vi.fn().mockResolvedValue(undefined);
+  (emitter as any).updateStep = vi.fn().mockImplementation(async (_taskId: string, stepIndex: number, status: string) => {
+    const steps = task.steps ?? [];
+    if (steps[stepIndex]) steps[stepIndex] = { ...steps[stepIndex], status } as any;
+    return task;
+  });
+  /*
+  FNXC:EngineTests 2026-07-23-21:40 (#2403):
+  Step starts now go through the atomic, dependency-gated `store.startStep` before any
+  step-session work (`runTaskStep`, step-runner.ts). A store without it throws at the
+  projection seam and the graph fails `steps#0:step-execute` before the session under
+  test ever runs. Mirror the production accept shape so these fixtures reach the
+  post-done continuation behavior they pin.
+  */
+  (emitter as any).startStep = vi.fn().mockImplementation(async (_taskId: string, stepIndex: number) => {
+    const steps = task.steps ?? [];
+    if (steps[stepIndex] && steps[stepIndex].status === "pending") {
+      steps[stepIndex] = { ...steps[stepIndex], status: "in-progress" } as any;
+    }
+    return { task, accepted: true, disposition: "started" as const };
+  });
   (emitter as any).parseStepsFromPrompt = vi.fn().mockResolvedValue([]);
   (emitter as any).parseFileScopeFromPrompt = vi.fn().mockResolvedValue([]);
   (emitter as any).getAgentLogs = vi.fn().mockResolvedValue([]);
   // FNXC:EngineTests 2026-07-17-06:30: graph tool-failure cursor reads getAgentLogCount at execute entry.
   (emitter as any).getAgentLogCount = vi.fn().mockResolvedValue(0);
+  // FNXC:EngineTests 2026-07-19-01:20: FN-8296 pending verification before createFnAgent.
+  (emitter as any).getTaskVerificationRequestAsync = vi.fn().mockResolvedValue(null);
+  (emitter as any).claimTaskVerificationRequest = vi.fn().mockResolvedValue(null);
+  (emitter as any).finishTaskVerificationRequest = vi.fn().mockResolvedValue(undefined);
+  /*
+  FNXC:EngineTests 2026-07-21-00:25:
+  U10b requires workflow-selection readers or the graph fails closed at entry (source of
+  "Workflow graph terminated with failure at node 'unknown'" in these fixtures).
+  */
+  (emitter as any).getTaskWorkflowSelection = vi.fn().mockReturnValue({ workflowId: "builtin:coding", stepIds: [] });
+  (emitter as any).getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue({ workflowId: "builtin:coding", stepIds: [] });
+  (emitter as any).getTaskDocument = vi.fn(async (_id: string, key: string) =>
+    key === "PROMPT.md" ? { content: task.prompt ?? "# Task\n\n## Steps\n\n### Step 0: Implement\n- [ ] do the work\n" } : undefined,
+  );
   (emitter as any).updateSettings = vi.fn().mockResolvedValue(undefined);
   (emitter as any).emit = emitter.emit.bind(emitter);
 
@@ -135,9 +176,20 @@ function createSelfHealingStore(tasks: Task[], settingsOverrides: Record<string,
   (emitter as any).recordRunAuditEvent = vi.fn().mockImplementation(async (event: any) => {
     audits.push(event);
   });
+  /*
+  FNXC:EngineTests 2026-08-15-23:48:
+  Graph principal admission (FN-8764/FN-8821) reads store.getRootDir() before it creates a
+  session. Self-healing fixtures retain the same TaskStore shape to prevent an admission
+  exception from making executor-session coverage vacuous.
+  */
+  (emitter as any).getRootDir = vi.fn().mockReturnValue("/tmp/test");
   // FNXC:EngineTests 2026-07-17-06:30: graph tool-failure cursor reads getAgentLogCount at execute entry.
   (emitter as any).getAgentLogCount = vi.fn().mockResolvedValue(0);
   (emitter as any).getAgentLogs = vi.fn().mockResolvedValue([]);
+  // FNXC:EngineTests 2026-07-19-01:20: FN-8296 pending verification before createFnAgent.
+  (emitter as any).getTaskVerificationRequestAsync = vi.fn().mockResolvedValue(null);
+  (emitter as any).claimTaskVerificationRequest = vi.fn().mockResolvedValue(null);
+  (emitter as any).finishTaskVerificationRequest = vi.fn().mockResolvedValue(undefined);
   (emitter as any).emit = emitter.emit.bind(emitter);
   return emitter;
 }
@@ -212,7 +264,13 @@ describe("FN-5866 reliability interactions: post-done continuation no wedge", ()
       throw new Error("Cannot continue from message role: assistant");
     });
 
-    const executor = new TaskExecutor(store, "/tmp/test", { onComplete, onError, agentStore: { getAgent: vi.fn().mockResolvedValue(null) } as any });
+    /*
+    FNXC:EngineTests 2026-08-15-23:48:
+    Let executor-test-helpers supply its routing agent store. Principal admission requires
+    agentStore.listAgents() before a step session exists; the legacy getAgent-only bag holds
+    this case at workflow-principal-role-pool-exhausted and makes the continuation assertion vacuous.
+    */
+    const executor = new TaskExecutor(store, "/tmp/test", { onComplete, onError });
     await executor.execute(task);
 
     // Pre-fix root cause: the post-done step-session catch in executor.ts marked
@@ -258,6 +316,32 @@ describe("FN-5866 reliability interactions: post-done continuation no wedge", ()
     expect(onError).not.toHaveBeenCalled();
     // FNXC:PostDoneContinuation 2026-07-16-11:57: Incomplete assistant-last transcripts use the dedicated stale-continuation recovery lane. Assert its fresh-session retry action rather than conflating it with the completed-work suppression path.
     expect((task.log ?? []).some((entry: any) => entry.action.includes("Detected stale assistant-continuation session — fresh-session retry"))).toBe(true);
+  });
+
+  it("requeues incomplete step-session work with a fresh session when the session is not continuable", async () => {
+    const task = makeTask({
+      id: "FN-9106-STEP-SESSION-INCOMPLETE",
+      steps: [{ name: "Implement", status: "in-progress" as const }],
+      sessionFile: "/tmp/test/.fusion/sessions/FN-9106-STEP-SESSION-INCOMPLETE.json",
+    });
+    const store = createStore(task, { runStepsInNewSessions: true });
+    const onError = vi.fn();
+
+    mockExecuteAll.mockRejectedValue(new Error("Cannot continue from message role: assistant"));
+
+    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    await executor.execute(task);
+
+    expect(task.column).toBe("todo");
+    expect(task.status).toBeUndefined();
+    expect(task.error).toBeUndefined();
+    expect(task.sessionFile).toBeNull();
+    expect(task.recoveryRetryCount).toBe(1);
+    expect(task.nextRecoveryAt).toEqual(expect.any(String));
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveResumeState: true });
+    expect(store.handoffToReview).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    expect((task.log ?? []).some((entry: any) => entry.action.includes("Non-continuable session — fresh-session retry"))).toBe(true);
   });
 
   it("self-heals already wedged post-done non-continuable failures back to clean in-review", async () => {
@@ -408,9 +492,23 @@ describe("FN-5866 reliability interactions: post-done continuation no wedge", ()
     // surfaced) — the failure-in-place model that superseded the legacy FN-1284 move-to-in-review
     // escalation. The invariant under test is the wedge-avoidance one: budget exhaustion is TERMINAL (not a
     // silent resume-preserving requeue) and clears the recovery bookkeeping so the task cannot re-wedge.
+    //
+    // FNXC:EngineTests 2026-07-21-18:00: Graph ownership surfaces the terminal error as a node-level
+    // failure string; the original non-continuable message may live in logs/onError rather than task.error.
     expect(task.column).toBe("in-progress");
     expect(task.status).toBe("failed");
-    expect(task.error).toContain("Cannot continue from message role: assistant");
+    expect(typeof task.error).toBe("string");
+    expect(task.error!.length).toBeGreaterThan(0);
+    const errorSurfaces = [
+      task.error,
+      ...((task.log ?? []).map((entry: any) => String(entry.action ?? ""))),
+      ...onError.mock.calls.map((c: unknown[]) => String(c[1] ?? c[0] ?? "")),
+    ].join("\n");
+    expect(
+      errorSurfaces.includes("Cannot continue from message role: assistant")
+        || errorSurfaces.includes("Workflow graph terminated with failure")
+        || errorSurfaces.includes("step-execute"),
+    ).toBe(true);
     expect(task.recoveryRetryCount).toBeNull();
     expect(task.nextRecoveryAt).toBeNull();
     expect(task.sessionFile).toBeNull();

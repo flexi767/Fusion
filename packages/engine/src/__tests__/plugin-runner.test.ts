@@ -6,7 +6,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { PluginRunner, type PluginRunnerOptions } from "../plugin-runner.js";
+import { PluginRunner, type PluginRunnerOptions } from "../plugins/plugin-runner.js";
+import { RENAMED_VOCAB, lifecycleIr } from "./_workflow-vocabulary-fixture.js";
 import {
   __resetWorkflowExtensionRegistryForTests,
   getWorkflowExtensionRegistry,
@@ -16,17 +17,28 @@ import {
   type PluginInstallation,
 } from "@fusion/core";
 import type { FusionPlugin, PluginToolDefinition } from "@fusion/core";
-import { createLogger } from "../logger.js";
 
-// Mock the logger to suppress output during tests
-vi.mock("../logger.js", () => ({
-  createLogger: vi.fn(() => ({
+/*
+FNXC:PluginRunnerTests 2026-08-17-12:11:
+The no-isolation, worker-reuse campaign showed unrelated files can call `vi.clearAllMocks()`
+between this module's import and its lifecycle assertion. Keep the mocked logger instance in a
+hoisted stable reference so the assertion continues to test the warning contract rather than
+Vitest's erased mock-call history.
+*/
+const { pluginRunnerLogger } = vi.hoisted(() => ({
+  pluginRunnerLogger: {
     log: vi.fn(),
+    debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  })),
+  },
+}));
+
+// Mock the logger to suppress output during tests.
+vi.mock("../logger.js", () => ({
+  createLogger: vi.fn(() => pluginRunnerLogger),
   executorLog: {
-    log: vi.fn(),
+    log: vi.fn(), debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   },
@@ -98,17 +110,7 @@ describe("PluginRunner", () => {
     ...overrides,
   });
 
-  const getPluginRunnerLogger = () => {
-    const logger = vi.mocked(createLogger).mock.results.at(-1)?.value as {
-      log: ReturnType<typeof vi.fn>;
-      warn: ReturnType<typeof vi.fn>;
-      error: ReturnType<typeof vi.fn>;
-    } | undefined;
-    if (!logger) {
-      throw new Error("Expected plugin-runner logger to be initialized");
-    }
-    return logger;
-  };
+  const getPluginRunnerLogger = () => pluginRunnerLogger;
 
   beforeEach(() => {
     // Create fresh mocks for each test
@@ -1627,6 +1629,62 @@ describe("PluginRunner", () => {
       );
     });
 
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-12:40 (batch-engine tail):
+    The case above proves `onTaskCompleted` fires for the LEGACY id, which is what the guard compared
+    against — it passed before this conversion and would pass for a broken one. On a board whose complete
+    lane is renamed the hook NEVER fired: every plugin that closes an issue, posts a notification, or
+    records a metric on completion silently stopped, with nothing logged.
+
+    REVERT CHECK, measured: with `if (to === "done")` restored, this fails — `invokeHook` is never called
+    with `onTaskCompleted`. The legacy case above passes both ways, which is why both are kept.
+    */
+    it("should invoke onTaskCompleted when the complete lane is RENAMED", async () => {
+      const ir = lifecycleIr(RENAMED_VOCAB, "plugin-runner-lifecycle");
+      mockTaskStore.getTaskWorkflowSelectionAsync = vi.fn(async () => ({ workflowId: "plugin-runner-lifecycle", stepIds: [] }));
+      mockTaskStore.getTaskWorkflowSelection = vi.fn(() => ({ workflowId: "plugin-runner-lifecycle", stepIds: [] }));
+      mockTaskStore.getWorkflowDefinition = vi.fn(async (id: string) => (id === "plugin-runner-lifecycle" ? { ir } : undefined));
+      mockPluginLoader.invokeHook = vi.fn();
+      await pluginRunner.init();
+
+      const movedHandler = mockTaskStore.on.mock.calls.find(
+        call => call[0] === "task:moved"
+      )?.[1];
+
+      const mockTask = { id: "FN-001", title: "Test Task" };
+      if (movedHandler) {
+        movedHandler({ task: mockTask, from: RENAMED_VOCAB.review, to: RENAMED_VOCAB.complete });
+      }
+      await flushMicrotasks();
+
+      expect(mockPluginLoader.invokeHook).toHaveBeenCalledWith("onTaskCompleted", mockTask);
+    });
+
+    it("should NOT invoke onTaskCompleted when a RENAMED board moves the card to a non-complete lane", async () => {
+      /*
+      Non-vacuous companion: without it, a guard that fired on EVERY move would satisfy the case above.
+      Same renamed board, same handler — only the destination lane changes.
+      */
+      const ir = lifecycleIr(RENAMED_VOCAB, "plugin-runner-lifecycle");
+      mockTaskStore.getTaskWorkflowSelectionAsync = vi.fn(async () => ({ workflowId: "plugin-runner-lifecycle", stepIds: [] }));
+      mockTaskStore.getTaskWorkflowSelection = vi.fn(() => ({ workflowId: "plugin-runner-lifecycle", stepIds: [] }));
+      mockTaskStore.getWorkflowDefinition = vi.fn(async (id: string) => (id === "plugin-runner-lifecycle" ? { ir } : undefined));
+      mockPluginLoader.invokeHook = vi.fn();
+      await pluginRunner.init();
+
+      const movedHandler = mockTaskStore.on.mock.calls.find(
+        call => call[0] === "task:moved"
+      )?.[1];
+
+      const mockTask = { id: "FN-001", title: "Test Task" };
+      if (movedHandler) {
+        movedHandler({ task: mockTask, from: RENAMED_VOCAB.hold, to: RENAMED_VOCAB.wip });
+      }
+      await flushMicrotasks();
+
+      expect(mockPluginLoader.invokeHook).not.toHaveBeenCalledWith("onTaskCompleted", mockTask);
+    });
+
     it("should NOT invoke onTaskCompleted when task moves elsewhere", async () => {
       mockPluginLoader.invokeHook = vi.fn();
       await pluginRunner.init();
@@ -1716,6 +1774,8 @@ describe("PluginRunner", () => {
       const unregisteredHandler = mockPluginStore.on.mock.calls.find(
         call => call[0] === "plugin:unregistered"
       )?.[1];
+      // Mirror a worker-reused neighbour's mock cleanup after this module initialized.
+      vi.clearAllMocks();
       const logger = getPluginRunnerLogger();
       logger.warn.mockClear();
       expect(unregisteredHandler).toBeTypeOf("function");

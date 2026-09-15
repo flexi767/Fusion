@@ -48,21 +48,30 @@ vi.mock("@fusion/core", async () => {
   };
 });
 
-vi.mock("@fusion/engine", () => ({
-  listCliAdapterDescriptors: () => [],
-  createFnAgent: vi.fn(async () => ({ session: { state: { messages: [] }, prompt: vi.fn(), dispose: vi.fn() } })),
-  createResolvedAgentSession: vi.fn(async () => ({
-    session: { state: { messages: [] }, prompt: vi.fn(), dispose: vi.fn() },
-    runtimeModel: undefined,
-  })),
-  ExperimentFinalizeService: class {
-    async finalize() {
-      return { keptRuns: [], droppedRuns: [], branches: [] };
-    }
-  },
-  defaultGitOps: vi.fn(() => ({})),
-  promptWithFallback: vi.fn(),
-}));
+/*
+FNXC:DashboardRouteTests 2026-08-15-05:10:
+Route mounting imports model-registry refresh constants from @fusion/engine, so wholesale inline
+engine mocks go stale whenever the barrel grows. Use the canonical createEngineMock helper
+(fallback vi.fn() proxy) instead of hand-listing every export.
+*/
+vi.mock("@fusion/engine", async () => {
+  const { createEngineMock } = await import("../../test/mockCoreEngine.js");
+  return createEngineMock({
+    listCliAdapterDescriptors: () => [],
+    createFnAgent: vi.fn(async () => ({ session: { state: { messages: [] }, prompt: vi.fn(), dispose: vi.fn() } })),
+    createResolvedAgentSession: vi.fn(async () => ({
+      session: { state: { messages: [] }, prompt: vi.fn(), dispose: vi.fn() },
+      runtimeModel: undefined,
+    })),
+    ExperimentFinalizeService: class {
+      async finalize() {
+        return { keptRuns: [], droppedRuns: [], branches: [] };
+      }
+    },
+    defaultGitOps: vi.fn(() => ({})),
+    promptWithFallback: vi.fn(),
+  });
+});
 
 function buildMultipartBody(fileName: string, mimeType: string, buffer: Buffer): { body: Buffer; contentType: string } {
   const boundary = "----fusion-test-boundary";
@@ -99,6 +108,14 @@ function createMockStore(fusionDir: string) {
     getAllDocuments: vi.fn().mockResolvedValue([]),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     getMissionStore: vi.fn(),
+    /*
+    FNXC:PluginMcpServers 2026-07-24-02:05:
+    FN-8491 (3cd023fa4) made resolveProjectContext bind a project-scoped plugin
+    MCP provider on every getProjectContext call; a store exposing
+    getProjectScopedPluginMcpServers is treated as runtime-owned and skips the
+    binder (which would otherwise 500 on getPluginStore()).
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
   } as any;
 }
 

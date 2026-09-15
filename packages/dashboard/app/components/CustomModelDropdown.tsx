@@ -1,9 +1,11 @@
 import "./CustomModelDropdown.css";
+import { AlphaButton, AlphaInput, AlphaListBox, AlphaListBoxItem, AlphaListBoxRow, AlphaPopoverSurface, AlphaSelect } from "./alpha-ui";
+import { useAlphaSurface } from "../context/AlphaContext";
 import { useState, useEffect, useCallback, useMemo, useRef, useId } from "react";
 import { THINKING_LEVELS } from "@fusion/core";
 import { useTranslation } from "react-i18next";
 import { createPortal } from "react-dom";
-import type { ModelInfo } from "../api";
+import type { ModelInfo, ProviderCredentialInstanceSummary } from "../api";
 import { filterModels } from "../utils/modelFilter";
 import { ProviderIcon } from "./ProviderIcon";
 
@@ -39,10 +41,17 @@ export interface CustomModelDropdownProps {
   defaultThinkingLevel?: string;
   /** Explicitly render the optional inline thinking-level selector even without a change callback. */
   showThinkingLevel?: boolean;
+  /** Optional selected credential instance; empty or absent means provider default. */
+  credentialInstanceId?: string;
+  /** Called when the inline credential-instance selector changes; empty means clear the persisted override. */
+  onCredentialInstanceChange?: (instanceId: string) => void;
+  /** Available credential instances keyed by provider, as advertised by /api/models. */
+  credentialInstances?: Record<string, { instances: ProviderCredentialInstanceSummary[] }>;
 }
 
 interface DropdownPosition {
-  top: number;
+  top: number | null;
+  bottom: number | null;
   left: number;
   width: number;
   maxHeight: number;
@@ -100,8 +109,12 @@ export function CustomModelDropdown({
   onThinkingLevelChange,
   defaultThinkingLevel,
   showThinkingLevel,
+  credentialInstanceId,
+  onCredentialInstanceChange,
+  credentialInstances,
 }: CustomModelDropdownProps) {
   const { t } = useTranslation("app");
+  const alphaSurface = useAlphaSurface();
   const placeholder = placeholderProp ?? t("model.selectPlaceholder", "Select a model…");
   const noChangeLabel = noChangeLabelProp ?? t("model.noChange", "No change");
   const defaultOptionLabel = defaultOptionLabelProp ?? t("models.useDefault", "Use default");
@@ -112,6 +125,7 @@ export function CustomModelDropdown({
   const [portalRoot, setPortalRoot] = useState<HTMLElement | null>(null);
   const [collapsedProviders, setCollapsedProviders] = useState<Set<string>>(loadCollapsedProviders);
   const generatedThinkingId = useId();
+  const generatedInstanceId = useId();
 
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -131,10 +145,16 @@ export function CustomModelDropdown({
     }, {});
   }, [filteredModels]);
 
-  // Build favorited model entries - models that are in the favoriteModels list and in filteredModels
+  /*
+  FNXC:ModelDropdown 2026-09-06-21:10:
+  Chat model pickers expose the same favorite stars as settings surfaces. Normalize duplicate or stale persisted identifiers before rendering pinned rows so each available model has exactly one coherent action and invalid favorites never leave an empty affordance.
+  */
   const favoritedModelEntries = useMemo(() => {
     const result: Array<{ model: ModelInfo; fullId: string }> = [];
+    const seen = new Set<string>();
     for (const fullId of favoriteModels) {
+      if (seen.has(fullId)) continue;
+      seen.add(fullId);
       const slashIdx = fullId.indexOf("/");
       if (slashIdx === -1) continue;
       const provider = fullId.slice(0, slashIdx);
@@ -189,20 +209,28 @@ export function CustomModelDropdown({
   const hasNoChangeOption = typeof noChangeValue === "string" && noChangeValue.length > 0;
   const shouldShowThinking = showThinkingLevel ?? Boolean(onThinkingLevelChange);
   const normalizedThinkingLevel = thinkingLevel ?? "";
+  const selectedModel = useMemo(() => {
+    if (!value || (hasNoChangeOption && value === noChangeValue)) return undefined;
+    const slashIdx = value.indexOf("/");
+    if (slashIdx <= 0) return undefined;
+    return models.find((model) => model.provider === value.slice(0, slashIdx) && model.id === value.slice(slashIdx + 1));
+  }, [hasNoChangeOption, models, noChangeValue, value]);
   const hasDefaultThinkingOption = typeof defaultThinkingLevel === "string";
   const thinkingSelectId = id ? `${id}-thinking-level` : `${generatedThinkingId}-thinking-level`;
 
   /*
-  FNXC:Settings-ThinkingLevel 2026-07-10-00:00:
-  The shared model dropdown can optionally embed a thinking-level selector so task and agent model pickers expose one consistent reasoning-effort affordance, including `xhigh`. The selector stays inert unless a caller opts in with `showThinkingLevel` or `onThinkingLevelChange`, preserving every settings, insights, schedule, workflow, planning, onboarding, and bulk-edit surface that only needs model selection.
+  FNXC:Settings-ThinkingLevel 2026-08-18-23:38:
+  The shared model dropdown can optionally embed a thinking-level selector so task and agent model pickers expose one consistent reasoning-effort affordance, including the canonical `xhigh` and `max` levels. Model metadata narrows the list only when documented capabilities are available; missing metadata keeps the canonical fallback. The selector stays inert unless a caller opts in with `showThinkingLevel` or `onThinkingLevelChange`, preserving every settings, insights, schedule, workflow, planning, onboarding, and bulk-edit surface that only needs model selection.
   */
-  const thinkingOptions = useMemo(() => THINKING_LEVELS.map((level) => ({
+  const thinkingOptions = useMemo(() => (selectedModel?.supportedThinkingLevels ?? THINKING_LEVELS).map((level) => ({
     value: level,
     label: t(`models.options.${level}`, level === "xhigh" ? "Very High" : level.charAt(0).toUpperCase() + level.slice(1)),
-  })), [t]);
+  })), [selectedModel, t]);
+  const hasStaleThinkingLevel = Boolean(normalizedThinkingLevel) && !thinkingOptions.some((option) => option.value === normalizedThinkingLevel);
+  const shouldRenderThinking = shouldShowThinking && (thinkingOptions.length > 0 || hasStaleThinkingLevel || hasDefaultThinkingOption);
 
   const thinkingBadgeLabel = useMemo(() => {
-    if (!shouldShowThinking) return "";
+    if (!shouldRenderThinking) return "";
     if (normalizedThinkingLevel) {
       return thinkingOptions.find((option) => option.value === normalizedThinkingLevel)?.label ?? normalizedThinkingLevel;
     }
@@ -210,7 +238,7 @@ export function CustomModelDropdown({
       return t("modelSelection.thinkingDefault", "Default ({{level}})", { level: defaultThinkingLevel });
     }
     return thinkingOptions.find((option) => option.value === "off")?.label ?? "Off";
-  }, [defaultThinkingLevel, hasDefaultThinkingOption, normalizedThinkingLevel, shouldShowThinking, t, thinkingOptions]);
+  }, [defaultThinkingLevel, hasDefaultThinkingOption, normalizedThinkingLevel, shouldRenderThinking, t, thinkingOptions]);
 
   // Get current provider from value
   const currentProvider = useMemo(() => {
@@ -218,6 +246,38 @@ export function CustomModelDropdown({
     const slashIdx = value.indexOf("/");
     return slashIdx === -1 ? null : value.slice(0, slashIdx);
   }, [hasNoChangeOption, noChangeValue, value]);
+
+  const instanceOptions = useMemo(() => {
+    if (!currentProvider) return [];
+    const seen = new Set<string>();
+    const available = credentialInstances?.[currentProvider]?.instances
+      ?? models.find((model) => model.provider === currentProvider)?.credentialInstances
+      ?? [];
+    const deduplicated = available.filter((instance) => {
+      if (!instance.id || seen.has(instance.id)) return false;
+      seen.add(instance.id);
+      return true;
+    });
+    /*
+    FNXC:ModelDropdown 2026-08-01-09:13:
+    A stale persisted id is retained only after the availability threshold is met. It must not make a single-instance provider sprout this optional control.
+    */
+    if (deduplicated.length >= 2 && credentialInstanceId && !seen.has(credentialInstanceId)) {
+      deduplicated.push({ id: credentialInstanceId, isDefault: false });
+    }
+    return deduplicated;
+  }, [credentialInstanceId, credentialInstances, currentProvider, models]);
+  const shouldShowCredentialInstance = instanceOptions.length >= 2;
+  const normalizedCredentialInstanceId = credentialInstanceId ?? "";
+  const credentialInstanceSelectId = id ? `${id}-credential-instance` : `${generatedInstanceId}-credential-instance`;
+
+  /*
+  FNXC:ModelDropdown 2026-08-01-09:13:
+  Credential-instance selection is visible exactly when a selected provider advertises at least two distinct instances. Rendering nothing otherwise keeps existing and older-server picker menus structurally unchanged; ownership callbacks determine persistence, never visibility.
+
+  FNXC:ModelDropdown 2026-08-01-09:13:
+  A stale selected instance remains an explicit option rather than being cleared during render. Only an operator change may remove a persisted override, preventing unrelated saves from silently changing runtime credentials.
+  */
 
   const specialOptions = useMemo(() => {
     const options: Array<{ type: "default" | "no-change"; value: string; label: string }> = [];
@@ -362,12 +422,22 @@ export function CustomModelDropdown({
       Math.max(triggerLeft, horizontalPadding),
       viewportWidth - horizontalPadding - dropdownWidth,
     ) + offsetLeft;
+    /*
+    FNXC:ModelDropdown 2026-08-01-07:11:
+    The model menu's maxHeight includes a 160px scroll floor, so upward top placement based on that
+    cap separates short model lists from their trigger. Anchor the bottom instead; the visual-viewport
+    offset preserves the existing effective-viewport coordinate conversion for keyboard and zoom cases.
+    */
     const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
+      ? null
       : Math.min(triggerBottom + gap + offsetTop, viewportHeight + offsetTop - verticalPadding - maxHeight);
+    const bottom = openUpward
+      ? viewportHeight + offsetTop - rect.top + gap
+      : null;
 
     setDropdownPosition({
       top,
+      bottom,
       left,
       width: dropdownWidth,
       maxHeight,
@@ -464,6 +534,23 @@ export function CustomModelDropdown({
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [isOpen]);
+
+  /*
+  FNXC:ModelDropdown 2026-08-12-21:56:
+  Every dashboard host must treat the document.body model-menu portal as inside its model control. Stop native pointer and mouse events at the portal boundary before document-level outside-close listeners run, so provider collapse/expand remains interactive on desktop and mobile without requiring each consumer to duplicate the portal exemption.
+
+  FNXC:ModelDropdown 2026-08-15-12:27:
+  Mobile hosts may close from touchstart before a virtual-keyboard re-anchor sends the synthesized click to a backdrop. Stop touchstart and touchend too, but never click: React option and favorite handlers dispatch through this body portal.
+  */
+  useEffect(() => {
+    const dropdown = dropdownRef.current;
+    if (!dropdown) return;
+
+    const stopPortalOutsideClose = (event: Event) => event.stopPropagation();
+    const events = ["pointerdown", "mousedown", "touchstart", "touchend"] as const;
+    events.forEach((eventName) => dropdown.addEventListener(eventName, stopPortalOutsideClose));
+    return () => events.forEach((eventName) => dropdown.removeEventListener(eventName, stopPortalOutsideClose));
+  }, [dropdownPosition, isOpen]);
 
   // Keyboard navigation
   const handleKeyDown = useCallback(
@@ -585,22 +672,25 @@ export function CustomModelDropdown({
   }, [highlightedIndex, isOpen]);
 
   const dropdownContent = isOpen && dropdownPosition ? (
-    <div
+    <AlphaPopoverSurface
       ref={dropdownRef}
+      triggerRef={triggerRef}
+      onClose={() => setIsOpen(false)}
       className="model-combobox-dropdown model-combobox-dropdown--portal"
-      role="listbox"
       data-testid="model-combobox-portal"
+      data-portal-surface="model-menu"
       data-menu-width={menuWidth}
-      onKeyDown={handleKeyDown}
+      onKeyDown={alphaSurface ? undefined : handleKeyDown}
       style={{
-        top: `${dropdownPosition.top}px`,
+        top: dropdownPosition.bottom === null ? `${dropdownPosition.top}px` : "auto",
+        bottom: dropdownPosition.bottom === null ? undefined : `${dropdownPosition.bottom}px`,
         left: `${dropdownPosition.left}px`,
         width: `${dropdownPosition.width}px`,
         maxHeight: `${dropdownPosition.maxHeight}px`,
       }}
     >
       <div className="model-combobox-search-wrapper">
-        <input
+        <AlphaInput
           ref={searchInputRef}
           type="text"
           className="model-combobox-search"
@@ -610,14 +700,14 @@ export function CustomModelDropdown({
           onClick={(e) => e.stopPropagation()}
         />
         {hasFilter && (
-          <button
+          <AlphaButton
             type="button"
             className="model-combobox-clear"
             onClick={handleClearFilter}
             aria-label={t("models.clearFilter", "Clear filter")}
           >
             ×
-          </button>
+          </AlphaButton>
         )}
       </div>
 
@@ -625,12 +715,34 @@ export function CustomModelDropdown({
         {t("models.count", { count: filteredModels.length, defaultValue_one: "{{count}} model", defaultValue_other: "{{count}} models" })}
       </div>
 
-      {shouldShowThinking && (
+      {shouldShowCredentialInstance && (
+        <div className="model-combobox-instance" onMouseDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
+          <label className="model-combobox-instance-label" htmlFor={credentialInstanceSelectId}>
+            {t("models.labels.credentialInstance", "Credential instance")}
+          </label>
+          <AlphaSelect
+            id={credentialInstanceSelectId}
+            className="thinking-level-select model-combobox-instance-select"
+            data-testid="custom-model-dropdown-credential-instance"
+            value={normalizedCredentialInstanceId}
+            onChange={(e) => onCredentialInstanceChange?.(e.target.value)}
+            disabled={disabled || !onCredentialInstanceChange}
+            aria-label={t("models.labels.credentialInstance", "Credential instance")}
+          >
+            <option value="">{t("models.credentialInstanceDefault", "Default")}</option>
+            {instanceOptions.map((instance) => (
+              <option key={instance.id} value={instance.id}>{instance.id}</option>
+            ))}
+          </AlphaSelect>
+        </div>
+      )}
+
+      {shouldRenderThinking && (
         <div className="model-combobox-thinking" onMouseDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
           <label className="model-combobox-thinking-label" htmlFor={thinkingSelectId}>
             {t("models.labels.thinkingLevel", "Thinking Level")}
           </label>
-          <select
+          <AlphaSelect
             id={thinkingSelectId}
             className="thinking-level-select model-combobox-thinking-select"
             data-testid="custom-model-dropdown-thinking"
@@ -642,26 +754,84 @@ export function CustomModelDropdown({
             {hasDefaultThinkingOption && (
               <option value="">{t("modelSelection.thinkingDefault", "Default ({{level}})", { level: defaultThinkingLevel })}</option>
             )}
+            {hasStaleThinkingLevel ? (
+              <option value={normalizedThinkingLevel} disabled>
+                {t("models.options.unavailable", "Unavailable: {{level}}", { level: normalizedThinkingLevel })}
+              </option>
+            ) : null}
             {thinkingOptions.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
-          </select>
+          </AlphaSelect>
         </div>
       )}
 
-      <div ref={listRef} className="model-combobox-list">
+      {alphaSurface ? (
+        <div ref={listRef} className="model-combobox-list model-combobox-list--alpha">
+          {/*
+          FNXC:AlphaCollections 2026-09-10-20:43:
+          Alpha models form one homemade Alpha listbox so native arrow navigation crosses every selectable row. Provider and model controls follow it in a labelled sibling rail whose visible row labels identify exactly which selection each favorite or collapse action affects.
+          */}
+          <AlphaListBox aria-label={label} className="model-combobox-alpha-options">
+            {optionsList.filter((option) => option.type !== "provider").map((option, index) => {
+              const model = option.provider
+                ? models.find((candidate) => `${candidate.provider}/${candidate.id}` === option.value)
+                : undefined;
+              return (
+                <AlphaListBoxItem
+                  key={`${option.type}-${option.value}`}
+                  id={`${option.type}-${option.value}`}
+                  textValue={option.label}
+                  data-index={index}
+                  className={`model-combobox-option ${value === option.value ? "model-combobox-option--selected" : ""}`}
+                  aria-selected={value === option.value}
+                  onClick={() => handleSelect(option.value)}
+                >
+                  <span className="model-combobox-option-main">
+                    {model ? <span className="model-combobox-option-icon"><ProviderIcon provider={model.provider} size="sm" /></span> : null}
+                    <span className="model-combobox-option-text">{option.label}</span>
+                  </span>
+                  {model ? <span className="model-combobox-option-id">{model.id}</span> : null}
+                </AlphaListBoxItem>
+              );
+            })}
+          </AlphaListBox>
+          <div className="model-combobox-alpha-actions" aria-label={t("models.modelActions", "Model actions")}>
+            <div className="model-combobox-alpha-actions-heading">{t("models.modelActions", "Model actions")}</div>
+            {visibleProviderEntries.map(({ provider, isCollapsed }) => {
+              const isFavorite = favoriteProviders.includes(provider);
+              return (
+                <div key={provider} className="model-combobox-alpha-action-row model-combobox-alpha-provider-actions">
+                  <span className="model-combobox-alpha-action-label"><ProviderIcon provider={provider} size="sm" />{provider}</span>
+                  <span className="model-combobox-alpha-action-controls">
+                  {onToggleFavorite ? <AlphaButton type="button" className={`model-combobox-optgroup-favorite ${isFavorite ? "model-combobox-optgroup-favorite--active" : ""}`} onClick={() => onToggleFavorite(provider)} aria-label={isFavorite ? t("models.removeProviderFromFavoritesAriaLabel", "Remove {{provider}} from favorites", { provider }) : t("models.addProviderToFavoritesAriaLabel", "Add {{provider}} to favorites", { provider })}>★</AlphaButton> : null}
+                  <AlphaButton type="button" className="model-combobox-optgroup-toggle" onClick={() => handleToggleCollapsedProvider(provider)} aria-label={isCollapsed ? t("models.expandProvider", "Expand {{provider}}", { provider }) : t("models.collapseProvider", "Collapse {{provider}}", { provider })} aria-expanded={!isCollapsed}>▼</AlphaButton>
+                  </span>
+                </div>
+              );
+            })}
+            {onToggleModelFavorite ? optionsList.filter((option) => option.provider && option.type !== "provider").map((option) => {
+              const isFavorited = favoriteModels.includes(option.value);
+              return <div key={option.value} className="model-combobox-alpha-action-row"><span className="model-combobox-alpha-action-label">{option.label}</span><AlphaButton type="button" className={`model-combobox-option-favorite ${isFavorited ? "model-combobox-option-favorite--active" : ""}`} onClick={() => onToggleModelFavorite(option.value)} aria-label={isFavorited ? t("models.removeFromFavoritesAriaLabel", "Remove {{name}} from favorites", { name: option.label }) : t("models.addToFavoritesAriaLabel", "Add {{name}} to favorites", { name: option.label })}>{isFavorited ? "★" : "☆"}</AlphaButton></div>;
+            }) : null}
+          </div>
+          {filteredModels.length === 0 && hasFilter ? <div className="model-combobox-no-results">{t("models.noResults", "No models match '{{filter}}'", { filter: localFilter })}</div> : null}
+        </div>
+      ) : (
+      <div ref={listRef} className="model-combobox-list" role={"listbox"} aria-label={label}>
         {specialOptions.map((option, index) => (
-          <div
+          <AlphaListBoxRow collectionLabel={label}
             key={`${option.type}-${option.value}`}
+            id={`${option.type}-${option.value}`}
+            textValue={option.label}
             data-index={index}
             className={`model-combobox-option ${highlightedIndex === index ? "model-combobox-option--highlighted" : ""} ${value === option.value ? "model-combobox-option--selected" : ""}`}
             onClick={() => handleSelect(option.value)}
             onMouseEnter={() => setHighlightedIndex(index)}
-            role="option"
             aria-selected={value === option.value}
           >
             <span className="model-combobox-option-text model-combobox-option-text--default">{option.label}</span>
-          </div>
+          </AlphaListBoxRow>
         ))}
 
         {/* Favorited models as pinned rows */}
@@ -673,14 +843,19 @@ export function CustomModelDropdown({
               const isHighlighted = highlightedIndex === optionIndex;
               const isSelected = value === fullId;
               return (
-                <div
+                <AlphaListBoxRow collectionLabel={`${label}: ${model.name}`}
                   key={fullId}
+                  id={`favorite-${fullId}`}
+                  textValue={model.name}
                   data-index={optionIndex}
                   className={`model-combobox-option model-combobox-option--favorite ${isHighlighted ? "model-combobox-option--highlighted" : ""} ${isSelected ? "model-combobox-option--selected" : ""}`}
                   onClick={() => handleSelect(fullId)}
                   onMouseEnter={() => setHighlightedIndex(optionIndex)}
-                  role="option"
                   aria-selected={isSelected}
+                  auxiliary={onToggleModelFavorite ? (
+                    <AlphaButton type="button" className="model-combobox-option-favorite model-combobox-option-favorite--active" onClick={() => onToggleModelFavorite(fullId)} title={t("models.removeFromFavorites", "Remove from favorites")} aria-label={t("models.removeFromFavoritesAriaLabel", "Remove {{name}} from favorites", { name: model.name })}>★</AlphaButton>
+                  ) : null}
+                  rowClassName="model-combobox-option-row"
                 >
                   <span className="model-combobox-option-main">
                     <span className="model-combobox-option-icon">
@@ -689,21 +864,7 @@ export function CustomModelDropdown({
                     <span className="model-combobox-option-text">{model.name}</span>
                   </span>
                   <span className="model-combobox-option-id">{model.id}</span>
-                  {onToggleModelFavorite && (
-                    <button
-                      type="button"
-                      className="model-combobox-option-favorite model-combobox-option-favorite--active"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onToggleModelFavorite(fullId);
-                      }}
-                      title={t("models.removeFromFavorites", "Remove from favorites")}
-                      aria-label={t("models.removeFromFavoritesAriaLabel", "Remove {{name}} from favorites", { name: model.name })}
-                    >
-                      ★
-                    </button>
-                  )}
-                </div>
+                </AlphaListBoxRow>
               );
             })}
             <div className="model-combobox-divider" />
@@ -721,7 +882,7 @@ export function CustomModelDropdown({
                 <ProviderIcon provider={provider} size="sm" />
                 <span className="model-combobox-optgroup-text">{provider}</span>
                 {onToggleFavorite && (
-                  <button
+                  <AlphaButton
                     type="button"
                     className={`model-combobox-optgroup-favorite ${isFavorite ? "model-combobox-optgroup-favorite--active" : ""}`}
                     onClick={(e) => {
@@ -732,9 +893,9 @@ export function CustomModelDropdown({
                     aria-label={isFavorite ? t("models.removeProviderFromFavoritesAriaLabel", "Remove {{provider}} from favorites", { provider }) : t("models.addProviderToFavoritesAriaLabel", "Add {{provider}} to favorites", { provider })}
                   >
                     ★
-                  </button>
+                  </AlphaButton>
                 )}
-                <button
+                <AlphaButton
                   type="button"
                   className={`model-combobox-optgroup-toggle ${isExpanded ? "model-combobox-optgroup-toggle--expanded" : ""}`}
                   onClick={(event) => {
@@ -748,7 +909,7 @@ export function CustomModelDropdown({
                   data-testid={`model-combobox-provider-toggle-${provider}`}
                 >
                   ▼
-                </button>
+                </AlphaButton>
               </div>
               {!isCollapsed && providerModels.map((model) => {
                 const optionValue = `${model.provider}/${model.id}`;
@@ -758,32 +919,23 @@ export function CustomModelDropdown({
                 const isFavorited = favoriteModels.includes(optionValue);
 
                 return (
-                  <div
+                  <AlphaListBoxRow collectionLabel={`${label}: ${model.name}`}
                     key={optionValue}
+                    id={optionValue}
+                    textValue={model.name}
                     data-index={optionIndex}
                     className={`model-combobox-option ${isHighlighted ? "model-combobox-option--highlighted" : ""} ${isSelected ? "model-combobox-option--selected" : ""}`}
                     onClick={() => handleSelect(optionValue)}
                     onMouseEnter={() => setHighlightedIndex(optionIndex)}
-                    role="option"
                     aria-selected={isSelected}
+                    auxiliary={onToggleModelFavorite ? (
+                      <AlphaButton type="button" className={`model-combobox-option-favorite ${isFavorited ? "model-combobox-option-favorite--active" : ""}`} onClick={() => onToggleModelFavorite(optionValue)} title={isFavorited ? t("models.removeFromFavorites", "Remove from favorites") : t("models.addToFavorites", "Add to favorites")} aria-label={isFavorited ? t("models.removeFromFavoritesAriaLabel", "Remove {{name}} from favorites", { name: model.name }) : t("models.addToFavoritesAriaLabel", "Add {{name}} to favorites", { name: model.name })}>{isFavorited ? "★" : "☆"}</AlphaButton>
+                    ) : null}
+                    rowClassName="model-combobox-option-row"
                   >
                     <span className="model-combobox-option-text">{model.name}</span>
                     <span className="model-combobox-option-id">{model.id}</span>
-                    {onToggleModelFavorite && (
-                      <button
-                        type="button"
-                        className={`model-combobox-option-favorite ${isFavorited ? "model-combobox-option-favorite--active" : ""}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onToggleModelFavorite(optionValue);
-                        }}
-                        title={isFavorited ? t("models.removeFromFavorites", "Remove from favorites") : t("models.addToFavorites", "Add to favorites")}
-                        aria-label={isFavorited ? t("models.removeFromFavoritesAriaLabel", "Remove {{name}} from favorites", { name: model.name }) : t("models.addToFavoritesAriaLabel", "Add {{name}} to favorites", { name: model.name })}
-                      >
-                        {isFavorited ? "★" : "☆"}
-                      </button>
-                    )}
-                  </div>
+                  </AlphaListBoxRow>
                 );
               })}
             </div>
@@ -794,13 +946,18 @@ export function CustomModelDropdown({
           <div className="model-combobox-no-results">{t("models.noResults", "No models match '{{filter}}'", { filter: localFilter })}</div>
         )}
       </div>
-    </div>
+      )}
+    </AlphaPopoverSurface>
   ) : null;
 
+  /*
+  FNXC:AlphaKeyboard 2026-09-10-21:03:
+  homemade Alpha owns keyboard navigation for the Alpha listbox and its sibling action rail. Restrict the historical delegated handler to stable mode so Enter activates focused favorite and provider-collapse buttons instead of selecting the highlighted model.
+  */
   return (
     <>
-      <div ref={containerRef} className="model-combobox" onKeyDown={handleKeyDown}>
-        <button
+      <div ref={containerRef} className="model-combobox" onKeyDown={alphaSurface ? undefined : handleKeyDown}>
+        <AlphaButton
           ref={triggerRef}
           type="button"
           id={id}
@@ -817,13 +974,18 @@ export function CustomModelDropdown({
             </span>
           )}
           <span className="model-combobox-trigger-text">{selectedDisplayText || placeholder}</span>
-          {shouldShowThinking && (
+          {shouldRenderThinking && (
             <span className={`model-badge ${normalizedThinkingLevel ? "model-badge-custom" : "model-badge-default"} model-combobox-thinking-badge`} data-testid="custom-model-dropdown-thinking-badge">
               {thinkingBadgeLabel}
             </span>
           )}
+          {shouldShowCredentialInstance && normalizedCredentialInstanceId && (
+            <span className="model-badge model-badge-custom model-combobox-thinking-badge" data-testid="custom-model-dropdown-credential-instance-badge">
+              {normalizedCredentialInstanceId}
+            </span>
+          )}
           <span className="model-combobox-trigger-arrow">▼</span>
-        </button>
+        </AlphaButton>
       </div>
       {portalRoot && dropdownContent ? createPortal(dropdownContent, portalRoot) : null}
     </>

@@ -1,5 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 /*
 FNXC:Dependencies 2026-07-01-08:16:
@@ -7,6 +6,7 @@ The pi 0.80 SDK keeps compatibility helpers under ./compat and exposes provider 
 */
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
+import { createInMemoryModelRegistry, warmSharedModelRuntime } from "./_model-runtime-fixture.js";
 
 function createSseResponse(): Response {
   const stream = new ReadableStream({
@@ -21,14 +21,9 @@ function createSseResponse(): Response {
 }
 
 
-async function createInMemoryModelRegistry(): Promise<ModelRegistry> {
-  const runtime = await ModelRuntime.create({
-    credentials: { read: async () => undefined, list: async () => [], modify: async (_id, fn) => fn(undefined), delete: async () => undefined },
-    modelsPath: null,
-    allowModelNetwork: false,
-  });
-  return new ModelRegistry(runtime);
-}
+beforeAll(async () => {
+  await warmSharedModelRuntime();
+});
 
 describe("custom providers openai-completions regression", () => {
   afterEach(() => {
@@ -52,7 +47,7 @@ describe("custom providers openai-completions regression", () => {
       baseUrl: provider.baseUrl,
       api: "openai-completions",
       apiKey: provider.apiKey,
-      models: [{ id: "my-model", name: "My Model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
+      models: [{ id: "my-model", name: "My Model", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" }, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
     });
     await modelRegistry.refresh();
 

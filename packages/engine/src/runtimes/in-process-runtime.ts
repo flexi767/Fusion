@@ -9,55 +9,937 @@ import type {
   AgentHeartbeatRun,
   PluginStore,
   PluginLoader,
+  PluginLoaderOptions,
   MessageStore,
   RoutineStore,
   GithubIssueAction,
   CliSession,
   NotificationPayload,
+  WorkflowWorkItem,
+  WorkflowWorkItemState,
+  WorkflowIr,
 } from "@fusion/core";
-import { AsyncCentralClaimStore, ChatStore, isEphemeralAgent } from "@fusion/core";
+import {
+  AsyncCentralClaimStore,
+  ChatStore,
+  isEphemeralAgent,
+  isPlanReviewSatisfied,
+  isTaskBlockedOnApproval,
+  resolveWorkflowIrForTask,
+  resolveTaskLifecycleColumns,
+} from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
-import type { PrMonitor, PrComment } from "../pr-monitor.js";
+import { registerDefaultAgentPluginRunner, unregisterDefaultAgentPluginRunner } from "../pi.js";
+import type { PrMonitor, PrComment } from "../merge/pr-monitor.js";
 import type { PrInfo } from "@fusion/core";
 import { TaskExecutor, type TaskExecutorOptions } from "../executor.js";
-import { buildPrNodeDeps } from "../pr-nodes.js";
+import { buildPrNodeDeps } from "../merge/pr-nodes.js";
 import { isExperimentalFeatureEnabled } from "@fusion/core";
 import { createCliAgentRuntime, type BootstrappedCliAgentRuntime } from "../cli-agent/runtime.js";
-import { WorktreePool, detectGitRepository, type GitRepoDetection, type PoolInvariantViolation } from "../worktree-pool.js";
-import { AgentSemaphore, ScopedAgentSemaphore } from "../concurrency.js";
+import { detectGitRepository, type GitRepoDetection } from "../worktree/worktree-pool.js";
+import type { PlanningHandoffOutcome } from "../triage.js";
 import { HeartbeatMonitor, HeartbeatTriggerScheduler, type WakeContext } from "../agent-heartbeat.js";
-import { AutoClaimSnapshotManager } from "../auto-claim-snapshot.js";
-import { RoutineRunner, type RoutineRunnerOptions } from "../routine-runner.js";
-import { RoutineScheduler } from "../routine-scheduler.js";
-import { createAiPromptExecutor } from "../cron-runner.js";
+import { AutoClaimSnapshotManager } from "../scheduling/auto-claim-snapshot.js";
+import { RoutineRunner, type RoutineRunnerOptions } from "../scheduling/routine-runner.js";
+import { RoutineScheduler } from "../scheduling/routine-scheduler.js";
+import { createAiPromptExecutor } from "../scheduling/cron-runner.js";
 import type {
   ProjectRuntime,
   ProjectRuntimeConfig,
   RuntimeStatus,
   RuntimeMetrics,
   ProjectRuntimeEvents,
-} from "../project-runtime.js";
+} from "../project/project-runtime.js";
 import { runtimeLog } from "../logger.js";
-import { getActiveNotificationService } from "../notifier.js";
-import { StuckTaskDetector } from "../stuck-task-detector.js";
-import type { UsageLimitPauser } from "../usage-limit-detector.js";
-import { SelfHealingManager, VALIDATOR_RUN_STALE_MAX_AGE_MS } from "../self-healing.js";
-import { RestartRecoveryCoordinator } from "../restart-recovery-coordinator.js";
-import { MeshLeaseManager } from "../mesh-lease-manager.js";
-import { PluginRunner } from "../plugin-runner.js";
-import { MissionAutopilot } from "../mission-autopilot.js";
-import { MissionExecutionLoop } from "../mission-execution-loop.js";
+import { getActiveNotificationService } from "../util/notifier.js";
+import { StuckTaskDetector } from "../healing/stuck-task-detector.js";
+import { UsageLimitPauser } from "../errors/usage-limit-detector.js";
+import { CredentialInstanceRotator } from "../credential-instance-rotation.js";
+import { createFusionAuthStorage } from "../auth/auth-storage.js";
+import {
+  SelfHealingManager,
+  VALIDATOR_RUN_STALE_MAX_AGE_MS,
+  type SelfHealingOptions,
+  type OverlapBlockerRelease,
+} from "../self-healing.js";
+import { RestartRecoveryCoordinator } from "../healing/restart-recovery-coordinator.js";
+import { MeshLeaseManager } from "../project/mesh-lease-manager.js";
+import { PluginRunner } from "../plugins/plugin-runner.js";
+import { MissionAutopilot } from "../missions/mission-autopilot.js";
+import { MissionExecutionLoop } from "../missions/mission-execution-loop.js";
 import { TriageProcessor } from "../triage.js";
-import { EphemeralWorkerManager } from "../ephemeral-worker-manager.js";
-import { validateProjectNodeMapping } from "../node-dispatch-validation.js";
-import { attachAgentLinkSync } from "../task-agent-sync.js";
-import { createRunAuditor, generateSyntheticRunId } from "../run-audit.js";
+import { validateProjectNodeMapping } from "../project/node-dispatch-validation.js";
+import { attachAgentLinkSync } from "../agents/task-agent-sync.js";
+import {
+  isPlanningContinuationDispatchClaim,
+  isTaskPlanningOrExecutionLive,
+  planningContinuationDispatchLeaseOwner,
+} from "../agents/planning-execution-liveness.js";
+import { generateSyntheticRunId } from "../util/run-audit.js";
+import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
+import { seedPreReleasePlanReviewContinuation, type PlanReviewSeedBailReason } from "../plan-review-continuation.js";
+import {
+  formatAdmissionCapacityQueuedReason,
+  persistedTopLevelAgentTaskIdsFromStore,
+  projectAdmissionCoordinator,
+  resolveAgentCapacityLimit,
+} from "../concurrency/concurrency.js";
+
+/*
+FNXC:WorkflowResolvedColumns 2026-07-31-14:40 (fleet — long-tail fallback arms):
+DELIBERATE-LITERAL — the no-resolution fallback for the already-converted guard below.
+
+A named set rather than an inline `=== "<id>"` arm. Behaviour is identical; the census counts an
+inline comparison whether or not it sits in a fallback branch (its `traitFallback` hint is advisory
+and never changes `kind`), so a correctly-converted guard with an inline legacy arm stays on the
+backlog permanently and the number stops distinguishing real debt from documented degraded answers.
+*/
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
+/**
+ * FNXC:PluginMcpServers 2026-07-23-12:00:
+ * FN-8596 keeps cross-root MCP discovery private to its throwaway loader. This
+ * exported production seam lets regression tests prove runtime construction
+ * cannot reintroduce shared lifecycle registration or state persistence.
+ */
+export function createDiscoveryPluginLoaderOptions(
+  scopedStore: { getPluginStore(): unknown },
+): PluginLoaderOptions {
+  return {
+    pluginStore: scopedStore.getPluginStore() as PluginStore,
+    taskStore: scopedStore as TaskStore,
+    lifecycleScope: "isolated",
+    persistRuntimeState: false,
+  };
+}
+
+export function createRuntimePluginMcpProviderOptions(input: {
+  hostRootDir: string;
+  hostLoader: Pick<PluginLoader, "getPluginMcpServers">;
+  PluginLoaderClass: new (options: PluginLoaderOptions) => PluginLoader;
+}): {
+  hostRootDir: string;
+  hostLoader: Pick<PluginLoader, "getPluginMcpServers">;
+  createScopedLoader: (store: { getPluginStore(): unknown }) => PluginLoader;
+} {
+  return {
+    hostRootDir: input.hostRootDir,
+    hostLoader: input.hostLoader,
+    createScopedLoader: (scopedStore) => new input.PluginLoaderClass(createDiscoveryPluginLoaderOptions(scopedStore)),
+  };
+}
+
 export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
-const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
+
+export interface PlanningContinuationCandidate {
+  item: WorkflowWorkItem;
+  task: Task | null | undefined;
+}
+
+/**
+ * FNXC:WorkflowScheduling 2026-07-21-22:31:
+ * A planning continuation is only dispatchable when its live task can still
+ * enter plan-review. Soft-deleted and completed cards must be treated as
+ * non-dispatchable so their orphaned work items can be cancelled instead of
+ * blocking later due rows (FN-8470 tombstone starved FN-8471 plan-review).
+ */
+/*
+FNXC:WorkflowLifecycleColumns 2026-08-02-15:10 (fleet: the planning-continuation drain):
+The terminal columns arrive from the caller so renamed workflow completion lanes cancel orphaned planning work instead of starving the FIFO drain.
+
+FNXC:TaskArchiveRemoval 2026-09-04-14:51:
+Done is the only built-in completion fallback. Historical `archived` snapshots are identified by `deletedAt` and must not make the removed archive lane a live terminal role again.
+*/
+export function isPlanningContinuationTaskDispatchable(
+  task: Task | null | undefined,
+  terminalColumns?: ReadonlySet<string>,
+): task is Task {
+  if (task == null) return false;
+  if (task.paused === true || task.userPaused === true) return false;
+  if (task.deletedAt) return false;
+  const terminal = terminalColumns ?? LEGACY_TERMINAL_COLUMNS;
+  if (terminal.has(task.column)) return false;
+  return true;
+}
+
+/** The built-in completion id used when workflow metadata is unavailable. */
+const LEGACY_TERMINAL_COLUMNS: ReadonlySet<string> = new Set(["done"]);
+
+/** Outcome of resolving one due work item for the planning-continuation drain. */
+export type PlanningContinuationResolution =
+  | { kind: "actionable"; item: WorkflowWorkItem; task: Task }
+  | { kind: "skip"; item: WorkflowWorkItem; reason: "paused" | "awaiting-approval" | "planner-live" }
+  | {
+      kind: "orphan";
+      item: WorkflowWorkItem;
+      reason: "task-not-found" | "task-terminal";
+    };
+
+/**
+ * FNXC:WorkflowScheduling 2026-07-21-22:31:
+ * Classify a due work item after a per-item task load. Lookup failures and
+ * terminal/missing tasks become orphans (cancel); paused planning items stay
+ * held without cancel.
+ *
+ * FNXC:WorkflowScheduling 2026-08-11-17:30: `waitReason` no longer gates this —
+ * see the note at the `isTaskBlockedOnApproval` guard for the strand that gate
+ * caused. The remaining guards (terminal, approval, pause, dispatchable) apply
+ * to every continuation regardless of why it stopped.
+ */
+export function resolvePlanningContinuationCandidate(
+  item: WorkflowWorkItem,
+  task: Task | null | undefined,
+  opts?: { taskLookupFailed?: boolean; terminalColumns?: ReadonlySet<string>; plannerLive?: boolean },
+): PlanningContinuationResolution {
+  if (opts?.taskLookupFailed === true || task == null) {
+    return { kind: "orphan", item, reason: "task-not-found" };
+  }
+  const terminal = opts?.terminalColumns ?? LEGACY_TERMINAL_COLUMNS;
+  if (task.deletedAt || terminal.has(task.column)) {
+    return { kind: "orphan", item, reason: "task-terminal" };
+  }
+  /*
+  FNXC:WorkflowScheduling 2026-08-11-17:30:
+  EVERY due `kind: "task"` continuation is this drain's work, whatever its `waitReason`. This used to
+  skip anything but `waitReason: "planning"` as "belonging to a different drain" — but no such drain
+  exists. `listDueWorkflowWorkItems` has exactly two callers: this pass, and the self-healing reclaim
+  sweep, which deliberately refuses to touch `runnable`/`retrying` rows because they are "the
+  dispatcher's own queue" (`workflows/stranded-continuation-reclaim.ts`). So a runnable non-planning
+  row was owned by nobody: skipped here every ~2s poll with no state change and no audit row, and
+  passed over there by design. Silent, permanent, and invisible — the board simply looks idle.
+
+  Observed on the Fusion board 2026-08-11: eight cards (FN-8901/8902/8953/8955/8956/8958/8987/8988)
+  sat runnable for up to 8h while the engine was unpaused with 0 tasks in progress and 4 of 10
+  worktrees used. Three carried `waitReason: "capacity"` (written by the capacity-suspend path in
+  `workflow-column-boundary-hooks.ts` — the graph correctly parks a card when the board is full, and
+  nothing ever resumed it once capacity freed); five carried a NULL reason. The 09:04 reclaim sweep
+  had just moved them `held -> runnable`, which HANDED them to this drain and simultaneously put them
+  out of the sweep's own reach — so the auto-resume fix made the strand tighter than the wedge it
+  repaired.
+
+  Dispatch is node-agnostic (`executor.execute(task)` re-enters the durable graph at the card's own
+  node) and admission-gated by `admitPlanningContinuation`, which re-checks the real live-task cap.
+  A capacity-parked row therefore resumes only when a slot is genuinely free — accepting it here
+  cannot reintroduce the over-cap dispatch the suspend exists to prevent.
+  */
+  /*
+  FNXC:PlanApprovalHold 2026-07-27-19:30 (U7 / R4):
+  Dispatching a planning continuation starts a Plan Review run, so a card blocked
+  on a pending human approval decision must not be dispatched. The status-only
+  hold shape the plan-approval gate writes (`status: "awaiting-approval"`, no
+  pause flag) fell straight through the pause check below and was dispatched.
+
+  SKIP, never `orphan`: an orphan is cancelled and terminalized, so an approval
+  landing a minute later would find nothing left to resume and would need a second
+  repair (FN-8592's sweep) to come back. Skipping leaves the item due and
+  claimable, which is what "the operator has not decided yet" actually means.
+  */
+  if (isTaskBlockedOnApproval(task)) {
+    return { kind: "skip", item, reason: "awaiting-approval" };
+  }
+  if (task.paused === true || task.userPaused === true) {
+    return { kind: "skip", item, reason: "paused" };
+  }
+  /*
+  FNXC:PlanningContinuationDispatch 2026-09-06-00:29:
+  A runnable row can briefly coexist with the planner that just armed its successor. Defer rather
+  than dispatch while planner ownership is live; missing and terminal tasks remain orphans above,
+  and operator-owned approval/pause reasons retain priority over this transient process condition.
+  */
+  if (opts?.plannerLive === true) {
+    return { kind: "skip", item, reason: "planner-live" };
+  }
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-01:40 (the partially-threaded conversion named by
+  workflow-planning-continuation-terminal-gap-live-e2e.pg.test.ts):
+  THREAD THE SET THIS FUNCTION ALREADY RESOLVED. The terminal test at the top of this function uses the
+  caller's `terminal`; this delegation then re-tested against `LEGACY_TERMINAL_COLUMNS`, so the conversion
+  was whole at the call site and not whole inside it.
+
+  The reachable case is narrow but real: a board that DECLARES `done` as a non-terminal column id. The
+  outer check passes (not terminal per the resolved set), then the inner predicate calls it terminal per
+  the fallback set and the continuation is skipped as "paused" — a card stalled by a lane name.
+
+  A partially threaded conversion is indistinguishable from a complete one at every call site that looks
+  converted, which is why this is worth closing even though the outer check dominates the common case.
+  */
+  if (!isPlanningContinuationTaskDispatchable(task, terminal)) {
+    return { kind: "skip", item, reason: "paused" };
+  }
+  return { kind: "actionable", item, task };
+}
+
+/**
+ * FNXC:PlanApprovalHold 2026-07-27-21:30 (U7, PR #2491 review — greptile P1):
+ * How long a park-skipped continuation leaves the due window for.
+ *
+ * The due poll is a FIFO batch (`limit: 20`) and a skipped item stays `runnable`
+ * and due, so it re-fills a batch slot on every pass. Before the approval guard
+ * an approval-held item was DISPATCHED, so it never accumulated; now that it is
+ * correctly skipped, 20 cards parked on approval would starve every newer
+ * plan-review continuation until enough humans decided. That is a real
+ * consequence of the guard, not a pre-existing one.
+ *
+ * Deferral, not a state change: the item stays `runnable`, so every "is the graph
+ * idle?" predicate that reasons over ACTIVE_WORKFLOW_WORK_ITEM_STATES behaves
+ * exactly as before — moving it to `held` would remove it from the due set too,
+ * but nothing requeues a `held` planning item, which trades starvation for a
+ * permanent strand. `retryAfter` is a pure due-window filter, so the worst case
+ * is bounded latency instead.
+ *
+ * 60s is chosen against HUMAN latency: the park it defers is waiting on a person,
+ * who has already taken minutes or hours, so an extra minute after the decision
+ * is invisible — while occupancy of the shared batch drops from every poll (~2s)
+ * to at most one slot per minute per parked card.
+ */
+export const PARKED_CONTINUATION_DEFER_MS = 60_000;
+export const PLANNER_LIVE_CONTINUATION_DEFER_MS = 15_000;
+
+/**
+ * FNXC:PlanApprovalHold 2026-07-27-21:30 (U7, PR #2491 review — greptile P1):
+ * Decide whether a skipped due item should be pushed out of the due window.
+ *
+ * Operator parks (`awaiting-approval`, `paused`) use the caller-controlled human-wait window.
+ * `planner-live` uses a short fixed window because it is a normal handoff: `specifyTask` terminalizes
+ * the planning row and releases capacity before it removes the task from its planning-owner set.
+ * The item stays runnable, so a delayed handoff adds bounded latency and never becomes a new hold.
+ *
+ * FNXC:WorkflowScheduling 2026-08-11-17:30: `not-planning` was the third skip
+ * reason here and is now gone — this drain owns every `kind: "task"` row, so a
+ * non-planning continuation is dispatched rather than skipped and has nothing
+ * left to defer.
+ *
+ * Pure and separately exported so the deferral is testable without constructing a
+ * runtime, matching why `resolvePlanningContinuationCandidate` is exported.
+ */
+export function resolveParkedContinuationDeferral(
+  resolution: PlanningContinuationResolution,
+  nowMs: number,
+  deferMs: number = PARKED_CONTINUATION_DEFER_MS,
+): { itemId: string; expectedState: WorkflowWorkItemState; retryAfter: string } | null {
+  if (resolution.kind !== "skip") return null;
+  if (resolution.reason !== "awaiting-approval" && resolution.reason !== "paused" && resolution.reason !== "planner-live") return null;
+  const selectedDeferMs = resolution.reason === "planner-live"
+    ? PLANNER_LIVE_CONTINUATION_DEFER_MS
+    : deferMs;
+  return {
+    itemId: resolution.item.id,
+    /*
+    FNXC:WorkflowWorkItemCas 2026-07-27-22:10 (U7, PR #2491 review — greptile P1):
+    The state as the due poll SAW it, carried so the write is a compare-and-set.
+    A blind write would reset a claim another node took between the poll and here:
+    the store's terminal-state check refuses cancelled/succeeded/failed, but
+    `running` is not terminal, so `running -> runnable` would have succeeded and
+    let the item be claimed twice. Deferral is a fairness optimization — it must
+    never be able to disturb live work to achieve it.
+    */
+    expectedState: resolution.item.state,
+    retryAfter: new Date(nowMs + selectedDeferMs).toISOString(),
+  };
+}
+
+/*
+FNXC:PlanReviewApproval 2026-08-04-00:26:
+An operator decision must remove the one-minute human-wait deferral immediately. Clear every
+runnable planning continuation for the task, preserve CAS ownership, and wake the drain even when
+inspection fails so the normal classifier remains authoritative.
+*/
+export async function wakeApprovedPlanningContinuations(deps: {
+  taskId: string;
+  list: (taskId: string) => Promise<WorkflowWorkItem[]>;
+  transition: (
+    itemId: string,
+    state: WorkflowWorkItemState,
+    patch: { expectedState: WorkflowWorkItemState; retryAfter: null },
+  ) => Promise<unknown>;
+  kick: () => void;
+  warn: (message: string) => void;
+}): Promise<number> {
+  let released = 0;
+  try {
+    const items = await deps.list(deps.taskId);
+    for (const item of items) {
+      if (item.state !== "runnable" || item.waitReason !== "planning" || !item.retryAfter) continue;
+      try {
+        await deps.transition(item.id, item.state, { expectedState: item.state, retryAfter: null });
+        released += 1;
+      } catch (error) {
+        deps.warn(`Failed to clear approval deferral for workflow work item ${item.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  } catch (error) {
+    deps.warn(`Failed to inspect approval-deferred workflow work for ${deps.taskId}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    deps.kick();
+  }
+  return released;
+}
+
+/** The FIFO due-poll batch size. Named because the starvation the deferral above
+ *  prevents is a property of this bound, so the two belong in one place. */
+export const DUE_PLANNING_CONTINUATION_BATCH_LIMIT = 20;
+
+/** Everything the specification-complete reaction touches, injected so the
+ *  reaction is exercisable without constructing a runtime. */
+export interface SpecificationCompleteReactionDeps {
+  taskId: string;
+  outcome: PlanningHandoffOutcome;
+  getTask: (taskId: string) => Promise<Task | undefined>;
+  resolveIr: (taskId: string) => Promise<WorkflowIr>;
+  seed: (task: Task, ir: WorkflowIr) => Promise<{ seeded: boolean; reason?: PlanReviewSeedBailReason }>;
+  kick: () => void;
+  log: (message: string) => void;
+  /*
+  FNXC:PlanningHandoffAtomicity 2026-08-13-03:49:
+  A seed outcome that is neither success nor a legitimate operator park is a broken
+  handoff that used to be dropped silently; it must be surfaced loudly because the
+  only remaining recovery owner is the FN-8592 self-healing sweep (~10 min later).
+  */
+  warn: (message: string) => void;
+  /** Injectable delay for the bounded transient-failure retry; defaults to setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * FNXC:PlanningHandoffOutcome 2026-07-28-10:05 (U7 / R4, R5 — workflow-owned lifecycle):
+ * The engine's reaction to a finished specification: arm the graph's pre-release
+ * Plan Review run for a card that was actually handed off.
+ *
+ * WHAT WAS WRONG: this fired on every finished specification, because the seam that
+ * announces it fired unconditionally. So a card parked at the manual plan-approval
+ * gate — finalize writes `status: "awaiting-approval"` and RETURNS EARLY, before the
+ * release move — was logged as "Specified X → todo" and had a Plan Review run armed
+ * for a plan the operator had not approved. PR #2491 stopped the seeder from acting
+ * on that, defensively, at the seeder. This removes the reason it was ever asked.
+ *
+ * `released` is the ONLY outcome that licenses arming a run: it is the only one that
+ * means the card crossed into the hold column (or was already resting there) and is
+ * the graph's now. `parked` belongs to a human, `withheld` belongs to the caller's
+ * retry budget — arming a run for either is doing work nobody asked for.
+ *
+ * The log line reports the real outcome rather than asserting a move that may not
+ * have happened; an operator reading "Specified → todo" for a card sitting in the
+ * planner column is being told something false about their own board.
+ *
+ * EXTRACTED from the inline `onSpecifyComplete` callback for the same reason the
+ * continuation drain was in PR #2491: the callback is constructed inside
+ * `InProcessRuntime`, whose construction attaches to the real project registry, so
+ * no test could tell "the reaction respects the outcome" from "the reaction ignores
+ * it". A guard that cannot be shown to fail is not a guard.
+ */
+export async function reactToSpecificationComplete(
+  deps: SpecificationCompleteReactionDeps,
+): Promise<void> {
+  if (deps.outcome !== "released") {
+    deps.log(
+      `Specification finished for ${deps.taskId} without a handoff (${deps.outcome}) — no plan review armed`,
+    );
+    return;
+  }
+  deps.log(`Specified ${deps.taskId} → todo`);
+  /*
+  FNXC:PlanningHandoffAtomicity 2026-08-13-03:49:
+  The seed outcome was previously discarded, so a bailed handoff was invisible: the
+  seeder saw the caller's own still-running plan work item as an "active
+  continuation", returned {seeded:false}, and the card stranded in the hold column
+  until FN-8592 self-healing re-seeded it ~10 minutes later. The seed is now atomic
+  (it retires the named predecessor in the same transaction), so a bail here is a
+  genuine anomaly. Consume the result: retry a bounded number of times to absorb a
+  transient store error or a racing writer, then warn loudly — self-healing remains
+  the durable backstop, never the primary handoff.
+
+  FNXC:PlanningHandoffAtomicity 2026-08-13-04:20:
+  The task and IR are re-fetched at the TOP OF EVERY ATTEMPT (review finding: a
+  single pre-loop snapshot let an operator pause or a replan landing during the
+  retry delays be ignored, arming Plan Review for a plan the operator had just
+  parked or superseded). The seeder re-applies the pause/approval guards from the
+  task object it is given, so a fresh snapshot per attempt is what makes those
+  guards current. A needs-replan status means the plan this handoff belongs to is
+  already superseded — quiet exit, the replan loop owns the card now.
+  QUIET_PARK_REASONS is typed against the seeder's exported reason union so a
+  renamed or added reason is a compile error here, not a silent misroute into the
+  retry/warn path.
+  */
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const QUIET_PARK_REASONS: ReadonlySet<PlanReviewSeedBailReason> = new Set<PlanReviewSeedBailReason>([
+    "no-pre-release-plan-review",
+    "awaiting-approval",
+    "paused",
+    "plan-review-passed",
+  ]);
+  const RETRY_DELAYS_MS = [1_000, 5_000];
+  for (let attempt = 0; ; attempt++) {
+    let failure: string | null = null;
+    try {
+      const live = await deps.getTask(deps.taskId);
+      if (!live || live.paused || live.userPaused) return;
+      if (live.status === "needs-replan") {
+        deps.log(`Plan Review handoff for ${deps.taskId} not armed (needs-replan)`);
+        return;
+      }
+      const ir = await deps.resolveIr(live.id);
+      const result = await deps.seed(live, ir);
+      if (result.seeded) {
+        deps.kick();
+        return;
+      }
+      if (result.reason && QUIET_PARK_REASONS.has(result.reason)) {
+        deps.log(`Plan Review handoff for ${deps.taskId} not armed (${result.reason})`);
+        return;
+      }
+      failure = result.reason ?? "not-seeded";
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    if (attempt >= RETRY_DELAYS_MS.length) {
+      deps.warn(
+        `Plan Review handoff for ${deps.taskId} failed after ${attempt + 1} attempts (${failure}) — stranded-continuation self-healing will recover it`,
+      );
+      return;
+    }
+    deps.warn(`Plan Review handoff for ${deps.taskId} did not seed (${failure}) — retrying`);
+    await sleep(RETRY_DELAYS_MS[attempt]);
+  }
+}
+
+/** Everything the drain pass touches, injected so the pass is exercisable without
+ *  constructing a runtime (which would attach to the real project registry). */
+export interface DuePlanningContinuationDrainDeps {
+  listDue: () => Promise<WorkflowWorkItem[]>;
+  getTask: (taskId: string) => Promise<Task | undefined>;
+  /** The task's own terminal columns; omitted callers use the built-in Done fallback. */
+  resolveTerminalColumns?: (taskId: string) => Promise<ReadonlySet<string>>;
+  /** True only for planning ownership; execution admission remains the dispatcher's responsibility. */
+  isPlannerLive?: (taskId: string) => boolean;
+  cancelOrphan: (
+    item: WorkflowWorkItem,
+    reason: "task-not-found" | "task-terminal",
+  ) => Promise<void>;
+  defer: (
+    deferral: { itemId: string; expectedState: WorkflowWorkItemState; retryAfter: string },
+  ) => Promise<void>;
+  /** `item` is passed only so the caller's failure log can keep naming the work
+   *  item verbatim; the extraction is otherwise a byte-for-byte body move. */
+  /** Return false when shared capacity rejected this item; later FIFO items
+   *  cannot fit either, so the bounded pass stops without repeating snapshots. */
+  dispatch: (task: Task, item: WorkflowWorkItem) => boolean | void | Promise<boolean | void>;
+  nowMs: () => number;
+  warn: (message: string) => void;
+}
+
+/**
+ * FNXC:WorkflowScheduling 2026-07-21-12:20:
+ * A single runtime drain owns selection at a time. Concurrent wakeups collapse
+ * behind the caller's guard and the recurring processor supplies the next pass.
+ *
+ * FNXC:WorkflowScheduling 2026-07-21-22:31:
+ * Per-item task loads must not abort the pass. getTask throws for soft-deleted
+ * rows without an archive snapshot; one orphan earlier in created_at FIFO used
+ * to prevent every later planning continuation from dispatching (FN-8470 → FN-8471).
+ * Cancel orphaned work items so they leave the due set and free the batch window.
+ *
+ * FNXC:PlanApprovalHold 2026-07-27-22:10 (U7, PR #2491 review — CodeRabbit):
+ * EXTRACTED verbatim from `InProcessRuntime.drainWorkflowContinuations` with no
+ * behavior change, because the deferral wiring was unprovable where it lived: the
+ * method is private on a class whose construction attaches to the real project
+ * registry, so no test could tell "the drain applies the deferral" from "the drain
+ * ignores it". The re-entry guard and `status === "active"` check stay with the
+ * caller — those are runtime lifecycle, not pass logic.
+ */
+export async function drainDuePlanningContinuations(
+  deps: DuePlanningContinuationDrainDeps,
+): Promise<void> {
+  const items = await deps.listDue();
+  for (const item of items) {
+    let task: Task | undefined;
+    let taskLookupFailed = false;
+    try {
+      task = await deps.getTask(item.taskId);
+    } catch (error) {
+      taskLookupFailed = true;
+      deps.warn(
+        `Workflow continuation ${item.id}: getTask(${item.taskId}) failed — treating as orphan: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const terminalColumns = taskLookupFailed
+      ? undefined
+      : await deps.resolveTerminalColumns?.(item.taskId).catch(() => undefined);
+    const resolved = resolvePlanningContinuationCandidate(item, task, {
+      taskLookupFailed,
+      terminalColumns,
+      plannerLive: deps.isPlannerLive?.(item.taskId) === true,
+    });
+    if (resolved.kind === "orphan") {
+      await deps.cancelOrphan(resolved.item, resolved.reason);
+      continue;
+    }
+    // FNXC:PlanApprovalHold 2026-07-27-21:30 (U7, PR #2491 review — greptile P1):
+    // push an operator-parked item out of the FIFO due window so it cannot starve
+    // newer actionable continuations while a human decides.
+    const deferral = resolveParkedContinuationDeferral(resolved, deps.nowMs());
+    if (deferral) await deps.defer(deferral);
+    if (resolved.kind !== "actionable") continue;
+    if (await deps.dispatch(resolved.task, resolved.item) === false) break;
+  }
+}
+
+const planningContinuationRuns = new Set<string>();
+const planningContinuationCapacityReasons = new Map<string, string>();
+
+export const FILE_SCOPE_CONTINUATION_WAIT_PREFIX = "file-scope:";
+
+function fileScopeContinuationWaitReason(blockerId: string): string {
+  return `${FILE_SCOPE_CONTINUATION_WAIT_PREFIX}${blockerId}`;
+}
+
+/*
+FNXC:PlanningContinuationDispatch 2026-09-09-22:33:
+Outer file-scope admission can return before the graph consumes the drain's running claim. Settlement
+must relinquish only that exact owner: retain a durable held wait while the blocker is current, or make
+the row due immediately when completion already won the race. This prevents a fabricated dead lease
+without allowing an old dispatch callback to overwrite a successor or terminal graph transition.
+*/
+export async function settlePlanningContinuationDispatch(input: {
+  store: TaskStore;
+  taskId: string;
+  itemId: string;
+  leaseOwner: string;
+  kick?: () => void;
+}): Promise<"waiting" | "runnable" | "unchanged"> {
+  if (typeof input.store.transitionWorkflowWorkItem !== "function") return "unchanged";
+  const task = await input.store.getTask(input.taskId).catch(() => null);
+  if (!task || task.deletedAt) return "unchanged";
+  const blockerId = task.overlapBlockedBy?.trim();
+  const dependencyId = task.blockedBy?.trim();
+  const waitingReason = task.status === "queued"
+    ? blockerId
+      ? fileScopeContinuationWaitReason(blockerId)
+      : dependencyId
+        ? `dependency:${dependencyId}`
+        : null
+    : null;
+  const waiting = waitingReason !== null;
+  const targetState: WorkflowWorkItemState = waiting ? "held" : "runnable";
+  const transitioned = await input.store.transitionWorkflowWorkItem(input.itemId, targetState, {
+    expectedState: "running",
+    expectedLeaseOwner: input.leaseOwner,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    retryAfter: null,
+    lastError: null,
+    blockedReason: waitingReason,
+  }).catch(() => null);
+  if (!transitioned
+    || transitioned.state !== targetState
+    || transitioned.leaseOwner !== null
+    || (waiting && transitioned.blockedReason !== waitingReason)) {
+    return "unchanged";
+  }
+  if (!waiting) input.kick?.();
+  return waiting ? "waiting" : "runnable";
+}
+
+/** Release only explicit file-scope waits whose task-level blocker clear has already committed. */
+export async function releaseFileScopeWaitingContinuations(
+  store: TaskStore,
+  releases: readonly OverlapBlockerRelease[],
+): Promise<string[]> {
+  if (typeof store.listWorkflowWorkItemsForTask !== "function"
+    || typeof store.transitionWorkflowWorkItem !== "function") return [];
+  const released: string[] = [];
+  for (const release of releases) {
+    const task = await store.getTask(release.taskId).catch(() => null);
+    if (!task || task.deletedAt || task.overlapBlockedBy != null || task.blockedBy != null) continue;
+    const items = await store.listWorkflowWorkItemsForTask(release.taskId, { kinds: ["task"] }).catch(() => []);
+    for (const item of items) {
+      if (item.state !== "held"
+        || item.leaseOwner !== null
+        || item.blockedReason !== fileScopeContinuationWaitReason(release.blockerId)) continue;
+      const transitioned = await store.transitionWorkflowWorkItem(item.id, "runnable", {
+        expectedState: "held",
+        expectedLeaseOwner: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        retryAfter: null,
+        lastError: null,
+        blockedReason: null,
+      }).catch(() => null);
+      if (transitioned?.state === "runnable" && transitioned.leaseOwner === null) released.push(item.id);
+    }
+  }
+  return released;
+}
+
+async function dispatchPlanningContinuationIfCurrent(input: {
+  store: TaskStore;
+  task: Task;
+  item: WorkflowWorkItem;
+  isPlannerLive?: (taskId: string) => boolean;
+  dispatch: () => void;
+}): Promise<boolean> {
+  const validateAndDispatch = async (): Promise<boolean> => {
+    if (input.isPlannerLive?.(input.task.id) === true) return false;
+    const currentTask = typeof input.store.getTask === "function"
+      ? await input.store.getTask(input.task.id).catch(() => undefined)
+      : input.task;
+    if (!isPlanningContinuationTaskDispatchable(currentTask)) return false;
+    if (isTaskBlockedOnApproval(currentTask)) return false;
+    const currentItem = typeof input.store.getWorkflowWorkItem === "function"
+      ? await input.store.getWorkflowWorkItem(input.item.id).catch(() => null)
+      : input.item;
+    if (!currentItem
+      || currentItem.id !== input.item.id
+      || currentItem.taskId !== input.item.taskId
+      || currentItem.runId !== input.item.runId
+      || currentItem.nodeId !== input.item.nodeId
+      || currentItem.nodeInstanceId !== input.item.nodeInstanceId
+      || currentItem.kind !== input.item.kind
+      || currentItem.state !== input.item.state
+      || currentItem.attempt !== input.item.attempt
+      || currentItem.retryAfter !== input.item.retryAfter
+      || currentItem.leaseOwner !== input.item.leaseOwner
+      || currentItem.leaseExpiresAt !== input.item.leaseExpiresAt) return false;
+    /*
+    FNXC:PlanningContinuationDispatch 2026-09-06-01:58:
+    Validation under the planning lock is insufficient by itself: a planner that was awaiting setup
+    can acquire the lock after dispatch starts and otherwise replace this row. Publish the winner as
+    a durable running claim before launching the graph. The state-and-owner CAS makes another drain
+    or planner an ordinary loser, while the executor consumes this same running continuation.
+    */
+    const transition = (input.store as Partial<TaskStore>).transitionWorkflowWorkItem;
+    if (typeof transition === "function") {
+      const leaseOwner = planningContinuationDispatchLeaseOwner(currentItem);
+      const claimed = await input.store.transitionWorkflowWorkItem(currentItem.id, "running", {
+        expectedState: currentItem.state,
+        expectedLeaseOwner: currentItem.leaseOwner,
+        leaseOwner,
+        leaseExpiresAt: null,
+        lastError: null,
+        blockedReason: null,
+      });
+      if (!isPlanningContinuationDispatchClaim(claimed) || claimed.leaseOwner !== leaseOwner) {
+        return false;
+      }
+    }
+    input.dispatch();
+    return true;
+  };
+  const lifecycleLock = (input.store as Partial<TaskStore>).withPlanningLifecycleLock;
+  return typeof lifecycleLock === "function"
+    ? await input.store.withPlanningLifecycleLock(input.task.id, validateAndDispatch)
+    : await validateAndDispatch();
+}
+
+export async function admitPlanningContinuation(input: {
+  store: TaskStore;
+  projectId: string;
+  task: Task;
+  item: WorkflowWorkItem;
+  isPlannerLive?: (taskId: string) => boolean;
+  dispatch: () => Promise<void>;
+  onDispatchSettled?: () => void;
+}): Promise<boolean> {
+  const runKey = `${input.projectId}:${input.task.id}`;
+  // A task owns one top-level slot regardless of how many durable continuation
+  // rows point at it. Treat a duplicate due row as already handled; admitting it
+  // would attach two releasers to one task-keyed coordinator reservation.
+  if (planningContinuationRuns.has(runKey)) return true;
+  const settings = await input.store.getSettings();
+  let selected = false;
+  let duplicateHandled = false;
+  const loadClaimSnapshot = async (): Promise<{ count: number; ids: string[] }> => {
+    /*
+    FNXC:WorkflowContinuationCapacity 2026-09-01-14:49:
+    A direct continuation consumes provider capacity but never claims a new worktree slot: it either
+    resumes a task whose retained checkout is already counted by the holder predicate or enters a
+    checkout-free plan-lane node. Full rows preserve pending workflow-step leases for the agent gate.
+    */
+    const tasks = await input.store.listTasks({ slim: false, includeArchived: false });
+    const ids = await persistedTopLevelAgentTaskIdsFromStore(input.store, tasks);
+    return { count: ids.length, ids };
+  };
+  // Resuming another node of an already-live task is a same-slot handoff, not a
+  // new admission. Check only this fully hydrated task here; the project-wide
+  // snapshot belongs inside the serialized coordinator drain below.
+  const taskAlreadyActive = (await persistedTopLevelAgentTaskIdsFromStore(input.store, [input.task]))
+    .includes(input.task.id);
+  if (taskAlreadyActive) {
+    await dispatchPlanningContinuationIfCurrent({
+      store: input.store,
+      task: input.task,
+      item: input.item,
+      isPlannerLive: input.isPlannerLive,
+      dispatch: () => {
+        void input.dispatch()
+          .then(() => input.onDispatchSettled?.())
+          .catch(() => {});
+      },
+    });
+    return true;
+  }
+  // This snapshot is intentionally created lazily inside the coordinator drain.
+  // A prior lane may have been finishing its own handoff before this task's
+  // turn; a pre-drain project snapshot can admit into its newly occupied slot.
+  let admissionSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
+  let plannerOrContinuationSuperseded = false;
+  const getAdmissionSnapshot = () => admissionSnapshot ??= loadClaimSnapshot();
+  await projectAdmissionCoordinator.admitNext({
+    projectId: input.projectId,
+    maxConcurrent: resolveAgentCapacityLimit({
+      maxConcurrent: settings.maxConcurrent,
+    }),
+    claimed: async () => (await getAdmissionSnapshot()).count,
+    claimedTaskIds: async () => (await getAdmissionSnapshot()).ids,
+    refresh: async () => [{
+      taskId: input.task.id,
+      projectId: input.projectId,
+      lane: "execute",
+      consumesWorktree: false,
+      createdAt: input.item.createdAt ?? input.task.createdAt,
+      start: async () => {
+        // The preflight above is only a fast path. This serialized check is the
+        // ownership authority when concurrent drains race the same durable row.
+        if (planningContinuationRuns.has(runKey)) {
+          duplicateHandled = true;
+          // The coordinator's task-keyed Set already contains the ORIGINAL
+          // run's reservation. Accept this no-op candidate so its decline path
+          // cannot release capacity owned by that still-running workflow.
+          return true;
+        }
+        /*
+        FNXC:PlanningContinuationDispatch 2026-09-06-01:28:
+        Capacity admission awaits mutable project state, so the planner can acquire ownership after
+        the due-poll liveness sample. Fence the point of use with the planning lifecycle lock, then
+        re-read both task and exact continuation snapshot before synchronously launching execution.
+        Triage installs its running continuation under the same lock; whichever owner arrives first
+        is visible to the other, and a superseded candidate declines without consuming capacity.
+        */
+        const dispatched = await dispatchPlanningContinuationIfCurrent({
+          store: input.store,
+          task: input.task,
+          item: input.item,
+          isPlannerLive: input.isPlannerLive,
+          dispatch: () => {
+            selected = true;
+            planningContinuationRuns.add(runKey);
+            // Keep the coordinator reservation for the whole resumed run. The task
+            // can remain canonically inactive until its first workflow node writes a
+            // pending lease; releasing at executor entry recreates the over-cap gap.
+            let run: Promise<void>;
+            try {
+              run = input.dispatch();
+            } catch (error) {
+              planningContinuationRuns.delete(runKey);
+              throw error;
+            }
+            void run.then(
+              () => {
+                planningContinuationRuns.delete(runKey);
+                projectAdmissionCoordinator.releaseReservation(input.task.id);
+                input.onDispatchSettled?.();
+              },
+              () => {
+                planningContinuationRuns.delete(runKey);
+                projectAdmissionCoordinator.releaseReservation(input.task.id);
+              },
+            ).catch(() => {});
+          },
+        });
+        if (!dispatched) plannerOrContinuationSuperseded = true;
+        return dispatched;
+      },
+    }],
+  });
+  if (selected || duplicateHandled || plannerOrContinuationSuperseded) {
+    planningContinuationCapacityReasons.delete(runKey);
+    return true;
+  }
+  const snapshot = await getAdmissionSnapshot();
+  const limit = resolveAgentCapacityLimit({
+    maxConcurrent: settings.maxConcurrent,
+  });
+  if (snapshot.count >= limit) {
+    /*
+    FNXC:ConcurrencyAdmission 2026-08-08-04:27:
+    Direct workflow continuations bypass scheduler task-status handling. A full live-task cap must
+    still be visible through the shared task log, using the same canonical-holder diagnostic as
+    execute, triage, and merge admission; unchanged retries remain deduplicated.
+    */
+    const reason = formatAdmissionCapacityQueuedReason({
+      gate: "maxConcurrent",
+      limit,
+      claimed: snapshot.count,
+      holderTaskIds: snapshot.ids,
+    });
+    if (planningContinuationCapacityReasons.get(runKey) !== reason) {
+      planningContinuationCapacityReasons.set(runKey, reason);
+      await input.store.logEntry(input.task.id, reason);
+    }
+  }
+  return false;
+}
+
+export function createPlanningContinuationDispatcher(input: {
+  store: TaskStore;
+  projectId: string;
+  execute: (task: Task) => Promise<void>;
+  isPlannerLive?: (taskId: string) => boolean;
+  kick?: () => void;
+  onError?: (task: Task, item: WorkflowWorkItem, error: unknown) => void;
+}): (task: Task, item: WorkflowWorkItem) => Promise<boolean> {
+  return (task, item) => {
+    let kickAfterOwnershipRelease = false;
+    return admitPlanningContinuation({
+      store: input.store,
+      projectId: input.projectId,
+      task,
+      item,
+      isPlannerLive: input.isPlannerLive,
+      dispatch: async () => {
+        const leaseOwner = planningContinuationDispatchLeaseOwner(item);
+        await input.execute(task).catch((error) => {
+          input.onError?.(task, item, error);
+        });
+        kickAfterOwnershipRelease = await settlePlanningContinuationDispatch({
+          store: input.store,
+          taskId: task.id,
+          itemId: item.id,
+          leaseOwner,
+        }) === "runnable";
+      },
+      /*
+      FNXC:PlanningContinuationDispatch 2026-09-09-23:09:
+      A completion that wins before dispatch settlement makes the exact work item runnable, but its
+      wake must follow removal of the task-keyed run and capacity reservation. Otherwise the real
+      drain mistakes the event-driven retry for a duplicate and waits for the periodic timer.
+      */
+      onDispatchSettled: () => {
+        if (kickAfterOwnershipRelease) input.kick?.();
+      },
+    });
+  };
+}
+
+/**
+ * FNXC:WorkflowScheduling 2026-07-21-12:30:
+ * Select due planning continuations whose task remains dispatchable.
+ *
+ * FNXC:WorkflowScheduling 2026-07-21-22:31:
+ * Also exclude soft-deleted / archived / done tasks so archive-fallback rows
+ * returned by getTask cannot re-enter plan-review after the card left the board.
+ */
+export function selectActionablePlanningContinuations(
+  candidates: readonly PlanningContinuationCandidate[],
+): Array<{ item: WorkflowWorkItem; task: Task }> {
+  return candidates.flatMap((candidate) => {
+    const resolved = resolvePlanningContinuationCandidate(candidate.item, candidate.task);
+    return resolved.kind === "actionable" ? [{ item: resolved.item, task: resolved.task }] : [];
+  });
+}
 
 export interface CliAgentAwaitingInputNotificationInfo {
   sessionId: string;
@@ -134,7 +1016,7 @@ export function buildCliAgentAwaitingInputNotificationPayload(input: {
  * InProcessRuntime runs a project within the main process.
  *
  * This is the default execution mode — all components (TaskStore, Scheduler,
- * Executor, WorktreePool) share the same memory space and event loop.
+ * Executor) share the same memory space and event loop.
  *
  * Features:
  * - Direct access to TaskStore and Scheduler via getter methods
@@ -168,13 +1050,58 @@ export function buildCliAgentAwaitingInputNotificationPayload(input: {
  * await runtime.stop();
  * ```
  */
+/*
+FNXC:CodeOrganization 2026-08-03-12:15:
+Match executor formatGitRepositoryDetectionError: never interpolate the working directory into the
+copy-paste safe.directory shell remedy (quote/metachar injection if pasted). Path stays in prose only.
+*/
 function formatRuntimeGitDetectionWarning(workingDirectory: string, detection: Extract<GitRepoDetection, { status: "error" }>): string {
   const stderr = detection.stderr.trim() || "git rev-parse --git-dir failed without stderr";
   const remedy = detection.reason === "dubious-ownership"
-    ? ` Resolve Git safe-directory ownership with: git config --global --add safe.directory "${workingDirectory}"`
+    ? " Resolve Git safe-directory ownership with: git config --global --add safe.directory <project-directory>"
     : "";
   return `Project directory "${workingDirectory}" could not be verified as a Git repository. ` +
     `Task execution will fail until the Git error is resolved. Git reported: ${stderr}.${remedy}`;
+}
+
+/**
+ * FNXC:RunAudit 2026-08-20-06:06:
+ * Credential rotation is runtime-owned recovery plumbing. Its optional audit adapter must use the
+ * bounded seam so an unavailable telemetry sink cannot delay a production rotation candidate.
+ */
+/*
+FNXC:OverlapScheduling 2026-09-07-15:03:
+Runtime composition owns the completion-to-scheduler bridge. Startup and regression tests use this
+single factory so the test cannot reconstruct SelfHealingManager with wiring that production omitted.
+*/
+export function createRuntimeSelfHealingManager(
+  store: TaskStore,
+  scheduler: Pick<Scheduler, "requestImmediateSchedule">,
+  options: Omit<SelfHealingOptions, "onOverlapBlockersReleased">,
+  continuations?: { kick: () => void },
+): SelfHealingManager {
+  return new SelfHealingManager(store, {
+    ...options,
+    onOverlapBlockersReleased: async (releases) => {
+      await releaseFileScopeWaitingContinuations(store, releases);
+      continuations?.kick();
+      scheduler.requestImmediateSchedule();
+    },
+  });
+}
+
+export function createRuntimeCredentialRotationAuditAdapter(taskStore: TaskStore) {
+  return async (mutationType: string, metadata: Record<string, unknown>): Promise<void> => {
+    await emitBoundedRunAudit(taskStore, {
+      taskId: typeof metadata.taskId === "string" ? metadata.taskId : undefined,
+      agentId: typeof metadata.agentId === "string" ? metadata.agentId : "runtime",
+      runId: generateSyntheticRunId("credential-instance-rotation", typeof metadata.taskId === "string" ? metadata.taskId : String(metadata.providerId ?? "unknown")),
+      domain: "database",
+      mutationType,
+      target: String(metadata.providerId ?? "unknown"),
+      metadata,
+    });
+  };
 }
 
 export class InProcessRuntime
@@ -194,9 +1121,14 @@ export class InProcessRuntime
   private backendShutdown?: () => Promise<void>;
   private scheduler!: Scheduler;
   private executor!: TaskExecutor;
-  private worktreePool!: WorktreePool;
-  private globalSemaphore?: AgentSemaphore;
-  private projectSemaphore?: ScopedAgentSemaphore;
+  /*
+  FNXC:CapacityModel 2026-07-28-20:10 (drop the cross-project cap):
+  The global and project-scoped semaphores are DELETED. Capacity is two numbers
+  per project; the machine-wide cap was a third limiter with a separate authority
+  (a central-DB singleton row) that the per-project gates then had to be reconciled
+  against. The scheduler/triage semaphore gate is now simply ABSENT rather than
+  holding an infinite limit — absence cannot start binding again by accident.
+  */
   private stuckTaskDetector?: StuckTaskDetector;
   /**
    * Per-project CLI Agent Executor runtime bundle (PTY manager + telemetry hub +
@@ -206,18 +1138,16 @@ export class InProcessRuntime
    */
   private cliAgentRuntime?: BootstrappedCliAgentRuntime;
   private usageLimitPauser?: UsageLimitPauser;
+  /** One runtime-owned cooldown map keeps executor and recovery paths coherent. */
+  private credentialRotator?: CredentialInstanceRotator;
+  /** FNXC:PlanReviewLease 2026-07-26-20:42: cluster node id stamped onto review-gate leases; undefined until start() resolves it, or if resolution fails. */
+  private localNodeId?: string;
   private selfHealingManager?: SelfHealingManager;
   private leaseManager?: MeshLeaseManager;
   private leaseCentralClaimStore?: AsyncCentralClaimStore;
   private agentStore?: AgentStore;
   private heartbeatMonitor?: HeartbeatMonitor;
   private triggerScheduler?: HeartbeatTriggerScheduler;
-  /**
-   * Coordinates the ephemeral task-worker lifecycle (spawn dedup, finalize,
-   * halt-listener cleanup, startup sweep). See `ephemeral-worker-manager.ts`.
-   * Created once the AgentStore is available; guard call sites with `?`.
-   */
-  private workerManager?: EphemeralWorkerManager;
   private lastActivityAt: string = new Date().toISOString();
   private pluginRunner?: PluginRunner;
   private pluginStore?: PluginStore;
@@ -228,10 +1158,31 @@ export class InProcessRuntime
   private missionExecutionLoop?: MissionExecutionLoop;
   private missionAutopilot?: MissionAutopilot;
   private triageProcessor?: TriageProcessor;
+  private workflowContinuationTimer?: ReturnType<typeof setInterval>;
+  private workflowContinuationDrainActive = false;
+  private workflowContinuationDrainSince = 0;
+  private workflowContinuationDrainPending = false;
+  private workflowContinuationDrainGeneration = 0;
+  /*
+  FNXC:PlanReviewApproval 2026-08-04-00:26:
+  Track the event edge and the durable approval marker. The marker covers engine restarts and
+  cross-process updates that did not deliver the earlier awaiting-approval event.
+  */
+  private approvalHeldTaskIds = new Set<string>();
+  private approvalReleasedTaskIds = new Set<string>();
   private messageStore?: MessageStore;
+  /** FNXC:TaskDeleteNotice 2026-07-26-16:10: identity-guarded teardown for the delete-notice mailbox seam. */
+  private unregisterTaskDeleteNoticeMailbox?: () => void;
   private chatStore?: ChatStore;
+  /**
+   * FNXC:RUFU121RuntimeProjectIdentity 2026-08-18-19:53:
+   * RUFU-121 Step 4: cached project-identity resolution (ONCE per runtime start).
+   * Both attach call sites share this promise so the central-core name lookup
+   * runs a single time; a resolution failure degrades to { projectId, null }
+   * and NEVER blocks runtime start.
+   */
+  private projectIdentityCache: Promise<{ projectId: string | null; projectName: string | null }> | null = null;
   private detachAgentLinkSync?: () => void;
-  private concurrencyChangedListener?: (state: { globalMaxConcurrent: number }) => void;
   /**
    * Optional callback the runtime forwards to SelfHealingManager so that
    * stale-merge recovery can re-enqueue tasks immediately. Set by ProjectEngine
@@ -252,7 +1203,7 @@ export class InProcessRuntime
    * ProjectEngine before `start()` via `setMergePendingProvider`. Used by the workspace
    * self-healing reconcilers to avoid re-dispatching / reclaiming a task mid-dequeue→rawMerge.
    */
-  private mergePendingProvider?: (taskId: string) => boolean;
+  private mergePendingProvider?: (taskId: string) => boolean | Promise<boolean>;
   /** Tracks whether startup recovery was intentionally deferred due to pause state. */
   private startupRecoveryDeferred = false;
   /** Prevent duplicate unpause recovery dispatches from racing each other. */
@@ -277,10 +1228,9 @@ export class InProcessRuntime
    *
    * Initialization order:
    * 1. Initialize TaskStore
-   * 2. Initialize WorktreePool
-   * 3. Initialize Scheduler (with TaskStore)
-   * 4. Initialize TaskExecutor (with TaskStore, worktree pool, global semaphore)
-   * 5. Resume orphaned in-progress tasks
+   * 2. Initialize Scheduler (with TaskStore)
+   * 3. Initialize TaskExecutor (with TaskStore and global semaphore)
+   * 4. Resume orphaned in-progress tasks
    * 6. Start scheduler
    */
   async start(): Promise<void> {
@@ -306,6 +1256,10 @@ export class InProcessRuntime
         // InProcessRuntime.start(). When the factory returns a backend result,
         // the engine owns the result's shutdown() for process teardown.
         createTaskStoreForBackend,
+        buildConsumerId,
+        createProjectScopedPluginMcpProvider,
+        registerTaskDeleteNoticeMailbox,
+        syncBackupRoutine,
       } = await import("@fusion/core");
       if (this.config.externalTaskStore) {
         this.taskStore = this.config.externalTaskStore;
@@ -314,6 +1268,8 @@ export class InProcessRuntime
         const backendBoot = await createTaskStoreForBackend({
           rootDir: this.config.workingDirectory,
           projectId: this.config.projectId,
+          /* FNXC:CrossProcessDeleteObservation 2026-08-01-11:39: the engine owns this store, so its role-only identity is restart-stable and never derives from boot state. */
+          consumerId: buildConsumerId("engine"),
           onMigrationProgress: this.config.onMigrationProgress,
         });
         // FNXC:PostgresFinalCutover 2026-07-14-17:20: Engine runtimes must fail
@@ -324,6 +1280,22 @@ export class InProcessRuntime
           `TaskStore initialized on PostgreSQL (${backendBoot.backend.mode}) for project ${this.config.projectId}`,
         );
       }
+
+      /*
+      FNXC:ProviderRateLimitIsolation 2026-07-19-19:10:
+      Every project runtime owns one usage-limit coordinator and shares it across executor, triage, reviewer, and merger surfaces. Runtime isolation replaced the old dashboard-level construction site; constructing it here prevents a silently undefined pauser while keeping a provider outage local to the affected project/task.
+      */
+      this.credentialRotator ??= new CredentialInstanceRotator({
+        instanceSource: createFusionAuthStorage(),
+        // FNXC:CredentialInstanceRotation 2026-08-01-11:05:
+        // Rotation evidence is emitted through the runtime-owned audit seam. Metadata
+        // is supplied by the rotator as ids/counts/outcomes only; audit failures stay
+        // non-fatal so an observability outage cannot prevent rate-limit recovery.
+        recordRunAuditEvent: createRuntimeCredentialRotationAuditAdapter(this.taskStore),
+      });
+      this.usageLimitPauser ??= new UsageLimitPauser(this.taskStore, {
+        credentialRotator: this.credentialRotator,
+      });
 
       // Initialize MessageStore early so TaskExecutor receives send_message capability.
       // FNXC:RuntimeSatelliteAsync 2026-06-24-12:45:
@@ -357,6 +1329,17 @@ export class InProcessRuntime
 
       this.messageStore = new MessageStoreClass(null, { asyncLayer: messageLayer });
 
+      /*
+      FNXC:TaskDeleteNotice 2026-07-26-16:10:
+      Core owns the delete path but has no mailbox, so it exposes a store-scoped seam and the
+      runtime supplies the MessageStore. Registering here (rather than process-globally) keeps one
+      project's "a task was deleted by someone who is not you" notice out of another project's
+      inbox. A store with no registration degrades to no notice — never to a failed delete.
+      */
+      this.unregisterTaskDeleteNoticeMailbox = registerTaskDeleteNoticeMailbox(
+        this.taskStore,
+        this.messageStore,
+      );
       await yieldEventLoop();
 
       // 2. Initialize Plugin system (PluginStore + PluginLoader + PluginRunner)
@@ -382,19 +1365,45 @@ export class InProcessRuntime
         rootDir: this.config.workingDirectory,
       });
       await this.pluginRunner.init();
+      /*
+      FNXC:CliRuntimeRouting 2026-08-16-14:37:
+      Publish this project's PluginRunner as the ambient default for bare
+      `createFnAgent` callers (research providers, cron, evaluator, reflection,
+      core DI lanes, dashboard side-lanes) so their sessions route CLI-runtime
+      model selections (cursor-cli etc.) through the plugin runtime instead of
+      dying in pi's model registry. Keyed by project root; createFnAgent matches
+      the session cwd against registered roots so multi-project hosts stay
+      project-scoped.
+      */
+      registerDefaultAgentPluginRunner(this.config.workingDirectory, this.pluginRunner);
+      /*
+       * FNXC:PluginMcpServers 2026-07-22-12:00:
+       * FN-8491 installs the sole session-facing provider on the project store.
+       * resolveMcpServersForStore consumes this filtered seam across every AI
+       * lane; it never sees PluginRunner's raw contribution list.
+       */
+      const projectScopedPluginMcpProvider = createProjectScopedPluginMcpProvider(
+        createRuntimePluginMcpProviderOptions({
+          hostRootDir: this.config.workingDirectory,
+          hostLoader: this.pluginLoader,
+          PluginLoaderClass,
+        }),
+      );
+      (this.taskStore as TaskStore & { getProjectScopedPluginMcpServers?: () => Promise<ReturnType<PluginRunner["getPluginMcpServers"]>> }).getProjectScopedPluginMcpServers = () => projectScopedPluginMcpProvider.get(this.taskStore);
+      /*
+       * FNXC:PluginMcpServers 2026-07-22-15:35:
+       * FN-8491 / #2401 requires the runtime seam to use the core provider,
+       * not an ad-hoc enabled-ID filter. The provider owns same-root caching
+       * and non-persisting other-root discovery so all project contexts retain
+       * their own plugin enablement state.
+       */
       runtimeLog.log(`PluginRunner initialized`);
 
       await yieldEventLoop();
 
-      // 3. Initialize WorktreePool
-
-      // Reap half-initialized orphan worktree directories before doing anything
-      // else with the pool.  These are directories under .worktrees/ that exist
-      // on disk but were never fully registered with git (e.g. the process was
-      // killed between `mkdir` and `git worktree add`).  Removing them here
-      // ensures scanIdleWorktrees / rehydrate never sees broken entries, and
-      // prevents assertValidWorktreeSession from permanently blocking retries.
-      const { reapOrphanWorktrees, scanIdleWorktrees } = await import("../worktree-pool.js");
+      // Reap half-initialized orphan worktree directories before execution.
+      // This recovery is independent of the retired recycle pool.
+      const { reapOrphanWorktrees } = await import("../worktree/worktree-pool.js");
       const settings = await this.taskStore.getSettings();
       try {
         const reaped = await reapOrphanWorktrees(this.config.workingDirectory, settings);
@@ -418,44 +1427,7 @@ export class InProcessRuntime
         runtimeLog.warn(formatRuntimeGitDetectionWarning(this.config.workingDirectory, gitDetection));
       }
 
-      this.worktreePool = new WorktreePool();
-
-      // Rehydrate pool from disk state (idle worktrees)
-      const idleWorktrees = await scanIdleWorktrees(
-        this.config.workingDirectory,
-        this.taskStore,
-        settings,
-      );
-      if (idleWorktrees.length > 0) {
-        this.worktreePool.rehydrate(idleWorktrees);
-        runtimeLog.log(
-          `Rehydrated worktree pool with ${idleWorktrees.length} idle worktrees`
-        );
-      }
-
       await yieldEventLoop();
-
-      // 4. Initialize global semaphore — use shared one from ProjectManager if provided,
-      // otherwise create a local one from CentralCore (single-project mode).
-      if (this.config.globalSemaphore) {
-        this.globalSemaphore = this.config.globalSemaphore;
-      } else {
-        // Dynamic getter that re-reads from CentralCore on each semaphore acquire.
-        // This ensures changes via PUT /api/global-concurrency take effect immediately.
-        let cachedLimit = await this.getGlobalConcurrencyLimit();
-        this.globalSemaphore = new AgentSemaphore(() => cachedLimit);
-
-        // Listen for concurrency changes from CentralCore (if it supports events)
-        if (typeof this.centralCore.on === "function") {
-          this.concurrencyChangedListener = (state: { globalMaxConcurrent: number }) => {
-            cachedLimit = state.globalMaxConcurrent;
-            runtimeLog.log(`Global concurrency limit updated to ${cachedLimit}`);
-          };
-          this.centralCore.on("concurrency:changed", this.concurrencyChangedListener);
-        }
-      }
-
-      this.projectSemaphore = new ScopedAgentSemaphore(this.globalSemaphore);
 
       await yieldEventLoop();
 
@@ -586,7 +1558,6 @@ export class InProcessRuntime
       this.scheduler = new Scheduler(this.taskStore, {
         maxConcurrent: this.config.maxConcurrent,
         maxWorktrees: this.config.maxWorktrees,
-        semaphore: this.projectSemaphore,
         // FNXC:GlobalConcurrencyControls 2026-07-17-00:00: Feed the triage service's
         // live pre-planning in-flight count into the scheduler's stale-semaphore
         // recovery so a triage session holding a slot before it writes
@@ -594,6 +1565,10 @@ export class InProcessRuntime
         // triageProcessor is constructed after the scheduler but exists by the
         // time the first scheduling pass runs.
         getInFlightTopLevelCount: () => this.triageProcessor?.getProcessingTaskIds().size ?? 0,
+        // Planning and execution share project admission capacity; this callback only nudges discovery.
+        onCapacityReleased: () => {
+          this.triageProcessor?.requestImmediatePoll();
+        },
         agentStore: this.agentStore,
         hasActiveAgentExecution: (agentId: string) => this.heartbeatMonitor?.getTrackedAgents().includes(agentId) ?? false,
         missionStore,
@@ -607,7 +1582,11 @@ export class InProcessRuntime
         },
         onSchedule: (task) => {
           this.recordActivity();
-          runtimeLog.log(`Scheduled task ${task.id}`);
+          /*
+          FNXC:EngineDiagnostics 2026-08-03-05:54:
+          Redundant with scheduler `Starting ${id}` — keep the dispatch side-effect silent by default.
+          */
+          runtimeLog.debug(`Scheduled task ${task.id}`);
         },
         onBlocked: () => {},
         validateNodeDispatch: async (nodeId) => {
@@ -659,15 +1638,11 @@ export class InProcessRuntime
       // 5b. Initialize TaskExecutor
       this.stuckTaskDetector = new StuckTaskDetector(this.taskStore, {
         isCliSessionWaitingOnInput: this.cliAgentRuntime?.isCliSessionWaitingOnInput,
-        beforeRequeue: (taskId, reason, event) => this.selfHealingManager?.checkStuckBudget(taskId, reason, event) ?? Promise.resolve(true),
         onLoopDetected: (event) => this.executor?.handleLoopDetected(event) ?? Promise.resolve(false),
         onStuck: (event) => {
           this.triageProcessor?.markStuckAborted(event.taskId);
-          this.executor?.markStuckAborted(event.taskId, event.shouldRequeue);
-          runtimeLog.warn(
-            `Task ${event.taskId} stuck (${event.reason}) — ` +
-            `${event.shouldRequeue ? "will retry" : "budget exhausted"}`,
-          );
+          this.executor?.markStuckAborted(event.taskId);
+          runtimeLog.warn(`Task ${event.taskId} stuck (${event.reason}) — resuming in place`);
         },
       });
 
@@ -683,15 +1658,27 @@ export class InProcessRuntime
       }
 
       // 5c. Initialize AgentReflectionService (requires agentStore and reflectionStore)
-      let reflectionService: import("../agent-reflection.js").AgentReflectionService | undefined;
+      let recallCaptureWriter: import("@fusion/core").RecallCaptureWriter | undefined;
+      try {
+        const layer = this.taskStore.getAsyncLayer?.();
+        if (layer) {
+          const { createRecallCaptureWriter } = await import("@fusion/core");
+          recallCaptureWriter = createRecallCaptureWriter({ layer, logger: runtimeLog });
+        }
+      } catch (captureInitError) {
+        // FNXC:MemoryRecallCapture 2026-08-11-10:55: optional recall initialization cannot block runtime startup.
+        runtimeLog.warn("Recall capture initialization failed; automatic capture remains disabled:", captureInitError instanceof Error ? captureInitError.message : captureInitError);
+      }
+      let reflectionService: import("../agents/agent-reflection.js").AgentReflectionService | undefined;
       if (agentStoreForReflection && reflectionStoreForService) {
         try {
-          const { AgentReflectionService: AgentReflectionServiceClass } = await import("../agent-reflection.js");
+          const { AgentReflectionService: AgentReflectionServiceClass } = await import("../agents/agent-reflection.js");
           reflectionService = new AgentReflectionServiceClass({
             agentStore: agentStoreForReflection,
             taskStore: this.taskStore,
             reflectionStore: reflectionStoreForService,
             rootDir: this.config.workingDirectory,
+            ...(recallCaptureWriter ? { captureWriter: recallCaptureWriter } : {}),
           });
           runtimeLog.log("AgentReflectionService initialized");
         } catch (reflServiceErr) {
@@ -699,10 +1686,10 @@ export class InProcessRuntime
         }
       }
 
-      let selfImproveService: import("../agent-self-improve.js").AgentSelfImproveService | undefined;
+      let selfImproveService: import("../agents/agent-self-improve.js").AgentSelfImproveService | undefined;
       if (agentStoreForReflection && reflectionStoreForService) {
         try {
-          const { AgentSelfImproveService: AgentSelfImproveServiceClass } = await import("../agent-self-improve.js");
+          const { AgentSelfImproveService: AgentSelfImproveServiceClass } = await import("../agents/agent-self-improve.js");
           selfImproveService = new AgentSelfImproveServiceClass({
             agentStore: agentStoreForReflection,
             reflectionStore: reflectionStoreForService,
@@ -714,15 +1701,49 @@ export class InProcessRuntime
         }
       }
 
-      const prNodeGithubOps = this.config.prNodeGithubOps;
+      /*
+      FNXC:PrMergeAutoMerge 2026-08-09-10:59:
+      Native auto-merge is project policy, so construct its CLI callbacks only
+      after this runtime owns the TaskStore. A process-wide callback cannot
+      safely infer which concurrently running project's setting applies.
+      */
+      const prNodeGithubOps = this.config.createPrNodeGithubOps?.(this.taskStore)
+        ?? this.config.prNodeGithubOps;
+      /*
+      FNXC:SecretsEnvRuntimeWiring 2026-08-05-21:30:
+      `secretsEnv` materializes only through fresh executor and heartbeat worktree acquisitions.
+      Resolve the project-scoped store once at this composition boundary and share it with both
+      consumers; omitting either dependency silently degrades that path to the defensive no-store skip.
+      */
+      const secretsStore = await this.taskStore.getSecretsStore();
       const executorOptions: TaskExecutorOptions = {
-        semaphore: this.projectSemaphore,
-        pool: this.worktreePool,
+        /*
+        FNXC:PlanReviewLease 2026-07-26-21:12:
+        Getter, not a value: `this.localNodeId` is resolved later in start() (it needs an async
+        CentralCore read), so capturing it here would freeze `undefined` and silently disable lease
+        attribution. Reading it lazily at runner-construction time picks up the resolved id.
+        */
+        getLocalNodeId: () => this.localNodeId,
+        /*
+        FNXC:WorkflowAgentRouting 2026-08-07-22:39:
+        FN-8764 made every role-classified graph node (execute / step-execute / review / merge)
+        resolve a permanent principal through `options.agentStore`, and fail closed with
+        `workflow-principal-routing-unavailable:<role>` when that store is absent. The runtime built
+        the one long-lived engine AgentStore above but never handed it to the executor, so EVERY
+        task deadlocked on entry to `steps#0:step-execute`: routing failed closed, the executor's
+        `workflow-principal-*` hold branch swallowed the result as a recoverable wait, and the card
+        sat in-progress with its foreach instance pinned `in-progress` and no session, no log, and
+        no audit row. Wire the same instance the scheduler, triage, merger, and heartbeat already
+        receive — an executor without it can no longer run any classified node at all.
+        */
+        agentStore: this.agentStore,
         usageLimitPauser: this.usageLimitPauser,
+        credentialRotator: this.credentialRotator,
         stuckTaskDetector: this.stuckTaskDetector,
         cliAgentRuntime: this.cliAgentRuntime?.bundle,
         pluginRunner: this.pluginRunner,
         messageStore: this.messageStore,
+        secretsStore,
         missionStore,
         reflectionService,
         // PR-entity nodes (U3): assemble the handler deps from the CLI-injected
@@ -741,16 +1762,17 @@ export class InProcessRuntime
         },
         onStart: (task, worktreePath) => {
           this.recordActivity();
-          runtimeLog.log(`Started executing task ${task.id} in ${worktreePath}`);
-          // Legacy invariant (implemented in EphemeralWorkerManager):
-          // if (this.taskAgentMap.has(task.id)) { ... "Skipping task-worker creation for" ... }
-          void this.workerManager?.onTaskStart(task);
+          /*
+          FNXC:EngineDiagnostics 2026-08-03-05:54:
+          Executor already emits `Starting ${id}` at dispatch; worktree path is also on
+          worktree-created / node-acquired lines. Demote this echo to debug.
+          */
+          runtimeLog.debug(`Started executing task ${task.id} in ${worktreePath}`);
         },
         onComplete: (task) => {
           this.recordActivity();
           runtimeLog.log(`Completed task ${task.id}`);
           this.recordTaskCompletion(task.id, true);
-          void this.workerManager?.onTaskComplete(task.id);
         },
         onError: (task, error) => {
           this.recordActivity();
@@ -763,8 +1785,23 @@ export class InProcessRuntime
             void (async () => {
               try {
                 const latest = await this.taskStore.getTask(task.id);
-                if (latest?.column === "in-progress") {
-                  await this.taskStore.moveTask(task.id, "todo");
+                /*
+                FNXC:WorkflowLifecycleColumns 2026-08-02-15:30 (fleet — GUARD AND DESTINATION together):
+                A mission task that errored is requeued from the WIP lane back to the HOLD lane. Both ends were
+                literals, so on a renamed board the guard never matched and the requeue never happened — the
+                errored mission task stayed in the wip lane holding a slot, which is worse than a requeue that
+                fails loudly.
+
+                Converting the guard alone would be worse still: it would admit the card and then move it to a
+                `todo` the board may not declare, `moveTask` rejects an unknown column, and the task stays put
+                with an exception in the log. A board that declares no hold lane keeps the card in place
+                deliberately — the same outcome it has today.
+                */
+                const requeueLifecycle = await resolveTaskLifecycleColumns(this.taskStore, task.id);
+                const requeueWip = requeueLifecycle?.wip ?? "in-progress";
+                const requeueHold = requeueLifecycle ? requeueLifecycle.hold : "todo";
+                if (latest?.column === requeueWip && requeueHold !== undefined) {
+                  await this.taskStore.moveTask(task.id, requeueHold as never);
                 }
               } catch (moveErr) {
                 runtimeLog.warn(`Failed to requeue mission task ${task.id} after error:`, moveErr);
@@ -772,7 +1809,6 @@ export class InProcessRuntime
             })();
           }
 
-          void this.workerManager?.onTaskError(task.id);
         },
       };
 
@@ -785,33 +1821,6 @@ export class InProcessRuntime
         this.executor.setMergeRequester(this.mergeRequester);
       }
 
-      this.worktreePool.setInvariantViolationHandler((violation: PoolInvariantViolation) => {
-        void (async () => {
-          try {
-            runtimeLog.warn(
-              `[worktree-pool] invariant violation detected (${violation.phase}) path=${violation.path} holder=${violation.existingHolder} requester=${violation.requestingTaskId}`,
-            );
-            const audit = createRunAuditor(this.taskStore, {
-              runId: generateSyntheticRunId("worktree-pool-invariant", violation.requestingTaskId),
-              taskId: violation.requestingTaskId,
-              agentId: "system",
-              phase: "execute",
-            });
-            await audit.database({
-              type: "worktree:pool-double-lease-detected",
-              target: violation.path,
-              metadata: violation,
-            });
-            await this.taskStore.logEntry(
-              violation.requestingTaskId,
-              `Worktree pool invariant violation (${violation.phase}): ${violation.path} is held by ${violation.existingHolder}`,
-            );
-          } catch (error) {
-            runtimeLog.warn(`Failed to process worktree pool invariant violation: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        })();
-      });
-
       await yieldEventLoop();
 
       // 6. Initialize HeartbeatMonitor (reuses AgentStore from step 5a)
@@ -823,6 +1832,7 @@ export class InProcessRuntime
         if (!chatLayer) throw new Error("Heartbeat ChatStore requires the project PostgreSQL AsyncDataLayer");
         /* FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Engine chat services share the authoritative project PostgreSQL layer and never reopen SQLite. */
         this.chatStore ??= new ChatStore(chatLayer);
+        await this.attachChatMemoryCaptureToExecutor();
         this.heartbeatMonitor = new HeartbeatMonitor({
           store: this.agentStore,
           agentStore: this.agentStore, // enables per-agent config resolution
@@ -834,6 +1844,8 @@ export class InProcessRuntime
           reflectionStore: reflectionStoreForService,
           reflectionService,
           selfImproveService,
+          credentialRotator: this.credentialRotator,
+          secretsStore,
           snapshotManager: autoClaimSnapshotManager,
           onMissed: (agentId, reason) => {
             runtimeLog.warn(`Agent ${agentId} missed heartbeat: ${reason}`);
@@ -911,29 +1923,6 @@ export class InProcessRuntime
         const isTimerManagedAgent = (agent: import("@fusion/core").Agent) =>
           isHeartbeatEnabledAgent(agent) && isTickableHeartbeatState(agent.state);
 
-        // Wire the ephemeral worker manager (now that the executor exists, so
-        // its spawned-child pending-deletion set can be consulted) and run
-        // the startup orphan sweep. See ephemeral-worker-manager.ts for the
-        // full lifecycle contract. Non-fatal: failures are logged and never
-        // block startup.
-        if (this.agentStore && !this.workerManager) {
-          this.workerManager = new EphemeralWorkerManager({
-            agentStore: this.agentStore,
-            taskStore: this.taskStore,
-            logger: runtimeLog,
-            isDeletionPendingExternal: (agentId) => this.executor?.isEphemeralDeletionPending(agentId) ?? false,
-            getSettings: async () => {
-              const settings = await this.taskStore.getSettings();
-              return { ephemeralAgentsEnabled: settings.ephemeralAgentsEnabled };
-            },
-          });
-        }
-        if (this.workerManager) {
-          this.workerManager.attachStateChangeListener();
-          void this.workerManager.reconcileOrphaned().catch((err) => {
-            runtimeLog.warn(`Deferred workerManager.reconcileOrphaned failed: ${err instanceof Error ? err.message : String(err)}`);
-          });
-        }
 
         // Register existing non-ephemeral, heartbeat-enabled agents in tickable states.
         try {
@@ -969,20 +1958,52 @@ export class InProcessRuntime
         this.taskStore,
         this.config.workingDirectory,
         {
-          semaphore: this.projectSemaphore,
           stuckTaskDetector: this.stuckTaskDetector,
+          usageLimitPauser: this.usageLimitPauser,
           agentStore: this.agentStore,
+          messageStore: this.messageStore,
           pluginRunner: this.pluginRunner,
           onSpecifyStart: (t) => {
             this.recordActivity();
-            runtimeLog.log(`Specifying ${t.id}...`);
+            /*
+            FNXC:EngineDiagnostics 2026-08-01-18:11:
+            Duplicate of triage's richer `Specifying ${id}: ${title}` planLog line. Keep this
+            short runtime echo on debug (FUSION_DEBUG=runtime) so planning start is not double-logged.
+            */
+            runtimeLog.debug(`Specifying ${t.id}...`);
           },
-          onSpecifyComplete: (t) => {
+          onSpecifyComplete: (t, report) => {
+            // Activity is recorded for EVERY outcome: a planning session ran either
+            // way, and idle detection must not depend on whether it released.
             this.recordActivity();
-            runtimeLog.log(`Specified ${t.id} → todo`);
+            void reactToSpecificationComplete({
+              taskId: t.id,
+              outcome: report.outcome,
+              getTask: (id) => Promise.resolve(this.taskStore.getTask(id)),
+              resolveIr: (id) => resolveWorkflowIrForTask(this.taskStore, id),
+              /*
+              FNXC:PlanningHandoffAtomicity 2026-08-13-03:49:
+              The report carries the planning session's own durable work item id so the
+              seeder can retire that exact predecessor row atomically with the successor
+              install. Without it the seeder raced triage's finally-block terminal
+              transition and bailed on its own caller (529 stranded cards in 18 days).
+              */
+              seed: (task, ir) => seedPreReleasePlanReviewContinuation(this.taskStore, task, ir, {
+                retirePredecessorId: report.planningWorkItemId,
+              }),
+              kick: () => this.kickWorkflowContinuationProcessor(),
+              log: (message) => runtimeLog.log(message),
+              warn: (message) => runtimeLog.warn(message),
+            }).catch((error) => {
+              runtimeLog.error(`Failed to start Todo plan review for ${t.id}:`, error);
+            });
           },
           onSpecifyError: (t, e) => {
             runtimeLog.error(`Triage failed for ${t.id}: ${e.message}`);
+          },
+          // Planning and execution share project admission capacity; this callback only nudges discovery.
+          onPlanningSlotReleased: () => {
+            void this.scheduler?.schedule();
           },
         },
       );
@@ -1001,6 +2022,18 @@ export class InProcessRuntime
             : new RoutineStoreClass(this.config.workingDirectory);
           await routineStore.init();
           this.routineStore = routineStore;
+
+          /*
+          FNXC:SettingsBackups 2026-08-13-23:51:
+          Backup settings can change while no engine is running, so startup must reconcile the
+          durable backup routine before the scheduler's first immediate tick. This both creates
+          an enabled schedule and removes a stale one when automatic backups are disabled.
+          */
+          try {
+            await syncBackupRoutine(routineStore, await this.taskStore.getSettings());
+          } catch (backupRoutineErr) {
+            runtimeLog.warn("Database backup routine reconciliation skipped:", backupRoutineErr instanceof Error ? backupRoutineErr.message : backupRoutineErr);
+          }
 
           if (this.heartbeatMonitor) {
             const aiPromptExecutor = await createAiPromptExecutor(this.config.workingDirectory);
@@ -1038,19 +2071,52 @@ export class InProcessRuntime
         const chatLayer2 = this.taskStore.getAsyncLayer();
         if (!chatLayer2) throw new Error("Self-healing ChatStore requires the project PostgreSQL AsyncDataLayer");
         this.chatStore ??= new ChatStore(chatLayer2);
+        await this.attachChatMemoryCaptureToExecutor();
       }
-      this.selfHealingManager = new SelfHealingManager(this.taskStore, {
+      /*
+      FNXC:PlanReviewLease 2026-07-26-20:40:
+      Resolve this engine's cluster node id once at start so review-gate leases can be attributed.
+      Attribution is what lets self-healing tell "a lease my own dead process left behind" from "a
+      peer node's lease that is genuinely running" — the former is reclaimed immediately, the latter
+      keeps the 15-minute staleness floor. Fail-soft: on any error the id stays undefined, leases are
+      written unattributed, and floor-only semantics (the pre-existing behavior) apply.
+      */
+      let localNodeId: string | undefined;
+      try {
+        const registeredNodes = await this.centralCore.listNodes();
+        localNodeId = registeredNodes.find((node) => node.type === "local")?.id;
+      } catch (error) {
+        runtimeLog.warn(`Could not resolve local node id for review-gate lease attribution: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.localNodeId = localNodeId;
+
+      this.selfHealingManager = createRuntimeSelfHealingManager(this.taskStore, this.scheduler, {
         rootDir: this.config.workingDirectory,
+        localNodeId,
         agentStore: this.agentStore,
         isWorktreeResumeReserved: this.cliAgentRuntime?.isWorktreeResumeReserved,
         recoverCompletedTask: (task) => this.executor.recoverCompletedTask(task),
         recoverFailedPreMergeStep: (task) => this.executor.recoverFailedPreMergeWorkflowStep(task),
+        /* FNXC:LifecycleContainment 2026-08-30-13:36: without this wiring the sweep's claim never reaches the recovery, so a refusal releases its claim and is re-narrated every five minutes. */
+        recoverFailedPreMergeStepDetailed: (task, options) => this.executor.recoverFailedPreMergeWorkflowStepDetailed(task, options),
         getExecutingTaskIds: () => this.executor?.getExecutingTaskIds() ?? new Set<string>(),
-        clearPhantomExecutorBinding: (taskId: string, options?: { preserveWorktrees?: boolean }) => this.executor?.clearPhantomExecutorBinding(taskId, options),
+        clearPhantomExecutorBinding: (taskId: string, options?: { preserveWorktrees?: boolean; externallyBlocked?: boolean }) => this.executor?.clearPhantomExecutorBinding(taskId, options),
+        /*
+        FNXC:NodeWorktreeIsolation 2026-07-29-06:05 (FN-6756):
+        Wire the read-only liveness probe. self-healing.ts's own comment records that
+        `releaseExecutorWorktreeOwnership` was a declared-but-never-wired option that
+        silently no-opped; an unwired probe here would be worse — `?.() === true` is
+        false when unwired, so every sweep gating on it would silently stop deferring
+        for live sessions and the FN-6756 fix would evaporate without a test failing.
+        */
+        hasLiveSessionSurface: (taskId: string) => this.executor?.hasLiveSessionSurface(taskId) ?? false,
         listWorktreeHolders: () => this.executor?.listWorktreeHolders() ?? [],
+        // FNXC:PlanningEvacuation 2026-07-25-23:00: the executor owns the release safety conditions.
+        releasePreExecutionWorktree: (taskId, reason) =>
+          this.executor?.releasePreExecutionWorktree(taskId, reason) ?? Promise.resolve(false),
         recoverApprovedTriageTask: (task) => this.triageProcessor?.recoverApprovedTask(task) ?? Promise.resolve(false),
         getPlanningTaskIds: () => this.triageProcessor?.getPlanningTaskIds() ?? new Set<string>(),
-        // FNXC:TaskTiming 2026-08-01-12:00: orphan planning recovery must defer
+        // FNXC:TaskTiming 2026-07-20-12:00: orphan planning recovery must defer
         // while executor-owned graph Plan Review holds the sole planning anchor.
         hasActivePlanningWorkflowSession: (taskId) => this.executor?.hasActivePlanningWorkflowSession(taskId) ?? false,
         reserveAdvancedTriageRecovery: (taskId) => this.triageProcessor?.tryReserveAdvancedRecovery(taskId),
@@ -1082,7 +2148,7 @@ export class InProcessRuntime
           }
           return this.missionExecutionLoop.reapStaleValidatorRuns(VALIDATOR_RUN_STALE_MAX_AGE_MS);
         },
-        reconcileAllMissionFeatures: async () => this.scheduler.reconcileAllMissionFeatures(),
+        reconcileAllMissionFeatures: async () => this.scheduler.reconcileAllMissionFeatures("self-healing"),
         chatStore: this.chatStore,
         messageStore: this.messageStore,
         restartDurableAgentHeartbeat: async (agentId: string, context: { reason: string; attempt: number }) => {
@@ -1103,7 +2169,18 @@ export class InProcessRuntime
           });
           return !!run;
         },
+      }, {
+        kick: () => this.kickWorkflowContinuationProcessor(),
       });
+      /*
+      FNXC:PauseGatedMaintenance 2026-08-13-03:08 (RUFU-076):
+      SelfHealingManager.start() is now itself pause-aware: it registers the settings:updated re-arm
+      listener unconditionally, but its periodic-maintenance timer is only armed when the project is not
+      paused (globalPause/enginePaused). This call runs before the startup pause gate below, yet a
+      project that starts paused never arms the setInterval that drives batch-1 git churn — fixing the
+      production perf collapse where pausing every project failed to cut CPU because maintenance ran at
+      the task-store/runtime level, not per-agent. The listener re-arms the timer on unpause.
+      */
       this.selfHealingManager.start();
       this.stuckTaskDetector.start();
       this.detachAgentLinkSync = attachAgentLinkSync({
@@ -1116,6 +2193,17 @@ export class InProcessRuntime
 
       // 8. Set up event forwarding from TaskStore
       this.setupEventForwarding();
+      /*
+      FNXC:CrossProcessDeleteObservation 2026-08-01-13:03:
+      Engine-owned stores do not call watch(), so runtime startup owns durable delete observation.
+      Start only after its bridge is attached so the initial poll cannot lose a cross-process delete.
+
+      FNXC:TaskDeletionWorktrees 2026-09-07-12:00:
+      SelfHealingManager is already started above, so its asynchronous worktree-cleanup listener exists
+      before the first outbox poll can redeliver a remote deletion. Git cleanup remains outside both the
+      outbox acknowledgement transaction and the original delete response.
+      */
+      await this.taskStore.startTaskDeletedOutboxConsumer();
 
       const startupSettings = await this.taskStore.getSettings();
       if (startupSettings.globalPause || startupSettings.enginePaused) {
@@ -1185,7 +2273,7 @@ export class InProcessRuntime
 
       // 13. Reconcile feature status for all active missions (not just autopilot)
       if (activeMissionStore) {
-        void this.scheduler.reconcileAllMissionFeatures();
+        void this.scheduler.reconcileAllMissionFeatures("startup");
       }
 
       // 14. Start MissionAutopilot background polling
@@ -1218,6 +2306,11 @@ export class InProcessRuntime
       }
 
       this.setStatus("active");
+      this.workflowContinuationTimer = setInterval(() => {
+        this.kickWorkflowContinuationProcessor();
+      }, 2_000);
+      this.workflowContinuationTimer.unref?.();
+      this.kickWorkflowContinuationProcessor();
       runtimeLog.log(`InProcessRuntime started for project ${this.config.projectId}`);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -1237,6 +2330,42 @@ export class InProcessRuntime
       this.emit("error", err);
       throw err;
     }
+  }
+
+  /**
+   * Close every process-local admission source without aborting work that is
+   * already running. Development source reload uses this boundary before it
+   * waits for the live-agent count to reach zero.
+   */
+  beginDrain(): void {
+    if (this.status !== "active") return;
+
+    this.setStatus("paused");
+    if (this.workflowContinuationTimer) {
+      clearInterval(this.workflowContinuationTimer);
+      this.workflowContinuationTimer = undefined;
+    }
+    const admissionStops: Array<readonly [string, () => void]> = [
+      ["self-healing manager", () => this.selfHealingManager?.stop()],
+      ["routine scheduler", () => this.routineScheduler?.stop()],
+      ["trigger scheduler", () => this.triggerScheduler?.stop()],
+      ["stuck task detector", () => this.stuckTaskDetector?.stop()],
+      ["heartbeat monitor", () => this.heartbeatMonitor?.stop()],
+      ["triage processor", () => this.triageProcessor?.stop()],
+      ["scheduler", () => this.scheduler?.stop()],
+      ["mission autopilot", () => this.missionAutopilot?.stop()],
+      ["mission execution loop", () => this.missionExecutionLoop?.stop()],
+    ];
+    for (const [label, stop] of admissionStops) {
+      try {
+        stop();
+      } catch (error) {
+        runtimeLog.warn(
+          `Failed to stop ${label} while draining ${this.config.projectId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    runtimeLog.log(`InProcessRuntime draining for ${this.config.projectId}`);
   }
 
   /**
@@ -1272,14 +2401,16 @@ export class InProcessRuntime
     */
     const backendShutdown = this.backendShutdown;
     this.backendShutdown = undefined;
+    // FNXC:TaskDeleteNotice 2026-07-26-16:10: drop the mailbox seam first so a stopping runtime
+    // cannot keep writing notices; the unregister is identity-guarded against a newer runtime.
+    this.unregisterTaskDeleteNoticeMailbox?.();
+    this.unregisterTaskDeleteNoticeMailbox = undefined;
     let stopError: Error | undefined;
     try {
-      // 1. Remove concurrency change listener (if we registered one)
-      if (this.concurrencyChangedListener && typeof this.centralCore.off === "function") {
-        this.centralCore.off("concurrency:changed", this.concurrencyChangedListener);
-        this.concurrencyChangedListener = undefined;
+      if (this.workflowContinuationTimer) {
+        clearInterval(this.workflowContinuationTimer);
+        this.workflowContinuationTimer = undefined;
       }
-
       // 2. Stop self-healing manager
       if (this.selfHealingManager) {
         this.selfHealingManager.stop();
@@ -1313,8 +2444,6 @@ export class InProcessRuntime
       // 3. Tear down the ephemeral worker manager (detaches the
       // agent:stateChanged listener and clears in-memory tracking). Safe to
       // call when uninitialized.
-      this.workerManager?.detachStateChangeListener();
-      this.workerManager?.reset();
       this.executor?.disposeEphemeralTimers();
 
       // 4. Stop trigger scheduler
@@ -1425,29 +2554,22 @@ export class InProcessRuntime
         );
       }
 
-      /**
-       * FNXC:Scheduler-Concurrency 2026-06-27-20:05:
-       * After stop aborts a project's agents and waits the bounded drain window, any slots still attributed to this runtime are residual leaks from sessions that did not settle their normal finally path. Return only this project's scoped slots so pauseProject/stopAll promptly free shared global capacity without clobbering other projects' active slots.
-       */
-      const returnedResidualSlots = this.projectSemaphore?.returnAllHeldSlots() ?? 0;
-      if (returnedResidualSlots > 0) {
-        runtimeLog.warn(
-          `Returned ${returnedResidualSlots} residual global concurrency slot(s) after project stop drain`,
-        );
-      }
+      /*
+      FNXC:CapacityModel 2026-07-28-20:10 (drop the cross-project cap):
+      The residual-slot return on stop is GONE with the scoped semaphore it drained.
+      There is no shared cross-project pool left to leak INTO, so a session that
+      skips its finally path can no longer strand capacity belonging to another
+      project. Per-project capacity is derived from live task rows by the hold/
+      release sweep, which recomputes occupancy every pass rather than tracking a
+      counter that can drift.
+      */
 
       // 8. Shutdown plugin runner
       if (this.pluginRunner) {
+        // FNXC:CliRuntimeRouting 2026-08-16-14:37: retract the ambient default runner published at init so bare createFnAgent callers never resolve a shut-down runner.
+        unregisterDefaultAgentPluginRunner(this.config.workingDirectory);
         await this.pluginRunner.shutdown();
         runtimeLog.log("PluginRunner shutdown complete");
-      }
-
-      // 9. Drain and cleanup worktree pool
-      if (this.worktreePool) {
-        const worktrees = this.worktreePool.drain();
-        if (worktrees.length > 0) {
-          runtimeLog.log(`Drained ${worktrees.length} worktrees from pool`);
-        }
       }
 
       this.leaseCentralClaimStore = undefined;
@@ -1521,7 +2643,7 @@ export class InProcessRuntime
     this.activeMergeAborter = abortActiveMerge;
   }
 
-  setMergePendingProvider(isMergePending: (taskId: string) => boolean): void {
+  setMergePendingProvider(isMergePending: (taskId: string) => boolean | Promise<boolean>): void {
     this.mergePendingProvider = isMergePending;
   }
 
@@ -1621,6 +2743,62 @@ export class InProcessRuntime
   }
 
   /**
+   * FNXC:RUFU121RuntimeProjectIdentity 2026-08-18-19:53:
+   * RUFU-121 Step 4: resolve this runtime's project identity ONCE per start —
+   * projectId from the runtime config, projectName from CentralCore.getProject
+   * (the Step 3 central accessor). Best-effort: an unreachable central DB, an
+   * unknown project id, or a name-less row degrades projectName to null; the
+   * per-project Stash session folder still resolves by the stable external_key
+   * fusion-<projectId>. The cached promise is reused by both attach call sites.
+   */
+  private resolveProjectIdentity(): Promise<{ projectId: string | null; projectName: string | null }> {
+    if (!this.projectIdentityCache) {
+      const projectId = this.config.projectId ?? null;
+      this.projectIdentityCache = (async () => {
+        let projectName: string | null = null;
+        if (projectId) {
+          try {
+            const project = await this.centralCore.getProject(projectId);
+            if (project && typeof project.name === "string" && project.name.length > 0) {
+              projectName = project.name;
+            }
+          } catch {
+            // Central DB unreachable or not initialized — never block runtime start.
+            projectName = null;
+          }
+        }
+        return { projectId, projectName };
+      })();
+    }
+    return this.projectIdentityCache;
+  }
+
+  /**
+   * FNXC:MemoryCapture 2026-08-13-18:05:
+   * RUFU-068: Once the project ChatStore exists, wire the executor's complete-chat memory
+   * capture onto it so live conversations flow into the Stash memory backend as they happen
+   * (best-effort / fail-closed). The facade attach is idempotent, so double-invocation from the
+   * two `chatStore ??=` construction sites is safe.
+   *
+   * FNXC:RUFU121AttachIdentity 2026-08-18-19:53:
+   * RUFU-121 Step 4: now async — resolves the project identity (cached, best-effort) and
+   * passes it to the attach so captured events are stamped to the per-project Stash session
+   * folder. Awaited at both runtime-start call sites; a resolution failure degrades to a
+   * null name and never blocks startup.
+   */
+  private async attachChatMemoryCaptureToExecutor(): Promise<void> {
+    if (!this.executor || !this.chatStore) return;
+    try {
+      const projectIdentity = await this.resolveProjectIdentity();
+      this.executor.attachChatMemoryCapture(this.chatStore, projectIdentity);
+    } catch (error) {
+      runtimeLog.warn(
+        `Chat memory capture attach failed (best-effort, non-blocking): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
    * Get the project-scoped PluginRunner (if initialized).
    * Dashboard chat needs this runner, not the top-level PluginLoader, so
    * runtime hints such as `hermes` can resolve plugin runtimes correctly.
@@ -1664,8 +2842,13 @@ export class InProcessRuntime
       ? (this.executor as unknown as { activeWorktrees?: Map<string, string> }).activeWorktrees?.size ?? 0
       : 0;
 
-    // Get active agent count from the semaphore
-    const activeAgents = this.globalSemaphore?.activeCount ?? 0;
+    /*
+    FNXC:CapacityModel 2026-07-28-20:10 (drop the cross-project cap):
+    Active-agent load now comes from the executor's live worktree map rather than a
+    semaphore counter. The counter was a second bookkeeping of the same fact and
+    needed its own leak reaper when the two drifted.
+    */
+    const activeAgents = inFlightTasks;
 
     // Get memory usage if available
     const memoryBytes = process.memoryUsage?.().heapUsed;
@@ -1796,6 +2979,179 @@ export class InProcessRuntime
   }
 
   /**
+   * FNXC:WorkflowScheduling 2026-07-21-12:20:
+   * Wake the durable task-continuation consumer in a microtask so triage can
+   * release its own execution slot before continuation dispatch begins.
+   */
+  private kickWorkflowContinuationProcessor(): void {
+    queueMicrotask(() => {
+      void this.drainWorkflowContinuations().catch((error) => {
+        runtimeLog.error("Workflow continuation processor failed:", error);
+      });
+    });
+  }
+
+  /**
+   * FNXC:WorkflowScheduling 2026-07-21-12:20:
+   * A single runtime drain owns selection at a time. Concurrent wakeups collapse
+   * behind this guard and the recurring processor supplies the next bounded pass.
+   *
+   * FNXC:WorkflowScheduling 2026-09-09-23:18:
+   * A wake published while a drain is unwinding must remain pending and start one
+   * follow-up pass after ownership clears. Dropping that edge makes a continuation
+   * returned to runnable during dispatch settlement wait for the periodic timer.
+   *
+   * The pass itself lives in `drainDuePlanningContinuations` (see its header for
+   * the FN-8470/FN-8471 orphan rationale and the deferral); this method is the
+   * runtime-lifecycle wrapper — re-entry guard, active-status check, and the
+   * adapters that bind the pass to this runtime's store and executor.
+   */
+  private async drainWorkflowContinuations(): Promise<void> {
+    if (this.status !== "active") return;
+    if (this.workflowContinuationDrainActive) {
+      this.workflowContinuationDrainPending = true;
+      /* FNXC:PumpWatchdog 2026-08-01-02:00: one hung pass leaves the guard closed forever and every later tick/wake drops SILENTLY (the triage-poll death, 00769fad7c/e51ebff381). Past the threshold, warn with the stuck duration and force the guard open; a generation fence prevents the superseded pass's finally from clearing its successor. */
+      const stuckMs = this.workflowContinuationDrainSince > 0 ? Date.now() - this.workflowContinuationDrainSince : 0;
+      if (stuckMs < 300_000) return;
+      runtimeLog.warn(`continuation-drain watchdog: previous drain still marked in-flight after ${Math.round(stuckMs / 1000)}s — forcing the guard open`);
+    }
+    this.workflowContinuationDrainActive = true;
+    this.workflowContinuationDrainPending = false;
+    this.workflowContinuationDrainSince = Date.now();
+    const drainGeneration = ++this.workflowContinuationDrainGeneration;
+    /*
+    FNXC:EnginePause 2026-08-01-00:20:
+    A pause-suspended run persists a runnable continuation (same mechanism as capacity). Without
+    this gate the drain would re-dispatch it on the next tick and the graph would bounce
+    suspend→dispatch→suspend forever while paused — and worse, dispatch genuinely new work under
+    Stop AI Engine. Settings are re-read here (not event-driven) for the same reason as the
+    boundary probe: the pause must bind even if `settings:updated` never reaches this instance.
+    */
+    try {
+      const settings = await this.taskStore.getSettings();
+      if (settings.globalPause === true || settings.enginePaused === true) return;
+    } catch {
+      /* unreadable settings: proceed as before rather than wedging the pump */
+    }
+    const isPlannerLive = (taskId: string) => isTaskPlanningOrExecutionLive(taskId, {
+      activeSessionRegistry: { pathsForTask: () => [], isPathActive: () => false },
+      executingTaskLock: { has: () => false },
+      isTaskActive: () => false,
+      getPlanningTaskIds: () => this.triageProcessor?.getPlanningTaskIds() ?? new Set<string>(),
+    });
+    try {
+      await drainDuePlanningContinuations({
+        listDue: () => this.taskStore.listDueWorkflowWorkItems({
+          kinds: ["task"],
+          states: ["runnable", "retrying"],
+          limit: DUE_PLANNING_CONTINUATION_BATCH_LIMIT,
+        }),
+        getTask: (taskId) => Promise.resolve(this.taskStore.getTask(taskId)),
+        /* FNXC:WorkflowLifecycleColumns 2026-08-02-15:20 (fleet): the PRODUCTION resolver for the drain's
+           terminal check — the pure pass keeps the built-in Done fallback when this is omitted. One IR read per due item, and the batch is capped by
+           DUE_PLANNING_CONTINUATION_BATCH_LIMIT. */
+        resolveTerminalColumns: async (taskId) => {
+          const lifecycle = await resolveTaskLifecycleColumns(this.taskStore, taskId);
+          return new Set([
+            lifecycle?.complete ?? "done",
+            "done",
+          ]);
+        },
+        /*
+        FNXC:PlanningContinuationDispatch 2026-09-06-00:29:
+        Restrict the shared predicate to its two planning inputs here. Executor liveness is already
+        governed by `admitPlanningContinuation`; folding it into this transient handoff guard would
+        broaden dispatch policy and could indefinitely defer a continuation the executor owns.
+        */
+        isPlannerLive,
+        cancelOrphan: (item, reason) => this.cancelOrphanedWorkflowWorkItem(item, reason),
+        defer: (deferral) => this.deferParkedWorkflowWorkItem(deferral),
+        dispatch: createPlanningContinuationDispatcher({
+          store: this.taskStore,
+          projectId: this.taskStore.getRootDir(),
+          execute: (task) => this.executor.execute(task),
+          isPlannerLive,
+          kick: () => this.kickWorkflowContinuationProcessor(),
+          onError: (_task, item, error) => {
+            runtimeLog.error(`Workflow continuation ${item.id} failed:`, error);
+          },
+        }),
+        nowMs: () => Date.now(),
+        warn: (message) => runtimeLog.warn(message),
+      });
+    } finally {
+      if (this.workflowContinuationDrainGeneration === drainGeneration) {
+        this.workflowContinuationDrainActive = false;
+        this.workflowContinuationDrainSince = 0;
+        if (this.workflowContinuationDrainPending) {
+          this.workflowContinuationDrainPending = false;
+          this.kickWorkflowContinuationProcessor();
+        }
+      }
+    }
+  }
+
+  /**
+   * FNXC:PlanApprovalHold 2026-07-27-21:30 (U7, PR #2491 review — greptile P1):
+   * Push an operator-parked item's `retryAfter` forward so it leaves the due
+   * window. State stays `runnable` on purpose (see
+   * `PARKED_CONTINUATION_DEFER_MS`).
+   *
+   * Fail-soft: if the write loses, the item simply stays due and is re-skipped
+   * next pass — exactly the pre-deferral behavior — so a store hiccup degrades to
+   * the old starvation risk rather than dropping the card's continuation.
+   */
+  private async deferParkedWorkflowWorkItem(
+    deferral: { itemId: string; expectedState: WorkflowWorkItemState; retryAfter: string },
+  ): Promise<void> {
+    if (typeof this.taskStore.transitionWorkflowWorkItem !== "function") return;
+    try {
+      // `expectedState` makes this a compare-and-set: if another node claimed or
+      // terminalized the item since the due poll, the store returns it untouched.
+      await this.taskStore.transitionWorkflowWorkItem(deferral.itemId, deferral.expectedState, {
+        expectedState: deferral.expectedState,
+        retryAfter: deferral.retryAfter,
+      });
+    } catch (error) {
+      runtimeLog.warn(
+        `Failed to defer parked workflow work item ${deferral.itemId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * FNXC:WorkflowScheduling 2026-07-21-22:31:
+   * Terminalize a due work item whose task can no longer host graph work so the
+   * FIFO due poll no longer revisits it every 2s. Fail-soft: a transition race
+   * must not abort the rest of the drain.
+   */
+  private async cancelOrphanedWorkflowWorkItem(
+    item: WorkflowWorkItem,
+    reason: "task-not-found" | "task-terminal",
+  ): Promise<void> {
+    if (typeof this.taskStore.transitionWorkflowWorkItem !== "function") return;
+    try {
+      await this.taskStore.transitionWorkflowWorkItem(item.id, "cancelled", {
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: `orphaned-continuation:${reason}`,
+        blockedReason: reason,
+      });
+      runtimeLog.log(
+        `Cancelled orphaned workflow work item ${item.id} (task=${item.taskId}, node=${item.nodeId}, reason=${reason})`,
+      );
+    } catch (error) {
+      runtimeLog.warn(
+        `Failed to cancel orphaned workflow work item ${item.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * Execute a heartbeat run for an agent.
    *
    * Delegates to HeartbeatMonitor.executeHeartbeat().
@@ -1840,6 +3196,7 @@ export class InProcessRuntime
    */
   setUsageLimitPauser(pauser: UsageLimitPauser): void {
     this.usageLimitPauser = pauser;
+    pauser.setCredentialRotator(this.credentialRotator);
   }
 
   /**
@@ -1847,6 +3204,18 @@ export class InProcessRuntime
    * for task:created, task:moved, task:updated, and task:deleted.
    */
   private setupEventForwarding(): void {
+    /*
+    FNXC:Workspace 2026-08-15-05:28:
+    publishSettingsUpdated reconciles workspace.json before this event, so only a payload with a
+    real boolean transition may invalidate the executor's per-host cache. Failed/corrected toggles
+    deliberately retain their valid cache rather than resolving a mode the store disowned.
+    */
+    this.taskStore.on("settings:updated", ({ settings, previous }: { settings: { workspaceMode?: boolean }; previous: { workspaceMode?: boolean } }) => {
+      if ((settings.workspaceMode === true) !== (previous.workspaceMode === true)) {
+        this.executor?.invalidateWorkspaceConfig();
+      }
+    });
+
     // Forward task:created events
     this.taskStore.on("task:created", (task: Task) => {
       this.recordActivity();
@@ -1856,25 +3225,48 @@ export class InProcessRuntime
     // Forward task:moved events
     this.taskStore.on("task:moved", (data: { task: Task; from: string; to: string }) => {
       this.recordActivity();
-      if (data.to === "archived") {
-        /*
-        FNXC:TaskDetailPlannerChatRetention 2026-06-30-18:45:
-        In-process task archival is the retention cutoff for task-local planner chats. Keep interacted planner chats when tasks reach done, but delete exact task-planner sessions on archive through ChatStore so normal conversations and other tasks remain untouched.
-        */
-        void this.chatStore?.deleteSessionsForAgentId(`${TASK_PLANNER_CHAT_AGENT_ID_PREFIX}${data.task.id}`, { projectId: this.config.projectId });
-      }
       this.emit("task:moved", data);
     });
 
     // Forward task:updated events
     this.taskStore.on("task:updated", (task: Task) => {
       this.recordActivity();
+      if (task.status === "awaiting-approval") {
+        this.approvalHeldTaskIds.add(task.id);
+        this.approvalReleasedTaskIds.delete(task.id);
+      } else if (
+        !task.status
+        && !task.paused
+        && !task.userPaused
+        && (
+          this.approvalHeldTaskIds.delete(task.id)
+          || (
+            (Boolean(task.approvedPlanFingerprint) || task.workflowStepResults?.some(isPlanReviewSatisfied) === true)
+            && !this.approvalReleasedTaskIds.has(task.id)
+          )
+        )
+      ) {
+        this.approvalReleasedTaskIds.add(task.id);
+        void wakeApprovedPlanningContinuations({
+          taskId: task.id,
+          list: (taskId) => this.taskStore.listWorkflowWorkItemsForTask(taskId),
+          transition: (itemId, state, patch) => this.taskStore.transitionWorkflowWorkItem(itemId, state, patch),
+          kick: () => this.kickWorkflowContinuationProcessor(),
+          warn: (message) => runtimeLog.warn(message),
+        });
+      }
       this.emit("task:updated", task);
     });
 
-    // Forward task:deleted events
-    this.taskStore.on("task:deleted", (task: Task, meta?: { githubIssueAction?: GithubIssueAction }) => {
+    /*
+    FNXC:CrossProcessDeleteObservation 2026-08-01-12:02:
+    Preserve observed outbox provenance through the runtime bridge. Downstream project and IPC
+    bridges must distinguish cross-process deletion delivery without re-running writer effects.
+    */
+    this.taskStore.on("task:deleted", (task: Task, meta?: { githubIssueAction?: GithubIssueAction; observed?: boolean; outboxEventId?: string }) => {
       this.recordActivity();
+      this.approvalHeldTaskIds.delete(task.id);
+      this.approvalReleasedTaskIds.delete(task.id);
       this.emit("task:deleted", task, meta);
     });
 
@@ -1900,20 +3292,12 @@ export class InProcessRuntime
     this.lastActivityAt = new Date().toISOString();
   }
 
-  /**
-   * Get global concurrency limit from CentralCore.
-   */
-  private async getGlobalConcurrencyLimit(): Promise<number> {
-    try {
-      const state = await this.centralCore.getGlobalConcurrencyState();
-      return state.globalMaxConcurrent;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      runtimeLog.warn(`Failed to fetch global concurrency from CentralCore, falling back to default (4): ${msg}`);
-      // Fallback to default if CentralCore is unavailable
-      return 4;
-    }
-  }
+  /*
+  FNXC:CapacityModel 2026-07-28-23:30 (drop the cross-project cap — settings half):
+  `getGlobalConcurrencyLimit` is DELETED. Its only caller was the global semaphore
+  construction removed in the enforcement half, so it has been reading a limit
+  nothing consults. Capacity is two numbers per project.
+  */
 
   /**
    * Record task completion in CentralCore.

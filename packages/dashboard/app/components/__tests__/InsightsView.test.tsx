@@ -20,6 +20,7 @@ vi.mock("../../hooks/useInsights", () => ({
   },
 }));
 
+
 // Mock lucide-react icons
 vi.mock("lucide-react", () => ({
   Sparkles: ({ size = 24, className = "" }: { size?: number; className?: string }) => (
@@ -99,6 +100,7 @@ describe("InsightsView", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+
     mockUseInsights.mockReturnValue({
       sections: mockSections,
       loading: false,
@@ -250,6 +252,47 @@ describe("InsightsView", () => {
       expect(screen.getByTestId("insights-category-trends")).toBeInTheDocument();
       // Detail pane shows the first populated section by default
       expect(screen.getByTestId("insights-section-features")).toBeInTheDocument();
+    });
+
+    it("renders active-section insight titles newest-first in document order", () => {
+      mockUseInsights.mockReturnValue({
+        sections: [
+          {
+            ...mockSections[0],
+            items: [
+              { id: "INS-NEW", projectId: "test", title: "Newest insight", content: "", category: "features", status: "generated", fingerprint: "fp-new", provenance: { trigger: "manual" }, lastRunId: null, createdAt: "2026-03-01T00:00:00Z", updatedAt: "2026-03-01T00:00:00Z" },
+              { id: "INS-MID", projectId: "test", title: "Middle insight", content: "", category: "features", status: "generated", fingerprint: "fp-mid", provenance: { trigger: "manual" }, lastRunId: null, createdAt: "2026-02-01T00:00:00Z", updatedAt: "2026-02-01T00:00:00Z" },
+              { id: "INS-OLD", projectId: "test", title: "Oldest insight", content: "", category: "features", status: "generated", fingerprint: "fp-old", provenance: { trigger: "manual" }, lastRunId: null, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+            ],
+          },
+          ...mockSections.slice(1),
+        ],
+        loading: false,
+        error: null,
+        latestRun: null,
+        isRunInFlight: false,
+        runError: null,
+        refresh: vi.fn(),
+        runInsights: vi.fn(),
+        dismiss: vi.fn(),
+        createTask: vi.fn(),
+        archive: vi.fn(),
+        unarchive: vi.fn(),
+        toggleShowArchived: vi.fn(),
+        dismissStates: new Map(),
+        createTaskStates: new Map(),
+        archiveStates: new Map(),
+        unarchiveStates: new Map(),
+        totalCount: 3,
+        dismissedCount: 0,
+        archivedCount: 0,
+        showArchived: false,
+      });
+
+      const { container } = render(<InsightsView {...defaultProps} />);
+
+      expect([...container.querySelectorAll(".insight-item-title")].map((node) => node.textContent))
+        .toEqual(["Newest insight", "Middle insight", "Oldest insight"]);
     });
 
     it("should render loading state", () => {
@@ -1459,4 +1502,5 @@ describe("InsightsView", () => {
       expect(css).toMatch(/@media[^{]*\(min-width:\s*769px\)\s*and\s*\(max-width:\s*1024px\)[^{]*\{[\s\S]*?\.insights-detail\s*\{[^}]*flex:\s*1\s+1\s+0;[^}]*min-width:\s*0;[^}]*min-inline-size:\s*0;[^}]*overflow-y:\s*auto;[^}]*\}/);
     });
   });
+
 });

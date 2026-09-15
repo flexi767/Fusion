@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { loadAllAppCss, loadAllAppCssBaseOnly } from "../../test/cssFixture";
 import { Header } from "../Header";
 import { ResearchView } from "../ResearchView";
@@ -29,6 +30,24 @@ vi.mock("../../api", () => ({
   fetchSettings: (...args: unknown[]) => mockFetchSettings(...args),
   fetchAuthStatus: (...args: unknown[]) => mockFetchAuthStatus(...args),
   fetchTasks: (...args: unknown[]) => mockFetchTasks(...args),
+  /*
+  FNXC:ResearchViewTests 2026-07-31-20:24:
+  This factory REPLACES the whole `../../api` module, so every import anywhere in the rendered tree
+  must appear here or it resolves to undefined. `fetchBoardWorkflows` reached this file indirectly —
+  the task modals ResearchView opens import it — and its absence failed four cases with
+  `No "fetchBoardWorkflows" export is defined on the "../../api" mock`, none of which are about board
+  workflows.
+
+  Returns the flag-OFF payload the server sends when multi-lane boards are disabled, which is the
+  shape these cases already assume: no board metadata, legacy rendering, and the consumers'
+  `.then()` handlers take their empty-state path rather than a fabricated workflow list.
+  */
+  fetchBoardWorkflows: vi.fn().mockResolvedValue({
+    flagEnabled: false,
+    defaultWorkflowId: "",
+    workflows: [],
+    taskWorkflowIds: {},
+  }),
 }));
 
 vi.mock("lucide-react", async (importOriginal) => {
@@ -273,7 +292,14 @@ describe("ResearchView", () => {
     });
   });
 
+  /*
+  FNXC:ResearchEnrich 2026-08-01-02:35:
+  The enrich control is a real editable combobox, not a broken product path. Drive it with
+  per-character user input so this regression test validates the same state updates as a user;
+  synthetic change events previously masked that interaction contract.
+  */
   it("triggers enrich-task action from finding modal", async () => {
+    const user = userEvent.setup();
     const attachRunToTask = vi.fn().mockResolvedValue({});
     mockUseResearch.mockReturnValue({
       ...baseHookValue,
@@ -296,8 +322,8 @@ describe("ResearchView", () => {
 
     const enrichDialog = await screen.findByRole("dialog");
     const targetInput = within(enrichDialog).getByRole("combobox", { name: "Target task" });
-    fireEvent.change(targetInput, { target: { value: "FN-1" } });
-    fireEvent.click(within(enrichDialog).getByRole("button", { name: "Enrich Task" }));
+    await user.type(targetInput, "FN-1");
+    await user.click(within(enrichDialog).getByRole("button", { name: "Enrich Task" }));
 
     await waitFor(() => {
       expect(attachRunToTask).toHaveBeenCalledWith("RR-1", "FN-1", "finding-1", false);
@@ -515,7 +541,8 @@ describe("ResearchView", () => {
     });
   });
 
-  it("keeps enrich action disabled until a task id is provided", async () => {
+  it("keeps enrich action disabled for empty and whitespace-only task ids, then enables for a typed id", async () => {
+    const user = userEvent.setup();
     mockUseResearch.mockReturnValue({
       ...baseHookValue,
       runs: [{ id: "RR-1", title: "t", query: "q", status: "completed" }],
@@ -539,7 +566,10 @@ describe("ResearchView", () => {
     expect(enrichButton).toBeDisabled();
 
     const targetInput = within(dialog).getByRole("combobox", { name: "Target task" });
-    fireEvent.change(targetInput, { target: { value: "FN-1" } });
+    await user.type(targetInput, "   ");
+    expect(enrichButton).toBeDisabled();
+    await user.clear(targetInput);
+    await user.type(targetInput, "FN-1");
     await waitFor(() => expect(enrichButton).not.toBeDisabled());
   });
 

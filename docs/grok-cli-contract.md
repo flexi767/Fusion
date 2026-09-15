@@ -32,11 +32,12 @@ The previously documented https://github.com/superagent-ai/grok-cli contract is 
 Fusion's `GrokRuntimeAdapter` drives Grok as an ACP (Agent Client Protocol) agent over JSON-RPC/stdio, following [xAI Headless & Scripting](https://docs.x.ai/build/cli/headless-scripting#acp):
 
 ```bash
-# Official automation shape (docs.x.ai): suppress update checks in CI/scripts
-grok --no-auto-update agent stdio
+grok agent stdio
 # with optional model + session skills plugin:
-grok --no-auto-update agent --plugin-dir <session-plugin> -m grok-4.5 stdio
+grok agent --plugin-dir <session-plugin> -m grok-4.6 stdio
 ```
+
+xAI's [Headless & Scripting docs](https://docs.x.ai/build/cli/headless-scripting#acp) suggest `--no-auto-update`, but released Grok CLI v1.0.0 exits with "unexpected argument" when it is passed. Fusion therefore defaults it OFF and exposes it only as the opt-in `buildGrokAcpArgs({ noAutoUpdate: true })` argument, which prepends the flag before `agent`.
 
 ACP session lifecycle (official contract):
 
@@ -77,7 +78,7 @@ mcpServers through createResolvedAgentSession. Grok ACP must not drop them.
 
 When custom Fusion tools were requested but the bridge cannot start, the session emits `FUSION_TOOL_BRIDGE_FAILED: mcp-schema-server-missing` or `FUSION_TOOL_BRIDGE_FAILED: bridge-start-failed`. It deliberately omits the broken MCP server entry, and the engine records `fusionToolBridgeFailed`, its fixed reason code, and a requested-tool count on the ids-only `session:runtime-resolved` run-audit event. Paths, schemas, error prose, and credentials are not persisted there.
 
-Grok ACP sessions store a string model plus `lastModelDescription`; lane markers normalize this to `grok/<model>` (for example `grok/grok-4.5`) before appending thinking metadata, never `undefined/undefined`.
+Grok ACP sessions store a string model plus `lastModelDescription`; lane markers normalize this to `grok/<model>` (for example `grok/grok-4.6`) before appending thinking metadata, never `undefined/undefined`.
 
 ### Session lifecycle
 

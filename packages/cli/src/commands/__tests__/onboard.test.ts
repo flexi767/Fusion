@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -8,6 +8,7 @@ const mockRunInit = vi.fn(async () => {});
 const mockResolveProject = vi.fn();
 const mockProviderAuthFactory = vi.fn();
 const mockGetDefaultCentralDbPath = vi.fn();
+const mockGetModelRegistryModelsPath = vi.fn(() => "/tmp/models.json");
 
 const globalSettingsState: Record<string, any> = {};
 
@@ -38,7 +39,7 @@ vi.mock("../provider-auth.js", () => ({
   wrapAuthStorageWithApiKeyProviders: vi.fn(() => mockProviderAuthFactory()),
 }));
 vi.mock("../auth-paths.js", () => ({
-  getModelRegistryModelsPath: vi.fn(() => "/tmp/models.json"),
+  getModelRegistryModelsPath: mockGetModelRegistryModelsPath,
 }));
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   ModelRegistry: { create: vi.fn(() => ({})) },
@@ -54,6 +55,7 @@ vi.mock("@fusion/core", () => ({
 }));
 
 const { __testUtils, runOnboard } = await import("../onboard.js");
+const { composeLocalProviderRegistry, normalizeLocalBaseUrl, parseModelIds, persistLocalProviderRegistry } = __testUtils;
 
 function inputFrom(lines: string[]): PassThrough {
   const input = new PassThrough();
@@ -96,6 +98,7 @@ describe("onboard", () => {
     vi.clearAllMocks();
     for (const key of Object.keys(globalSettingsState)) delete globalSettingsState[key];
     mockGetDefaultCentralDbPath.mockReturnValue(join(mkdtempSync(join(tmpdir(), "fn-onboard-db-")), "fusion-central.db"));
+    mockGetModelRegistryModelsPath.mockReturnValue(join(mkdtempSync(join(tmpdir(), "fn-onboard-models-")), "models.json"));
     mockResolveProject.mockRejectedValue(new Error("no project"));
   });
 
@@ -130,13 +133,37 @@ describe("onboard", () => {
     choiceSession.close();
   });
 
+  it("composes and persists custom providers without losing registry fields", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "fn-models-")), "nested", "models.json");
+    const config = {
+      id: "local", name: "Local", baseUrl: normalizeLocalBaseUrl("http://localhost:8080/v1/"),
+      modelIds: parseModelIds("qwen, , qwen, llama"), reasoning: true, qwenChatTemplate: true,
+    };
+    persistLocalProviderRegistry(path, config);
+    const first = JSON.parse(readFileSync(path, "utf8"));
+    expect(first.providers.local.apiKey).toBeUndefined();
+    expect(first.providers.local.baseUrl).toBe("http://localhost:8080/v1");
+    expect(first.providers.local.models).toEqual([
+      { id: "qwen", reasoning: true, compat: { thinkingFormat: "qwen-chat-template", chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" } } } },
+      { id: "llama", reasoning: true, compat: { thinkingFormat: "qwen-chat-template", chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" } } } },
+    ]);
+
+    const merged = composeLocalProviderRegistry({ unknownTop: true, providers: { local: { unknown: "kept", models: [{ id: "old" }] }, other: { api: "other" } } }, { ...config, apiKey: "secret", modelIds: ["new"], reasoning: false, qwenChatTemplate: false });
+    expect(merged).toMatchObject({ unknownTop: true, providers: { other: { api: "other" }, local: { unknown: "kept", apiKey: "secret", models: [{ id: "old" }, { id: "new" }] } } });
+    expect(() => composeLocalProviderRegistry([], config)).toThrow("JSON object");
+    writeFileSync(path, "{ not json");
+    expect(() => persistLocalProviderRegistry(path, config)).toThrow("Cannot update malformed");
+    expect(readFileSync(path, "utf8")).toBe("{ not json");
+    expect(() => normalizeLocalBaseUrl("relative")).toThrow("absolute http");
+  });
+
   it("runOnboard initializes central db when missing", async () => {
     const providerAuth = makeProviderAuth();
     mockProviderAuthFactory.mockReturnValue(providerAuth);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     await runOnboard({
-      input: inputFrom(["y", "y", "3", "y", "y", "n", "y"]),
+      input: inputFrom(["y", "4", "y", "y", "n", "y"]),
     });
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Creating central DB"));
     expect(centralInitMock).toHaveBeenCalled();
@@ -150,8 +177,24 @@ describe("onboard", () => {
     writeFileSync(existingPath, "db");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    await runOnboard({ input: inputFrom(["y", "3", "y", "y", "n", "y"]) });
+    await runOnboard({ input: inputFrom(["y", "4", "y", "y", "n", "y"]) });
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Central DB already exists"));
+  });
+
+  it("registers a blank-key local provider through the custom picker", async () => {
+    mockProviderAuthFactory.mockReturnValue(makeProviderAuth());
+    const path = mockGetModelRegistryModelsPath();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runOnboard({
+      input: inputFrom(["y", "3", "local", "Local server", "http://localhost:8080/v1/", "", "qwen, , qwen", "y", "y", "n", "n", "n"]),
+    });
+
+    const registry = JSON.parse(readFileSync(path, "utf8"));
+    expect(registry.providers.local).toMatchObject({ api: "openai-completions", baseUrl: "http://localhost:8080/v1" });
+    expect(registry.providers.local.apiKey).toBeUndefined();
+    expect(registry.providers.local.models).toHaveLength(1);
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("local/qwen"));
   });
 
   it("waits for API-key persistence before reporting onboarding success", async () => {
@@ -166,7 +209,7 @@ describe("onboard", () => {
       if (message.includes("Stored API key")) expect(persisted).toBe(true);
     });
 
-    await runOnboard({ input: inputFrom(["y", "y", "1", "test-key", "y", "y", "n", "y"]) });
+    await runOnboard({ input: inputFrom(["y", "1", "test-key", "y", "y", "n", "y"]) });
     expect(providerAuth.setApiKey).toHaveBeenCalledWith("openrouter", "test-key");
     expect(logSpy).toHaveBeenCalledWith("✓ Stored API key for openrouter");
   });
@@ -176,7 +219,7 @@ describe("onboard", () => {
     mockProviderAuthFactory.mockReturnValue(providerAuth);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    await runOnboard({ input: inputFrom(["y", "y", "1", "test-key", "y", "y", "y", "y"]) });
+    await runOnboard({ input: inputFrom(["y", "1", "test-key", "y", "y", "y", "y"]) });
 
     expect(providerAuth.setApiKey).toHaveBeenCalledWith("openrouter", "test-key");
     expect(mockRunInit).toHaveBeenCalledTimes(1);
@@ -193,12 +236,12 @@ describe("onboard", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     globalSettingsState.cliOnboardingCompletedAt = "2026-06-01T00:00:00.000Z";
 
-    await runOnboard({ input: inputFrom(["y", "3", "y", "y", "n", "y"]) });
+    await runOnboard({ input: inputFrom(["y", "4", "y", "y", "n", "y"]) });
     expect(logSpy).toHaveBeenCalledWith("Onboarding already completed. Re-run with --force to run it again.");
     expect(providerAuth.setApiKey).not.toHaveBeenCalled();
     expect(mockRunInit).not.toHaveBeenCalled();
 
-    await runOnboard({ force: true, input: inputFrom(["y", "n", "n", "n", "n"]) });
+    await runOnboard({ force: true, input: inputFrom(["n", "n", "n", "n"]) });
     expect(globalSettingsState.cliOnboardingCompletedAt).not.toBe("2026-06-01T00:00:00.000Z");
   });
 
@@ -236,13 +279,44 @@ describe("onboard", () => {
     acceptSession.close();
   });
 
+  /*
+  FNXC:Onboarding 2026-08-19-03:38:
+  Auto-launch fires while the operator is starting something ELSE — a dashboard, a `pnpm dev
+  --tunnel`. Its questions interrupt work nobody asked to interrupt, and a dev server stopped on
+  "Run ai provider setup now?" never listens, so nothing is served and no tunnel can point at it.
+  The non-interactive path prepares the install and asks nothing.
+  */
+  it("asks nothing when not interactive, but still prepares the install", async () => {
+    const providerAuth = makeProviderAuth();
+    mockProviderAuthFactory.mockReturnValue(providerAuth);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    // No input at all: any prompt would hang or cancel rather than pass.
+    await runOnboard({ interactive: false });
+
+    expect(centralInitMock).toHaveBeenCalled();
+    expect(typeof globalSettingsState.cliOnboardingCompletedAt).toBe("string");
+    // The interactive-only steps must not have run.
+    expect(mockRunInit).not.toHaveBeenCalled();
+    expect(providerAuth.setApiKey).not.toHaveBeenCalled();
+    const printed = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(printed).not.toMatch(/Run ai provider setup now/i);
+    expect(printed).toMatch(/dashboard|fn onboard/i);
+  });
+
   it("allows fully skipping onboarding steps while still persisting completion marker", async () => {
     const providerAuth = makeProviderAuth();
     mockProviderAuthFactory.mockReturnValue(providerAuth);
 
-    await runOnboard({ input: inputFrom(["n", "n", "n", "n", "n"]) });
+    await runOnboard({ input: inputFrom(["n", "n", "n", "n"]) });
 
-    expect(centralInitMock).not.toHaveBeenCalled();
+    /*
+    FNXC:Onboarding 2026-08-19-03:38:
+    The central DB is no longer skippable: declining left an install Fusion cannot run on, and the
+    prompt blocked non-interactive startups outright (a `pnpm dev --tunnel` sat on it and never
+    listened). Skipping every OPTIONAL step must still leave a created database.
+    */
+    expect(centralInitMock).toHaveBeenCalled();
     expect(mockRunInit).not.toHaveBeenCalled();
     expect(globalSettingsState.testMode).toBeUndefined();
     expect(typeof globalSettingsState.cliOnboardingCompletedAt).toBe("string");
@@ -253,7 +327,7 @@ describe("onboard", () => {
     const providerAuth = makeProviderAuth();
     mockProviderAuthFactory.mockReturnValue(providerAuth);
 
-    await runOnboard({ input: inputFrom(["y", "n", "y", "y", "n", "y"]) });
+    await runOnboard({ input: inputFrom(["n", "y", "y", "n", "y"]) });
     expect(providerAuth.setApiKey).not.toHaveBeenCalled();
     expect(mockRunInit).toHaveBeenCalledTimes(1);
     expect(globalSettingsState.testMode).toBe(false);
@@ -264,10 +338,59 @@ describe("onboard", () => {
     const providerAuth = makeProviderAuth();
     mockProviderAuthFactory.mockReturnValue(providerAuth);
 
-    await runOnboard({ input: inputFrom(["y", "y", "3", "n", "y", "n", "y"]) });
+    await runOnboard({ input: inputFrom(["y", "4", "n", "y", "n", "y"]) });
     expect(mockRunInit).not.toHaveBeenCalled();
     expect(globalSettingsState.testMode).toBe(false);
     expect(typeof globalSettingsState.cliOnboardingCompletedAt).toBe("string");
+  });
+
+  /*
+  FNXC:GithubStarAsk 2026-08-19-03:59:
+  The star ask runs after onboarding is complete, is one-shot, and must never be able to cost the
+  operator their setup: declining, or ending input on the question, still leaves onboarding stamped.
+  */
+  it("asks for a GitHub star once onboarding completes and stamps the answer", async () => {
+    mockProviderAuthFactory.mockReturnValue(makeProviderAuth());
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runOnboard({ input: inputFrom(["n", "n", "n", "n", "y"]) });
+
+    const printed = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    // The question itself goes to the readline prompt stream, so assert on the answer's output.
+    expect(printed).toMatch(/Star it here/i);
+    expect(printed).toContain("https://github.com/Runfusion/Fusion");
+    expect(typeof globalSettingsState.githubStarPromptDismissedAt).toBe("string");
+    expect(typeof globalSettingsState.cliOnboardingCompletedAt).toBe("string");
+  });
+
+  it("never asks for a star again once it has been dismissed", async () => {
+    mockProviderAuthFactory.mockReturnValue(makeProviderAuth());
+    const firstLog = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runOnboard({ input: inputFrom(["n", "n", "n", "n", "n"]) });
+    expect(firstLog.mock.calls.map((call) => String(call[0])).join("\n")).toMatch(/won't ask again/i);
+    const dismissedAt = globalSettingsState.githubStarPromptDismissedAt;
+    expect(typeof dismissedAt).toBe("string");
+    firstLog.mockRestore();
+
+    const secondLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runOnboard({ force: true, input: inputFrom(["n", "n", "n", "n"]) });
+
+    expect(secondLog.mock.calls.map((call) => String(call[0])).join("\n")).not.toMatch(/GitHub/i);
+    expect(globalSettingsState.githubStarPromptDismissedAt).toBe(dismissedAt);
+    expect(__testUtils.shouldAskGithubStar(globalSettingsState)).toBe(false);
+    expect(__testUtils.shouldAskGithubStar({})).toBe(true);
+    expect(__testUtils.shouldAskGithubStar({ githubStarPromptDismissedAt: "  " })).toBe(true);
+  });
+
+  it("does not ask for a star on the non-interactive auto-launch path", async () => {
+    mockProviderAuthFactory.mockReturnValue(makeProviderAuth());
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runOnboard({ interactive: false });
+
+    expect(logSpy.mock.calls.map((call) => String(call[0])).join("\n")).not.toMatch(/GitHub/i);
+    expect(globalSettingsState.githubStarPromptDismissedAt).toBeUndefined();
   });
 
   it("treats cancellation distinctly from skip and does not persist completion", async () => {

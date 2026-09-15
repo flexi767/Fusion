@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
-import { reviewStep as mockedReviewStepFn } from "../reviewer.js";
+import { reviewStep as mockedReviewStepFn } from "../execution/reviewer.js";
 import {
   createMockStore,
   mockedCreateFnAgent,
@@ -134,9 +134,9 @@ async function captureWorkflowStepSystemPrompt(taskDetail: Record<string, unknow
               type: "message_update",
               assistantMessageEvent: {
                 type: "text_delta",
-                partial: '{"verdict":"APPROVE","notes":""}',
+                partial: '{"verdict":"APPROVE","notes":"Reviewed the scoped work and found it correct."}',
                 contentIndex: 0,
-                delta: '{"verdict":"APPROVE","notes":""}',
+                delta: '{"verdict":"APPROVE","notes":"Reviewed the scoped work and found it correct."}',
               },
             });
           }

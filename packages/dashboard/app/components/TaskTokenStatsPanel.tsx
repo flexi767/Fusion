@@ -1,12 +1,21 @@
 import { useTranslation } from "react-i18next";
 import type { Task, TaskTokenUsage, WorkflowStepResult } from "@fusion/core";
-import { extractTimingEvents, getTotalAgentActiveMs, getEndToEndDurationMs, getTimedDurationMs, getWallClockSinceFirstExecutionMs, getWorkflowRuntimeMs, type TimingEvent } from "../utils/taskTiming";
+import { extractTimingEvents, formatDurationMs, getTotalAgentActiveMs, getEndToEndDurationMs, getTimedDurationMs, getWallClockSinceFirstExecutionMs, getWorkflowRuntimeMs, type TimingEvent } from "../utils/taskTiming";
+import type { ColumnRoleFlags } from "../utils/columnRoles";
 import { getCanonicalStepNumber } from "../lib/step-display";
 import "./TaskTokenStatsPanel.css";
 
 interface TaskTokenStatsPanelProps {
   tokenUsage?: TaskTokenUsage;
   loading: boolean;
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-00:45 (partial-supply seam, caught by the gate):
+  Resolved trait flags for THIS panel's task column. `getTotalAgentActiveMs` gained a flags parameter
+  and `TaskCard` supplied it; this panel was the sibling that did not, so the same runtime number was
+  computed from the real column on a card and from legacy ids in the detail modal. Omitted, the
+  helper keeps the legacy id, so first paint is unchanged.
+  */
+  columnFlags?: ColumnRoleFlags;
   task?: Pick<
     Task,
     | "log"
@@ -36,6 +45,10 @@ interface TaskTokenStatsPanelProps {
     | "planningStartedAt"
     | "column"
     | "columnMovedAt"
+    | "sourceType"
+    | "sourceAgentId"
+    | "sourceParentTaskId"
+    | "sourceMetadata"
   >;
 }
 
@@ -59,19 +72,6 @@ function formatTimestamp(value: string): string {
     return value;
   }
   return parsed.toLocaleString();
-}
-
-function formatDuration(valueMs: number): string {
-  if (valueMs < 1000) {
-    return `${Math.round(valueMs)} ms`;
-  }
-  const valueSeconds = valueMs / 1000;
-  if (valueSeconds < 60) {
-    return `${valueSeconds.toFixed(1)} s`;
-  }
-  const minutes = Math.floor(valueSeconds / 60);
-  const seconds = Math.round(valueSeconds % 60);
-  return `${minutes}m ${seconds}s`;
 }
 
 function summarizeWorkflowTiming(results: WorkflowStepResult[]): WorkflowTimingSummary {
@@ -117,7 +117,7 @@ function summarizeWorkflowTiming(results: WorkflowStepResult[]): WorkflowTimingS
   };
 }
 
-export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStatsPanelProps) {
+export function TaskTokenStatsPanel({ tokenUsage, loading, task, columnFlags }: TaskTokenStatsPanelProps) {
   const { t } = useTranslation("app");
   const nowMs = Date.now();
   const timingEvents = extractTimingEvents(task?.log ?? []);
@@ -135,7 +135,7 @@ export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStat
   }, undefined);
 
   const workflowTiming = summarizeWorkflowTiming(task?.workflowStepResults ?? []);
-  const activeRuntimeMs = task ? getTotalAgentActiveMs(task, nowMs) : null;
+  const activeRuntimeMs = task ? getTotalAgentActiveMs(task, nowMs, columnFlags) : null;
   const endToEndDurationMs = getEndToEndDurationMs(task?.executionStartedAt, task?.executionCompletedAt, nowMs);
   const wallClockSinceFirstExecutionMs = getWallClockSinceFirstExecutionMs(
     task?.firstExecutionAt,
@@ -173,7 +173,7 @@ export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStat
           </div>
           <div className="task-token-stats-panel__metric" role="listitem">
             <span className="task-token-stats-panel__label">{t("taskDetail.timedDuration", "Timed duration")}</span>
-            <span className="task-token-stats-panel__value">{formatDuration(totalTimingDurationMs)}</span>
+            <span className="task-token-stats-panel__value">{formatDurationMs(totalTimingDurationMs)}</span>
           </div>
           <div className="task-token-stats-panel__metric" role="listitem">
             <span className="task-token-stats-panel__label">{t("taskDetail.workflowTimedSteps", "Workflow timed steps")}</span>
@@ -181,16 +181,16 @@ export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStat
           </div>
           <div className="task-token-stats-panel__metric" role="listitem">
             <span className="task-token-stats-panel__label">{t("taskDetail.workflowRuntime", "Workflow runtime")}</span>
-            <span className="task-token-stats-panel__value">{formatDuration(workflowTiming.totalDurationMs)}</span>
+            <span className="task-token-stats-panel__value">{formatDurationMs(workflowTiming.totalDurationMs)}</span>
           </div>
           <div className="task-token-stats-panel__metric" role="listitem">
             <span className="task-token-stats-panel__label">{t("taskDetail.totalExecutionTime", "Total execution time")}</span>
-            <span className="task-token-stats-panel__value">{formatDuration(totalExecutionMs)}</span>
+            <span className="task-token-stats-panel__value">{formatDurationMs(totalExecutionMs)}</span>
           </div>
           {showWallClockSinceFirstExecution ? (
             <div className="task-token-stats-panel__metric" role="listitem">
               <span className="task-token-stats-panel__label">{t("taskDetail.wallClockSinceFirst", "Wall-clock since first execution")}</span>
-              <span className="task-token-stats-panel__value">{formatDuration(wallClockSinceFirstExecutionMs)}</span>
+              <span className="task-token-stats-panel__value">{formatDurationMs(wallClockSinceFirstExecutionMs)}</span>
             </div>
           ) : null}
         </div>
@@ -200,7 +200,7 @@ export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStat
             <dt>{t("taskDetail.longestTimingEvent", "Longest timing event")}</dt>
             <dd>
               {longestTimingEvent?.durationMs
-                ? `${longestTimingEvent.summary} (${formatDuration(longestTimingEvent.durationMs)})`
+                ? `${longestTimingEvent.summary} (${formatDurationMs(longestTimingEvent.durationMs)})`
                 : t("taskDetail.noTimedEvents", "No timed events recorded yet.")}
             </dd>
           </div>
@@ -208,7 +208,7 @@ export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStat
             <dt>{t("taskDetail.longestWorkflowStep", "Longest workflow step")}</dt>
             <dd>
               {workflowTiming.longestStep
-                ? `${workflowTiming.longestStep.name} (${formatDuration(workflowTiming.longestStep.durationMs)})`
+                ? `${workflowTiming.longestStep.name} (${formatDurationMs(workflowTiming.longestStep.durationMs)})`
                 : t("taskDetail.noWorkflowStepTimings", "No completed workflow step timings yet.")}
             </dd>
           </div>
@@ -267,6 +267,75 @@ export function TaskTokenStatsPanel({ tokenUsage, loading, task }: TaskTokenStat
           </div>
         </dl>
       </div>
+
+      {/*
+      FNXC:TaskStatsProvenance 2026-07-22-14:45:
+      Operators triaging duplicate follow-up tasks (FN-8510/8511/8513/8514 incident) need to see
+      WHO filed a task without querying the DB: the Stats sub-tab surfaces creation provenance —
+      source type, the parent task whose executor called fn_task_create, the creating agent, and
+      the triage near-duplicate marker (canonical task id) when one was recorded.
+      Rows with no value are omitted rather than rendered empty.
+      */}
+      {task?.sourceType ? (
+        <div className="task-token-stats-panel__section">
+          {/*
+          FNXC:TaskStatsProvenance 2026-07-22-14:45:
+          `taskDetail.provenance` is a nested locale OBJECT (Summary-tab provenance labels);
+          calling t() on it returns an object and crashes the render (issue #1863 pattern).
+          All keys here must be leaves under that namespace, e.g. `taskDetail.provenance.title`.
+          */}
+          <h5>{t("taskDetail.provenance.title", "Provenance")}</h5>
+          <dl className="task-token-stats-panel__details">
+            <div className="task-token-stats-panel__detail-row">
+              <dt>{t("taskDetail.provenance.createdVia", "Created via")}</dt>
+              <dd>{task.sourceType}</dd>
+            </div>
+            {task.sourceParentTaskId ? (
+              <div className="task-token-stats-panel__detail-row">
+                <dt>{t("taskDetail.provenance.parentTask", "Parent task")}</dt>
+                <dd>{task.sourceParentTaskId}</dd>
+              </div>
+            ) : null}
+            {task.sourceAgentId ? (
+              <div className="task-token-stats-panel__detail-row">
+                <dt>{t("taskDetail.provenance.creatingAgent", "Creating agent")}</dt>
+                <dd>{task.sourceAgentId}</dd>
+              </div>
+            ) : null}
+            {/*
+            FNXC:TaskStatsProvenance 2026-07-22-15:20:
+            sourceMetadata is writable through the task-creation API, so issueUrl is untrusted:
+            only http(s) URLs may render as a link (blocks javascript:-scheme injection);
+            anything else renders as plain text.
+            */}
+            {typeof task.sourceMetadata?.issueUrl === "string" ? (
+              <div className="task-token-stats-panel__detail-row">
+                <dt>{t("taskDetail.provenance.importedFrom", "Imported from")}</dt>
+                <dd>
+                  {/^https?:\/\//i.test(task.sourceMetadata.issueUrl) ? (
+                    /*
+                    FNXC:TaskStatsProvenance 2026-07-22-21:47:
+                    Imported-source links use the active accent rather than the browser default so the
+                    shared Stats panel remains theme-aware on desktop and narrow/mobile task detail.
+                    */
+                    <a className="task-token-stats-panel__imported-source-link" href={task.sourceMetadata.issueUrl} target="_blank" rel="noreferrer">
+                      {task.sourceMetadata.issueUrl}
+                    </a>
+                  ) : (
+                    task.sourceMetadata.issueUrl
+                  )}
+                </dd>
+              </div>
+            ) : null}
+            {typeof task.sourceMetadata?.nearDuplicateOf === "string" ? (
+              <div className="task-token-stats-panel__detail-row">
+                <dt>{t("taskDetail.provenance.nearDuplicateOf", "Flagged near-duplicate of")}</dt>
+                <dd>{task.sourceMetadata.nearDuplicateOf}</dd>
+              </div>
+            ) : null}
+          </dl>
+        </div>
+      ) : null}
 
       <div className="task-token-stats-panel__section">
         <h5>{t("taskDetail.tokenUsage", "Token Usage")}</h5>

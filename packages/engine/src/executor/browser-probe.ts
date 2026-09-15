@@ -5,7 +5,7 @@
  */
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import type { SkillSelectionContext } from "../skill-resolver.js";
+import type { SkillSelectionContext } from "../cli-runtime/skill-resolver.js";
 
 const execAsync = promisify(exec);
 
@@ -88,7 +88,7 @@ export function formatAgentBrowserAvailabilityLog(result: AgentBrowserAvailabili
     return `[browser-verification] agent-browser available — version ${result.version ?? "unknown"}`;
   }
   if (result.reason === "probe timed out") {
-    return "[browser-verification] agent-browser availability probe timed out — the step relies on the agent-browser CLI; continuing so the step can fast-bail or report its own failure.";
+    return "[browser-verification] agent-browser availability probe timed out — the step will be recorded as not executed and the task will continue.";
   }
-  return "[browser-verification] agent-browser not found on PATH — the step relies on the agent-browser CLI; install the agent-browser plugin/binary. Continuing; the step may fast-bail or fail.";
+  return "[browser-verification] agent-browser not found on PATH — the step will be recorded as not executed and the task will continue.";
 }

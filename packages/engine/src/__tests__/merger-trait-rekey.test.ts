@@ -12,7 +12,7 @@ benchmark whose Done is terminal, complete-column entry IS the success terminal.
 import { describe, expect, it, vi } from "vitest";
 import "@fusion/core";
 import type { MergeResult, Task, TaskStore, WorkflowIr } from "@fusion/core";
-import { finalizeProvenAutoMergeTask } from "../auto-merge-finalization.js";
+import { finalizeProvenAutoMergeTask } from "../merge/auto-merge-finalization.js";
 
 function benchmarkIr(): WorkflowIr {
   return {
@@ -70,7 +70,10 @@ describe("finalizeProvenAutoMergeTask — complete-trait column (U7)", () => {
     const store = makeStore(task); // no ir → builtin:coding
     const res = await finalizeProvenAutoMergeTask({ store, taskId: task.id, result: confirmedResult, source: "direct-ai-merge" });
     expect(res.outcome).toBe("done");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-M1", "done", expect.anything());
+    expect(store.moveTask).toHaveBeenCalledWith("FN-M1", "done", expect.objectContaining({
+      moveSource: "engine",
+      workflowMoveSource: "auto-merge-finalization",
+    }));
   });
 
   it("moves a confirmed-merged custom/benchmark card to its OWN complete column (`shipped`)", async () => {

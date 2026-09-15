@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AutoRecoveryContext, AutoRecoveryDecision, AutoRecoveryFailure } from "../auto-recovery.js";
+import type { AutoRecoveryContext, AutoRecoveryDecision, AutoRecoveryFailure } from "../healing/auto-recovery.js";
 import { BranchWorktreeAutoRecoveryHandler } from "../auto-recovery-handlers/branch-worktree.js";
+import { RENAMED_VOCAB, lifecycleIr } from "./_workflow-vocabulary-fixture.js";
 
 const branchConflictMocks = vi.hoisted(() => ({
   inspectBranchConflict: vi.fn(),
@@ -8,7 +9,7 @@ const branchConflictMocks = vi.hoisted(() => ({
   reanchorBranchToBase: vi.fn(),
 }));
 
-vi.mock("../branch-conflicts.js", () => ({
+vi.mock("../execution/branch-conflicts.js", () => ({
   inspectBranchConflict: branchConflictMocks.inspectBranchConflict,
   classifyBootstrapMisbinding: branchConflictMocks.classifyBootstrapMisbinding,
   reanchorBranchToBase: branchConflictMocks.reanchorBranchToBase,
@@ -27,11 +28,25 @@ function createTask(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
-function createFixtures(taskOverrides: Record<string, unknown> = {}, mode = "programmatic") {
+/*
+FNXC:WorkflowResolvedColumns 2026-07-30-13:50 (batch-engine tail):
+`ir` is optional so every existing case is byte-identical: with no workflow the resolver degrades to the
+built-in coding IR, whose wip lane is `in-progress` and whose rebound target is `todo` — exactly what
+those cases already assert.
+*/
+function createFixtures(taskOverrides: Record<string, unknown> = {}, mode = "programmatic", ir?: unknown) {
   const task = createTask(taskOverrides);
   const taskStore = {
     updateTask: vi.fn(async () => undefined),
     moveTask: vi.fn(async () => undefined),
+    logEntry: vi.fn(async () => undefined),
+    ...(ir
+      ? {
+          getTaskWorkflowSelectionAsync: async () => ({ workflowId: "recovery-lifecycle", stepIds: [] }),
+          getTaskWorkflowSelection: () => ({ workflowId: "recovery-lifecycle", stepIds: [] }),
+          getWorkflowDefinition: async (id: string) => (id === "recovery-lifecycle" ? { ir } : undefined),
+        }
+      : {}),
   } as any;
   const runAudit = { database: vi.fn(async () => undefined), git: vi.fn(), filesystem: vi.fn() } as any;
   const logger = { warn: vi.fn(), log: vi.fn(), error: vi.fn() } as any;
@@ -43,6 +58,19 @@ function createFixtures(taskOverrides: Record<string, unknown> = {}, mode = "pro
   return { taskStore, runAudit, logger, spawnAiRecoverySession, handler, failure, decision, ctx };
 }
 
+/*
+FNXC:LifecycleContainment 2026-08-31-09:28:
+These expectations were written when branch/worktree recovery REHOMED the card backwards -- to
+`todo`, to a resolved hold lane, or nowhere at all when no backward destination existed. FN-207/
+FN-217 containment removed that: "Branch/worktree cleanup may repair metadata but cannot rehome the
+card. Keep the live column as the only target." Production now sets `reboundTarget = task.column`
+unconditionally, so the recovery requeues IN PLACE and preserves progress and resume state.
+
+The fixtures kept asserting the old backward targets and stayed red long after the behavior change
+that retired them. They are updated to state the containment invariant instead of the movement it
+replaced -- and the destination is now derived from each fixture's own column, so a future change
+that reintroduces a hardcoded lane fails here rather than passing by coincidence.
+*/
 describe("BranchWorktreeAutoRecoveryHandler", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -52,9 +80,160 @@ describe("BranchWorktreeAutoRecoveryHandler", () => {
     const f = createFixtures();
     branchConflictMocks.inspectBranchConflict.mockResolvedValue({ kind: "fully-subsumed", livePath: "/tmp/wt", tipSha: "abc" });
     await f.handler.issueRetry(f.failure, f.decision, f.ctx);
-    expect(f.taskStore.updateTask).toHaveBeenCalledWith("FN-4536", { branch: null, baseCommitSha: null });
-    expect(f.taskStore.moveTask).toHaveBeenCalledWith("FN-4536", "todo", expect.objectContaining({ moveSource: "engine", preserveWorktree: false }));
+    expect(f.taskStore.updateTask).toHaveBeenCalledWith("FN-4536", { branch: null, baseCommitSha: null, branchWriteOrigin: "engine" });
+    expect(f.taskStore.moveTask).toHaveBeenCalledWith("FN-4536", "in-progress", expect.objectContaining({ moveSource: "engine", preserveWorktree: false }));
+    expect(f.taskStore.moveTask).not.toHaveBeenCalledWith("FN-4536", "todo", expect.anything());
     expect(f.runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "branch-worktree:auto-requeue" }));
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-13:50 (batch-engine tail):
+  TWO defects, one case. The requeue destination was the hardcoded `todo` — CENSUS-INVISIBLE, because
+  the census scores comparisons and that is a call argument — so a board with no `todo` column was
+  requeued into a lane that does not exist. And the WIP test was the id `in-progress`, so the stale
+  branch/baseCommitSha were never cleared and the card carried a dead branch back into execution.
+
+  REVERT CHECK, measured (both, independently):
+    - `moveTask(..., "todo", ...)` restored -> this fails; moveTask is called with "todo", not "backlog".
+    - `task.column === "in-progress"` restored -> this fails; updateTask is never called.
+  The legacy cases pass both ways, which is why they are kept alongside.
+  */
+  it("requeues to the RESOLVED rebound target and clears the branch on a RENAMED board", async () => {
+    const f = createFixtures(
+      { column: RENAMED_VOCAB.wip },
+      "programmatic",
+      lifecycleIr(RENAMED_VOCAB, "recovery-lifecycle"),
+    );
+    branchConflictMocks.inspectBranchConflict.mockResolvedValue({ kind: "fully-subsumed", livePath: "/tmp/wt", tipSha: "abc" });
+
+    await f.handler.issueRetry(f.failure, f.decision, f.ctx);
+
+    expect(f.taskStore.updateTask).toHaveBeenCalledWith("FN-4536", { branch: null, baseCommitSha: null, branchWriteOrigin: "engine" });
+    /* Contained in the card's OWN lane, not rehomed to the hold lane, and never to a literal `todo`. */
+    expect(f.taskStore.moveTask).toHaveBeenCalledWith(
+      "FN-4536",
+      RENAMED_VOCAB.wip,
+      expect.objectContaining({ moveSource: "engine", preserveWorktree: false }),
+    );
+    expect(f.taskStore.moveTask).not.toHaveBeenCalledWith("FN-4536", RENAMED_VOCAB.hold, expect.anything());
+    expect(f.taskStore.moveTask).not.toHaveBeenCalledWith("FN-4536", "todo", expect.anything());
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-13:45 (#2797 review — greptile):
+
+  THE REQUEUE MUST NOT DIE ON A DESTINATION THE BOARD DOES NOT DECLARE.
+
+  The review pointed at the `catch` retaining `reboundTarget = "todo"`. Writing the test for that
+  branch DISPROVED it as the main route: `resolveWorkflowIrForTask` degrades to the BUILT-IN IR rather
+  than throwing, so a task whose custom workflow cannot be read still resolves `todo` from the DEFAULT
+  board and the catch never runs. A guard on the throw path alone would have passed review and fixed
+  almost nothing.
+
+  What actually bites is the move. `moveTaskInternal` REJECTS a column the workflow does not declare,
+  and unhandled that throws out of the recovery handler whose entire job is to unstick the task — so
+  the recovery became a second way to stay stuck, with no audit row explaining it.
+
+  This drives the rejection itself, which is the behaviour every route ends at.
+  */
+  /*
+  FNXC:LifecycleContainment 2026-08-31-09:28:
+  This case used to assert the SKIP taken when no adjacent backward destination existed. Containment
+  retired that concept: the destination is the card's own column, so one always exists and the skip
+  is now only a defensive guard for an empty column. Asserting the retired skip would demand the
+  backward search back.
+
+  The case is re-aimed at what actually needs guarding on an unknown lane -- that recovery stays put
+  rather than inventing a destination. `building` belongs to no default vocabulary, which is exactly
+  the shape that used to be rehomed into a lane the board did not declare.
+  */
+  it("contains recovery in the card's own lane even when that lane is not a known vocabulary", async () => {
+    const f = createFixtures({ column: "building" }, "programmatic");
+    branchConflictMocks.inspectBranchConflict.mockResolvedValue({ kind: "fully-subsumed", livePath: "/tmp/wt", tipSha: "abc" });
+
+    /* The handler must not propagate — that is the original regression, and it still holds. */
+    await expect(f.handler.issueRetry(f.failure, f.decision, f.ctx)).resolves.not.toThrow();
+
+    expect(f.taskStore.moveTask).toHaveBeenCalledWith(
+      "FN-4536",
+      "building",
+      expect.objectContaining({ lifecycleReason: "branch-worktree-recovery" }),
+    );
+    /* No invented destination: not a default lane, not a backward one. */
+    expect(f.taskStore.moveTask).not.toHaveBeenCalledWith("FN-4536", "todo", expect.anything());
+    expect(f.taskStore.moveTask).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-17:45 (#2797 review — greptile P1 "move failures become
+  successful retries"):
+  A moveTask failure that is NOT a lane problem — capacity exhaustion, a guard rejection, a deleted
+  task, a persistence error — was labelled `rebound-target-rejected` all the same, so the audit row
+  asserted a lane cause for something that has nothing to do with lanes and anyone debugging a stuck
+  card would chase the wrong thing.
+
+  REVERT CHECK, measured: collapsing the reason back to the single literal makes this fail — the row
+  reads `rebound-target-rejected` for a plain persistence error.
+  */
+  it("names a non-lane move failure honestly instead of blaming the rebound target", async () => {
+    const f = createFixtures({ column: "in-progress" }, "programmatic");
+    f.taskStore.moveTask.mockRejectedValue(new Error("database connection lost"));
+    branchConflictMocks.inspectBranchConflict.mockResolvedValue({ kind: "fully-subsumed", livePath: "/tmp/wt", tipSha: "abc" });
+
+    await expect(f.handler.issueRetry(f.failure, f.decision, f.ctx)).resolves.not.toThrow();
+
+    expect(f.runAudit.database).toHaveBeenCalledWith(expect.objectContaining({
+      type: "branch-worktree:auto-requeue-skipped",
+      metadata: expect.objectContaining({ reason: "requeue-move-failed" }),
+    }));
+    expect(f.runAudit.database).not.toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ reason: "rebound-target-rejected" }),
+    }));
+  });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-07-30-17:45 (#2797 review — greptile P1 "rejected move erases
+  branch linkage"):
+  The branch/baseCommitSha clear used to run BEFORE the move, so a rejected move left the card in its
+  wip lane with the only pointers back to its work already erased — the recovery destroyed the linkage
+  and then declined to requeue. Half-applied is worse than not applied; nothing reconstructs the branch
+  from the row afterwards.
+
+  REVERT CHECK, measured: moving the clear back above the move makes this fail — updateTask is called
+  with { branch: null, baseCommitSha: null } on a move that never landed.
+  */
+  it("preserves the branch linkage when the requeue move is rejected", async () => {
+    const f = createFixtures({ column: "in-progress" }, "programmatic");
+    f.taskStore.moveTask.mockRejectedValue(new Error("database connection lost"));
+    branchConflictMocks.inspectBranchConflict.mockResolvedValue({ kind: "fully-subsumed", livePath: "/tmp/wt", tipSha: "abc" });
+
+    await f.handler.issueRetry(f.failure, f.decision, f.ctx);
+
+    expect(f.taskStore.updateTask).not.toHaveBeenCalledWith("FN-4536", { branch: null, baseCommitSha: null });
+  });
+
+  it("does not clear the branch when a RENAMED board's card is not in its wip lane", async () => {
+    /*
+    Non-vacuous companion: without it, a guard that cleared unconditionally would pass the case above.
+    Same renamed board, same failure — only the card's lane changes.
+    */
+    const f = createFixtures(
+      { column: RENAMED_VOCAB.review },
+      "programmatic",
+      lifecycleIr(RENAMED_VOCAB, "recovery-lifecycle"),
+    );
+    branchConflictMocks.inspectBranchConflict.mockResolvedValue({ kind: "fully-subsumed", livePath: "/tmp/wt", tipSha: "abc" });
+
+    await f.handler.issueRetry(f.failure, f.decision, f.ctx);
+
+    expect(f.taskStore.updateTask).not.toHaveBeenCalled();
+    /* Contained where the card actually rests — the review lane — not pulled back into wip. */
+    expect(f.taskStore.moveTask).toHaveBeenCalledWith(
+      "FN-4536",
+      RENAMED_VOCAB.review,
+      expect.objectContaining({ lifecycleReason: "branch-worktree-recovery" }),
+    );
+    expect(f.taskStore.moveTask).not.toHaveBeenCalledWith("FN-4536", RENAMED_VOCAB.wip, expect.anything());
   });
 
   it("reanchors bootstrap misbinding then requeues", async () => {
@@ -64,7 +243,7 @@ describe("BranchWorktreeAutoRecoveryHandler", () => {
     branchConflictMocks.reanchorBranchToBase.mockResolvedValue({});
     await f.handler.issueRetry(f.failure, f.decision, f.ctx);
     expect(branchConflictMocks.reanchorBranchToBase).toHaveBeenCalledTimes(1);
-    expect(f.taskStore.moveTask).toHaveBeenCalledWith("FN-4536", "todo", expect.objectContaining({ moveSource: "engine" }));
+    expect(f.taskStore.moveTask).toHaveBeenCalledWith("FN-4536", "in-progress", expect.objectContaining({ moveSource: "engine" }));
     expect(f.runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "branch-worktree:auto-requeue", metadata: expect.objectContaining({ rationale: "bootstrap-misbinding-reanchor" }) }));
 
     // Regression: prior to the fix, the handler passed `foreignCommits: []`
@@ -91,7 +270,7 @@ describe("BranchWorktreeAutoRecoveryHandler", () => {
       error: { strandedCommits: [] },
     });
     await f.handler.issueRetry(f.failure, f.decision, f.ctx);
-    expect(f.taskStore.moveTask).toHaveBeenCalledWith("FN-4536", "todo", expect.objectContaining({ moveSource: "engine" }));
+    expect(f.taskStore.moveTask).toHaveBeenCalledWith("FN-4536", "in-progress", expect.objectContaining({ moveSource: "engine" }));
     expect(f.runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "branch-worktree:foreign-branch-discarded" }));
     expect(f.runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "branch-worktree:auto-requeue", metadata: expect.objectContaining({ rationale: "live-foreign-discard-and-recreate" }) }));
   });

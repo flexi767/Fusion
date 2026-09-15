@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PathLike } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const createAgentSessionMock = vi.fn();
 const createBashToolMock = vi.fn((cwd: string, options?: any) => ({ name: "bash", cwd, options }));
@@ -97,7 +99,7 @@ vi.mock("node:fs", async () => {
   };
 });
 
-vi.mock("../custom-providers.js", () => ({
+vi.mock("../auth/custom-providers.js", () => ({
   readCustomProviders: readCustomProvidersMock,
 }));
 
@@ -158,7 +160,15 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   this until FN-8142's SDK bump (this PR); mock ModelRuntime so createFnAgent's registry path resolves.
   */
   ModelRuntime: {
-    create: async () => ({ getAuth: modelRuntimeGetAuthMock }),
+    /*
+    FNXC:ModelRegistry 2026-07-23-21:20:
+    396090fc0 bounded post-registration registry refreshes via refreshFusionModelRegistry, which
+    PREFERS `modelRegistry.modelRuntime.refresh({ allowNetwork, signal })` over the legacy
+    `registry.refresh()` whenever a runtime is attached. The mocked runtime must expose `refresh`
+    (delegating to the same refreshMock) or the preferred path throws "runtime.refresh is not a
+    function" and the registration-order test can no longer observe the refresh.
+    */
+    create: async () => ({ getAuth: modelRuntimeGetAuthMock, refresh: async () => refreshMock() }),
   },
   ModelRegistry: class {
     static create(...args: unknown[]) {
@@ -410,6 +420,70 @@ describe("worktree path boundary helpers", () => {
       expect(mockBashTool.execute).toHaveBeenCalled();
     });
 
+    it("rejects symlink escapes through every allowed root across all path-taking tools", async () => {
+      const makeTool = (name: string) => ({
+        name,
+        label: name,
+        description: `${name} a boundary path`,
+        parameters: {},
+        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
+      });
+      /*
+      FNXC:WorktreeBoundary 2026-08-23-03:44:
+      Symlink-escape coverage must include every filesystem wrapper plus both Bash path surfaces. Read-only aliases and verification cwd checks are part of the same boundary invariant, not optional follow-up cases.
+      */
+      const toolNames = ["read", "glob", "grep", "find", "ls", "write", "edit", "bash", "fn_run_verification"];
+      const tools = toolNames.map(makeTool);
+      const worktreeRoot = "/project/.worktrees/fn-001";
+      const projectRoot = "/project";
+      const hostSkillRoot = "/host/skills";
+      const userSkillRoot = join(homedir(), ".agents", "skills");
+      const externalRoot = "/host/private";
+      const escapeCases = [
+        { symlink: `${worktreeRoot}/escape`, path: `${worktreeRoot}/escape/secret.txt` },
+        { symlink: `${projectRoot}/.fusion/memory/escape`, path: `${projectRoot}/.fusion/memory/escape/secret.txt` },
+        { symlink: `${projectRoot}/.fusion/tasks/FN-001/attachments/escape`, path: `${projectRoot}/.fusion/tasks/FN-001/attachments/escape/secret.txt` },
+        { symlink: `${projectRoot}/.fusion/tasks/FN-002`, path: `${projectRoot}/.fusion/tasks/FN-002/PROMPT.md` },
+        { symlink: `${userSkillRoot}/escape`, path: `${userSkillRoot}/escape/secret.txt` },
+        { symlink: `${hostSkillRoot}/escape`, path: `${hostSkillRoot}/escape/secret.txt` },
+      ];
+      const escapedPaths = new Set(escapeCases.map(({ path }) => path));
+      const symlinkTargets = new Map(escapeCases.map(({ symlink }) => [symlink, externalRoot]));
+      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
+        const text = String(path);
+        if (escapedPaths.has(text)) throw new Error("ENOENT");
+        return symlinkTargets.get(text) ?? text;
+      });
+
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary(tools as any, worktreeRoot, projectRoot, [hostSkillRoot]);
+
+      for (const { symlink, path } of escapeCases) {
+        for (const tool of wrapped as any[]) {
+          const params = tool.name === "bash"
+            ? { command: "pwd", cwd: symlink }
+            : tool.name === "fn_run_verification"
+              ? { command: "pnpm test", cwd: symlink }
+              : { path };
+          const result = await tool.execute(`call-${tool.name}-${symlink}`, params);
+          expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+        }
+
+        const wrappedBash = (wrapped as any[]).find((tool) => tool.name === "bash");
+        const commandTargetResult = await wrappedBash.execute(`call-bash-command-${symlink}`, {
+          command: `cd ${symlink} && pwd`,
+          cwd: worktreeRoot,
+        });
+        expect(commandTargetResult).toMatchObject({
+          ok: false,
+          error: expect.stringContaining("outside the worktree boundary"),
+        });
+      }
+      for (const tool of tools) {
+        expect(tool.execute).not.toHaveBeenCalled();
+      }
+    });
+
     it("allows project root .fusion/memory/ files from worktree session", async () => {
       const mockReadTool = {
         name: "read",
@@ -473,6 +547,22 @@ describe("worktree path boundary helpers", () => {
       expect(result).toEqual({ ok: true, content: [{ type: "text", text: "daily memory" }] });
     });
 
+    it("rejects bash command targets and verification cwd outside the same boundary", async () => {
+      const makeTool = (name: string) => ({ name, label: name, description: name, parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) });
+      const bash = makeTool("bash");
+      const verification = makeTool("fn_run_verification");
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary([bash, verification] as any, "/project/.worktrees/fn-158", "/project");
+
+      const bashResult = await (wrapped[0] as any).execute("bash", { command: "cd ../../other-repo && touch x" });
+      const verificationResult = await (wrapped[1] as any).execute("verify", { cwd: "/project/other-repo", command: "pnpm test" });
+
+      expect(bashResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(verificationResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(bash.execute).not.toHaveBeenCalled();
+      expect(verification.execute).not.toHaveBeenCalled();
+    });
+
     it("allows task attachments from worktree session", async () => {
       const mockReadTool = {
         name: "read",
@@ -494,6 +584,190 @@ describe("worktree path boundary helpers", () => {
       const result = await (wrapped[0] as any).execute("call-1", { path: "/project/.fusion/tasks/FN-001/attachments/screenshot.png" });
       expect(mockReadTool.execute).toHaveBeenCalled();
       expect(result).toEqual({ ok: true, content: [{ type: "text", text: "attachment content" }] });
+    });
+
+    it("allows only read/glob/grep under host-advertised skill roots", async () => {
+      const makeTool = (name: string) => ({
+        name,
+        label: name,
+        description: `${name} a skill file`,
+        parameters: {},
+        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
+      });
+      const skillRoot = "/Users/agent/.fusion/plugins/de-sloppify/skills";
+      const skillPath = `${skillRoot}/de-sloppify/references/style.md`;
+      const [readTool, globTool, grepTool, writeTool, editTool, bashTool] = [
+        makeTool("read"),
+        makeTool("glob"),
+        makeTool("grep"),
+        makeTool("write"),
+        makeTool("edit"),
+        makeTool("bash"),
+      ];
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary(
+        [readTool, globTool, grepTool, writeTool, editTool, bashTool] as any,
+        "/project/.worktrees/fn-8466",
+        "/project",
+        [skillRoot],
+      );
+
+      for (const tool of wrapped.slice(0, 3) as any[]) {
+        await tool.execute(`call-${tool.name}`, { path: skillPath });
+      }
+      expect(readTool.execute).toHaveBeenCalledOnce();
+      expect(globTool.execute).toHaveBeenCalledOnce();
+      expect(grepTool.execute).toHaveBeenCalledOnce();
+
+      for (const tool of wrapped.slice(3, 5) as any[]) {
+        const result = await tool.execute(`call-${tool.name}`, { path: skillPath });
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      }
+      expect(writeTool.execute).not.toHaveBeenCalled();
+      expect(editTool.execute).not.toHaveBeenCalled();
+
+      const bashResult = await (wrapped[5] as any).execute("call-bash", { command: "pwd", cwd: skillRoot });
+      expect(bashResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(bashTool.execute).not.toHaveBeenCalled();
+
+      const outsideResult = await (wrapped[0] as any).execute("call-outside", { path: "/other/project/secret" });
+      expect(outsideResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(readTool.execute).toHaveBeenCalledOnce();
+    });
+
+    it("allows read/glob/grep/find/ls under the standard user agent skill root without symlink escapes", async () => {
+      const makeTool = (name: string) => ({
+        name,
+        label: name,
+        description: `${name} a user skill file`,
+        parameters: {},
+        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
+      });
+      const userAgentRoot = join(homedir(), ".agents");
+      const userSkillRoot = join(userAgentRoot, "skills");
+      const skillPath = join(userSkillRoot, "code-review", "SKILL.md");
+      /*
+      FNXC:SkillReadBoundary 2026-08-23-03:54:
+      Every read-only filesystem alias must share the user-skill allowance and symlink-escape denial. Cover `find` and `ls` alongside `read`, `glob`, and `grep` so aliases cannot drift into a broader or narrower host boundary.
+      */
+      const [readTool, globTool, grepTool, findTool, lsTool, writeTool, editTool, bashTool] = [
+        makeTool("read"),
+        makeTool("glob"),
+        makeTool("grep"),
+        makeTool("find"),
+        makeTool("ls"),
+        makeTool("write"),
+        makeTool("edit"),
+        makeTool("bash"),
+      ];
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary(
+        [readTool, globTool, grepTool, findTool, lsTool, writeTool, editTool, bashTool] as any,
+        "/project/.worktrees/fn-user-skills",
+        "/project",
+      );
+
+      for (const tool of wrapped.slice(0, 5) as any[]) {
+        await tool.execute(`call-${tool.name}`, { path: skillPath });
+      }
+      expect(readTool.execute).toHaveBeenCalledOnce();
+      expect(globTool.execute).toHaveBeenCalledOnce();
+      expect(grepTool.execute).toHaveBeenCalledOnce();
+      expect(findTool.execute).toHaveBeenCalledOnce();
+      expect(lsTool.execute).toHaveBeenCalledOnce();
+
+      for (const tool of wrapped.slice(5, 7) as any[]) {
+        const result = await tool.execute(`call-${tool.name}`, { path: skillPath });
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      }
+      expect(writeTool.execute).not.toHaveBeenCalled();
+      expect(editTool.execute).not.toHaveBeenCalled();
+
+      const bashResult = await (wrapped[7] as any).execute("call-bash", { command: "pwd", cwd: userSkillRoot });
+      expect(bashResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(bashTool.execute).not.toHaveBeenCalled();
+
+      const siblingConfigResult = await (wrapped[0] as any).execute("call-config", {
+        path: join(userAgentRoot, "config.json"),
+      });
+      expect(siblingConfigResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(readTool.execute).toHaveBeenCalledOnce();
+
+      const symlinkDir = join(userSkillRoot, "linked-config");
+      const symlinkEscapePath = join(symlinkDir, "config.json");
+      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
+        const text = String(path);
+        if (text === symlinkEscapePath) throw new Error("ENOENT");
+        return text === symlinkDir ? userAgentRoot : text;
+      });
+      for (const tool of wrapped.slice(0, 5) as any[]) {
+        const result = await tool.execute(`call-${tool.name}-symlink`, { path: symlinkEscapePath });
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      }
+      expect(readTool.execute).toHaveBeenCalledOnce();
+      expect(globTool.execute).toHaveBeenCalledOnce();
+      expect(grepTool.execute).toHaveBeenCalledOnce();
+      expect(findTool.execute).toHaveBeenCalledOnce();
+      expect(lsTool.execute).toHaveBeenCalledOnce();
+    });
+
+    it("rejects host skill paths when no read-only extra roots are provided", async () => {
+      const mockReadTool = {
+        name: "read",
+        label: "Read",
+        description: "Read a file",
+        parameters: {},
+        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
+      };
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary([mockReadTool as any], "/project/.worktrees/fn-8466", "/project");
+
+      const result = await (wrapped[0] as any).execute("call-1", {
+        path: "/Users/agent/.fusion/plugins/de-sloppify/skills/de-sloppify/SKILL.md",
+      });
+      expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      expect(mockReadTool.execute).not.toHaveBeenCalled();
+    });
+
+    it("canonicalizes macOS-style skill roots before allowing reads", async () => {
+      const skillRoot = "/var/folders/fn-8466/plugin/skills";
+      const canonicalSkillPath = "/private/var/folders/fn-8466/plugin/skills/de-sloppify/SKILL.md";
+      const mockReadTool = {
+        name: "read",
+        label: "Read",
+        description: "Read a file",
+        parameters: {},
+        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
+      };
+      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
+        const text = String(path);
+        return text.startsWith("/var/") ? `/private${text}` : text;
+      });
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary(
+        [mockReadTool as any],
+        "/project/.worktrees/fn-8466",
+        "/project",
+        [skillRoot],
+      );
+
+      const result = await (wrapped[0] as any).execute("call-1", { path: canonicalSkillPath });
+      expect(result).toEqual({ ok: true, content: [] });
+      expect(mockReadTool.execute).toHaveBeenCalledOnce();
+    });
+
+    it("normalizes one stable skill-root list for resource loading and boundary wiring", async () => {
+      const { normalizeAdditionalSkillPaths } = await import("../pi.js");
+      expect(normalizeAdditionalSkillPaths(["/skills/plugin", "", "/skills/plugin/", "/skills/ce"])).toEqual([
+        "/skills/plugin",
+        "/skills/ce",
+      ]);
+
+      const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const source = fs.readFileSync(`${process.cwd()}/src/pi.ts`, "utf8");
+      expect(source).toContain("const normalizedAdditionalSkillPaths = normalizeAdditionalSkillPaths(options.additionalSkillPaths);");
+      expect(source).toContain("additionalSkillPaths: normalizedAdditionalSkillPaths");
+      expect(source).toMatch(/wrapToolsWithBoundary\(\s*toolsWithActionGate,\s*boundaryContext\.worktreePath,\s*boundaryContext\.worktreeProjectRoot,\s*normalizedAdditionalSkillPaths,/);
     });
 
     it("does not wrap tools when cwd is not a worktree", async () => {
@@ -783,17 +1057,17 @@ describe("wrapToolsWithPermanentAgentGating", () => {
 
     const result = await (wrapped[0] as any).execute("t1", { description: "create" });
     expect((result as any).isError).toBe(true);
+    /*
+    FNXC:EngineTests 2026-07-22-13:07:
+    Freeform chat creates omit mission_lineage and remain policy-governed (require-approval
+    here), not hard-blocked. Autonomous heartbeat still enforces lineage at the tool factory.
+    */
     expect((result as any).details).toEqual(expect.objectContaining({
-      approvalRequestId: "apr-fn-1",
       category: "task_agent_mutation",
       disposition: "require-approval",
-      requiresApproval: true,
       toolName: "fn_task_create",
     }));
-    expect(createApprovalRequest).toHaveBeenCalledWith(expect.objectContaining({
-      category: "task_agent_mutation",
-      toolName: "fn_task_create",
-    }));
+    expect(createApprovalRequest).toHaveBeenCalledOnce();
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
@@ -1217,6 +1491,15 @@ describe("wrapToolsWithActionGate", () => {
   });
 });
 
+/*
+FNXC:CliRuntimeRouting 2026-08-16-14:37:
+This file pins the RAW pi session constructor's behavior (auth, principals,
+skills, registry resolution, tool wrapping). The public `createFnAgent` now
+routes through createResolvedAgentSession, so every direct call here aliases
+`createPiAgentSessionRaw` — the function DefaultPiRuntime bridges into — to
+keep asserting pi internals rather than the routing seam (covered by
+agent-session-helpers/runtime-resolution tests).
+*/
 describe("createFnAgent", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1253,13 +1536,218 @@ describe("createFnAgent", () => {
     });
   });
 
+  it("binds a durable chat principal to the host-tool prompt invocation when pi omits agentId", async () => {
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    const {
+      __clearFusionSessionIdentityRegistryForTests,
+      resolveFusionSessionPrincipal,
+    } = await import("@fusion/core");
+    __clearFusionSessionIdentityRegistryForTests();
+    const observedPrincipals: unknown[] = [];
+    createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        prompt: vi.fn(async () => {
+          // This is the host-extension execution point: its immediate context has only cwd.
+          await Promise.resolve();
+          observedPrincipals.push(resolveFusionSessionPrincipal("/project"));
+        }),
+        subscribe: vi.fn(),
+        dispose: vi.fn(),
+        setThinkingLevel: vi.fn(),
+      },
+    });
+
+    const { session } = await createFnAgent({
+      cwd: "/project",
+      systemPrompt: "chat",
+      tools: "coding",
+      sessionPurpose: "executor",
+      actionGateContext: {
+        agentId: "agent-1a009724",
+        agentName: "Dashboard Chat Agent",
+        isEphemeral: false,
+        permissionPolicy: { presetId: "unrestricted", rules: {} },
+        createApprovalRequest: vi.fn(),
+        findApprovalByDedupeKey: vi.fn(),
+      } as any,
+    });
+
+    /*
+    FNXC:SecretsAccessApproval 2026-08-05-22:10:
+    The regression boundary is an actual pi prompt invocation, not merely a
+    registered cwd. The host extension receives no agentId here, yet its
+    async execution resolves the durable chat agent through the invocation.
+    */
+    // Dashboard chat uses the fallback-aware public prompt entry point.
+    await (session as any).promptWithFallback("read the prompt-gated secret");
+    expect(observedPrincipals).toEqual([
+      expect.objectContaining({
+        kind: "agent",
+        identity: expect.objectContaining({
+          agentId: "agent-1a009724",
+          agentName: "Dashboard Chat Agent",
+          purpose: "executor",
+        }),
+      }),
+    ]);
+
+    await session.dispose?.();
+    expect(resolveFusionSessionPrincipal("/project")).toEqual({ kind: "operator" });
+    __clearFusionSessionIdentityRegistryForTests();
+  });
+
+  it("reaches the pi host-tool identity wrapper from a durable dashboard chat session", async () => {
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    const {
+      __clearFusionSessionIdentityRegistryForTests,
+      resolveFusionSessionPrincipal,
+    } = await import("@fusion/core");
+    const { ChatManager, __resetChatState, __setCreateResolvedAgentSession } = await import("../../../dashboard/src/chat.js");
+    __clearFusionSessionIdentityRegistryForTests();
+    const observedPrincipals: unknown[] = [];
+    /*
+    FNXC:SecretsAccessApproval 2026-08-23-19:45:
+    Arm the observing session for the DURABLE CHAT session specifically, not for whichever pi session
+    happens to be created first. `ChatManager.sendMessage` also runs `summarizeTitle`, which builds
+    its own anonymous `engine-session-*` principal through `agent-session-helpers`. A bare
+    `mockResolvedValueOnce` was consumed by that title summarizer, so the prompt under inspection was
+    the summarizer's and the assertion read its anonymous identity instead of the bound agent's. The
+    injected `createResolvedAgentSession` seam is reached ONLY by the chat session, which makes it the
+    correct place to arm the instrumented session.
+    */
+    const armObservingSession = () => createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        prompt: vi.fn(async () => {
+          // This mirrors a host-extension callback: pi supplies cwd but no agentId.
+          observedPrincipals.push(resolveFusionSessionPrincipal("/project"));
+        }),
+        subscribe: vi.fn(),
+        dispose: vi.fn(),
+        setThinkingLevel: vi.fn(),
+      },
+    });
+    const chatStore = {
+      /*
+      FNXC:SecretsAccessApproval 2026-08-23-19:58:
+      The session carries a title so `ChatManager.sendMessage` does not also fire its non-blocking
+      title summarizer. That summarizer builds its OWN anonymous `engine-session-*` pi session
+      concurrently with the chat session, and the two race for the mocked session queue — the
+      observed host-tool principal then came from whichever won, which is what made this read the
+      summarizer's anonymous identity instead of the bound agent's. Titling the session removes the
+      unrelated concurrent session rather than trying to order the race.
+      */
+      getSession: vi.fn(() => ({ id: "chat-secret", agentId: "agent-1a009724", status: "active", title: "Prompt-gated secret" })),
+      addMessage: vi.fn((message) => ({ id: `message-${message.role}`, ...message })),
+      getMessages: vi.fn(() => []),
+      setInFlightGeneration: vi.fn(async () => undefined),
+      updateSession: vi.fn(async () => undefined),
+      recordTokenUsage: vi.fn(async () => undefined),
+    };
+    const agentStore = {
+      init: vi.fn(async () => undefined),
+      getAgent: vi.fn(async () => ({
+        id: "agent-1a009724",
+        name: "Dashboard Chat Agent",
+        role: "executor",
+        runtimeConfig: {},
+      })),
+    };
+
+    /*
+    FNXC:SecretsAccessApproval 2026-08-05-23:17:
+    The dashboard must reach the real pi invocation wrapper, not a test-created
+    identity scope. This composes ChatManager's durable-agent lookup with its
+    resolved-session options and pi's host-tool prompt dispatch, where the
+    immediate extension context intentionally omits agentId.
+    */
+    __setCreateResolvedAgentSession(async (options: any) => {
+      armObservingSession();
+      return createFnAgent({
+        ...options,
+        tools: "coding",
+        defaultProvider: "mock",
+        defaultModelId: "scripted",
+      }) as any;
+    });
+
+    try {
+      const manager = new ChatManager(
+        chatStore as any,
+        "/project",
+        agentStore as any,
+        undefined,
+        undefined,
+        undefined,
+        {
+          getAsyncLayer: vi.fn(() => ({})),
+          getSettings: vi.fn(async () => ({ defaultAgentPermissionPolicy: { presetId: "unrestricted", rules: {} } })),
+          getFusionDir: () => "/project/.fusion",
+        } as any,
+      );
+      await manager.sendMessage("chat-secret", "Read the prompt-gated secret");
+
+      expect(observedPrincipals).toEqual([
+        expect.objectContaining({
+          kind: "agent",
+          identity: expect.objectContaining({
+            agentId: "agent-1a009724",
+            agentName: "Dashboard Chat Agent",
+            purpose: "executor",
+          }),
+        }),
+      ]);
+    } finally {
+      __resetChatState();
+      __clearFusionSessionIdentityRegistryForTests();
+    }
+  });
+
+  it("assigns distinct fail-closed principals to concurrent anonymous engine sessions", async () => {
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    const {
+      __clearFusionSessionIdentityRegistryForTests,
+      resolveFusionSessionPrincipal,
+    } = await import("@fusion/core");
+    __clearFusionSessionIdentityRegistryForTests();
+    const observedPrincipals: Array<{ kind?: string; identity?: { agentId?: string } }> = [];
+    const makeSession = () => ({
+      prompt: vi.fn(async () => {
+        const principal = resolveFusionSessionPrincipal("/project");
+        observedPrincipals.push(principal as { kind?: string; identity?: { agentId?: string } });
+      }),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+    });
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: makeSession() })
+      .mockResolvedValueOnce({ session: makeSession() });
+
+    const [first, second] = await Promise.all([
+      createFnAgent({ cwd: "/project", systemPrompt: "anonymous one", tools: "coding" }),
+      createFnAgent({ cwd: "/project", systemPrompt: "anonymous two", tools: "coding" }),
+    ]);
+    await Promise.all([
+      (first.session as any).promptWithFallback("read secret one"),
+      (second.session as any).promptWithFallback("read secret two"),
+    ]);
+
+    expect(observedPrincipals).toHaveLength(2);
+    expect(observedPrincipals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "agent", identity: expect.objectContaining({ agentId: expect.stringMatching(/^engine-session-/) }) }),
+    ]));
+    expect(new Set(observedPrincipals.map((principal) => principal.identity?.agentId))).toHaveLength(2);
+    await Promise.all([first.session.dispose?.(), second.session.dispose?.()]);
+    __clearFusionSessionIdentityRegistryForTests();
+  });
+
   it("skips host extensions for merger sessions so dual-store fn_* tools cannot wedge merge", async () => {
     /*
     FNXC:MergeQueue 2026-07-15-11:08:
     FN-7956 hung AI merge review on extension fn_task_show (second TaskStore boot, no tool timeout).
     Merger sessions must not receive host @runfusion/fusion extension paths even with tools:coding.
     */
-    const { createFnAgent, setHostExtensionPaths } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent, setHostExtensionPaths } = await import("../pi.js");
     setHostExtensionPaths(["/mock/fusion-extension"]);
 
     await createFnAgent({
@@ -1279,7 +1767,7 @@ describe("createFnAgent", () => {
   });
 
   it("still injects host extensions for coding non-merger sessions", async () => {
-    const { createFnAgent, setHostExtensionPaths } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent, setHostExtensionPaths } = await import("../pi.js");
     setHostExtensionPaths(["/mock/fusion-extension"]);
 
     await createFnAgent({
@@ -1298,7 +1786,7 @@ describe("createFnAgent", () => {
   });
 
   it("passes task-scoped env into bash spawn hook when provided", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project",
@@ -1337,7 +1825,7 @@ describe("createFnAgent", () => {
   });
 
   it("keeps bash tool default behavior when taskEnv is not provided", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project",
@@ -1349,7 +1837,7 @@ describe("createFnAgent", () => {
   });
 
   it("keeps spawned env unchanged when taskEnv is empty", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project",
@@ -1366,7 +1854,7 @@ describe("createFnAgent", () => {
   });
 
   it("adds new task env keys absent from spawned env", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project",
@@ -1382,7 +1870,7 @@ describe("createFnAgent", () => {
   });
 
   it("preserves undefined task env values explicitly in merged env", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project",
@@ -1398,7 +1886,7 @@ describe("createFnAgent", () => {
   });
 
   it("injects PATH from task env when spawned env has no PATH", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project",
@@ -1426,7 +1914,7 @@ describe("createFnAgent", () => {
       return "worktree /project\nHEAD abc123\nbranch refs/heads/main\n";
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await expect(createFnAgent({
       cwd: "/project/.worktrees/fn-001",
@@ -1453,7 +1941,7 @@ describe("createFnAgent", () => {
         "worktree /project/.worktrees/fn-001\nHEAD def456\nbranch refs/heads/fusion/fn-001\n";
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project/.worktrees/fn-001",
@@ -1480,7 +1968,7 @@ describe("createFnAgent", () => {
         "worktree /project/.worktrees/task-branch\nHEAD def456\nbranch refs/heads/fusion/fn-001\n";
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     // Pass skills parameter with a worktree cwd.
     // getProjectRootFromWorktree extracts /project from the .worktrees path,
@@ -1508,7 +1996,7 @@ describe("createFnAgent", () => {
       return value === "/project/.fusion";
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/project/src/components",
@@ -1527,7 +2015,7 @@ describe("createFnAgent", () => {
     // No .fusion directory exists anywhere above cwd.
     existsSyncMock.mockImplementation(() => false);
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/unrelated/directory",
@@ -1551,7 +2039,7 @@ describe("createFnAgent", () => {
   });
 
   it("passes a project-trusted settings view through package-manager discovery", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1583,7 +2071,7 @@ describe("createFnAgent", () => {
       errors: [],
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1640,7 +2128,7 @@ describe("createFnAgent", () => {
       },
     ] as any);
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1733,9 +2221,17 @@ describe("createFnAgent", () => {
         anthropicPromptCaching: true,
         models: [{ id: "anthropic-model", name: "Anthropic Model" }],
       },
+      {
+        id: "880e8400-e29b-41d4-a716-446655440003",
+        name: "Custom Google Provider",
+        apiType: "google-generative-ai",
+        baseUrl: "https://google.example",
+        apiKey: "GOOGLE_API_KEY",
+        models: [{ id: "google-model", name: "Google Model" }],
+      },
     ] as any);
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1750,6 +2246,8 @@ describe("createFnAgent", () => {
       api: "openai-completions",
       models: [expect.objectContaining({
         id: "custom-model",
+        reasoning: true,
+        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
         compat: expect.objectContaining({ cacheControlFormat: "anthropic" }),
       })],
     }));
@@ -1757,20 +2255,37 @@ describe("createFnAgent", () => {
     // Opted-out (default) openai-compatible provider: no forced cache_control marker.
     const noCacheCall = registerProviderMock.mock.calls.find(([key]: [string]) => key === "custom-openai-no-caching");
     expect(noCacheCall).toBeDefined();
-    const [, noCacheConfig] = noCacheCall as [string, { models: Array<{ compat?: Record<string, unknown> }> }];
+    const [, noCacheConfig] = noCacheCall as [string, { models: Array<{ reasoning: boolean; thinkingLevelMap: Record<string, string>; compat?: Record<string, unknown> }> }];
+    expect(noCacheConfig.models[0]).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    });
     expect(noCacheConfig.models[0].compat).not.toHaveProperty("cacheControlFormat");
 
     // anthropic-compatible provider: opt-in is a documented no-op — pi-ai's anthropic path already
     // auto-caches without this compat flag, and openai-completions-only compat must not leak in.
     const anthropicCall = registerProviderMock.mock.calls.find(([key]: [string]) => key === "custom-anthropic-caching-opt-in");
     expect(anthropicCall).toBeDefined();
-    const [, anthropicConfig] = anthropicCall as [string, { api: string; models: Array<{ compat?: Record<string, unknown> }> }];
+    const [, anthropicConfig] = anthropicCall as [string, { api: string; models: Array<{ reasoning: boolean; thinkingLevelMap: Record<string, string>; compat?: Record<string, unknown> }> }];
     expect(anthropicConfig.api).toBe("anthropic-messages");
+    expect(anthropicConfig.models[0]).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    });
     expect(anthropicConfig.models[0].compat).toBeUndefined();
+
+    const googleCall = registerProviderMock.mock.calls.find(([key]: [string]) => key === "custom-google-provider");
+    expect(googleCall).toBeDefined();
+    const [, googleConfig] = googleCall as [string, { api: string; models: Array<{ reasoning: boolean; thinkingLevelMap: Record<string, string> }> }];
+    expect(googleConfig.api).toBe("google-generative-ai");
+    expect(googleConfig.models[0]).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    });
   });
 
   it("avoids lock-based SettingsManager.create when loading extension providers", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1791,7 +2306,7 @@ describe("createFnAgent", () => {
       provider === "zai" && modelId === "glm-5.1" ? undefined : { provider, id: modelId }
     ));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await expect(createFnAgent({
       cwd: "/tmp",
@@ -1817,7 +2332,7 @@ describe("createFnAgent", () => {
       return { provider, id: modelId };
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1840,7 +2355,7 @@ describe("createFnAgent", () => {
       provider === "openai-codex" && modelId === "missing-model" ? undefined : { provider, id: modelId }
     ));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await expect(createFnAgent({
       cwd: "/tmp",
@@ -1871,7 +2386,7 @@ describe("createFnAgent", () => {
     ));
     getAllMock.mockReturnValue([]);
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await expect(createFnAgent({
       cwd: "/tmp",
@@ -1910,7 +2425,7 @@ describe("createFnAgent", () => {
     ));
     getAllMock.mockReturnValue([{ provider: "grok-cli", id: "grok-4.5", name: "Grok 4.5" }]);
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1927,7 +2442,7 @@ describe("createFnAgent", () => {
   });
 
   it("creates a session when configured models resolve successfully", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -1950,7 +2465,7 @@ describe("createFnAgent", () => {
     getAllMock.mockReturnValue([]);
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -1968,7 +2483,7 @@ describe("createFnAgent", () => {
     }));
   });
 
-  it("does not duplicate Claude Sonnet 5 when the Anthropic registry already has it", async () => {
+  it("preserves upstream Claude Sonnet 5 while adding missing supplemental models", async () => {
     getAllMock.mockReturnValue([
       {
         provider: "anthropic",
@@ -1983,7 +2498,7 @@ describe("createFnAgent", () => {
     ]);
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -1993,7 +2508,11 @@ describe("createFnAgent", () => {
     });
 
     const anthropicRegistrations = registerProviderMock.mock.calls.filter(([name]) => name === "anthropic");
-    expect(anthropicRegistrations).toHaveLength(0);
+    expect(anthropicRegistrations).toHaveLength(1);
+    expect(anthropicRegistrations[0]?.[1].models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "claude-sonnet-5", name: "Claude Sonnet 5 Upstream" }),
+      expect.objectContaining({ id: "claude-fable-5-1", name: "Claude Fable 5.1" }),
+    ]));
   });
 
   it("synthesizes OpenAI Codex GPT-5.6 models from supplemental metadata when the pi registry lacks them", async () => {
@@ -2002,7 +2521,7 @@ describe("createFnAgent", () => {
     getAllMock.mockReturnValue([]);
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2037,7 +2556,7 @@ describe("createFnAgent", () => {
     getAllMock.mockReturnValue([existingLunaRow]);
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2073,7 +2592,7 @@ describe("createFnAgent", () => {
     getAllMock.mockReturnValue([{ provider: "anthropic", id: "claude-opus-4-8", name: "Claude Opus 4.8" }]);
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2091,11 +2610,36 @@ describe("createFnAgent", () => {
     }));
   });
 
+  it("self-heals stale subscription auth-id selections onto the direct Anthropic provider", async () => {
+    authStorageGetMock.mockImplementation((provider: string) => provider === "anthropic-subscription"
+      ? { type: "oauth", access: "subscription-access-token", refresh: "refresh", expires: Date.now() + 3_600_000 }
+      : undefined);
+    authStorageHasAuthMock.mockImplementation((provider: string) => provider === "anthropic-subscription");
+    getAllMock.mockReturnValue([{ provider: "anthropic", id: "claude-opus-4-8", name: "Claude Opus 4.8" }]);
+    findMock.mockImplementation((provider: string, modelId: string) => provider === "anthropic"
+      ? { provider, id: modelId }
+      : undefined);
+
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    await expect(createFnAgent({
+      cwd: "/tmp",
+      systemPrompt: "test",
+      tools: "readonly",
+      defaultProvider: "anthropic-subscription",
+      defaultModelId: "claude-opus-4-8",
+    })).resolves.toBeDefined();
+
+    expect(createAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      model: { provider: "anthropic", id: "claude-opus-4-8" },
+    }));
+    expect(registerProviderMock).not.toHaveBeenCalledWith("anthropic-subscription", expect.anything());
+  });
+
   it("keeps explicit Claude CLI selections on the Claude CLI provider", async () => {
     authStorageGetApiKeyMock.mockResolvedValue(undefined);
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2115,7 +2659,7 @@ describe("createFnAgent", () => {
       provider === "anthropic" ? "sk-ant-api03-direct" : undefined
     ));
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2146,7 +2690,7 @@ describe("createFnAgent", () => {
     });
     getAllMock.mockReturnValue([{ provider: "anthropic", id: "claude-opus-4-8" }]);
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2169,7 +2713,7 @@ describe("createFnAgent", () => {
     };
     createAgentSessionMock.mockResolvedValueOnce({ session });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     const result = await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2198,7 +2742,7 @@ describe("createFnAgent", () => {
       execute: vi.fn(),
     };
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2210,8 +2754,29 @@ describe("createFnAgent", () => {
     expect(createSessionArgs.customTools.map((tool) => tool.name)).toContain("fn_list_agents");
   });
 
+  it("keeps fn_task_prompt_write in coding session tools", async () => {
+    const promptWriter = {
+      name: "fn_task_prompt_write",
+      label: "Write PROMPT.md",
+      description: "Persist the task specification",
+      parameters: {},
+      execute: vi.fn(),
+    };
+
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    await createFnAgent({
+      cwd: "/tmp",
+      systemPrompt: "test",
+      tools: "coding",
+      customTools: [promptWriter as any],
+    });
+
+    const createSessionArgs = createAgentSessionMock.mock.calls[0]?.[0] as { customTools: Array<{ name: string }> };
+    expect(createSessionArgs.customTools.map((tool) => tool.name)).toContain("fn_task_prompt_write");
+  });
+
   it("does not allow extra builtin tools in readonly sessions by default", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2224,7 +2789,7 @@ describe("createFnAgent", () => {
   });
 
   it("intersects readonly builtin allowlist with readonly policy", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2245,7 +2810,7 @@ describe("createFnAgent", () => {
   });
 
   it("filters coding tools with a case-insensitive toolsAllowlist", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2260,7 +2825,7 @@ describe("createFnAgent", () => {
   });
 
   it("keeps all coding tools when toolsAllowlist is undefined", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2274,7 +2839,7 @@ describe("createFnAgent", () => {
   });
 
   it("exposes no coding tools when toolsAllowlist is empty", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2298,7 +2863,7 @@ describe("createFnAgent", () => {
       execute: vi.fn(),
     };
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2314,7 +2879,7 @@ describe("createFnAgent", () => {
     const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
     const permanentCreateApproval = vi.fn();
     const markApprovalCompleted = vi.fn();
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2355,7 +2920,7 @@ describe("createFnAgent", () => {
   });
 
   it("exposes connected MCP tools in readonly sessions only with the explicit opt-in", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     const close = vi.fn(async () => undefined);
     const mcpClient = {
       connect: vi.fn(async () => undefined),
@@ -2397,6 +2962,51 @@ describe("createFnAgent", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  it("connects and exposes only allowlisted MCP servers in readonly sessions", async () => {
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    const nav = {
+      connect: vi.fn(async () => undefined),
+      listTools: vi.fn(async () => ({ tools: [{ name: "find_symbol" }, { name: "find_references" }] })),
+      callTool: vi.fn(async () => ({ content: [] })),
+      close: vi.fn(async () => undefined),
+    };
+    const memory = {
+      connect: vi.fn(async () => undefined),
+      listTools: vi.fn(async () => ({ tools: [{ name: "recall_append" }] })),
+      callTool: vi.fn(async () => ({ content: [] })),
+      close: vi.fn(async () => undefined),
+    };
+
+    const created = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "test",
+      tools: "readonly",
+      defaultProvider: "anthropic",
+      defaultModelId: "claude-sonnet-4-5",
+      mcpServers: [
+        { name: "nav", transport: "stdio", command: "node", enabled: true },
+        { name: "memory", transport: "stdio", command: "node", enabled: true },
+      ],
+      allowMcpToolsInReadonly: true,
+      readonlyMcpServerAllowlist: ["nav"],
+      mcpClientFactory: (server) => (server.name === "nav" ? nav : memory) as any,
+    });
+
+    const customTools = (createAgentSessionMock.mock.calls[0]?.[0] as { customTools: Array<{ name: string }> }).customTools;
+    expect(customTools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      "mcp__nav__find_symbol",
+      "mcp__nav__find_references",
+    ]));
+    expect(customTools.map((tool) => tool.name)).not.toContain("mcp__memory__recall_append");
+    expect(nav.connect).toHaveBeenCalledTimes(1);
+    expect(memory.connect).not.toHaveBeenCalled();
+    expect(customTools.map((tool) => tool.name)).not.toEqual(expect.arrayContaining(["edit", "write", "bash"]));
+
+    await created.session.dispose?.();
+    expect(nav.close).toHaveBeenCalledTimes(1);
+    expect(memory.close).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["connect", "TypeError"],
     ["list", "RangeError"],
@@ -2419,7 +3029,7 @@ describe("createFnAgent", () => {
       clients.push(client);
       return client;
     });
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     try {
       await expect(createFnAgent({
@@ -2449,7 +3059,7 @@ describe("createFnAgent", () => {
   });
 
   it("keeps MCP tools out of readonly sessions without the explicit opt-in", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     const mcpClient = {
       connect: vi.fn(async () => undefined),
       listTools: vi.fn(async () => ({ tools: [{ name: "lookup" }] })),
@@ -2474,8 +3084,9 @@ describe("createFnAgent", () => {
 
   it("logs createFnAgent startup diagnostics without leaking cwd", async () => {
     const { piLog } = await import("../logger.js");
-    const logSpy = vi.spyOn(piLog, "log").mockImplementation(() => {});
-    const { createFnAgent } = await import("../pi.js");
+    // FNXC:EngineDiagnostics 2026-07-26-09:55: entry chatter is debug-gated.
+    const debugSpy = vi.spyOn(piLog, "debug").mockImplementation(() => {});
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp/private-worktree",
@@ -2485,7 +3096,7 @@ describe("createFnAgent", () => {
       defaultModelId: "gpt-5.4",
     });
 
-    const startupLog = logSpy.mock.calls
+    const startupLog = debugSpy.mock.calls
       .map(([message]) => String(message))
       .find((message) => message.includes("createFnAgent called"));
 
@@ -2497,12 +3108,17 @@ describe("createFnAgent", () => {
     expect(startupLog).not.toContain("cwd=");
     expect(startupLog).not.toContain("/tmp/private-worktree");
 
-    logSpy.mockRestore();
+    debugSpy.mockRestore();
   });
 
-  it("falls back during prompt when the primary model has an auth failure", async () => {
+  it("retains a durable host-tool principal through a fallback session replacement", async () => {
     const primaryPrompt = vi.fn().mockRejectedValue(new Error("401 unauthorized: invalid api key"));
-    const fallbackPrompt = vi.fn().mockResolvedValue(undefined);
+    const observedFallbackPrincipals: unknown[] = [];
+    const fallbackPrompt = vi.fn(async () => {
+      const { resolveFusionSessionPrincipal } = await import("@fusion/core");
+      // Pi's replacement session invokes host tools with only this cwd.
+      observedFallbackPrincipals.push(resolveFusionSessionPrincipal("/tmp"));
+    });
     const primaryDispose = vi.fn();
 
     createAgentSessionMock
@@ -2523,7 +3139,9 @@ describe("createFnAgent", () => {
         },
       });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    const { __clearFusionSessionIdentityRegistryForTests } = await import("@fusion/core");
+    __clearFusionSessionIdentityRegistryForTests();
 
     const { session } = await createFnAgent({
       cwd: "/tmp",
@@ -2533,6 +3151,14 @@ describe("createFnAgent", () => {
       defaultModelId: "glm-5.1",
       fallbackProvider: "openai-codex",
       fallbackModelId: "gpt-5.3-codex",
+      actionGateContext: {
+        agentId: "agent-1a009724",
+        agentName: "Dashboard Chat Agent",
+        isEphemeral: false,
+        permissionPolicy: { presetId: "unrestricted", rules: {} },
+        createApprovalRequest: vi.fn(),
+        findApprovalByDedupeKey: vi.fn(),
+      } as any,
     });
 
     await (session as any).promptWithFallback("make a spec");
@@ -2540,6 +3166,14 @@ describe("createFnAgent", () => {
     expect(primaryPrompt).toHaveBeenCalledWith("make a spec");
     expect(primaryDispose).toHaveBeenCalled();
     expect(fallbackPrompt).toHaveBeenCalledWith("make a spec");
+    expect(observedFallbackPrincipals).toEqual([
+      expect.objectContaining({
+        kind: "agent",
+        identity: expect.objectContaining({ agentId: "agent-1a009724", agentName: "Dashboard Chat Agent" }),
+      }),
+    ]);
+    await session.dispose?.();
+    __clearFusionSessionIdentityRegistryForTests();
     expect(createAgentSessionMock).toHaveBeenNthCalledWith(1, expect.objectContaining({
       model: { provider: "zai", id: "glm-5.1" },
     }));
@@ -2573,7 +3207,7 @@ describe("createFnAgent", () => {
         },
       });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     const { session } = await createFnAgent({
       cwd: "/tmp",
@@ -2596,7 +3230,7 @@ describe("createFnAgent", () => {
   });
 
   it("enables auto-compaction to prevent context-window overflow", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2613,7 +3247,7 @@ describe("createFnAgent", () => {
   });
 
   it("passes compaction enabled alongside retry settings", async () => {
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await createFnAgent({
       cwd: "/tmp",
@@ -2644,7 +3278,7 @@ describe("createFnAgent", () => {
     };
     createAgentSessionMock.mockResolvedValueOnce({ session });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     const { session: guardedSession } = await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2675,7 +3309,7 @@ describe("createFnAgent", () => {
       _rewriteFile: rewriteFile,
     };
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2721,7 +3355,7 @@ describe("createFnAgent", () => {
     };
     createAgentSessionMock.mockResolvedValueOnce({ session });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
     await createFnAgent({
       cwd: "/tmp",
       systemPrompt: "test",
@@ -2765,7 +3399,7 @@ describe("createFnAgent", () => {
       },
     });
 
-    const { createFnAgent } = await import("../pi.js");
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
 
     await expect(createFnAgent({
       cwd: "/tmp",
@@ -2795,7 +3429,7 @@ describe("createFnAgent", () => {
     const anyModel = { provider: "anthropic", id: "claude" } as never;
 
     async function createAndCaptureRuntime(overrides: Record<string, unknown> = {}) {
-      const { createFnAgent } = await import("../pi.js");
+      const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
       await createFnAgent({
         cwd: "/tmp",
         systemPrompt: "test",
@@ -2839,6 +3473,28 @@ describe("createFnAgent", () => {
       const result = await runtime.getAuth(anyModel);
 
       expect(result?.auth.headers).toEqual({});
+    });
+
+    it("adds OAuth identity alongside task routing headers", async () => {
+      modelRuntimeGetAuthMock.mockResolvedValueOnce({ auth: { apiKey: "sk-ant-oat-test", headers: {} } });
+      const runtime = await createAndCaptureRuntime({ taskId: "FN-9245" });
+
+      const result = await runtime.getAuth(anyModel);
+
+      expect(result?.auth.headers).toEqual({
+        "X-Session-Id": "FN-9245",
+        "X-Session-Affinity": "FN-9245",
+        "user-agent": "claude-cli/2.1.251",
+      });
+    });
+
+    it("adds OAuth identity without a task or pi session id", async () => {
+      modelRuntimeGetAuthMock.mockResolvedValueOnce({ auth: { apiKey: "sk-ant-oat-test", headers: {} } });
+      const runtime = await createAndCaptureRuntime();
+
+      const result = await runtime.getAuth(anyModel);
+
+      expect(result?.auth.headers).toEqual({ "user-agent": "claude-cli/2.1.251" });
     });
   });
 
@@ -2914,7 +3570,7 @@ describe("createFnAgent", () => {
         },
       }));
 
-      const { createFnAgent: freshCreateFnAgent } = await import("../pi.js");
+      const { createPiAgentSessionRaw: freshCreateFnAgent } = await import("../pi.js");
 
       await freshCreateFnAgent({
         cwd: "/tmp",
@@ -3005,7 +3661,7 @@ describe("createFnAgent", () => {
         },
       }));
 
-      const { createFnAgent: freshCreateFnAgent } = await import("../pi.js");
+      const { createPiAgentSessionRaw: freshCreateFnAgent } = await import("../pi.js");
 
       await freshCreateFnAgent({
         cwd: "/tmp",
@@ -3027,7 +3683,15 @@ describe("createFnAgent", () => {
       }
     });
 
-    it("with skillSelection (specific requested names) activates skill filtering", async () => {
+    /*
+    FNXC:SkillResolution 2026-08-16-15:12:
+    FN-9114 changed requested skill names from an allow-list to ensure-present:
+    all enabled discovered skills stay available, and requested names only
+    guarantee inclusion (agent metadata is no longer an availability filter).
+    This test previously asserted the pre-FN-9114 allow-list narrowing and was
+    the one call-site-level assertion missed by that commit's test sweep.
+    */
+    it("with skillSelection (specific requested names) keeps all discovered skills and ensures requested ones are present", async () => {
       let capturedResourceLoaderOptions: any;
       vi.doMock("@earendil-works/pi-coding-agent", () => ({
         LegacyCredentialStorage: {
@@ -3093,7 +3757,7 @@ describe("createFnAgent", () => {
         },
       }));
 
-      const { createFnAgent: freshCreateFnAgent } = await import("../pi.js");
+      const { createPiAgentSessionRaw: freshCreateFnAgent } = await import("../pi.js");
 
       await freshCreateFnAgent({
         cwd: "/tmp",
@@ -3118,17 +3782,20 @@ describe("createFnAgent", () => {
         diagnostics: [],
       });
 
-      // Only paperclip should pass through (matching requested name)
-      expect(result.skills).toHaveLength(1);
-      expect(result.skills[0].name).toBe("paperclip");
+      // FN-9114: requested names are ensure-present, not an allow-list — every
+      // discovered skill stays available and the requested one is included.
+      expect(result.skills).toHaveLength(2);
+      expect(result.skills.map((skill: { name: string }) => skill.name)).toEqual(
+        expect.arrayContaining(["paperclip", "lint"]),
+      );
     });
 
     it("diagnostics are logged via structured logger with [skills] context", async () => {
       const { piLog } = await import("../logger.js");
-      const piLogSpy = vi.spyOn(piLog, "log").mockImplementation(() => {});
+      const piDebugSpy = vi.spyOn(piLog, "debug").mockImplementation(() => {});
 
       // Test diagnostics logging by directly calling createSkillsOverrideFromSelection
-      const { createSkillsOverrideFromSelection } = await import("../skill-resolver.js");
+      const { createSkillsOverrideFromSelection } = await import("../cli-runtime/skill-resolver.js");
 
       const selection = {
         allowedSkillPaths: new Set<string>(),
@@ -3151,8 +3818,8 @@ describe("createFnAgent", () => {
       // Check that diagnostics were produced
       expect(result.diagnostics.length).toBeGreaterThan(0);
 
-      // Check that diagnostics were logged with [skills] context
-      const skillLogs = piLogSpy.mock.calls.filter(call =>
+      // type=info skill diagnostics (including not-found) are debug-gated
+      const skillLogs = piDebugSpy.mock.calls.filter(call =>
         String(call[0]).includes("[skills]")
       );
       expect(skillLogs.length).toBeGreaterThan(0);
@@ -3161,7 +3828,7 @@ describe("createFnAgent", () => {
       const lastLog = skillLogs[skillLogs.length - 1][0] as string;
       expect(lastLog).toContain("[executor]");
 
-      piLogSpy.mockRestore();
+      piDebugSpy.mockRestore();
     });
   });
 });

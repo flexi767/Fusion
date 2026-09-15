@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import type { StepStatus, WorkflowStepResult } from "../types.js";
-import { getLatestFailedPreMergeReviewStep, getTaskMergeBlocker } from "../task-merge.js";
+import { findPendingPreMergeStep, getLatestFailedPreMergeReviewStep, getTaskMergeBlocker } from "../merge/task-merge.js";
+import { FAST_MODE_BYPASS_ACTOR } from "../workflows/workflow-fast-lane.js";
+import { archiveTerminalWorkflowStepFailures } from "../workflows/workflow-step-results.js";
 
 /*
  * FNXC:ReviewLaneBypass 2026-07-09-00:00:
@@ -76,6 +78,31 @@ describe("getLatestFailedPreMergeReviewStep", () => {
     ];
     const selected = getLatestFailedPreMergeReviewStep({ workflowStepResults: results });
     expect(selected?.workflowStepId).toBe("WS-later");
+  });
+
+  it("selects eligible archived failure carriers while preserving live-failure precedence and recency", () => {
+    const archived = (overrides: Partial<WorkflowStepResult> = {}) => ({
+      ...archiveTerminalWorkflowStepFailures([
+        stepResult({ workflowStepId: "archived", completedAt: "2026-09-01T00:00:00.000Z" }),
+      ], "2026-09-02T00:00:00.000Z")![0]!,
+      ...overrides,
+    });
+
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [] })).toBeUndefined();
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [
+      archived({ workflowStepId: "older-archived" }),
+      stepResult({ workflowStepId: "live-failed", completedAt: "2026-08-01T00:00:00.000Z" }),
+    ] })?.workflowStepId).toBe("live-failed");
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [archived()] })?.workflowStepId).toBe("archived");
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [archived({ remediationArchivedFromStatus: "advisory_failure" })] })?.workflowStepId).toBe("archived");
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [archived({ remediationArchivedFromStatus: "passed" })] })).toBeUndefined();
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [archived({ bypassedBy: "operator" })] })).toBeUndefined();
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [archived({ supersededAt: "2026-09-03T00:00:00.000Z" })] })).toBeUndefined();
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [archived({ phase: "post-merge" })] })).toBeUndefined();
+    expect(getLatestFailedPreMergeReviewStep({ workflowStepResults: [
+      archived({ workflowStepId: "older", completedAt: "2026-09-01T00:00:00.000Z" }),
+      archived({ workflowStepId: "newer", completedAt: "2026-09-04T00:00:00.000Z" }),
+    ] })?.workflowStepId).toBe("newer");
   });
 });
 
@@ -174,5 +201,100 @@ describe("bypass invariant on getTaskMergeBlocker", () => {
       ],
     };
     expect(getTaskMergeBlocker(task)).toMatch(/marked 'stuck-killed'/);
+  });
+});
+
+describe("content-binding bypass actors", () => {
+  const requiredPreMergeStepIds = new Set(["code-review"]);
+  const mergeContent = { kind: "singular" as const, diff: { state: "fingerprint" as const, fingerprint: "current" } };
+  const audit = {
+    status: "skipped" as const,
+    bypassedAt: "2026-09-01T00:00:00.000Z",
+    bypassReason: "Reviewer transport failed",
+    bypassedFromStatus: "absent" as const,
+  };
+
+  function blocker(result: WorkflowStepResult, manual: boolean) {
+    return getTaskMergeBlocker({ ...baseTask, workflowStepResults: [result] }, {
+      manual,
+      requiredPreMergeStepIds,
+      mergeContent,
+    });
+  }
+
+  it.each([false, true])("releases audited human carriers but not the field-identical fast carrier when manual=%s", (manual) => {
+    const humanAbsent = stepResult({ workflowStepId: "code-review", ...audit, bypassedBy: "operator-1" });
+    const humanFailed = stepResult({ ...humanAbsent, bypassedFromStatus: "failed" });
+    const automated = stepResult({ ...humanAbsent, bypassedBy: FAST_MODE_BYPASS_ACTOR });
+    const incompleteHuman = stepResult({ ...humanAbsent, bypassedAt: undefined, bypassReason: undefined });
+
+    expect(blocker(humanFailed, manual)).toBeUndefined();
+    expect(blocker(humanAbsent, manual)).toBeUndefined();
+    expect(blocker(automated, manual)).toBe("task has no provable approval for the content being merged");
+    expect(blocker(incompleteHuman, manual)).toBe("task has no provable approval for the content being merged");
+  });
+
+  it("keeps fast-mode behavior unchanged for empty and absent descriptors", () => {
+    const automated = stepResult({ workflowStepId: "code-review", ...audit, bypassedBy: FAST_MODE_BYPASS_ACTOR });
+    expect(getTaskMergeBlocker({ ...baseTask, workflowStepResults: [automated] }, {
+      requiredPreMergeStepIds,
+      mergeContent: { kind: "singular", diff: { state: "empty" } },
+    })).toBeUndefined();
+    expect(getTaskMergeBlocker({ ...baseTask, workflowStepResults: [automated] }, {
+      requiredPreMergeStepIds,
+    })).toBeUndefined();
+  });
+
+  it("lets an audited waiver release stale content while an unbypassed approval stays stale", () => {
+    const stale = stepResult({
+      workflowStepId: "code-review",
+      status: "passed",
+      reviewKind: "code",
+      verdict: "APPROVE",
+      reviewInputFingerprint: "stale",
+    });
+    expect(blocker(stale, false)).toBe("task has a pre-merge approval recorded against different content");
+    expect(blocker({ ...stale, ...audit, bypassedBy: "operator-1" }, false)).toBeUndefined();
+  });
+});
+
+describe("findPendingPreMergeStep", () => {
+  it("returns undefined when workflowStepResults is undefined", () => {
+    expect(findPendingPreMergeStep({ workflowStepResults: undefined })).toBeUndefined();
+  });
+
+  it("returns undefined when no pre-merge step is pending", () => {
+    const results = [
+      stepResult({ status: "passed" }),
+      stepResult({ status: "failed" }),
+      stepResult({ workflowStepId: "WS-post", phase: "post-merge", status: "pending" }),
+    ];
+    expect(findPendingPreMergeStep({ workflowStepResults: results })).toBeUndefined();
+  });
+
+  it("returns the pending result when one exists", () => {
+    const results = [stepResult({ status: "pending" })];
+    const found = findPendingPreMergeStep({ workflowStepResults: results });
+    expect(found?.workflowStepId).toBe("WS-001");
+    expect(found?.status).toBe("pending");
+  });
+
+  it("returns the latest pending result when multiple exist", () => {
+    const results = [
+      stepResult({ workflowStepId: "WS-older", startedAt: "2026-07-17T10:00:00.000Z", status: "pending" }),
+      stepResult({ workflowStepId: "WS-newer", startedAt: "2026-07-17T16:10:10.052Z", status: "pending" }),
+    ];
+    const found = findPendingPreMergeStep({ workflowStepResults: results });
+    expect(found?.workflowStepId).toBe("WS-newer");
+  });
+
+  it("does NOT return failed or passed results (only pending)", () => {
+    const results = [
+      stepResult({ workflowStepId: "WS-passed", status: "passed" }),
+      stepResult({ workflowStepId: "WS-failed", status: "failed" }),
+      stepResult({ workflowStepId: "WS-pending", status: "pending" }),
+    ];
+    const found = findPendingPreMergeStep({ workflowStepResults: results });
+    expect(found?.workflowStepId).toBe("WS-pending");
   });
 });

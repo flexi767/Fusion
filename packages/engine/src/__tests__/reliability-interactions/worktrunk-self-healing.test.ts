@@ -31,8 +31,13 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-vi.mock("../../worktree-pool.js", async () => {
-  const actual = await vi.importActual<any>("../../worktree-pool.js");
+/*
+FNXC:TestHarnessIntegrity 2026-08-12-01:04:
+A moved `vi.mock` target and its `importActual` sibling must change together; guarding only the mock target
+leaves the factory broken at runtime.
+*/
+vi.mock("../../worktree/worktree-pool.js", async () => {
+  const actual = await vi.importActual<any>("../../worktree/worktree-pool.js");
   return {
     ...actual,
     resolveWorktreeBackend: resolveBackendSpy,
@@ -41,8 +46,13 @@ vi.mock("../../worktree-pool.js", async () => {
   };
 });
 
-vi.mock("../../branch-conflicts.js", async () => {
-  const actual = await vi.importActual<any>("../../branch-conflicts.js");
+/*
+FNXC:TestHarnessIntegrity 2026-08-12-01:04:
+A moved `vi.mock` target and its `importActual` sibling must change together; guarding only the mock target
+leaves the factory broken at runtime.
+*/
+vi.mock("../../execution/branch-conflicts.js", async () => {
+  const actual = await vi.importActual<any>("../../execution/branch-conflicts.js");
   return {
     ...actual,
     inspectBranchConflict: inspectBranchConflictSpy,

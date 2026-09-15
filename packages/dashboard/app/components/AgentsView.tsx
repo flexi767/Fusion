@@ -2,14 +2,17 @@ import "./AgentsView.css";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { useState, useEffect, useCallback, useRef, useMemo, useId, useLayoutEffect, lazy, Suspense, type CSSProperties, type ReactNode, type MutableRefObject, type RefObject, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, Filter, Upload, Network, SlidersHorizontal, ZoomIn, ZoomOut, Minimize2, Move, Info } from "lucide-react";
+import { Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, Filter, Upload, Network, SlidersHorizontal, ZoomIn, ZoomOut, Minimize2, Move, Info } from "lucide-react";
 import type { Agent, AgentCapability, AgentOnboardingSummary, AgentState, OrgTreeNode } from "../api";
-import { fetchAgents, updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings } from "../api";
+import { fetchAgents, updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings, isAgentHeartbeatEnabled, withAgentHeartbeatEnabled } from "../api";
 
 const AgentDetailView = lazy(() => import("./AgentDetailView").then((m) => ({ default: m.AgentDetailView })));
 import { AgentTokenStatsPanel } from "./AgentTokenStatsPanel";
-import { AgentsOverviewBar } from "./AgentsOverviewBar";
+import { AgentsOverviewBar, AgentsOverviewToggle } from "./AgentsOverviewBar";
 import { ViewHeader } from "./ViewHeader";
+import { ViewActionButton } from "./ViewActionButton";
+import { ViewSidebar } from "./ViewSidebar";
+import { ViewLayout } from "./ViewLayout";
 import { AgentEmptyState } from "./AgentEmptyState";
 import { useAgents } from "../hooks/useAgents";
 import { useConfirm } from "../hooks/useConfirm";
@@ -26,8 +29,10 @@ import {
   MIN_HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_INTERVAL_PRESETS,
 } from "../utils/heartbeatIntervals";
-import { isEphemeralAgent, getErrorMessage } from "@fusion/core";
-import { formatAgentSkillBadgeLabel } from "../utils/agentSkills";
+import { isEphemeralAgent, getErrorMessage, resolvePermanentAgentEffectiveModel, type Settings } from "@fusion/core";
+import { classifyAgentSkill, formatAgentSkillBadgeLabel } from "../utils/agentSkills";
+import { useDiscoveredSkillsCache } from "../hooks/useDiscoveredSkillsCache";
+import { isInsidePortaledModelMenu } from "../utils/portalSurfaces";
 import {
   ORG_CHART_LAYOUT_STORAGE_KEY,
   isOrgChartLayoutPreference,
@@ -39,12 +44,17 @@ import { AgentAvatar } from "./AgentAvatar";
 import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
 import { AgentTaskBadge } from "./AgentTaskBadge";
 import { RuntimeFallbackBadge } from "./RuntimeFallbackBadge";
+import { useAgentActivity } from "../hooks/useAgentActivity";
+import { useReducedMotion } from "../hooks/useReducedMotion";
+import { orgChartEdgeKey, resolveFlowEdges, resolveNodeActivityState } from "./agentsOrgChartActivity";
+import type { AgentActivityEvent } from "../api";
 
 export interface AgentsViewProps {
   addToast: (message: string, type?: "success" | "error") => void;
   projectId?: string;
   onOpenTaskLogs?: (taskId: string) => void;
   agentOnboardingEnabled?: boolean;
+  focusAgent?: { agentId: string; requestId: number };
 }
 
 function getAgentRoles(t: TFunction<"app">): { value: AgentCapability; label: string; icon: string }[] {
@@ -60,33 +70,12 @@ function getAgentRoles(t: TFunction<"app">): { value: AgentCapability; label: st
 }
 
 const HEARTBEAT_MULTIPLIER_PRESETS = [0.1, 0.25, 0.5, 1, 2, 3, 5, 10] as const;
+const HEARTBEAT_DISABLED_OPTION_VALUE = "__disabled__";
 
 const ORG_CHART_SCALE_MIN = 0.25;
 const ORG_CHART_SCALE_MAX = 3;
 const ORG_CHART_KEYBOARD_PAN_STEP = 16;
 const ORG_CHART_OVERSCROLL = 32;
-
-/*
-FNXC:AgentsView 2026-06-20-00:00:
-The Agents split view needs a wider tablet default than the old fixed CSS column and the sidebar must be user-resizable on non-mobile viewports.
-Persist the clamped width per project so desktop and tablet users keep their preferred agent-list/detail balance without affecting the stacked mobile layout.
-*/
-const AGENTS_SIDEBAR_DEFAULT_WIDTH = 320;
-const AGENTS_SIDEBAR_MIN_WIDTH = 260;
-const AGENTS_SIDEBAR_MAX_WIDTH = 520;
-const AGENTS_SIDEBAR_WIDTH_STORAGE_KEY = "kb-dashboard-agents-sidebar-width";
-
-function clampAgentsSidebarWidth(width: number): number {
-  return Math.max(AGENTS_SIDEBAR_MIN_WIDTH, Math.min(AGENTS_SIDEBAR_MAX_WIDTH, width));
-}
-
-function readAgentsSidebarWidth(projectId?: string): number {
-  if (typeof window === "undefined") return AGENTS_SIDEBAR_DEFAULT_WIDTH;
-  const stored = getScopedItem(AGENTS_SIDEBAR_WIDTH_STORAGE_KEY, projectId);
-  const parsed = stored ? Number(stored) : NaN;
-  if (!Number.isFinite(parsed)) return AGENTS_SIDEBAR_DEFAULT_WIDTH;
-  return clampAgentsSidebarWidth(parsed);
-}
 
 function getStateBadgeClass(state: AgentState): string {
   switch (state) {
@@ -133,7 +122,7 @@ FNXC:AgentsView 2026-06-23-04:00:
 Agent list cards must expose the configured model or plugin runtime without requiring a detail-view open.
 Use the same runtimeHint/modelProvider+modelId/legacy model fallback order as the detail view and leave no-override agents as Auto at render time.
 */
-function getAgentModelLabel(agent: Agent): AgentModelLabel {
+function getAgentModelLabel(agent: Agent, settings?: Partial<Settings>): AgentModelLabel {
   const runtimeConfig = agent.runtimeConfig ?? {};
   const runtimeHint = typeof runtimeConfig.runtimeHint === "string" ? runtimeConfig.runtimeHint : "";
   if (runtimeHint) {
@@ -152,7 +141,8 @@ function getAgentModelLabel(agent: Agent): AgentModelLabel {
     return { label: legacyModel.slice(slashIdx + 1), isRuntime: false };
   }
 
-  return { label: null, isRuntime: false };
+  const effective = resolvePermanentAgentEffectiveModel(agent, settings);
+  return { label: effective.provider && effective.modelId ? `${effective.provider}/${effective.modelId}` : null, isRuntime: false };
 }
 
 function getOrgChartLeafCount(node: OrgTreeNode): number {
@@ -161,6 +151,19 @@ function getOrgChartLeafCount(node: OrgTreeNode): number {
   }
 
   return node.children.reduce((sum, child) => sum + getOrgChartLeafCount(child), 0);
+}
+
+/**
+ * FNXC:OrgChartNavigation 2026-08-09-22:00: Node chat navigation must use the
+ * rendered org-tree task binding when the independently refreshed roster lags.
+ */
+function findOrgTreeAgent(nodes: readonly OrgTreeNode[], agentId: string): Agent | undefined {
+  for (const node of nodes) {
+    if (node.agent.id === agentId) return node.agent;
+    const child = findOrgTreeAgent(node.children, agentId);
+    if (child) return child;
+  }
+  return undefined;
 }
 
 function getHealthSummary(agent: Agent, health: AgentHealthStatus, t: TFunction<"app">): { title: string | undefined; label: string | null } {
@@ -177,6 +180,38 @@ function getHealthSummary(agent: Agent, health: AgentHealthStatus, t: TFunction<
 type OrgChartLink = { parentId: string; childId: string };
 type OrgChartTransform = { scale: number; x: number; y: number };
 
+/*
+FNXC:AgentHeartbeatControls 2026-07-23-13:10:
+List and board cards use one explicit heartbeat action. It changes only runtimeConfig.enabled through the preserved payload helper; lifecycle pause/resume remains a separate control.
+
+FNXC:AgentHeartbeatControls 2026-07-26-19:07:
+FN-8625 makes the org chart intentionally read-only for heartbeat configuration. Enable and disable actions remain available through board, list, and bulk-control surfaces.
+*/
+function HeartbeatToggle({ agent, pending, onToggle }: { agent: Agent; pending: boolean; onToggle: (agent: Agent) => void }) {
+  const { t } = useTranslation("app");
+  // FNXC:AgentHeartbeatControls 2026-07-23-13:30: Task-worker agents are ephemeral and must never receive durable heartbeat mutations, even when operators expose system agents.
+  if (isEphemeralAgent(agent)) return null;
+  const enabled = isAgentHeartbeatEnabled(agent);
+  const label = enabled
+    ? t("agents.disableHeartbeat", "Disable heartbeat")
+    : t("agents.enableHeartbeat", "Enable heartbeat");
+  return (
+    <button
+      type="button"
+      className="btn btn-sm agent-heartbeat-toggle"
+      disabled={pending}
+      aria-pressed={enabled}
+      aria-label={t("agents.heartbeatActionForAgent", "{{action}} for {{name}}", { action: label, name: agent.name })}
+      onClick={(event) => {
+        event.stopPropagation();
+        onToggle(agent);
+      }}
+    >
+      {pending ? t("agents.heartbeatUpdating", "Updating heartbeat…") : label}
+    </button>
+  );
+}
+
 type OrgChartNodeProps = {
   node: OrgTreeNode;
   onSelect: (id: string) => void;
@@ -184,9 +219,11 @@ type OrgChartNodeProps = {
   selectedAgentId: string | null;
   registerNodeElement: (id: string, element: HTMLDivElement | null) => void;
   linksRef: MutableRefObject<OrgChartLink[]>;
+  activityByAgentId: ReadonlyMap<string, AgentActivityEvent>;
+  nowTick: number;
 };
 
-function OrgChartNode({ node, onSelect, getHealthStatus, selectedAgentId, registerNodeElement, linksRef }: OrgChartNodeProps) {
+function OrgChartNode({ node, onSelect, getHealthStatus, selectedAgentId, registerNodeElement, linksRef, activityByAgentId, nowTick }: OrgChartNodeProps) {
   const { t } = useTranslation("app");
   const { agent, children } = node;
   const health = getHealthStatus(agent);
@@ -194,6 +231,8 @@ function OrgChartNode({ node, onSelect, getHealthStatus, selectedAgentId, regist
   const stateBadgeClass = getStateBadgeClass(agent.state);
   const stateNodeClass = getStateCardClass("org-chart-node-card", agent.state);
   const subtreeLeafCount = getOrgChartLeafCount(node);
+  const activityState = resolveNodeActivityState(agent, activityByAgentId.get(agent.id), nowTick, health);
+  const activityClass = activityState === "unknown" ? "" : ` org-chart-node-card--activity-${activityState}`;
   const nodeStyle = { "--org-chart-subtree-leaves": String(subtreeLeafCount) } as CSSProperties;
 
   return (
@@ -201,7 +240,8 @@ function OrgChartNode({ node, onSelect, getHealthStatus, selectedAgentId, regist
       <div
         ref={(element) => registerNodeElement(agent.id, element)}
         data-agent-id={agent.id}
-        className={`org-chart-node-card ${stateNodeClass}${selectedAgentId === agent.id ? " agent-card--selected" : ""}`}
+        className={`org-chart-node-card ${stateNodeClass}${activityClass}${selectedAgentId === agent.id ? " agent-card--selected" : ""}`}
+        {...(activityState === "unknown" ? {} : { "data-activity-state": activityState, "aria-label": `${agent.name}: ${activityState}` })}
         onClick={() => onSelect(agent.id)}
         role="button"
         tabIndex={0}
@@ -239,6 +279,8 @@ function OrgChartNode({ node, onSelect, getHealthStatus, selectedAgentId, regist
                 selectedAgentId={selectedAgentId}
                 registerNodeElement={registerNodeElement}
                 linksRef={linksRef}
+                activityByAgentId={activityByAgentId}
+                nowTick={nowTick}
               />
             );
           })}
@@ -255,6 +297,8 @@ function OrgChartConnectors({
   viewportRef,
   layoutMode,
   transform,
+  activityEvents,
+  nowTick,
 }: {
   links: OrgChartLink[];
   nodeElements: Map<string, HTMLDivElement>;
@@ -262,8 +306,16 @@ function OrgChartConnectors({
   viewportRef: RefObject<HTMLDivElement | null>;
   layoutMode: OrgChartLayoutMode;
   transform: OrgChartTransform;
+  activityEvents: readonly AgentActivityEvent[];
+  nowTick: number;
 }) {
-  const [paths, setPaths] = useState<string[]>([]);
+  const [paths, setPaths] = useState<Array<{ d: string; link: OrgChartLink }>>([]);
+  const reducedMotion = useReducedMotion();
+  /*
+  FNXC:OrgChartConnectorFlow 2026-08-09-21:45:
+  Delegation flow uses the existing measured paths in either layout. Reduced-motion users retain a static directional stroke rather than an animated dash, so direction is not hidden with the animation.
+  */
+  const flowEdges = useMemo(() => resolveFlowEdges(links, activityEvents, nowTick), [activityEvents, links, nowTick]);
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
@@ -292,7 +344,7 @@ function OrgChartConnectors({
           const endX = cLeft;
           const endY = cTop + childRect.height / transform.scale / 2;
           const midX = startX - (startX - endX) / 2;
-          return [`M ${startX} ${startY} L ${midX} ${startY} L ${midX} ${endY} L ${endX} ${endY}`];
+          return [{ d: `M ${startX} ${startY} L ${midX} ${startY} L ${midX} ${endY} L ${endX} ${endY}`, link: { parentId, childId } }];
         }
 
         const startX = pLeft + parentRect.width / transform.scale / 2;
@@ -300,7 +352,7 @@ function OrgChartConnectors({
         const endX = cLeft + childRect.width / transform.scale / 2;
         const endY = cTop;
         const midY = startY + (endY - startY) / 2;
-        return [`M ${startX} ${startY} L ${startX} ${midY} L ${endX} ${midY} L ${endX} ${endY}`];
+        return [{ d: `M ${startX} ${startY} L ${startX} ${midY} L ${endX} ${midY} L ${endX} ${endY}`, link: { parentId, childId } }];
       });
       setPaths(next);
     };
@@ -315,15 +367,19 @@ function OrgChartConnectors({
 
   return (
     <svg className="agent-org-chart-connectors" aria-hidden="true">
-      {paths.map((d, index) => (
-        <path key={`${index}-${d}`} d={d} />
-      ))}
+      {paths.map(({ d, link }) => {
+        const direction = flowEdges.get(orgChartEdgeKey(link.parentId, link.childId));
+        const flowClass = direction ? ` agent-org-chart-connectors__flow--${reducedMotion ? "static " : ""}${direction}` : "";
+        return <path key={`${link.parentId}-${link.childId}-${d}`} d={d} className={flowClass || undefined} {...(direction ? { "data-flow-direction": direction } : {})} />;
+      })}
     </svg>
   );
 }
 
-export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardingEnabled = false }: AgentsViewProps) {
+export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardingEnabled = false, focusAgent }: AgentsViewProps) {
   const { t } = useTranslation("app");
+  const { skills: discoveredSkills, loading: discoveredSkillsLoading, error: discoveredSkillsError } = useDiscoveredSkillsCache(projectId);
+  const activitySnapshot = useAgentActivity(projectId);
   const agentRoles = getAgentRoles(t);
   const [showSystemAgents, setShowSystemAgents] = useState(false);
 
@@ -427,7 +483,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   );
   const viewportMode = useViewportMode();
   const isMobileViewport = viewportMode === "mobile";
-  const [sidebarWidth, setSidebarWidth] = useState<number>(() => readAgentsSidebarWidth(projectId));
   const [filterState, setFilterState] = useState<AgentState | "all">("all");
   const { agents, stats, isLoading, loadAgents, refreshAgents } = useAgents(projectId, {
     filterState,
@@ -461,6 +516,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const [isBulkEligibilityLoading, setIsBulkEligibilityLoading] = useState(false);
   const [bulkPauseEligibleCount, setBulkPauseEligibleCount] = useState(0);
   const [bulkResumeEligibleCount, setBulkResumeEligibleCount] = useState(0);
+  const [bulkEnableHeartbeatEligibleCount, setBulkEnableHeartbeatEligibleCount] = useState(0);
+  const [bulkDisableHeartbeatEligibleCount, setBulkDisableHeartbeatEligibleCount] = useState(0);
   const [orgChartTransform, setOrgChartTransform] = useState<OrgChartTransform>({ scale: 1, x: 0, y: 0 });
   const [isOrgChartPanning, setIsOrgChartPanning] = useState(false);
   const controlsPanelRef = useRef<HTMLDivElement>(null);
@@ -475,10 +532,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const { confirm } = useConfirm();
   const controlsTriggerRef = useRef<HTMLButtonElement>(null);
   const controlsPanelId = useId();
-
-  useEffect(() => {
-    setSidebarWidth(readAgentsSidebarWidth(projectId));
-  }, [projectId]);
 
   useEffect(() => {
     const saved = getScopedItem("fn-agent-view", projectId);
@@ -503,68 +556,18 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     setScopedItem(ORG_CHART_LAYOUT_STORAGE_KEY, orgChartLayoutPreference, projectId);
   }, [orgChartLayoutPreference, projectId]);
 
-  const persistSidebarWidth = useCallback((width: number) => {
-    try {
-      setScopedItem(AGENTS_SIDEBAR_WIDTH_STORAGE_KEY, String(width), projectId);
-    } catch {
-      // Ignore storage errors.
-    }
-  }, [projectId]);
-
-  const handleSidebarResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (isMobileViewport) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const handle = event.currentTarget;
-    if (typeof handle.setPointerCapture === "function") {
-      handle.setPointerCapture(event.pointerId);
-    }
-    const startX = event.clientX;
-    const startWidth = sidebarWidth;
-    let latestWidth = startWidth;
-    document.body.style.userSelect = "none";
-
-    const onPointerMove = (moveEvent: PointerEvent) => {
-      const deltaX = moveEvent.clientX - startX;
-      const nextWidth = clampAgentsSidebarWidth(startWidth + deltaX);
-      latestWidth = nextWidth;
-      setSidebarWidth(nextWidth);
-    };
-
-    const onPointerUp = (upEvent: PointerEvent) => {
-      if (typeof handle.releasePointerCapture === "function") {
-        handle.releasePointerCapture(upEvent.pointerId);
-      }
-      document.body.style.userSelect = "";
-      document.removeEventListener("pointermove", onPointerMove);
-      document.removeEventListener("pointerup", onPointerUp);
-      persistSidebarWidth(latestWidth);
-    };
-
-    document.addEventListener("pointermove", onPointerMove);
-    document.addEventListener("pointerup", onPointerUp);
-  }, [isMobileViewport, persistSidebarWidth, sidebarWidth]);
-
-  const handleSidebarResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (isMobileViewport) return;
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    const step = event.shiftKey ? 50 : 10;
-    const delta = event.key === "ArrowLeft" ? -step : step;
-    const nextWidth = clampAgentsSidebarWidth(sidebarWidth + delta);
-    setSidebarWidth(nextWidth);
-    persistSidebarWidth(nextWidth);
-  }, [isMobileViewport, persistSidebarWidth, sidebarWidth]);
-
   const [editingRoleForAgent, setEditingRoleForAgent] = useState<string | null>(null);
   const roleSelectRef = useRef<HTMLSelectElement>(null);
   const [updatingHeartbeatAgentId, setUpdatingHeartbeatAgentId] = useState<string | null>(null);
+  const [heartbeatMutationAgentIds, setHeartbeatMutationAgentIds] = useState<Set<string>>(new Set());
+  const [isBulkHeartbeatMutationRunning, setIsBulkHeartbeatMutationRunning] = useState(false);
   /** Agent ID currently showing custom heartbeat input */
   const [customHeartbeatAgentId, setCustomHeartbeatAgentId] = useState<string | null>(null);
   /** Custom minutes input value for each agent */
   const [customHeartbeatMinutes, setCustomHeartbeatMinutes] = useState<Record<string, string>>({});
   /** Global heartbeat multiplier loaded from project settings */
   const [heartbeatMultiplier, setHeartbeatMultiplier] = useState<number>(1);
+  const [agentModelSettings, setAgentModelSettings] = useState<Partial<Settings>>({});
   /** Whether the heartbeat multiplier is currently being saved */
   const [isSavingMultiplier, setIsSavingMultiplier] = useState(false);
   /** Agent IDs with an in-flight state transition (for optimistic update guard) */
@@ -586,6 +589,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       .then((settings) => {
         if (!isMountedRef.current) return;
         setHeartbeatMultiplier(settings.heartbeatMultiplier ?? 1);
+        setAgentModelSettings(settings);
       })
       .catch(() => {
         // Use default on error
@@ -733,11 +737,15 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
           nonEphemeralAgents.filter((projectAgent) => projectAgent.state === "active" || projectAgent.state === "running").length,
         );
         setBulkResumeEligibleCount(nonEphemeralAgents.filter((projectAgent) => projectAgent.state === "paused").length);
+        setBulkEnableHeartbeatEligibleCount(nonEphemeralAgents.filter((projectAgent) => !isAgentHeartbeatEnabled(projectAgent)).length);
+        setBulkDisableHeartbeatEligibleCount(nonEphemeralAgents.filter((projectAgent) => isAgentHeartbeatEnabled(projectAgent)).length);
       })
       .catch((err) => {
         if (cancelled) return;
         setBulkPauseEligibleCount(0);
         setBulkResumeEligibleCount(0);
+        setBulkEnableHeartbeatEligibleCount(0);
+        setBulkDisableHeartbeatEligibleCount(0);
         addToast(t("agents.bulkActionsLoadFailed", "Failed to load bulk agent actions: {{error}}", { error: getErrorMessage(err) }), "error");
       })
       .finally(() => {
@@ -751,6 +759,11 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       if (!target) return;
       if (controlsPanelRef.current?.contains(target)) return;
       if (controlsTriggerRef.current?.contains(target)) return;
+      /*
+      FNXC:ModelDropdown 2026-08-15-12:27:
+      Body-portaled model controls are logical children of their host; shared pointer and touch dismissal must not close a panel from their gesture origin.
+      */
+      if (isInsidePortaledModelMenu(target)) return;
       setIsControlsPanelOpen(false);
     };
 
@@ -840,6 +853,47 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     }
   };
 
+  const handleBulkHeartbeatChange = async (enabled: boolean) => {
+    if (isBulkHeartbeatMutationRunning || isBulkActionRunning || heartbeatMutationAgentIds.size > 0) return;
+    setIsBulkHeartbeatMutationRunning(true);
+    try {
+      const projectAgents = await fetchAgents(undefined, projectId);
+      const durableAgents = projectAgents.filter((agent) => !isEphemeralAgent(agent));
+      const eligibleAgents = durableAgents.filter((agent) => isAgentHeartbeatEnabled(agent) !== enabled);
+      const skippedCount = projectAgents.length - eligibleAgents.length;
+      if (eligibleAgents.length === 0) {
+        addToast(enabled ? t("agents.noHeartbeatsToEnable", "No agent heartbeats need enabling") : t("agents.noHeartbeatsToDisable", "No agent heartbeats need disabling"), "error");
+        return;
+      }
+      const confirmed = await confirm({
+        title: enabled ? t("agents.enableAllHeartbeats", "Enable all heartbeats") : t("agents.disableAllHeartbeats", "Disable all heartbeats"),
+        message: enabled
+          ? t("agents.enableAllHeartbeatsConfirm", "Enable heartbeats for {{count}} project agents?", { count: eligibleAgents.length })
+          : t("agents.disableAllHeartbeatsConfirm", "Disable heartbeats for {{count}} project agents?", { count: eligibleAgents.length }),
+        danger: !enabled,
+      });
+      if (!confirmed) return;
+      const results = await Promise.allSettled(eligibleAgents.map((agent) => updateAgent(agent.id, { runtimeConfig: withAgentHeartbeatEnabled(agent, enabled) }, projectId)));
+      const failedResults = results
+        .map((result, index) => ({ result, agent: eligibleAgents[index] }))
+        .filter((entry): entry is { result: PromiseRejectedResult; agent: Agent } => entry.result.status === "rejected");
+      const successCount = results.length - failedResults.length;
+      const summary = enabled
+        ? t("agents.enableHeartbeatsSummary", "Enabled {{count}} heartbeats; skipped {{skipped}}", { count: successCount, skipped: skippedCount })
+        : t("agents.disableHeartbeatsSummary", "Disabled {{count}} heartbeats; skipped {{skipped}}", { count: successCount, skipped: skippedCount });
+      const failureSummary = failedResults
+        .slice(0, 3)
+        .map(({ agent, result }) => `${agent.name || agent.id}: ${getErrorMessage(result.reason)}`)
+        .join("; ");
+      addToast(failedResults.length ? `${summary}; ${t("agents.bulkFailures", "failed {{count}}", { count: failedResults.length })}${failureSummary ? ` (${failureSummary})` : ""}` : summary, failedResults.length ? "error" : "success");
+      await loadAgents();
+    } catch (err) {
+      addToast(t("agents.heartbeatUpdateFailed", "Failed to update heartbeat: {{error}}", { error: getErrorMessage(err) }), "error");
+    } finally {
+      setIsBulkHeartbeatMutationRunning(false);
+    }
+  };
+
   const handleStateChange = async (agentId: string, newState: AgentState) => {
     if (transitioningAgentIds.has(agentId)) return;
 
@@ -918,6 +972,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   };
 
   const handleHeartbeatIntervalChange = async (agent: Agent, newIntervalMs: number) => {
+    if (isBulkHeartbeatMutationRunning || heartbeatMutationAgentIds.has(agent.id)) return;
     // Clear custom input state when selecting a preset
     if (customHeartbeatAgentId === agent.id) {
       setCustomHeartbeatAgentId(null);
@@ -933,10 +988,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       await updateAgent(
         agent.id,
         {
-          runtimeConfig: {
-            ...(agent.runtimeConfig ?? {}),
-            heartbeatIntervalMs: newIntervalMs,
-          },
+          runtimeConfig: { ...withAgentHeartbeatEnabled(agent, true), heartbeatIntervalMs: newIntervalMs },
         },
         projectId,
       );
@@ -949,6 +1001,31 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     }
   };
 
+  const handleHeartbeatEnabledChange = async (agent: Agent, enabled: boolean) => {
+    if (isEphemeralAgent(agent) || isBulkHeartbeatMutationRunning || heartbeatMutationAgentIds.has(agent.id)) return;
+    setHeartbeatMutationAgentIds((previous) => new Set(previous).add(agent.id));
+    try {
+      await updateAgent(agent.id, { runtimeConfig: withAgentHeartbeatEnabled(agent, enabled) }, projectId);
+      addToast(
+        enabled
+          ? t("agents.heartbeatEnabledForAgent", "Heartbeat enabled for {{name}}", { name: agent.name })
+          : t("agents.heartbeatDisabled", "Heartbeat disabled for {{name}}", { name: agent.name }),
+        "success",
+      );
+      await loadAgents();
+    } catch (err) {
+      addToast(t("agents.heartbeatUpdateFailed", "Failed to update heartbeat: {{error}}", { error: getErrorMessage(err) }), "error");
+    } finally {
+      setHeartbeatMutationAgentIds((previous) => {
+        const next = new Set(previous);
+        next.delete(agent.id);
+        return next;
+      });
+    }
+  };
+
+  const handleHeartbeatDisabled = (agent: Agent) => handleHeartbeatEnabledChange(agent, false);
+
   /**
    * Handle saving custom heartbeat interval from typed minutes input.
    * Validation behavior:
@@ -959,6 +1036,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
    * - Value >= 5: save exact minute value converted to ms
    */
   const handleCustomHeartbeatSave = async (agent: Agent) => {
+    if (isBulkHeartbeatMutationRunning || heartbeatMutationAgentIds.has(agent.id)) return;
     const inputValue = customHeartbeatMinutes[agent.id] ?? "";
 
     // Validate: empty value
@@ -987,10 +1065,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         await updateAgent(
           agent.id,
           {
-            runtimeConfig: {
-              ...(agent.runtimeConfig ?? {}),
-              heartbeatIntervalMs: MIN_HEARTBEAT_INTERVAL_MS,
-            },
+            runtimeConfig: { ...withAgentHeartbeatEnabled(agent, true), heartbeatIntervalMs: MIN_HEARTBEAT_INTERVAL_MS },
           },
           projectId,
         );
@@ -1017,10 +1092,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       await updateAgent(
         agent.id,
         {
-          runtimeConfig: {
-            ...(agent.runtimeConfig ?? {}),
-            heartbeatIntervalMs: intervalMs,
-          },
+          runtimeConfig: { ...withAgentHeartbeatEnabled(agent, true), heartbeatIntervalMs: intervalMs },
         },
         projectId,
       );
@@ -1041,6 +1113,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
   /** Handle selecting custom option from dropdown */
   const handleSelectCustomHeartbeat = (agent: Agent) => {
+    if (isBulkHeartbeatMutationRunning || heartbeatMutationAgentIds.has(agent.id)) return;
     const configuredIntervalMs = resolveHeartbeatIntervalMs(agent.runtimeConfig?.heartbeatIntervalMs);
     // Convert ms to minutes for the input field
     const currentMinutes = Math.round(configuredIntervalMs / 60_000);
@@ -1072,7 +1145,10 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const handleOrgChartNodeSelect = useCallback((agentId: string) => {
     setSelectedOrgChartAgentId(agentId);
     openAgentDetail(agentId);
-  }, [openAgentDetail]);
+    const taskId = agents.find((agent) => agent.id === agentId)?.taskId
+      ?? findOrgTreeAgent(orgTree, agentId)?.taskId;
+    if (taskId && onOpenTaskLogs) onOpenTaskLogs(taskId);
+  }, [agents, onOpenTaskLogs, openAgentDetail, orgTree]);
 
   const handleDetailMutationSuccess = useCallback(async ({ agentId, deleted }: { agentId: string; deleted?: boolean }) => {
     await refreshAgents();
@@ -1087,6 +1163,16 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       setIsOverviewOpen(false);
     }
   }, [isMobileViewport, openAgentDetail]);
+  const handledFocusRequestRef = useRef<number | undefined>(undefined);
+  /*
+  FNXC:CommandCenterAgentActivity 2026-08-10-01:30:
+  Command Center supplies a monotonic request id, not merely an agent id, so repeat activity-row clicks reopen the same detail while unrelated renders remain inert.
+  */
+  useEffect(() => {
+    if (!focusAgent || handledFocusRequestRef.current === focusAgent.requestId) return;
+    handledFocusRequestRef.current = focusAgent.requestId;
+    handleOverviewAgentSelect(focusAgent.agentId);
+  }, [focusAgent, handleOverviewAgentSelect]);
 
   const handleRunHeartbeat = async (agentId: string, agentName: string) => {
     // Optimistic state flip: the API call can take several seconds before the
@@ -1352,6 +1438,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
   const isPauseAllDisabled = isBulkEligibilityLoading || isBulkActionRunning || bulkPauseEligibleCount === 0;
   const isResumeAllDisabled = isBulkEligibilityLoading || isBulkActionRunning || bulkResumeEligibleCount === 0;
+  const isEnableAllHeartbeatsDisabled = isBulkEligibilityLoading || isBulkActionRunning || isBulkHeartbeatMutationRunning || bulkEnableHeartbeatEligibleCount === 0;
+  const isDisableAllHeartbeatsDisabled = isBulkEligibilityLoading || isBulkActionRunning || isBulkHeartbeatMutationRunning || bulkDisableHeartbeatEligibleCount === 0;
   const showInitialAgentsLoading = isLoading && agents.length === 0;
 
   const handleOpenNewAgent = useCallback(() => {
@@ -1359,7 +1447,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   }, []);
 
   return (
-    <div className="agents-view">
+    <ViewLayout className="agents-view" contentOwnsScroll header={<>
       {/*
       FNXC:Navigation 2026-06-22-01:10:
       Agents adopts the shared ViewHeader (Command Center-modeled) title row for cross-view consistency. The deeply-integrated controls (view-toggle, controls popup, refresh, import, new-agent) keep working by passing the existing agents-view-controls cluster through the header actions prop. The agents-view-controls / agents-view-primary-actions class names are preserved so existing scoped CSS (incl. mobile rules covered by the CSS string-match test) still applies.
@@ -1370,8 +1458,23 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       <ViewHeader
         icon={Bot}
         title={t("agents.title", "Agents")}
+        backAction={selectedAgentId && (isMobileViewport || agentView === "org") ? {
+          label: agentView === "org" ? t("agents.backToOrgChart", "Back to org chart") : t("agents.backToAgents", "Back to agents"),
+          onClick: handleCloseDetail,
+          "data-testid": "agents-detail-back",
+        } : undefined}
         actions={
         <div className="agents-view-controls">
+          {/*
+          FNXC:StandardizedViewActions 2026-09-14-02:47:
+          Overview is a view-level disclosure, so its trigger sits with the other header actions. The rail keeps only the
+          agent collection and the expanded overview drops in as a sibling section beneath the header.
+          */}
+          <AgentsOverviewToggle
+            activeAgents={displayActiveAgents}
+            isOpen={isOverviewOpen}
+            onToggle={() => setIsOverviewOpen((open) => !open)}
+          />
           <div className="view-toggle">
             <button
               className={`view-toggle-btn${agentView === "list" ? " active" : ""}`}
@@ -1422,34 +1525,27 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
             >
               <RefreshCw size={16} className={isLoading ? "spin" : undefined} />
             </button>
-            {!isMobileViewport && (
-              <>
-                <button
-                  className="btn btn-sm agent-import-trigger"
-                  onClick={() => {
-                    setIsImporting(true);
-                    setIsControlsPanelOpen(false);
-                  }}
-                  aria-label={t("agents.import", "Import")}
-                  title={t("agents.import", "Import")}
-                >
-                  <Upload size={16} />
-                  {t("agents.import", "Import")}
-                </button>
-                <button
-                  className="btn btn-task-create btn-sm"
-                  onClick={() => {
-                    handleOpenNewAgent();
-                    setIsControlsPanelOpen(false);
-                  }}
-                  aria-label={t("agents.newAgent", "New Agent")}
-                  title={t("agents.newAgent", "New Agent")}
-                >
-                  <Plus size={16} />
-                  {t("agents.newAgent", "New Agent")}
-                </button>
-              </>
-            )}
+            {!isMobileViewport ? <button
+              className="btn btn-sm agent-import-trigger"
+              onClick={() => {
+                setIsImporting(true);
+                setIsControlsPanelOpen(false);
+              }}
+              aria-label={t("agents.import", "Import")}
+              title={t("agents.import", "Import")}
+            >
+              <Upload size={16} />
+              {t("agents.import", "Import")}
+            </button> : null}
+            <ViewActionButton
+              kind="create"
+              label={t("agents.newAgent", "New Agent")}
+              onClick={() => {
+                handleOpenNewAgent();
+                setIsControlsPanelOpen(false);
+              }}
+              data-testid="agents-new-agent"
+            />
             {isControlsPanelOpen && (
               <div
                 ref={controlsPanelRef}
@@ -1504,18 +1600,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                       <Upload size={16} />
                       {t("agents.import", "Import")}
                     </button>
-                    <button
-                      className="btn btn-task-create btn-sm"
-                      onClick={() => {
-                        handleOpenNewAgent();
-                        setIsControlsPanelOpen(false);
-                      }}
-                      aria-label={t("agents.newAgent", "New Agent")}
-                      title={t("agents.newAgent", "New Agent")}
-                    >
-                      <Plus size={16} />
-                      {t("agents.newAgent", "New Agent")}
-                    </button>
                   </div>
                 )}
 
@@ -1541,6 +1625,32 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                           ? t("agents.noAgentsToPauseHint", "No active or running project agents to pause")
                           : t("agents.pauseCountHint", { count: bulkPauseEligibleCount, defaultValue_one: "Pause {{count}} active/running agent", defaultValue_other: "Pause {{count}} active/running agents" })}
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="agent-detail-bulk-menu-item"
+                    role="menuitem"
+                    disabled={isEnableAllHeartbeatsDisabled}
+                    onClick={() => {
+                      setIsControlsPanelOpen(false);
+                      void handleBulkHeartbeatChange(true);
+                    }}
+                  >
+                    <span className="agent-controls-bulk-actions__label"><Play /><span>{t("agents.enableAllHeartbeats", "Enable all heartbeats")}</span></span>
+                    <span className="agent-detail-bulk-menu-item-hint">{t("agents.enableHeartbeatsCountHint", "Enable {{count}} disabled project heartbeats", { count: bulkEnableHeartbeatEligibleCount })}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="agent-detail-bulk-menu-item"
+                    role="menuitem"
+                    disabled={isDisableAllHeartbeatsDisabled}
+                    onClick={() => {
+                      setIsControlsPanelOpen(false);
+                      void handleBulkHeartbeatChange(false);
+                    }}
+                  >
+                    <span className="agent-controls-bulk-actions__label"><Pause /><span>{t("agents.disableAllHeartbeats", "Disable all heartbeats")}</span></span>
+                    <span className="agent-detail-bulk-menu-item-hint">{t("agents.disableHeartbeatsCountHint", "Disable {{count}} enabled project heartbeats", { count: bulkDisableHeartbeatEligibleCount })}</span>
                   </button>
                   <button
                     type="button"
@@ -1621,6 +1731,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         </div>
         }
       />
+    </>}
+    >
 
       <NewAgentDialog
         isOpen={isCreating}
@@ -1648,7 +1760,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         activeAgents={displayActiveAgents}
         projectId={projectId}
         isOpen={isOverviewOpen}
-        onToggle={() => setIsOverviewOpen((open) => !open)}
         onSelectAgent={handleOverviewAgentSelect}
         onOpenTaskLogs={onOpenTaskLogs}
       />
@@ -1658,14 +1769,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
           <div className="agents-view-content agents-view-content--org-full">
             {selectedAgentId ? (
               <div className="agents-org-detail-view" data-testid="agents-org-detail-view">
-                <button
-                  type="button"
-                  className="btn btn-sm agents-org-detail-back"
-                  onClick={handleCloseDetail}
-                  aria-label={t("agents.backToOrgChart", "Back to org chart")}
-                >
-                  {t("agents.backToOrgChart", "Back to org chart")}
-                </button>
                 <Suspense fallback={null}>
                   <AgentDetailView
                     key={selectedAgentId}
@@ -1747,6 +1850,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                               selectedAgentId={selectedOrgChartAgentId}
                               registerNodeElement={registerOrgChartNodeElement}
                               linksRef={orgChartLinksRef}
+                              activityByAgentId={activitySnapshot.activityByAgentId}
+                              nowTick={activitySnapshot.nowTick}
                             />
                           ));
                         })()
@@ -1759,6 +1864,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                       viewportRef={orgChartViewportRef}
                       layoutMode={orgChartLayoutMode}
                       transform={orgChartTransform}
+                      activityEvents={activitySnapshot.events}
+                      nowTick={activitySnapshot.nowTick}
                     />
                   </div>
                 </div>
@@ -1767,11 +1874,16 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
           </div>
         </div>
       ) : (
-      <div
-        className="agents-split-layout"
-        style={isMobileViewport ? undefined : { gridTemplateColumns: `${sidebarWidth}px var(--space-sm) minmax(0, 1fr)` }}
-      >
-        <div className={`agents-split-sidebar${isMobileDetailOpen ? " agents-split-sidebar--hidden-mobile" : ""}`}>
+      <div className="agents-split-layout">
+        <ViewSidebar
+          ariaLabel={t("agents.agentList", "Agent list")}
+          resizeLabel={t("agents.resizeSidebar", "Resize agent list")}
+          hostIdentity="agents-main"
+          mobile={isMobileViewport}
+          panelTestId="agents-split-sidebar"
+          separatorTestId="agents-sidebar-resize-handle"
+          className={`agents-split-sidebar${isMobileDetailOpen ? " agents-split-sidebar--hidden-mobile" : ""}`}
+        >
           <div className="agents-view-content">
         {/* Agent Collection */}
         {showInitialAgentsLoading ? (
@@ -1826,8 +1938,9 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         {health.icon}{healthSummary.label ? ` ${healthSummary.label}` : ""}
                       </div>
                     </div>
-                    {(agent.state === "idle" || agent.state === "paused" || agent.state === "error") && (
-                      <div className="agent-board-actions">
+                    <div className="agent-board-actions">
+                      <HeartbeatToggle agent={agent} pending={isBulkHeartbeatMutationRunning || heartbeatMutationAgentIds.has(agent.id)} onToggle={(target) => void handleHeartbeatEnabledChange(target, !isAgentHeartbeatEnabled(target))} />
+                      {(agent.state === "idle" || agent.state === "paused" || agent.state === "error") && (
                         <button
                           className="btn btn-sm btn-danger"
                           onClick={() => void handleDelete(agent.id, agent.name)}
@@ -1835,8 +1948,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         >
                           <Trash2 size={14} />
                         </button>
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </div>
                 );
               })
@@ -1855,8 +1968,16 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
               const stateCardClass = getStateCardClass("agent-card", agent.state);
               const configuredIntervalMs = resolveHeartbeatIntervalMs(agent.runtimeConfig?.heartbeatIntervalMs);
               const heartbeatOptions = getHeartbeatIntervalOptions(configuredIntervalMs);
-              const isUpdatingHeartbeat = updatingHeartbeatAgentId === agent.id;
-              const modelLabel = getAgentModelLabel(agent);
+              /*
+               * FNXC:AgentHeartbeatControls 2026-07-23-12:43:
+               * The list-card select is the scheduling control: an explicit false wins over its saved cadence,
+               * while absent enabled remains backwards-compatible as enabled. Interval changes always persist
+               * enabled: true; disabling retains the complete runtime configuration and saved cadence.
+               */
+              const isHeartbeatDisabled = !isAgentHeartbeatEnabled(agent);
+              const heartbeatSelectValue = isHeartbeatDisabled ? HEARTBEAT_DISABLED_OPTION_VALUE : String(configuredIntervalMs);
+              const isUpdatingHeartbeat = isBulkHeartbeatMutationRunning || updatingHeartbeatAgentId === agent.id || heartbeatMutationAgentIds.has(agent.id);
+              const modelLabel = getAgentModelLabel(agent, agentModelSettings);
               return (
                 <div
                   key={agent.id}
@@ -1960,10 +2081,11 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         const extraCount = skills.length - 2;
                         return (
                           <>
-                            {displaySkills.map((skillId) => (
-                              <span key={skillId} className="badge badge-skill" title={skillId}>{formatAgentSkillBadgeLabel(skillId)}</span>
-                            ))}
-                            {extraCount > 0 && <span className="badge badge-skill">+{extraCount}</span>}
+                            {displaySkills.map((skillId) => {
+                              const classification = classifyAgentSkill(skillId, discoveredSkillsLoading || discoveredSkillsError ? null : discoveredSkills, { forced: true });
+                              return <span key={skillId} className="badge badge-skill" data-skill-state={classification.state} title={`${skillId}: ${t(classification.titleKey, classification.defaultTitle)}`}>{formatAgentSkillBadgeLabel(skillId)} <span className="skill-state-marker">{t(classification.labelKey, classification.defaultLabel)}</span> <span className="skill-state-marker skill-state-marker--forced">{t("skills.forced", "Forced")}</span></span>;
+                            })}
+                            {extraCount > 0 && <span className="badge badge-skill" title={skills.slice(2).some((skillId) => ["disabled", "unknown"].includes(classifyAgentSkill(skillId, discoveredSkillsLoading || discoveredSkillsError ? null : discoveredSkills, { forced: true }).state)) ? t("skills.hiddenUnavailable", "Hidden skills include disabled or not-discovered entries") : undefined}>+{extraCount}</span>}
                           </>
                         );
                       })()}
@@ -1996,6 +2118,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         <RuntimeFallbackBadge taskId={agent.taskId} isInViewport={isAgentCardInViewport(`list:${agent.id}`)} projectId={projectId} />
                       </div>
                     )}
+                    {!isEphemeralAgent(agent) && (
                     <div className="agent-heartbeat-control">
                       <span className="text-secondary">{t("agents.heartbeat", "Heartbeat:")}</span>
                       {customHeartbeatAgentId === agent.id ? (
@@ -2056,10 +2179,12 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         <>
                           <select
                             className="select agent-heartbeat-select"
-                            value={configuredIntervalMs}
+                            value={heartbeatSelectValue}
                             onChange={(e) => {
                               const value = e.target.value;
-                              if (value === "__custom__") {
+                              if (value === HEARTBEAT_DISABLED_OPTION_VALUE) {
+                                void handleHeartbeatDisabled(agent);
+                              } else if (value === "__custom__") {
                                 handleSelectCustomHeartbeat(agent);
                               } else {
                                 void handleHeartbeatIntervalChange(agent, Number(value));
@@ -2068,6 +2193,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                             disabled={isUpdatingHeartbeat}
                             aria-label={t("agents.setHeartbeatAria", "Set heartbeat interval for {{name}}", { name: agent.name })}
                           >
+                            <option value={HEARTBEAT_DISABLED_OPTION_VALUE}>{t("agents.heartbeatDisabledOption", "Disabled")}</option>
                             {heartbeatOptions.map((option) => (
                               <option key={option.value} value={option.value}>
                                 {option.label}
@@ -2099,6 +2225,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         );
                       })()}
                     </div>
+                    )}
                   </div>
 
                   <div className="agent-card-actions">
@@ -2203,23 +2330,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         )}
           </div>
 
-        </div>
-
-        {!isMobileViewport && (
-          <div
-            className="agents-split-resize-handle"
-            data-testid="agents-sidebar-resize-handle"
-            role="separator"
-            aria-orientation="vertical"
-            aria-valuemin={AGENTS_SIDEBAR_MIN_WIDTH}
-            aria-valuemax={AGENTS_SIDEBAR_MAX_WIDTH}
-            aria-valuenow={sidebarWidth}
-            aria-label={t("agents.resizeSidebar", "Resize agents sidebar")}
-            tabIndex={0}
-            onPointerDown={handleSidebarResizeStart}
-            onKeyDown={handleSidebarResizeKeyDown}
-          />
-        )}
+        </ViewSidebar>
 
         <div className={`agents-split-detail${isMobileViewport && !selectedAgentId ? " agents-split-detail--hidden-mobile" : ""}`}>
           {selectedAgentId ? (
@@ -2227,7 +2338,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
               <AgentDetailView
                 key={selectedAgentId}
                 inline
-                showInlineBackButton={isMobileViewport}
+                showInlineBackButton={false}
                 agentId={selectedAgentId}
                 projectId={projectId}
                 onClose={handleCloseDetail}
@@ -2249,6 +2360,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         </div>
       </div>
       )}
-    </div>
+    </ViewLayout>
   );
 }

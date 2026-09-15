@@ -1,3 +1,4 @@
+import { ViewHeader } from "./ViewHeader";
 import "./GitHubImportModal.css";
 import { useState, useEffect, useCallback, useContext, useRef, useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -37,21 +38,21 @@ import {
   useGitHubImportAutoTranslate,
 } from "./GitHubImportTranslateControls";
 import type { TFunction } from "i18next";
-import { useModalResizePersist } from "../hooks/useModalResizePersist";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
-import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
+import { useModalDismissPreference } from "../hooks/useOverlayDismiss";
 import { useConfirm } from "../hooks/useConfirm";
 import { useEmbeddedPresentation, type ModalPresentation } from "../hooks/useEmbeddedPresentation";
 import { getGitHubImportState, saveGitHubImportState } from "../hooks/modalPersistence";
 import { FloatingWindow } from "./FloatingWindow";
 import { NavigationHistoryContext } from "../hooks/useNavigationHistory";
+import { containsIssueImageMarkup, PER_BODY_MAX_CHARS, TRANSPORT_MAX_CHARS } from "../../src/issue-image-markup";
 
 interface GitHubImportModalProps {
   isOpen: boolean;
   onClose: () => void;
   onImport: (task: Task) => void;
   /** Optional because callers without Planning Mode retain the direct-import-only surface. */
-  onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
+  onPlanningMode?: (initialPlan: string, workflowId?: string | null, sourceIssue?: { provider: "github"; repository: string; issueNumber: number; url: string; title?: string; imageBodies?: string[]; commentsUnavailable?: boolean; droppedBodyCount?: number }) => void;
   /*
   FNXC:GitHubImport 2026-07-30-12:00:
   Chat is deliberately separate from direct import: it seeds a GitHub issue/PR link in the composer,
@@ -71,6 +72,13 @@ interface GitHubImportModalProps {
 type TabType = "issues" | "pulls";
 type ImportProvider = "github" | "gitlab";
 type GitLabResourceTab = "project_issue" | "group_issue" | "merge_request";
+
+/**
+ * FNXC:GitHubPlanningSourceIssue 2026-08-09-14:59: Cache identity includes the remote because GitHub issue numbers are repository-local.
+ */
+function issueDetailCacheKey(owner: string, repo: string, issueNumber: number): string {
+  return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase()}#${issueNumber}`;
+}
 
 /*
 FNXC:GitHubImport 2026-06-23-03:30:
@@ -377,10 +385,9 @@ const ISSUES_PAGE_SIZE = 30;
  * Keep this prompt composition pure so every check row carries its repository, PR, branch, status, and details-link evidence.
  */
 /*
-FNXC:GitHubImport 2026-07-30-00:00:
-Operators can choose direct task import or Planning Mode for GitHub issues. Planning receives a
-self-contained issue seed, including the source URL, but intentionally does not establish GitHub
-sourceIssue tracking or deduplication; those remain exclusive to direct import.
+FNXC:GitHubImport 2026-08-09-05:36:
+Planning receives both the canonical seed and structured GitHub provenance so the server can preserve
+issue context and safely adopt the source issue without treating arbitrary prose URLs as links.
 */
 export function buildIssuePlanningSeed(issue: GitHubIssue): string {
   return [
@@ -417,7 +424,7 @@ export function buildCheckFixTaskPrompt(
 }
 
 export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, onOpenChatWithPrefill, tasks, projectId, presentation = "modal" }: GitHubImportModalProps) {
-  const { isEmbedded, scrollLockEnabled, resizePersistEnabled, escapeEnabled } = useEmbeddedPresentation(presentation);
+  const { isEmbedded, scrollLockEnabled, escapeEnabled } = useEmbeddedPresentation(presentation);
   useMobileScrollLock(isOpen && scrollLockEnabled);
   const { t, i18n } = useTranslation("app");
   /*
@@ -561,9 +568,13 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
   /*
   FNXC:GitHubImport 2026-06-23-03:15:
   The issue preview pane mirrors the PR preview: the SELECTED issue's full comment thread is fetched ON SELECTION (issues have no checks rollup, so comments only).
-  Cached by issue number in a ref so re-selecting does not refetch; the body renders immediately while comments stream in (loading/error tracked separately, never blocking the body).
+  Cached by repository plus issue number in a ref so re-selecting does not refetch; the body renders immediately while comments stream in (loading/error tracked separately, never blocking the body).
+
+  FNXC:GitHubPlanningSourceIssue 2026-08-09-14:59:
+  Planning capture must never carry comments from another repository that happens to reuse an issue number.
+  The cache key therefore includes the normalized repository as well as the issue number.
   */
-  const issueDetailCacheRef = useRef<Map<number, GitHubIssueDetail>>(new Map());
+  const issueDetailCacheRef = useRef<Map<string, GitHubIssueDetail>>(new Map());
   const [issueDetail, setIssueDetail] = useState<GitHubIssueDetail | null>(null);
   const [issueDetailLoading, setIssueDetailLoading] = useState(false);
   const [issueDetailError, setIssueDetailError] = useState<string | null>(null);
@@ -597,9 +608,7 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
   const [selectedRemoteName, setSelectedRemoteName] = useState<string>("");
   const mountedRef = useRef(false);
   const remoteLoadRequestIdRef = useRef(0);
-  const modalRef = useRef<HTMLDivElement>(null);
-  useModalResizePersist(modalRef, isOpen && resizePersistEnabled, "fusion:github-modal-size");
-  const overlayDismissProps = useOverlayDismiss(onClose);
+  const dismissOnOutsidePointerDown = useModalDismissPreference();
 
   // Track which owner/repo we've already auto-loaded to prevent duplicate loads
   const autoLoadedRef = useRef<{ owner: string; repo: string; labels: string; tab: TabType } | null>(null);
@@ -1192,10 +1201,23 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
     if (!selectedIssue || !onPlanningMode || importing || isUrlImported(selectedIssue.html_url)) return;
 
     const seed = buildIssuePlanningSeed(selectedIssue);
+    // FNXC:GitHubPlanningSourceIssue 2026-08-09-14:30: State can briefly retain the prior selection, so only the repository-and-number cache proves captured comments belong to this issue.
+    const detail = issueDetailCacheRef.current.get(issueDetailCacheKey(owner, repo, selectedIssue.number));
+    // FNXC:GitHubPlanningSourceIssue 2026-08-09-14:51: Availability is scoped to the selected issue's cache; global loading/error state can belong to a different, newly selected issue.
+    const commentsUnavailable = !detail;
+    const candidates = [selectedIssue.body ?? "", ...(detail?.comments ?? []).map((comment) => comment.body ?? "")].filter(containsIssueImageMarkup);
+    let transportedChars = 0;
+    let droppedBodyCount = 0;
+    const imageBodies = candidates.flatMap((body) => {
+      if (body.length > PER_BODY_MAX_CHARS || transportedChars + body.length > TRANSPORT_MAX_CHARS) { droppedBodyCount++; return []; }
+      transportedChars += body.length;
+      return [body];
+    });
+    /* FNXC:GitHubPlanningSourceIssue 2026-08-09-14:09: Plan must not await or re-fetch comments; transport ordered image-bearing bodies only, while the server resolves URLs and records partial capture. */
     // FNXC:GitHubImport 2026-07-30-00:00: Embedded close navigates to Board, so close first and open Planning last to preserve Planning as the final destination.
     onClose();
-    onPlanningMode(seed);
-  }, [activeTab, importing, isUrlImported, issues, onClose, onPlanningMode, selectedIssueNumber]);
+    onPlanningMode(seed, undefined, { provider: "github", repository: `${owner}/${repo}`, issueNumber: selectedIssue.number, url: selectedIssue.html_url, title: selectedIssue.title, ...(imageBodies.length ? { imageBodies } : {}), ...(commentsUnavailable ? { commentsUnavailable: true } : {}), ...(droppedBodyCount ? { droppedBodyCount } : {}) });
+  }, [activeTab, importing, isUrlImported, issues, onClose, onPlanningMode, owner, repo, selectedIssueNumber]);
 
   const fetchPullDetail = useCallback((force: boolean) => {
     const requestId = ++pullDetailRequestRef.current;
@@ -1264,7 +1286,8 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
       return;
     }
 
-    const cached = issueDetailCacheRef.current.get(selectedIssueNumber);
+    const cacheKey = issueDetailCacheKey(owner, repo, selectedIssueNumber);
+    const cached = issueDetailCacheRef.current.get(cacheKey);
     if (cached) {
       setIssueDetail(cached);
       setIssueDetailLoading(false);
@@ -1279,7 +1302,7 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
 
     apiFetchGitHubIssueDetail(`${owner.trim()}/${repo.trim()}`, selectedIssueNumber)
       .then((detail) => {
-        issueDetailCacheRef.current.set(selectedIssueNumber, detail);
+        issueDetailCacheRef.current.set(cacheKey, detail);
         if (issueDetailRequestRef.current !== requestId) return;
         setIssueDetail(detail);
         setIssueDetailLoading(false);
@@ -1349,6 +1372,7 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
 
     const issueNumber = selectedIssueNumber;
     const repository = `${owner.trim()}/${repo.trim()}`;
+    const cacheKey = issueDetailCacheKey(owner, repo, issueNumber);
     setAddingComment(true);
     if (closeToastTimerRef.current) clearTimeout(closeToastTimerRef.current);
     setCloseToast(null);
@@ -1360,8 +1384,8 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
         createdAt: new Date().toISOString(),
         authorIsBot: false,
       };
-      const cachedDetail = issueDetailCacheRef.current.get(issueNumber) ?? { comments: [] };
-      issueDetailCacheRef.current.set(issueNumber, {
+      const cachedDetail = issueDetailCacheRef.current.get(cacheKey) ?? { comments: [] };
+      issueDetailCacheRef.current.set(cacheKey, {
         ...cachedDetail,
         comments: [...cachedDetail.comments, postedComment],
       });
@@ -1446,6 +1470,9 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
         key: `gitlab:${selectedGitlabKey ?? ""}`,
         title: selectedGitlabItem.title ?? "",
         body: selectedGitlabItem.description ?? "",
+        identity: selectedGitlabItem.projectPath
+          ? { provider: "gitlab" as const, repoKey: selectedGitlabItem.projectPath, issueNumber: selectedGitlabItem.iid }
+          : null,
       };
     }
     if (provider === "github" && activeTab === "issues" && selectedIssue) {
@@ -1453,6 +1480,9 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
         key: `issue:${selectedIssue.number}`,
         title: selectedIssue.title ?? "",
         body: selectedIssue.body ?? "",
+        identity: owner.trim() && repo.trim()
+          ? { provider: "github" as const, repoKey: `${owner.trim()}/${repo.trim()}`, issueNumber: selectedIssue.number }
+          : null,
       };
     }
     if (provider === "github" && activeTab === "pulls" && selectedPull) {
@@ -1460,10 +1490,13 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
         key: `pull:${selectedPull.number}`,
         title: selectedPull.title ?? "",
         body: selectedPull.body ?? "",
+        identity: owner.trim() && repo.trim()
+          ? { provider: "github" as const, repoKey: `${owner.trim()}/${repo.trim()}`, issueNumber: selectedPull.number }
+          : null,
       };
     }
-    return { key: null as string | null, title: "", body: "" };
-  }, [provider, selectedGitlabItem, selectedGitlabKey, activeTab, selectedIssue, selectedPull]);
+    return { key: null as string | null, title: "", body: "", identity: null };
+  }, [provider, selectedGitlabItem, selectedGitlabKey, activeTab, selectedIssue, selectedPull, owner, repo]);
 
   /*
   FNXC:GitHubImportTranslate 2026-07-17-12:50:
@@ -1499,6 +1532,7 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
     body: translateSelection.body,
     dashboardLocale: translateTargetLocale,
     projectId,
+    identity: translateSelection.identity,
     autoTranslation: selectedAutoTranslation,
     autoTranslateEnabled,
   });
@@ -1568,31 +1602,28 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
   Modal mode is kept byte-identical: same overlay wrapper, header with subtitle + close button, and overlay-dismiss props.
   */
   const inner = (
-    <div className={`modal modal-lg github-import-modal${isEmbedded ? " github-import-modal--embedded" : ""}`} ref={modalRef}>
-      {isEmbedded ? (
-        /*
-        FNXC:RightDockEmbedding 2026-06-22-00:40:
-        Import Tasks is a main-content destination, so its header reads like Command Center (cc-header/cc-title): a plain title row with the GitHub logo and the shared 1.125rem embedded-title font, no modal-header bar or close button. Padding matches the embedded view container.
-        */
-        <header className="github-import-modal__embedded-header">
-          <h2 className="github-import-modal__embedded-title">
-            <GithubIcon size={20} />
-            {t("git.importTasksHeading", "Import Tasks")}
-          </h2>
-        </header>
-      ) : (
-        <div className="modal-header github-import-modal__header">
-          <div>
-            <h3>{t("git.importFromGitHub", "Import from GitHub")}</h3>
-            <p className="github-import-modal__subtitle">
-              {t("git.importSubtitle", "Choose a detected remote, load open issues or pull requests, and import one into the board.")}
-            </p>
-          </div>
-          <button className="modal-close" onClick={onClose} aria-label={t("git.closeModalAriaLabel", "Close import modal")}>
-            &times;
-          </button>
-        </div>
-      )}
+    <div className={`modal modal-lg github-import-modal${isEmbedded ? " github-import-modal--embedded" : ""}`}>
+      {/*
+      FNXC:StandardizedViewLayout 2026-09-13-21:43:
+      Import Tasks keeps its real full-width candidate list and floating previews rather than inventing a split pane. Embedded and floating hosts share one canonical header; only the floating host adds its required close action.
+      */}
+      <ViewHeader
+        className={isEmbedded ? "github-import-modal__embedded-header" : "modal-header github-import-modal__header"}
+        icon={GithubIcon}
+        titleId="github-import-modal-title"
+        title={(
+          <span className={isEmbedded ? "github-import-modal__embedded-title" : "github-import-modal__title-copy"}>
+            <span>{isEmbedded ? t("git.importTasksHeading", "Import Tasks") : t("git.importFromGitHub", "Import from GitHub")}</span>
+            {!isEmbedded ? (
+              <span className="github-import-modal__subtitle">
+                {t("git.importSubtitle", "Choose a detected remote, load open issues or pull requests, and import one into the board.")}
+              </span>
+            ) : null}
+          </span>
+        )}
+        onClose={isEmbedded ? undefined : onClose}
+        closeButtonProps={{ "aria-label": t("git.closeModalAriaLabel", "Close import modal") }}
+      />
 
         <div className="modal-body github-import-modal__body">
           {/*
@@ -1606,8 +1637,8 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
           */}
           <div className="github-import-controls" data-testid="github-import-controls">
           <div className="github-import-provider" role="group" aria-label={t("git.providerAriaLabel", "Import provider")}>
-            <button type="button" className={`github-import-tab ${provider === "github" ? "active" : ""}`} aria-pressed={provider === "github"} onClick={() => setProvider("github")} disabled={loading || importing}>GitHub</button>
-            {gitlabEnabled ? <button type="button" className={`github-import-tab ${provider === "gitlab" ? "active" : ""}`} aria-pressed={provider === "gitlab"} onClick={() => setProvider("gitlab")} disabled={loading || importing}>GitLab</button> : null}
+            <button type="button" className={`github-import-tab ${provider === "github" ? "active" : ""}`} aria-pressed={provider === "github"} onClick={() => setProvider("github")} disabled={loading || importing}>{t("githubImport.github", "GitHub")}</button>
+            {gitlabEnabled ? <button type="button" className={`github-import-tab ${provider === "gitlab" ? "active" : ""}`} aria-pressed={provider === "gitlab"} onClick={() => setProvider("gitlab")} disabled={loading || importing}>{t("githubImport.gitlab", "GitLab")}</button> : null}
           </div>
           {provider === "github" && (<>
           {/* Tab Navigation */}
@@ -2013,6 +2044,7 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
               </div>
             </section>
 
+            {/* FNXC:ModalTouchGeometry 2026-07-26-19:05: Import detail is already an independent FloatingWindow and remains unwrapped so it stacks above the migrated root importer. */}
             {(selectedIssue || selectedPull) && (
             <FloatingWindow
               windowKey="github-import-detail"
@@ -2316,48 +2348,50 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
                     </button>
                   </form>
                 )}
-                {activeTab === "issues" && selectedIssue && !selectedIssueClosed && (
+                <div className="github-import-detail-action-row" data-testid="github-import-detail-action-row">
+                  {activeTab === "issues" && selectedIssue && !selectedIssueClosed && (
+                    <button
+                      className="btn btn-danger github-import-issue-close"
+                      data-testid="github-import-issue-close"
+                      onClick={handleCloseIssue}
+                      disabled={closingIssue}
+                      title={t("git.closeIssueTitle", "Close issue #{{number}}", { number: selectedIssue.number })}
+                    >
+                      {closingIssue ? <Loader2 size={14} className="spin" /> : t("git.closeIssue", "Close issue")}
+                    </button>
+                  )}
+                  {activeTab === "issues" && selectedIssue && onPlanningMode && (
+                    <button
+                      type="button"
+                      className="btn github-import-action"
+                      data-testid="github-import-action-plan"
+                      onClick={handlePlanIssue}
+                      disabled={importing || isUrlImported(selectedIssue.html_url)}
+                    >
+                      {t("git.planIssue", "Plan")}
+                    </button>
+                  )}
+                  {onOpenChatWithPrefill && (activeTab === "issues" ? selectedIssue?.html_url?.trim() : selectedPull?.html_url?.trim()) && (
+                    <button
+                      type="button"
+                      className="btn github-import-action"
+                      data-testid="github-import-action-chat"
+                      onClick={handleChatAboutSelection}
+                    >
+                      {t("git.chatAboutIssue", "Chat")}
+                    </button>
+                  )}
                   <button
-                    className="btn btn-danger github-import-issue-close"
-                    data-testid="github-import-issue-close"
-                    onClick={handleCloseIssue}
-                    disabled={closingIssue}
-                    title={t("git.closeIssueTitle", "Close issue #{{number}}", { number: selectedIssue.number })}
+                    className="btn btn-primary github-import-action"
+                    data-testid="github-import-action-top"
+                    onClick={handleImport}
+                    disabled={
+                      (activeTab === "issues" ? selectedIssueNumber === null || isUrlImported(selectedIssue?.html_url) : selectedPullNumber === null || isUrlImported(selectedPull?.html_url)) || importing
+                    }
                   >
-                    {closingIssue ? <Loader2 size={14} className="spin" /> : t("git.closeIssue", "Close issue")}
+                    {importing ? <Loader2 size={14} className="spin" /> : activeTab === "pulls" ? t("git.resolveFeedback", "Resolve feedback") : t("git.importAsTask", "Import as task")}
                   </button>
-                )}
-                {activeTab === "issues" && selectedIssue && onPlanningMode && (
-                  <button
-                    type="button"
-                    className="btn github-import-action"
-                    data-testid="github-import-action-plan"
-                    onClick={handlePlanIssue}
-                    disabled={importing || isUrlImported(selectedIssue.html_url)}
-                  >
-                    {t("git.planIssue", "Plan")}
-                  </button>
-                )}
-                {onOpenChatWithPrefill && (activeTab === "issues" ? selectedIssue?.html_url?.trim() : selectedPull?.html_url?.trim()) && (
-                  <button
-                    type="button"
-                    className="btn github-import-action"
-                    data-testid="github-import-action-chat"
-                    onClick={handleChatAboutSelection}
-                  >
-                    {t("git.chatAboutIssue", "Chat")}
-                  </button>
-                )}
-                <button
-                  className="btn btn-primary github-import-action"
-                  data-testid="github-import-action-top"
-                  onClick={handleImport}
-                  disabled={
-                    (activeTab === "issues" ? selectedIssueNumber === null || isUrlImported(selectedIssue?.html_url) : selectedPullNumber === null || isUrlImported(selectedPull?.html_url)) || importing
-                  }
-                >
-                  {importing ? <Loader2 size={14} className="spin" /> : activeTab === "pulls" ? t("git.resolveFeedback", "Resolve feedback") : t("git.importAsTask", "Import as task")}
-                </button>
+                </div>
               </div>
               </div>
             </FloatingWindow>
@@ -2469,13 +2503,35 @@ export function GitHubImportModal({ isOpen, onClose, onImport, onPlanningMode, o
     </div>
   );
 
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-19:05:
+  Embedded Import Tasks remains a container-filling presentation exception. resizePersistEnabled
+  continues to gate modal-only geometry behavior rather than introducing FloatingWindow chrome here.
+  */
   if (isEmbedded) {
     return <div className="github-import-embedded right-dock-embedded-view">{inner}</div>;
   }
 
   return (
-    <div className="modal-overlay open" {...overlayDismissProps} role="dialog" aria-modal="true">
+    <FloatingWindow
+      windowKey="github-import"
+      title={t("git.importFromGitHub", "Import from GitHub")}
+      ariaLabelledBy="github-import-modal-title"
+      onClose={onClose}
+      modal
+      hideHeader
+      dragHandleSelector=".github-import-modal__header"
+      className="floating-window--github-import"
+      defaultSize={{ width: 1200, height: 720 }}
+      minSize={{ width: 480, height: 480 }}
+      /* FNXC:ModalTouchGeometry 2026-07-26-19:05: The legacy size-only key cannot restore FloatingWindow position, so a new complete geometry key intentionally resets once. */
+      persistGeometryKey="floating-window:github-import"
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+      /* FNXC:ModalTouchGeometry 2026-07-26-19:05: Preserve the global default-off dismissal preference; unconditional pointer-down would lose the data-safety contract. */
+      closeOnOutsidePointerDown={dismissOnOutsidePointerDown}
+    >
       {inner}
-    </div>
+    </FloatingWindow>
   );
 }

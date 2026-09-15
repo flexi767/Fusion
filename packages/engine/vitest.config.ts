@@ -7,6 +7,17 @@ const maxWorkers = computeMaxWorkers();
 export default defineConfig({
   resolve: {
     alias: {
+      /*
+      FNXC:VitestAliases 2026-07-30-13:10:
+      Must precede the broader `@fusion/core` alias: Vite string aliases match by PREFIX, so that key
+      rewrites this subpath to `index.ts/task-delete-attribution` and resolution fails. Reached here
+      transitively — this project aliases `@fusion/dashboard`, and `app/api/client.ts` imports the
+      browser-safe delete-attribution leaf.
+      */
+      "@fusion/core/column-roles": resolve(__dirname, "../core/src/column-roles.ts"),
+      "@fusion/core/task-delete-attribution": resolve(__dirname, "../core/src/task-delete-attribution.ts"),
+      // FNXC:MemoryMcp 2026-08-11-00:19: Preserve the Node-only factory subpath without leaking it through the browser-safe core barrel.
+      "@fusion/core/mcp-builtin-servers": resolve(__dirname, "../core/src/config/mcp-builtin-servers.ts"),
       "@fusion/core": resolve(__dirname, "../core/src/index.ts"),
       "@fusion/test-utils": resolve(__dirname, "../core/src/__test-utils__/workspace.ts"),
       "@fusion/engine": resolve(__dirname, "./src/index.ts"),
@@ -62,6 +73,14 @@ export default defineConfig({
           inherited via extends:true, so @fusion/test-utils/@fusion/plugin-sdk/@fusion/dashboard
           stay on their root aliases and only @fusion/core is overridden here.
 
+          FNXC:MergeGatePerformance 2026-08-04-15:44:
+          FN-8783 confirms W32's engine-core lane has 22 exact policy files.
+          The current core bundle remains the only evidence-backed import-path
+          optimization: it is rebuilt every run, retains mock interception, and
+          avoids the measured-slower engine-graph bundle designs below. Keep pool,
+          worker budgeting, file parallelism, and this alias intact; membership is
+          pinned in scripts/__tests__/engine-vitest-gate-policy.test.mjs.
+
           FNXC:EngineTests 2026-07-08-04:50:
           FN-7669: the @fusion/core alias now points at a PRE-BUNDLED single ESM
           file (packages/core/.gate-bundle/core.mjs — a SIBLING of
@@ -71,8 +90,8 @@ export default defineConfig({
           bundle, see scripts/build-engine-core-gate-bundle.mjs for the full repro)
           instead of directly at index.gate.ts's source. FN-7668 profiled the
           gate's dominant wall-time cost as vitest/Vite SSR's import-phase — each
-          of the 18 pool:"forks" processes independently re-resolving+evaluating
-          the ~430-file barrel closure with zero cross-fork sharing. esbuild-
+          of the fork workers independently re-resolving+evaluating the ~430-file
+          barrel closure with zero cross-fork sharing. esbuild-
           bundling the index.gate.ts closure (220 first-party files, the
           @fusion/core slice of that ~430) into one file
           (scripts/build-engine-core-gate-bundle.mjs, wired below via globalSetup
@@ -81,8 +100,8 @@ export default defineConfig({
           fork. See the task's docs document for the full A/B measurement,
           coverage-parity proof, and land/no-land rationale.
           @fusion/engine is deliberately left on the full barrel, unbundled: none
-          of the 18 curated gate files import "@fusion/engine" at all (verified by
-          grep across all 18 files), so bundling it would be zero-benefit
+          of the originally profiled curated files imported "@fusion/engine" at
+          all, so bundling it would be zero-benefit
           churn/risk — and it would additionally risk double-registering or
           dead-locking the core↔engine circular-import DI
           (`void import("@fusion/core").then(setCreateFnAgent...)` in
@@ -91,7 +110,7 @@ export default defineConfig({
           FNXC:EngineTests 2026-07-08-06:20:
           FN-7670 prototyped extending this same lever to the @fusion/engine
           RELATIVE-import production graph (`../merger.js`, `../hold-release.js`,
-          `../scheduler.js`, `../workflow-node-handlers.js`, ...) that the 18 gate
+          `../scheduler.js`, `../workflow-node-handlers.js`, ...) that curated gate
           files reach directly — NOT the barrel above, which stays untouched per
           the paragraph above regardless. It built a fully working, coverage-
           parity-preserving, mock-safe bundle (171 first-party files → 35 output
@@ -142,8 +161,8 @@ export default defineConfig({
           /*
           FNXC:EngineTests 2026-07-08-04:50:
           FN-7669: prepend the gate-bundle builder to this project's globalSetup so
-          the @fusion/core bundle above is rebuilt before any of the 18 forks spawn
-          and resolve the alias. REBUILD-EVERY-RUN is the invalidation model — the
+          the @fusion/core bundle above is rebuilt before fork workers spawn and
+          resolve the alias. REBUILD-EVERY-RUN is the invalidation model — the
           builder's own esbuild dependency graph (not a hand list) determines what
           gets bundled, and because it reruns on every gate invocation there is no
           drift surface. The original root-level vitest-teardown.ts worker-root
@@ -161,6 +180,20 @@ export default defineConfig({
           The curated engine-core merge gate hits a Node 24.15.0/macOS libuv kqueue SIGABRT when Vitest thread workers close unmanaged file descriptors. Scope fork workers to this gate so the broad default engine suite keeps its explicit worker-thread behavior.
           */
           pool: "forks",
+          experimental: {
+            /*
+            FNXC:MergeGatePerformance 2026-08-04-16:09:
+            FN-8783 retains all 22 forked files but enables Vitest's validated
+            filesystem transform cache only for engine-core. Fork isolation still
+            evaluates every test and preserves mocks; caching immutable Vite
+            transforms avoids repeating import/setup compilation on warm gate runs.
+            Keep this cache project-scoped so broad engine lanes cannot inherit
+            gate-specific artifacts, and let Vitest invalidate entries from its
+            transform dependency graph rather than maintaining an unsafe file list.
+            */
+            fsModuleCache: true,
+            fsModuleCachePath: resolve(__dirname, "node_modules/.engine-core-fs-module-cache"),
+          },
           // The curated merge-gate suite (see docs/testing.md "Merge gate").
           // Membership is an explicit allow-list, NOT a glob: tests earn their
           // way in with evidence of value, and a flaky gate test is evicted by
@@ -177,11 +210,70 @@ export default defineConfig({
           Removed merger-post-merge.test.ts — retired by FN-7039 (graph is sole post-merge owner); it matched zero files. Graph post-merge is covered by workflow-graph-post-merge.test.ts in engine-default; no gate replacement needed.
           */
           include: [
+            /*
+            FNXC:EngineTests 2026-07-31-00:40 (PR #2557 review — greptile):
+            THE CENSUS RATCHET MUST BE IN THE BLOCKING GATE, or it cannot do the one
+            thing it exists for. Outside the gate a PR can add a legacy column
+            comparison and every blocking check stays green while the count rises —
+            the ratchet notices hours later in a non-blocking run, which is exactly
+            the window this program kept losing work in.
+
+            Admission evidence: it is pure computation over `git ls-files` plus file
+            reads — no store, no network, no timers, no subprocess beyond one
+            `ls-files`. Measured ~0.3s. Deterministic by construction: same tree,
+            same number.
+            */
+            "src/__tests__/legacy-column-literal-census.test.ts",
+            /*
+            FNXC:EngineTests 2026-07-31-23:59:
+            THE MOVE-TARGET RATCHET BELONGS HERE FOR THE SAME REASON THE CENSUS RATCHET ABOVE DOES,
+            and the argument is stronger for this one.
+
+            The census counts COMPARISONS; a move target is an ARGUMENT, so nothing above sees it. And
+            the failure mode is harder than a stale guard's: `moveTaskInternal` REJECTS a target the
+            workflow does not declare (`TransitionRejectionError: unknown-column`), so a regression
+            here THROWS on a renamed board instead of degrading — in recovery paths, which are the
+            ones that run when something has already gone wrong.
+
+            Outside the gate this repeats the pattern this program keeps paying for: a correct signal
+            that fires in a non-blocking run while the PR merges anyway. That happened to my own
+            #3114 this week — `check-inert-sync-lanes` flagged it correctly and it landed regardless.
+
+            Admission evidence, on the same terms as the entries around it: pure computation over one
+            `git ls-files` plus file reads. No store, no network, no timers, no subprocess beyond that
+            one call. Deterministic by construction — same tree, same counts. Measured 509ms / 508ms
+            across runs, 12 tests, after memoising the corpus scan (it was 800ms when each case
+            re-read every file).
+            */
+            "src/__tests__/no-legacy-move-targets.test.ts",
             "src/__tests__/merger-merge-lifecycle.test.ts",
             "src/__tests__/merger-conflict-resolution.test.ts",
             "src/__tests__/merger-diff-scope.test.ts",
             "src/__tests__/merger-landed-files-capture.test.ts",
             "src/__tests__/branch-attribution.test.ts",
+            /*
+            FNXC:EngineTests 2026-08-10-09:35:
+            FN-8937 rescued project-engine.test.ts into engine-default by sealing its
+            git resolver seam and using real guard watchdog timers. It remains outside
+            engine-core: merge-gate admission requires separate deterministic evidence.
+            */
+            /*
+            FNXC:EngineTests 2026-07-28-21:05 (#2520 review — greptile P1):
+            Capacity single-flight IS covered — by this purpose-built file, not by anything in project-engine.test.ts. It was outside blocking CI, which is the real gap. Removing `if (this.mergeRunning) return;` fails "refuses a second concurrent drain while one merge is in flight" here and nowhere else. Deterministic, 3.69s / 3 tests.
+            */
+            "src/__tests__/merge-single-flight-invariant.test.ts",
+            /*
+            FNXC:EngineTests 2026-07-29-12:40 (U9 review lane):
+            The merge half of U9's safeguards fires in blocking CI; this is the review half, which did not. `workflow-step-verdict-parsing.test.ts` holds the leniency guard: a prose REJECTION must never be promoted to APPROVE. Removing the REVISE/RETHINK/negated-approval disqualifiers in `proseSignalsClearApproval` fails 11 of its cases — a fail-OPEN defect on the path to an irreversible merge, so it belongs in the gate rather than a non-blocking run hours later. Deterministic, pure parser assertions, no mocks/git/network.
+
+            NOT admitted: `reviewer.test.ts`, which holds the sibling "a provider outage is not a review verdict" family. It is green in engine-default but fails 72 cases under engine-core, because that project resolves @fusion/core through the REDUCED `index.gate.ts` barrel/bundle and the suite reaches exports it does not carry (`__vite_ssr_import_0__.has…` TypeError). Admitting it needs the gate barrel widened, which trades away the bundle's whole reason for existing; left outside deliberately rather than papered over.
+            */
+            "src/__tests__/workflow-step-verdict-parsing.test.ts",
+            /*
+            FNXC:EngineTests 2026-07-28-10:20:
+            Gate admission evidence (U9): this pins which authority actually decides merge-region policy — the built-in IR declares `merge-retry.maxAttempts` / `manual-merge-hold.release` that no handler reads, while the live budgets sit in `settings.maxAutoMergeRetries` and `ProjectEngine.MAX_AUTO_MERGE_TRANSIENT_RETRIES`. Merge is where irreversible work happens, and the drift it guards is SILENT: a handler-only edit can quietly make the dead IR config live (or move the live budget) with no other test failing. Outside the gate the ratchet cannot fire on the defect it exists for. Deterministic and pure — no git subprocesses, no timers, no network, no store; 3 ms of assertions.
+            */
+            "src/__tests__/u9-merge-region-node-config-authority.test.ts",
             /*
             FNXC:EngineTests 2026-06-23-10:48:
             Workflow columns and workflow graph execution are now the default runtime. Retire the legacy direct-dispatch executor/scheduler gate files and gate the new hold-release plus graph interpreter seams instead.
@@ -239,10 +331,24 @@ export default defineConfig({
           include: ["src/**/*.test.ts"],
           exclude: [
             "src/__tests__/reliability-interactions/**/*.test.ts",
+            // FNXC:PipelineSmoke 2026-08-23-14:52: FN-182's whole-pipeline fixture is opt-in, never a default or gate test.
+            "src/__tests__/pipeline-smoke/**/*.test.ts",
             // Real-git heavy files run in the engine-slow project so local
             // `pnpm test` stays snappy. CI picks them up via `test:slow`
             // / `test:all` invoked from the root `test:full` script.
             "src/**/*.slow.test.ts",
+            /*
+            FNXC:PluginRunnerFlake 2026-08-17-12:11:
+            FN-9141 rescued the PluginRunner suite before the 2026-08-30 deletion
+            ratchet. A completed shuffled worker-reuse campaign reproduced a test-fixture
+            defect: cross-file `vi.clearAllMocks()` erased the logger mock-result history
+            used by the lifecycle warning assertion. The suite now keeps a stable hoisted
+            logger reference and directly proves that cleanup cannot erase that contract.
+            */
+            /*
+            FNXC:FullSuiteBookkeeping 2026-08-09-03:49:
+            All 11 engine-default entries from the 2026-08-05 full-suite quarantine wave (run 30982276306) were deleted under the deletion ratchet after operator directive. These tested pre-refactor APIs (getBuiltinWorkflow removed post-U10b), stale mock shapes, census/allowlist drift, and mock-hoist errors that no longer have a production path to exercise.
+            */
             /*
             FNXC:EngineTests 2026-06-26-13:15:
             FN-7068 rescued the 2026-06-25 self-healing quarantine batch by completing the local TaskStore fakes for the FN-5488 overlap path. Keep both files active in engine-default so fake drift around clearStaleBlockedBy() is caught before the deletion ratchet expires.
@@ -318,6 +424,10 @@ export default defineConfig({
           exclude: [
             "src/**/*.slow.test.ts",
             /*
+            FNXC:FullSuiteBookkeeping 2026-08-09-03:49:
+            dependency-cycle-reconcile and worktrunk-failure from the 2026-08-05 full-suite quarantine wave (run 30982276306) deleted under the deletion ratchet after operator directive. Both tested pre-refactor PG lifecycle-lock and mock-hoist behavior that no longer exists.
+            */
+            /*
             FNXC:EngineTests 2026-06-26-09:30:
             Quarantined 3 reliability-interactions files failing in CI full-suite run 28259456548 under the deletion ratchet.
 
@@ -371,6 +481,31 @@ export default defineConfig({
           // SQLite rowid interleaving (e.g. FN-5521 hit
           // `expected 24 to be less than 19` in merge-reuse-task-worktree).
           // Serialize at the file level; within-file order is already linear.
+          minWorkers: 1,
+          maxWorkers: 1,
+          fileParallelism: false,
+        },
+      },
+      {
+        extends: true,
+        test: {
+          /*
+          FNXC:PipelineSmoke 2026-08-23-14:52:
+          FN-182 reserves a focused opt-in project for the deterministic full
+          workflow composition. It must not join engine-default, engine-slow,
+          or engine-core: the smoke suite owns a real disposable Git fixture and
+          PostgreSQL store, while the ordinary and blocking lanes stay bounded.
+          */
+          name: "engine-pipeline-smoke",
+          include: ["src/__tests__/pipeline-smoke/**/*.pipeline.test.ts"],
+          /*
+          FNXC:PipelineSmoke 2026-08-23-15:18:
+          FN-182 permits one bounded timeout for the serialized real PostgreSQL/local-Git lane.
+          The five-minute runner budget remains the outer contract; these values only allow a
+          single fixture body and shared database hook to report a concrete failure before it.
+          */
+          testTimeout: 120_000,
+          hookTimeout: 60_000,
           minWorkers: 1,
           maxWorkers: 1,
           fileParallelism: false,

@@ -14,7 +14,7 @@
  *   const store = await getOrCreateProjectStore(projectId);
  */
 
-import { countRunningAgentTasks, type TaskStore } from "@fusion/core";
+import { buildConsumerId, countRunningAgentTasks, enrichRunningAgentTaskShape, resolveWorkflowIrForTask, type TaskStore } from "@fusion/core";
 
 /**
  * Internal cache: projectId → TaskStore instance.
@@ -110,7 +110,12 @@ export async function getOrCreateProjectStore(projectId: string): Promise<TaskSt
     // default when DATABASE_URL is unset, external PG when DATABASE_URL is
     // set. The factory applies the schema baseline and integrates the
     // dual-read harness when FUSION_DUAL_READ=1.
-    const backendBoot = await createTaskStoreForBackend({ projectId });
+    /*
+    FNXC:CrossProcessDeleteObservation 2026-08-01-12:14:
+    This dashboard-owned, SSE-subscribed store needs its own project-scoped stream. The role-only
+    identity is restart-stable and must not share the engine consumer's cursor or fenced lease.
+    */
+    const backendBoot = await createTaskStoreForBackend({ projectId, consumerId: buildConsumerId("dashboard") });
     // FNXC:PostgresFinalCutover 2026-07-14-17:20: Project-scoped dashboard
     // stores are always factory-backed PostgreSQL stores.
     const store = backendBoot.taskStore;
@@ -277,7 +282,17 @@ export function listRegisteredProjectStores(): Array<{ projectId: string; store:
  */
 export async function countRunningAgentsInStore(store: TaskStore): Promise<number> {
   const tasks = await store.listTasks({ slim: true });
-  return countRunningAgentTasks(tasks);
+  const irCache = new Map();
+  /*
+  FNXC:ConcurrencyIndicators 2026-08-03-12:00:
+  FN-8453 requires dashboard store counts to enrich custom workflow traits before
+  the pure predicate runs; otherwise a custom complete card with stale session
+  metadata would falsely consume displayed/global top-level concurrency.
+  */
+  const enriched = await Promise.all(tasks.map(async (task) =>
+    enrichRunningAgentTaskShape(task, await resolveWorkflowIrForTask(store, task.id, irCache)),
+  ));
+  return countRunningAgentTasks(enriched);
 }
 
 /**

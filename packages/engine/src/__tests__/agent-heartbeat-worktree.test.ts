@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Agent, AgentHeartbeatRun } from "@fusion/core";
 import { HeartbeatMonitor } from "../agent-heartbeat.js";
-import * as worktreeAcquisition from "../worktree-acquisition.js";
+import * as worktreeAcquisition from "../worktree/worktree-acquisition.js";
 import * as piModule from "../pi.js";
 
 describe("heartbeat worktree cwd", () => {
@@ -49,11 +49,57 @@ describe("heartbeat worktree cwd", () => {
     vi.restoreAllMocks();
   });
 
-  it("uses acquired worktree cwd for task-scoped runs", async () => {
+  it("refreshes acquired worktree before creating task-scoped session", async () => {
     const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: "/repo" });
     await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
-    expect(worktreeAcquisition.acquireTaskWorktree).toHaveBeenCalled();
+
+    expect(worktreeAcquisition.acquireTaskWorktree).toHaveBeenCalledWith(expect.objectContaining({
+      task: expect.objectContaining({ id: "FN-1" }),
+      refreshStaleBase: true,
+    }));
     expect(piModule.createFnAgent).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/tmp/wt" }));
+    expect(worktreeAcquisition.acquireTaskWorktree.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(piModule.createFnAgent).mock.invocationCallOrder[0],
+    );
+  });
+
+  it("acknowledges heartbeat overlap context only after success and delivers a later generation", async () => {
+    const episode = (id: string, predecessor: string, revision: number) => ({
+      phase: "ready", episodeId: id, revision, owner: "heartbeat-owner",
+      receipt: {
+        decision: "briefing", freshness: "proven", commonFiles: ["src/shared.ts"], deliveryProofs: [],
+        decisionFingerprint: `${id}-generation`, briefing: `OVERLAP_WAIT_CONTEXT:\n${predecessor} delivered src/shared.ts`,
+        decidedAt: new Date().toISOString(),
+      },
+    });
+    const first = episode("heartbeat-overlap-a", "FN-A", 3);
+    const second = episode("heartbeat-overlap-c", "FN-C", 7);
+    let delivery = { context: first.receipt.briefing, episodes: [first] };
+    const failedPrompt = vi.fn(async () => { throw new Error("transport failed"); });
+    const retryPrompt = vi.fn(async () => undefined);
+    const nextGenerationPrompt = vi.fn(async () => undefined);
+    vi.spyOn(piModule, "createFnAgent")
+      .mockResolvedValueOnce({ session: { prompt: failedPrompt, dispose: vi.fn() } } as any)
+      .mockResolvedValueOnce({ session: { prompt: retryPrompt, dispose: vi.fn() } } as any)
+      .mockResolvedValueOnce({ session: { prompt: nextGenerationPrompt, dispose: vi.fn() } } as any);
+    vi.spyOn(worktreeAcquisition, "acquireTaskWorktree").mockImplementation(async () => ({
+      worktreePath: "/tmp/wt", branch: "fusion/fn-1", source: "existing", hydrated: false, isResume: true,
+      overlapResumeDelivery: delivery,
+    } as any));
+    taskStore.completeTaskOverlapWait = vi.fn(async (input: any) => ({ ...input, phase: "delivered" }));
+
+    const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: "/repo" });
+    await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
+    expect(taskStore.completeTaskOverlapWait).not.toHaveBeenCalled();
+
+    await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
+    expect(retryPrompt).toHaveBeenCalledWith(expect.stringContaining("FN-A delivered src/shared.ts"));
+    expect(taskStore.completeTaskOverlapWait).toHaveBeenCalledWith(expect.objectContaining({ episodeId: "heartbeat-overlap-a", phase: "delivered" }));
+
+    delivery = { context: second.receipt.briefing, episodes: [second] };
+    await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
+    expect(nextGenerationPrompt).toHaveBeenCalledWith(expect.stringContaining("FN-C delivered src/shared.ts"));
+    expect(taskStore.completeTaskOverlapWait).toHaveBeenCalledWith(expect.objectContaining({ episodeId: "heartbeat-overlap-c", phase: "delivered" }));
   });
 
   it("uses rootDir for no-task runs", async () => {
@@ -73,6 +119,34 @@ describe("heartbeat worktree cwd", () => {
     // FN-7721: first failure bumps the bounded cross-heartbeat retry counter
     // (reuses Task.recoveryRetryCount) rather than terminally failing the task.
     expect(taskStore.updateTask).toHaveBeenCalledWith("FN-1", { recoveryRetryCount: 1 });
+  });
+
+  it("parks typed base-refresh refusals without consuming acquisition retries", async () => {
+    /*
+    FNXC:WorktreeBaseRefresh 2026-08-01-16:33:
+    A stale checkout is a deliberate no-session outcome. It must retain the concrete reason for
+    the next heartbeat rather than converting into the unrelated acquisition retry cap.
+    */
+    vi.spyOn(worktreeAcquisition, "acquireTaskWorktree").mockRejectedValueOnce(
+      new worktreeAcquisition.WorktreeBaseRefreshError({
+        kind: "base-reconciliation-required",
+        executionSafe: false,
+        durableBaseSha: "c0",
+        baseSha: "c1",
+      }),
+    );
+    const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: "/repo" });
+
+    await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
+
+    expect(piModule.createFnAgent).not.toHaveBeenCalled();
+    expect(taskStore.updateTask).not.toHaveBeenCalledWith("FN-1", expect.objectContaining({ recoveryRetryCount: expect.anything() }));
+    expect(taskStore.logEntry).toHaveBeenCalledWith(
+      "FN-1",
+      "Worktree base refresh blocked heartbeat execution (base-reconciliation-required)",
+      expect.any(String),
+    );
+    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-1", "todo", { preserveProgress: true });
   });
 
   // FN-7721 regression: reproduces the reported "worktree-setup loop" symptom
