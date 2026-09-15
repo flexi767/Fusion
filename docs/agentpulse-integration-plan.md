@@ -1,0 +1,168 @@
+# AgentPulse integration into Fusion
+
+Status: proposed implementation plan; no integration implemented.
+Prepared: 2026-09-15.
+Baseline: Fusion fork `a58b374c7`, including upstream `6e6adf393`; AgentPulse fork `04f0dcf`.
+
+## Outcome
+
+Use Fusion as the single dashboard for Fusion-managed work and Codex/Claude sessions started independently on m3, m5 and J. Show host, project, live activity, prompt/result history, elapsed work time, file changes, model, context, token breakdown and estimated cost. Allow feedback and session controls when the owning runtime supports them. Preserve the historical data collected by AgentPulse.
+
+“Session” and “Fusion task” must remain distinct: one task can have several sessions, and an external session need not be a scheduled task. Observing a session must never enroll it in Fusion's planning, execution, review or merge workflow. Link sessions to tasks explicitly or through verified native identifiers; matching a project path or title alone is insufficient.
+
+## Reuse and gaps
+
+| Capability | Existing foundation | Integration work |
+| --- | --- | --- |
+| Authentication and access | Fusion dashboard authentication, route registrars and node infrastructure | Host-scoped collector credentials and session access rules |
+| Live sessions across hosts | AgentPulse observers, hooks and durable relay; Fusion live events and mesh | External-session ingestion, stable identities, reconciliation and Sessions view |
+| Managed agents and controls | Fusion runtime adapters, agents and CLI session transport | Unified capability display and routing to the owning host |
+| Prompts, results, elapsed time, diffs | AgentPulse turn-result parser; Fusion task/session UI | Durable imported turns and shared presentation |
+| Tokens and costs | Fusion token analytics, TaskCostTab, pricing overrides and refresh support | Provider-normalized accounting, turn breakdowns, cost popup and rankings |
+| Feedback to external sessions | AgentPulse feedback queue | Delivery acknowledgements, host routing and supported runtime injection |
+| AI summaries | Fusion AI configuration; selected Qwen3.5-2B-4bit on m3 | Bounded summary jobs, provenance and last-summarized position |
+| Historical data | AgentPulse session/event store and native transcripts | Resumable import, reconciliation and retention controls |
+
+Scope includes the AgentPulse features used in this deployment. Before implementation, inventory additional AgentPulse surfaces—search, alerts, session notes, launch templates and workspace actions—and map each to a Fusion equivalent or a named follow-up. Do not declare complete parity while a used feature has no replacement.
+
+## Architecture
+
+Implement a Sessions feature within Fusion's existing application. Keep provider transcript parsers and host collectors isolated behind a versioned contract, while reusing Fusion's database, authentication, event delivery, pricing and UI components.
+
+A bundled plugin is an option for collector registration and provider adapters, but it does not remove all Fusion changes: the current plugin UI needs explicit registration in the host's static view registry. Confirm module ownership during phase 0; do not build another dashboard or introduce a second live database.
+
+Data flow:
+
+```text
+m3 / m5 / J
+  Native transcripts + hooks + runtime handles
+       -> local collector and durable spool
+       -> authenticated Fusion ingestion on the central server
+       -> PostgreSQL session/turn/usage records
+       -> Fusion live events -> Sessions view and task detail
+
+Fusion feedback/control request
+       -> durable command -> owning host -> provider adapter -> acknowledgement
+
+Session changes -> bounded summary queue -> m3 Qwen3.5-2B-4bit
+```
+
+Prefer the current central-server placement on J, subject to verifying the serving Fusion instance and its database. Mesh discovery is useful for host identity and routing; it does not replace transcript delivery. Fusion's shared mesh snapshots currently exclude transcript blobs and local runtime handles.
+
+### Data contract
+
+- **Session:** internal id, stable host id, provider, native session id, project identity, optional Fusion task/run link, observed/managed origin, capabilities, status, last event time and last collector heartbeat.
+- **Turn:** native turn id, ordered user prompts, final response, start/end timestamps, duration with source, completion state and collected tool-call count.
+- **File change:** turn id, repository-relative path, add/delete/modify operation, patch, added/removed lines, truncation and availability flags. Do not substitute the current working-tree diff for a historical turn's diff.
+- **Usage:** native request id where available, model/provider, input/output/cache read/cache write counts, cache lifetime where reported, reasoning count, service tier, context size/capacity and provenance. Preserve unknown values; zero must mean a reported zero.
+- **Delivery:** event id, collector version, cursor/sequence and acknowledgement position. Retries and backfill must be idempotent; late events must not overwrite newer state.
+- **Command:** request id, session and host identity, requested operation, creation/expiry times and queued/delivered/applied/failed status. Accepted into a queue does not mean applied by the agent.
+
+PostgreSQL migrations should follow Fusion's existing migration ownership and numbering. Keep imported sessions outside task lifecycle tables unless linked. Bound patch sizes, request bodies and retention; paginate history and large output. Reuse current secret-redaction boundaries and never expose arbitrary host filesystem reads through the diff viewer.
+
+### Accounting rules
+
+1. Normalize provider input/cache semantics before totaling. Claude cache creation/read and Codex inclusive input totals cannot be summed using the same raw formula.
+2. Use request deltas or a canonical cumulative-counter reconciliation; never add both for the same work. Deduplicate Fusion-native and externally collected observations of the same session.
+3. Reasoning is included in output when the provider reports it that way. Cached output is not a separate billable category.
+4. Reuse and extend Fusion's pricing service; do not retain independent Fusion and AgentPulse rate tables. Preserve unknown-model and unsupported-tier indicators.
+5. Support cache-write lifetime and service-tier differences without guessing unsupported rates. Show counts, per-million rates, charge by category, source and effective date in the popup.
+6. Add versioned/effective-dated rates and distinguish cost at recorded rates from a recalculation at current rates. Existing histories lacking applicable rates remain explicitly estimated.
+7. Rankings show their date range and coverage. Whole-session totals and individual-turn totals must disclose missing usage and excluded unknown prices. Explain expensive work using measured request volume, context size, output and cache charges rather than invented causes.
+
+## Delivery phases and acceptance gates
+
+### Phase 0 — Confirm contracts and preserve recovery data
+
+- Audit the current Fusion deployment, database, host identities, auth and live-event mechanism.
+- Inventory all used AgentPulse features and existing Fusion equivalents.
+- Capture sanitized native transcript fixtures from both providers, including model changes, compacted context, resumed sessions and file edits.
+- Record AgentPulse counts and cost coverage by host/provider; take supported database backups and preserve collector configuration.
+- Select native feature/plugin ownership and document source licensing/attribution for copied components.
+
+**Gate:** approved technical contract and a feature checklist with no unassigned used capability. No production ingestion changes yet.
+
+### Phase 1 — Collect and list external sessions
+
+- Implement storage, authenticated ingestion, durable acknowledgements and heartbeat reporting.
+- Adapt existing collectors on m3/m5/J. Keep replay cursors and delivery acknowledgements independent for Fusion and AgentPulse during comparison.
+- Add Sessions navigation, host/project/provider/status filters and stable live cards.
+- Reconcile native Fusion sessions with observations to avoid duplicate cards.
+- Show working, waiting, completed, disconnected and stale states without transient label flicker. Collector connectivity and agent activity are separate signals.
+
+**Gate:** existing and newly started Codex/Claude sessions on every available host appear once, show the correct host and survive disconnect/reconnect plus replay. Target p95 under 3 seconds for hook-driven updates and under 35 seconds for polling fallback; measure these as acceptance targets, not assumed current performance.
+
+### Phase 2 — Turn history, results and changes
+
+- Port AgentPulse's bounded transcript parsing and durable result ingestion.
+- Render each user prompt above its response, measured work duration, tool activity and expandable file patches.
+- Support completed and ongoing turns, older-history pagination, deep links and clear unavailable/truncated states.
+- Reuse Fusion presentation in linked task detail rather than maintaining two versions of the same result UI.
+
+**Gate:** compare representative turns against native Codex/Claude output, including the known 20-file, +663/-42 example if its source transcript remains available. Replayed or out-of-order delivery must not duplicate turns or lose newer patches.
+
+### Phase 3 — Usage, pricing and expensive-work overview
+
+- Connect normalized external usage to Fusion analytics without double-counting existing task telemetry.
+- Show model and total estimated cost on cards; provide an accessible hover/click/focus popup with token categories, rates and charges.
+- Show current context and capacity when reported, separately from lifetime tokens.
+- Extend price overrides/refresh with effective dates and provenance; keep unsupported models visibly unpriced.
+- Add session and turn rankings, date/host/model filters, coverage totals and measured cost drivers.
+
+**Gate:** provider fixture counters reconcile exactly; cost arithmetic matches category rates; repeated imports leave totals unchanged. Compare against AgentPulse over the same records and pricing date, documenting intentional differences.
+
+### Phase 4 — Feedback and controls
+
+- Reuse Fusion controls for sessions it owns. Route external commands through the owning host adapter.
+- Port external feedback delivery with explicit capability and delivery state.
+- Show stop, resume and send-feedback only where supported; describe queued feedback that requires the session to resume.
+- Prevent duplicate command execution after retries. Expired commands must not affect a later session or a reused process id.
+
+**Gate:** disposable sessions on each host verify delivery, cancellation, offline queues, restart recovery and unsupported actions. An observed session must never acquire full-control status merely because a transcript was found.
+
+### Phase 5 — Summaries and operational reliability
+
+- Use Qwen3.5-2B-4bit through the existing m3 endpoint for short summaries, with thinking disabled.
+- Summarize only changed content; coalesce work, cap input/output and retry busy responses with bounded backoff.
+- Display summary timestamp and covered turn range. Preserve the previous summary during inference outages and indicate when it is stale.
+- Add collector lag, spool depth, last acknowledgement, parse errors, command failures and summary failures to operational health.
+- Add searchable collected output and any remaining used notes/notification functionality identified in phase 0.
+
+**Gate:** summaries preserve failures and unfinished work; endpoint outages do not block session display. Burst load and an extended disconnect drain successfully without duplicate output or costs.
+
+### Phase 6 — Historical import and cutover
+
+- Run a resumable importer from a consistent AgentPulse snapshot through the same normalization rules as live data.
+- Preserve native identities, hosts, timestamps, turns and patches; retain original usage provenance. Do not fabricate missing historical telemetry.
+- Compare counts, representative text/diffs, usage totals and price coverage while both dashboards receive data.
+- Run at least a 24-hour observation window including host/service restarts and a network outage.
+- Switch the primary entry point to Fusion after parity gates pass. Stop AgentPulse ingestion/services only after explicit retirement approval, retaining the recovery snapshot and configuration.
+
+**Gate:** all used features have verified replacements, the reconciliation report explains every discrepancy, and rollback has been rehearsed.
+
+## Validation and rollout discipline
+
+Run one resource-heavy command at a time, with bounded workers. Use focused parser, persistence, route-auth, accounting and command-delivery tests during implementation. Before landing each slice, run Fusion's required lint/typecheck/build and merge gate as applicable; execute concurrent gate lanes serially on this Mac. Browser checks must cover desktop/mobile, keyboard-operated popups, disconnected hosts, missing prices and stable live refresh.
+
+Use feature flags for ingestion, navigation and controls so phases can ship independently. Keep schema changes additive through the comparison period. Rollback disables Fusion collectors/controls and restores the prior entry point; AgentPulse's independently acknowledged spool remains usable. Never replay accepted control commands as part of rollback.
+
+## Existing source anchors
+
+Fusion:
+- `packages/core/src/board/token-analytics.ts`
+- `packages/core/src/ai/model-pricing.ts`
+- `packages/dashboard/app/components/TaskCostTab.tsx`
+- `packages/dashboard/app/utils/taskTokenCost.ts`
+- `packages/dashboard/src/routes/` and existing CLI session transport
+- `docs/PLUGIN_AUTHORING.md`, `docs/storage.md`, `docs/architecture.md`
+
+AgentPulse:
+- `scripts/session-results.py`, `scripts/session-usage-backfill.py`, `scripts/relay.ts`
+- `src/supervisor/services/codex-observer.ts`
+- `src/server/services/session-results.ts`, `src/server/services/session-feedback.ts`
+- `src/shared/session-results.ts`, `src/shared/session-telemetry.ts`, `src/shared/model-pricing.ts`
+- `src/web/components/CostOverview.tsx`, `src/web/components/CostPopover.tsx`
+
+## First implementation slice
+
+Start with phases 0 and 1: one external Codex session and one Claude session from m3, m5 and J, where available, visible in Fusion with correct host, stable status and reliable replay. This proves collection and identity before adding history, pricing and commands. Do not retire AgentPulse at this stage.
