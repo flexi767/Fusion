@@ -48,7 +48,7 @@ export const LITELLM_PRICING_SOURCE_URL =
 export const LITELLM_PRICING_SOURCE_LABEL = "litellm/model_prices_and_context_window.json";
 
 /** A single model's per-1M-token rates plus a citation. */
-export interface ModelPricing {
+export interface ModelPricingRates {
   /** USD per 1M uncached input tokens. */
   inputPer1M: number;
   /** USD per 1M output tokens. */
@@ -57,18 +57,28 @@ export interface ModelPricing {
   cacheReadPer1M: number;
   /** USD per 1M cache-write tokens. */
   cacheWritePer1M: number;
+  /** Explicit one-hour cache-write price; absent means unsupported, not free. */
+  cacheWriteHourPer1M?: number;
   /** Where the rate came from (provider pricing page / docs). */
   source: string;
   /** Optional operator-specified applicability interval; absent means unknown. */
   effectiveFrom?: string;
   effectiveUntil?: string;
 }
+export interface ModelPricing extends ModelPricingRates {
+  /** Separately configured long-context rates. Never infer a premium or reuse standard rates. */
+  longContext?: ModelPricingRates;
+}
 
-export function validModelPricing(rates: ModelPricing | undefined | null): rates is ModelPricing {
+function validPricingBand(rates: ModelPricingRates | undefined | null): rates is ModelPricingRates {
   if (!rates || typeof rates.source !== "string" || rates.source.length > 4096) return false;
   if (![rates.inputPer1M, rates.outputPer1M, rates.cacheReadPer1M, rates.cacheWritePer1M].every(rate => typeof rate === "number" && Number.isFinite(rate) && rate >= 0)) return false;
+  if (rates.cacheWriteHourPer1M !== undefined && (typeof rates.cacheWriteHourPer1M !== "number" || !Number.isFinite(rates.cacheWriteHourPer1M) || rates.cacheWriteHourPer1M < 0)) return false;
   if ([rates.effectiveFrom, rates.effectiveUntil].some(date => date !== undefined && (typeof date !== "string" || !Number.isFinite(Date.parse(date)) || date.length > 40))) return false;
   return !(rates.effectiveFrom && rates.effectiveUntil && Date.parse(rates.effectiveFrom) >= Date.parse(rates.effectiveUntil));
+}
+export function validModelPricing(rates: ModelPricing | undefined | null): rates is ModelPricing {
+  return validPricingBand(rates) && (rates.longContext === undefined || validPricingBand(rates.longContext));
 }
 export function pricingAppliesAt(rates: ModelPricing, at: number): boolean {
   return validModelPricing(rates) && Number.isFinite(at)

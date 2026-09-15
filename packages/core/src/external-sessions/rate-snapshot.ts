@@ -5,6 +5,7 @@ import type { SessionModelUsage } from "./turn.js";
 export interface RecordedSessionPrice {
   version: string; usageKey: string; capturedAt: string; turnStartedAt: string;
   referenceDate: string; rates: ModelPricing | null;
+  contextBand?: "standard" | "long";
 }
 export function usagePriceKey(usage: SessionModelUsage) {
   return JSON.stringify([usage.model, usage.serviceTier ?? null, usage.fast, usage.longContext]);
@@ -15,11 +16,14 @@ export function captureSessionPrice(provider: string, usage: SessionModelUsage, 
   const usageKey = usagePriceKey(usage);
   if (previous?.usageKey === usageKey) return previous.turnStartedAt === turnStartedAt ? previous : { ...previous, turnStartedAt };
   const configured = overrides === null ? undefined : lookupPricing({ provider: provider === "claude" ? "anthropic" : "openai-codex", model: usage.model }, overrides);
-  const rates: ModelPricing | null = validModelPricing(configured) ? { inputPer1M: configured.inputPer1M, outputPer1M: configured.outputPer1M,
-    cacheReadPer1M: configured.cacheReadPer1M, cacheWritePer1M: configured.cacheWritePer1M, source: redactSecrets(configured.source),
-    ...(configured.effectiveFrom ? { effectiveFrom: new Date(configured.effectiveFrom).toISOString() } : {}),
-    ...(configured.effectiveUntil ? { effectiveUntil: new Date(configured.effectiveUntil).toISOString() } : {}) } : null;
+  const selected = usage.longContext ? configured?.longContext : configured;
+  const rates: ModelPricing | null = validModelPricing(selected) ? { inputPer1M: selected.inputPer1M, outputPer1M: selected.outputPer1M,
+    cacheReadPer1M: selected.cacheReadPer1M, cacheWritePer1M: selected.cacheWritePer1M, source: redactSecrets(selected.source),
+    ...(selected.cacheWriteHourPer1M !== undefined ? { cacheWriteHourPer1M: selected.cacheWriteHourPer1M } : {}),
+    ...(selected.effectiveFrom ? { effectiveFrom: new Date(selected.effectiveFrom).toISOString() } : {}),
+    ...(selected.effectiveUntil ? { effectiveUntil: new Date(selected.effectiveUntil).toISOString() } : {}) } : null;
   const referenceDate = overrides && configured && Object.values(overrides).includes(configured) ? "Operator override; verification date unavailable" : pricingAsOf;
-  const version = createHash("sha256").update(JSON.stringify([provider, usage.model, rates, referenceDate])).digest("hex");
-  return { version, usageKey, capturedAt, turnStartedAt, referenceDate, rates };
+  const contextBand = usage.longContext ? "long" : "standard";
+  const version = createHash("sha256").update(JSON.stringify([provider, usage.model, contextBand, rates, referenceDate])).digest("hex");
+  return { version, usageKey, capturedAt, turnStartedAt, referenceDate, rates, contextBand };
 }

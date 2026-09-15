@@ -60,6 +60,7 @@ export async function externalSessionAnalytics(layer: AsyncDataLayer, query: Ext
       GROUP BY id, rank_turn_id, recorded.definition, recorded.applies, u->>'model', u->>'fast', u->>'longContext', u->>'serviceTier',
         (u->>'inputTokens' IS NOT NULL AND u->>'cachedInputTokens' IS NOT NULL AND u->>'cacheWriteTokens' IS NOT NULL AND u->>'outputTokens' IS NOT NULL),
         (u->>'cacheWriteHourTokens' IS NOT NULL), ((u->>'cacheWriteHourTokens')::numeric > 0),
+        ((u->>'cacheWriteTokens')::numeric >= (u->>'cacheWriteHourTokens')::numeric),
         ((u->>'inputTokens')::numeric >= (u->>'cachedInputTokens')::numeric + (u->>'cacheWriteTokens')::numeric)
     )
     SELECT totals.*, (SELECT count(*) FROM grouped) AS group_count,

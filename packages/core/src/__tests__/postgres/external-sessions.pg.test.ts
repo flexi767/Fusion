@@ -202,4 +202,25 @@ pgDescribe("External session durable ingestion", () => {
     expect(await store.get(id)).not.toBeNull();
   });
 
+  it("keeps standard, long-context and inconsistent cache lifetimes separate in session and turn rankings", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const standard = { inputPer1M: 2, cacheReadPer1M: 1, cacheWritePer1M: 3, cacheWriteHourPer1M: 5, outputPer1M: 4, source: "fixture" };
+    const prices = { "anthropic:fixture": { ...standard, longContext: { inputPer1M: 20, cacheReadPer1M: 10, cacheWritePer1M: 30, cacheWriteHourPer1M: 50, outputPer1M: 40, source: "long fixture" } } };
+    let sessionId = "";
+    for (const [index, patch] of [{}, { longContext: true }, { cacheWriteHourTokens: 31 }].entries()) {
+      const usage = { model: "fixture", inputTokens: 100, cachedInputTokens: 20, cacheWriteTokens: 30, cacheWriteHourTokens: 10, outputTokens: 40, requests: 1, ...patch };
+      const turn = { id: String(index), startedAt: observation.observedAt, updatedAt: observation.observedAt, prompts: [], response: "", files: [], usage: [usage] };
+      ({ id: sessionId } = await store.ingest("m3", "native", { ...observation, provider: "claude", revision: 10 + index }, [turn], false, undefined, undefined, prices));
+    }
+    for (const basis of ["current", "recorded"] as const) {
+      const ranked = await externalSessionAnalytics(h.layer(), { sessionId, basis }, prices);
+      expect(ranked.sessions[0].usage).toHaveLength(3);
+      expect(ranked.sessions[0].unpricedRows).toBe(1);
+      expect(ranked.sessions[0].usd).toBeCloseTo(0.00429, 12);
+      const turns = await externalSessionAnalytics(h.layer(), { sessionId, basis, groupBy: "turn" }, prices);
+      expect(turns.sessions.find(row => row.turnId === "2")?.usd).toBeNull();
+      expect(turns.sessions.filter(row => row.usd !== null).reduce((sum, row) => sum + row.usd!, 0)).toBeCloseTo(ranked.sessions[0].usd!, 12);
+    }
+  });
+
 });

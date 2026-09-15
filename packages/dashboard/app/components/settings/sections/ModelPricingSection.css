@@ -34,6 +34,7 @@
 
 .model-pricing-modal__body {
   overflow-x: auto;
+  padding: var(--space-md);
 }
 
 .model-pricing-table {
@@ -115,3 +116,13 @@
 .model-pricing-source-fields { display: flex; flex-direction: column; gap: var(--space-xs); min-inline-size: 0; }
 .model-pricing-source-fields label { display: flex; flex-direction: column; gap: var(--space-xs); }
 .model-pricing-source-fields summary { cursor: pointer; }
+
+.model-pricing-additional > * + * { margin-block-start: var(--space-sm); }
+
+.model-pricing-modal { inline-size: min(calc(100vw - 2 * var(--space-xl)), calc(var(--font-size-base) * 75)); }
+.model-pricing-modal__subtitle { display: block; white-space: normal; overflow-wrap: anywhere; }
+.model-pricing-additional { grid-column: 1 / -1; padding-block: var(--space-sm); }
+.model-pricing-additional label { display: flex; flex-direction: column; gap: var(--space-xs); }
+.model-pricing-additional > label { max-inline-size: calc(var(--font-size-base) * 15); }
+.model-pricing-band { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, calc(var(--font-size-base) * 12)), 1fr)); gap: var(--space-sm); }
+.model-pricing-band > strong, .model-pricing-band > button { grid-column: 1 / -1; }

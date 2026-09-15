@@ -22,19 +22,47 @@ interface ModelPricingSectionProps {
   projectId?: string;
 }
 
-interface PricingDraft {
-  key: string;
-  inputPer1M: number;
-  outputPer1M: number;
-  cacheReadPer1M: number;
-  cacheWritePer1M: number;
-  source: string;
-  effectiveFrom?: string;
-  effectiveUntil?: string;
-}
+interface PricingDraft extends ModelPricing { key: string; }
 
 function dateInput(value?: string): string { return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString().slice(0, 16) : ""; }
 function dateValue(value: string): string | undefined { return value ? new Date(`${value}Z`).toISOString() : undefined; }
+
+const bandRateFields = [
+  ["inputPer1M", "Input"], ["outputPer1M", "Output"],
+  ["cacheReadPer1M", "Cache read"], ["cacheWritePer1M", "Cache write (5 minutes)"],
+] as const;
+
+function AdditionalPricingFields({ label, pricing, update }: {
+  label: string; pricing: ModelPricing; update: (patch: Partial<ModelPricing>) => void;
+}) {
+  const band = pricing.longContext;
+  const updateBand = (patch: Partial<NonNullable<ModelPricing["longContext"]>>) => {
+    if (band) update({ longContext: { ...band, ...patch } });
+  };
+  return <details className="model-pricing-additional"><summary>Cache lifetime and long context</summary>
+    <label>Cache write (1 hour) / 1M<input aria-label={`${label} one-hour cache write per 1M`} className="input" type="number" min="0" step="any"
+      value={pricing.cacheWriteHourPer1M ?? ""} onChange={event => update({ cacheWriteHourPer1M: event.target.value === "" ? undefined : parseRate(event.target.value) })} /></label>
+    <small className="settings-muted">Blank means unpriced. Long-context usage requires a separate rate band.</small>
+    {band ? <div className="model-pricing-band">
+      <strong>Long-context rates / 1M</strong>
+      {bandRateFields.map(([field, title]) => <label key={field}>{title}<input aria-label={`${label} long-context ${title.toLowerCase()} per 1M`} className="input" type="number" min="0" step="any"
+        value={band[field]} onChange={event => updateBand({ [field]: parseRate(event.target.value) })} /></label>)}
+      <label>Cache write (1 hour)<input aria-label={`${label} long-context one-hour cache write per 1M`} className="input" type="number" min="0" step="any"
+        value={band.cacheWriteHourPer1M ?? ""} onChange={event => updateBand({ cacheWriteHourPer1M: event.target.value === "" ? undefined : parseRate(event.target.value) })} /></label>
+      <label>Source<input aria-label={`${label} long-context source`} className="input" value={band.source} onChange={event => updateBand({ source: event.target.value })} /></label>
+      <label>From (UTC)<input aria-label={`${label} long-context effective from UTC`} className="input" type="datetime-local" value={dateInput(band.effectiveFrom)} onChange={event => updateBand({ effectiveFrom: dateValue(event.target.value) })} /></label>
+      <label>Until (UTC)<input aria-label={`${label} long-context effective until UTC`} className="input" type="datetime-local" value={dateInput(band.effectiveUntil)} onChange={event => updateBand({ effectiveUntil: dateValue(event.target.value) })} /></label>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => update({ longContext: undefined })}>Remove long-context rates</button>
+    </div> : <button type="button" className="btn btn-sm" onClick={() => {
+      update({ longContext: {
+        inputPer1M: pricing.inputPer1M, outputPer1M: pricing.outputPer1M,
+        cacheReadPer1M: pricing.cacheReadPer1M, cacheWritePer1M: pricing.cacheWritePer1M,
+        cacheWriteHourPer1M: pricing.cacheWriteHourPer1M, source: pricing.source,
+        effectiveFrom: pricing.effectiveFrom, effectiveUntil: pricing.effectiveUntil,
+      } });
+    }}>Copy these rates for long context</button>}
+  </details>;
+}
 
 function pricingToDraft(key: string, pricing: ModelPricing): PricingDraft {
   return { key, ...pricing };
@@ -139,6 +167,8 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
         cacheReadPer1M: draft.cacheReadPer1M,
         cacheWritePer1M: draft.cacheWritePer1M,
         source: draft.source || "manual",
+        ...(draft.cacheWriteHourPer1M !== undefined ? { cacheWriteHourPer1M: draft.cacheWriteHourPer1M } : {}),
+        ...(draft.longContext ? { longContext: draft.longContext } : {}),
         ...(draft.effectiveFrom ? { effectiveFrom: draft.effectiveFrom } : {}),
         ...(draft.effectiveUntil ? { effectiveUntil: draft.effectiveUntil } : {}),
       },
@@ -228,6 +258,7 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
                       </details>
                     </div>
                     <button type="button" className="btn btn-ghost btn-sm" onClick={() => deleteRow(key)}>{t("settings.modelPricing.delete", "Delete")}</button>
+                    <AdditionalPricingFields label={key} pricing={pricing} update={patch => updateRow(key, patch)} />
                   </div>
                 );
               })}
@@ -245,6 +276,7 @@ export function ModelPricingSection({ form, setForm, addToast, projectId }: Mode
                   </details>
                 </div>
                 <button type="button" className="btn btn-sm" onClick={addRow}>{t("settings.modelPricing.addRow", "Add row")}</button>
+                <AdditionalPricingFields label="New" pricing={draft} update={patch => setDraft(current => ({ ...current, ...patch }))} />
               </div>
             </div>
           </div>

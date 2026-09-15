@@ -39,3 +39,18 @@ it("displays reported model/context and cost coverage without inventing capacity
   expect(popup.open).toBe(true);
   expect(screen.getByText(/1 unpriced model rows; 2 turns without usage/)).toBeTruthy();
 });
+
+
+it("discloses long-context and separate cache-lifetime charges while retaining unknown-rate explanations", () => {
+  render(<SessionCostDetails cost={{ usd: 0.0039, unpricedRows: 1, unreportedTurns: 0, coveredTurns: 2, usage: [
+    { model: "fixture", contextBand: "long", usd: 0.0039, reason: null, lines: [
+      { category: "Cache write (5 minutes)", tokens: 20, ratePerMillion: 30, usd: 0.0006 },
+      { category: "Cache write (1 hour)", tokens: 10, ratePerMillion: 50, usd: 0.0005 },
+    ], source: "verified fixture", effectiveDate: "2026-09-15", calculation: "current-rates-estimate" },
+    { model: "unknown", contextBand: "long", usd: null, reason: "No long-context rate was recorded", lines: [], source: null, effectiveDate: "unknown", calculation: "recorded-rates-estimate" },
+  ] }} />);
+  expect(screen.getByText("fixture · Long context")).toBeTruthy();
+  expect(screen.getByText("Cache write (5 minutes)")).toBeTruthy();
+  expect(screen.getByText("Cache write (1 hour)")).toBeTruthy();
+  expect(screen.getByText("No long-context rate was recorded")).toBeTruthy();
+});

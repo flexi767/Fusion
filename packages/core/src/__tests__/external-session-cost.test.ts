@@ -55,3 +55,42 @@ it("uses each native provider's exact pricing override for both current costs an
     }
   }
 });
+
+
+it("prices separate cache lifetimes and context bands without borrowing missing rates", async () => {
+  const { captureSessionPrice } = await import("../external-sessions/rate-snapshot.js");
+  const { validModelPricing } = await import("../ai/model-pricing.js");
+  const standard = { ...rates, cacheWriteHourPer1M: 5 };
+  const long = { inputPer1M: 20, cacheReadPer1M: 10, cacheWritePer1M: 30, cacheWriteHourPer1M: 50, outputPer1M: 40, source: "long fixture" };
+  const combined = { ...standard, longContext: long };
+  const at = "2026-09-15T12:00:00Z";
+  for (const provider of ["codex", "claude"]) for (const longContext of [false, true]) {
+    const row = { ...usage, cacheWriteHourTokens: 10, longContext };
+    const key = `${provider === "codex" ? "openai-codex" : "anthropic"}:fixture`;
+    const overrides = { [key]: combined };
+    const price = priceSessionUsage(provider, row, overrides);
+    expect(price.contextBand).toBe(longContext ? "long" : "standard");
+    expect(price.lines.map(line => line.tokens)).toEqual([50, 20, 20, 10, 40]);
+    expect(price.usd).toBeCloseTo(longContext ? 0.0039 : 0.00039, 12);
+    const snapshot = captureSessionPrice(provider, row, at, at, overrides);
+    expect(snapshot.rates).toEqual(longContext ? long : standard);
+    expect(captureSessionPrice(provider, row, at, at, { [key]: rates }, snapshot)).toBe(snapshot);
+    expect(priceSessionUsage(provider, row, undefined, snapshot).usd).toBe(price.usd);
+    expect(priceSessionUsage(provider, { ...row, cacheWriteHourTokens: 31 }, overrides).reason).toBe("Inconsistent cache-write counters");
+    expect(priceSessionUsage(provider, { ...row, fast: true }, overrides).usd).toBeNull();
+    expect(priceSessionUsage(provider, { ...row, serviceTier: "unknown" }, overrides).usd).toBeNull();
+    if (longContext) {
+      expect(priceSessionUsage(provider, row, { [key]: standard }).reason).toBe("No long-context rate configured");
+      expect(priceSessionUsage(provider, row, undefined, { ...snapshot, contextBand: undefined }).reason).toBe("No long-context rate was recorded");
+      const dated = captureSessionPrice(provider, row, at, at, { [key]: { ...standard, longContext: { ...long, effectiveFrom: "2026-09-16T00:00:00Z" } } });
+      expect(priceSessionUsage(provider, row, undefined, dated).reason).toBe("Rate does not cover this calculation date");
+    } else {
+      expect(priceSessionUsage(provider, row, { [key]: rates }).reason).toBe("No one-hour cache-write rate configured");
+    }
+  }
+  expect(validModelPricing(combined)).toBe(true);
+  for (const bad of [-1, NaN, Infinity]) {
+    expect(validModelPricing({ ...standard, cacheWriteHourPer1M: bad })).toBe(false);
+    expect(validModelPricing({ ...standard, longContext: { ...long, inputPer1M: bad } })).toBe(false);
+  }
+});

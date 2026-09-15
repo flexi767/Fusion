@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { ModelPricingSection } from "./ModelPricingSection";
 import type { SettingsFormState } from "./context";
@@ -182,4 +183,37 @@ it("preserves explicit UTC effective dates while other pricing fields change", (
   fireEvent.change(screen.getByLabelText("openai:gpt-4o input per 1M"), { target: { value: "3" } });
   expect(screen.getByLabelText("openai:gpt-4o effective from UTC")).toBe(from);
   expect(from).toHaveValue("2026-09-01T12:00"); expect(until).toHaveValue("2026-10-01T12:00");
+});
+
+
+it("keeps optional cache and context rates through add, edits and explicit removal without remounting inputs", async () => {
+  const user = userEvent.setup();
+  render(<Harness initial={{} as SettingsFormState} />); openPricingTable();
+  await user.type(screen.getByLabelText("New provider:model key"), "anthropic:fixture");
+  fireEvent.click(screen.getByText("Cache lifetime and long context"));
+  const hour = screen.getByLabelText("New one-hour cache write per 1M");
+  expect(hour).toHaveValue(null);
+  await user.type(hour, "12");
+  expect(screen.getByLabelText("New one-hour cache write per 1M")).toBe(hour);
+  fireEvent.click(screen.getByRole("button", { name: "Copy these rates for long context" }));
+  expect(screen.getByLabelText("New long-context one-hour cache write per 1M")).toHaveValue(12);
+  const source = screen.getByLabelText("New long-context source");
+  await user.clear(source); await user.type(source, "verified fixture");
+  expect(screen.getByLabelText("New long-context source")).toBe(source);
+  fireEvent.change(screen.getByLabelText("New long-context input per 1M"), { target: { value: "20" } });
+  fireEvent.change(screen.getByLabelText("New long-context effective from UTC"), { target: { value: "2026-09-01T00:00" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+  const label = "anthropic:fixture";
+  expect(screen.getByLabelText(`${label} one-hour cache write per 1M`)).toHaveValue(12);
+  expect(screen.getByLabelText(`${label} long-context input per 1M`)).toHaveValue(20);
+  expect(screen.getByLabelText(`${label} long-context source`)).toHaveValue("verified fixture");
+  const existing = screen.getByLabelText(`${label} long-context effective from UTC`);
+  fireEvent.change(screen.getByLabelText(`${label} input per 1M`), { target: { value: "3" } });
+  expect(screen.getByLabelText(`${label} long-context effective from UTC`)).toBe(existing);
+  expect(existing).toHaveValue("2026-09-01T00:00");
+  fireEvent.change(screen.getByLabelText(`${label} one-hour cache write per 1M`), { target: { value: "" } });
+  expect(screen.getByLabelText(`${label} one-hour cache write per 1M`)).toHaveValue(null);
+  fireEvent.click(screen.getByRole("button", { name: "Remove long-context rates", hidden: true }));
+  expect(screen.queryByLabelText(`${label} long-context source`)).not.toBeInTheDocument();
+  expect(screen.getByLabelText(`${label} input per 1M`)).toHaveValue(3);
 });

@@ -26,7 +26,7 @@ export function SessionTurnResult({ turn, sessionId, cost }: { turn: SessionTurn
 export function SessionCostDetails({ cost, label }: { cost: SessionDetail["cost"]; label?: string }) {
   return <details className="session-card"><summary>{label ?? `Estimated cost for ${cost.coveredTurns} displayed turns`}: {formatCost(cost.usd, cost.usd === null)}</summary>
     <p>{cost.unpricedRows} unpriced model rows; {cost.unreportedTurns} turns without usage. Estimates use {cost.basis === "recorded" ? "recorded rate snapshots" : "current configured rates"}.</p>
-    {cost.usage.map((row, index) => <section key={index}><h4>{row.model}</h4>{row.reason ? <p>{row.reason}</p> : <>
+    {cost.usage.map((row, index) => <section key={index}><h4>{row.model}{row.contextBand === "long" ? " · Long context" : ""}</h4>{row.reason ? <p>{row.reason}</p> : <>
       <div className="session-cost-table"><table><thead><tr><th>Category</th><th>Tokens</th><th>USD / million</th><th>Charge USD</th></tr></thead><tbody>{row.lines.map(line => <tr key={line.category}><td>{line.category}</td><td>{line.tokens.toLocaleString()}</td><td>{line.ratePerMillion}</td><td>{line.usd.toFixed(6)}</td></tr>)}</tbody></table></div>
       <p>Rate reference: {row.effectiveDate}{row.effectiveUntil ? ` → ${row.effectiveUntil} (exclusive)` : ""} · {row.source}</p></>}
       {row.rateVersion && <p>Rate version {row.rateVersion.slice(0, 12)} · Captured {row.capturedAt ? new Date(row.capturedAt).toLocaleString() : "Unreported"} · {row.rateTiming === "effective-period" ? "Operator-specified effective period" : "Historical applicability unknown; capture-time estimate"}</p>}
