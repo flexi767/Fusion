@@ -3182,6 +3182,7 @@ export * from "./cloud-link/index.js";
 
 export * from "./external-sessions/observation.js";
 export * from "./external-sessions/store.js";
+export * from "./external-sessions/retention.js";
 export * from "./external-sessions/turn.js";
 export * from "./external-sessions/cost.js";
 export * from "./external-sessions/controls.js";

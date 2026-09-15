@@ -10,11 +10,12 @@ import { request as rawRequest } from "../../test-request.js";
 function request(app: express.Express, method: string, path: string, options: { body?: unknown; headers?: Record<string, string> } = {}) {
   return rawRequest(app, method, path, options.body ? JSON.stringify(options.body) : undefined, { "Content-Type": "application/json", ...options.headers });
 }
+const retentionPreview = vi.fn(); const retentionApply = vi.fn();
 const ingest = vi.fn();
 const heartbeat = vi.fn();
 const linkTask = vi.fn(); const get = vi.fn(); const list = vi.fn(); const getTask = vi.fn();
 const launchQueue = vi.fn(); const launchList = vi.fn(); const launchAvailable = vi.fn(); const launchCancel = vi.fn();
-vi.mock("@fusion/core", () => ({ ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; },
+vi.mock("@fusion/core", () => ({ ExternalSessionRetention: class { preview = retentionPreview; apply = retentionApply; }, ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; },
   ExternalSessionLaunches: class { queue = launchQueue; list = launchList; available = launchAvailable; cancel = launchCancel; } }));
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 function app() {
@@ -109,4 +110,22 @@ it("returns linked sessions only from the resolved task/project and respects the
   vi.stubEnv("FUSION_SESSIONS", "1"); getTask.mockResolvedValue({ id: "FN-1" }); list.mockResolvedValue({ sessions: [], nextCursor: null });
   expect((await request(server, "GET", "/api/tasks/FN-1/external-sessions", { headers })).status).toBe(200);
   expect(list).toHaveBeenCalledWith({ taskProjectId: "canonical-project", taskId: "FN-1", before: undefined });
+});
+
+
+it("requires dashboard authentication and explicit bounded retention intent", async () => {
+  const server = app(); vi.stubEnv("FUSION_SESSIONS", "1");
+  const headers = { Authorization: "Bearer dashboard-token" };
+  expect((await request(server, "POST", "/api/external-session-retention/apply", { headers: { Authorization: "Bearer collector-token" }, body: { cutoff: "2026-07-01" } })).status).toBe(401);
+  for (const retentionDays of [0, 3651, 1.5, "30"]) expect((await request(server, "POST", "/api/external-session-retention/preview", { headers, body: { retentionDays } })).status).toBe(400);
+  retentionPreview.mockResolvedValue({ eligibleTurns: 25 });
+  expect((await request(server, "POST", "/api/external-session-retention/preview", { headers, body: { retentionDays: 30 } })).status).toBe(200);
+  expect(retentionPreview).toHaveBeenCalledOnce(); expect(retentionApply).not.toHaveBeenCalled();
+  const cutoff = retentionPreview.mock.calls[0][0];
+  retentionApply.mockResolvedValue({ removedContentTurns: 25 });
+  expect((await request(server, "POST", "/api/external-session-retention/apply", { headers, body: { cutoff } })).status).toBe(200);
+  expect(retentionApply).toHaveBeenCalledWith(cutoff, expect.any(Number));
+  expect((await request(server, "POST", "/api/external-session-retention/apply", { headers, body: {} })).status).toBe(400);
+  vi.stubEnv("FUSION_SESSIONS", "0");
+  expect((await request(server, "POST", "/api/external-session-retention/preview", { headers, body: { retentionDays: 30 } })).status).toBe(404);
 });

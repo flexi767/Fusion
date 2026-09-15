@@ -59,3 +59,7 @@ export const fetchTaskSessions = (taskId: string, projectId?: string, before?: s
   return api<Pick<SessionPage, "enabled" | "sessions" | "nextCursor">>(`/tasks/${encodeURIComponent(taskId)}/external-sessions?${query}`);
 };
 export const linkTaskSession = (taskId: string, sessionId: string, linked: boolean, expectedRevision: number, projectId?: string) => api(`/tasks/${encodeURIComponent(taskId)}/external-sessions/${encodeURIComponent(sessionId)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`, { method: "PUT", body: JSON.stringify({ linked, expectedRevision }) });
+
+export interface SessionRetentionPreview { cutoff: string; eligibleTurns: number; moreAvailable: boolean; batchLimit: number; removedContentTurns?: number }
+export const previewSessionRetention = (retentionDays: number) => api<SessionRetentionPreview>("/external-session-retention/preview", { method: "POST", body: JSON.stringify({ retentionDays }) });
+export const applySessionRetention = (cutoff: string) => api<SessionRetentionPreview>("/external-session-retention/apply", { method: "POST", body: JSON.stringify({ cutoff }) });

@@ -19,3 +19,9 @@ it("accepts explicit native parser generations and refuses invalid authority mar
     expect(() => parseSessionTurn({ ...turn, nativeParserVersion })).toThrow("Invalid native parser version");
   }
 });
+
+
+it("ignores collector-supplied retention watermarks", () => {
+  const parsed = parseSessionTurn({ ...turn, response: "Still visible", contentPruned: { at: turn.updatedAt, through: turn.updatedAt } });
+  expect(parsed.contentPruned).toBeUndefined(); expect(parsed.response).toBe("Still visible");
+});

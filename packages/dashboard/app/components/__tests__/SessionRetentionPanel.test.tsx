@@ -1,0 +1,34 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, expect, it, vi } from "vitest";
+import { SessionRetentionPanel } from "../SessionRetentionPanel";
+const { preview, apply } = vi.hoisted(() => ({ preview: vi.fn(), apply: vi.fn() }));
+vi.mock("../../api/external-sessions", () => ({ previewSessionRetention: preview, applySessionRetention: apply }));
+const result = { cutoff: "2026-08-15T00:00:00.000Z", eligibleTurns: 25, moreAvailable: true, batchLimit: 25 };
+beforeEach(() => { preview.mockReset().mockResolvedValue(result); apply.mockReset().mockResolvedValue({ ...result, eligibleTurns: 0, moreAvailable: false, removedContentTurns: 25 }); });
+it("keeps retention inert until reviewed, uses the reviewed cutoff and clears stale review on edits", async () => {
+  const user = userEvent.setup(); render(<SessionRetentionPanel />);
+  expect(preview).not.toHaveBeenCalled(); expect(apply).not.toHaveBeenCalled();
+  await user.click(screen.getByText("Collected content retention"));
+  await user.click(screen.getByRole("button", { name: "Review eligible content" }));
+  await screen.findByRole("button", { name: "Remove text from up to 25 eligible turns" });
+  expect(apply).not.toHaveBeenCalled();
+  const input = screen.getByLabelText("Keep recent content (days)"); await user.clear(input); await user.type(input, "60");
+  expect(screen.getByLabelText("Keep recent content (days)")).toBe(input);
+  expect(screen.queryByRole("button", { name: /Remove text/ })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Review eligible content" }));
+  await user.click(await screen.findByRole("button", { name: "Remove text from up to 25 eligible turns" }));
+  await screen.findByText(/Removed collected text from 25 turns/);
+  expect(preview).toHaveBeenLastCalledWith(60); expect(apply).toHaveBeenCalledExactlyOnceWith(result.cutoff);
+  expect(screen.queryByRole("button", { name: /Remove text/ })).toBeNull();
+});
+it("requires a new review after an ambiguous failure and prevents duplicate submissions", async () => {
+  const user = userEvent.setup(); let fail!: (error: Error) => void;
+  apply.mockImplementation(() => new Promise((_resolve, reject) => { fail = reject; }));
+  render(<SessionRetentionPanel />); await user.click(screen.getByText("Collected content retention"));
+  await user.click(screen.getByRole("button", { name: "Review eligible content" }));
+  const button = await screen.findByRole("button", { name: /Remove text/ }); await user.dblClick(button);
+  expect(apply).toHaveBeenCalledTimes(1); expect(button).toBeDisabled();
+  fail(new Error("network")); await waitFor(() => expect(screen.queryByRole("button", { name: /Remove text/ })).toBeNull());
+  expect(screen.getByText(/Review eligibility again before retrying/)).toBeTruthy();
+});

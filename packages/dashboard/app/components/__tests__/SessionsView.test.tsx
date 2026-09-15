@@ -69,3 +69,14 @@ it("discloses the live latency sample window, queue age and clock exclusions wit
   expect(screen.getByText("Live delivery lag: no valid measurements yet.")).toBeTruthy();
   expect(screen.queryByText(/Queue delay p95/)).toBeNull();
 });
+
+
+it("labels retained turn metadata without showing removed text as an active response", () => {
+  const turn: SessionTurn = { id: "retained", startedAt: session.receivedAt, updatedAt: session.receivedAt, completedAt: null, durationMs: null, durationSource: "timestamps", prompts: [], response: "", usage: [], toolCalls: 2, provenance: "native-transcript", contentPruned: { at: session.receivedAt, through: session.receivedAt }, files: [{ path: "a.ts", diff: "", added: 3, removed: 1, available: false, truncated: true }] };
+  render(<SessionTurnResult turn={turn} />);
+  expect(screen.getByText(/Collected prompt, response and patch text removed by retention/)).toBeTruthy();
+  expect(screen.getByText("Response removed by retention")).toBeTruthy();
+  expect(screen.getByText("Patch text removed by retention.")).toBeTruthy();
+  expect(screen.getByText(/a.ts.*3.*1/)).toBeTruthy();
+  expect(screen.queryByText("Response in progress")).toBeNull();
+});

@@ -1,6 +1,6 @@
 import { readSessionPricing } from "./session-pricing.js";
 import { createSessionSummaryWorker } from "./session-summary-worker.js";
-import { ExternalSessionStore, externalSessionAnalytics, priceSessionTurns, ExternalSessionControls, ExternalSessionSummaries, ExternalSessionLaunches } from "@fusion/core";
+import { ExternalSessionStore, ExternalSessionRetention, externalSessionAnalytics, priceSessionTurns, ExternalSessionControls, ExternalSessionSummaries, ExternalSessionLaunches } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateSessionCollector } from "./session-collector-auth.js";
@@ -79,6 +79,22 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     const totals = await externalSessionAnalytics(layer(), { sessionIds: result.sessions.map(row => row.id) }, settings.modelPricingOverrides);
     const costs = new Map(totals.sessions.map(row => [row.id, row]));
     res.json({ enabled: true, ...result, sessions: result.sessions.map(row => ({ ...row, usageSummary: costs.get(row.id) ?? null })), collectors: await sessions().collectors() });
+  });
+  router.post("/external-session-retention/:operation", async (req, res) => {
+    if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");
+    const operation = req.params.operation;
+    if (!["preview", "apply"].includes(operation)) throw new ApiError(404, "Unknown retention operation");
+    const now = Date.now();
+    const days = req.body?.retentionDays;
+    if (operation === "preview" && (!Number.isSafeInteger(days) || days < 1 || days > 3650)) throw new ApiError(400, "Retention days must be between 1 and 3650");
+    const cutoff = operation === "preview" ? new Date(now - days * 86_400_000).toISOString() : req.body?.cutoff;
+    if (typeof cutoff !== "string") throw new ApiError(400, "A reviewed retention cutoff is required");
+    const retention = new ExternalSessionRetention(layer());
+    try { return res.json(operation === "preview" ? await retention.preview(cutoff, now) : await retention.apply(cutoff, now)); }
+    catch (error) {
+      if (error instanceof Error && error.message.startsWith("Retention cutoff")) throw new ApiError(400, error.message);
+      throw error;
+    }
   });
   router.get("/external-session-launches", async (_req, res) => {
     if (!launchesEnabled()) return res.json({ enabled: false, runtimes: [], requests: [] });

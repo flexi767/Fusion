@@ -1,3 +1,4 @@
+import { SessionRetentionPanel } from "./SessionRetentionPanel";
 import { SessionUsageOverview } from "./SessionUsageOverview";
 import { SessionLaunchPanel } from "./SessionLaunchPanel";
 import { SessionHistory, SessionCostDetails } from "./SessionHistory";
@@ -50,6 +51,7 @@ function SessionList() {
       <button className="btn btn-secondary" type="submit">Search</button>
     </form>
     <SessionUsageOverview />
+    <SessionRetentionPanel />
     <SessionResults key={JSON.stringify(filters)} filters={filters} onCollectors={setCollectors} />
   </div></ViewLayout>;
 }

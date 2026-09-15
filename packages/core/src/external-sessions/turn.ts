@@ -8,6 +8,8 @@ export interface SessionModelUsage {
   requests: number | null; contextTokens: number | null; longContext: boolean; fast: boolean;
 }
 export interface SessionTurn {
+  /** Server-owned retention watermark; collector input cannot set it. */
+  contentPruned?: { at: string; through: string };
   /** Native normalization generation; imports cannot claim this authority. */
   nativeParserVersion?: number;
   /** Server-owned snapshots; collector-supplied values are ignored by validation. */

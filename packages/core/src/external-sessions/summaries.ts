@@ -24,7 +24,8 @@ export class ExternalSessionSummaries {
     const store = new ExternalSessionStore(this.layer);
     const page = await store.turns(id, undefined, 5);
     if (!page.turns.length) return { changed: false, reason: "No collected turns" };
-    const ordered = [...page.turns].reverse();
+    const ordered = [...page.turns].filter(turn => !turn.contentPruned).reverse();
+    if (!ordered.length) return { changed: false, reason: "Collected content was removed by retention" };
     const input = ordered.map(turn => `[${turn.id}; ${turn.completedAt ? "finished turn" : "unfinished turn"}]\nPrompt: ${turn.prompts.join("\n").slice(0, 1000)}\nResult: ${turn.response.slice(-1800)}`).join("\n\n").slice(-10000);
     const hash = createHash("sha256").update(input).digest("hex");
     await this.layer.db.insert(details).values({ sessionId: id }).onConflictDoNothing();
@@ -35,6 +36,13 @@ export class ExternalSessionSummaries {
     const claimed = await this.layer.db.update(details).set({ summaryLeaseUntil: lease })
       .where(and(eq(details.sessionId, id), or(isNull(details.summaryLeaseUntil), lt(details.summaryLeaseUntil, stamp)), or(isNull(details.summaryRetryAt), lt(details.summaryRetryAt, stamp)))).returning();
     if (!claimed.length) return { changed: false, reason: "Summary already queued or retry delayed" };
+    // Retention may commit between reading the input and acquiring this lease.
+    // After acquisition, retention invalidates the lease before clearing content.
+    const latest = await store.turns(id, undefined, 5);
+    if (JSON.stringify(latest.turns) !== JSON.stringify(page.turns)) {
+      await this.layer.db.update(details).set({ summaryLeaseUntil: null }).where(and(eq(details.sessionId, id), eq(details.summaryLeaseUntil, lease)));
+      return { changed: false, reason: "Content changed before summary started" };
+    }
     try {
       const response = await send(`${endpoint.replace(/\/$/, "")}/chat/completions`, {
         method: "POST", headers: { "Content-Type": "application/json", "X-Request-ID": randomUUID() }, signal: AbortSignal.timeout(15_000),
@@ -45,9 +53,9 @@ export class ExternalSessionSummaries {
       const body = await response.json() as { choices?: { message?: { content?: unknown } }[] };
       const raw = body.choices?.[0]?.message?.content;
       if (typeof raw !== "string" || !raw.trim() || raw.length > 4000) throw new Error("summary-invalid-output");
-      await this.layer.db.update(details).set({ summary: { text: redactSecrets(raw.trim()), at: new Date().toISOString(), model: "qwen3.5-2b", firstTurn: ordered[0].id, lastTurn: ordered[ordered.length - 1].id, coveredTurns: ordered.length }, summaryHash: hash,
-        summaryLeaseUntil: null, summaryRetryAt: null, summaryFailures: 0, lastSummaryError: null }).where(and(eq(details.sessionId, id), eq(details.summaryLeaseUntil, lease)));
-      return { changed: true };
+      const saved = await this.layer.db.update(details).set({ summary: { text: redactSecrets(raw.trim()), at: new Date().toISOString(), model: "qwen3.5-2b", firstTurn: ordered[0].id, lastTurn: ordered[ordered.length - 1].id, coveredTurns: ordered.length }, summaryHash: hash,
+        summaryLeaseUntil: null, summaryRetryAt: null, summaryFailures: 0, lastSummaryError: null }).where(and(eq(details.sessionId, id), eq(details.summaryLeaseUntil, lease))).returning({ sessionId: details.sessionId });
+      return saved.length ? { changed: true } : { changed: false, reason: "Summary was not saved because its content or lease changed" };
     } catch (error) {
       const failures = Math.min(20, (previous?.summaryFailures ?? 0) + 1);
       await this.layer.db.update(details).set({ summaryLeaseUntil: null, summaryFailures: failures,

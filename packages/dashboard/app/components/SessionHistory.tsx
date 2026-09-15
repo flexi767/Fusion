@@ -13,13 +13,14 @@ export function SessionTurnResult({ turn, sessionId, cost }: { turn: SessionTurn
   return <article className="session-card" id={`session-turn-${encodeURIComponent(turn.id)}`}>
     <h3><time dateTime={turn.startedAt}>{new Date(turn.startedAt).toLocaleString()}</time></h3>
     {sessionId && <a href={`?view=sessions&session=${encodeURIComponent(sessionId)}&turn=${encodeURIComponent(turn.id)}#session-turn-${encodeURIComponent(turn.id)}`}>Link to this turn</a>}
+    {turn.contentPruned && <p>Collected prompt, response and patch text removed by retention on {new Date(turn.contentPruned.at).toLocaleString()}. Usage and file counts are retained.</p>}
     {turn.prompts.map((prompt, index) => <section key={index}><h4>Prompt {index + 1}</h4><pre className="session-output">{prompt}</pre></section>)}
-    <section><h4>Response</h4><pre className="session-output">{turn.response || (turn.completedAt ? "Response unavailable" : "Response in progress")}</pre></section>
+    <section><h4>Response</h4><pre className="session-output">{turn.contentPruned ? "Response removed by retention" : turn.response || (turn.completedAt ? "Response unavailable" : "Response in progress")}</pre></section>
     <p>{turn.completedAt ? "Turn finished" : "Turn ongoing"} · {turn.durationMs === null ? "Duration unavailable" : `${(turn.durationMs / 1000).toFixed(1)} seconds (${turn.durationSource})`} · {turn.toolCalls} tool calls</p>
     {cost && <SessionCostDetails cost={cost} label="Turn cost" />}
     {turn.usage.map((usage, i) => <p key={i}>{usage.model} · Context {usage.contextTokens ?? "unreported"} tokens · Reasoning {usage.reasoningTokens ?? "unreported"} tokens (included in output)</p>)}
     {turn.files.length === 0 ? <p>No collected patches for this turn.</p> : <details><summary>{turn.files.length} file changes</summary>{turn.files.map(file => <details key={file.path}><summary>{file.path}{file.scope === "external" ? " · outside project" : ""} · +{file.added}/−{file.removed}{file.truncated ? " · truncated" : ""}</summary>
-      {file.available ? <pre className="session-output">{file.diff || "Patch text unavailable"}</pre> : <p>Historical patch unavailable.</p>}</details>)}</details>}
+      {file.available ? <pre className="session-output">{file.diff || "Patch text unavailable"}</pre> : <p>{turn.contentPruned ? "Patch text removed by retention." : "Historical patch unavailable."}</p>}</details>)}</details>}
   </article>;
 }
 

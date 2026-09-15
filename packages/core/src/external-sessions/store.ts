@@ -1,3 +1,4 @@
+import { pruneSessionContent } from "./retention.js";
 import { captureSessionPrice, usagePriceKey } from "./rate-snapshot.js";
 import type { ModelPricingOverrides } from "../ai/model-pricing.js";
 import { createHash } from "node:crypto";
@@ -62,9 +63,10 @@ export class ExternalSessionStore {
         // jsonb reorders keys; compare the validated canonical representation.
         if (JSON.stringify(parseSessionObservation(current.observation)) !== JSON.stringify(observation)) throw new Error("Observation revision conflict");
       }
-      for (const result of turns) {
+      for (let result of turns) {
         const [previous] = await tx.select({ result: externalSessionTurns.result }).from(externalSessionTurns)
           .where(and(eq(externalSessionTurns.sessionId, id), eq(externalSessionTurns.id, result.id)));
+        if (previous?.result.contentPruned && result.updatedAt <= previous.result.contentPruned.through) result = pruneSessionContent(result, previous.result.contentPruned);
         result.recordedPricing = result.usage.map(usage => captureSessionPrice(observation.provider, usage, result.startedAt, receivedAt, pricingOverrides,
           previous?.result.recordedPricing?.find(price => price.usageKey === usagePriceKey(usage))));
         await tx.insert(externalSessionTurns).values({ sessionId: id, id: result.id, revision: observation.revision, startedAt: result.startedAt, result })
