@@ -97,3 +97,9 @@ export function collectorConnection(lastHeartbeatAt: string | null, nowMs: numbe
   const last = lastHeartbeatAt === null ? NaN : Date.parse(lastHeartbeatAt);
   return Number.isFinite(last) && last <= nowMs && nowMs - last <= staleAfterMs ? "connected" : "disconnected";
 }
+
+
+/** Quiet working reports are uncertain, never an inferred completion or cancellation. */
+export function sessionActivityStale(observation: Pick<SessionObservation, "activity" | "observedAt">, nowMs: number): boolean {
+  return observation.activity === "working" && nowMs - Date.parse(observation.observedAt) > 5 * 60_000;
+}

@@ -1,3 +1,4 @@
+import { SessionActivityStatus } from "./SessionActivityStatus";
 import { SessionRetentionPanel } from "./SessionRetentionPanel";
 import { SessionUsageOverview } from "./SessionUsageOverview";
 import { SessionLaunchPanel } from "./SessionLaunchPanel";
@@ -15,7 +16,8 @@ export function SessionCard({ session, connected }: { session: ObservedSession; 
   return <article className="session-card" aria-label={`${session.hostId}: ${row.title}`}>
     {(session.archived || session.pinned) && <p>{session.archived ? "Archived · " : ""}{session.pinned ? "Pinned" : ""}</p>}
     <h3><a href={`?view=sessions&session=${encodeURIComponent(session.id)}`}>{row.title}</a></h3>
-    <p>{session.hostId} · {row.provider} · <strong>{row.activity}</strong> · {connected ? "Collector connected" : "Collector disconnected"}</p>
+    <p>{session.hostId} · {row.provider}</p>
+    <SessionActivityStatus session={session} connected={connected} />
     <p>Last reported model: {row.telemetry?.model ?? "Unreported"} · Context: {row.telemetry?.contextTokens?.toLocaleString() ?? "Unreported"}{row.telemetry?.contextCapacity != null ? ` / ${row.telemetry.contextCapacity.toLocaleString()}` : " / capacity unreported"}</p>
     {row.telemetry && <p>Telemetry as of <time dateTime={row.telemetry.observedAt}>{new Date(row.telemetry.observedAt).toLocaleString()}</time>{row.telemetry.serviceTier ? ` · ${row.telemetry.serviceTier} service` : ""}</p>}
     {session.usageSummary ? <SessionCostDetails label="Session cost and coverage" cost={{ ...session.usageSummary, coveredTurns: session.usageSummary.turns }} /> : <p>Cost total unavailable</p>}

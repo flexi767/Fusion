@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseSessionObservation, externalSessionKey, reconcileSessionObservation, collectorConnection } from "../../packages/core/src/external-sessions/observation.ts";
+import { parseSessionObservation, externalSessionKey, reconcileSessionObservation, collectorConnection, sessionActivityStale } from "../../packages/core/src/external-sessions/observation.ts";
 
 const row = { version: 1, provider: "codex", nativeSessionId: "native-1", revision: 10, observedAt: "2026-09-15T12:00:00.000Z", activity: "working", title: "Review", projectPath: "/workspace/project" };
 test("identity includes host and provider even for the same native id", () => {
@@ -43,4 +43,16 @@ test("reported telemetry preserves unknowns, validates counters and cannot grant
   for (const patch of [{ contextTokens: -1 }, { contextCapacity: 1.5 }, { observedAt: "2026-09-16T12:00:00Z" }]) {
     assert.throws(() => parseSessionObservation({ ...row, telemetry: { ...telemetry, ...patch } }));
   }
+});
+
+test("only an old working report becomes stale, independently of collector connectivity", () => {
+  const now = Date.parse(row.observedAt) + 300001;
+  for (const provider of ["codex", "claude"]) {
+    assert.equal(sessionActivityStale({ ...row, provider }, now - 1), false);
+    assert.equal(sessionActivityStale({ ...row, provider }, now), true);
+    assert.equal(sessionActivityStale({ ...row, provider }, Date.parse(row.observedAt) - 1), false);
+    for (const activity of ["waiting", "completed", "error"]) assert.equal(sessionActivityStale({ ...row, provider, activity }, now), false);
+  }
+  assert.equal(collectorConnection(new Date(now).toISOString(), now), "connected");
+  assert.equal(sessionActivityStale({ ...row, observedAt: new Date(now).toISOString() }, now), false);
 });

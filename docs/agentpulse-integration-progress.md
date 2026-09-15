@@ -4,13 +4,13 @@ Session: **Fusion AgentPulse integration**. Updated 2026-09-15.
 Worktree: `/Users/v/dev/fusion-worktrees/agentpulse-sessions`.
 Branch: `codex/agentpulse-sessions`; plan baseline `801d03c84`; foundation `f435871bf`.
 
-## Current checkpoint (2026-09-15, 20:21 UTC)
+## Current checkpoint (2026-09-15, 20:38 UTC)
 
-- J authenticated comparison server and independent m3/J collectors run branch `270efe156` (collector v9), with their original preview database/spools. AgentPulse remains active. Provisional observation began **2026-09-15 18:28 UTC**; the required 24 hours have not elapsed. m5 is unreachable.
+- J authenticated comparison server and independent m3/J collectors run branch `afd6ca91e` (collector v10), with their original preview database/spools. AgentPulse remains active. Provisional observation began **2026-09-15 18:28 UTC**; the required 24 hours have not elapsed. m5 is unreachable.
 - Historical audit: **70 of 95 source identities verified** (65 m3, five J); all **5,374 mapped turns** are present. Latest strict comparison: 4,841 normalized exact, 36 later native, 497 equal-time differences. Equal-time differences are reported context/service tier or traced upstream prompt attribution. Later-native differences still need complete explanation. Thirteen identities remain unresolved; 12 source sessions are on m5. Earlier coarse equal-or-newer classifications below are superseded.
 - Implemented: PostgreSQL ingestion/history; authenticated host identity; bounded durable native collectors; Sessions and linked-task history; search/diffs; model/context/current and recorded pricing, explicit cache/context bands; notes/archive/pins; commands and Fusion CLI runtime bridge; optional feedback adapters; bounded Qwen summaries; live delivery-lag monitoring; snapshot import.
-- **Verified, pending comparison-server rollout:** operator-triggered content retention. No actual comparison history has been pruned. The five-minute comparison-tunnel outage and bounded preview rollback both completed; queues drained and AgentPulse stayed available.
-- Still open: all-host controls/native-hook verification and other native runtime backends; remaining identity/content reconciliation; parser-cache maintenance rollout; sustained lag/outage/rollback evidence; m5; production entry-point switch after parity. No automatic task enrollment occurs.
+- **Deployed, opt-in:** operator-triggered content retention, exact project filtering and bounded parser-cache maintenance. No actual comparison history has been pruned. The five-minute comparison-tunnel outage and bounded preview rollback both completed; queues drained and AgentPulse stayed available.
+- Still open: all-host controls/native-hook verification and other native runtime backends; remaining identity/content reconciliation; explicit stale-state presentation; sustained lag/outage/rollback evidence; m5; production entry-point switch after parity. No automatic task enrollment occurs.
 - Push remains blocked by unavailable GitHub credentials. All commits are retained on `codex/agentpulse-sessions`. No main merge, release, AgentPulse retirement, model download or new inference service.
 
 ## Verified deployment and source
@@ -391,3 +391,17 @@ The Sessions list now has a separate exact native project-path filter, composed 
 - Retained prefixes skip unchanged files. Append/replacement and parser-generation upgrades rebuild history from the native source before consuming new history. Ordinary offsets reset to zero, so older readers reparse safely rather than continuing against an empty ledger. Claude ownership and request deduplication survive cleanup/restart/replay.
 - Surface enumeration and verification: both provider suites, changed/incomplete/recent/missing/oversized candidates, pending ACK refusal, read-only preview, active-process lock refusal, bounded file continuation, SQLite restart, parser upgrade and resumed Claude usage. All 56 Python tests pass. One fixture initially assumed more than one ledger record; its configured threshold was corrected to exercise the actual boundary. The final serial node gate also passed 754 tests/static checks with these source changes present.
 - A read-only preview against the actual m3 comparison spool found five eligible files, 5,707 records and 3,210,068 bytes with zero pending deliveries. **No real parser cache or PostgreSQL content was deleted.** Deployment of v10 and the latest server features is next. Instructions are in [collector README](../scripts/session-collector/README.md#opt-in-parser-cache-retention-collector-v10).
+
+
+## Latest comparison rollout (20:38 UTC)
+
+The isolated J server and both original comparison jobs now run frozen `afd6ca91e`; collectors report v10. Server archive SHA-256 matches `10852a18bb29e2276404ef6a20d7ccb00e37038f3a51cdb9262b7dfcd88b4911`. This includes content retention and exact project filtering. Auth returned 401/200 as expected; J's exact-project query returned 50 matching cards, and its retention preview returned 25 eligible turns with further batches available. **Only preview ran—no real content or cache was pruned.**
+
+Both hosts reported empty queues, zero rejections/parse/delivery errors and no capacity pauses. J: 67 live samples, p95 4.767 seconds, maximum 9.218 seconds. m3: 468 samples, outage-inclusive p95 33.267 seconds, maximum 296.344 seconds. These growing samples still do not close all-host/24-hour acceptance. AgentPulse and its supervisor remain active. m5 is still unreachable; the earlier optional address question remains unanswered.
+
+
+## Stale native activity display verified
+
+A working report older than five minutes is now explicitly stale in the global list and shared global/task-linked history. The server derives this projection without changing native activity or revision; collector connectivity remains independent. Waiting, completed and error reports are not relabeled, and a future timestamp is not treated as expired.
+
+Surface enumeration covers both providers, every host, fresh/exact-boundary/stale/future timestamps, connected/disconnected collectors, list/detail/task-linked shared rendering and desktop/mobile. Seven observation tests, 17 PostgreSQL tests and 11 UI tests pass. Scoped lint, all 25 serial verification steps (147.1 seconds), and the 754-test serial merge gate/static validators pass. The CI-shape command was initially pointed at the wrong private package; running the actual published CLI package gate passed all 72 cases. Browser checks verified the list at 1440px and 390px plus mobile history with an explicitly synthetic old working observation; mobile document width stayed 390px. Screenshots were visually inspected. The separate test preview retains its pre-existing engine/provider/allocator warnings.

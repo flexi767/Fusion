@@ -8,7 +8,7 @@ import { externalSessions, externalSessionTurns, externalSessionDetails, session
 import { parseImportedSessionMetadata } from "./imported-metadata.js";
 import { parseSessionTurn } from "./turn.js";
 import { redactSecrets } from "../secrets/redact-secrets.js";
-import { externalSessionKey, parseSessionObservation, type SessionObservation } from "./observation.js";
+import { externalSessionKey, parseSessionObservation, sessionActivityStale, type SessionObservation } from "./observation.js";
 
 export function sessionId(hostId: string, row: Pick<SessionObservation, "provider" | "nativeSessionId">): string {
   return createHash("sha256").update(externalSessionKey(hostId, row.provider, row.nativeSessionId)).digest("hex");
@@ -120,7 +120,7 @@ export class ExternalSessionStore {
       ))` : undefined,
       before ? or(lt(externalSessions.receivedAt, before.at), and(eq(externalSessions.receivedAt, before.at), lt(externalSessions.id, before.id))) : undefined,
     )).orderBy(desc(externalSessions.receivedAt), desc(externalSessions.id)).limit(limit + 1);
-    return { sessions: rows.slice(0, limit), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].receivedAt, rows[limit - 1].id) : null };
+    return { sessions: rows.slice(0, limit).map(row => ({ ...row, activityStale: sessionActivityStale(row.observation, Date.now()) })), nextCursor: rows.length > limit ? nextCursor(rows[limit - 1].receivedAt, rows[limit - 1].id) : null };
   }
 
   async preferences(id: string, archived: boolean, pinned: boolean, expectedRevision: number) {
@@ -164,7 +164,7 @@ export class ExternalSessionStore {
 
   async get(id: string) {
     const [row] = await this.layer.db.select().from(externalSessions).where(eq(externalSessions.id, id));
-    return row ?? null;
+    return row ? { ...row, activityStale: sessionActivityStale(row.observation, Date.now()) } : null;
   }
 
   async turn(sessionId: string, turnId: string) {

@@ -29,6 +29,19 @@ pgDescribe("External session durable ingestion", () => {
     expect((await store.collectors()).find(row => row.hostId === "m3")?.collectorVersion).toBe("test-2");
     expect((await store.list({ hostId: "m3" })).sessions.every(row => row.observation.activity === "working")).toBe(true);
   });
+  it("projects stale working reports in both list and detail without changing native activity or revisions", async () => {
+    const store = new ExternalSessionStore(h.layer());
+    const old = new Date(Date.now() - 600_000).toISOString();
+    const { id } = await store.ingest("m3", "test", { ...observation, observedAt: old });
+    await store.heartbeat("m3", "test");
+    expect(await store.get(id)).toMatchObject({ activityStale: true, revision: 10, observation: { activity: "working" } });
+    expect((await store.list()).sessions[0]).toMatchObject({ activityStale: true, revision: 10 });
+    await store.ingest("m3", "test", { ...observation, revision: 11, observedAt: new Date().toISOString() });
+    expect(await store.get(id)).toMatchObject({ activityStale: false, observation: { activity: "working" } });
+    await store.ingest("m3", "test", { ...observation, revision: 12, observedAt: old, activity: "completed" });
+    expect(await store.get(id)).toMatchObject({ activityStale: false, observation: { activity: "completed" } });
+  });
+
   it("filters exact native project paths across hosts/providers without title matching or task enrollment", async () => {
     const store = new ExternalSessionStore(h.layer());
     for (const host of ["m3", "m5", "j"]) for (const provider of ["codex", "claude"]) {

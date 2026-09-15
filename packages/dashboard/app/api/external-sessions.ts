@@ -9,6 +9,7 @@ export const fetchSessionLaunches = () => api<SessionLaunchPage>("/external-sess
 export const queueSessionLaunch = (input: SessionLaunchInput) => api("/external-session-launches", { method: "POST", body: JSON.stringify(input) });
 export const cancelSessionLaunch = (id: string, hostId: string) => api(`/external-session-launches/${encodeURIComponent(id)}/cancel`, { method: "POST", body: JSON.stringify({ hostId }) });
 export interface ObservedSession {
+  activityStale?: boolean;
   taskProjectId?: string | null; taskId?: string | null; taskLinkRevision?: number | null;
   archived?: boolean | null; pinned?: boolean | null;
   id: string; hostId: string; provider: string; nativeSessionId: string;

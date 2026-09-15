@@ -1,3 +1,4 @@
+import { SessionActivityStatus } from "./SessionActivityStatus";
 import { SessionPreferences } from "./SessionPreferences";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionTurn } from "@fusion/core";
@@ -148,7 +149,7 @@ export function SessionHistory({ id, embedded = false }: { id: string; embedded?
       {error && <p role="alert">{error}</p>}
       {!detail && !error && <p role="status">Loading history…</p>}
       {detail?.wholeSessionUsage && <section className="session-card"><h3>Whole session: {formatCost(detail.wholeSessionUsage.usd, detail.wholeSessionUsage.usd === null)}</h3><p>{detail.wholeSessionUsage.turns} collected turns · {detail.wholeSessionUsage.unreportedTurns} turns without usage · {detail.wholeSessionUsage.unpricedRows} unpriced model groups. Estimate at {detail.wholeSessionUsage.basis === "recorded" ? "recorded" : "current"} rates.</p></section>}
-      {detail && <><p>{detail.session.hostId} · {detail.session.provider} · {detail.session.observation.activity} · Observed session</p><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} label={`Latest ${detail.cost.coveredTurns} turns`} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /><SessionPreferences id={id} details={detail.details} refresh={refresh} /></>}
+      {detail && <><p>{detail.session.hostId} · {detail.session.provider} · Observed session</p><SessionActivityStatus session={detail.session} /><SessionSummary detail={detail} refresh={refresh} /><SessionCostDetails cost={detail.cost} label={`Latest ${detail.cost.coveredTurns} turns`} /><SessionControls detail={detail} /><SessionNotes id={id} details={detail.details} /><SessionPreferences id={id} details={detail.details} refresh={refresh} /></>}
       {detail?.details?.nativeRuntime && <p>Verified Fusion runtime · {detail.details.nativeRuntime.cliSessionId} · Last verified {new Date(detail.details.nativeRuntime.verifiedAt).toLocaleString()}</p>}
       {detail?.details?.taskId && detail.details.taskProjectId && <p>{detail.details.taskLinkSource === "native-runtime" ? "Verified native link to" : "Explicitly linked to"} <a href={`?project=${encodeURIComponent(detail.details.taskProjectId)}&task=${encodeURIComponent(detail.details.taskId)}`}>{detail.details.taskId}</a>. Usage remains in Sessions and is not added again to task costs.</p>}
       <div className="sessions-grid">{turns.map(turn => <SessionTurnResult key={turn.id} turn={turn} sessionId={id} cost={detail?.turnCosts?.[turn.id] ?? olderCosts[turn.id] ?? (turn.id === targetId ? targetCost : undefined)} />)}</div>

@@ -1,5 +1,6 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { expect, it } from "vitest";
+import { SessionActivityStatus } from "../SessionActivityStatus";
 import { SessionCard, SessionDeliveryLag } from "../SessionsView";
 import { SessionCostDetails, SessionTurnResult } from "../SessionHistory";
 import type { SessionTurn } from "@fusion/core";
@@ -79,4 +80,17 @@ it("labels retained turn metadata without showing removed text as an active resp
   expect(screen.getByText("Patch text removed by retention.")).toBeTruthy();
   expect(screen.getByText(/a.ts.*3.*1/)).toBeTruthy();
   expect(screen.queryByText("Response in progress")).toBeNull();
+});
+
+
+it("keeps reported activity distinct from stale observation and collector connectivity", () => {
+  const { rerender } = render(<SessionActivityStatus session={{ ...session, activityStale: true }} connected />);
+  expect(screen.getByText("working")).toBeTruthy(); expect(screen.getByText(/Collector connected/)).toBeTruthy();
+  expect(screen.getByText(/Stale working report/)).toBeTruthy();
+  rerender(<SessionActivityStatus session={{ ...session, activityStale: true }} connected={false} />);
+  expect(screen.getByText("working")).toBeTruthy(); expect(screen.getByText(/Collector disconnected/)).toBeTruthy();
+  expect(screen.getByText(/Stale working report/)).toBeTruthy();
+  rerender(<SessionActivityStatus session={{ ...session, activityStale: false }} />);
+  expect(screen.queryByText(/Stale working report/)).toBeNull(); expect(screen.queryByText(/Collector/)).toBeNull();
+  expect(screen.getByText("working")).toBeTruthy();
 });
