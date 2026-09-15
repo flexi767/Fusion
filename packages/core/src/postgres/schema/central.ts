@@ -381,6 +381,16 @@ export const externalSessionRuntimes = centralSchema.table("external_session_run
   controller: text("controller").notNull().default("host-adapter"),
 });
 
+export const externalSessionLaunchRuntimes = centralSchema.table("external_session_launch_runtimes", {
+  hostId: text("host_id").notNull(), projectId: text("project_id").notNull(), generation: text("generation").notNull(),
+  projectPath: text("project_path").notNull(), expiresAt: text("expires_at").notNull(),
+}, table => [primaryKey({ columns: [table.hostId, table.projectId] })]);
+export const externalSessionLaunches = centralSchema.table("external_session_launches", {
+  id: text("id").primaryKey(), hostId: text("host_id").notNull(), projectId: text("project_id").notNull(), generation: text("generation").notNull(),
+  prompt: text("prompt").notNull(), model: text("model"), status: text("status").notNull(), cliSessionId: text("cli_session_id"), failure: text("failure"),
+  createdAt: text("created_at").notNull(), expiresAt: text("expires_at").notNull(), updatedAt: text("updated_at").notNull(),
+});
+
 // ── Schema version meta ──────────────────────────────────────────────
 export const centralMeta = centralSchema.table("__meta", {
   key: text("key").primaryKey(),
@@ -396,5 +406,5 @@ export const centralTableNames = [
   "central_activity_log", "central_settings",
   "peer_nodes", "settings_sync_state", "managed_docker_nodes",
   "plugin_installs", "project_plugin_states", "mesh_shared_snapshots",
-  "mesh_write_queue", "secrets_global", "task_claims", "global_routines", "session_collectors", "external_sessions", "external_session_turns", "external_session_details", "external_session_commands", "external_session_runtimes", "__meta",
+  "mesh_write_queue", "secrets_global", "task_claims", "global_routines", "session_collectors", "external_sessions", "external_session_turns", "external_session_details", "external_session_commands", "external_session_runtimes", "external_session_launch_runtimes", "external_session_launches", "__meta",
 ] as const;

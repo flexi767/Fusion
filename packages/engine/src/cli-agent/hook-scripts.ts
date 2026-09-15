@@ -106,7 +106,10 @@ if [ -z "$PAYLOAD" ]; then
 fi
 URL="$ENDPOINT"
 if [ -n "$EVENT" ]; then
-  URL="$ENDPOINT?event=$EVENT"
+  case "$ENDPOINT" in
+    *\\?*) URL="$ENDPOINT&event=$EVENT" ;;
+    *) URL="$ENDPOINT?event=$EVENT" ;;
+  esac
 fi
 if command -v curl >/dev/null 2>&1; then
   printf '%s' "$PAYLOAD" | curl -sS -X POST "$URL" \\
@@ -130,7 +133,9 @@ export function buildNotifyShimContent(opts: {
   token: string;
   endpointUrl: string;
 }): string {
-  const endpoint = shellSingleQuote(opts.endpointUrl);
+  const notifyUrl = new URL(opts.endpointUrl);
+  notifyUrl.searchParams.set("event", "notify");
+  const endpoint = shellSingleQuote(notifyUrl.toString());
   const token = shellSingleQuote(opts.token);
   const sessionId = shellSingleQuote(opts.sessionId);
   return `#!/bin/sh
@@ -150,7 +155,7 @@ if [ -z "$PAYLOAD" ]; then
   PAYLOAD='{}'
 fi
 if command -v curl >/dev/null 2>&1; then
-  printf '%s' "$PAYLOAD" | curl -sS -X POST "$ENDPOINT?event=notify" \\
+  printf '%s' "$PAYLOAD" | curl -sS -X POST "$ENDPOINT" \\
     --connect-timeout ${CURL_CONNECT_TIMEOUT_S} --max-time ${CURL_MAX_TIME_S} \\
     -H 'Content-Type: application/json' \\
     -H "${HOOK_TOKEN_HEADER}: $TOKEN" \\

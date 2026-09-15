@@ -1,4 +1,5 @@
 import { SessionUsageOverview } from "./SessionUsageOverview";
+import { SessionLaunchPanel } from "./SessionLaunchPanel";
 import { SessionHistory, SessionCostDetails } from "./SessionHistory";
 import { useEffect, useMemo, useState } from "react";
 import { useExternalSessions } from "../hooks/useExternalSessions";
@@ -39,6 +40,7 @@ function SessionList() {
   const filters = { host, provider, activity, q: query, saved };
   return <ViewLayout header={<ViewHeader icon={Activity} title="Sessions" />}><div className="sessions-view">
     <p>Codex and Claude sessions across your hosts. Observing a session does not schedule a Fusion task.</p>
+    <SessionLaunchPanel />
     <form className="sessions-filters" onSubmit={event => { event.preventDefault(); setQuery(search.trim()); }}>
       <label>Saved sessions<select value={saved} onChange={event => setSaved(event.target.value)}><option value="">All sessions</option><option value="archived">Archived</option><option value="pinned">Pinned</option></select></label>
       <label>Host<select value={host} onChange={e => setHost(e.target.value)}><option value="">All hosts</option>{collectors.map(c => <option key={c.hostId}>{c.hostId}</option>)}</select></label>

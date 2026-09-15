@@ -1,5 +1,13 @@
 import type { SessionObservation } from "@fusion/core";
 import { api } from "./client/client.js";
+export interface SessionLaunchPage {
+  enabled: boolean; runtimes: import("@fusion/core").SessionLaunchRuntime[];
+  requests: import("@fusion/core").SessionLaunchRequest[];
+}
+export type SessionLaunchInput = Parameters<import("@fusion/core").ExternalSessionLaunches["queue"]>[0];
+export const fetchSessionLaunches = () => api<SessionLaunchPage>("/external-session-launches");
+export const queueSessionLaunch = (input: SessionLaunchInput) => api("/external-session-launches", { method: "POST", body: JSON.stringify(input) });
+export const cancelSessionLaunch = (id: string, hostId: string) => api(`/external-session-launches/${encodeURIComponent(id)}/cancel`, { method: "POST", body: JSON.stringify({ hostId }) });
 export interface ObservedSession {
   taskProjectId?: string | null; taskId?: string | null; taskLinkRevision?: number | null;
   archived?: boolean | null; pinned?: boolean | null;

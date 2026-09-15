@@ -1620,6 +1620,7 @@ export class InProcessRuntime
             hookEndpointUrl: this.resolveCliAgentHookEndpointUrl(),
             sessionObservation: process.env.FUSION_SESSIONS === "1" && /^[a-zA-Z0-9._-]{1,128}$/.test(process.env.FUSION_SESSION_HOST_ID ?? "")
               ? { hostId: process.env.FUSION_SESSION_HOST_ID!, controlsEnabled: process.env.FUSION_SESSION_CONTROLS === "1" && (process.env.FUSION_SESSION_CONTROL_HOSTS ?? "").split(",").includes(process.env.FUSION_SESSION_HOST_ID!),
+                  launchesEnabled: process.env.FUSION_SESSION_LAUNCHES === "1",
                   onError: (error) => runtimeLog.warn("Session observation bridge failed; CLI execution remains independent:", error instanceof Error ? error.message : "Unavailable") }
               : undefined,
             onNotification: (info) => {

@@ -1,6 +1,6 @@
 import { readSessionPricing } from "./session-pricing.js";
 import { createSessionSummaryWorker } from "./session-summary-worker.js";
-import { ExternalSessionStore, externalSessionAnalytics, priceSessionTurns, ExternalSessionControls, ExternalSessionSummaries } from "@fusion/core";
+import { ExternalSessionStore, externalSessionAnalytics, priceSessionTurns, ExternalSessionControls, ExternalSessionSummaries, ExternalSessionLaunches } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateSessionCollector } from "./session-collector-auth.js";
@@ -15,6 +15,8 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
   const hostControlsEnabled = (host: string) => process.env.FUSION_SESSION_CONTROLS === "1" && (process.env.FUSION_SESSION_CONTROL_HOSTS ?? "").split(",").includes(host);
   const controls = () => new ExternalSessionControls(layer());
   const summaries = () => new ExternalSessionSummaries(layer());
+  const launches = () => new ExternalSessionLaunches(layer());
+  const launchesEnabled = () => process.env.FUSION_SESSIONS === "1" && process.env.FUSION_SESSION_LAUNCHES === "1" && process.env.FUSION_SESSION_CONTROLS === "1";
   const summaryWorker = process.env.FUSION_SESSION_SUMMARIES === "1" && process.env.FUSION_SESSION_SUMMARY_URL
     ? createSessionSummaryWorker(layer, process.env.FUSION_SESSION_SUMMARY_URL) : undefined;
   if (summaryWorker) registerDispose(() => summaryWorker.stop());
@@ -77,6 +79,24 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ({ router, store
     const totals = await externalSessionAnalytics(layer(), { sessionIds: result.sessions.map(row => row.id) }, settings.modelPricingOverrides);
     const costs = new Map(totals.sessions.map(row => [row.id, row]));
     res.json({ enabled: true, ...result, sessions: result.sessions.map(row => ({ ...row, usageSummary: costs.get(row.id) ?? null })), collectors: await sessions().collectors() });
+  });
+  router.get("/external-session-launches", async (_req, res) => {
+    if (!launchesEnabled()) return res.json({ enabled: false, runtimes: [], requests: [] });
+    return res.json({ enabled: true, runtimes: (await launches().available()).filter(row => hostControlsEnabled(row.hostId)), requests: (await launches().list()).filter(row => hostControlsEnabled(row.hostId)) });
+  });
+  router.post("/external-session-launches", async (req, res) => {
+    if (!launchesEnabled()) throw new ApiError(404, "Session launches disabled");
+    const body = req.body;
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => !["id", "hostId", "projectId", "generation", "prompt", "model"].includes(key))) throw new ApiError(400, "Invalid launch fields");
+    if (!hostControlsEnabled(body.hostId)) throw new ApiError(403, "Host launches disabled");
+    try { return res.json(await launches().queue(body)); }
+    catch (error) { throw new ApiError(409, error instanceof Error ? error.message : "Launch rejected"); }
+  });
+  router.post("/external-session-launches/:id/cancel", async (req, res) => {
+    if (!launchesEnabled()) throw new ApiError(404, "Session launches disabled");
+    if (!hostControlsEnabled(req.body?.hostId)) throw new ApiError(403, "Host launches disabled");
+    if (!await launches().cancel(String(req.params.id), req.body.hostId)) throw new ApiError(409, "Launch already claimed or changed; inspect its current state");
+    return res.json({ cancelled: true });
   });
   router.get("/external-session-usage", async (req, res) => {
     if (process.env.FUSION_SESSIONS !== "1") throw new ApiError(404, "Sessions disabled");

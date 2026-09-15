@@ -1284,6 +1284,7 @@ export {
   type CliAdapterDescriptor,
 } from "./cli-agent/adapters/index.js";
 export { MemoryConsolidationService, resolveMemoryConsolidationPorts } from "./memory/index.js";
+export { mapNotifyPayload as mapCodexNotifyPayload } from "./cli-agent/adapters/codex.js";
 
 // CLI Agent Executor — task ↔ session orchestration (U7).
 export {

@@ -25,7 +25,7 @@
  */
 
 import { CliSessionStore, ExternalSessionStore, ExternalSessionControls } from "@fusion/core";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { ExternalSessionRuntimeBridge } from "./external-session-bridge.js";
 import type { AsyncDataLayer } from "@fusion/core";
 import { CliAdapterRegistry } from "./adapter.js";
@@ -34,11 +34,14 @@ import { CliSessionManager, type CliSessionManagerOptions } from "./session-mana
 import { TelemetryHub, type TelemetryHubOptions } from "./telemetry-hub.js";
 import { CliResumeCoordinator } from "./resume-coordinator.js";
 import { writeSessionHookScripts } from "./hook-scripts.js";
+import { ExternalSessionLaunches } from "@fusion/core";
+import { SessionLaunchWorker } from "./session-launch-worker.js";
+import { launchObservedCodex, markObservedPromptInjected } from "./launch-observed-codex.js";
 import type { CliAgentRuntime } from "../executor.js";
 
 /** Options for {@link createCliAgentRuntime}. */
 export interface CreateCliAgentRuntimeOptions {
-  sessionObservation?: { hostId: string; controlsEnabled: boolean; onError?: (error: unknown) => void };
+  sessionObservation?: { hostId: string; controlsEnabled: boolean; launchesEnabled?: boolean; onError?: (error: unknown) => void };
   /** The project's `.fusion` dir (scratch root for hook scripts). */
   fusionDir: string;
   /** The project's already-open PostgreSQL data layer (reused, never re-opened). */
@@ -96,7 +99,10 @@ export interface BootstrappedCliAgentRuntime {
 export async function createCliAgentRuntime(
   options: CreateCliAgentRuntimeOptions,
 ): Promise<BootstrappedCliAgentRuntime> {
-  const { asyncLayer, projectId, hookEndpointUrl } = options;
+  const { asyncLayer, projectId } = options;
+  const scopedHookEndpoint = new URL(options.hookEndpointUrl);
+  scopedHookEndpoint.searchParams.set("projectId", projectId);
+  const hookEndpointUrl = scopedHookEndpoint.toString();
 
   // FNXC:CliAgentPostgres 2026-07-14-12:00:
   // Hydrate the project-scoped cache before state machines or recovery inspect
@@ -154,8 +160,14 @@ export async function createCliAgentRuntime(
   const sessionBridge = options.sessionObservation ? new ExternalSessionRuntimeBridge({
     ...options.sessionObservation, projectId, projectPath: dirname(options.fusionDir), store, manager,
     observations: new ExternalSessionStore(asyncLayer), controls: new ExternalSessionControls(asyncLayer),
+    onInjected: sessionId => markObservedPromptInjected(hub, sessionId),
   }) : undefined;
   sessionBridge?.start();
+  const launchWorker = options.sessionObservation?.controlsEnabled && options.sessionObservation.launchesEnabled ? new SessionLaunchWorker({
+    hostId: options.sessionObservation.hostId, projectId, projectPath: dirname(options.fusionDir), requests: new ExternalSessionLaunches(asyncLayer), onError: options.sessionObservation.onError,
+    launch: (request, signal) => launchObservedCodex({ manager, hub, projectId, projectPath: dirname(options.fusionDir), hookRoot: join(options.fusionDir, "session-launch-hooks"), hookEndpointUrl }, request, signal),
+  }) : undefined;
+  launchWorker?.start();
 
   return {
     bundle,
@@ -175,6 +187,7 @@ export async function createCliAgentRuntime(
       }
     },
     dispose: async () => {
+      launchWorker?.stop();
       sessionBridge?.stop();
       manager.dispose();
       await store.flush();

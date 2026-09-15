@@ -283,6 +283,9 @@ type WriteJob =
 // ── Session spawn options ───────────────────────────────────────────────────
 
 export interface SpawnCliSessionOptions {
+  /** Optional owner cancellation/deadline, checked after async preparation before spawning. */
+  signal?: AbortSignal;
+  deadlineMs?: number;
   /** Adapter id to drive the session (resolved against the registry). */
   adapterId: string;
   /** Project the session belongs to. */
@@ -441,6 +444,11 @@ export class CliSessionManager {
    * waitForReady).
    */
   async spawn(options: SpawnCliSessionOptions): Promise<CliSession> {
+    const checkLaunch = () => {
+      if (options.signal?.aborted) throw new Error("CLI launch cancelled");
+      if (options.deadlineMs !== undefined && (!Number.isFinite(options.deadlineMs) || Date.now() >= options.deadlineMs)) throw new Error("CLI launch expired");
+    };
+    checkLaunch();
     if (this.sessions.size >= this.concurrencyCeiling) {
       throw new CliConcurrencyLimitError(this.concurrencyCeiling, this.sessions.size);
     }
@@ -493,9 +501,11 @@ export class CliSessionManager {
     const allowlist = adapter.buildEnvAllowlist(launchCtx);
     const env = this.buildEnv(allowlist);
 
-    const pty = await this.loadPty();
     let child: IPty;
     try {
+      checkLaunch();
+      const pty = await this.loadPty();
+      checkLaunch();
       child = pty.spawn(launch.command, launch.args, {
         name: "xterm-color",
         cols: options.cols ?? 80,

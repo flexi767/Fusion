@@ -8,6 +8,7 @@ export interface ExternalSessionBridgeOptions {
   observations: Pick<ExternalSessionStore, "get" | "ingest" | "associateNativeRuntime">;
   controls: Pick<ExternalSessionControls, "register" | "claim" | "beginExecution" | "acknowledge">;
   onError?: (error: unknown) => void;
+  onInjected?: (sessionId: string) => void;
 }
 
 /** Reads only this manager's owned handles. Transcript discovery never enters this bridge. */
@@ -67,13 +68,13 @@ export class ExternalSessionRuntimeBridge {
     if (!stillOwned() || !this.options.controlsEnabled) return;
     // Task-owned sessions retain Fusion's task Pause/Resume controls. Direct
     // process stop is exposed only for independent managed/chat sessions.
-    const capabilities = unambiguous ? row.taskId ? ["feedback"] as const : ["feedback", "stop"] as const : [];
+    const capabilities = unambiguous ? row.taskId ? row.agentState === "done" ? [] : ["feedback"] as const : ["feedback", "stop"] as const : [];
     if (!await controls.register(hostId, identity, generation, [...capabilities], Date.now(), "fusion-runtime") || !unambiguous || !stillOwned()) return;
     const commands = await controls.claim(hostId, identity, generation);
     commands.sort((a, b) => Number(b.operation === "stop") - Number(a.operation === "stop"));
     for (const queued of commands) {
       if (!stillOwned()) break;
-      if (queued.operation === "feedback" && !["ready", "waitingOnInput"].includes(row.agentState)) continue;
+      if (queued.operation === "feedback" && !["ready", "waitingOnInput", ...(!row.taskId ? ["done"] : [])].includes(row.agentState)) continue;
       if (queued.operation !== "feedback" && (queued.operation !== "stop" || row.taskId)) continue;
       const command = await controls.beginExecution(hostId, queued.id, generation);
       if (!command) continue;
@@ -84,6 +85,7 @@ export class ExternalSessionRuntimeBridge {
         else {
           await manager.inject(row.id, command.text!, { generation, signal: this.shutdown.signal, deadlineMs: Math.min(Date.parse(command.expiresAt), Date.now() + 2000) });
           applied = true;
+          try { this.options.onInjected?.(row.id); } catch { /* Bytes were already written. */ }
         }
       } catch { applied = false; }
       // A failed acknowledgement leaves the execution fence in place. Never

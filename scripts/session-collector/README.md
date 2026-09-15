@@ -154,3 +154,35 @@ an unconfirmed result remains explicit. Injection is cancellable and checks its
 deadline again before writing; acknowledgement means bytes were written to the
 owned terminal, not that the model obeyed them. A connected Fusion owner takes
 precedence over the optional external feedback hook adapter.
+
+### Managed Codex launches
+
+With the CLI Agent Executor enabled, a Fusion runtime can opt in to independent
+managed launches using `FUSION_SESSION_LAUNCHES=1`, alongside the Sessions,
+controls, host ID and control-host allowlist flags above. Enable the launch flag
+on the dashboard as well. The Sessions launch panel lists only registered,
+connected host/project runtimes. The selected project supplies the working
+directory; browser requests cannot supply a command, argument vector, arbitrary
+working directory, environment, task ID or elevated posture.
+
+This first managed launch adapter preserves the policies recorded on all four
+used AgentPulse launch requests: Codex, `--sandbox read-only`,
+`--ask-for-approval never`. These flags were verified against the installed m3
+`codex-cli 0.141.0` help. It reuses Fusion's existing PTY manager, native adapter,
+per-session hook token and notify shim. It starts no task and no additional
+inference server. Claude launch, provider resume/fork, and arbitrary remote
+supervisor launch modes are not advertised by this adapter.
+
+Launches have immutable request IDs, a five-minute queue expiry, exact
+host/project/runtime generation binding, and a one-shot durable claim before
+spawn. At most five requests may be pending per host. A worker handles one launch
+at a time, with a 30-second spawn/initial-prompt deadline. Only queued requests can
+be cancelled. A failed acknowledgement after launch leaves an interrupted,
+unconfirmed request; it never automatically launches again. Inspect the owning
+runtime before manually creating another request. Acknowledged `started` means
+the initial prompt reached the owned terminal, not that its work completed.
+
+Runtime registration and launch execution currently require the runtime to use
+the same central PostgreSQL data layer as the dashboard. The read-only Python
+collector cannot register a launch runtime or execute launch requests. Deployment
+and real per-host launch/control verification remain part of the parity gate.

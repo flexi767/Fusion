@@ -68,3 +68,11 @@ it("rotates bounded work and detects duplicate owners beyond the current page", 
   expect(f.observations.associateNativeRuntime).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ cliSessionId: "cli-32" }));
   expect(f.observations.associateNativeRuntime).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ cliSessionId: "cli-33" }));
 });
+it("allows independent follow-ups after completion but leaves completed task work under task controls", async () => {
+  const f = fixture([row({ agentState: "done" })]); const queued = command();
+  f.controls.claim.mockResolvedValue([queued]); f.controls.beginExecution.mockResolvedValue(queued);
+  await f.bridge.tick(); expect(f.manager.inject).toHaveBeenCalledOnce();
+  const task = fixture([row({ taskId: "FN-1", agentState: "done" })]); task.controls.claim.mockResolvedValue([queued]);
+  await task.bridge.tick(); expect(task.manager.inject).not.toHaveBeenCalled();
+  expect(task.controls.register).toHaveBeenCalledWith("m3", expect.any(String), expect.any(String), [], expect.any(Number), "fusion-runtime");
+});

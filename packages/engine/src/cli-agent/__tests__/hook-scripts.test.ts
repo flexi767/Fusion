@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, statSync, existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { rm } from "node:fs/promises";
@@ -15,6 +17,18 @@ import {
 describe("hook-scripts", () => {
   let tmpDir: string;
   let dir: string;
+  it("preserves project routing when both native hook forms append an event query", async () => {
+    const bin = join(tmpDir, "bin"); await mkdir(bin);
+    const capture = join(tmpDir, "request-args");
+    await writeFile(join(bin, "curl"), '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_CAPTURE"\ncat >/dev/null\n', { mode: 0o700 });
+    const scripts = await writeSessionHookScripts({ sessionId: "owned", token: "test-token", endpointUrl: "http://127.0.0.1:12345/api/cli-agent/hooks?projectId=project-other", dir });
+    for (const [path, event] of [[scripts.hookScriptPath, "SessionStart"], [scripts.notifyScriptPath, "notify"]]) {
+      await promisify(execFile)("sh", ["-c", 'exec "$1" "$2" </dev/null', "sh", path, "{}"], { env: { PATH: `${bin}:/usr/bin:/bin`, TEST_CAPTURE: capture, FUSION_HOOK_EVENT: "SessionStart" }, timeout: 2000 });
+      const args = (await readFile(capture, "utf8")).split("\n");
+      const url = new URL(args[args.indexOf("POST") + 1]);
+      expect(url.searchParams.get("projectId")).toBe("project-other"); expect(url.searchParams.get("event")).toBe(event);
+    }
+  });
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "fusion-hook-scripts-"));

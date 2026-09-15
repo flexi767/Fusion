@@ -1,0 +1,5 @@
+.session-launch-panel form { display: grid; gap: var(--space-md); margin-block: var(--space-md); }
+.session-launch-panel label { display: grid; gap: var(--space-sm); min-width: 0; }
+.session-launch-panel :is(input, select, textarea) { width: 100%; min-width: 0; }
+.session-launch-panel textarea { min-height: calc(var(--space-2xl) * 3); }
+.session-launch-panel article { border-top: var(--btn-border-width) solid var(--border); padding-block: var(--space-md); overflow-wrap: anywhere; }

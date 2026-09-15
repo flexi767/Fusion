@@ -13,7 +13,9 @@ function request(app: express.Express, method: string, path: string, options: { 
 const ingest = vi.fn();
 const heartbeat = vi.fn();
 const linkTask = vi.fn(); const get = vi.fn(); const list = vi.fn(); const getTask = vi.fn();
-vi.mock("@fusion/core", () => ({ ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; } }));
+const launchQueue = vi.fn(); const launchList = vi.fn(); const launchAvailable = vi.fn(); const launchCancel = vi.fn();
+vi.mock("@fusion/core", () => ({ ExternalSessionStore: class { ingest = ingest; heartbeat = heartbeat; linkTask = linkTask; get = get; list = list; },
+  ExternalSessionLaunches: class { queue = launchQueue; list = launchList; available = launchAvailable; cancel = launchCancel; } }));
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 function app() {
   vi.stubEnv("FUSION_SESSION_INGESTION", "1");
@@ -26,6 +28,28 @@ function app() {
   return app;
 }
 const body = { version: 1, eventId: "event-1", collectorVersion: "test", observation: { hostId: "spoofed" } };
+it("restricts managed launch to enabled browser-authenticated hosts and refuses arbitrary executable/cwd fields", async () => {
+  const server = app(); const headers = { Authorization: "Bearer dashboard-token" };
+  vi.stubEnv("FUSION_SESSIONS", "1"); vi.stubEnv("FUSION_SESSION_LAUNCHES", "1"); vi.stubEnv("FUSION_SESSION_CONTROLS", "1"); vi.stubEnv("FUSION_SESSION_CONTROL_HOSTS", "m3");
+  const input = { id: "launch-request-12345", hostId: "m3", projectId: "project", generation: "generation-123456", prompt: "Inspect", model: null };
+  launchQueue.mockResolvedValue({ ...input, status: "queued" });
+  expect((await request(server, "POST", "/api/external-session-launches", { body: input, headers: { Authorization: "Bearer collector-token" } })).status).toBe(401);
+  expect((await request(server, "POST", "/api/external-session-launches", { body: { ...input, hostId: "m5" }, headers })).status).toBe(403);
+  for (const field of ["cwd", "command", "extraArgs", "autoApprove", "taskId", "sandbox"]) {
+    expect((await request(server, "POST", "/api/external-session-launches", { body: { ...input, [field]: "injected" }, headers })).status).toBe(400);
+  }
+  expect(launchQueue).not.toHaveBeenCalled();
+  expect((await request(server, "POST", "/api/external-session-launches", { body: input, headers })).status).toBe(200);
+  expect(launchQueue).toHaveBeenCalledWith(input);
+  launchAvailable.mockResolvedValue([{ hostId: "m3" }, { hostId: "m5" }]); launchList.mockResolvedValue([{ hostId: "m3", status: "starting" }, { hostId: "m5" }]);
+  const listed = await request(server, "GET", "/api/external-session-launches", { headers });
+  expect(listed.body).toMatchObject({ runtimes: [{ hostId: "m3" }], requests: [{ hostId: "m3", status: "starting" }] });
+  launchCancel.mockResolvedValue(false);
+  expect((await request(server, "POST", `/api/external-session-launches/${input.id}/cancel`, { headers, body: { hostId: "m3" } })).status).toBe(409);
+  expect(launchCancel).toHaveBeenCalledWith(input.id, "m3");
+  vi.stubEnv("FUSION_SESSION_LAUNCHES", "0");
+  expect((await request(server, "POST", "/api/external-session-launches", { body: input, headers })).status).toBe(404);
+});
 it("host token reaches only its independently authenticated ingestion route", async () => {
   const server = app(); ingest.mockResolvedValue({ id: "session", revision: 1 });
   const response = await request(server, "POST", "/api/session-collector", { body, headers: { Authorization: "Bearer collector-token" } });

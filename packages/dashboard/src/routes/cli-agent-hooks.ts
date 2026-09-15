@@ -39,6 +39,7 @@
 
 import { Router, type Request, type Response } from "express";
 import express from "express";
+import { mapCodexNotifyPayload } from "@fusion/engine";
 import type { ApiRouteRegistrar } from "./types.js";
 
 /** Max accepted hook payload size. Hook payloads are small JSON envelopes. */
@@ -86,6 +87,11 @@ function headerValue(req: Request, name: string): string | undefined {
  */
 function normalizeHookEvent(eventName: string | undefined, body: Record<string, unknown>) {
   const name = (eventName ?? "").toLowerCase();
+  if (name === "notify" && body.type === "agent-turn-complete") {
+    const event = mapCodexNotifyPayload(body);
+    if (event?.payload?.nativeSessionId) return event;
+    return { kind: "outputProgress" as const, payload: {} };
+  }
   // Carry the native session id whenever the payload reports one (Claude:
   // `session_id` in every payload) so the hub can persist it.
   const nativeSessionId =

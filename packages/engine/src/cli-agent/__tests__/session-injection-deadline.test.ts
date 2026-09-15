@@ -54,3 +54,19 @@ it("rejects unwritten input on process exit and fences a reused session id with 
   ready(); expect(pty.write).not.toHaveBeenCalled();
   expect(manager.killOwned("owned", manager.getRuntimeGeneration("owned")!)).toBe(true); expect(pty.kill).toHaveBeenCalledOnce();
 });
+it("does not spawn after cancellation or expiry during asynchronous preparation", async () => {
+  vi.useFakeTimers();
+  for (const during of ["database", "pty-loader"]) {
+    vi.setSystemTime(1000); const abort = new AbortController(); let record: CliSession;
+    const store = Object.assign(new EventEmitter(), {
+      createSession: (input: object) => (record = { id: "delayed", ...input } as CliSession),
+      updateSession: (_id: string, patch: object) => (record = { ...record, ...patch }), getSession: () => record,
+      flush: async () => { if (during === "database") vi.setSystemTime(3000); },
+    }) as unknown as CliSessionStore;
+    const registry = new CliAdapterRegistry(); registry.register({ id: "fixture", name: "Fixture", capabilities: { nativeDone: false, nativeWaiting: false, transcriptSource: "none", supportsResume: false },
+      buildLaunch: () => ({ command: "fixture", args: [] }), buildEnvAllowlist: () => [], createReadinessDetector: () => ({ observe: () => true }), formatInjection: text => ({ payload: text }) });
+    const spawn = vi.fn(); const manager = new CliSessionManager({ registry, store, loadPty: async () => { abort.abort(); return { spawn }; } });
+    await expect(manager.spawn({ adapterId: "fixture", projectId: "project", purpose: "chat", signal: abort.signal, deadlineMs: 2000 })).rejects.toThrow(during === "database" ? "expired" : "cancelled");
+    expect(spawn).not.toHaveBeenCalled(); expect(store.getSession("delayed")?.agentState).toBe("dead"); manager.dispose();
+  }
+});
