@@ -16,7 +16,7 @@ def text(content):
     return '\n'.join(b.get('text','') for b in content or [] if isinstance(b,dict) and b.get('type','').lower() in ('text','input_text','output_text'))
 def bounded_text(value,units):
     # The TypeScript contract counts UTF-16 units, not Python Unicode scalars.
-    return value.encode('utf-16-le',errors='replace')[:units*2].decode('utf-16-le',errors='ignore')
+    return value.replace('\0','␀').encode('utf-16-le',errors='replace')[:units*2].decode('utf-16-le',errors='ignore')
 def fresh(tid,at):
     return {'id':tid,'startedAt':at,'completedAt':None,'durationMs':None,'durationSource':'timestamps','prompts':[],'response':'','usage':[],'files':[],'toolCalls':0,'updatedAt':at}
 def claude_turn_finished(message):

@@ -216,3 +216,21 @@ file; Codex history remains at parser version 4. Live cursors, monotonically
 increasing delivery revisions and pending acknowledgements are preserved. The
 new ownership namespace is subject to the existing parser byte/record bounds.
 Keep AgentPulse and its independent recovery snapshot throughout comparison.
+
+
+## Opaque records and binary display text (collector v7)
+
+Canonical Codex `compacted` records and `response_item` records with
+`custom_tool_call_output`/`function_call_output` payloads do not contribute turn
+history. Their oversized opaque bodies can now be framed without loading them
+into JSON memory. The reader recognizes the canonical header, including optional
+`ordinal`, persists bounded scan progress and advances the main cursor only after
+the terminating newline arrives. It reads at most 1 MiB per continuation, after
+the existing bounded initial prefix. User/assistant messages and unknown record
+shapes still pause at the configured limit; no actionable record is skipped.
+
+NUL in display prompts, responses or patch text is shown as `␀`. A bounded repair
+pass can retry previously rejected 400 deliveries when this normalization changes
+the display text, retaining the exact event ID and observation revision. Other
+rejections remain parked. Patch counts stay intact and sanitized patch display is
+marked bounded. Native transcript files and AgentPulse recovery data are unchanged.

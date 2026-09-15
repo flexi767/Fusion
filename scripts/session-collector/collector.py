@@ -13,8 +13,9 @@ import uuid
 from datetime import datetime
 from turn_parser import consume, known, total, claude_turn_finished, bounded_text
 import parser_ledger
+from opaque_records import ignored_header, scan_opaque_tail
 
-VERSION = "fusion-native-6"
+VERSION = "fusion-native-7"
 PARSER_VERSION = 4
 CLAUDE_PARSER_VERSION = 5
 LIVE_PARSER_VERSION = 1
@@ -36,7 +37,21 @@ class CollectionCapacityError(ValueError):
     pass
 
 
+def normalize_display(envelope):
+    """Keep NUL visible without sending a forbidden binary character to the API."""
+    if not envelope.get('turns'):return envelope
+    turns=[]
+    for original in envelope['turns']:
+        turn={**original,'prompts':[value.replace('\0','␀') for value in original.get('prompts',[])],
+              'response':original.get('response','').replace('\0','␀')}
+        turn['files']=[{**file,'diff':file.get('diff','').replace('\0','␀'),
+                        'truncated':file.get('truncated',False) or '\0' in file.get('diff','')} for file in original.get('files',[])]
+        turns.append(turn)
+    return {**envelope,'turns':turns}
+
+
 def enqueue(db, envelope, live_key=None):
+    envelope=normalize_display(envelope)
     if 'observation' in envelope:
         title=envelope['observation'].get('title','')
         title=' '.join(''.join(c if ord(c)>=32 else ' ' for c in title).split())
@@ -219,6 +234,7 @@ def _scan_file(db, path, provider, max_pending=5000):
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
     old = db.execute('SELECT inode,offset,state FROM files WHERE path=?', (str(path),)).fetchone()
     offset, state = (old[1], json.loads(old[2])) if old and old[0] == inode and old[1] <= stat.st_size else (0, {})
+    if state.get('opaqueRecord',{}).get('position',0)>stat.st_size:offset,state=0,{}
     parser_version=CLAUDE_PARSER_VERSION if provider=='claude' else PARSER_VERSION
     if state and state.get('parserVersion') != parser_version: offset,state=0,{}
     state['parserVersion']=parser_version
@@ -228,7 +244,7 @@ def _scan_file(db, path, provider, max_pending=5000):
     data=b''
     # Drain changed turns before reading more input; neither list nor snapshots
     # can grow indefinitely while history delivery is backlogged.
-    if not state['turnsState'].get('changed'):
+    if not state['turnsState'].get('changed') and not state.get('opaqueRecord'):
         with path.open('rb') as stream:
             stream.seek(offset); data = stream.read(MAX_READ)
             # An incomplete record is never acknowledged. Bound long-line handling.
@@ -237,15 +253,32 @@ def _scan_file(db, path, provider, max_pending=5000):
                 if not more: break
                 data += more
     end = data.rfind(b'\n') + 1
-    if end == 0 and offset != stat.st_size and not state['turnsState'].get('changed'):
+    opaque=state.get('opaqueRecord')
+    if opaque or (end==0 and len(data)>MAX_LINE):
+        header=opaque['header'] if opaque else ignored_header(data,provider)
+        if header:
+            position=opaque['position'] if opaque else offset+len(data)
+            position,complete=scan_opaque_tail(path,position,MAX_READ)
+            if complete:
+                data=(json.dumps(header)+'\n').encode();end=position-offset
+                state.pop('opaqueRecord',None)
+                with db:
+                    db.execute("DELETE FROM health WHERE key='parse_error' AND value=?",('Oversized native record; collection paused for '+str(path),))
+            else:
+                state['opaqueRecord']={'header':header,'position':position}
+                data=b'';end=0
+    if end == 0 and offset != stat.st_size and not state['turnsState'].get('changed') and not state.get('opaqueRecord'):
         if len(data) > MAX_LINE:
             with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Oversized native record; collection paused for '+str(path)))
         return False
     changed = False
     for raw in data[:end].splitlines():
         if len(raw) > MAX_LINE:
-            capacity_pause(db, path, 'Native record exceeds byte limit; cursor preserved')
-            raise CollectionCapacityError('Native record exceeds byte limit; cursor preserved')
+            event=ignored_header(raw,provider)
+            if event is None:
+                capacity_pause(db, path, 'Native record exceeds byte limit; cursor preserved')
+                raise CollectionCapacityError('Native record exceeds byte limit; cursor preserved')
+            raw=json.dumps(event).encode()
         try: event = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             with db: db.execute('INSERT OR REPLACE INTO health VALUES (?,?)', ('parse_error', 'Malformed complete native record; cursor paused in '+str(path)))
@@ -314,7 +347,22 @@ def post(url, token, body, timeout=10):
         return json.loads(response.read(65536))
 
 
+def repair_rejected_display(db, limit=50):
+    """Only repair known display normalization failures; preserve IDs and revisions."""
+    repaired=0
+    for row_id,event_id,body in db.execute("SELECT id,event_id,body FROM pending WHERE rejection='400' ORDER BY id LIMIT ?",(limit,)).fetchall():
+        try:
+            original=json.loads(body);normalized=normalize_display(original)
+        except (ValueError,TypeError,AttributeError):continue
+        if normalized==original:continue
+        with db:
+            repaired+=db.execute("UPDATE pending SET body=?,rejection=NULL,retry_after=0 WHERE id=? AND event_id=? AND body=? AND rejection='400'",
+                (json.dumps(normalized),row_id,event_id,body)).rowcount
+    return repaired
+
+
 def drain(db, send, limit=50):
+    repair_rejected_display(db)
     with db: db.execute('UPDATE pending SET priority=1 WHERE priority=2 AND event_at<?',(time.time()-LIVE_PRIORITY_SECONDS,))
     for row_id, event_id, body, priority in db.execute('SELECT id,event_id,body,priority FROM pending WHERE rejection IS NULL AND retry_after<=? ORDER BY priority DESC,CASE WHEN priority=2 THEN event_at END DESC,id LIMIT ?', (time.time(),limit)).fetchall():
         try: result = send(json.loads(body))

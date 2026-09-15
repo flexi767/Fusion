@@ -313,4 +313,69 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(claude['telemetry']['contextTokens'],60)
         self.assertIsNone(claude['telemetry']['contextCapacity'])
 
+
+    def test_opaque_codex_records_resume_after_restart_without_hiding_following_prompts(self):
+        for kind,payload in [('compacted',{'opaque':'x'*1800}),('response_item',{'type':'custom_tool_call_output','output':'x'*1800})]:
+            with self.subTest(kind=kind),patch('collector.MAX_READ',256),patch('collector.MAX_LINE',512):
+                self.path=self.root/(kind+'.jsonl')
+                first=self.codex()[:1]
+                opaque=dict(timestamp='2026-09-15T12:00:01Z',ordinal=7,type=kind,payload=payload)
+                later=dict(type='event_msg',timestamp='2026-09-15T12:00:02Z',payload=dict(type='item_completed',turn_id='later-'+kind,item=dict(type='UserMessage',id='prompt',content=[dict(type='input_text',text='After opaque record')])))
+                self.write(first+[opaque,later])
+                for _ in range(2):scan_file(self.db,self.path,'codex')
+                row=self.db.execute('SELECT offset,state FROM files WHERE path=?',(str(self.path),)).fetchone()
+                self.assertIn('opaqueRecord',json.loads(row[1]));self.assertLess(row[0],self.path.stat().st_size)
+                self.db.close();self.db=connect(self.root/'spool.sqlite')
+                for _ in range(12):scan_file(self.db,self.path,'codex')
+                self.assertEqual(self.db.execute('SELECT offset FROM files WHERE path=?',(str(self.path),)).fetchone()[0],self.path.stat().st_size)
+                value=json.loads(self.db.execute("SELECT value FROM parser_records WHERE path=? AND namespace='turns' AND key=?",(str(self.path),'later-'+kind)).fetchone()[0])
+                self.assertEqual(value['prompts'],['After opaque record'])
+
+    def test_opaque_framing_never_skips_actionable_or_unrecognized_oversized_records(self):
+        from opaque_records import ignored_header
+        for provider,kind,payload in [('codex','response_item',{'type':'message','content':'x'*1800}),('claude','compacted',{'opaque':'x'*1800})]:
+            row=dict(timestamp='2026-09-15T12:00:01Z',type=kind,payload=payload)
+            self.assertIsNone(ignored_header(json.dumps(row).encode(),provider))
+        self.write(self.codex()[:1]+[dict(timestamp='2026-09-15T12:00:01Z',type='response_item',payload=dict(type='message',role='user',content='x'*1800))])
+        with patch('collector.MAX_READ',256),patch('collector.MAX_LINE',512):
+            scan_file(self.db,self.path,'codex');before=self.db.execute('SELECT offset FROM files').fetchone()[0]
+            self.assertFalse(scan_file(self.db,self.path,'codex'))
+            self.assertEqual(self.db.execute('SELECT offset FROM files').fetchone()[0],before)
+            self.assertTrue(diagnostics(self.db)['parseError'])
+
+    def test_nul_display_repair_keeps_event_identity_and_patch_counts(self):
+        from collector import normalize_display
+        body=dict(eventId='same-event',turns=[dict(id='turn',prompts=['before\0after'],response='a\0b',files=[dict(path='a.txt',diff='+a\0b',added=1,removed=0,truncated=False)])])
+        result=normalize_display(body)
+        self.assertEqual(result['eventId'],'same-event');self.assertEqual(body['turns'][0]['response'],'a\0b')
+        self.assertEqual(result['turns'][0]['prompts'],['before␀after']);self.assertEqual(result['turns'][0]['response'],'a␀b')
+        self.assertEqual(result['turns'][0]['files'][0],dict(path='a.txt',diff='+a␀b',added=1,removed=0,truncated=True))
+
+
+    def test_rejected_nul_display_retries_with_original_identity_and_other_rejections_stay_parked(self):
+        body=dict(eventId='nul',turns=[dict(id='turn',prompts=[],response='a\0b',files=[])])
+        with self.db:
+            self.db.execute("INSERT INTO pending(event_id,body,rejection) VALUES (?,?,?)",('nul',json.dumps(body),'400'))
+            self.db.execute("INSERT INTO pending(event_id,body,rejection) VALUES (?,?,?)",('other',json.dumps(dict(eventId='other')),'400'))
+        seen=[];drain(self.db,lambda body:(seen.append(body) or dict(acknowledged=True,eventId=body['eventId'])))
+        self.assertEqual(len(seen),1);self.assertEqual(seen[0]['eventId'],'nul')
+        self.assertEqual(seen[0]['turns'][0]['response'],'a␀b')
+        self.assertEqual(self.db.execute('SELECT event_id,rejection FROM pending').fetchall(),[('other','400')])
+
+
+    def test_incomplete_opaque_record_keeps_main_cursor_until_newline_arrives(self):
+        first=self.codex()[:1];self.write(first)
+        initial=self.path.stat().st_size
+        opaque=json.dumps(dict(timestamp='2026-09-15T12:00:01Z',ordinal=1,type='compacted',payload=dict(opaque='x'*1800)))
+        with self.path.open('a') as stream:stream.write(opaque[:-2])
+        with patch('collector.MAX_READ',256),patch('collector.MAX_LINE',512):
+            for _ in range(12):scan_file(self.db,self.path,'codex')
+            row=self.db.execute('SELECT offset,state FROM files').fetchone()
+            self.assertEqual(row[0],initial);self.assertIn('opaqueRecord',json.loads(row[1]))
+            self.db.close();self.db=connect(self.root/'spool.sqlite')
+            with self.path.open('a') as stream:stream.write(opaque[-2:]+'\n')
+            scan_file(self.db,self.path,'codex')
+            row=self.db.execute('SELECT offset,state FROM files').fetchone()
+            self.assertEqual(row[0],self.path.stat().st_size);self.assertNotIn('opaqueRecord',json.loads(row[1]))
+
 if __name__ == '__main__': unittest.main()
