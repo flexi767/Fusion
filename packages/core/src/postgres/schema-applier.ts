@@ -1638,7 +1638,7 @@ export async function applySchemaBaseline(
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
-    // FNXC:ExternalSessions 2026-09-18-00:00: Probe the full column contract; a ledger row alone cannot prove a restored schema is usable.
+    // FNXC:ExternalSessions 2026-09-17-22:56: Probe the full column contract; a ledger row alone cannot prove a restored schema is usable.
     const externalSessionsMissing = ((await tx.execute(sql`
       SELECT to_regclass('project.tasks') IS NOT NULL AND EXISTS (
         SELECT 1 FROM (VALUES
