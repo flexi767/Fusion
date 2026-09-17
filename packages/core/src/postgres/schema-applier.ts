@@ -89,7 +89,9 @@ touches no data; it must advance in the same change that ships a new migration f
 /* FNXC:PatchnodeLedger 2026-08-28-12:16: the permanent ledger table must exist before TaskStore can commit a completion move atomically with its entry. */
 /* FNXC:ChatSidebarPerf 2026-09-08-04:48: baseline marker includes the chat-message recency index required for index-backed sidebar previews. */
 /* FNXC:OverlapWaitSynchronization 2026-09-17-00:22: advance the ceiling so an upgraded project has the durable wait table before any overlap-marker transition tries to record into it. Renumbered 0074->0084 (2026-09-18): upstream's own migrations 0074 (FN-323 project notes) through 0083 (FN-514) are absent from this branch by design (it excludes their source commits), but the numeric slots are real and must not be reused, or a database that ran the real 0074..0083 would be misread as compatible with this branch's different 0074. */
-export const SCHEMA_BASELINE_VERSION = "0085";
+/** FNXC:ExternalSessions 2026-09-19-00:00: Register additive observation storage on fresh databases and upgrades. Renumbered 0082->0086 during the rebase onto the post-force-push main: the 0082 slot collided with this branch's compressed 0074-0085 renumbering, so external-sessions takes the next free slot after 0085. */
+export const SCHEMA_BASELINE_VERSION = "0086";
+export const EXTERNAL_SESSIONS_VERSION = "0086";
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -397,6 +399,7 @@ function resolveMigrationsDir(): string {
 }
 
 const MIGRATIONS_DIR = resolveMigrationsDir();
+const EXTERNAL_SESSIONS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0086_external_sessions.sql");
 const BASELINE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0000_initial.sql");
 const AUTOMATION_ISOLATION_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
@@ -1631,6 +1634,17 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_MIGRATION_PATH, "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    const externalSessionsMissing = ((await tx.execute(sql`
+      SELECT to_regclass('project.external_session_hosts') IS NULL
+        OR to_regclass('project.external_session_streams') IS NULL
+        OR to_regclass('project.external_sessions') IS NULL AS missing
+    `)) as unknown as Array<{ missing: boolean }>)[0]?.missing ?? true;
+    if (!applied.includes(EXTERNAL_SESSIONS_VERSION) || externalSessionsMissing) {
+      const migrationSql = await readFile(EXTERNAL_SESSIONS_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${EXTERNAL_SESSIONS_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };
