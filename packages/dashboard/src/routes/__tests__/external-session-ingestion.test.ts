@@ -17,7 +17,7 @@ type Handler = (req: Request, res: Response) => Promise<void>;
 function setup(config: unknown = [credential]) {
   const handlers = new Map<string, Handler>();
   const getProjectContext = vi.fn(async () => ({ projectId: "project-1", store: { getAsyncLayer: () => ({ projectId: "project-1" }) } }));
-  registerExternalSessionRoutes({ router: { post: (path: string, handler: Handler) => handlers.set(path, handler) },
+  registerExternalSessionRoutes({ router: { get: vi.fn(), post: (path: string, handler: Handler) => handlers.set(path, handler) },
     options: { externalSessionCollectors: config, noAuth: true }, getProjectContext } as unknown as ApiRoutesContext);
   const res = { status: vi.fn(), json: vi.fn() }; res.status.mockReturnValue(res);
   const req = { headers: { authorization: `Bearer ${token}` }, query: { projectId: "project-1" }, body } as unknown as Request;
@@ -80,12 +80,12 @@ describe("external-session ingestion registrar", () => {
     vi.stubEnv("FUSION_EXTERNAL_SESSION_COLLECTORS", undefined);
     const disabled = setup(undefined);
     const handlers = new Map<string, Handler>();
-    registerExternalSessionRoutes({ router: { post: (path: string, handler: Handler) => handlers.set(path, handler) }, options: {} } as unknown as ApiRoutesContext);
+    registerExternalSessionRoutes({ router: { get: vi.fn(), post: (path: string, handler: Handler) => handlers.set(path, handler) }, options: {} } as unknown as ApiRoutesContext);
     await expect(handlers.get("/external-sessions/ingest")!(disabled.req, disabled.res)).rejects.toMatchObject({ statusCode: 404 });
     vi.stubEnv("FUSION_EXTERNAL_SESSION_COLLECTORS", JSON.stringify([credential]));
     vi.spyOn(ExternalSessionStore.prototype, "ingest").mockResolvedValue(ack as Awaited<ReturnType<ExternalSessionStore["ingest"]>>);
     const env = setup(null);
-    registerExternalSessionRoutes({ router: { post: (path: string, handler: Handler) => env.handlers.set(path, handler) }, getProjectContext: env.getProjectContext } as unknown as ApiRoutesContext);
+    registerExternalSessionRoutes({ router: { get: vi.fn(), post: (path: string, handler: Handler) => env.handlers.set(path, handler) }, getProjectContext: env.getProjectContext } as unknown as ApiRoutesContext);
     await env.handlers.get("/external-sessions/ingest")!(env.req, env.res);
     expect(env.json).toHaveBeenCalledWith(ack);
   });

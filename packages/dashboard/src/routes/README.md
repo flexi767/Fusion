@@ -69,7 +69,7 @@ The following is the complete top-level registrar map currently imported by `rou
 - `registerSetupActivityRoutes` — the late activity feed, concurrency, and setup split export from `register-setup-activity-routes.ts`.
 - `registerIntegratedDevServerRouter` — domain registrar mounted by `createApiRoutes`.
 - `registerAgentSkillsRoutes` — domain registrar mounted by `createApiRoutes`.
-- `registerExternalSessionRoutes` — opt-in, host/project-authenticated observation ingestion and heartbeat; no read/UI/control routes.
+- `registerExternalSessionRoutes` — opt-in, host/project-authenticated observation ingestion and heartbeat; dashboard-authenticated project-scoped cursor list/detail reads. Collector credentials do not grant read or control access.
 - `registerPatchnodeRoutes` — project-scoped read-only History delivery feed.
 - `registerProxyRoutes` — domain registrar mounted by `createApiRoutes`.
 

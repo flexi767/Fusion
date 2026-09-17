@@ -3214,3 +3214,5 @@ export { TASK_LOG_READ_ONLY_SUFFIX, buildTaskLogReadOnlyMessage, buildTaskNotFou
 export { OVERLAP_DELIVERY_UNAVAILABLE_ERROR, isRecoverableOverlapWaitFailure } from "./tasks/overlap-wait-release.js";
 export * from "./external-sessions/contract.js";
 export { ExternalSessionStore } from "./external-sessions/store.js";
+export * from "./external-sessions/read-contract.js";
+export { ExternalSessionReader } from "./external-sessions/reader.js";

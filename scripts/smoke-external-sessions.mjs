@@ -121,6 +121,20 @@ async function main() {
   const replay = await post("ingest", event);
   assert.equal(replay.status, 200); assert.equal(replay.body.applied, false); assert.equal(replay.body.sessionId, first.body.sessionId);
   console.log("PASS: ingestion and response-loss replay");
+  // FNXC:RemoteAgents 2026-09-17-23:19: Exercise the real project-bound dashboard reader, including exact host filters and the receipt-free presentation contract.
+  const read = async endpoint => {
+    const response = await fetch(`${base}/api/external-sessions${endpoint}${endpoint.includes("?") ? "&" : "?"}projectId=${encodeURIComponent(projectId)}`,
+      { signal: globalThis.AbortSignal.timeout(10_000) });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const page = await read(`?hostId=${hostId}&provider=manual-test&limit=1`);
+  assert.equal(page.sessions.length, 1); assert.equal(page.nextCursor, null);
+  assert.equal(page.sessions[0].id, first.body.sessionId); assert.equal(page.sessions[0].collectorConnected, true);
+  assert.equal(Object.hasOwn(page.sessions[0], "observationDigest"), false);
+  assert.equal((await read("?hostId=other-host")).sessions.length, 0);
+  assert.equal((await read(`/${first.body.sessionId}`)).session.id, first.body.sessionId);
+  console.log("PASS: project-scoped remote session list/detail and host filters");
   const gap = await post("ingest", { ...event, sequence: 3, eventId: "event-3" });
   assert.equal(gap.status, 409); assert.equal(gap.body.error, "sequence-gap"); assert.equal(gap.body.acknowledgedSequence, 1);
   const changed = await post("ingest", { ...event, eventId: "changed" });
@@ -141,6 +155,7 @@ async function main() {
   const recovered = await post("ingest", completed);
   assert.equal(recovered.status, 200); assert.equal(recovered.body.applied, false);
   assert.equal(recovered.body.sessionId, first.body.sessionId); assert.equal(recovered.body.acknowledgedSequence, 2);
+  assert.equal((await read(`/${first.body.sessionId}`)).session.observation.activity, "completed");
   console.log("PASS: durable acknowledgement and replay after server restart");
   await stop();
   console.log("PASS: clean shutdown");

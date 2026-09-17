@@ -1,4 +1,6 @@
-import { ExternalSessionStore, ExternalSessionConflict, externalSessionIngestionSchema, externalSessionHeartbeatSchema } from "@fusion/core";
+import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, externalSessionIngestionSchema,
+  externalSessionHeartbeatSchema, externalSessionListQuerySchema, externalSessionReadId,
+  externalSessionCursorAfter } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
@@ -10,6 +12,34 @@ import { authenticateExternalSessionCollector, parseExternalSessionCollectorCred
  * Strict bounded bodies cannot submit runtime handles, capabilities, task links, or control requests.
  */
 export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
+  // FNXC:RemoteAgents 2026-09-17-23:19: Dashboard authentication owns list/detail access; the two collector POST exemptions grant no read access.
+  ctx.router.get("/external-sessions", async (req, res) => {
+    const limit = typeof req.query.limit === "string" && /^\d+$/.test(req.query.limit) ? Number(req.query.limit) : req.query.limit;
+    const query = externalSessionListQuerySchema.safeParse({
+      ...(req.query.hostId !== undefined ? { hostId: req.query.hostId } : {}),
+      ...(req.query.provider !== undefined ? { provider: req.query.provider } : {}),
+      ...(req.query.cursor !== undefined ? { cursor: req.query.cursor } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    if (!query.success) throw new ApiError(400, "Invalid external session list query");
+    const { store, projectId } = await ctx.getProjectContext(req);
+    if (!projectId) throw new ApiError(503, "External session project storage unavailable");
+    try { externalSessionCursorAfter(projectId, query.data); }
+    catch { throw new ApiError(400, "Invalid external session cursor"); }
+    const layer = store.getAsyncLayer();
+    if (!layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
+    res.json(await new ExternalSessionReader(layer, projectId).list(query.data));
+  });
+  ctx.router.get("/external-sessions/:id", async (req, res) => {
+    const id = externalSessionReadId.safeParse(req.params.id);
+    if (!id.success) throw new ApiError(400, "Invalid external session id");
+    const { store, projectId } = await ctx.getProjectContext(req);
+    const layer = store.getAsyncLayer();
+    if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
+    const session = await new ExternalSessionReader(layer, projectId).get(id.data);
+    if (!session) throw new ApiError(404, "External session not found");
+    res.json({ schemaVersion: 1, session });
+  });
   const configured = ctx.options?.externalSessionCollectors ?? process.env.FUSION_EXTERNAL_SESSION_COLLECTORS;
   let value: unknown = configured;
   if (typeof configured === "string") {

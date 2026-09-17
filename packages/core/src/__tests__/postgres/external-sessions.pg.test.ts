@@ -4,6 +4,7 @@ import { sql } from "drizzle-orm";
 import { createSharedPgTaskStoreTestHarness, pgDescribe } from "../../__test-utils__/pg-test-harness.js";
 import { externalSessionDigest, externalSessionIngestionSchema } from "../../external-sessions/contract.js";
 import { ExternalSessionStore } from "../../external-sessions/store.js";
+import { ExternalSessionReader } from "../../external-sessions/reader.js";
 import { externalSessions, externalSessionStreams, externalSessionHosts, tasks } from "../../postgres/schema/project.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
@@ -18,6 +19,35 @@ pgDescribe("external sessions: durable observation ingestion", () => {
   const h = createSharedPgTaskStoreTestHarness({ prefix: "fusion_external", projectId: principal.projectId });
   const store = () => new ExternalSessionStore(h.layer(), principal);
   beforeAll(h.beforeAll); beforeEach(h.beforeEach); afterEach(h.afterEach); afterAll(h.afterAll);
+
+  it("reads across hosts with exact filters, bounded pages and independent heartbeat freshness", async () => {
+    const a = await store().ingest(envelope());
+    const second = new ExternalSessionStore(h.layer(), { ...principal, hostId: "host-2" });
+    const b = await second.ingest({ ...envelope(), session: { ...envelope().session, provider: "other" } });
+    await second.heartbeat({ schemaVersion: 1, collectorVersion: "1.0" }, "2026-09-17T00:05:00Z");
+    const reader = new ExternalSessionReader(h.layer(), principal.projectId);
+    const now = Date.parse("2026-09-17T00:05:10Z");
+    const first = await reader.list({ limit: 1 }, now);
+    const next = await reader.list({ limit: 1, cursor: first.nextCursor! }, now);
+    expect(new Set([...first.sessions, ...next.sessions].map(session => session.id))).toEqual(new Set([a.sessionId, b.sessionId]));
+    expect(next.nextCursor).toBeNull();
+    expect((await reader.get(a.sessionId, now))).toMatchObject({ collectorConnected: false, activityStale: true });
+    expect((await reader.get(b.sessionId, now))).toMatchObject({ collectorConnected: true, activityStale: true });
+    expect((await reader.list({ hostId: "host-2", provider: "other" })).sessions.map(session => session.id)).toEqual([b.sessionId]);
+    expect((await reader.list({ hostId: "host-2", provider: "runtime" })).sessions).toEqual([]);
+    expect(first.sessions[0]).not.toHaveProperty("observationDigest");
+  });
+
+  it("keeps reads project-isolated under an owner connection with RLS bypass", async () => {
+    const first = await store().ingest(envelope());
+    const otherLayer: AsyncDataLayer = { ...h.layer(), projectId: "other-project",
+      db: h.adminDb(), transactionImmediate: callback => h.adminDb().transaction(callback) };
+    await new ExternalSessionStore(otherLayer, { projectId: "other-project", hostId: principal.hostId }).ingest(envelope());
+    const reader = new ExternalSessionReader(otherLayer, "other-project");
+    expect(await reader.get(first.sessionId)).toBeNull();
+    expect((await reader.list()).sessions).toHaveLength(1);
+    expect(() => new ExternalSessionReader(h.layer(), "other-project")).toThrow("matching project-bound");
+  });
 
   it("deduplicates response-loss replay after reopening and never creates tasks or heartbeat", async () => {
     const first = await store().ingest(envelope());

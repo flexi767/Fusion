@@ -1,0 +1,42 @@
+# Remote agents in Fusion: delivery loop
+
+<!-- FNXC:RemoteAgents 2026-09-17-23:19: The operator narrowed AgentPulse integration to cross-server agent visibility, direct feedback and per-session token costs, and explicitly authorized deployment to the existing Fusion server. -->
+
+The latest operator instruction supersedes the broad AgentPulse parity plan. Deliver only:
+
+- See independently running Codex and Claude agents across servers: host, project, model, state, last activity and enough recent prompt/result/tool activity to understand their work. Keep connectivity distinct from activity.
+- Send feedback from Fusion to the exact owning agent. Show queued, delivered, expired, unsupported and uncertain delivery accurately; never replay an ambiguous delivery as if exactly-once injection were proven.
+- Show each session's input, cached-input, output and reasoning usage where reported, model/category token rates, and estimated session cost. Reuse Fusion pricing with effective-date/source provenance. Missing usage or prices are unknown, never zero. Distinguish estimates from provider-reported billed cost.
+
+Reuse existing Fusion views, components, navigation, auth, runtimes, history and pricing. External sessions remain observations, not lifecycle tasks. Do not build AgentPulse search, notes, pins, launch/stop/resume, AI summaries/watchers, rankings, notifications or historical-parity migration. Existing provider hooks/collectors can be adapted narrowly; do not copy or merge the prototype wholesale. Keep AgentPulse available for rollback until the operator separately requests retirement.
+
+## Starting evidence
+
+- Foundation draft PR: https://github.com/Runfusion/Fusion/pull/3631, head `3e9bef1eec65ab41839cfcc030e0a8224e0d635d`; all upstream CI passed. Acceptance: 39 focused tests plus isolated HTTP ingest/replay/restart smoke. This is a foundation, not a finished dashboard.
+- Owned feature worktree: `/Users/v/Documents/Codex/2026-09-16/fusion-external-pr1-retry/work/fusion-remote-agents`, branch `codex/remote-agent-feedback-costs`.
+- Read-only prototype: `/Users/v/dev/fusion-worktrees/agentpulse-sessions`, `9c7797a91`. Earlier comparison notes target m3, m5 and J with Codex/Claude; confirm current reachability and ownership before installation. m5 was historically unreachable; do not claim it connected based on imported history.
+- SSH alias `j` reaches server J. Its existing `fusion-daemon.service` is a user systemd service, invokes `/home/ubuntu/.npm-global/bin/fn dashboard --host 127.0.0.1 --port 4040 --no-auth`, working directory `/srv/scrapeui-dev`. Loopback health is healthy, `0.78.0-beta.4`. Server source checkout `/home/ubuntu/fusion-src` was clean at `38455359f`.
+- `fusion.topcollie.com` failed DNS resolution from both workstation and J. Read-only nginx inspection resolved the actual existing URL as `https://fusion.topkoli.com`; it returns HTTP 401 as expected from proxy authentication. Target the existing service, rather than creating a guessed domain. Never change unrelated network configuration to guess around a hostname.
+- There are separate AgentPulse, supervisor and Fusion comparison/collector services already active on J. Leave their state intact while building the narrow production integration.
+
+## Ordered implementation queue
+
+1. **Deployment and source inventory.** Inspect local/server AGENTS.md, peer activity/status, exact installed artifact and systemd service, reverse proxy and currently published domain, database/migration identity and backup/restore path. Confirm supported native feedback mechanism for each runtime. Record metadata, not secrets. Resolve migration identity against fresh upstream before extending the foundation.
+2. **Read API and bounded activity/usage contract.** Add authenticated project-isolated cursor list/detail APIs with deterministic ordering and host freshness. Persist bounded recent native activity and usage idempotently. Scope every query explicitly even under owner/superuser DB connections. Reject path/title-based identity. Review pagination, replay, clock skew and stale/offline semantics.
+3. **Native collectors and accounting.** Adapt only Codex/Claude activity and usage parsers with independent bounded durable spools, incremental complete-line reads, request deduplication and native generation fencing. Reuse recorded Fusion model pricing and current rates; avoid double-counting cached/reasoning categories or cumulative snapshots. Verify actual native formats from source/fixtures and official docs. No new AI inference.
+4. **Direct feedback.** Add authenticated browser action plus scoped host retrieval/acknowledgement, durable command ID, exact host/provider/native session/runtime generation, expiry and capability. Use only verified feedback transport (Fusion runtime bridge or explicitly installed native context hook). Preserve provider settings and existing hooks. Disable action for unsupported transports; distinguish queued-for-next-hook from immediate delivery. No arbitrary SSH execution or derived runtime handle from display paths.
+5. **Dashboard.** Extend existing Agents/session presentation with a remote-session destination, exact server/provider/project filters, recent activity, token counts, unit prices and cost coverage. Reuse existing design tokens and responsive components. One feedback composer per session with stable keyboard focus, idempotent submit and honest delivery status. No duplicate Fusion-managed cards for proven native identities.
+6. **Validation and landing.** Proportionate contract/PG/auth/parser/feedback/pricing/UI tests; real disposable end-to-end visibility and feedback transport plus restart/outage replay. Desktop/mobile, empty/unknown/populated/stale/unsupported/error states. Run required Lint, Typecheck, Build and curated Gate; do not broaden the Gate. Push only owned paths and integrate via checked PRs; coordinate peers, never force-push main or overwrite dirty work.
+7. **Deploy the finished feature.** The operator explicitly authorized production deployment to the existing Fusion service. Verify clean landed source/installed artifact, backed-up PostgreSQL/config and a usable rollback artifact before switching. Follow the deployment's normal supervised process; preserve all projects/tasks, service env, private routing and unrelated hooks. Do not publish npm or cut release tags as a substitute for deployment. Install narrowly scoped collectors/hooks on confirmed hosts, with per-host/project credentials handled privately. Enable only capabilities actually supported. Verify external URL and live view, correct session costs, real feedback delivery to each reachable supported host and reconnect/restart behavior. Roll back the owned deployment on material failure, recording evidence.
+8. **Complete.** Record exact deployed SHA/artifact, service/URL health, connected/offline hosts, feedback and cost evidence and operator test steps. Pause this heartbeat only after those acceptance criteria pass. If access/domain/host information is missing, ask one concise question, keep the exact blocker pending, and continue independent ready work.
+
+## Loop discipline
+
+Each run refreshes Git/CI/peer/service evidence, reads this plan and the state note, then advances the first ready bounded increment. Checkpoint coherent owned work with explicit-path commits and update `docs/remote-agent-delivery-state.md`. Resolve failures before accumulating new work. Do not claim deployment, native feedback or cost accuracy from unit tests alone. Do not launch agents or send unsolicited feedback; use a disposable controlled agent for acceptance, or ask the operator for an intended real message. The user authorizes implementing feedback delivery, not unsolicited messages to their active agents. When fully accepted, pause the automation and report the result; do not invent follow-on scope.
+
+## Scheduler activation blocker
+
+Creation of the requested 20-minute thread heartbeat was rejected: the scheduler tool requires
+approval, but this session's approval policy is `never`. No automation was created. The plan and
+state files support resuming in a session where scheduler creation is available. Do not claim
+this loop is active or rely on a future scheduled run until its creation is confirmed.
