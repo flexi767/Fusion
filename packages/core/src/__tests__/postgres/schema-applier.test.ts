@@ -182,7 +182,7 @@ describe("schema-applier: immutable migration identities", () => {
     expect(WHITEBOARDS_SCHEMA_VERSION).toBe("0076");
     expect(OVERLAP_WAIT_REPAIR_REQUIRED_PHASE_VERSION).toBe("0077");
     expect(OVERLAP_REVALIDATION_DRAIN_VERSION).toBe("0078");
-    expect(SCHEMA_BASELINE_VERSION).toBe("0078");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0079");
   });
 
   it("keeps monitor and approval isolation assigned to version 0003", () => {
@@ -717,7 +717,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 120 project tables, 17 central tables, 1 archive table", async () => {
+  it("creates all 120 project tables, 21 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -752,7 +752,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     database still CREATEs it from the historical 0000 baseline and then drops it,
     so fresh and upgraded databases converge on the same shape.
     */
-    expect(bySchema.central).toBe(17);
+    expect(bySchema.central).toBe(21);
     expect(bySchema.archive).toBe(1);
   });
 

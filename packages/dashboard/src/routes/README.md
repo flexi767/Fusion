@@ -139,8 +139,11 @@ Express matches in registration order. `create-api-routes-mount-sequence.ts` is 
 58. `registerIntegratedDevServerRouter`
 59. `registerAgentSkillsRoutes`
 60. `registerPatchnodeRoutes`
-61. `registerProxyRoutes`
+61. `registerExternalSessionRoutes`
+62. `registerProxyRoutes`
 <!-- mount-sequence:end -->
+
+`registerExternalSessionRoutes` provides opt-in, host-authenticated `POST /external-sessions/ingest` and dashboard-authenticated session/collector reads. Delivery receipts and snapshots commit together in the central PostgreSQL schema. The registrar never creates tasks or starts runtimes.
 
 ## Ordering rules
 

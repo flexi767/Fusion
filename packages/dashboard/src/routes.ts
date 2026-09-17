@@ -77,6 +77,7 @@ import { registerAgentSkillsRoutes } from "./routes/register-agent-skills-routes
 import { registerPluginsAutomationRoutes } from "./routes/register-plugins-automation.js";
 import { registerProxyRoutes } from "./routes/register-proxy-routes.js";
 import { registerPatchnodeRoutes } from "./routes/register-patchnode-routes.js";
+import { registerExternalSessionRoutes } from "./routes/register-external-session-routes.js";
 import { registerModelRoutes } from "./routes/register-model-routes.js";
 import { registerCustomProviderRoutes } from "./routes/register-custom-provider-routes.js";
 import { registerUsageRoutes } from "./routes/register-usage-routes.js";
@@ -2124,6 +2125,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
 
   registrarMounter.mount("registerAgentSkillsRoutes", () => registerAgentSkillsRoutes(routeContext));
   registrarMounter.mount("registerPatchnodeRoutes", () => registerPatchnodeRoutes(routeContext));
+  registrarMounter.mount("registerExternalSessionRoutes", () => registerExternalSessionRoutes(routeContext));
 
   // Remote node proxy routes stay last so explicit handlers always precede
   // the wildcard /proxy/:nodeId/{*splat} route in Express match order.

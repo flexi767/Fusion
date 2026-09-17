@@ -17,6 +17,7 @@ import {
   pgSchema,
   text,
   integer,
+  bigint,
   jsonb,
   primaryKey,
   foreignKey,
@@ -26,6 +27,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { CENTRAL_SCHEMA, bytea } from "./_shared.js";
+import type { ExternalSessionAcknowledgement, ExternalSessionObservation } from "../../external-sessions/contract.js";
 
 /**
  * FNXC:PostgresSchema 2026-06-24-03:00:
@@ -337,7 +339,50 @@ export const centralMeta = centralSchema.table("__meta", {
  * FNXC:PostgresSchema 2026-06-24-03:05:
  * Registry of all central-schema table names.
  */
+export const externalSessionCollectors = centralSchema.table("external_session_collectors", {
+  hostId: text("host_id").primaryKey(),
+  collectorVersion: text("collector_version").notNull(),
+  lastHeartbeatAt: text("last_heartbeat_at"),
+  lastAcknowledgementAt: text("last_acknowledgement_at").notNull(),
+  acceptedDeliveries: bigint("accepted_deliveries", { mode: "number" }).notNull().default(0),
+  sessionCount: integer("session_count").notNull().default(0),
+  streamCount: integer("stream_count").notNull().default(0),
+});
+
+export const externalSessionStreams = centralSchema.table("external_session_streams", {
+  hostId: text("host_id").notNull(),
+  streamId: text("stream_id").notNull(),
+  acknowledgedSequence: bigint("acknowledged_sequence", { mode: "number" }).notNull(),
+}, table => [primaryKey({ columns: [table.hostId, table.streamId] }),
+  check("external_session_streams_acknowledged_sequence_check", sql`${table.acknowledgedSequence} > 0`)]);
+
+export const externalSessions = centralSchema.table("external_sessions", {
+  id: text("id").primaryKey(),
+  hostId: text("host_id").notNull(),
+  provider: text("provider").notNull(),
+  nativeSessionId: text("native_session_id").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  observation: jsonb("observation").$type<ExternalSessionObservation>().notNull(),
+  observationHash: text("observation_hash").notNull(),
+  receivedAt: text("received_at").notNull(),
+}, table => [unique().on(table.hostId, table.provider, table.nativeSessionId),
+  check("external_sessions_revision_check", sql`${table.revision} >= 0`),
+  index("idx_external_sessions_host_provider").on(table.hostId, table.provider, table.id)]);
+
+export const externalSessionReceipts = centralSchema.table("external_session_receipts", {
+  hostId: text("host_id").notNull(),
+  eventId: text("event_id").notNull(),
+  streamId: text("stream_id").notNull(),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  acknowledgement: jsonb("acknowledgement").$type<ExternalSessionAcknowledgement>().notNull(),
+  receivedAt: text("received_at").notNull(),
+}, table => [primaryKey({ columns: [table.hostId, table.eventId] }),
+  unique().on(table.hostId, table.streamId, table.sequence),
+  check("external_session_receipts_sequence_check", sql`${table.sequence} > 0`)]);
+
 export const centralTableNames = [
+  "external_session_collectors", "external_session_streams", "external_sessions", "external_session_receipts",
   "projects", "nodes", "project_node_path_mappings", "project_health",
   "central_activity_log", "central_settings",
   "peer_nodes", "settings_sync_state", "managed_docker_nodes",

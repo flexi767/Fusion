@@ -36,6 +36,11 @@ export function hasVerifiedDaemonRequest(req: Request): boolean {
  */
 const EXEMPT_PATHS = ["/api/health", "/api/cli-agent/hooks"];
 
+/** FNXC:ExternalSessions 2026-09-17-04:01: Only the exact ingestion POST delegates auth to the host-credential registrar; reads and neighboring paths remain daemon-gated. */
+function isExternalSessionIngestion(req: Pick<Request, "method" | "path">): boolean {
+  return req.method === "POST" && req.path === "/api/external-sessions/ingest";
+}
+
 /**
  * Only /api/* paths are gated by this middleware. The SPA shell (index.html,
  * /assets/*, favicon, etc.) must load unauthenticated so the frontend JS can
@@ -174,7 +179,7 @@ export function createAuthMiddleware(token: string, options?: { validateRemoteSe
     }
 
     // Always allow exempt paths (liveness probes)
-    if (isExemptPath(req.path)) {
+    if (isExemptPath(req.path) || isExternalSessionIngestion(req)) {
       next();
       return;
     }
