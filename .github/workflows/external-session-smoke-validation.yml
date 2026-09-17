@@ -1,0 +1,120 @@
+# Temporary fork-only validation. This workflow is not part of the upstream PR.
+name: External session acceptance (fork only)
+on:
+  push:
+    branches: [codex/external-session-smoke-validation-20260918]
+permissions:
+  contents: read
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+jobs:
+  external-session-smoke:
+    name: External session acceptance (fork only)
+    runs-on: ubuntu-latest
+    # FNXC:FixPgTestsAndCi 2026-06-26-09:10:
+    # Provision a PostgreSQL service container so the postgres/*.pg.test.ts
+    # suites (pgDescribe) run in the merge gate. The pg-test-harness probe
+    # detects reachability via a TCP probe on localhost:5432 and skips when
+    # unavailable, so this service is what makes the 57 PG twin tests actually
+    # execute instead of being silently skipped.
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # Mark the service healthy only when pg_isready succeeds on the mapped
+        # port, so job steps don't start before Postgres accepts connections.
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Point the PG test harness at the service container. psql admin DDL
+      # (CREATE/DROP DATABASE) runs against this URL's maintenance database.
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
+      PGPASSWORD: "postgres"
+    # The gate's value is speed; without a job timeout a hung build or
+    # deadlocked vitest worker blocks every PR for GitHub's default 6 hours.
+    # Expected runtime is ~3-5 min.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      # FNXC:CIGateSpeed 2026-07-22-23:30:
+      # Gate-scoped INCREMENTAL dist cache (`gate-dist-*` namespace, distinct from
+      # the shard jobs' exact-match `dist-*` contract). Unlike the shard jobs —
+      # where restore-keys is forbidden because tests consume restored dist
+      # WITHOUT a build (stale dist was the FN-4232/FN-4605 failure mode) — the
+      # gate always runs `pnpm build` after restore. build-workspace.mjs verifies
+      # every package's git content hash against .fusion/cache/plugin-build-cache.json
+      # (cached below alongside dist) and rebuilds anything changed, missing, or
+      # unhashed, so a near-match restore can only speed the build up, never let
+      # stale dist through. Measured before this change: every PR missed the
+      # exact key and paid a full ~6-8 min build for ~45s of actual gate tests.
+      # NEVER add node_modules here (breaks Windows pnpm junctions elsewhere).
+      # The warm-gate-build-cache job in full-suite.yml saves this same cache
+      # (identical path list — actions/cache versions caches by path list, so
+      # the two blocks must stay in sync) on every push to main so a PR's FIRST
+      # gate run restores main's build instead of building cold.
+      - name: Compute dist source hash
+        id: dist-hash
+        run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache built dist artifacts (incremental)
+        id: dist-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            packages/core/dist
+            packages/dashboard/dist
+            packages/engine/dist
+            packages/plugin-sdk/dist
+            packages/cli/dist
+            plugins/fusion-plugin-dependency-graph/dist
+            plugins/fusion-plugin-hermes-runtime/dist
+            plugins/fusion-plugin-openclaw-runtime/dist
+            plugins/fusion-plugin-paperclip-runtime/dist
+            plugins/fusion-plugin-roadmap/dist
+            plugins/fusion-plugin-claude-runtime/dist
+            plugins/fusion-plugin-cursor-runtime/dist
+            plugins/fusion-plugin-droid-runtime/dist
+            plugins/fusion-plugin-grok-runtime/dist
+            plugins/fusion-plugin-omp-runtime/dist
+            .fusion/cache/plugin-build-cache.json
+          key: gate-dist-${{ runner.os }}-${{ steps.dist-hash.outputs.hash }}
+          restore-keys: |
+            gate-dist-${{ runner.os }}-
+
+      # Only seed the mtime-defeating artifact hash-cache on an EXACT hit; on a
+      # restore-keys near-hit the restored dist may be stale for changed
+      # packages, and `pnpm build` below is what reconciles it.
+      - name: Seed artifact hash-cache on cache hit
+        if: steps.dist-cache.outputs.cache-hit == 'true'
+        run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
+
+      # FNXC:CIGateSpeed 2026-07-22-23:30:
+      # Boot smoke needs the built workspace including the CLI. Fast CLI
+      # packaging (bin.js + extension.js, no desktop/bundled-plugin/DTS staging)
+      # is sufficient for boot smoke + test:gate and is the same shape
+      # `pnpm verify:fast` proves locally; CI=true would otherwise force the
+      # multi-minute full packaging tail on every gate run. Full CLI packaging
+      # coverage stays blocking in the separate Build job.
+      - name: Build
+        run: pnpm build
+        env:
+          FUSION_CLI_FULL_PACKAGE: "0"
+
+      - name: Focused storage and authentication regressions
+        run: pnpm test:external-sessions
+
+      - name: Isolated external-session HTTP acceptance
+        run: pnpm smoke:external-sessions
