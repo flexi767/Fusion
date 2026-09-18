@@ -139,6 +139,7 @@ async function main() {
   console.log("PASS: project-scoped remote session list/detail and host filters");
   const commandId = randomUUID();
   const feedbackBody = { commandId, generation: "smoke-generation", text: "Disposable feedback acceptance" };
+  assert.equal((await post(`${first.body.sessionId}/feedback`, feedbackBody, { authorized: false, extraHeaders: { Origin: "https://other-origin.test" } })).status, 403);
   const queued = await post(`${first.body.sessionId}/feedback`, feedbackBody, { authorized: false });
   assert.equal(queued.status, 200); assert.equal(queued.body.status, "queued");
   assert.deepEqual((await post(`${first.body.sessionId}/feedback`, feedbackBody, { authorized: false })).body, queued.body);
