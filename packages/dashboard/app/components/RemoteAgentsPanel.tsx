@@ -9,6 +9,7 @@ type Feedback = { commandId: string; status: string; createdAt: string; expiresA
 type Cost = { usage: RemoteUsage[]; estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; pricingDate: string; pricingSource: string };
 const number = (n: number) => n.toLocaleString();
 const usd = (n: number | null) => n === null ? "Unavailable" : new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(n);
+const tokenPrice = (perMillion: number) => `$${(perMillion / 1_000_000).toFixed(9)}`;
 
 function RemoteAgentDetail({ session, projectId }: { session: ExternalSessionView; projectId: string }) {
   const [detail, setDetail] = useState(session);
@@ -62,7 +63,7 @@ function RemoteAgentDetail({ session, projectId }: { session: ExternalSessionVie
       {cost.usage.map((u, i) => <section key={`${u.model}:${i}`} className="remote-agent-usage">
         <strong>{u.model} · {usd(u.usd)}</strong>
         <dl><dt>Fresh input</dt><dd>{number(u.input)}</dd><dt>Cached input</dt><dd>{number(u.cached)}</dd><dt>Cache writes (5 min / 1 hour)</dt><dd>{number(u.cacheWrite)} / {number(u.cacheWriteHour)}</dd><dt>Output</dt><dd>{number(u.output)}</dd><dt>Reasoning (included in output)</dt><dd>{u.reasoning === null ? "Not reported" : number(u.reasoning)}</dd></dl>
-        {u.rates ? <p className="remote-agent-meta">Base USD per million tokens: input {usd(u.rates.inputPer1M)}, cached {usd(u.rates.cacheReadPer1M)}, cache write {usd(u.rates.cacheWritePer1M)}, output {usd(u.rates.outputPer1M)}. Per-token price = rate ÷ 1,000,000. Source: {u.rates.source}.</p> : <p>Model rate unavailable.</p>}
+        {u.rates ? <><p className="remote-agent-meta">Base price per token: input {tokenPrice(u.rates.inputPer1M)}, cached {tokenPrice(u.rates.cacheReadPer1M)}, cache write {tokenPrice(u.rates.cacheWritePer1M)}, output {tokenPrice(u.rates.outputPer1M)}.</p><p className="remote-agent-meta">USD per million tokens: input {usd(u.rates.inputPer1M)}, cached {usd(u.rates.cacheReadPer1M)}, cache write {usd(u.rates.cacheWritePer1M)}, output {usd(u.rates.outputPer1M)}. Source: {u.rates.source}.</p></> : <p>Model rate unavailable.</p>}
         {u.reason && <p>{u.reason}</p>}
       </section>)}
       <p className="remote-agent-meta">Prices as of {cost.pricingDate} · {cost.pricingSource}. Estimates are based on reported tokens and rates, rather than a provider bill.</p>
