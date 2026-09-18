@@ -484,10 +484,16 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   );
   const viewportMode = useViewportMode();
   const isMobileViewport = viewportMode === "mobile";
+  const [agentView, setAgentView] = useState<"list" | "board" | "org" | "remote">(() => {
+    if (typeof window === "undefined") return "list";
+    const saved = getScopedItem("fn-agent-view", projectId);
+    return (saved === "list" || saved === "board" || saved === "org" || saved === "remote") ? saved : "list";
+  });
   const [filterState, setFilterState] = useState<AgentState | "all">("all");
   const { agents, stats, isLoading, loadAgents, refreshAgents } = useAgents(projectId, {
     filterState,
     showSystemAgents,
+    enabled: agentView !== "remote",
   });
   const [isCreating, setIsCreating] = useState(false);
   const [onboardingDraft, setOnboardingDraft] = useState<AgentOnboardingSummary | null>(null);
@@ -498,11 +504,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const [selectedAgentInitialTab, setSelectedAgentInitialTab] = useState<"dashboard" | "runs">("dashboard");
   const [selectedAgentInitialRunId, setSelectedAgentInitialRunId] = useState<string | null>(null);
   const [selectedAgentPreferActiveRun, setSelectedAgentPreferActiveRun] = useState(false);
-  const [agentView, setAgentView] = useState<"list" | "board" | "org" | "remote">(() => {
-    if (typeof window === "undefined") return "list";
-    const saved = getScopedItem("fn-agent-view", projectId);
-    return (saved === "list" || saved === "board" || saved === "org" || saved === "remote") ? saved : "list";
-  });
   const [orgChartLayoutPreference, setOrgChartLayoutPreference] = useState<OrgChartLayoutPreference>(() => {
     if (typeof window === "undefined") return "auto";
     const saved = getScopedItem(ORG_CHART_LAYOUT_STORAGE_KEY, projectId);
@@ -716,6 +717,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   // This ensures health badges stay current while the view is open.
   // SSE refreshes are handled by useAgents.
   useEffect(() => {
+    if (agentView === "remote") return;
     const pollInterval = setInterval(() => {
       void loadAgents();
     }, 30_000);
@@ -723,10 +725,10 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     return () => {
       clearInterval(pollInterval);
     };
-  }, [loadAgents]);
+  }, [agentView, loadAgents]);
 
   useEffect(() => {
-    if (!isControlsPanelOpen) return;
+    if (agentView === "remote" || !isControlsPanelOpen) return;
 
     let cancelled = false;
     setIsBulkEligibilityLoading(true);
@@ -784,7 +786,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       document.removeEventListener("touchstart", handlePointerDown);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [addToast, isControlsPanelOpen, projectId]);
+  }, [addToast, agentView, isControlsPanelOpen, projectId]);
 
   const handleBulkStateChange = async (targetState: "paused" | "active") => {
     if (isBulkActionRunning) return;
