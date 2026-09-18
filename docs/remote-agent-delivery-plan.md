@@ -38,9 +38,11 @@ Reuse existing Fusion views, components, navigation, auth, runtimes, history and
 
 Each run refreshes Git/CI/peer/service evidence, reads this plan and the state note, then advances the first ready bounded increment. Checkpoint coherent owned work with explicit-path commits and update `docs/remote-agent-delivery-state.md`. Resolve failures before accumulating new work. Do not claim deployment, native feedback or cost accuracy from unit tests alone. Do not launch agents or send unsolicited feedback; use a disposable controlled agent for acceptance, or ask the operator for an intended real message. The user authorizes implementing feedback delivery, not unsolicited messages to their active agents. When fully accepted, pause the automation and report the result; do not invent follow-on scope.
 
-## Scheduler activation blocker
+## Scheduler activation history
 
 Creation of the requested 20-minute thread heartbeat was rejected: the scheduler tool requires
 approval, but this session's approval policy is `never`. No automation was created. The plan and
 state files support resuming in a session where scheduler creation is available. Do not claim
 this loop is active or rely on a future scheduled run until its creation is confirmed.
+
+Activation was subsequently completed from the coordinating session and independently confirmed on 2026-09-18: automation `fusion-remote-agent-delivery` is an ACTIVE heartbeat every 20 minutes, targeting this implementation thread `01a0a8fc-aba6-72d0-b6b2-fd94f06a5e79`. Its saved scheduler configuration is `/Users/v/.codex/automations/fusion-remote-agent-delivery/automation.toml`. Earlier rejected attempts remain historical evidence. Preserve the narrow heartbeat; pause only after full live acceptance and leave the unrelated general delivery loop paused.
