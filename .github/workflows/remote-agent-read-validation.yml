@@ -120,7 +120,7 @@ jobs:
         run: python3 -m unittest discover -s scripts/remote-agents -p 'test_*.py'
 
       - name: Remote agents UI and composer regressions
-        run: pnpm --filter @fusion/dashboard exec vitest run --config vitest.app.config.ts app/components/__tests__/RemoteAgentsPanel.test.tsx app/components/__tests__/AgentsView.test.tsx
+        run: pnpm --filter @fusion/dashboard exec vitest run app/components/__tests__/RemoteAgentsPanel.test.tsx app/components/__tests__/AgentsView.test.tsx
 
       - name: Isolated external-session HTTP acceptance
         run: pnpm smoke:external-sessions
