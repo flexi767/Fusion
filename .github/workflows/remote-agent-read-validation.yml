@@ -126,7 +126,8 @@ jobs:
         run: python3 -m unittest discover -s scripts/remote-agents -p 'test_*.py'
 
       - name: Remote agents UI and composer regressions
-        run: pnpm --filter @fusion/dashboard exec vitest run app/components/__tests__/RemoteAgentsPanel.test.tsx app/components/__tests__/AgentsView.test.tsx
+        # FNXC:RemoteAgents 2026-09-18-15:54: Remote mode pauses managed-agent requests; execute the disable/in-flight/re-enable regressions as well as the native session view.
+        run: pnpm --filter @fusion/dashboard exec vitest run app/hooks/__tests__/useAgents.test.ts app/components/__tests__/RemoteAgentsPanel.test.tsx app/components/__tests__/AgentsView.test.tsx
 
       - name: Isolated external-session HTTP acceptance
         run: pnpm smoke:external-sessions
