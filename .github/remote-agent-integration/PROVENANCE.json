@@ -1,0 +1,480 @@
+{
+  "createdAt": "2026-09-18T21:00:13.939060+00:00",
+  "upstreamSha": "8a83f875bae673e3692bab0da36cc93851801f24",
+  "featureSha": "16c7cc03a8649c99dc0d1d7ffef4b188708d0491",
+  "featureBase": "c98134f470fbfa0de1be59bcb042908b3bcac3a2",
+  "files": [
+    {
+      "path": ".changeset/external-session-ingestion.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "0172e6df5290482677dc986c35b42725c0c1ca8f4eda1e19bb2bd105cf1c4117",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": ".changeset/remote-agent-session-reads.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "288f580710af75f1f2af1e83d70c1e41b28dbb324e36512c95a196bd852af32a",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": ".changeset/standalone-remote-agents.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "27d75e8423366b17898053bca1b1d6d27e0be478f9b079f6e6aa3c6fed8ece4f",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "docs/external-session-ingestion.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "e2173731511398cff55135a6e1fcddc48904ec53a3a85a2a00d062c2407a6571",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "docs/external-sessions-pr-map.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "01a80c31269d97e233cf7abc7525ba85e1d824dbec668f8a179fc6558587c32a",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "docs/remote-agent-delivery-plan.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "905b15007978c9a1d6bd224b61a2caca68d0e4ac6c5c21e81216819b18dee414",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "docs/remote-agent-delivery-state.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "55c2fbac55cf3a1c653afcab95ed58898137e56c89272990a0b06a3d824aa665",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "package.json",
+      "upstreamBlob": "5284e3faf7bf92a42d7414cd45f401959ba02c81",
+      "upstreamSha256": "de2513914dd67bc588483fb40ef815f0ccdce7f88743ae801f789ea97830d9ff",
+      "resolvedSha256": "6631b38a1c45f4ae45dad1969cb3644534435ecf3e328b7e81118c41c23a773a",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/cli/tsup.config.ts",
+      "upstreamBlob": "2d3a61577e99669700cc6bbbb1e58e27e3d02e7b",
+      "upstreamSha256": "d51fcf1885f16e74cebfd3f14b93a6851aa01f9dba26a68096d73410b5f753ab",
+      "resolvedSha256": "0d7c40cbc534c95df2a4ac16fe3ca5c77017e334ae33808b73d65fcf205ba431",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/package.json",
+      "upstreamBlob": "e1537e6676387f286960cd697630de5a22e6fb01",
+      "upstreamSha256": "364ec38596241216fec391e202052149bbc983f4a56cb12d9f951b120bac79d2",
+      "resolvedSha256": "fb8169fe2c2489262843a8a3d5686392979a53592722d840c861feb628171059",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/__tests__/external-session-contract.test.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "ecf415aed27f8c2d875f30b5c2ac8ac70b38d64486ff887d0aea17786199d18f",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/__tests__/external-session-read-contract.test.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "2b6ca411bd7c1b18de3c6f28e39d0f65ef92599acd232cf296e462e551480721",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/__tests__/model-pricing.test.ts",
+      "upstreamBlob": "ca3123c5a9380b6275937f3b2cd386bc4fc460d0",
+      "upstreamSha256": "70e01800e2506365aa567468d8433588feb986e605038ef1dcd5340b3270b4ad",
+      "resolvedSha256": "905686187932e06af1e7759889a406103494d4e412a7c6d25db6f189d68b0273",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/__tests__/postgres/external-sessions.pg.test.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "26c86a6a45aae3f02235217bf184d25e4add713d2c5ac01a6c9ba961d74e507b",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/__tests__/postgres/schema-applier.test.ts",
+      "upstreamBlob": "61c3e01d4586f673d3fa03ab5c04237e2831885c",
+      "upstreamSha256": "101470b746a0779a88b522b400aed5b401f68df455babb1779474ce08a35bf5b",
+      "resolvedSha256": "ed097ec3bce3c49066ee267d23745d41fe8ff9023f54cf7845716911ccc4d23f",
+      "method": "prepared current-main owned conflict resolution",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/ai/model-pricing.ts",
+      "upstreamBlob": "ef4f1f4462c9f3f581975eb804f499a29eaf7868",
+      "upstreamSha256": "f389243f3b8c36f689ab1c39935aa74952427261c89da1681867ed1530df14f9",
+      "resolvedSha256": "ba3782e7c6ffbcd0474541ff0fb007133bf13796c7ecf1ef65ca45aae7762987",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/external-sessions/contract.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "c1c1ca8e015000764fbe56c3f26fad8718cf13b12f2f5ca1beb16c606b3dbc14",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/external-sessions/feedback.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "c336c943589b2cec8cbd7e4f2449b1cb445d32088d6669901dfec85bfa2b06de",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/external-sessions/read-contract.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "c50aba1808143799409b253babd197e82a7438672d4b9f3a4786769e7759b3d6",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/external-sessions/reader.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "0cc27c412a77156a77b7e555e061541c4c1be4049edbfd60a1eaa513c41d32cb",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/external-sessions/store.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "fc447f989a9a9ed56a120d0e08c8470e21242fc24ad7e9e95a6c3efeadfab420",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/index.ts",
+      "upstreamBlob": "ac391cb9591f4f43a5de9121b708ea91c75f1657",
+      "upstreamSha256": "2db0b43828e550f3d6be9f911bd564c8d5010d3c618832018e5bb4f6bfbf9742",
+      "resolvedSha256": "13c3d7de821580a47bd8b523954755836ee5d0b746be3669896572beccb54c2b",
+      "method": "prepared current-main owned conflict resolution",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/postgres/index.ts",
+      "upstreamBlob": "2c76e98f2da7666f2e7c39683889297f9a7b6cf1",
+      "upstreamSha256": "ab77d516395532f7f21289be340eb73ee1cb1efff4e98c17365c5d6ced1d7821",
+      "resolvedSha256": "13ff1ce013570950b11e55161dc268ea3469da401d92dad315781cf58c41c925",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/postgres/migrations/0084_external_sessions.sql",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "e6e70c805c3089b2cbb226766e4ebf62ca60e3f07d5d5badf900f2a62d0f303d",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/postgres/migrations/0085_external_session_feedback.sql",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "f01ccb506c8c4c939c7e285f0695b62e94022207375df90a9cdcab71a03d20f0",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/postgres/schema-applier.ts",
+      "upstreamBlob": "dac483919c9612ddd0bde5242bff1066df7fca1e",
+      "upstreamSha256": "e57ad9c3adefc9bbf5e3567f40dd5f4721b4e27cfd2355dbcf2a0b511b2f598d",
+      "resolvedSha256": "664513ef9ea971fd26d1342d711bef226b12360b61d315e047ba8b35b98a6730",
+      "method": "prepared current-main owned conflict resolution",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/core/src/postgres/schema/project.ts",
+      "upstreamBlob": "c412b4084c39393df7079dc429e4736bf9ec730e",
+      "upstreamSha256": "3b97219b08f48aed23ecaa56bca858e4d5d88d5868057fd151c4670c237e8aab",
+      "resolvedSha256": "9f08aa9b2b3a247be582ac7ed0ecd3dbe97fc5d845ef870e0140bd28ef2d9033",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/components/AgentsView.tsx",
+      "upstreamBlob": "cd75f682acd9c8d6843915ad1d8310f78c2bdc52",
+      "upstreamSha256": "61a5973f156bb38420de1dc1e181d90504e1b0d5395db0bce1cb934e75829245",
+      "resolvedSha256": "b36cf559969cbb21b4185e9b9bfd96b24197f881ba3875b7f86612a5d9421b0c",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/components/RemoteAgentsPanel.css",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "068b5492d8524e3947894be3f238200dd56cdafed8e528d119e58ae3fa7f77e3",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/components/RemoteAgentsPanel.tsx",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "f9ec67b55ffef3ac19e533add4d4b0e1ad0a0aed418440d9e0993111c35887a2",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/components/__tests__/AgentsView.test.tsx",
+      "upstreamBlob": "69f4dc3fe59181fd41a3df94374570de03186259",
+      "upstreamSha256": "9ed83324e4eb2f1175658038395a99422e2078f291e7c6b381de98ebf0352122",
+      "resolvedSha256": "241932d60ab926fe01efab9d4288c2d8537d8405c74f42280295eecaf1cc61c3",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/components/__tests__/RemoteAgentsPanel.test.tsx",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "fe3d8ae3e0d72c313be9ce7722b0cae807fe9f28bc698b41bff799fe2c14e69a",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/auth-middleware.ts",
+      "upstreamBlob": "32941f31ad7905fbf6f5d92d0d710b308818115a",
+      "upstreamSha256": "392b547b8f913d21021db77f812a0d370fe780cc638482938f307552f912f8b6",
+      "resolvedSha256": "4255b4b8765ea2d05b21bc3cb3270263942db682d2444a9efd795c12b482a36f",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/external-session-ingestion-paths.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "3b6c2473e1329b6af05c5d1f4f4f85c49177fed547317e3061c16a9c4a4f301c",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/remote-agents/pricing.test.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "0f764308b251388a78743595bba59a2061acb924f3a60d3606e77d505215b3ff",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/remote-agents/pricing.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "9f14d81fa42ffbfdb03bbe28016c0a8ead061829ea0a24a410628c2f68b32c66",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/remote-agents/types.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "38590146a07ef753e9971b721f2ad1110d80eba71fa49bafc0dd8c8ba485954d",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes.ts",
+      "upstreamBlob": "7b19d830df264def85d17238df59e0d9fe81e9ad",
+      "upstreamSha256": "5cf59022b17e8fe8e91cf2747fb98f6316f2cbb021e983d67e885dd25ca1acd2",
+      "resolvedSha256": "af2f57dfd17df6b5d88567f08f205078872c315e10fcc9cbb47efea99a7d8bf7",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/README.md",
+      "upstreamBlob": "34dd6d2873b3dd497c3aa58dd42accaf99f8bdbc",
+      "upstreamSha256": "384575a4e93e1082b2806dcf5f4e3837d960e7fd6348acc25b282f121751dfc9",
+      "resolvedSha256": "2ffef6c5d4bf851e728a8cfbdfddc623530558a2667914e203d8b14cea1001d2",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/__tests__/external-session-ingestion.test.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "ad8c05764b740bb075ddceed9773e9b7f74cb3440bc9db71ae59c18983425606",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/__tests__/external-session-reads.test.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "dd041cc04fd44365372708417a932bd6aaecdedc0b8bcf3686d1726ce9a22a9e",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/create-api-routes-mount-sequence.ts",
+      "upstreamBlob": "6d0121b8a40781a335664223a4c7c3d25476f9f8",
+      "upstreamSha256": "32e03ff5c93c2b57313540b31b3a4eae8112f905486eb1347a8efb612887623c",
+      "resolvedSha256": "a6d006a3cde64f10103d9a64d56fad8c9055279eb200f2239dfbff0f93aa7948",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/external-session-collector-auth.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "b0f1aa70a3a718615d42297cd54856b41dd097cc7bcf6f6d4b071e6bfd63c8ba",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/register-external-session-routes.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "69915e60923e6f36ae43fdedd46a8bfc2f5decae1ba024f6f64ab0cf90d031b9",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/routes/register-remote-agent-actions.ts",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "a2fada9311adf362a1c207eb7aa5c4b8b429949f3ef024a7154061888132bd7d",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/src/server.ts",
+      "upstreamBlob": "7484d839c35d25ae7af6700a3ea0fd5c8a57ddb4",
+      "upstreamSha256": "3c9d8bf3979c200e2210a3d4c2eed7f5ab6b4489d25d6fed6e8c3bf1f061a13b",
+      "resolvedSha256": "4d50415e07fc8c3c52fede52b13252d6ba5caa8ba06d1306c669534435d15e98",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "pnpm-lock.yaml",
+      "upstreamBlob": "a3577936438b8c62168a1129fa7eb2aab0960889",
+      "upstreamSha256": "fa3ca7b1ac99c48af9053afdfceb8b85f5788dd5c780388241bbf190e801e916",
+      "resolvedSha256": "01b4994676fdb82d12326471eda62dec2188b02ecb742b71d078fc43bbdd1be7",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/.gitignore",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "605b039425ae181cc8c40f0aa1778586524d25f19d8f9c91f7557217a2574ca4",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/README.md",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "55ebfd22cec3c0b16a2327eddcd51d5d337b7fd4d6ddcdde11d8bae9d2e2c7b5",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/collector.py",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "baef357e8899dc4781b138e4e469475a3bbdd3289f5d6d388d072a029169c47e",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/feedback_hook.py",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "f68f550823a7870dfcb9499344cd1736027167a41cd25c54410eb174cfd31d78",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/install_hooks.py",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "67272af4cb096dc3ed4f5753bdac7125c0d94ab2cc7ec64b080651c4f89488cf",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/native_parser.py",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "fef80e28ed9fa244be189ceea9d8d32feef4ee70204d1ccf49620f7307f4371a",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/opaque_records.py",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "8c4c4b422a89f4d02a328faf58c3357aa27ac683537d9c94fb00000624b6fddb",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/remote-agents/test_native.py",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "ae122b39fac143bae463c4dcfc8ff8a21f334de87b1471fe2a1fe2dd6be0e3e6",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/smoke-external-sessions.mjs",
+      "upstreamBlob": null,
+      "upstreamSha256": null,
+      "resolvedSha256": "dbd9b70cb6aaed0fcc1e6e0175211fe944c91aa33a9310cfa2e84a914f6c7501",
+      "method": "owned addition absent upstream",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/hooks/useAgents.ts",
+      "upstreamBlob": "725f66463cde2f4716a42e02e0cf2a50dd97e0b3",
+      "upstreamSha256": "f46e4d670378a1fe25f37f5bbdc9189e51299fcb287f0b62f72891a555806000",
+      "resolvedSha256": "8c7cc7df4cc37290f8c4477b26c1e292d89008237a5982acea6ec2bccc1bc8c9",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    },
+    {
+      "path": "packages/dashboard/app/hooks/__tests__/useAgents.test.ts",
+      "upstreamBlob": "163d993bde34cdda375027094743b628d99fa826",
+      "upstreamSha256": "b43ce9cda0cf09957068854030a81ef89491ebf08a5e6d9f249dbdc24853e04e",
+      "resolvedSha256": "5913cdd5714c1005e0692b91894def573a5f406b91df12cd213f747fd16ae1b7",
+      "method": "clean three-way merge preserving upstream edits",
+      "mode": "100644"
+    }
+  ],
+  "patch": "standalone-current-main-owned.patch",
+  "bytes": 322338,
+  "sha256": "e9be1662f3d2496fdd8c0e514439660c9627f2a89482ca09ad04b0152b83e493",
+  "excluded": [
+    "packages/dashboard/app/components/MailboxModal.tsx",
+    "packages/dashboard/app/components/MailboxView.tsx"
+  ],
+  "status": "Prepared locally from exact verified upstream blobs and owned feature source. No J staged snapshot could be read. No server application, full current-main runtime/PG/CI validation, protected landing or deployment performed. Guard current upstream HEAD and each base blob before applying to a new isolated integration worktree."
+}

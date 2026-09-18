@@ -1,0 +1,162 @@
+# Temporary fork-only validation. This workflow is not part of the upstream PR.
+name: Current-main remote agent integration (fork only)
+on:
+  push:
+    branches: [codex/remote-agent-current-main-validation]
+permissions:
+  contents: read
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+jobs:
+  external-session-smoke:
+    name: Current-main remote agent integration (fork only)
+    runs-on: ubuntu-latest
+    # FNXC:FixPgTestsAndCi 2026-06-26-09:10:
+    # Provision a PostgreSQL service container so the postgres/*.pg.test.ts
+    # suites (pgDescribe) run in the merge gate. The pg-test-harness probe
+    # detects reachability via a TCP probe on localhost:5432 and skips when
+    # unavailable, so this service is what makes the 57 PG twin tests actually
+    # execute instead of being silently skipped.
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # Mark the service healthy only when pg_isready succeeds on the mapped
+        # port, so job steps don't start before Postgres accepts connections.
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Point the PG test harness at the service container. psql admin DDL
+      # (CREATE/DROP DATABASE) runs against this URL's maintenance database.
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
+      PGPASSWORD: "postgres"
+    # The gate's value is speed; without a job timeout a hung build or
+    # deadlocked vitest worker blocks every PR for GitHub's default 6 hours.
+    # Expected runtime is ~3-5 min.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout prepared fork package
+        uses: actions/checkout@v7.0.1
+
+      # FNXC:RemoteAgents 2026-09-18-21:02: Validate the real current upstream plus the bounded owned package, preserving all peer paths and requiring exact base/source digests. No server or protected-main write.
+      - name: Preserve owned package outside the checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/fusion-remote-owned"
+          cp .github/remote-agent-integration/standalone-current-main-owned.patch .github/remote-agent-integration/PROVENANCE.json .github/remote-agent-integration/apply_owned.py "$RUNNER_TEMP/fusion-remote-owned/"
+
+      - name: Checkout exact current upstream
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: Runfusion/Fusion
+          ref: 8a83f875bae673e3692bab0da36cc93851801f24
+          persist-credentials: false
+
+      - name: Guard and apply only owned integration paths
+        run: python3 "$FUSION_REMOTE_PREPARED_DIR/apply_owned.py"
+        env:
+          FUSION_REMOTE_PREPARED_DIR: ${{ runner.temp }}/fusion-remote-owned
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      # FNXC:CIGateSpeed 2026-07-22-23:30:
+      # Gate-scoped INCREMENTAL dist cache (`gate-dist-*` namespace, distinct from
+      # the shard jobs' exact-match `dist-*` contract). Unlike the shard jobs —
+      # where restore-keys is forbidden because tests consume restored dist
+      # WITHOUT a build (stale dist was the FN-4232/FN-4605 failure mode) — the
+      # gate always runs `pnpm build` after restore. build-workspace.mjs verifies
+      # every package's git content hash against .fusion/cache/plugin-build-cache.json
+      # (cached below alongside dist) and rebuilds anything changed, missing, or
+      # unhashed, so a near-match restore can only speed the build up, never let
+      # stale dist through. Measured before this change: every PR missed the
+      # exact key and paid a full ~6-8 min build for ~45s of actual gate tests.
+      # NEVER add node_modules here (breaks Windows pnpm junctions elsewhere).
+      # The warm-gate-build-cache job in full-suite.yml saves this same cache
+      # (identical path list — actions/cache versions caches by path list, so
+      # the two blocks must stay in sync) on every push to main so a PR's FIRST
+      # gate run restores main's build instead of building cold.
+      - name: Compute dist source hash
+        id: dist-hash
+        run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache built dist artifacts (incremental)
+        id: dist-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            packages/core/dist
+            packages/dashboard/dist
+            packages/engine/dist
+            packages/plugin-sdk/dist
+            packages/cli/dist
+            plugins/fusion-plugin-dependency-graph/dist
+            plugins/fusion-plugin-hermes-runtime/dist
+            plugins/fusion-plugin-openclaw-runtime/dist
+            plugins/fusion-plugin-paperclip-runtime/dist
+            plugins/fusion-plugin-roadmap/dist
+            plugins/fusion-plugin-claude-runtime/dist
+            plugins/fusion-plugin-cursor-runtime/dist
+            plugins/fusion-plugin-droid-runtime/dist
+            plugins/fusion-plugin-grok-runtime/dist
+            plugins/fusion-plugin-omp-runtime/dist
+            .fusion/cache/plugin-build-cache.json
+          key: gate-dist-${{ runner.os }}-${{ steps.dist-hash.outputs.hash }}
+          restore-keys: |
+            gate-dist-${{ runner.os }}-
+
+      # Only seed the mtime-defeating artifact hash-cache on an EXACT hit; on a
+      # restore-keys near-hit the restored dist may be stale for changed
+      # packages, and `pnpm build` below is what reconciles it.
+      - name: Seed artifact hash-cache on cache hit
+        if: steps.dist-cache.outputs.cache-hit == 'true'
+        run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
+
+      # FNXC:CIGateSpeed 2026-07-22-23:30:
+      # Boot smoke needs the built workspace including the CLI. Fast CLI
+      # packaging (bin.js + extension.js, no desktop/bundled-plugin/DTS staging)
+      # is sufficient for boot smoke + test:gate and is the same shape
+      # `pnpm verify:fast` proves locally; CI=true would otherwise force the
+      # multi-minute full packaging tail on every gate run. Full CLI packaging
+      # coverage stays blocking in the separate Build job.
+      - name: Build
+        run: pnpm build
+        env:
+          FUSION_CLI_FULL_PACKAGE: "0"
+
+      - name: Focused storage and authentication regressions
+        run: pnpm test:external-sessions
+
+      # FNXC:RemoteAgents 2026-09-18-08:13: Legacy ledger expectations must include feedback 0085. Require all five selected PostgreSQL cases to execute, so a skipped database probe cannot produce false acceptance.
+      - name: Legacy migration ledger regressions
+        run: |
+          pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/schema-applier.test.ts -t 'upgrades 0000 rows into the sole registered project|serializes concurrent schema appliers|upgrades a 0001 database by backfilling analytics ownership|upgrades a 0002 database by backfilling monitor and approval ownership|upgrades a 0003 database with legacy cutover preservation tables' --reporter=json --outputFile=/tmp/fusion-legacy-ledger-results.json
+          node --input-type=module -e 'import {readFileSync} from "node:fs"; const result=JSON.parse(readFileSync("/tmp/fusion-legacy-ledger-results.json", "utf8")); if(result.numPassedTests!==5 || result.numFailedTests!==0) throw new Error("Expected five executed legacy ledger cases"); console.log("Legacy ledger: five executed PostgreSQL cases passed");'
+
+      - name: Standalone native parser spool and hook regressions
+        run: python3 -m unittest discover -s scripts/remote-agents -p 'test_*.py'
+
+      - name: Remote agents UI and composer regressions
+        # FNXC:RemoteAgents 2026-09-18-15:54: Remote mode pauses managed-agent requests; execute the disable/in-flight/re-enable regressions as well as the native session view.
+        run: pnpm --filter @fusion/dashboard exec vitest run app/hooks/__tests__/useAgents.test.ts app/components/__tests__/RemoteAgentsPanel.test.tsx app/components/__tests__/AgentsView.test.tsx
+        env:
+          FUSION_DASHBOARD_DEEP: "1"
+
+      - name: Isolated external-session HTTP acceptance
+        run: pnpm smoke:external-sessions
+
+      - name: Lint and policy checks
+        run: pnpm lint
+
+      - name: Workspace typecheck
+        run: pnpm typecheck
+
+      - name: Curated Gate
+        run: pnpm test:gate
