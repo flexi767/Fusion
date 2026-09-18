@@ -1952,6 +1952,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_HUMAN_PLAN_APPROVAL_VERSION,
       TASK_PAUSE_ACCOUNTING_VERSION,
       EXTERNAL_SESSIONS_VERSION,
+      // FNXC:RemoteAgents 2026-09-18-08:12: Feedback migration 0085 is additive and must appear in legacy upgrade bookkeeping as well as observation migration 0084.
+      "0085",
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -2060,6 +2062,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_HUMAN_PLAN_APPROVAL_VERSION,
       TASK_PAUSE_ACCOUNTING_VERSION,
       EXTERNAL_SESSIONS_VERSION,
+      "0085",
     ]);
   });
 
@@ -2301,6 +2304,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_HUMAN_PLAN_APPROVAL_VERSION,
       TASK_PAUSE_ACCOUNTING_VERSION,
       EXTERNAL_SESSIONS_VERSION,
+      "0085",
     ]);
   });
 
@@ -2423,6 +2427,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_HUMAN_PLAN_APPROVAL_VERSION,
       TASK_PAUSE_ACCOUNTING_VERSION,
       EXTERNAL_SESSIONS_VERSION,
+      "0085",
     ]);
   });
 
@@ -2545,6 +2550,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_HUMAN_PLAN_APPROVAL_VERSION,
       TASK_PAUSE_ACCOUNTING_VERSION,
       EXTERNAL_SESSIONS_VERSION,
+      "0085",
     ]);
   });
 });
