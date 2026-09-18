@@ -8,9 +8,14 @@ describe("remote session accounting", () => {
     const actual = priceUsage(usage, "claude_code", { "anthropic:fixture": rates });
     expect(actual).toMatchObject({ input: 700000, cached: 200000, cacheWrite: 100000, output: 10000, reasoning: 5000, usd: 8.95, rates });
   });
-  it("keeps unknown models, tiers and hourly cache pricing unavailable", () => {
+  it("keeps unknown models and unsupported tiers unavailable", () => {
     expect(priceUsage(usage, "codex_cli")?.usd).toBeNull();
-    for (const extra of [{ fast: true }, { longContext: true }, { cacheWriteHourTokens: 1 }]) expect(priceUsage({ ...usage, ...extra }, "claude_code", { "anthropic:fixture": rates })?.usd).toBeNull();
+    for (const extra of [{ fast: true }, { longContext: true }]) expect(priceUsage({ ...usage, ...extra }, "claude_code", { "anthropic:fixture": rates })?.usd).toBeNull();
+  });
+  it("prices mixed cache durations once and handles the observed native Claude receipt", () => {
+    expect(priceUsage({ ...usage, cacheWriteHourTokens: 40000 }, "claude_code", { "anthropic:fixture": rates })).toMatchObject({ cacheWrite: 60000, cacheWriteHour: 40000, usd: 9.25 });
+    const native = priceUsage({ ...usage, model: "claude-haiku-4-5-20251001", inputTokens: 20817, cachedInputTokens: 13607, cacheWriteTokens: 7200, cacheWriteHourTokens: 7200, outputTokens: 379, reasoningTokens: null }, "claude_code");
+    expect(native?.usd).toBeCloseTo(0.0176657, 9);
   });
   it("rejects missing/negative and overlapping counters instead of guessing zero", () => {
     for (const extra of [{ outputTokens: undefined }, { inputTokens: -1 }, { cachedInputTokens: 1000001 }, { reasoningTokens: 10001 }]) expect(priceUsage({ ...usage, ...extra }, "claude_code")).toBeNull();

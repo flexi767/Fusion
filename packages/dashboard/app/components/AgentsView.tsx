@@ -1459,7 +1459,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       <ViewHeader
         icon={Bot}
         title={t("agents.title", "Agents")}
-        backAction={selectedAgentId && (isMobileViewport || agentView === "org") ? {
+        backAction={agentView !== "remote" && selectedAgentId && (isMobileViewport || agentView === "org") ? {
           label: agentView === "org" ? t("agents.backToOrgChart", "Back to org chart") : t("agents.backToAgents", "Back to agents"),
           onClick: handleCloseDetail,
           "data-testid": "agents-detail-back",
@@ -1471,11 +1471,11 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
           Overview is a view-level disclosure, so its trigger sits with the other header actions. The rail keeps only the
           agent collection and the expanded overview drops in as a sibling section beneath the header.
           */}
-          <AgentsOverviewToggle
+          {agentView !== "remote" && <AgentsOverviewToggle
             activeAgents={displayActiveAgents}
             isOpen={isOverviewOpen}
             onToggle={() => setIsOverviewOpen((open) => !open)}
-          />
+          />}
           <div className="view-toggle">
             <button className={`view-toggle-btn${agentView === "remote" ? " active" : ""}`} onClick={() => handleAgentViewChange("remote")} title="Remote agents" aria-label="Remote agents" aria-pressed={agentView === "remote"}><Server size={16} /></button>
             <button
@@ -1506,7 +1506,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
               <Network size={16} />
             </button>
           </div>
-          <div className={`agents-view-primary-actions${isControlsPanelOpen ? " agents-view-primary-actions--controls-open" : ""}`}>
+          {agentView !== "remote" && <div className={`agents-view-primary-actions${isControlsPanelOpen ? " agents-view-primary-actions--controls-open" : ""}`}>
             <button
               ref={controlsTriggerRef}
               className={`btn-icon agent-controls-trigger${isControlsPanelOpen ? " agent-controls-trigger--active" : ""}`}
@@ -1729,7 +1729,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                 <AgentTokenStatsPanel agents={displayAgents} />
               </div>
             )}
-          </div>
+          </div>}
         </div>
         }
       />
@@ -1761,7 +1761,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         stats={stats}
         activeAgents={displayActiveAgents}
         projectId={projectId}
-        isOpen={isOverviewOpen}
+        isOpen={agentView !== "remote" && isOverviewOpen}
         onSelectAgent={handleOverviewAgentSelect}
         onOpenTaskLogs={onOpenTaskLogs}
       />
