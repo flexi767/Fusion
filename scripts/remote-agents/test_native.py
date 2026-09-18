@@ -31,6 +31,17 @@ class NativeTests(unittest.TestCase):
         consume(self.db, state, e, 'codex'); consume(self.db, state, e, 'codex')
         self.assertEqual(totals(self.db, 'codex', 'native')[0]['inputTokens'], 100)
 
+    def test_codex_response_receipts_preserve_models_and_cache_writes(self):
+        state = dict(nativeSessionId='native', projectPath='/work', model='model-a')
+        e = dict(type='token_usage_record', timestamp='2026-09-18T05:00:00Z', payload=dict(response_id='response-a', usage=dict(input_tokens=100, cached_input_tokens=40, cache_write_input_tokens=10, output_tokens=8, reasoning_output_tokens=3)))
+        consume(self.db, state, e, 'codex'); consume(self.db, state, e, 'codex')
+        state['model']='model-b'; e=json.loads(json.dumps(e)); e['payload']['response_id']='response-b'
+        consume(self.db, state, e, 'codex')
+        result=totals(self.db, 'codex', 'native')
+        self.assertEqual({u['model'] for u in result}, {'model-a','model-b'})
+        self.assertEqual(sum(u['inputTokens'] for u in result),200)
+        self.assertEqual(sum(u['cacheWriteTokens'] for u in result),20)
+
     def test_partial_line_retry_and_restart_preserve_sequence(self):
         p = self.root / 'rollout.jsonl'
         meta = json.dumps(dict(type='session_meta', timestamp='2026-09-18T05:00:00Z', payload=dict(id='native', cwd='/work')))

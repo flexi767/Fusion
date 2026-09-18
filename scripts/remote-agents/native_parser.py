@@ -89,7 +89,7 @@ def consume(db, state, event, provider, accounting=True):
         if isinstance(u, dict):
             request = 'response:' + str(p.get('response_id') or event.get('ordinal') or hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest())
             usage = {k: count(u.get(v, 0 if k == 'cachedInputTokens' else None)) for k, v in fields.items()}
-            usage.update(cacheWriteTokens=0, cacheWriteHourTokens=0)
+            usage.update(cacheWriteTokens=count(u.get('cache_write_input_tokens', 0)), cacheWriteHourTokens=0)
             authoritative = True
     elif provider == 'codex' and sub == 'token_count':
         info = p.get('info') or {}; u = info.get('total_token_usage') or {}
