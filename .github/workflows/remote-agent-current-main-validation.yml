@@ -137,7 +137,7 @@ jobs:
       # FNXC:RemoteAgents 2026-09-18-08:13: Legacy ledger expectations must include feedback 0085. Require all five selected PostgreSQL cases to execute, so a skipped database probe cannot produce false acceptance.
       - name: Legacy migration ledger regressions
         run: |
-          pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/schema-applier.test.ts -t 'upgrades 0000 rows into the sole registered project|serializes concurrent schema appliers|upgrades a 0001 database by backfilling analytics ownership|upgrades a 0002 database by backfilling monitor and approval ownership|upgrades a 0003 database with legacy cutover preservation tables' --reporter=json --outputFile=/tmp/fusion-legacy-ledger-results.json
+          pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/schema-applier.test.ts -t 'upgrades 0000 rows into the sole registered project|serializes concurrent schema appliers|upgrades a 0001 database by backfilling analytics ownership|upgrades a 0002 database by backfilling monitor and approval ownership|upgrades a 0003 database with legacy cutover preservation tables' --reporter=default --reporter=json --outputFile.json=/tmp/fusion-legacy-ledger-results.json
           node --input-type=module -e 'import {readFileSync} from "node:fs"; const result=JSON.parse(readFileSync("/tmp/fusion-legacy-ledger-results.json", "utf8")); if(result.numPassedTests!==5 || result.numFailedTests!==0) throw new Error("Expected five executed legacy ledger cases"); console.log("Legacy ledger: five executed PostgreSQL cases passed");'
 
       - name: Standalone native parser spool and hook regressions

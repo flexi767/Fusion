@@ -1,7 +1,7 @@
 {
   "createdAt": "2026-09-18T21:00:13.939060+00:00",
   "upstreamSha": "8a83f875bae673e3692bab0da36cc93851801f24",
-  "featureSha": "16c7cc03a8649c99dc0d1d7ffef4b188708d0491",
+  "featureSha": "846be21f7f85905db788dd48928a2732bf35bde6",
   "featureBase": "c98134f470fbfa0de1be59bcb042908b3bcac3a2",
   "files": [
     {
@@ -120,9 +120,10 @@
       "path": "packages/core/src/__tests__/postgres/schema-applier.test.ts",
       "upstreamBlob": "61c3e01d4586f673d3fa03ab5c04237e2831885c",
       "upstreamSha256": "101470b746a0779a88b522b400aed5b401f68df455babb1779474ce08a35bf5b",
-      "resolvedSha256": "ed097ec3bce3c49066ee267d23745d41fe8ff9023f54cf7845716911ccc4d23f",
+      "resolvedSha256": "3791dbe58dd93de2bc9769101615fff806d5370397b7125aeb5070d2a3ee8f7b",
       "method": "prepared current-main owned conflict resolution",
-      "mode": "100644"
+      "mode": "100644",
+      "merge": "Current-main resolution plus authentic historical task-column fixture correction"
     },
     {
       "path": "packages/core/src/ai/model-pricing.ts",
@@ -470,16 +471,18 @@
     }
   ],
   "patch": "standalone-current-main-owned.patch",
-  "bytes": 322338,
-  "sha256": "e9be1662f3d2496fdd8c0e514439660c9627f2a89482ca09ad04b0152b83e493",
+  "bytes": 323069,
+  "sha256": "06144a25b22440aa95b36518f4e3d6064e282898561938ec5378167dd27e341c",
   "excluded": [
     "packages/dashboard/app/components/MailboxModal.tsx",
     "packages/dashboard/app/components/MailboxView.tsx"
   ],
-  "status": "Prepared locally from exact verified upstream blobs and owned feature source. No J staged snapshot could be read. No server application, full current-main runtime/PG/CI validation, protected landing or deployment performed. Guard current upstream HEAD and each base blob before applying to a new isolated integration worktree.",
+  "status": "Prepared current-main v2 after actual CI legacy fixture failure; exact owned source and base digests verified. No J application, protected landing or deployment. Full current-main checks must pass for this corrected package.",
+  "supersedesPackageSha256": "e9be1662f3d2496fdd8c0e514439660c9627f2a89482ca09ad04b0152b83e493",
+  "correction": "Actual current-main CI 35394875573 passed build and 54 focused cases but failed the legacy 0000 fixture at published 0082's column index. Retain the authentic 0000 task column; no published migration changed.",
   "archive": {
     "file": "standalone-current-main-owned.patch.gz",
-    "bytes": 87061,
-    "sha256": "a9e06501a791f8bd75655d719bd26ae2eb852ac927614722dc25d30f3a79e994"
+    "bytes": 87369,
+    "sha256": "dc443cf12cb6c92a956043b60e1f213ae0cefbe208c7bb4294f66756b23764f5"
   }
 }
