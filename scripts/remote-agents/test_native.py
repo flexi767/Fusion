@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 import tempfile
 import unittest
@@ -95,6 +96,40 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(result['otherSetting'])
         self.assertEqual(result['hooks']['PreToolUse'][0], other['hooks']['PreToolUse'][0])
         self.assertEqual(len(result['hooks']['PreToolUse']), 2)
+
+    def test_hook_route_update_deduplicates_only_owned_invocations(self):
+        path = self.root / 'hooks.json'
+        old = shlex.join(['python3', '/owned/feedback_hook.py', '--url', 'http://127.0.0.1:14040', '--project', 'project', '--host', 'm3', '--provider', 'codex', '--token-file', '/private/token', '--state', '/private/spool'])
+        new = old.replace('http://127.0.0.1:14040', 'http://wj:4040')
+        peer = old.replace('--project project', '--project peer-project')
+        wrapper = old + ' && echo operator-command'
+        preserved = [{'type': 'command', 'command': 'existing-hook'}, {'type': 'command', 'command': peer}, {'type': 'command', 'command': wrapper}]
+        config = {'trust': {'unchanged': True}, 'hooks': {'PreToolUse': [
+            {'matcher': 'Bash', 'hooks': [*preserved, {'type': 'command', 'command': old, 'timeout': 3}]},
+            {'hooks': [{'type': 'command', 'command': new}]},
+            {'hooks': [{'type': 'command', 'command': old}]},
+        ]}}
+        path.write_text(json.dumps(config))
+        before = path.read_bytes()
+        install(path, new)
+        self.assertEqual(path.read_bytes(), before)
+        install(path, new, True)
+        result = json.loads(path.read_text())
+        self.assertEqual(result['trust'], config['trust'])
+        self.assertEqual(result['hooks']['PreToolUse'][0]['matcher'], 'Bash')
+        self.assertEqual(result['hooks']['PreToolUse'][0]['hooks'][:3], preserved)
+        for groups in result['hooks'].values():
+            commands = [hook.get('command') for group in groups for hook in group['hooks']]
+            self.assertEqual(commands.count(new), 1)
+            self.assertNotIn(old, commands)
+        self.assertEqual(len(result['hooks']['PreToolUse']), 1)
+        backups = list(self.root.glob('hooks.json.fusion-backup-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), before)
+        after = path.read_bytes()
+        install(path, new, True)
+        self.assertEqual(path.read_bytes(), after)
+        self.assertEqual(list(self.root.glob('hooks.json.fusion-backup-*')), backups)
 
 
 if __name__ == '__main__':
