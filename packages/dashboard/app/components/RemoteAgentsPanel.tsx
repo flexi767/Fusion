@@ -64,9 +64,10 @@ function RemoteAgentDetail({ session, projectId }: { session: ExternalSessionVie
         <strong>{u.model} · {usd(u.usd)}</strong>
         <dl><dt>Fresh input</dt><dd>{number(u.input)}</dd><dt>Cached input</dt><dd>{number(u.cached)}</dd><dt>Cache writes (5 min / 1 hour)</dt><dd>{number(u.cacheWrite)} / {number(u.cacheWriteHour)}</dd><dt>Output</dt><dd>{number(u.output)}</dd><dt>Reasoning (included in output)</dt><dd>{u.reasoning === null ? "Not reported" : number(u.reasoning)}</dd></dl>
         {u.rates ? <><p className="remote-agent-meta">Base price per token: input {tokenPrice(u.rates.inputPer1M)}, cached {tokenPrice(u.rates.cacheReadPer1M)}, cache write {tokenPrice(u.rates.cacheWritePer1M)}, output {tokenPrice(u.rates.outputPer1M)}.</p><p className="remote-agent-meta">USD per million tokens: input {usd(u.rates.inputPer1M)}, cached {usd(u.rates.cacheReadPer1M)}, cache write {usd(u.rates.cacheWritePer1M)}, output {usd(u.rates.outputPer1M)}. Source: {u.rates.source}.</p></> : <p>Model rate unavailable.</p>}
+        {u.rates?.cacheWriteHourPer1M != null && <p className="remote-agent-meta">One-hour cache writes: {tokenPrice(u.rates.cacheWriteHourPer1M)} per token ({usd(u.rates.cacheWriteHourPer1M)} per million). Source: {u.rates.cacheWriteHourSource}.</p>}
         {u.reason && <p>{u.reason}</p>}
       </section>)}
-      <p className="remote-agent-meta">Prices as of {cost.pricingDate} · {cost.pricingSource}. Estimates are based on reported tokens and rates, rather than a provider bill.</p>
+      <p className="remote-agent-meta">Fusion pricing baseline: {cost.pricingDate} · {cost.pricingSource}. Estimates are based on reported tokens and rates, rather than a provider bill.</p>
     </>}
     <h4>Feedback to this agent</h4>
     <p className="remote-agent-meta">Queued feedback expires after five minutes and enters the agent’s next native hook. Delivered means context was emitted by that hook.</p>

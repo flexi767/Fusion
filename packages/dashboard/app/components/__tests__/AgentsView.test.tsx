@@ -1597,6 +1597,14 @@ describe("AgentsView", () => {
   });
 
   describe("view toggle (list/board)", () => {
+    it("limits the remote view to monitoring and feedback without local agent controls", async () => {
+      renderView(<AgentsView addToast={mockAddToast} />);
+      fireEvent.click(await screen.findByRole("button", { name: "Remote agents" }));
+      expect(screen.queryByRole("button", { name: "New Agent" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Import" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Controls" })).toBeNull();
+      expect(screen.getAllByRole("button", { name: "Refresh" })).toHaveLength(1);
+    });
     it("can toggle between list and board view", async () => {
       renderView(<AgentsView addToast={mockAddToast} />);
 
