@@ -16,7 +16,7 @@ patch.write_bytes(gzip.decompress(archive.read_bytes()))
 
 
 def git(*args):
-    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).rstrip("\n")
 
 
 assert git("rev-parse", "HEAD") == manifest["upstreamSha"], "Upstream identity changed"
