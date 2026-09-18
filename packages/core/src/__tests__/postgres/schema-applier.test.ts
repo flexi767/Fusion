@@ -1764,7 +1764,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       Real 0000 databases have source_agent_id (baseline since the PG cutover), so this
       historical fixture must retain it; project_id arrives via the 0006 ownership migration.
       */
-      CREATE TABLE project.tasks (id text PRIMARY KEY, source_agent_id text);
+      /* FNXC:RemoteAgents 2026-09-18-21:11: Real 0000 tasks already have column; retain it so current-main 0082 can build its project/column Boost index during this legacy upgrade. */
+      CREATE TABLE project.tasks (id text PRIMARY KEY, source_agent_id text, "column" text NOT NULL);
       /*
       FNXC:Ideation 2026-07-18-13:25:
       FN-8295 migration 0022 FKs ideation rows to missions/mission_features on (project_id, id).
