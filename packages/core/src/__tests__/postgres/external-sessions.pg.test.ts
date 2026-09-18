@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createSharedPgTaskStoreTestHarness, pgDescribe } from "../../__test-utils__/pg-test-harness.js";
@@ -8,6 +8,7 @@ import { ExternalSessionReader } from "../../external-sessions/reader.js";
 import { externalSessions, externalSessionStreams, externalSessionHosts, tasks } from "../../postgres/schema/project.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
+import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
 const envelope = (sequence = 1, revision = sequence) => ({ schemaVersion: 1, streamId: "spool", sequence,
@@ -19,6 +20,38 @@ pgDescribe("external sessions: durable observation ingestion", () => {
   const h = createSharedPgTaskStoreTestHarness({ prefix: "fusion_external", projectId: principal.projectId });
   const store = () => new ExternalSessionStore(h.layer(), principal);
   beforeAll(h.beforeAll); beforeEach(h.beforeEach); afterEach(h.afterEach); afterAll(h.afterAll);
+
+  async function feedbackSession() {
+    const now = new Date().toISOString();
+    const input = { ...envelope(), session: { ...envelope().session, observedAt: now, feedback: { generation: "runtime-1", expiresAt: new Date(Date.parse(now) + 3600000).toISOString() } } };
+    const ack = await store().ingest(input); await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.0" }, now);
+    return { now, sessionId: ack.sessionId, feedback: new ExternalSessionFeedback(h.layer(), principal.projectId) };
+  }
+  it("queues idempotently and fences native generation, host and ambiguous claims", async () => {
+    const s = await feedbackSession(); const b = { commandId: randomUUID(), generation: "runtime-1", text: "Check the failing route" };
+    const results = await Promise.all([s.feedback.submit(s.sessionId, b, s.now), s.feedback.submit(s.sessionId, b, s.now)]);
+    expect(results[0]).toEqual(results[1]); expect(results[0].status).toBe("queued");
+    await expect(s.feedback.submit(s.sessionId, { ...b, text: "Different feedback" }, s.now)).rejects.toThrow("already used");
+    expect(await s.feedback.claim("other-host", { sessionId: s.sessionId, generation: b.generation }, s.now)).toEqual({ command: null });
+    expect(await s.feedback.claim(principal.hostId, { sessionId: s.sessionId, generation: "resumed-runtime" }, s.now)).toEqual({ command: null });
+    expect((await s.feedback.claim(principal.hostId, { sessionId: s.sessionId, generation: b.generation }, s.now)).command?.commandId).toBe(b.commandId);
+    const reopened = new ExternalSessionFeedback(h.layer(), principal.projectId);
+    expect(await reopened.claim(principal.hostId, { sessionId: s.sessionId, generation: b.generation }, s.now)).toEqual({ command: null });
+    expect((await reopened.list(s.sessionId, s.now))[0].status).toBe("uncertain");
+    await expect(reopened.acknowledge("other-host", { sessionId: s.sessionId, generation: b.generation, commandId: b.commandId, status: "delivered" }, s.now)).rejects.toThrow("scope mismatch");
+    expect(await reopened.acknowledge(principal.hostId, { sessionId: s.sessionId, generation: b.generation, commandId: b.commandId, status: "delivered" }, s.now)).toEqual({ acknowledged: true });
+    expect((await reopened.list(s.sessionId, s.now))[0].status).toBe("delivered");
+    const row = (await h.adminDb().execute(sql`SELECT text FROM project.external_session_feedback WHERE project_id=${principal.projectId} AND id=${b.commandId}`))[0];
+    expect(row.text).toBe("");
+  });
+  it("expires queued feedback and rejects offline capabilities", async () => {
+    const s = await feedbackSession(); const b = { commandId: randomUUID(), generation: "runtime-1", text: "Review this" };
+    await s.feedback.submit(s.sessionId, b, s.now);
+    const later = new Date(Date.parse(s.now) + 301000).toISOString();
+    expect((await s.feedback.list(s.sessionId, later))[0].status).toBe("expired");
+    expect(await s.feedback.claim(principal.hostId, { sessionId: s.sessionId, generation: b.generation }, later)).toEqual({ command: null });
+    await expect(s.feedback.submit(s.sessionId, { ...b, commandId: randomUUID() }, later)).rejects.toThrow("offline");
+  });
 
   it("reads across hosts with exact filters, bounded pages and independent heartbeat freshness", async () => {
     const a = await store().ingest(envelope());
@@ -207,12 +240,12 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(await h.layer().db.select({ id: externalSessions.id }).from(externalSessions)).toHaveLength(1);
   });
 
-  it("installs migration 0082 on an upgrade and reopening is idempotent", async () => {
-    await h.adminDb().execute(sql.raw("DROP TABLE project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version = '0082';"));
+  it("installs migration 0084 on an upgrade and reopening is idempotent", async () => {
+    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version = '0084';"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
     expect((await store().ingest(envelope())).applied).toBe(true);
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(false);
-    const ledger = await h.adminDb().execute(sql`SELECT version FROM public.fusion_schema_migrations WHERE version = '0082'`);
+    const ledger = await h.adminDb().execute(sql`SELECT version FROM public.fusion_schema_migrations WHERE version = '0084'`);
     expect(ledger).toHaveLength(1);
   });
 });

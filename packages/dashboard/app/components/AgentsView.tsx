@@ -1,8 +1,9 @@
+import { RemoteAgentsPanel } from "./RemoteAgentsPanel";
 import "./AgentsView.css";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { useState, useEffect, useCallback, useRef, useMemo, useId, useLayoutEffect, lazy, Suspense, type CSSProperties, type ReactNode, type MutableRefObject, type RefObject, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, Filter, Upload, Network, SlidersHorizontal, ZoomIn, ZoomOut, Minimize2, Move, Info } from "lucide-react";
+import { Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, Filter, Upload, Server, Network, SlidersHorizontal, ZoomIn, ZoomOut, Minimize2, Move, Info } from "lucide-react";
 import type { Agent, AgentCapability, AgentOnboardingSummary, AgentState, OrgTreeNode } from "../api";
 import { fetchAgents, updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings, isAgentHeartbeatEnabled, withAgentHeartbeatEnabled } from "../api";
 
@@ -497,10 +498,10 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const [selectedAgentInitialTab, setSelectedAgentInitialTab] = useState<"dashboard" | "runs">("dashboard");
   const [selectedAgentInitialRunId, setSelectedAgentInitialRunId] = useState<string | null>(null);
   const [selectedAgentPreferActiveRun, setSelectedAgentPreferActiveRun] = useState(false);
-  const [agentView, setAgentView] = useState<"list" | "board" | "org">(() => {
+  const [agentView, setAgentView] = useState<"list" | "board" | "org" | "remote">(() => {
     if (typeof window === "undefined") return "list";
     const saved = getScopedItem("fn-agent-view", projectId);
-    return (saved === "list" || saved === "board" || saved === "org") ? saved : "list";
+    return (saved === "list" || saved === "board" || saved === "org" || saved === "remote") ? saved : "list";
   });
   const [orgChartLayoutPreference, setOrgChartLayoutPreference] = useState<OrgChartLayoutPreference>(() => {
     if (typeof window === "undefined") return "auto";
@@ -535,7 +536,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
   useEffect(() => {
     const saved = getScopedItem("fn-agent-view", projectId);
-    if (saved === "list" || saved === "board" || saved === "org") {
+    if (saved === "list" || saved === "board" || saved === "org" || saved === "remote") {
       setAgentView(saved);
       return;
     }
@@ -1259,7 +1260,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     setOrgChartTransform(clampTransform({ scale, x, y }));
   }, [clampScale, clampTransform]);
 
-  const handleAgentViewChange = useCallback((nextView: "list" | "board" | "org") => {
+  const handleAgentViewChange = useCallback((nextView: "list" | "board" | "org" | "remote") => {
     setAgentView(nextView);
     if (nextView !== "org") {
       setOrgChartTransform({ scale: 1, x: 0, y: 0 });
@@ -1476,6 +1477,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
             onToggle={() => setIsOverviewOpen((open) => !open)}
           />
           <div className="view-toggle">
+            <button className={`view-toggle-btn${agentView === "remote" ? " active" : ""}`} onClick={() => handleAgentViewChange("remote")} title="Remote agents" aria-label="Remote agents" aria-pressed={agentView === "remote"}><Server size={16} /></button>
             <button
               className={`view-toggle-btn${agentView === "list" ? " active" : ""}`}
               onClick={() => handleAgentViewChange("list")}
@@ -1764,7 +1766,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         onOpenTaskLogs={onOpenTaskLogs}
       />
 
-      {agentView === "org" ? (
+      {agentView === "remote" ? <RemoteAgentsPanel projectId={projectId} /> : agentView === "org" ? (
         <div className="agents-org-full-view">
           <div className="agents-view-content agents-view-content--org-full">
             {selectedAgentId ? (

@@ -1,9 +1,10 @@
 import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, externalSessionIngestionSchema,
   externalSessionHeartbeatSchema, externalSessionListQuerySchema, externalSessionReadId,
-  externalSessionCursorAfter } from "@fusion/core";
+  externalSessionCursorAfter, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackClaimSchema, feedbackAckSchema } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
+import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
 
 /**
  * FNXC:ExternalSessions 2026-09-17-04:00:
@@ -12,6 +13,7 @@ import { authenticateExternalSessionCollector, parseExternalSessionCollectorCred
  * Strict bounded bodies cannot submit runtime handles, capabilities, task links, or control requests.
  */
 export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
+  registerRemoteAgentActions(ctx);
   // FNXC:RemoteAgents 2026-09-17-23:19: Dashboard authentication owns list/detail access; the two collector POST exemptions grant no read access.
   ctx.router.get("/external-sessions", async (req, res) => {
     const limit = typeof req.query.limit === "string" && /^\d+$/.test(req.query.limit) ? Number(req.query.limit) : req.query.limit;
@@ -46,7 +48,7 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     try { value = configured.length <= 131_072 ? JSON.parse(configured) : null; } catch { value = null; }
   }
   const credentials = configured === undefined ? undefined : parseExternalSessionCollectorCredentials(value);
-  for (const operation of ["ingest", "heartbeat"] as const) {
+  for (const operation of ["ingest", "heartbeat", "feedback-claim", "feedback-ack"] as const) {
     ctx.router.post(`/external-sessions/${operation}`, async (req, res) => {
       if (credentials === undefined) throw new ApiError(404, "External session ingestion is disabled");
       if (credentials === null) throw new ApiError(503, "Invalid external session collector configuration");
@@ -54,9 +56,7 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
       const principal = authenticateExternalSessionCollector(req.headers.authorization, credentials);
       if (!principal) throw new ApiError(401, "Valid collector bearer token required");
       if (req.query.projectId !== principal.projectId) throw new ApiError(403, "Collector project scope mismatch");
-      const parsed = operation === "ingest"
-        ? externalSessionIngestionSchema.safeParse(req.body)
-        : externalSessionHeartbeatSchema.safeParse(req.body);
+      const parsed = (operation === "ingest" ? externalSessionIngestionSchema : operation === "heartbeat" ? externalSessionHeartbeatSchema : operation === "feedback-claim" ? feedbackClaimSchema : feedbackAckSchema).safeParse(req.body);
       if (!parsed.success) throw new ApiError(400, "Invalid external session envelope");
       const { store, projectId } = await ctx.getProjectContext(req);
       const layer = store.getAsyncLayer();
@@ -68,10 +68,14 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
         if (operation === "heartbeat") {
           await sessions.heartbeat(parsed.data);
           res.json({ schemaVersion: 1, hostId: principal.hostId });
-        } else {
+        } else if (operation === "ingest") {
           res.json(await sessions.ingest(parsed.data));
+        } else {
+          const feedback = new ExternalSessionFeedback(layer, principal.projectId);
+          res.json(operation === "feedback-claim" ? await feedback.claim(principal.hostId, parsed.data) : await feedback.acknowledge(principal.hostId, parsed.data));
         }
       } catch (error) {
+        if (error instanceof ExternalFeedbackConflict) throw new ApiError(409, error.message);
         if (error instanceof ExternalSessionConflict) {
           res.status(409).json({ error: error.code, ...(error.acknowledgedSequence !== undefined ? { acknowledgedSequence: error.acknowledgedSequence } : {}) });
           return;

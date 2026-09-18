@@ -3056,6 +3056,7 @@ export type {
 // can build raw queries against the AsyncDataLayer without depending on
 // drizzle-orm directly.
 export { sql as drizzleSql, eq as drizzleEq } from "drizzle-orm";
+export { ExternalSessionFeedback, ExternalFeedbackConflict, feedbackSubmitSchema, feedbackClaimSchema, feedbackAckSchema } from "./external-sessions/feedback.js";
 
 // FNXC:PostgresSchema 2026-07-04-00:00:
 // Re-export the PostgreSQL Drizzle schema namespace so plugin stores (which

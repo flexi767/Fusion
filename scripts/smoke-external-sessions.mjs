@@ -8,7 +8,7 @@
  * port-4040-allowlist: rejects reserved ports; never probes or stops a live service.
  */
 import assert from "node:assert/strict";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -115,7 +115,9 @@ async function main() {
   assert.equal(beat.status, 200, `Heartbeat failed: ${JSON.stringify(beat.body)}`); assert.equal(beat.body.hostId, hostId);
   console.log("PASS: authenticated host heartbeat");
   const event = { schemaVersion: 1, collectorVersion: "manual-smoke", streamId: "smoke-spool", sequence: 1, eventId: "event-1",
-    session: { provider: "manual-test", nativeSessionId: "session-1", revision: 1, activity: "working", observedAt: new Date().toISOString(), title: "Manual ingestion smoke" } };
+    session: { provider: "manual-test", nativeSessionId: "session-1", revision: 1, activity: "working", observedAt: new Date().toISOString(), title: "Manual ingestion smoke",
+      feedback: { generation: "smoke-generation", expiresAt: new Date(Date.now() + 3600000).toISOString() },
+      usageComplete: true, usage: [{ model: "gpt-5.6-sol", inputTokens: 1000, cachedInputTokens: 500, cacheWriteTokens: 0, cacheWriteHourTokens: 0, outputTokens: 100, reasoningTokens: 20, fast: false, longContext: false }], recentActivity: [{ kind: "prompt", at: new Date().toISOString(), text: "Disposable native activity" }] } };
   const first = await post("ingest", event);
   assert.equal(first.status, 200); assert.equal(first.body.applied, true); assert.equal(first.body.acknowledgedSequence, 1);
   const replay = await post("ingest", event);
@@ -135,6 +137,19 @@ async function main() {
   assert.equal((await read("?hostId=other-host")).sessions.length, 0);
   assert.equal((await read(`/${first.body.sessionId}`)).session.id, first.body.sessionId);
   console.log("PASS: project-scoped remote session list/detail and host filters");
+  const commandId = randomUUID();
+  const feedbackBody = { commandId, generation: "smoke-generation", text: "Disposable feedback acceptance" };
+  const queued = await post(`${first.body.sessionId}/feedback`, feedbackBody, { authorized: false });
+  assert.equal(queued.status, 200); assert.equal(queued.body.status, "queued");
+  assert.deepEqual((await post(`${first.body.sessionId}/feedback`, feedbackBody, { authorized: false })).body, queued.body);
+  const identity = { sessionId: first.body.sessionId, generation: "smoke-generation" };
+  assert.equal((await post("feedback-claim", identity, { authorized: false })).status, 401);
+  const claim = await post("feedback-claim", identity); assert.equal(claim.body.command.commandId, commandId);
+  assert.equal((await post("feedback-claim", identity)).body.command, null);
+  assert.equal((await post("feedback-ack", { ...identity, commandId, status: "delivered" })).body.acknowledged, true);
+  const cost = await read(`/${first.body.sessionId}/cost`);
+  assert.equal(cost.usage[0].input, 500); assert.equal(cost.usage[0].output, 100); assert.equal(typeof cost.estimatedUsd, "number");
+  console.log("PASS: standalone feedback queue/claim/ack, double-click fencing and disjoint token costs");
   const gap = await post("ingest", { ...event, sequence: 3, eventId: "event-3" });
   assert.equal(gap.status, 409); assert.equal(gap.body.error, "sequence-gap"); assert.equal(gap.body.acknowledgedSequence, 1);
   const changed = await post("ingest", { ...event, eventId: "changed" });
@@ -156,6 +171,7 @@ async function main() {
   assert.equal(recovered.status, 200); assert.equal(recovered.body.applied, false);
   assert.equal(recovered.body.sessionId, first.body.sessionId); assert.equal(recovered.body.acknowledgedSequence, 2);
   assert.equal((await read(`/${first.body.sessionId}`)).session.observation.activity, "completed");
+  assert.equal((await read(`/${first.body.sessionId}/feedback`)).feedback[0].status, "delivered");
   console.log("PASS: durable acknowledgement and replay after server restart");
   await stop();
   console.log("PASS: clean shutdown");
