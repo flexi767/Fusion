@@ -91,8 +91,8 @@ touches no data; it must advance in the same change that ships a new migration f
 /* FNXC:HumanPlanApproval 2026-09-15-06:24: the ceiling includes FN-408's per-card decision column, so no release gate reads tasks before it exists. */
 /* FNXC:TaskPauseAccounting 2026-09-16-06:16: the ceiling includes FN-457's paused-time columns, so timing readers never query a tasks table that lacks them. */
 /** FNXC:ExternalSessions 2026-09-17-04:00: Register additive observation storage on fresh databases and upgrades. */
-export const SCHEMA_BASELINE_VERSION = "0082";
-export const EXTERNAL_SESSIONS_VERSION = "0082";
+export const SCHEMA_BASELINE_VERSION = "0085";
+export const EXTERNAL_SESSIONS_VERSION = "0084";
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -397,7 +397,7 @@ function resolveMigrationsDir(): string {
 }
 
 const MIGRATIONS_DIR = resolveMigrationsDir();
-const EXTERNAL_SESSIONS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0082_external_sessions.sql");
+const EXTERNAL_SESSIONS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0084_external_sessions.sql");
 const BASELINE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0000_initial.sql");
 const AUTOMATION_ISOLATION_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
@@ -1775,6 +1775,13 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(EXTERNAL_SESSIONS_MIGRATION_PATH, "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.insert(migrationBookkeeping).values({ version: EXTERNAL_SESSIONS_VERSION }).onConflictDoNothing();
+      schemaChanged = true;
+    }
+    // FNXC:RemoteAgents 2026-09-18-05:22: Feedback has its own forward identity after upstream 0082/0083; never reuse their bookkeeping IDs.
+    const feedbackMissing = ((await tx.execute(sql`SELECT to_regclass('project.external_session_feedback') IS NULL AS missing`)) as unknown as Array<{ missing: boolean }>)[0]?.missing ?? true;
+    if (!applied.includes("0085") || feedbackMissing) {
+      await tx.execute(sql.raw(await readFile(join(MIGRATIONS_DIR, "0085_external_session_feedback.sql"), "utf8")));
+      await tx.insert(migrationBookkeeping).values({ version: "0085" }).onConflictDoNothing();
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };

@@ -94,6 +94,17 @@ export const externalSessions = projectSchema.table("external_sessions", {
   index("idxExternalSessionsRecent").on(t.projectId, t.receivedAt, t.id),
 ]);
 
+export const externalSessionFeedback = projectSchema.table("external_session_feedback", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  id: text("id").notNull(), sessionId: text("session_id").notNull(), generation: text("generation").notNull(),
+  text: text("text").notNull(), fingerprint: text("fingerprint").notNull(), state: text("state").notNull(),
+  createdAt: text("created_at").notNull(), expiresAt: text("expires_at").notNull(), deliveredAt: text("delivered_at"),
+}, t => [primaryKey({ columns: [t.projectId, t.id] }),
+  foreignKey({ columns: [t.projectId, t.sessionId], foreignColumns: [externalSessions.projectId, externalSessions.id] }).onDelete("cascade"),
+  index("external_session_feedback_queue").on(t.projectId, t.sessionId, t.state, t.createdAt, t.id),
+]);
+
+
 // ── Tasks ────────────────────────────────────────────────────────────
 export const tasks = projectSchema.table("tasks", {
   id: text("id").notNull(),
@@ -493,6 +504,7 @@ export const config = projectSchema.table("config", {
   workflowSteps: jsonb("workflow_steps").default([]),
   updatedAt: text("updated_at"),
 });
+
 
 /*
 FNXC:PostgresMigrationCompleteness 2026-07-14-09:27:
@@ -2797,7 +2809,7 @@ export const chatRoomMessages = projectSchema.table("chat_room_messages", {
  * entry (drift signal).
  */
 export const projectTableNames = [
-  "external_session_hosts", "external_session_streams", "external_sessions",
+  "external_session_hosts", "external_session_streams", "external_sessions", "external_session_feedback",
   "tasks", "config", "boards", "project_auth_users", "project_auth_memberships",
   "project_auth_providers", "project_auth_sessions", "task_reviewer_runs",
   "distributed_task_id_state", "distributed_task_id_reservations",

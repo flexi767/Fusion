@@ -1,7 +1,7 @@
 import { and, asc, eq, gt } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import { externalSessionHosts, externalSessions } from "../postgres/schema/project.js";
-import { externalSessionFreshness, externalSessionIdentifier } from "./contract.js";
+import { externalSessionFreshness, externalSessionIdentifier, externalSessionHostConnected } from "./contract.js";
 import { externalSessionCursorAfter, externalSessionListQuerySchema, externalSessionPageCursor,
   externalSessionReadId, type ExternalSessionListQuery, type ExternalSessionPage, type ExternalSessionView } from "./read-contract.js";
 
@@ -17,6 +17,12 @@ export class ExternalSessionReader {
   constructor(private readonly layer: AsyncDataLayer, private readonly projectId: string) {
     externalSessionIdentifier.parse(projectId);
     if (layer.projectId !== projectId) throw new Error("External session reads require a matching project-bound data layer");
+  }
+
+  async hosts(now = Date.now()) {
+    const rows = await this.layer.db.select().from(externalSessionHosts).where(eq(externalSessionHosts.projectId, this.projectId)).limit(128);
+    return rows.map(h => ({ hostId: h.hostId, lastHeartbeatAt: h.lastHeartbeatAt,
+      collectorConnected: externalSessionHostConnected(h.lastHeartbeatAt, now) }));
   }
 
   async list(value: ExternalSessionListQuery = {}, now = Date.now()): Promise<ExternalSessionPage> {

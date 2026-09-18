@@ -4,6 +4,10 @@
 
 The latest operator instruction supersedes the broad AgentPulse parity plan. Deliver only:
 
+<!-- FNXC:RemoteAgents 2026-09-18-05:22: The operator explicitly requires a standalone implementation. AgentPulse must not be a runtime dependency. -->
+
+The implementation must run with AgentPulse stopped or removed. Fusion owns ingestion, storage, read APIs, pricing and the feedback queue. Standalone host collectors read native Codex/Claude records and native hooks deliver feedback directly to Fusion. Do not proxy AgentPulse APIs or rely on its database, relay, supervisor or hooks. Preserve unrelated existing services while deploying Fusion's independent replacements.
+
 - See independently running Codex and Claude agents across servers: host, project, model, state, last activity and enough recent prompt/result/tool activity to understand their work. Keep connectivity distinct from activity.
 - Send feedback from Fusion to the exact owning agent. Show queued, delivered, expired, unsupported and uncertain delivery accurately; never replay an ambiguous delivery as if exactly-once injection were proven.
 - Show each session's input, cached-input, output and reasoning usage where reported, model/category token rates, and estimated session cost. Reuse Fusion pricing with effective-date/source provenance. Missing usage or prices are unknown, never zero. Distinguish estimates from provider-reported billed cost.

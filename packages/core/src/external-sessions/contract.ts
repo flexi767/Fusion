@@ -7,6 +7,12 @@ function containsControlCharacters(value: string): boolean {
 export const externalSessionIdentifier = z.string().min(1).max(256).refine(value => value.trim() === value && !containsControlCharacters(value));
 const counter = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const displayText = (max: number) => z.string().max(max).refine(value => !containsControlCharacters(value));
+const tokenCount = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+export const externalSessionUsageSchema = z.object({
+  model: externalSessionIdentifier, inputTokens: tokenCount, cachedInputTokens: tokenCount,
+  cacheWriteTokens: tokenCount, cacheWriteHourTokens: tokenCount, outputTokens: tokenCount,
+  reasoningTokens: tokenCount.nullable(), fast: z.boolean(), longContext: z.boolean(),
+}).strict();
 
 /**
  * FNXC:ExternalSessions 2026-09-17-04:00:
@@ -22,6 +28,12 @@ export const externalSessionObservationSchema = z.object({
   observedAt: z.string().datetime({ offset: true }).transform(value => new Date(value).toISOString()),
   title: displayText(512).optional(),
   projectPath: displayText(4096).optional(),
+  // FNXC:RemoteAgents 2026-09-18-05:22: Standalone collectors supply bounded native activity and deduplicated usage snapshots. Native hooks advertise a fenced generation; no AgentPulse service participates.
+  model: externalSessionIdentifier.optional(),
+  usage: z.array(externalSessionUsageSchema).max(64).optional(),
+  usageComplete: z.boolean().optional(),
+  recentActivity: z.array(z.object({ kind: z.enum(["prompt", "response", "tool"]), at: z.string().datetime({ offset: true }), text: z.string().max(2048) }).strict()).max(10).optional(),
+  feedback: z.object({ generation: externalSessionIdentifier, expiresAt: z.string().datetime({ offset: true }).transform(v => new Date(v).toISOString()) }).strict().optional(),
 }).strict();
 
 export const externalSessionIngestionSchema = z.object({
@@ -63,9 +75,12 @@ export function externalSessionDigest(value: ExternalSessionObservation | Extern
 }
 
 /** Host connectivity and agent activity are independent signals, using distinct clocks. */
+export function externalSessionHostConnected(heartbeatAt: string | null, now: number, staleAfterMs = 60_000) {
+  return heartbeatAt !== null && now - Date.parse(heartbeatAt) < staleAfterMs;
+}
 export function externalSessionFreshness(observation: ExternalSessionObservation, heartbeatAt: string | null, now: number, staleAfterMs = 60_000) {
   return {
-    collectorConnected: heartbeatAt !== null && now - Date.parse(heartbeatAt) < staleAfterMs,
+    collectorConnected: externalSessionHostConnected(heartbeatAt, now, staleAfterMs),
     activityStale: (observation.activity === "working" || observation.activity === "waiting")
       && now - Date.parse(observation.observedAt) >= staleAfterMs,
   };

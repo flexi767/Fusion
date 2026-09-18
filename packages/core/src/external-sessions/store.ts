@@ -37,6 +37,7 @@ export class ExternalSessionStore {
     const observation = { ...input.session,
       ...(input.session.title !== undefined ? { title: redactSecrets(input.session.title) } : {}),
       ...(input.session.projectPath !== undefined ? { projectPath: redactSecrets(input.session.projectPath) } : {}),
+      ...(input.session.recentActivity !== undefined ? { recentActivity: input.session.recentActivity.map(a => ({ ...a, text: redactSecrets(a.text).slice(0, 2048) })) } : {}),
     };
     const digest = externalSessionDigest({ ...input, session: observation });
     const observationDigest = externalSessionDigest(observation);
