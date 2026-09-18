@@ -36,6 +36,9 @@ Reuse existing Fusion views, components, navigation, auth, runtimes, history and
 
 ## Loop discipline
 
+<!-- FNXC:RemoteAgents 2026-09-18-13:20: The operator reiterates that direct WireGuard access through wj is the intended Fusion route; the Cloudflare/public interface is unnecessary for ordinary Fusion operation. Existing public credentials were explicitly provided for normal authentication if needed. Keep their values out of tracked files and evidence; do not keep reporting that credentials were never supplied. -->
+Use `http://wj:4040` as the primary operator route and `wj` for administration. Public authentication can be checked with the operator-supplied existing credentials when a permitted client supports it; do not substitute a failed client/network attempt for rejection of those credentials. Preserve the original public endpoint and authentication. Full delivery still requires real native feedback acceptance on reachable supported runtimes, honest offline coverage and safe source landing.
+
 Each run refreshes Git/CI/peer/service evidence, reads this plan and the state note, then advances the first ready bounded increment. Checkpoint coherent owned work with explicit-path commits and update `docs/remote-agent-delivery-state.md`. Resolve failures before accumulating new work. Do not claim deployment, native feedback or cost accuracy from unit tests alone. Do not launch agents or send unsolicited feedback; use a disposable controlled agent for acceptance, or ask the operator for an intended real message. The user authorizes implementing feedback delivery, not unsolicited messages to their active agents. When fully accepted, pause the automation and report the result; do not invent follow-on scope.
 
 ## Scheduler activation history
