@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Request, Response } from "express";
-import { ExternalSessionStore, ExternalSessionConflict } from "@fusion/core";
+import { ExternalSessionStore, ExternalSessionConflict, ExternalSessionFeedback } from "@fusion/core";
 import type { ApiRoutesContext } from "../types.js";
 import { registerExternalSessionRoutes } from "../register-external-session-routes.js";
 import { createAuthMiddleware } from "../../auth-middleware.js";
@@ -27,6 +27,18 @@ function setup(config: unknown = [credential]) {
 beforeEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.stubEnv("FUSION_EXTERNAL_SESSION_COLLECTORS", ""); });
 
 describe("external-session ingestion registrar", () => {
+  it("authenticates standalone hook claims and acknowledgements with exact host scope", async () => {
+    const claim = vi.spyOn(ExternalSessionFeedback.prototype, "claim").mockResolvedValue({ command: null });
+    const ackHook = vi.spyOn(ExternalSessionFeedback.prototype, "acknowledge").mockResolvedValue({ acknowledged: true });
+    for (const operation of ["feedback-claim", "feedback-ack"]) {
+      const s = setup(); s.req.body = { sessionId: "a".repeat(64), generation: "native-generation", ...(operation === "feedback-ack" ? { commandId: "550e8400-e29b-41d4-a716-446655440000", status: "delivered" } : {}) };
+      await s.handlers.get(`/external-sessions/${operation}`)!(s.req, s.res);
+      expect(operation === "feedback-claim" ? claim : ackHook).toHaveBeenCalledWith("host-1", s.req.body);
+      s.req.headers.authorization = undefined; s.getProjectContext.mockClear();
+      await expect(s.handlers.get(`/external-sessions/${operation}`)!(s.req, s.res)).rejects.toMatchObject({ statusCode: 401 });
+      expect(s.getProjectContext).not.toHaveBeenCalled();
+    }
+  });
   it("authenticates the host/project credential before resolving storage and returns a committed ack", async () => {
     const ingest = vi.spyOn(ExternalSessionStore.prototype, "ingest").mockResolvedValue(ack as Awaited<ReturnType<ExternalSessionStore["ingest"]>>);
     const s = setup();
@@ -113,6 +125,9 @@ describe("dashboard authentication boundary", () => {
     const gate = createAuthMiddleware("dashboard-secret");
     for (const [method, path, allowed] of [
       ["POST", "/api/external-sessions/ingest", true], ["POST", "/api/external-sessions/heartbeat/", true],
+      ["POST", "/api/external-sessions/feedback-claim", true], ["POST", "/api/external-sessions/feedback-ack/", true],
+      ["GET", "/api/external-sessions/feedback-claim", false], ["POST", "/api/external-sessions/feedback-ack/nested", false],
+      ["POST", "/api/external-sessions/" + "a".repeat(64) + "/feedback", false],
       ["GET", "/api/external-sessions/ingest", false], ["POST", "/api/external-sessions/ingest/nested", false],
       ["POST", "/api/tasks", false], ["GET", "/api/external-sessions", false],
     ] as const) {

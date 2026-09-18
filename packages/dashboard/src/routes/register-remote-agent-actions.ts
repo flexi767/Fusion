@@ -39,6 +39,11 @@ export const registerRemoteAgentActions: ApiRouteRegistrar = ctx => {
   });
   ctx.router.post("/external-sessions/:id/feedback", async (req, res) => {
     if (req.headers["sec-fetch-site"] === "cross-site") throw new ApiError(403, "Feedback must originate in Fusion");
+    if (req.headers.origin) {
+      let sameHost = false;
+      try { sameHost = new URL(req.headers.origin).host === req.headers.host; } catch { /* Malformed origins fail closed. */ }
+      if (!sameHost) throw new ApiError(403, "Feedback must originate in Fusion");
+    }
     const b = feedbackSubmitSchema.safeParse(req.body); if (!b.success) throw new ApiError(400, "Invalid feedback");
     const { layer, projectId, session } = await resolve(req);
     try { res.json(await new ExternalSessionFeedback(layer, projectId).submit(session.id, b.data)); }
