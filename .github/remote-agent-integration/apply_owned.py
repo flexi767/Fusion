@@ -1,6 +1,7 @@
 """FNXC:RemoteAgents 2026-09-18-21:02: Validate only the exact owned package on the exact upstream commit before running integration CI."""
 from pathlib import Path, PurePosixPath
 import hashlib
+import gzip
 import json
 import os
 import subprocess
@@ -8,7 +9,10 @@ import subprocess
 prepared = Path(os.environ["FUSION_REMOTE_PREPARED_DIR"])
 repo = Path.cwd()
 manifest = json.loads((prepared / "PROVENANCE.json").read_text())
+archive = prepared / manifest["archive"]["file"]
+assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest["archive"]["sha256"]
 patch = prepared / manifest["patch"]
+patch.write_bytes(gzip.decompress(archive.read_bytes()))
 
 
 def git(*args):

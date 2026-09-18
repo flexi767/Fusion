@@ -476,5 +476,10 @@
     "packages/dashboard/app/components/MailboxModal.tsx",
     "packages/dashboard/app/components/MailboxView.tsx"
   ],
-  "status": "Prepared locally from exact verified upstream blobs and owned feature source. No J staged snapshot could be read. No server application, full current-main runtime/PG/CI validation, protected landing or deployment performed. Guard current upstream HEAD and each base blob before applying to a new isolated integration worktree."
+  "status": "Prepared locally from exact verified upstream blobs and owned feature source. No J staged snapshot could be read. No server application, full current-main runtime/PG/CI validation, protected landing or deployment performed. Guard current upstream HEAD and each base blob before applying to a new isolated integration worktree.",
+  "archive": {
+    "file": "standalone-current-main-owned.patch.gz",
+    "bytes": 87061,
+    "sha256": "a9e06501a791f8bd75655d719bd26ae2eb852ac927614722dc25d30f3a79e994"
+  }
 }

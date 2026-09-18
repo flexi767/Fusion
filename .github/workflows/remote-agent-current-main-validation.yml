@@ -50,7 +50,7 @@ jobs:
       - name: Preserve owned package outside the checkout
         run: |
           mkdir -p "$RUNNER_TEMP/fusion-remote-owned"
-          cp .github/remote-agent-integration/standalone-current-main-owned.patch .github/remote-agent-integration/PROVENANCE.json .github/remote-agent-integration/apply_owned.py "$RUNNER_TEMP/fusion-remote-owned/"
+          cp .github/remote-agent-integration/standalone-current-main-owned.patch.gz .github/remote-agent-integration/PROVENANCE.json .github/remote-agent-integration/apply_owned.py "$RUNNER_TEMP/fusion-remote-owned/"
 
       - name: Checkout exact current upstream
         uses: actions/checkout@v7.0.1
