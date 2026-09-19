@@ -50,6 +50,12 @@ Plan/state, peer ownership, Git/CI and production evidence refreshed. All listed
 
 Plan/state, peer ownership, Git/CI and deployment evidence refreshed. All listed worktrees clean; main remains 8a83f875bae673e3692bab0da36cc93851801f24 and accepted current-main CI remains SUCCESS. Wj health/database/task identity is healthy at 01:18:37 UTC; daemon/collector/relay active, J/m3 connected and m5 null/offline. Production remains 47e4ff866b7b21e88a98a557921f02de079e7e4f; unresolved integration, backup/rollback and unauthenticated 401 evidence are unchanged. No access prerequisite changed; no duplicate validation or mutation attempted. Checked source/deployment handoff remains ready for permitted execution.
 
+## Heartbeat 2026-09-19 01:40 UTC
+
+Plan/state, peer ownership, Git/CI and production evidence refreshed. All listed worktrees clean; main remains 8a83f875bae673e3692bab0da36cc93851801f24 and accepted current-main CI remains SUCCESS. Wj health/database/task identity is healthy at 01:39:09 UTC; daemon/collector/relay active, J/m3 connected and m5 null/offline. Production remains 47e4ff866b7b21e88a98a557921f02de079e7e4f; old integration conflicts, rollback evidence and unauthenticated 401 are unchanged.
+
+A fresh in-app browser attempt to the exact public health URL with the operator-supplied Basic Auth credential was blocked by the client before navigation (`ERR_BLOCKED_BY_CLIENT`). No credential value was persisted in source/state or printed by the browser. This is neither authenticated acceptance nor credential rejection. Direct wj remains healthy. No server/native/source mutation or duplicate validation occurred; checked landing/deployment handoff remains ready for permitted execution.
+
 ## Latest heartbeat refresh
 
 2026-09-18 23:52 UTC: read plan/state first, refreshed every listed local/peer worktree (clean), checked peer-activity script (absent), and declared scoped intent. Prior checkpoint `177a3e4ae` and handoff checkpoint `e520de4ac` are pushed. Canonical main remains `8a83f875bae673e3692bab0da36cc93851801f24`; current-main run `35395556505` remains completed SUCCESS at `924229521171f0b75d2710c610bca3090f779658`. Exact accepted package/evidence and complete-tree handoff above are unchanged; no tests, package preparation or completed native acceptance repeated.
