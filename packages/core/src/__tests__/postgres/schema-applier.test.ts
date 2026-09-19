@@ -25,12 +25,14 @@ import { describe, it, expect, afterEach, beforeAll } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
+import { TASK_QUEUE_ORDER_VERSION, TASK_HUMAN_MERGE_APPROVAL_VERSION } from "../../postgres/schema-applier.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   applySchemaBaseline,
   getAppliedMigrations,
   SCHEMA_BASELINE_VERSION,
+  EXTERNAL_SESSIONS_VERSION,
   WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_VERSION,
   assertBinaryNotOlderThanDatabase,
   cePluginSchemaInit,
@@ -707,7 +709,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 113 project tables, 17 central tables, 1 archive table", async () => {
+  it("creates all project, central and archive tables", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -732,7 +734,8 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     0060 adds workspace coordination leases and land intents (→ 115). Plugin tables are added separately
     by the schema-init hook and are excluded here.
     */
-    expect(bySchema.project).toBe(115);
+    // FNXC:ExternalSessions 2026-09-19-00:00: Migration 0086 adds three project-isolated observation tables (hosts, streams, sessions) and 0087 adds a fourth (feedback), bringing the baseline from 115 to 119.
+    expect(bySchema.project).toBe(119);
     /*
     FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
     17, not 18: `central.global_concurrency` is dropped by migration 0037. A fresh
@@ -1740,7 +1743,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       Real 0000 databases have source_agent_id (baseline since the PG cutover), so this
       historical fixture must retain it; project_id arrives via the 0006 ownership migration.
       */
-      CREATE TABLE project.tasks (id text PRIMARY KEY, source_agent_id text);
+      /* FNXC:RemoteAgents 2026-09-18-21:11: Real 0000 tasks already have column; retain it so current-main 0082 can build its project/column Boost index during this legacy upgrade. */
+      CREATE TABLE project.tasks (id text PRIMARY KEY, source_agent_id text, "column" text NOT NULL);
       /*
       FNXC:Ideation 2026-07-18-13:25:
       FN-8295 migration 0022 FKs ideation rows to missions/mission_features on (project_id, id).
@@ -1921,6 +1925,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      EXTERNAL_SESSIONS_VERSION,
+      "0087",
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -2021,6 +2027,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      EXTERNAL_SESSIONS_VERSION,
+      "0087",
     ]);
   });
 
@@ -2254,6 +2262,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      EXTERNAL_SESSIONS_VERSION,
+      "0087",
     ]);
   });
 
@@ -2368,6 +2378,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      EXTERNAL_SESSIONS_VERSION,
+      "0087",
     ]);
   });
 
@@ -2482,6 +2494,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      EXTERNAL_SESSIONS_VERSION,
+      "0087",
     ]);
   });
 });
