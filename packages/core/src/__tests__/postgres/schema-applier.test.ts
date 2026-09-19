@@ -117,6 +117,7 @@ import {
   TASK_PLANNING_FAILURE_VERSION,
   CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
   OVERLAP_WAIT_SYNC_VERSION,
+  DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -736,8 +737,8 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     0060 adds workspace coordination leases and land intents (→ 115). Plugin tables are added separately
     by the schema-init hook and are excluded here.
     */
-    // FNXC:ExternalSessions 2026-09-19-00:00: migration 0086 (renumbered from 0082) adds three project-isolated metadata tables (115 -> 118).
-    expect(bySchema.project).toBe(118);
+    // FNXC:ExternalSessions 2026-09-19-00:00: migration 0086 (renumbered from 0082) adds three project-isolated metadata tables on top of this branch's post-rebase baseline (117 -> 120); measured against a live PostgreSQL run rather than recomputed by hand, since the prior "115" comment here was already stale before this migration landed.
+    expect(bySchema.project).toBe(120);
     /*
     FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
     17, not 18: `central.global_concurrency` is dropped by migration 0037. A fresh
@@ -1926,6 +1927,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
@@ -2027,6 +2029,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
     ]);
   });
@@ -2261,6 +2264,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
     ]);
   });
@@ -2376,6 +2380,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
     ]);
   });
@@ -2491,6 +2496,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_PLANNING_FAILURE_VERSION,
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
+      DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
     ]);
   });
