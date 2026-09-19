@@ -347,3 +347,9 @@ Latest actual cost survey remains 10:09 UTC: J 12 sessions (7 complete priced/5 
 ## 2026-09-19 Claude: source-landing branch pushed
 
 Protected upstream main was still `8a83f875ba` (unchanged). Branch `claude/remote-agents-landing-20260919` (worktree `/home/ubuntu/fusion-deployments/remote-agents-landing-20260919`, head `e94ea10ab3918f19b81a6635b6caaeb011923857`) cherry-picks `02ab7f4f25` and `1a595c65c7` onto it. Its tree is `71e090f24169e99ef6f716c5a8d9fda92bb0b51b`, identical to the deployed tree, with no fork-only workflow/package files. Pushed to the `origin` push URL (`flexi767/Fusion`); no PR opened and nothing merged to Runfusion main. Remaining for item 4: open a PR against Runfusion/Fusion and confirm Lint/Typecheck/Build/Gate on CI. Items 1-3 (m5 route, m3 feedback, public-auth check) untouched: no m5 SSH route from this host.
+
+## 2026-09-19 Claude: draft PR opened; acceptance blockers
+
+Draft PR https://github.com/Runfusion/Fusion/pull/3637 (`flexi767:claude/remote-agents-landing-20260919` at `e94ea10ab3918f19b81a6635b6caaeb011923857` -> `Runfusion/Fusion` main `8a83f875ba`, mergeable, not merged). Required checks (Build, Lint, Typecheck, Gate) were pending at open; results below only when observed. J loopback health `ok`, database healthy; J artifact untouched.
+
+Blockers from this host (J), evidenced 11:3x UTC: m5 `172.18.30.5` port 22 times out and no m5 key/ssh config exists, so collector installation has no safe direct route. m3 `172.18.30.7` port 22 is open but the host key is unknown here (strict check fails) and no m3 login key exists; disposable native feedback needs an operator-approved key/trust. `https://fusion.topkoli.com/api/health` returns 401 unauthenticated; authenticated acceptance needs the operator-supplied Basic Auth credentials, which are not available to this session. No trust, networking or credential changes were made.
