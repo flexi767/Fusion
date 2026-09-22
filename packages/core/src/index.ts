@@ -3199,6 +3199,7 @@ PR was rebased onto the reduced fork — those modules no longer exist on this b
 exports are intentionally dropped rather than reintroduced.
 */
 export * from "./external-sessions/contract.js";
+export * from "./external-sessions/turn-contract.js";
 export { ExternalSessionStore } from "./external-sessions/store.js";
 export * from "./external-sessions/read-contract.js";
 export { ExternalSessionReader } from "./external-sessions/reader.js";

@@ -1,6 +1,6 @@
 # AgentPulse integration into Fusion
 
-Status: proposed implementation plan; no integration implemented.
+Status: active implementation. Phases 0-1 are deployed; Phase 2 is in progress.
 Prepared: 2026-09-15.
 Baseline: Fusion fork `a58b374c7`, including upstream `6e6adf393`; AgentPulse fork `04f0dcf`.
 
@@ -71,6 +71,12 @@ PostgreSQL migrations should follow Fusion's existing migration ownership and nu
 7. Rankings show their date range and coverage. Whole-session totals and individual-turn totals must disclose missing usage and excluded unknown prices. Explain expensive work using measured request volume, context size, output and cache charges rather than invented causes.
 
 ## Delivery phases and acceptance gates
+
+Implementation ledger:
+
+- Phases 0-1: external-session storage, authenticated collectors, host-aware live cards, replay acknowledgements and feedback are deployed on J.
+- Phase 2: the bounded provider-neutral turn contract now defines prompts, results, measured duration provenance, tool counts and historical per-file patches. Durable turn ingestion, pagination and rendering remain next.
+- Phases 3-6: partial usage/cost and summary foundations exist; the phase gates remain open until the complete accounting, controls, reliability and cutover checks below pass.
 
 ### Phase 0 — Confirm contracts and preserve recovery data
 
