@@ -1,5 +1,9 @@
 import unittest
+import json
+from pathlib import Path
+import tempfile
 
+from collector import bind, connect, drain_turns, scan
 from turn_parser import consume_codex
 
 
@@ -43,6 +47,33 @@ class CodexTurnTests(unittest.TestCase):
         self.assertIsNone(consume_codex(state, dict(timestamp='2026-09-22T12:00:03Z', type='event_msg', payload=dict(type='user_message', message='Second'))))
         second = consume_codex(state, dict(timestamp='2026-09-22T12:00:04Z', type='event_msg', payload=dict(type='task_started', turn_id='native-b')))
         self.assertEqual((second['nativeTurnId'], second['ordinal'], second['prompts'][0]['text']), ('native-b', 1, 'Second'))
+
+    def test_durable_delivery_retries_latest_revision_after_observation_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = connect(root / 'spool.sqlite'); bind(db, 'project', 'host')
+            transcript = root / 'rollout.jsonl'
+            events = [
+                dict(type='session_meta', timestamp='2026-09-22T12:00:00Z', payload=dict(id='native', cwd='/work')),
+                dict(type='event_msg', timestamp='2026-09-22T12:00:01Z', payload=dict(type='user_message', message='Fix it')),
+                dict(type='event_msg', timestamp='2026-09-22T12:00:02Z', payload=dict(type='task_started', turn_id='turn-a')),
+                dict(type='event_msg', timestamp='2026-09-22T12:00:03Z', payload=dict(type='task_complete', last_agent_message='Fixed')),
+            ]
+            transcript.write_text(''.join(json.dumps(event) + '\n' for event in events))
+            scan(db, transcript, 'codex')
+            self.assertEqual(db.execute('SELECT count(*) FROM turns').fetchone()[0], 1)
+            sent = []
+            def send(operation, body):
+                sent.append((operation, body))
+                return dict(eventId=body['eventId'], sessionId=body['sessionId'],
+                            nativeTurnId=body['turn']['nativeTurnId'], revision=body['turn']['revision'])
+            self.assertEqual(drain_turns(db, 'project', 'host', send), 0)
+            db.execute('DELETE FROM pending'); db.commit()
+            self.assertEqual(drain_turns(db, 'project', 'host', send), 1)
+            self.assertEqual(drain_turns(db, 'project', 'host', send), 0)
+            self.assertEqual(sent[0][1]['turn']['response'], 'Fixed')
+            self.assertEqual(len(sent[0][1]['sessionId']), 64)
+            db.close()
 
 
 if __name__ == '__main__':

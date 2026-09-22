@@ -14,6 +14,7 @@ import time
 import urllib.parse
 import uuid
 from native_parser import consume, totals, bounded
+from turn_parser import consume_codex
 from opaque_records import ignored_header, scan_opaque_tail
 
 VERSION = 'fusion-remote-1'
@@ -61,6 +62,10 @@ def connect(path):
       CREATE TABLE IF NOT EXISTS executions(id TEXT PRIMARY KEY,state TEXT NOT NULL,expires TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS observations(provider TEXT,native TEXT,session TEXT,digest TEXT,revision INTEGER,PRIMARY KEY(provider,native));
       CREATE TABLE IF NOT EXISTS live_files(path TEXT PRIMARY KEY,mtime INTEGER,state TEXT);
+      CREATE TABLE IF NOT EXISTS turn_state(path TEXT PRIMARY KEY,state TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS turns(provider TEXT NOT NULL,native TEXT NOT NULL,turn_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,acked INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,
+        PRIMARY KEY(provider,native,turn_id));
     ''')
     for key, value in [('stream', str(uuid.uuid4())), ('sequence', '0')]:
         db.execute('INSERT OR IGNORE INTO config VALUES (?,?)', (key, value))
@@ -108,12 +113,34 @@ def enqueue(db, session):
     db.execute("UPDATE config SET value=? WHERE key='sequence'", (str(seq),))
 
 
+def drain_turns(db, project, host, send, limit=25):
+    """Send latest durable revisions only after observation replay has caught up."""
+    if db.execute('SELECT 1 FROM pending LIMIT 1').fetchone():
+        return 0
+    delivered = 0
+    rows = db.execute('SELECT provider,native,turn_id,revision,body FROM turns WHERE revision>acked ORDER BY rowid LIMIT ?', (limit,)).fetchall()
+    for provider, native, turn_id, revision, body in rows:
+        session_id = hashlib.sha256(json.dumps([project, host, provider, native], separators=(',', ':')).encode()).hexdigest()
+        event_id = hashlib.sha256(json.dumps([session_id, turn_id, revision], separators=(',', ':')).encode()).hexdigest()
+        request = dict(schemaVersion=1, eventId=event_id, sessionId=session_id, turn=json.loads(body))
+        ack = send('turn-ingest', request)
+        if (ack.get('eventId'), ack.get('sessionId'), ack.get('nativeTurnId')) != (event_id, session_id, turn_id) or ack.get('revision', 0) < revision:
+            raise ValueError('Invalid turn ingestion acknowledgement')
+        with db:
+            db.execute('UPDATE turns SET acked=max(acked,?) WHERE provider=? AND native=? AND turn_id=?',
+                       (revision, provider, native, turn_id))
+        delivered += 1
+    return delivered
+
+
 def scan(db, path, provider):
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
     old = db.execute('SELECT inode,offset,state,digest,revision FROM files WHERE path=?', (str(path),)).fetchone()
     if old and (old[0] != inode or old[1] > stat.st_size):
         raise ValueError('Transcript was replaced/truncated; cursor preserved for review')
     offset, state, previous, revision = (old[1], json.loads(old[2]), old[3], old[4]) if old else (0, {}, '', 0)
+    turn_row = db.execute('SELECT state FROM turn_state WHERE path=?', (str(path),)).fetchone()
+    turn_state = json.loads(turn_row[0]) if turn_row else {}
     opaque = state.get('opaque')
     raw = b''
     if not opaque:
@@ -138,7 +165,21 @@ def scan(db, path, provider):
         for line in raw[:end].splitlines():
             if len(line) > MAX_LINE:
                 raise ValueError('Oversized native record; cursor preserved')
-            consume(db, state, json.loads(line), provider)
+            event = json.loads(line)
+            consume(db, state, event, provider)
+            turn = consume_codex(turn_state, event) if provider == 'codex' else None
+            native = state.get('nativeSessionId')
+            if turn and isinstance(native, str):
+                body = json.dumps(turn)
+                if len(body) > 2 * 1024 * 1024:
+                    raise ValueError('Turn exceeds durable spool limit; cursor preserved')
+                capacity = db.execute('SELECT count(*),coalesce(sum(length(body)),0) FROM turns WHERE revision>acked').fetchone()
+                if capacity[0] >= 5000 or capacity[1] + len(body) > 64 * 1024 * 1024:
+                    raise ValueError('Turn delivery spool full; cursor preserved')
+                db.execute('INSERT INTO turns(provider,native,turn_id,revision,body) VALUES (?,?,?,?,?) '
+                           'ON CONFLICT(provider,native,turn_id) DO UPDATE SET revision=excluded.revision,body=excluded.body '
+                           'WHERE excluded.revision>turns.revision',
+                           (provider, native, turn['nativeTurnId'], turn['revision'], body))
         offset += end
         # A separate bounded tail keeps activity current while old token history
         # catches up. It never contributes usage, so tail/history cannot double bill.
@@ -185,6 +226,10 @@ def scan(db, path, provider):
         encoded = json.dumps(state)
         if len(encoded) > 131072:
             raise ValueError('Parser state limit; cursor preserved')
+        turn_encoded = json.dumps(turn_state)
+        if len(turn_encoded) > 2 * 1024 * 1024:
+            raise ValueError('Turn parser state limit; cursor preserved')
+        db.execute('INSERT OR REPLACE INTO turn_state VALUES (?,?)', (str(path), turn_encoded))
         db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?)', (str(path), inode, offset, encoded, previous, revision))
 
 
@@ -220,6 +265,8 @@ def main():
                         raise ValueError('Invalid ingestion acknowledgement')
                     with db:
                         db.execute('DELETE FROM pending WHERE sequence=?', (seq,))
+                drain_turns(db, args.project, args.host,
+                            lambda operation, body: post(args.url, args.project, token, operation, body))
             except Exception as error:
                 print('Fusion delivery unavailable:', type(error).__name__, flush=True)
             files = sorted(discover(args.home, args.days), key=lambda item: item[1].stat().st_mtime, reverse=True)
