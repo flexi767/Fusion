@@ -65,6 +65,21 @@ class NativeTests(unittest.TestCase):
         self.assertEqual([r[0] for r in rows], [1, 2]); self.assertEqual(json.loads(rows[-1][1])['session']['title'], 'Do the work')
         scan(self.db, p, 'codex'); self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0], 2)
 
+    def test_reopen_repairs_only_controlled_display_fields_in_pending_spool(self):
+        body = dict(schemaVersion=1, streamId='stream', sequence=1, eventId='event',
+                    session=dict(provider='codex', nativeSessionId='native', revision=1,
+                                 title='Title\x7f', projectPath='/work\nname', observedAt='2026-09-22T12:00:00Z',
+                                 activity='working', recentActivity=[dict(kind='prompt', at='2026-09-22T12:00:00Z', text='line\n2')]))
+        self.db.execute('INSERT INTO pending VALUES (?,?)', (1, json.dumps(body)))
+        self.db.execute("DELETE FROM config WHERE key='display_repair_v1'")
+        self.db.commit(); self.db.close()
+        self.db = connect(self.root / 'spool.sqlite')
+        repaired = json.loads(self.db.execute('SELECT body FROM pending WHERE sequence=1').fetchone()[0])
+        self.assertEqual(repaired['session']['title'], 'Title\ufffd')
+        self.assertEqual(repaired['session']['projectPath'], '/work\ufffdname')
+        self.assertEqual(repaired['session']['recentActivity'], body['session']['recentActivity'])
+        self.assertEqual((repaired['eventId'], repaired['sequence']), ('event', 1))
+
     def test_native_hook_emits_once_and_resumed_generation_rejects_old_command(self):
         emitted = []; acks = []; payload = dict(session_id='native', hook_event_name='PreToolUse')
         def send(operation, b):

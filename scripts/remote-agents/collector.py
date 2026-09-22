@@ -69,7 +69,25 @@ def connect(path):
     ''')
     for key, value in [('stream', str(uuid.uuid4())), ('sequence', '0')]:
         db.execute('INSERT OR IGNORE INTO config VALUES (?,?)', (key, value))
+    if not db.execute("SELECT 1 FROM config WHERE key='display_repair_v1'").fetchone():
+        for sequence, body in db.execute('SELECT sequence,body FROM pending').fetchall():
+            envelope = json.loads(body)
+            session = envelope.get('session') or {}
+            changed = False
+            for field, limit in (('title', 512), ('projectPath', 4096)):
+                if isinstance(session.get(field), str):
+                    cleaned = safe_display(session[field], limit)
+                    if cleaned != session[field]:
+                        session[field] = cleaned; changed = True
+            if changed:
+                db.execute('UPDATE pending SET body=? WHERE sequence=?', (json.dumps(envelope), sequence))
+        db.execute("INSERT INTO config VALUES ('display_repair_v1','1')")
     db.commit(); return db
+
+
+def safe_display(value, limit):
+    return ''.join('\ufffd' if ord(character) < 32 or ord(character) == 127 else character
+                   for character in bounded(value, limit))
 
 
 def bind(db, project, host):
@@ -212,8 +230,8 @@ def scan(db, path, provider):
                 previous, revision = existing[1], existing[2]
             other_incomplete = db.execute("SELECT 1 FROM files WHERE path<>? AND json_extract(state,'$.nativeSessionId')=? AND coalesce(json_extract(state,'$.usageComplete'),0)=0 LIMIT 1", (str(path), native)).fetchone()
             session.update(provider=provider, usage=usage, usageComplete=state['usageComplete'] and not other_incomplete)
-            session['projectPath'] = bounded(session.get('projectPath', ''), 4096)
-            session['title'] = bounded(' '.join(session.get('title', native).split()), 512)
+            session['projectPath'] = safe_display(session.get('projectPath', ''), 4096)
+            session['title'] = safe_display(' '.join(session.get('title', native).split()), 512)
             runtime = db.execute('SELECT generation,expires FROM runtimes WHERE provider=? AND native=?', (provider, native)).fetchone()
             if runtime and runtime[1] > datetime.now(timezone.utc).isoformat():
                 session['feedback'] = dict(generation=runtime[0], expiresAt=runtime[1])
