@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 
 from collector import bind, connect, drain_turns, scan
-from turn_parser import consume_codex
+from turn_parser import consume_claude, consume_codex
 
 
 class CodexTurnTests(unittest.TestCase):
@@ -73,6 +73,62 @@ class CodexTurnTests(unittest.TestCase):
             self.assertEqual(drain_turns(db, 'project', 'host', send), 0)
             self.assertEqual(sent[0][1]['turn']['response'], 'Fixed')
             self.assertEqual(len(sent[0][1]['sessionId']), 64)
+            db.close()
+
+
+class ClaudeTurnTests(unittest.TestCase):
+    def test_prompt_tools_patch_final_answer_and_native_duration(self):
+        state = {}
+        def event(second, kind, **extra):
+            return dict(timestamp=f'2026-09-22T12:00:{second:02d}Z', type=kind,
+                        sessionId='session', cwd='/work', **extra)
+        prompt = consume_claude(state, event(0, 'user', uuid='prompt-a', message=dict(content='Change it')))
+        self.assertEqual((prompt['nativeTurnId'], prompt['prompts'][0]['text']), ('prompt-a', 'Change it'))
+        tool = consume_claude(state, event(1, 'assistant', message=dict(content=[
+            dict(type='tool_use', id='edit-1', name='Edit', input=dict(file_path='src/a.ts'))])))
+        self.assertEqual(tool['toolCallCount'], 1)
+        result = consume_claude(state, event(2, 'user', message=dict(content=[dict(type='tool_result', tool_use_id='edit-1')]),
+                                            toolUseResult=dict(structuredPatch=[dict(oldStart=1, oldLines=1, newStart=1, newLines=1,
+                                                                                      lines=['-before', '+after'])])))
+        self.assertEqual((result['fileChanges'][0]['addedLines'], result['fileChanges'][0]['removedLines']), (1, 1))
+        self.assertTrue(result['fileChanges'][0]['patchAvailable'])
+        answer = consume_claude(state, event(4, 'assistant', message=dict(content=[dict(type='text', text='Done')], stop_reason='end_turn')))
+        self.assertEqual((answer['state'], answer['response'], answer['durationSource']), ('completed', 'Done', 'derived'))
+        done = consume_claude(state, event(5, 'system', subtype='turn_duration', durationMs=3750))
+        self.assertEqual((done['durationMs'], done['durationSource'], done['ordinal']), (3750, 'native', 0))
+        next_prompt = consume_claude(state, event(6, 'user', uuid='prompt-b', message=dict(content='Next')))
+        self.assertEqual((next_prompt['nativeTurnId'], next_prompt['ordinal']), ('prompt-b', 1))
+
+    def test_unreported_patch_and_duplicate_tool_call(self):
+        state = {}
+        consume_claude(state, dict(timestamp='2026-09-22T12:00:00Z', type='user', uuid='a', message=dict(content='Write')))
+        tool = dict(timestamp='2026-09-22T12:00:01Z', type='assistant', message=dict(content=[
+            dict(type='tool_use', id='write-1', name='Write', input=dict(file_path='src/new.ts'))]))
+        consume_claude(state, tool); consume_claude(state, tool)
+        change = consume_claude(state, dict(timestamp='2026-09-22T12:00:02Z', type='user',
+                                          message=dict(content=[dict(type='tool_result', tool_use_id='write-1')])))
+        self.assertEqual(change['toolCallCount'], 1)
+        self.assertFalse(change['fileChanges'][0]['patchAvailable'])
+
+    def test_collector_spools_claude_turn_with_native_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = connect(root / 'spool.sqlite'); bind(db, 'project', 'host')
+            transcript = root / 'session.jsonl'
+            events = [
+                dict(type='user', timestamp='2026-09-22T12:00:00Z', sessionId='session', cwd='/work',
+                     uuid='prompt-a', message=dict(content='Fix the file')),
+                dict(type='assistant', timestamp='2026-09-22T12:00:03Z', sessionId='session', cwd='/work',
+                     message=dict(id='request-a', model='claude', content=[dict(type='text', text='Fixed')],
+                                  stop_reason='end_turn')),
+                dict(type='system', subtype='turn_duration', timestamp='2026-09-22T12:00:04Z', sessionId='session', cwd='/work',
+                     durationMs=2400),
+            ]
+            transcript.write_text(''.join(json.dumps(event) + '\n' for event in events))
+            scan(db, transcript, 'claude')
+            row = db.execute('SELECT native,turn_id,revision,body FROM turns').fetchone()
+            self.assertEqual((row[0], row[1]), ('session', 'prompt-a'))
+            self.assertEqual((json.loads(row[3])['durationMs'], json.loads(row[3])['response']), (2400, 'Fixed'))
+            self.assertEqual(db.execute('SELECT count(*) FROM turns').fetchone()[0], 1)
             db.close()
 
 

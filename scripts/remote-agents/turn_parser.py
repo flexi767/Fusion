@@ -1,4 +1,4 @@
-"""Incremental, bounded Codex turn projection from native transcript events.
+"""Incremental, bounded Codex and Claude turns from native transcript events.
 
 The caller persists ``state`` with its transcript cursor. No working-tree files are
 read: a patch is shown only when the native event carries one.
@@ -112,4 +112,88 @@ def consume_codex(state, event):
     if changed and turn['prompts']:
         turn['revision'] += 1
         return dict(turn) if not turn['nativeTurnId'].startswith('inferred:') else None
+    return None
+
+
+def consume_claude(state, event):
+    """Project Claude user/assistant/tool events without inspecting host files."""
+    if not isinstance(event, dict) or not isinstance(event.get('timestamp'), str):
+        return None
+    at, kind = event['timestamp'], event.get('type')
+    message = event.get('message') or {}
+    if not isinstance(message, dict):
+        return None
+    blocks = message.get('content')
+    blocks = blocks if isinstance(blocks, list) else []
+    turn = state.get('turn')
+    if kind == 'user' and not event.get('isMeta'):
+        prompt = content(message.get('content'))
+        if prompt:
+            if not turn or turn['state'] != 'ongoing':
+                state['ordinal'] = state.get('ordinal', -1) + 1
+                identity = event.get('uuid')
+                native_id = identity if isinstance(identity, str) and identity else 'claude:' + str(state['ordinal'])
+                turn = dict(nativeTurnId=bounded(native_id, 256), revision=0, ordinal=state['ordinal'],
+                            state='ongoing', prompts=[], response=None, startedAt=at, endedAt=None,
+                            durationMs=None, durationSource=None, toolCallCount=0, fileChanges=[])
+                state['turn'] = turn
+            if len(turn['prompts']) < 32 and (not turn['prompts'] or turn['prompts'][-1]['text'] != bounded(prompt, 65536)):
+                turn['prompts'].append(dict(at=at, text=bounded(prompt, 65536)))
+                turn['revision'] += 1
+                return dict(turn)
+    if not turn:
+        return None
+    changed = False
+    if kind == 'assistant':
+        answer = content(message.get('content'))
+        if answer and turn['response'] != bounded(answer, 131072):
+            turn['response'] = bounded(answer, 131072); changed = True
+        for block in blocks:
+            if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                continue
+            call_id = block.get('id')
+            if not isinstance(call_id, str) or not call_id or call_id in state.setdefault('calls', {}):
+                continue
+            state['calls'][call_id] = dict(name=block.get('name'), input=block.get('input') or {})
+            turn['toolCallCount'] += 1; changed = True
+        if message.get('stop_reason') in ('end_turn', 'stop_sequence', 'max_tokens') and turn['state'] == 'ongoing':
+            turn['state'] = 'completed'; turn['endedAt'] = at
+            turn['durationMs'] = _elapsed(turn['startedAt'], at)
+            turn['durationSource'] = 'derived' if turn['durationMs'] is not None else None
+            changed = True
+    elif kind == 'user':
+        result = event.get('toolUseResult') or {}
+        for block in blocks:
+            if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                continue
+            call = state.setdefault('calls', {}).pop(block.get('tool_use_id'), None)
+            if not call or block.get('is_error') or call['name'] not in ('Edit', 'Write', 'MultiEdit'):
+                continue
+            tool_input = call.get('input')
+            if not isinstance(tool_input, dict):
+                continue
+            path = tool_input.get('file_path') or tool_input.get('path')
+            if not isinstance(path, str) or not path or len(turn['fileChanges']) >= 128:
+                continue
+            patch = None
+            if isinstance(result, dict) and isinstance(result.get('structuredPatch'), list):
+                lines = []
+                for hunk in result['structuredPatch']:
+                    if not isinstance(hunk, dict):
+                        continue
+                    lines.append(f"@@ -{hunk.get('oldStart', 0)},{hunk.get('oldLines', 0)} +{hunk.get('newStart', 0)},{hunk.get('newLines', 0)} @@")
+                    lines.extend(line for line in hunk.get('lines', []) if isinstance(line, str))
+                patch = '\n'.join(lines) + '\n' if lines else None
+            change = _change(path, {'type': 'modify', **({'diff': patch} if patch else {})})
+            if change:
+                turn['fileChanges'].append(change); changed = True
+    elif kind == 'system' and event.get('subtype') == 'turn_duration':
+        duration = event.get('durationMs')
+        turn['state'] = 'completed'; turn['endedAt'] = at
+        turn['durationMs'] = duration if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0 else _elapsed(turn['startedAt'], at)
+        turn['durationSource'] = ('native' if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0 else 'derived') if turn['durationMs'] is not None else None
+        changed = True
+    if changed and turn['prompts']:
+        turn['revision'] += 1
+        return dict(turn)
     return None

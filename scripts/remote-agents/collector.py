@@ -14,7 +14,7 @@ import time
 import urllib.parse
 import uuid
 from native_parser import consume, totals, bounded
-from turn_parser import consume_codex
+from turn_parser import consume_claude, consume_codex
 from opaque_records import ignored_header, scan_opaque_tail
 
 VERSION = 'fusion-remote-1'
@@ -167,7 +167,7 @@ def scan(db, path, provider):
                 raise ValueError('Oversized native record; cursor preserved')
             event = json.loads(line)
             consume(db, state, event, provider)
-            turn = consume_codex(turn_state, event) if provider == 'codex' else None
+            turn = consume_codex(turn_state, event) if provider == 'codex' else consume_claude(turn_state, event) if provider == 'claude' else None
             native = state.get('nativeSessionId')
             if turn and isinstance(native, str):
                 body = json.dumps(turn)
