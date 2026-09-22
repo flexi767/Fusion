@@ -41,6 +41,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { desc, sql } from "drizzle-orm";
 import type { ExternalSessionObservation } from "../../external-sessions/contract.js";
+import type { ExternalSessionTurn } from "../../external-sessions/turn-contract.js";
 import { PROJECT_SCHEMA, bytea, tsvector } from "./_shared.js";
 
 /**
@@ -102,6 +103,24 @@ export const externalSessionFeedback = projectSchema.table("external_session_fee
 }, t => [primaryKey({ columns: [t.projectId, t.id] }),
   foreignKey({ columns: [t.projectId, t.sessionId], foreignColumns: [externalSessions.projectId, externalSessions.id] }).onDelete("cascade"),
   index("external_session_feedback_queue").on(t.projectId, t.sessionId, t.state, t.createdAt, t.id),
+]);
+
+/** Historical transcript data is immutable by identity and advances only by native revision. */
+export const externalSessionTurns = projectSchema.table("external_session_turns", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  sessionId: text("session_id").notNull(),
+  nativeTurnId: text("native_turn_id").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  ordinal: bigint("ordinal", { mode: "number" }).notNull(),
+  turn: jsonb("turn").$type<ExternalSessionTurn>().notNull(),
+  turnDigest: text("turn_digest").notNull(),
+  receivedAt: text("received_at").notNull(),
+}, t => [
+  primaryKey({ columns: [t.projectId, t.sessionId, t.nativeTurnId] }),
+  foreignKey({ columns: [t.projectId, t.sessionId], foreignColumns: [externalSessions.projectId, externalSessions.id] }).onDelete("cascade"),
+  check("external_session_turn_revision", sql`${t.revision} BETWEEN 1 AND 9007199254740991`),
+  check("external_session_turn_ordinal", sql`${t.ordinal} BETWEEN 0 AND 9007199254740991`),
+  index("external_session_turn_history").on(t.projectId, t.sessionId, t.ordinal, t.nativeTurnId),
 ]);
 
 
@@ -2720,7 +2739,7 @@ export const chatRoomMessages = projectSchema.table("chat_room_messages", {
  * entry (drift signal).
  */
 export const projectTableNames = [
-  "external_session_hosts", "external_session_streams", "external_sessions", "external_session_feedback",
+  "external_session_hosts", "external_session_streams", "external_sessions", "external_session_feedback", "external_session_turns",
   "tasks", "config", "boards", "project_auth_users", "project_auth_memberships",
   "project_auth_providers", "project_auth_sessions", "task_reviewer_runs",
   "distributed_task_id_state", "distributed_task_id_reservations",

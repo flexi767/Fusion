@@ -5,10 +5,11 @@ import { createSharedPgTaskStoreTestHarness, pgDescribe } from "../../__test-uti
 import { externalSessionDigest, externalSessionIngestionSchema } from "../../external-sessions/contract.js";
 import { ExternalSessionStore } from "../../external-sessions/store.js";
 import { ExternalSessionReader } from "../../external-sessions/reader.js";
-import { externalSessions, externalSessionStreams, externalSessionHosts, tasks } from "../../postgres/schema/project.js";
+import { externalSessions, externalSessionStreams, externalSessionHosts, externalSessionTurns, tasks } from "../../postgres/schema/project.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
+import { externalSessionTurnSchema } from "../../external-sessions/turn-contract.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
 const envelope = (sequence = 1, revision = sequence) => ({ schemaVersion: 1, streamId: "spool", sequence,
@@ -91,6 +92,21 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(await h.layer().db.select().from(tasks)).toHaveLength(0);
     expect((await store().getHost())?.lastHeartbeatAt).toBeNull();
     expect((await store().get(first.sessionId))?.origin).toBe("observed");
+  });
+
+  it("stores bounded historical turns under the observed session and cascades them on deletion", async () => {
+    const sessionId = (await store().ingest(envelope())).sessionId;
+    const turn = externalSessionTurnSchema.parse({ nativeTurnId: "turn-1", revision: 1, ordinal: 0,
+      state: "completed", prompts: [{ at: null, text: "Fix it" }], response: "Done",
+      startedAt: null, endedAt: null, durationMs: null, durationSource: null, toolCallCount: 2,
+      fileChanges: [{ path: "src/a.ts", operation: "modify", addedLines: 1, removedLines: 0,
+        patchAvailable: true, patch: "@@ -1 +1 @@\n-old\n+new", truncated: false }] });
+    await h.layer().db.insert(externalSessionTurns).values({ projectId: principal.projectId, sessionId,
+      nativeTurnId: turn.nativeTurnId, revision: turn.revision, ordinal: turn.ordinal, turn,
+      turnDigest: externalSessionDigest(turn), receivedAt: "2026-09-22T17:42:00Z" });
+    expect(await h.layer().db.select().from(externalSessionTurns)).toMatchObject([{ sessionId, nativeTurnId: "turn-1", revision: 1 }]);
+    await h.layer().db.delete(externalSessions).where(sql`${externalSessions.projectId} = ${principal.projectId} AND ${externalSessions.id} = ${sessionId}`);
+    expect(await h.layer().db.select().from(externalSessionTurns)).toEqual([]);
   });
 
   it("acknowledges late revisions without regressing state and ignores old delivery positions", async () => {
@@ -240,12 +256,12 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(await h.layer().db.select({ id: externalSessions.id }).from(externalSessions)).toHaveLength(1);
   });
 
-  it("installs migration 0084 on an upgrade and reopening is idempotent", async () => {
-    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version = '0084';"));
+  it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
+    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
     expect((await store().ingest(envelope())).applied).toBe(true);
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(false);
-    const ledger = await h.adminDb().execute(sql`SELECT version FROM public.fusion_schema_migrations WHERE version = '0084'`);
-    expect(ledger).toHaveLength(1);
+    const ledger = await h.adminDb().execute(sql`SELECT version FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088') ORDER BY version`);
+    expect(ledger.map(row => row.version)).toEqual(["0086", "0087", "0088"]);
   });
 });

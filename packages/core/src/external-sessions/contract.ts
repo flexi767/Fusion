@@ -66,7 +66,7 @@ export function externalSessionId(principal: ExternalSessionPrincipal, session: 
 }
 
 /** Canonicalize validated metadata without revalidating text that redaction can expand. */
-export function externalSessionDigest(value: ExternalSessionObservation | ExternalSessionIngestion): string {
+export function externalSessionDigest(value: unknown): string {
   const canonical = JSON.stringify(value, (_key, item: unknown) => {
     if (item === null || typeof item !== "object" || Array.isArray(item)) return item;
     return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));

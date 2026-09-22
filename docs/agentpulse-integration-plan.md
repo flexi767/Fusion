@@ -75,7 +75,7 @@ PostgreSQL migrations should follow Fusion's existing migration ownership and nu
 Implementation ledger:
 
 - Phases 0-1: external-session storage, authenticated collectors, host-aware live cards, replay acknowledgements and feedback are deployed on J.
-- Phase 2: the bounded provider-neutral turn contract now defines prompts, results, measured duration provenance, tool counts and historical per-file patches. Durable turn ingestion, pagination and rendering remain next.
+- Phase 2: the bounded provider-neutral turn contract defines prompts, results, measured duration provenance, tool counts and historical per-file patches. Project-isolated PostgreSQL turn storage is registered as migration 0088. Idempotent ingestion, pagination and rendering remain next.
 - Phases 3-6: partial usage/cost and summary foundations exist; the phase gates remain open until the complete accounting, controls, reliability and cutover checks below pass.
 
 ### Phase 0 — Confirm contracts and preserve recovery data

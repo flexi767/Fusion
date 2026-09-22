@@ -97,8 +97,9 @@ touches no data; it must advance in the same change that ships a new migration f
  * claim those slots on this rebase target, so external-session ingestion and its feedback queue
  * move to 0086/0087 rather than colliding with them.
  */
-export const SCHEMA_BASELINE_VERSION = "0087";
+export const SCHEMA_BASELINE_VERSION = "0088";
 export const EXTERNAL_SESSIONS_VERSION = "0086";
+export const EXTERNAL_SESSION_TURNS_VERSION = "0088";
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -409,6 +410,7 @@ function resolveMigrationsDir(): string {
 const MIGRATIONS_DIR = resolveMigrationsDir();
 const EXTERNAL_SESSIONS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0086_external_sessions.sql");
 const EXTERNAL_SESSION_FEEDBACK_MIGRATION_PATH = join(MIGRATIONS_DIR, "0087_external_session_feedback.sql");
+const EXTERNAL_SESSION_TURNS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0088_external_session_turns.sql");
 const BASELINE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0000_initial.sql");
 const AUTOMATION_ISOLATION_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
@@ -1689,6 +1691,12 @@ export async function applySchemaBaseline(
     if (!applied.includes("0087") || feedbackMissing) {
       await tx.execute(sql.raw(await readFile(EXTERNAL_SESSION_FEEDBACK_MIGRATION_PATH, "utf8")));
       await tx.insert(migrationBookkeeping).values({ version: "0087" }).onConflictDoNothing();
+      schemaChanged = true;
+    }
+    const turnsMissing = ((await tx.execute(sql`SELECT to_regclass('project.external_session_turns') IS NULL AS missing`)) as unknown as Array<{ missing: boolean }>)[0]?.missing ?? true;
+    if (!applied.includes(EXTERNAL_SESSION_TURNS_VERSION) || turnsMissing) {
+      await tx.execute(sql.raw(await readFile(EXTERNAL_SESSION_TURNS_MIGRATION_PATH, "utf8")));
+      await tx.insert(migrationBookkeeping).values({ version: EXTERNAL_SESSION_TURNS_VERSION }).onConflictDoNothing();
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };

@@ -175,7 +175,7 @@ describe("schema-applier: immutable migration identities", () => {
     expect(TASK_PLANNING_FAILURE_VERSION).toBe("0072");
     expect(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION).toBe("0073");
     expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION));
-    expect(SCHEMA_BASELINE_VERSION).toBe("0087");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0088");
   });
 
   it("keeps monitor and approval isolation assigned to version 0003", () => {
@@ -729,8 +729,8 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     0060 adds workspace coordination leases and land intents (→ 115); 0071 adds patchnode_entries and 0084 adds task_overlap_waits (→ 117). Plugin tables are added separately
     by the schema-init hook and are excluded here.
     */
-    // FNXC:ExternalSessions 2026-09-19-00:00: Migrations 0086 and 0087 add four project-isolated external-session tables after the current 117-table baseline.
-    expect(bySchema.project).toBe(121);
+    // FNXC:ExternalSessions 2026-09-22-19:42: Migrations 0086-0088 add five project-isolated external-session tables after the current 117-table baseline.
+    expect(bySchema.project).toBe(122);
     /*
     FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
     17, not 18: `central.global_concurrency` is dropped by migration 0037. A fresh
@@ -1928,6 +1928,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
       "0087",
+      "0088",
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -2031,6 +2032,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
       "0087",
+      "0088",
     ]);
   });
 
@@ -2267,6 +2269,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
       "0087",
+      "0088",
     ]);
   });
 
@@ -2384,6 +2387,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
       "0087",
+      "0088",
     ]);
   });
 
@@ -2501,6 +2505,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
       EXTERNAL_SESSIONS_VERSION,
       "0087",
+      "0088",
     ]);
   });
 });
