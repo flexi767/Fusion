@@ -61,5 +61,14 @@ export const externalSessionTurnSchema = z.object({
   }
 });
 
+const sessionReadId = z.string().regex(/^[a-f0-9]{64}$/);
+export const externalSessionTurnIngestionSchema = z.object({
+  schemaVersion: z.literal(1),
+  eventId: externalSessionIdentifier,
+  sessionId: sessionReadId,
+  turn: externalSessionTurnSchema,
+}).strict();
+
 export type ExternalSessionFileChange = z.infer<typeof externalSessionFileChangeSchema>;
 export type ExternalSessionTurn = z.infer<typeof externalSessionTurnSchema>;
+export type ExternalSessionTurnIngestion = z.infer<typeof externalSessionTurnIngestionSchema>;

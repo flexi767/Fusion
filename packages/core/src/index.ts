@@ -3200,6 +3200,8 @@ exports are intentionally dropped rather than reintroduced.
 */
 export * from "./external-sessions/contract.js";
 export * from "./external-sessions/turn-contract.js";
+export { ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict } from "./external-sessions/turn-store.js";
+export type { ExternalSessionTurnListQuery } from "./external-sessions/turn-store.js";
 export { ExternalSessionStore } from "./external-sessions/store.js";
 export * from "./external-sessions/read-contract.js";
 export { ExternalSessionReader } from "./external-sessions/reader.js";

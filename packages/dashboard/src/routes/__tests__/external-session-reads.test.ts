@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Request, Response } from "express";
-import { ExternalSessionReader, externalSessionPageCursor } from "@fusion/core";
+import { ExternalSessionReader, ExternalSessionTurnReader, externalSessionPageCursor } from "@fusion/core";
 import type { ApiRoutesContext } from "../types.js";
 import { registerExternalSessionRoutes } from "../register-external-session-routes.js";
 import { createAuthMiddleware } from "../../auth-middleware.js";
@@ -55,5 +55,18 @@ describe("project-scoped remote-session reads", () => {
     s.getProjectContext.mockResolvedValue({ projectId: "project-a", store: { getAsyncLayer: () => ({ projectId: "other" }) } });
     await expect(s.handlers.get("/external-sessions/:id")!(s.req, s.res)).rejects.toMatchObject({ statusCode: 503 });
     expect(get).toHaveBeenCalledTimes(1);
+  });
+  it("returns paginated turns and rejects malformed turn cursors", async () => {
+    const page = { schemaVersion: 1 as const, turns: [], nextCursor: null };
+    const list = vi.spyOn(ExternalSessionTurnReader.prototype, "list").mockResolvedValue(page);
+    const s = setup(); s.req.query = { projectId: "project-a", limit: "25" };
+    await s.handlers.get("/external-sessions/:id/turns")!(s.req, s.res);
+    expect(list).toHaveBeenCalledWith(id, { limit: 25 });
+    expect(s.json).toHaveBeenCalledWith(page);
+    for (const query of [{ limit: "101" }, { limit: "1.5" }, { cursor: ["bad"] }]) {
+      s.req.query = { projectId: "project-a", ...query } as typeof s.req.query;
+      await expect(s.handlers.get("/external-sessions/:id/turns")!(s.req, s.res)).rejects.toMatchObject({ statusCode: 400 });
+    }
+    expect(list).toHaveBeenCalledTimes(1);
   });
 });

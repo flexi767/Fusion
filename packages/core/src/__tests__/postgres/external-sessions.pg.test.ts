@@ -10,12 +10,19 @@ import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
 import { externalSessionTurnSchema } from "../../external-sessions/turn-contract.js";
+import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore } from "../../external-sessions/turn-store.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
 const envelope = (sequence = 1, revision = sequence) => ({ schemaVersion: 1, streamId: "spool", sequence,
   eventId: `event-${sequence}`, collectorVersion: "1.0",
   session: { provider: "runtime", nativeSessionId: "native-1", revision, activity: "working",
     observedAt: "2026-09-17T00:00:00Z", title: "Session", projectPath: "/same/path" } });
+const turnEnvelope = (sessionId: string, nativeTurnId = "turn-1", ordinal = 0, revision = 1) => ({ schemaVersion: 1,
+  eventId: `event-${nativeTurnId}-${revision}`, sessionId, turn: { nativeTurnId, revision, ordinal,
+    state: "completed" as const, prompts: [{ at: null, text: "Fix it" }], response: "Done",
+    startedAt: null, endedAt: null, durationMs: null, durationSource: null, toolCallCount: 2,
+    fileChanges: [{ path: "src/a.ts", operation: "modify" as const, addedLines: 1, removedLines: 0,
+      patchAvailable: true, patch: "@@ -1 +1 @@\n-old\n+new", truncated: false }] } });
 
 pgDescribe("external sessions: durable observation ingestion", () => {
   const h = createSharedPgTaskStoreTestHarness({ prefix: "fusion_external", projectId: principal.projectId });
@@ -107,6 +114,39 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(await h.layer().db.select().from(externalSessionTurns)).toMatchObject([{ sessionId, nativeTurnId: "turn-1", revision: 1 }]);
     await h.layer().db.delete(externalSessions).where(sql`${externalSessions.projectId} = ${principal.projectId} AND ${externalSessions.id} = ${sessionId}`);
     expect(await h.layer().db.select().from(externalSessionTurns)).toEqual([]);
+  });
+
+  it("ingests turn revisions idempotently, rejects conflicts and ignores late delivery", async () => {
+    const sessionId = (await store().ingest(envelope())).sessionId;
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const first = await turns.ingest(turnEnvelope(sessionId));
+    expect(first).toMatchObject({ applied: true, revision: 1, nativeTurnId: "turn-1" });
+    expect(await turns.ingest(turnEnvelope(sessionId))).toEqual({ ...first, applied: false });
+    await expect(turns.ingest({ ...turnEnvelope(sessionId), turn: { ...turnEnvelope(sessionId).turn, response: "Changed" } }))
+      .rejects.toBeInstanceOf(ExternalSessionTurnConflict);
+    expect((await turns.ingest(turnEnvelope(sessionId, "turn-1", 0, 3))).applied).toBe(true);
+    expect(await turns.ingest(turnEnvelope(sessionId, "turn-1", 0, 2))).toMatchObject({ applied: false, revision: 3 });
+    expect((await h.layer().db.select().from(externalSessionTurns))[0]).toMatchObject({ revision: 3, turn: { revision: 3 } });
+  });
+
+  it("fences turn ingestion to the collector host and paginates stable ordinal ties", async () => {
+    const sessionId = (await store().ingest(envelope())).sessionId;
+    await expect(new ExternalSessionTurnStore(h.layer(), { ...principal, hostId: "host-2" }).ingest(turnEnvelope(sessionId)))
+      .rejects.toMatchObject({ code: "session-scope" });
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    await turns.ingest(turnEnvelope(sessionId, "turn-b", 0));
+    await turns.ingest(turnEnvelope(sessionId, "turn-a", 0));
+    await turns.ingest(turnEnvelope(sessionId, "turn-c", 1));
+    const reader = new ExternalSessionTurnReader(h.layer(), principal.projectId);
+    const first = await reader.list(sessionId, { limit: 2 });
+    const second = await reader.list(sessionId, { limit: 2, cursor: first.nextCursor! });
+    expect(first.turns.map(turn => turn.nativeTurnId)).toEqual(["turn-a", "turn-b"]);
+    expect(second.turns.map(turn => turn.nativeTurnId)).toEqual(["turn-c"]);
+    expect(second.nextCursor).toBeNull();
+    const otherLayer: AsyncDataLayer = { ...h.layer(), projectId: "other-project",
+      db: h.adminDb(), transactionImmediate: callback => h.adminDb().transaction(callback) };
+    await expect(new ExternalSessionTurnReader(otherLayer, "other-project").list(sessionId)).resolves.toMatchObject({ turns: [] });
+    await expect(new ExternalSessionTurnReader(otherLayer, "other-project").list(sessionId, { cursor: first.nextCursor! })).rejects.toThrow("cursor scope");
   });
 
   it("acknowledges late revisions without regressing state and ignores old delivery positions", async () => {

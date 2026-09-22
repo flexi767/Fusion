@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Request, Response } from "express";
-import { ExternalSessionStore, ExternalSessionConflict, ExternalSessionFeedback } from "@fusion/core";
+import { ExternalSessionStore, ExternalSessionConflict, ExternalSessionFeedback, ExternalSessionTurnStore } from "@fusion/core";
 import type { ApiRoutesContext } from "../types.js";
 import { registerExternalSessionRoutes } from "../register-external-session-routes.js";
 import { createAuthMiddleware } from "../../auth-middleware.js";
@@ -56,6 +56,18 @@ describe("external-session ingestion registrar", () => {
     expect(heartbeat).toHaveBeenCalledTimes(1);
     expect(ingest).not.toHaveBeenCalled();
     expect(s.json).toHaveBeenCalledWith({ schemaVersion: 1, hostId: "host-1" });
+  });
+
+  it("authenticates and acknowledges bounded turn ingestion", async () => {
+    const result = { schemaVersion: 1 as const, eventId: "turn-event", sessionId: "a".repeat(64), nativeTurnId: "turn-1", revision: 1, applied: true };
+    const ingest = vi.spyOn(ExternalSessionTurnStore.prototype, "ingest").mockResolvedValue(result);
+    const s = setup(); s.req.body = { schemaVersion: 1, eventId: "turn-event", sessionId: "a".repeat(64),
+      turn: { nativeTurnId: "turn-1", revision: 1, ordinal: 0, state: "completed",
+        prompts: [{ at: null, text: "Fix it" }], response: "Done", startedAt: null, endedAt: null,
+        durationMs: null, durationSource: null, toolCallCount: 1, fileChanges: [] } };
+    await s.handlers.get("/external-sessions/turn-ingest")!(s.req, s.res);
+    expect(ingest).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "a".repeat(64), turn: expect.objectContaining({ nativeTurnId: "turn-1" }) }));
+    expect(s.json).toHaveBeenCalledWith(result);
   });
 
   it.each(["wrong", "", undefined])("rejects invalid/missing header credential %s before database access", async tokenValue => {
@@ -125,6 +137,7 @@ describe("dashboard authentication boundary", () => {
     const gate = createAuthMiddleware("dashboard-secret");
     for (const [method, path, allowed] of [
       ["POST", "/api/external-sessions/ingest", true], ["POST", "/api/external-sessions/heartbeat/", true],
+      ["POST", "/api/external-sessions/turn-ingest", true],
       ["POST", "/api/external-sessions/feedback-claim", true], ["POST", "/api/external-sessions/feedback-ack/", true],
       ["GET", "/api/external-sessions/feedback-claim", false], ["POST", "/api/external-sessions/feedback-ack/nested", false],
       ["POST", "/api/external-sessions/" + "a".repeat(64) + "/feedback", false],
