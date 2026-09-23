@@ -18,6 +18,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async (path, opts) => {
       if (opts?.method === "POST") { const b = JSON.parse(String(opts.body)); calls.push(b); return { commandId: b.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString() } as never; }
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -44,6 +45,7 @@ describe("standalone remote agents", () => {
     let listRequests = 0;
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       if (path.includes("provider=claude")) return { sessions: [fresh], nextCursor: null } as never;
       // The first load must finish, because Refresh is disabled while a load is in flight.
       if (++listRequests > 1) await new Promise<void>(resolve => pending.push(resolve));
@@ -68,6 +70,7 @@ describe("standalone remote agents", () => {
     const empty = { ...fixture, id: "4".repeat(64), hostId: "m3", observation: { ...fixture.observation, title: "No usage agent" }, cost: { estimatedUsd: null, partialUsd: null, usageComplete: false, unpricedRecords: 0 } };
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       return { sessions: [priced, partial, unknown, empty], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -86,6 +89,7 @@ describe("standalone remote agents", () => {
     const incomplete = { ...fixture, id: "3".repeat(64), hostId: "m3", observation: { ...fixture.observation, title: "M3 one" }, cost: { estimatedUsd: null, partialUsd: 0.25, usageComplete: false, unpricedRecords: 1 } };
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }, { hostId: "m5", collectorConnected: false }] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       return { sessions: [priced, alsoPriced, incomplete], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -107,6 +111,7 @@ describe("standalone remote agents", () => {
   it("exposes the sessions as a labelled list and announces how many are shown", async () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       return { sessions: [fixture], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -127,6 +132,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async (path, opts) => {
       if (opts?.method === "POST") { const body = JSON.parse(String(opts.body)); calls.push(body); return { commandId: body.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString() } as never; }
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -143,6 +149,7 @@ describe("standalone remote agents", () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -182,6 +189,7 @@ describe("standalone remote agents", () => {
         return { commandId: body.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString(), deliveredAt: null } as never;
       }
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: receiptStatus && posts[0] ? [{ commandId: posts[0].commandId, status: receiptStatus, createdAt: new Date().toISOString(), expiresAt: new Date().toISOString(), deliveredAt: null }] : [] } as never;
       if (path.includes(id)) return { session: fixture } as never;

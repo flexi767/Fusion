@@ -26,4 +26,14 @@ technology announces their size and position; the marker is removed for sighted 
 .remote-agent-hosts h3 { margin-block: 0 var(--space-sm); }
 .remote-agent-cost { font-variant-numeric: tabular-nums; }
 
+/* FNXC:RemoteAgents 2026-09-23-22:07: Turn history reuses the panel's card and meta primitives; patches keep monospace and wrap rather than scroll the page sideways. */
+.remote-turn-list, .remote-turn-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-md); }
+.remote-turn { padding: var(--space-lg); display: flex; flex-direction: column; gap: var(--space-sm); }
+.remote-turn h5 { margin: 0 0 var(--space-xs); }
+.remote-turn pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); margin: 0; }
+.remote-turn-patch { font-size: var(--font-size-sm); }
+.remote-turn-file summary { display: flex; flex-wrap: wrap; gap: var(--space-sm); cursor: pointer; }
+.remote-turn-op { text-transform: uppercase; font-size: var(--font-size-sm); color: var(--text-muted); }
+.remote-turn-path { font-family: var(--font-mono); overflow-wrap: anywhere; }
+
 @media (max-width: 48rem) { .remote-agent-layout { flex-direction: column; } .remote-agent-list, .remote-agent-detail { width: 100%; } }
