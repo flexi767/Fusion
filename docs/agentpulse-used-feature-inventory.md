@@ -41,13 +41,57 @@ model carry no data here. Each is recorded as a **named follow-up**, not a block
 Phase 0 gate wording ("no unassigned used capability"). If any is later switched on in
 AgentPulse, it re-enters scope and this table must be re-measured.
 
+## Correction, measured 2026-09-24: row counts over-counted usage
+
+The first pass of this inventory treated a non-zero row count as evidence of use. That was wrong, and it
+over-stated four capabilities. Re-measured by timestamp and by durable output:
+
+**Everything except sessions and events is confined to one 4-minute commissioning window.**
+
+| Table | Rows | First → last |
+| --- | --- | --- |
+| `events` | 96,180 | 2026-07-12 → 2026-09-23 (ongoing) |
+| `ask_threads` / `ask_messages` | 1 / 2 | 2026-09-15 09:11:01 → 09:11:13 |
+| `launch_requests` | 4 | 2026-09-15 09:13:22 → 09:17:03 |
+| `managed_sessions` | 4 | 2026-09-15 09:13:26 → 09:17:08 |
+| `control_actions` | 7 | 2026-09-15 09:14:50 → 09:17:25 |
+
+The control actions carry the synthetic prompt "Reply exactly: follow-up control passed. Do not use tools.",
+and their `metadata_json.executionState` is `failed` ("No conversation found with session ID") even though the
+outer row status is `succeeded`. These are commissioning tests of the control path, not operator use.
+
+**The AI watcher runs but retains nothing.** All 817 runs are `status=succeeded`, `trigger_kind=idle`, with no
+error sub-type, and they continue daily (162 on 09-19, 3 on 09-23). But:
+
+- `proposal_id` is set on **0** of them, and `watcher_proposals` holds 0 rows.
+- `sessions.plan_summary`, `current_task`, `semantic_status`, `watcher_state` and `watcher_last_run_at` are
+  populated on **0** of 556 sessions.
+- No `event_type` relates to AI or summaries; the 12 types are all transcript/hook events.
+- `sum(ai_spend_cents)` is **0** across 0 sessions.
+
+The provider is genuinely configured (`M3 MLX Qwen3.5 2B 4-bit`, openai_compatible, `http://m3:8080/v1`), so
+this is not a missing-configuration artifact. The feature executes and produces no durable, user-visible
+output in this deployment.
+
+**Consequence.** Porting AI summaries would reproduce a subsystem whose measured output here is nothing, and
+Phase 6 could not reconcile it against anything, because there is no stored summary to compare. Likewise,
+controls, launches, managed sessions and Ask have no operator-generated history to reconcile. They are
+recorded as named follow-ups on the same footing as the zero-row features below, and should be built when
+someone wants the capability — not to reach parity with data that does not exist.
+
+Genuinely used, continuously, for two and a half months: **session observation, transcript events, turn
+results and the search index built from them**. Those are ported.
+
 ## Consequences for ordering
 
-1. Turn history rendering (Phase 2) — the API exists, the data exists, nothing shows it.
-2. Search over collected output (Phase 5) — 67k indexed documents is real, demonstrated use.
-3. AI summaries (Phase 5) — 817 watcher runs.
-4. Controls (Phase 4) — 7 control actions; small but user-visible.
-5. Launches / Ask — lowest measured use; follow-ups.
+1. Turn history rendering (Phase 2) — DONE.
+2. Search over collected output (Phase 5) — DONE. 67k indexed documents, real demonstrated use.
+3. Operational health (Phase 5) — collector lag, spool depth, last acknowledgement, parse and command
+   failures. Not an AgentPulse port; it is what makes the ported pipeline observable, and it is the only
+   remaining item that serves day-to-day operation.
+4. Rest of Phase 3 — per-turn costs, context size vs capacity, effective-dated rates, rankings.
+5. AI summaries, controls, launches, managed sessions, Ask — build on request, not for parity. See the
+   correction above: none has durable operator-generated data in this deployment.
 
 Historical import (Phase 6) must carry `sessions` 556 and `events` 96,006, and its
 reconciliation report is what proves parity. Retiring AgentPulse still requires separate
