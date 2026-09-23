@@ -137,7 +137,7 @@ when its collector disconnects.
 
 ## Preparation and rollback for a target server
 
-These steps also apply to server J; paths, project ids, process manager, credentials, and database
+These steps apply to any target server; paths, project ids, process manager, credentials, and database
 connection must come from the operator's actual installation. PR1 needs no private host assumptions.
 Nothing here authorizes a deployment or service restart.
 
