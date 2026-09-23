@@ -62,17 +62,39 @@ class CodexTurnTests(unittest.TestCase):
             transcript.write_text(''.join(json.dumps(event) + '\n' for event in events))
             scan(db, transcript, 'codex')
             self.assertEqual(db.execute('SELECT count(*) FROM turns').fetchone()[0], 1)
+            other = root / 'other.jsonl'
+            other.write_text(''.join(json.dumps(event) + '\n' for event in [
+                dict(type='session_meta', timestamp='2026-09-22T12:01:00Z', payload=dict(id='native-b', cwd='/work')),
+                dict(type='event_msg', timestamp='2026-09-22T12:01:01Z', payload=dict(type='task_started', turn_id='turn-b')),
+                dict(type='event_msg', timestamp='2026-09-22T12:01:02Z', payload=dict(type='user_message', message='Other work')),
+            ]))
+            scan(db, other, 'codex')
             sent = []
             def send(operation, body):
                 sent.append((operation, body))
                 return dict(eventId=body['eventId'], sessionId=body['sessionId'],
                             nativeTurnId=body['turn']['nativeTurnId'], revision=body['turn']['revision'])
             self.assertEqual(drain_turns(db, 'project', 'host', send), 0)
-            db.execute('DELETE FROM pending'); db.commit()
+            db.execute("DELETE FROM pending WHERE json_extract(body,'$.session.nativeSessionId')='native'")
+            db.execute('INSERT INTO acknowledged_sessions VALUES (?,?)', ('codex', 'native'))
+            db.commit()
+            self.assertGreater(db.execute('SELECT count(*) FROM pending').fetchone()[0], 0)
             self.assertEqual(drain_turns(db, 'project', 'host', send), 1)
             self.assertEqual(drain_turns(db, 'project', 'host', send), 0)
             self.assertEqual(sent[0][1]['turn']['response'], 'Fixed')
             self.assertEqual(len(sent[0][1]['sessionId']), 64)
+            db.close()
+
+    def test_reopen_recovers_acknowledged_sessions_when_spool_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / 'spool.sqlite'
+            db = connect(path); bind(db, 'project', 'host')
+            db.execute('INSERT INTO observations VALUES (?,?,?,?,?)',
+                       ('codex', 'native', '{}', 'digest', 1))
+            db.commit(); db.close()
+            db = connect(path)
+            self.assertEqual(db.execute('SELECT provider,native FROM acknowledged_sessions').fetchall(),
+                             [('codex', 'native')])
             db.close()
 
 

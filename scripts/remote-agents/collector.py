@@ -66,6 +66,8 @@ def connect(path):
       CREATE TABLE IF NOT EXISTS turns(provider TEXT NOT NULL,native TEXT NOT NULL,turn_id TEXT NOT NULL,
         revision INTEGER NOT NULL,acked INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,
         PRIMARY KEY(provider,native,turn_id));
+      CREATE TABLE IF NOT EXISTS acknowledged_sessions(provider TEXT NOT NULL,native TEXT NOT NULL,
+        PRIMARY KEY(provider,native));
     ''')
     for key, value in [('stream', str(uuid.uuid4())), ('sequence', '0')]:
         db.execute('INSERT OR IGNORE INTO config VALUES (?,?)', (key, value))
@@ -82,6 +84,8 @@ def connect(path):
             if changed:
                 db.execute('UPDATE pending SET body=? WHERE sequence=?', (json.dumps(envelope), sequence))
         db.execute("INSERT INTO config VALUES ('display_repair_v1','1')")
+    if not db.execute('SELECT 1 FROM pending LIMIT 1').fetchone():
+        db.execute('INSERT OR IGNORE INTO acknowledged_sessions SELECT provider,native FROM observations')
     db.commit(); return db
 
 
@@ -132,11 +136,14 @@ def enqueue(db, session):
 
 
 def drain_turns(db, project, host, send, limit=25):
-    """Send latest durable revisions only after observation replay has caught up."""
-    if db.execute('SELECT 1 FROM pending LIMIT 1').fetchone():
-        return 0
+    """Send turns for sessions whose observation has already been acknowledged."""
+    if not db.execute('SELECT 1 FROM pending LIMIT 1').fetchone():
+        with db:
+            db.execute('INSERT OR IGNORE INTO acknowledged_sessions SELECT provider,native FROM observations')
     delivered = 0
-    rows = db.execute('SELECT provider,native,turn_id,revision,body FROM turns WHERE revision>acked ORDER BY rowid LIMIT ?', (limit,)).fetchall()
+    rows = db.execute('SELECT t.provider,t.native,t.turn_id,t.revision,t.body FROM turns t '
+                      'JOIN acknowledged_sessions a ON a.provider=t.provider AND a.native=t.native '
+                      'WHERE t.revision>t.acked ORDER BY t.rowid LIMIT ?', (limit,)).fetchall()
     for provider, native, turn_id, revision, body in rows:
         session_id = hashlib.sha256(json.dumps([project, host, provider, native], separators=(',', ':')).encode()).hexdigest()
         event_id = hashlib.sha256(json.dumps([session_id, turn_id, revision], separators=(',', ':')).encode()).hexdigest()
@@ -283,6 +290,8 @@ def main():
                         raise ValueError('Invalid ingestion acknowledgement')
                     with db:
                         db.execute('DELETE FROM pending WHERE sequence=?', (seq,))
+                        db.execute('INSERT OR IGNORE INTO acknowledged_sessions VALUES (?,?)',
+                                   (b['session']['provider'], b['session']['nativeSessionId']))
                 drain_turns(db, args.project, args.host,
                             lambda operation, body: post(args.url, args.project, token, operation, body))
             except Exception as error:

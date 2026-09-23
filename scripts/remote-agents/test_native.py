@@ -23,7 +23,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(validated_base_url('https://fusion.example'), 'https://fusion.example')
         self.assertEqual(validated_base_url('http://10.8.0.5:4040/'), 'http://10.8.0.5:4040')
         self.assertEqual(validated_base_url('http://localhost:4040'), 'http://localhost:4040')
-        self.assertEqual(validated_base_url('http://<collector-endpoint>'), 'http://<collector-endpoint>')
+        self.assertEqual(validated_base_url('http://10.0.0.1:4040'), 'http://10.0.0.1:4040')
         for value in ('http://fusion.example', 'http://8.8.8.8', 'https://user:secret@fusion.example', 'file:///tmp/socket', 'https://fusion.example/prefix'):
             with self.assertRaises(ValueError):
                 validated_base_url(value)
