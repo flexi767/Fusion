@@ -96,10 +96,11 @@ touches no data; it must advance in the same change that ships a new migration f
  * claim those slots on this rebase target, so external-session ingestion and its feedback queue
  * move to 0086/0087 rather than colliding with them.
  */
-export const SCHEMA_BASELINE_VERSION = "0089";
+export const SCHEMA_BASELINE_VERSION = "0090";
 export const EXTERNAL_SESSIONS_VERSION = "0086";
 export const EXTERNAL_SESSION_TURNS_VERSION = "0088";
 export const EXTERNAL_SESSION_TURN_SEARCH_VERSION = "0089";
+export const EXTERNAL_SESSION_HOST_HEALTH_VERSION = "0090";
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -411,6 +412,7 @@ const EXTERNAL_SESSIONS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0086_external_ses
 const EXTERNAL_SESSION_FEEDBACK_MIGRATION_PATH = join(MIGRATIONS_DIR, "0087_external_session_feedback.sql");
 const EXTERNAL_SESSION_TURNS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0088_external_session_turns.sql");
 const EXTERNAL_SESSION_TURN_SEARCH_MIGRATION_PATH = join(MIGRATIONS_DIR, "0089_external_session_turn_search.sql");
+const EXTERNAL_SESSION_HOST_HEALTH_MIGRATION_PATH = join(MIGRATIONS_DIR, "0090_external_session_host_health.sql");
 const BASELINE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0000_initial.sql");
 const AUTOMATION_ISOLATION_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
@@ -1762,6 +1764,20 @@ export async function applySchemaBaseline(
     if (!applied.includes(EXTERNAL_SESSION_TURN_SEARCH_VERSION) || searchMissing) {
       await tx.execute(sql.raw(await readFile(EXTERNAL_SESSION_TURN_SEARCH_MIGRATION_PATH, "utf8")));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${EXTERNAL_SESSION_TURN_SEARCH_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    /* FNXC:ExternalSessionHealth 2026-09-23-23:24: Probe the columns, not just the ledger: a hand-dropped column
+       would otherwise leave every heartbeat write failing while the ledger claimed the migration was applied. */
+    const healthMissing = ((await tx.execute(sql`
+      SELECT EXISTS (
+        SELECT 1 FROM (VALUES ('spool_depth'),('spool_bytes'),('parse_failures'),('delivery_failures'),('health_reported_at')) AS required(column_name)
+        WHERE NOT EXISTS (SELECT 1 FROM information_schema.columns c
+          WHERE c.table_schema = 'project' AND c.table_name = 'external_session_hosts' AND c.column_name = required.column_name)
+      ) AS missing
+    `)) as unknown as Array<{ missing: boolean }>)[0]?.missing ?? true;
+    if (!applied.includes(EXTERNAL_SESSION_HOST_HEALTH_VERSION) || healthMissing) {
+      await tx.execute(sql.raw(await readFile(EXTERNAL_SESSION_HOST_HEALTH_MIGRATION_PATH, "utf8")));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${EXTERNAL_SESSION_HOST_HEALTH_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };

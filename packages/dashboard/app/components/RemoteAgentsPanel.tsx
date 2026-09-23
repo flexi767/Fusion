@@ -9,6 +9,10 @@ import { RemoteAgentSearch } from "./RemoteAgentSearch";
 import "./RemoteAgentsPanel.css";
 
 type Feedback = { commandId: string; status: string; createdAt: string; expiresAt: string; deliveredAt: string | null };
+type HostHealth = {
+  hostId: string; collectorConnected: boolean; collectorVersion?: string | null; heartbeatAgeMs?: number | null;
+  spoolDepth?: number | null; spoolBytes?: number | null; parseFailures?: number | null; deliveryFailures?: number | null;
+};
 type CostBadge = { estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; unpricedRecords: number };
 /** The list route attaches a priced badge to every session; older servers may not, so it stays optional. */
 type ListedSession = ExternalSessionView & { cost?: CostBadge };
@@ -23,6 +27,35 @@ An estimate that quietly drops an unpriced model reads as the session's real cos
 bare number it cannot stand behind. Three distinct states, never collapsed into one: a complete total, a
 partial total that says how many records are unpriced, and no reported usage at all.
 */
+/*
+FNXC:ExternalSessionHealth 2026-09-23-23:24: Operational health per server. Every value distinguishes "not
+reported" from a reported zero: an unreported spool is unknown, not empty, and saying "0 queued" about a
+collector too old to answer is exactly the false reassurance this panel exists to prevent.
+*/
+function ageLabel(ms?: number | null): string {
+  if (ms === null || ms === undefined) return "never reported";
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  return `${Math.round(seconds / 3600)}h ago`;
+}
+
+function spoolLabel(host: HostHealth): string {
+  if (host.spoolDepth === null || host.spoolDepth === undefined) return "Spool not reported";
+  const bytes = host.spoolBytes === null || host.spoolBytes === undefined ? "" : ` (${Math.round(host.spoolBytes / 1024)} KiB)`;
+  return host.spoolDepth === 0 ? "Spool empty" : `${host.spoolDepth} queued${bytes}`;
+}
+
+function failureLabel(host: HostHealth): string {
+  const parts: string[] = [];
+  if (host.parseFailures === null || host.parseFailures === undefined) parts.push("parse failures not reported");
+  else if (host.parseFailures > 0) parts.push(`${host.parseFailures} parse ${host.parseFailures === 1 ? "failure" : "failures"}`);
+  if (host.deliveryFailures !== null && host.deliveryFailures !== undefined && host.deliveryFailures > 0) {
+    parts.push(`${host.deliveryFailures} delivery ${host.deliveryFailures === 1 ? "failure" : "failures"}`);
+  }
+  return parts.length ? parts.join(" · ") : "No failures reported";
+}
+
 function costLabel(cost?: CostBadge): string {
   if (!cost) return "Cost unavailable";
   if (cost.estimatedUsd !== null) return `${usd(cost.estimatedUsd)} estimated`;
@@ -159,7 +192,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
   const [host, setHost] = useState(""); const [provider, setProvider] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null); const [loading, setLoading] = useState(false);
-  const [hosts, setHosts] = useState<{ hostId: string; collectorConnected: boolean }[]>([]);
+  const [hosts, setHosts] = useState<HostHealth[]>([]);
   /*
   FNXC:RemoteAgents 2026-09-23-08:40: Every list request carries a generation, and only the newest one may write.
   Manual Refresh and Load More pass no AbortSignal, so an abort check alone let a response that was already in flight
@@ -185,7 +218,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
   }, [host, provider, projectId]);
   const refreshHosts = useCallback(async (signal: AbortSignal) => {
     if (!projectId) return;
-    try { const data = await api<{ hosts: { hostId: string; collectorConnected: boolean }[] }>(withProjectId("/external-sessions/hosts", projectId), { signal }); if (!signal.aborted) setHosts(data.hosts); }
+    try { const data = await api<{ hosts: HostHealth[] }>(withProjectId("/external-sessions/hosts", projectId), { signal }); if (!signal.aborted) setHosts(data.hosts); }
     catch { /* Session errors use the main monitoring error state. */ }
   }, [projectId]);
   const listPoll = useRef<AbortController | null>(null);
@@ -227,6 +260,9 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
           return <li key={h.hostId} className="remote-agent-host">
             <strong>{h.hostId}</strong>
             <span>{h.collectorConnected ? "Collector connected" : "Collector offline"}</span>
+            <span>Last heartbeat {ageLabel(h.heartbeatAgeMs)}</span>
+            <span>{spoolLabel(h)}</span>
+            <span>{failureLabel(h)}</span>
             <span>{summary ? `${summary.count} ${summary.count === 1 ? "session" : "sessions"} loaded` : "0 sessions loaded"}</span>
             <span>{hostCostLabel(summary)}</span>
           </li>;

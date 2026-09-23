@@ -121,6 +121,35 @@ describe("standalone remote agents", () => {
     expect(screen.getByRole("status", { name: "Session list status" })).toHaveTextContent("1 session shown");
   });
 
+  it("shows per-server operational health and never reports unknown counters as zero", async () => {
+    const hosts = [
+      { hostId: "j", collectorConnected: true, heartbeatAgeMs: 4000, spoolDepth: 0, spoolBytes: 0, parseFailures: 0, deliveryFailures: 0 },
+      { hostId: "m3", collectorConnected: true, heartbeatAgeMs: 125000, spoolDepth: 1750, spoolBytes: 2_097_152, parseFailures: 3, deliveryFailures: 2 },
+      { hostId: "m5", collectorConnected: false, heartbeatAgeMs: null, spoolDepth: null, spoolBytes: null, parseFailures: null, deliveryFailures: null },
+    ];
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.includes("/hosts")) return { hosts } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      return { sessions: [], nextCursor: null } as never;
+    });
+    render(<RemoteAgentsPanel projectId="project-a" />);
+    const items = await screen.findAllByRole("listitem");
+    const j = items.find(i => i.textContent?.startsWith("j"))!;
+    expect(j).toHaveTextContent("Last heartbeat 4s ago");
+    expect(j).toHaveTextContent("Spool empty");
+    expect(j).toHaveTextContent("No failures reported");
+    const m3 = items.find(i => i.textContent?.startsWith("m3"))!;
+    expect(m3).toHaveTextContent("Last heartbeat 2m ago");
+    expect(m3).toHaveTextContent("1750 queued (2048 KiB)");
+    expect(m3).toHaveTextContent("3 parse failures · 2 delivery failures");
+    const m5 = items.find(i => i.textContent?.startsWith("m5"))!;
+    // The bug this guards: a collector that never reported rendering as a healthy, empty spool.
+    expect(m5).toHaveTextContent("Last heartbeat never reported");
+    expect(m5).toHaveTextContent("Spool not reported");
+    expect(m5).toHaveTextContent("parse failures not reported");
+    expect(m5).not.toHaveTextContent("Spool empty");
+  });
+
   it("surfaces monitoring errors instead of showing an empty success state", async () => {
     vi.mocked(api).mockRejectedValue(new Error("Collector storage unavailable"));
     render(<RemoteAgentsPanel projectId="project-a" />);

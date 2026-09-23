@@ -23,10 +23,17 @@ export class ExternalSessionStore {
   }
 
   async heartbeat(value: unknown, now = new Date().toISOString()): Promise<void> {
-    const { collectorVersion } = externalSessionHeartbeatSchema.parse(value);
-    await this.layer.db.insert(externalSessionHosts).values({ ...this.principal, collectorVersion, lastHeartbeatAt: now })
+    const beat = externalSessionHeartbeatSchema.parse(value);
+    /* FNXC:ExternalSessionHealth 2026-09-23-23:24: Counters are written only when reported, and healthReportedAt
+       is stamped only alongside them, so an older collector cannot blank a newer collector's last known health. */
+    const reported = { spoolDepth: beat.spoolDepth, spoolBytes: beat.spoolBytes,
+      parseFailures: beat.parseFailures, deliveryFailures: beat.deliveryFailures };
+    const health = Object.fromEntries(Object.entries(reported).filter(([, v]) => v !== undefined));
+    const healthStamp = Object.keys(health).length ? { healthReportedAt: now } : {};
+    await this.layer.db.insert(externalSessionHosts)
+      .values({ ...this.principal, collectorVersion: beat.collectorVersion, lastHeartbeatAt: now, ...health, ...healthStamp })
       .onConflictDoUpdate({ target: [externalSessionHosts.projectId, externalSessionHosts.hostId],
-        set: { collectorVersion, lastHeartbeatAt: now },
+        set: { collectorVersion: beat.collectorVersion, lastHeartbeatAt: now, ...health, ...healthStamp },
         setWhere: sql`${externalSessionHosts.lastHeartbeatAt} IS NULL OR ${externalSessionHosts.lastHeartbeatAt} < ${now}` });
   }
 

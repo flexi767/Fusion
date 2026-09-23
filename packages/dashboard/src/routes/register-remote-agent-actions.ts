@@ -12,7 +12,11 @@ export const registerRemoteAgentActions: ApiRouteRegistrar = ctx => {
     let configured: unknown = ctx.options?.externalSessionCollectors ?? process.env.FUSION_EXTERNAL_SESSION_COLLECTORS;
     if (typeof configured === "string") { try { configured = configured.length <= 131072 ? JSON.parse(configured) : null; } catch { configured = null; } }
     const ids = new Set([...observed.map(h => h.hostId), ...(parseExternalSessionCollectorCredentials(configured) ?? []).filter(c => c.projectId === projectId).map(c => c.hostId)]);
-    res.json({ hosts: [...ids].sort().map(hostId => observed.find(h => h.hostId === hostId) ?? { hostId, lastHeartbeatAt: null, collectorConnected: false }) });
+    /* FNXC:ExternalSessionHealth 2026-09-23-23:24: A configured host that has never reported is listed with null
+       health rather than omitted, because "no collector has ever checked in" is the most important thing to see. */
+    const unreported = { lastHeartbeatAt: null, collectorConnected: false, collectorVersion: null, heartbeatAgeMs: null,
+      spoolDepth: null, spoolBytes: null, parseFailures: null, deliveryFailures: null, healthReportedAt: null };
+    res.json({ hosts: [...ids].sort().map(hostId => observed.find(h => h.hostId === hostId) ?? { hostId, ...unreported }) });
   });
   const resolve = async (req: Parameters<typeof ctx.getProjectContext>[0]) => {
     const id = externalSessionReadId.safeParse(req.params.id);

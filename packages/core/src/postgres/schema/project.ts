@@ -59,6 +59,12 @@ export const externalSessionHosts = projectSchema.table("external_session_hosts"
   hostId: text("host_id").notNull(),
   collectorVersion: text("collector_version").notNull(),
   lastHeartbeatAt: text("last_heartbeat_at"),
+  // FNXC:ExternalSessionHealth 2026-09-23-23:24: NULL means the collector did not report, never a reported zero.
+  spoolDepth: bigint("spool_depth", { mode: "number" }),
+  spoolBytes: bigint("spool_bytes", { mode: "number" }),
+  parseFailures: bigint("parse_failures", { mode: "number" }),
+  deliveryFailures: bigint("delivery_failures", { mode: "number" }),
+  healthReportedAt: text("health_reported_at"),
 }, t => [primaryKey({ columns: [t.projectId, t.hostId] })]);
 
 export const externalSessionStreams = projectSchema.table("external_session_streams", {

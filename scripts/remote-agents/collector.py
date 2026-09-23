@@ -55,6 +55,7 @@ def connect(path):
     os.chmod(path, 0o600)
     db.executescript('''PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS counters(key TEXT PRIMARY KEY,value INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,inode TEXT,offset INTEGER,state TEXT,digest TEXT,revision INTEGER);
       CREATE TABLE IF NOT EXISTS requests(provider TEXT,native TEXT,request TEXT,usage TEXT,PRIMARY KEY(provider,native,request));
       CREATE TABLE IF NOT EXISTS pending(sequence INTEGER PRIMARY KEY,body TEXT NOT NULL);
@@ -244,6 +245,7 @@ def scan(db, path, provider):
         if malformed and not parsed:
             raise ValueError('Native transcript has no parseable records; cursor preserved')
         if malformed:
+            bump(db, 'parse_failures', malformed)
             print('Skipped malformed native records:', path.name, malformed, flush=True)
         state['usageComplete'] = offset == stat.st_size and not state.get('unreportedUsage', False)
         native = state.get('nativeSessionId')
@@ -293,11 +295,41 @@ def delivery_delay(failures):
     return min(DELIVERY_BACKOFF_MAX_SECONDS, DELIVERY_BACKOFF_BASE_SECONDS * 2 ** (failures - 1))
 
 
+def bump(db, key, amount=1):
+    """Cumulative operational counter. Best effort: telemetry must never break collection."""
+    try:
+        with db:
+            db.execute('INSERT INTO counters(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=value+?',
+                       (key, amount, amount))
+    except Exception:
+        pass
+
+
+def counter(db, key):
+    row = db.execute('SELECT value FROM counters WHERE key=?', (key,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def health(db):
+    """Spool depth and cumulative failures. Only the collector can see these; Fusion measures staleness itself."""
+    depth = bytes_ = 0
+    try:
+        observations = db.execute('SELECT count(*),coalesce(sum(length(body)),0) FROM pending').fetchone()
+        turns = db.execute('SELECT count(*),coalesce(sum(length(body)),0) FROM turns').fetchone()
+        depth = int(observations[0]) + int(turns[0])
+        bytes_ = int(observations[1]) + int(turns[1])
+    except Exception:
+        # A counter query failure must not suppress the heartbeat itself; report what is known.
+        return {}
+    return dict(spoolDepth=depth, spoolBytes=bytes_,
+                parseFailures=counter(db, 'parse_failures'), deliveryFailures=counter(db, 'delivery_failures'))
+
+
 def deliver(db, args, token):
     """One delivery round: heartbeat and spooled observations, then turns. Returns True when both succeed."""
     delivered = True
     try:
-        post(args.url, args.project, token, 'heartbeat', dict(schemaVersion=1, collectorVersion=VERSION))
+        post(args.url, args.project, token, 'heartbeat', dict(schemaVersion=1, collectorVersion=VERSION, **health(db)))
         for seq, body in db.execute('SELECT sequence,body FROM pending ORDER BY sequence LIMIT 100').fetchall():
             b = json.loads(body); ack = post(args.url, args.project, token, 'ingest', b, timeout=20)
             if ack.get('streamId') != b['streamId'] or ack.get('acknowledgedSequence', 0) < seq:
@@ -308,6 +340,7 @@ def deliver(db, args, token):
                            (b['session']['provider'], b['session']['nativeSessionId']))
     except Exception as error:
         delivered = False
+        bump(db, 'delivery_failures')
         print('Fusion delivery unavailable:', type(error).__name__, flush=True)
     try:
         drain_turns(db, args.project, args.host,

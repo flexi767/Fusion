@@ -459,6 +459,46 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(index?.valid).toBe(true);
   });
 
+  it("records collector-reported health and keeps unreported counters null", async () => {
+    await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.0" });
+    const [bare] = await new ExternalSessionReader(h.layer(), principal.projectId).hosts();
+    // An older collector reports nothing; null must not be flattened to a reassuring zero.
+    expect(bare).toMatchObject({ spoolDepth: null, spoolBytes: null, parseFailures: null, deliveryFailures: null, healthReportedAt: null });
+    expect(bare!.heartbeatAgeMs).toBeGreaterThanOrEqual(0);
+    await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.1", spoolDepth: 12, spoolBytes: 3456, parseFailures: 2, deliveryFailures: 1 });
+    const [reported] = await new ExternalSessionReader(h.layer(), principal.projectId).hosts();
+    expect(reported).toMatchObject({ spoolDepth: 12, spoolBytes: 3456, parseFailures: 2, deliveryFailures: 1, collectorVersion: "1.1" });
+    expect(reported!.healthReportedAt).not.toBeNull();
+  });
+
+  it("does not let a collector without counters blank the last known health", async () => {
+    await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.1", spoolDepth: 9, parseFailures: 4 });
+    await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.0" });
+    const [host] = await new ExternalSessionReader(h.layer(), principal.projectId).hosts();
+    expect(host).toMatchObject({ spoolDepth: 9, parseFailures: 4 });
+  });
+
+  it("reports a reported zero spool distinctly from an unreported one", async () => {
+    await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.1", spoolDepth: 0, spoolBytes: 0 });
+    const [host] = await new ExternalSessionReader(h.layer(), principal.projectId).hosts();
+    expect(host!.spoolDepth).toBe(0);
+    expect(host!.spoolDepth).not.toBeNull();
+  });
+
+  it("rejects a malformed health counter rather than storing it", async () => {
+    for (const bad of [{ spoolDepth: -1 }, { parseFailures: 1.5 }, { spoolBytes: "many" }, { unknownCounter: 1 }]) {
+      await expect(store().heartbeat({ schemaVersion: 1, collectorVersion: "1.1", ...bad })).rejects.toThrow();
+    }
+  });
+
+  it("installs 0090 health columns and restores them when dropped", async () => {
+    await h.adminDb().execute(sql.raw("ALTER TABLE project.external_session_hosts DROP COLUMN spool_depth"));
+    expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
+    await store().heartbeat({ schemaVersion: 1, collectorVersion: "1.1", spoolDepth: 5 });
+    const [host] = await new ExternalSessionReader(h.layer(), principal.projectId).hosts();
+    expect(host).toMatchObject({ spoolDepth: 5 });
+  });
+
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
     await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
