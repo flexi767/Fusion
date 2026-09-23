@@ -156,3 +156,51 @@ class ClaudeTurnTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TurnUsageTests(unittest.TestCase):
+    def claude(self, usage, message_id='msg-1'):
+        state = {}
+        consume_claude(state, {'type': 'user', 'uuid': 'u1', 'timestamp': '2026-09-23T10:00:00Z',
+                               'message': {'role': 'user', 'content': 'go'}})
+        return consume_claude(state, {'type': 'assistant', 'timestamp': '2026-09-23T10:00:05Z',
+                                      'message': {'id': message_id, 'role': 'assistant', 'model': 'claude-sonnet-5',
+                                                  'content': 'done', 'usage': usage}}), state
+
+    def test_records_measured_usage_and_context_against_the_turn(self):
+        turn, _ = self.claude({'input_tokens': 100, 'cache_read_input_tokens': 900,
+                               'cache_creation_input_tokens': 50, 'output_tokens': 20})
+        self.assertEqual(len(turn['usage']), 1)
+        entry = turn['usage'][0]
+        self.assertEqual(entry['requestId'], 'msg-1')
+        self.assertEqual(entry['model'], 'claude-sonnet-5')
+        # inputTokens is the whole context presented to the model, which is also the context size.
+        self.assertEqual(entry['inputTokens'], 1050)
+        self.assertEqual(entry['cachedInputTokens'], 900)
+        self.assertEqual(entry['outputTokens'], 20)
+        self.assertEqual(turn['contextTokens'], 1050)
+        self.assertEqual(turn['contextCapacity'], 200000)
+
+    def test_does_not_double_count_a_repeated_message_id(self):
+        state = {}
+        consume_claude(state, {'type': 'user', 'uuid': 'u1', 'timestamp': '2026-09-23T10:00:00Z',
+                               'message': {'role': 'user', 'content': 'go'}})
+        event = {'type': 'assistant', 'timestamp': '2026-09-23T10:00:05Z',
+                 'message': {'id': 'msg-1', 'role': 'assistant', 'content': 'a',
+                             'usage': {'input_tokens': 10, 'cache_read_input_tokens': 0,
+                                       'cache_creation_input_tokens': 0, 'output_tokens': 5}}}
+        consume_claude(state, event)
+        consume_claude(state, event)
+        self.assertEqual(len(state['turn']['usage']), 1)
+
+    def test_unreadable_usage_marks_the_turn_incomplete_instead_of_dropping_it(self):
+        turn, state = self.claude({'input_tokens': 'lots', 'output_tokens': 5})
+        recorded = state['turn']
+        self.assertEqual(recorded.get('usage'), [])
+        # Silently reporting no usage would let the turn read as free.
+        self.assertIs(recorded.get('usageComplete'), False)
+
+    def test_usage_without_output_tokens_is_not_recorded(self):
+        _, state = self.claude({'input_tokens': 10, 'cache_read_input_tokens': 0,
+                                'cache_creation_input_tokens': 0})
+        self.assertEqual(state['turn']['usage'], [])

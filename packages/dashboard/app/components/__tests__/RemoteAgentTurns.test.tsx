@@ -61,6 +61,43 @@ describe("remote agent turn history", () => {
     expect(screen.getByText("Line counts not reported")).toBeInTheDocument();
   });
 
+  it("shows a measured turn cost and its context against the window", async () => {
+    const cost = { estimatedUsd: 0.0123, partialUsd: 0.0123, unpricedRecords: 0, usageComplete: true, contextTokens: 105000, contextCapacity: 200000 };
+    vi.mocked(api).mockResolvedValue({ schemaVersion: 1, turns: [{ ...turn(), cost }], nextCursor: null } as never);
+    render(<RemoteAgentTurns sessionId={sessionId} projectId="project-a" />);
+    const item = (await screen.findByRole("list", { name: "Collected turns" })).querySelector("li")!;
+    expect(item).toHaveTextContent("$0.0123");
+    expect(item).toHaveTextContent("Context 105,000 / 200,000 (53%)");
+  });
+
+  it("says a turn's cost was not reported rather than showing a share of the session", async () => {
+    const cost = { estimatedUsd: null, partialUsd: null, unpricedRecords: 0, usageComplete: true, contextTokens: null, contextCapacity: null };
+    vi.mocked(api).mockResolvedValue({ schemaVersion: 1, turns: [{ ...turn(), cost }], nextCursor: null } as never);
+    render(<RemoteAgentTurns sessionId={sessionId} projectId="project-a" />);
+    const item = (await screen.findByRole("list", { name: "Collected turns" })).querySelector("li")!;
+    expect(item).toHaveTextContent("Cost not reported");
+    expect(item).not.toHaveTextContent("Context");
+    expect(item).not.toHaveTextContent("$0");
+  });
+
+  it("flags incomplete turn usage and a partially priced turn distinctly", async () => {
+    vi.mocked(api).mockResolvedValue({ schemaVersion: 1, turns: [
+      { ...turn(), nativeTurnId: "t-incomplete", cost: { estimatedUsd: null, partialUsd: null, unpricedRecords: 0, usageComplete: false, contextTokens: null, contextCapacity: null } },
+      { ...turn(), nativeTurnId: "t-partial", cost: { estimatedUsd: null, partialUsd: 0.5, unpricedRecords: 2, usageComplete: true, contextTokens: null, contextCapacity: null } },
+    ], nextCursor: null } as never);
+    render(<RemoteAgentTurns sessionId={sessionId} projectId="project-a" />);
+    const list = await screen.findByRole("list", { name: "Collected turns" });
+    expect(list).toHaveTextContent("Usage incomplete for this turn");
+    expect(list).toHaveTextContent("$0.50 priced so far · 2 unpriced");
+  });
+
+  it("shows context without a percentage when the window is unknown", async () => {
+    const cost = { estimatedUsd: null, partialUsd: null, unpricedRecords: 0, usageComplete: true, contextTokens: 4200, contextCapacity: null };
+    vi.mocked(api).mockResolvedValue({ schemaVersion: 1, turns: [{ ...turn(), cost }], nextCursor: null } as never);
+    render(<RemoteAgentTurns sessionId={sessionId} projectId="project-a" />);
+    expect(await screen.findByText(/Context 4,200 tokens/)).toBeInTheDocument();
+  });
+
   it("appends older turns instead of replacing the page already shown", async () => {
     vi.mocked(api)
       .mockResolvedValueOnce({ schemaVersion: 1, turns: [turn()], nextCursor: "next" } as never)

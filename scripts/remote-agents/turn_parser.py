@@ -5,7 +5,7 @@ read: a patch is shown only when the native event carries one.
 """
 from datetime import datetime
 
-from native_parser import bounded, content
+from native_parser import CONTEXT_CAPACITY, bounded, claude_message_usage, content
 
 
 def _elapsed(start, end):
@@ -135,7 +135,8 @@ def consume_claude(state, event):
                 native_id = identity if isinstance(identity, str) and identity else 'claude:' + str(state['ordinal'])
                 turn = dict(nativeTurnId=bounded(native_id, 256), revision=0, ordinal=state['ordinal'],
                             state='ongoing', prompts=[], response=None, startedAt=at, endedAt=None,
-                            durationMs=None, durationSource=None, toolCallCount=0, fileChanges=[])
+                            durationMs=None, durationSource=None, toolCallCount=0, fileChanges=[],
+                            usage=[], contextTokens=None, contextCapacity=CONTEXT_CAPACITY['claude'])
                 state['turn'] = turn
             if len(turn['prompts']) < 32 and (not turn['prompts'] or turn['prompts'][-1]['text'] != bounded(prompt, 65536)):
                 turn['prompts'].append(dict(at=at, text=bounded(prompt, 65536)))
@@ -145,6 +146,26 @@ def consume_claude(state, event):
         return None
     changed = False
     if kind == 'assistant':
+        '''
+        FNXC:ExternalSessionUsage 2026-09-23-23:24: A turn's cost is measured, never apportioned from the
+        session total. Each priced request is recorded against the turn it belongs to, keyed by message id so a
+        rewritten transcript cannot double count. contextTokens is the newest request's whole input, which is
+        the context the model actually saw; capacity is the provider window.
+        '''
+        identity = message.get('id')
+        usage = claude_message_usage(message)
+        if isinstance(identity, str) and identity and usage is not None and usage['outputTokens'] is not None:
+            if len(turn.setdefault('usage', [])) < 64 and not any(u.get('requestId') == identity for u in turn['usage']):
+                model = message.get('model')
+                turn['usage'].append(dict(requestId=bounded(identity, 256),
+                                          model=bounded(model, 256) if isinstance(model, str) else None, **usage))
+                turn['contextTokens'] = usage['inputTokens']
+                turn['contextCapacity'] = CONTEXT_CAPACITY['claude']
+                changed = True
+        elif usage is None and isinstance(message.get('usage'), dict):
+            # Unreadable usage marks the turn's accounting incomplete rather than quietly under-reporting it.
+            turn['usageComplete'] = False
+            changed = True
         answer = content(message.get('content'))
         if answer and turn['response'] != bounded(answer, 131072):
             turn['response'] = bounded(answer, 131072); changed = True

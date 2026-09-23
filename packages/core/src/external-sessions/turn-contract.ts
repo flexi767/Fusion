@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { externalSessionIdentifier } from "./contract.js";
+import { externalSessionIdentifier, externalSessionUsageSchema } from "./contract.js";
 
 const safeCounter = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const timestamp = z.string().datetime({ offset: true }).transform(value => new Date(value).toISOString());
@@ -49,6 +49,17 @@ export const externalSessionTurnSchema = z.object({
   durationSource: z.enum(["native", "derived"]).nullable(),
   toolCallCount: safeCounter.nullable(),
   fileChanges: z.array(externalSessionFileChangeSchema).max(128),
+  /*
+  FNXC:ExternalSessionUsage 2026-09-23-23:24: Measured per-request usage for this turn, so a turn's cost is
+  priced from what the provider reported rather than apportioned from the session total. Optional because a
+  provider or an older collector may report none, and absent must stay distinguishable from zero.
+  requestId keys the record so a rewritten transcript cannot double count.
+  */
+  usage: z.array(externalSessionUsageSchema.extend({ requestId: externalSessionIdentifier })).max(64).optional(),
+  usageComplete: z.boolean().optional(),
+  /** Whole input of the newest request: what the model actually saw, against the provider window. */
+  contextTokens: safeCounter.nullable().optional(),
+  contextCapacity: safeCounter.nullable().optional(),
 }).strict().superRefine((value, ctx) => {
   if ((value.durationMs === null) !== (value.durationSource === null)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["durationSource"], message: "Duration value and source must be reported together" });

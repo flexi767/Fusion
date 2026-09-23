@@ -499,6 +499,41 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(host).toMatchObject({ spoolDepth: 5 });
   });
 
+  it("stores measured per-turn usage and context without inventing either", async () => {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const base = turnEnvelope(first.sessionId, "turn-usage", 0);
+    await turns.ingest({ ...base, turn: { ...base.turn,
+      usage: [{ requestId: "msg-1", model: "claude-sonnet-5", inputTokens: 1050, cachedInputTokens: 900,
+        cacheWriteTokens: 50, cacheWriteHourTokens: 0, outputTokens: 20, reasoningTokens: null, fast: false, longContext: false }],
+      usageComplete: true, contextTokens: 1050, contextCapacity: 200000 } });
+    const [stored] = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(first.sessionId)).turns;
+    expect(stored).toMatchObject({ contextTokens: 1050, contextCapacity: 200000, usageComplete: true });
+    expect(stored!.usage).toHaveLength(1);
+    expect(stored!.usage![0]).toMatchObject({ requestId: "msg-1", inputTokens: 1050, outputTokens: 20 });
+  });
+
+  it("keeps a turn without usage absent rather than zeroed", async () => {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    await turns.ingest(turnEnvelope(first.sessionId, "turn-bare", 0));
+    const [stored] = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(first.sessionId)).turns;
+    expect(stored!.usage).toBeUndefined();
+    expect(stored!.contextTokens ?? null).toBeNull();
+  });
+
+  it("rejects turn usage that contradicts itself", async () => {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const base = turnEnvelope(first.sessionId, "turn-bad", 0);
+    const usage = { requestId: "msg-1", model: "m", inputTokens: 10, cachedInputTokens: 0, cacheWriteTokens: 0,
+      cacheWriteHourTokens: 0, outputTokens: 1, reasoningTokens: null, fast: false, longContext: false };
+    for (const bad of [{ inputTokens: -1 }, { contextTokens: -5 }, { usage: [{ ...usage, requestId: "" }] }]) {
+      const broken = "usage" in bad ? { ...base.turn, ...bad } : { ...base.turn, usage: [{ ...usage, ...bad }] };
+      await expect(turns.ingest({ ...base, turn: broken as never })).rejects.toThrow();
+    }
+  });
+
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
     await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);

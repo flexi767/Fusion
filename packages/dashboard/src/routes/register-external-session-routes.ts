@@ -3,7 +3,7 @@ import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, e
   externalSessionCursorAfter, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackClaimSchema, feedbackAckSchema,
   ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict, externalSessionTurnIngestionSchema } from "@fusion/core";
 import { ApiError } from "../api-error.js";
-import { sessionCostBadge } from "../remote-agents/session-cost.js";
+import { sessionCostBadge, summarizeTurnCost } from "../remote-agents/session-cost.js";
 import { ExternalSessionTurnSearch } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
@@ -81,8 +81,22 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
       || (req.query.cursor !== undefined && typeof req.query.cursor !== "string")) throw new ApiError(400, "Invalid external turn query");
     const { store, projectId } = await ctx.getProjectContext(req); const layer = store.getAsyncLayer();
     if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
-    try { res.json(await new ExternalSessionTurnReader(layer, projectId).list(id.data,
-      { ...(limit === undefined ? {} : { limit: Number(limit) }), ...(req.query.cursor === undefined ? {} : { cursor: req.query.cursor }) })); }
+    const priceTurns = async (page: { turns: Array<Record<string, unknown>> }) => {
+      /* FNXC:ExternalSessionUsage 2026-09-23-23:24: Pricing is additive to turn history, so a failure to resolve
+         the session or the rate table leaves turns UNPRICED rather than making the history itself unavailable. */
+      let session: { provider: string } | null = null;
+      let overrides: Parameters<typeof summarizeTurnCost>[2];
+      try {
+        session = await new ExternalSessionReader(layer, projectId).get(id.data as string);
+        overrides = (await store.getGlobalSettingsStore().getSettings()).modelPricingOverrides;
+      } catch { session = null; }
+      /* FNXC:ExternalSessionUsage 2026-09-23-23:24: Priced here rather than in core so turns reuse the dashboard's
+         single pricing seam; a session that vanished mid-read leaves turns unpriced instead of guessing a provider. */
+      return { ...page, turns: page.turns.map(turn => ({ ...turn,
+        cost: session ? summarizeTurnCost(turn, session.provider, overrides) : null })) };
+    };
+    try { res.json(await priceTurns(await new ExternalSessionTurnReader(layer, projectId).list(id.data,
+      { ...(limit === undefined ? {} : { limit: Number(limit) }), ...(req.query.cursor === undefined ? {} : { cursor: req.query.cursor }) }) as never)); }
     catch (error) {
       if (error instanceof SyntaxError || (error instanceof Error && (error.name === "ZodError" || error.message.includes("cursor scope")))) {
         throw new ApiError(400, "Invalid external turn cursor");
