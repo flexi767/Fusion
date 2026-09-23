@@ -285,17 +285,20 @@ def main():
             try:
                 post(args.url, args.project, token, 'heartbeat', dict(schemaVersion=1, collectorVersion=VERSION))
                 for seq, body in db.execute('SELECT sequence,body FROM pending ORDER BY sequence LIMIT 100').fetchall():
-                    b = json.loads(body); ack = post(args.url, args.project, token, 'ingest', b)
+                    b = json.loads(body); ack = post(args.url, args.project, token, 'ingest', b, timeout=20)
                     if ack.get('streamId') != b['streamId'] or ack.get('acknowledgedSequence', 0) < seq:
                         raise ValueError('Invalid ingestion acknowledgement')
                     with db:
                         db.execute('DELETE FROM pending WHERE sequence=?', (seq,))
                         db.execute('INSERT OR IGNORE INTO acknowledged_sessions VALUES (?,?)',
                                    (b['session']['provider'], b['session']['nativeSessionId']))
-                drain_turns(db, args.project, args.host,
-                            lambda operation, body: post(args.url, args.project, token, operation, body))
             except Exception as error:
                 print('Fusion delivery unavailable:', type(error).__name__, flush=True)
+            try:
+                drain_turns(db, args.project, args.host,
+                            lambda operation, body: post(args.url, args.project, token, operation, body, timeout=20))
+            except Exception as error:
+                print('Fusion turn delivery unavailable:', type(error).__name__, flush=True)
             files = sorted(discover(args.home, args.days), key=lambda item: item[1].stat().st_mtime, reverse=True)
             for provider, path in files[:2000]:
                 try:
