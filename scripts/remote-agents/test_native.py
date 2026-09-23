@@ -93,6 +93,24 @@ class NativeTests(unittest.TestCase):
         run(self.db, 'project', 'host', 'codex', dict(session_id='native', hook_event_name='SessionStart'), lambda op, b: dict(command=None), emitted.append)
         self.assertNotEqual(self.db.execute('SELECT generation FROM runtimes').fetchone()[0], old)
 
+    def test_one_malformed_record_is_skipped_but_an_unparseable_file_fails_closed(self):
+        # A single corrupted COMPLETE line must not pin the cursor and block every later record,
+        # while a transcript with nothing parseable stays a fail-closed replacement.
+        p = self.root / 'rollout.jsonl'
+        meta = dict(type='session_meta', timestamp='2026-09-18T05:00:00Z', payload=dict(id='native-malformed'))
+        prompt = dict(type='event_msg', timestamp='2026-09-18T05:01:00Z', payload=dict(type='user_message', message='After the bad line'))
+        p.write_text(json.dumps(meta) + '\n{not valid json\n' + json.dumps(prompt) + '\n')
+        scan(self.db, p, 'codex')
+        self.assertEqual(self.db.execute('SELECT offset FROM files').fetchone()[0], p.stat().st_size)
+        self.assertGreater(self.db.execute('SELECT count(*) FROM pending').fetchone()[0], 0)
+        p.write_text(p.read_text() + json.dumps(dict(type='event_msg', timestamp='2026-09-18T05:02:00Z', payload=dict(type='user_message', message='Later still'))) + '\n')
+        scan(self.db, p, 'codex')
+        self.assertEqual(self.db.execute('SELECT offset FROM files').fetchone()[0], p.stat().st_size)
+        bad = self.root / 'replaced.jsonl'
+        bad.write_text('replaced\n')
+        with self.assertRaises(ValueError):
+            scan(self.db, bad, 'codex')
+
     def test_large_compaction_does_not_hide_live_activity_or_reset_cursor(self):
         p = self.root / 'rollout.jsonl'
         meta = dict(type='session_meta', timestamp='2026-09-18T05:00:00Z', payload=dict(id='native', cwd='/work'))

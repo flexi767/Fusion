@@ -194,11 +194,22 @@ def scan(db, path, provider):
             state['opaque'] = dict(header=opaque['header'], position=position)
         raw = b''
     end = raw.rfind(b'\n') + 1
+    parsed = malformed = 0
     with db:
         for line in raw[:end].splitlines():
             if len(line) > MAX_LINE:
                 raise ValueError('Oversized native record; cursor preserved')
-            event = json.loads(line)
+            # FNXC:RemoteAgents 2026-09-23-10:05: A COMPLETE line that is not valid JSON can never become
+            # valid, so raising on it pinned the cursor and blocked every later record in that transcript
+            # forever. Skip such a line when other records in the batch parse. When NOTHING parses the file
+            # is replaced or corrupt rather than carrying one bad record, so keep failing closed below and
+            # preserve the cursor and pending spool. Incomplete and oversized records still preserve it too.
+            try:
+                event = json.loads(line)
+            except ValueError:
+                malformed += 1
+                continue
+            parsed += 1
             consume(db, state, event, provider)
             turn = consume_codex(turn_state, event) if provider == 'codex' else consume_claude(turn_state, event) if provider == 'claude' else None
             native = state.get('nativeSessionId')
@@ -230,6 +241,10 @@ def scan(db, path, provider):
                 except (ValueError, TypeError):
                     pass
             db.execute('INSERT OR REPLACE INTO live_files VALUES (?,?,?)', (str(path), stat.st_mtime_ns, json.dumps(live_state)))
+        if malformed and not parsed:
+            raise ValueError('Native transcript has no parseable records; cursor preserved')
+        if malformed:
+            print('Skipped malformed native records:', path.name, malformed, flush=True)
         state['usageComplete'] = offset == stat.st_size and not state.get('unreportedUsage', False)
         native = state.get('nativeSessionId')
         if native:

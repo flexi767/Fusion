@@ -296,6 +296,89 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(await h.layer().db.select({ id: externalSessions.id }).from(externalSessions)).toHaveLength(1);
   });
 
+  it("repairs a damaged external-session schema even when project.tasks is absent", async () => {
+    await h.adminDb().execute(sql.raw("ALTER TABLE project.tasks RENAME TO tasks_hidden; ALTER TABLE project.external_sessions DROP COLUMN observation_digest CASCADE;"));
+    try {
+      expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
+    } finally {
+      await h.adminDb().execute(sql.raw("ALTER TABLE project.tasks_hidden RENAME TO tasks"));
+    }
+    expect((await store().ingest(envelope())).applied).toBe(true);
+  });
+
+  const sessionsContract = sql`
+    SELECT
+      to_regclass('project."idxExternalSessionsRecent"') IS NOT NULL AS recent_index,
+      (SELECT count(*)::int FROM pg_trigger WHERE tgname = 'fusion_assign_project_id'
+         AND tgrelid IN ('project.external_session_hosts'::regclass, 'project.external_session_streams'::regclass, 'project.external_sessions'::regclass)) AS triggers,
+      (SELECT count(*)::int FROM pg_constraint WHERE contype IN ('p', 'f', 'c')
+         AND conrelid IN ('project.external_session_hosts'::regclass, 'project.external_session_streams'::regclass, 'project.external_sessions'::regclass)) AS constraints`;
+
+  it("repairs 0086 even when another project table reuses a constraint name", async () => {
+    // A same-named CHECK on an unrelated table must not make the probe read the schema as intact.
+    // The decoy satisfies the project-ownership audit, so only the constraint-name collision is under test.
+    await h.adminDb().execute(sql.raw(`
+      CREATE TABLE project.external_sessions_decoy (
+        project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+        revision bigint,
+        CONSTRAINT external_sessions_revision CHECK (revision > 0)
+      );
+      ALTER TABLE project.external_sessions_decoy ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE project.external_sessions_decoy FORCE ROW LEVEL SECURITY;
+      CREATE POLICY fusion_project_isolation ON project.external_sessions_decoy
+        USING (current_setting('fusion.project_bypass', true) = 'on' OR project_id = current_setting('fusion.project_id', true))
+        WITH CHECK (current_setting('fusion.project_bypass', true) = 'on' OR project_id = current_setting('fusion.project_id', true));
+      ALTER TABLE project.external_sessions DROP CONSTRAINT external_sessions_revision;
+    `));
+    try {
+      expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
+      const restored = await h.adminDb().execute(sql`SELECT 1 FROM pg_constraint WHERE conrelid = 'project.external_sessions'::regclass AND conname = 'external_sessions_revision'`);
+      expect(restored).toHaveLength(1);
+    } finally {
+      await h.adminDb().execute(sql.raw("DROP TABLE project.external_sessions_decoy"));
+    }
+  });
+
+  it.each([
+    ["missing recent index", 'DROP INDEX project."idxExternalSessionsRecent"'],
+    ["missing project trigger", "DROP TRIGGER fusion_assign_project_id ON project.external_sessions"],
+    ["missing revision constraint", "ALTER TABLE project.external_sessions DROP CONSTRAINT external_sessions_revision"],
+    ["missing native identity constraint", "ALTER TABLE project.external_sessions DROP CONSTRAINT external_sessions_native_identity"],
+  ])("repairs a recorded 0086 session schema with a %s", async (_label, damage) => {
+    const intact = (await h.adminDb().execute(sessionsContract))[0];
+    await h.adminDb().execute(sql.raw(damage));
+    expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
+    expect((await h.adminDb().execute(sessionsContract))[0]).toEqual(intact);
+    expect((await applySchemaBaseline(h.adminDb())).applied).toBe(false);
+    expect((await store().ingest(envelope())).applied).toBe(true);
+  });
+
+  const feedbackContract = sql`
+    SELECT
+      (SELECT count(*)::int FROM information_schema.columns WHERE table_schema = 'project' AND table_name = 'external_session_feedback') AS columns,
+      to_regclass('project.external_session_feedback_queue') IS NOT NULL AS queue_index,
+      (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid = 'project.external_session_feedback'::regclass) AS rls,
+      EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'project' AND tablename = 'external_session_feedback' AND policyname = 'fusion_project_isolation') AS policy,
+      EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'project.external_session_feedback'::regclass AND tgname = 'fusion_assign_project_id') AS trigger,
+      (SELECT count(*)::int FROM pg_constraint WHERE conrelid = 'project.external_session_feedback'::regclass AND contype IN ('p', 'f', 'c')) AS constraints`;
+
+  it.each([
+    ["missing required column", "ALTER TABLE project.external_session_feedback DROP COLUMN fingerprint CASCADE"],
+    ["missing nullable column", "ALTER TABLE project.external_session_feedback DROP COLUMN delivered_at CASCADE"],
+    ["missing queue index", "DROP INDEX project.external_session_feedback_queue"],
+    ["missing project trigger", "DROP TRIGGER fusion_assign_project_id ON project.external_session_feedback"],
+    ["missing state constraint", "ALTER TABLE project.external_session_feedback DROP CONSTRAINT external_session_feedback_state_check"],
+    ["missing session foreign key", "ALTER TABLE project.external_session_feedback DROP CONSTRAINT external_session_feedback_project_id_session_id_fkey"],
+  ])("repairs a recorded 0087 feedback schema with a %s", async (_label, damage) => {
+    const intact = (await h.adminDb().execute(feedbackContract))[0];
+    await h.adminDb().execute(sql.raw(damage));
+    expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
+    expect((await h.adminDb().execute(feedbackContract))[0]).toEqual(intact);
+    expect((await applySchemaBaseline(h.adminDb())).applied).toBe(false);
+    const s = await feedbackSession();
+    const b = { commandId: randomUUID(), generation: "runtime-1", text: "Repaired schema" };
+    expect((await s.feedback.submit(s.sessionId, b, s.now)).status).toBe("queued");
+  });
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
     await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
