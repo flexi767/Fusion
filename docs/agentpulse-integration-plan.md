@@ -1,7 +1,8 @@
 # AgentPulse integration into Fusion
 
-Status: active implementation. Phases 0-1 are deployed; Phase 2 is in progress.
+Status: active implementation. Session collection is deployed; the Phase 1 acceptance gate and Phases 2-6 remain open.
 Prepared: 2026-09-15.
+Last reconciled with fork `main`: 2026-09-23, `f2a1a5552`.
 Baseline: Fusion fork `a58b374c7`, including upstream `6e6adf393`; AgentPulse fork `04f0dcf`.
 
 ## Outcome
@@ -74,9 +75,22 @@ PostgreSQL migrations should follow Fusion's existing migration ownership and nu
 
 Implementation ledger:
 
-- Phases 0-1: external-session storage, authenticated collectors, host-aware live cards, replay acknowledgements and feedback are deployed on J.
-- Phase 2: the bounded provider-neutral turn contract defines prompts, results, measured duration provenance, tool counts and historical per-file patches. Project-isolated PostgreSQL turn storage is registered as migration 0088; collector-authenticated ingestion is revision-idempotent and dashboard reads use project-bound pagination. Collector transcript parsing and rendering remain next.
-- Phases 3-6: partial usage/cost and summary foundations exist; the phase gates remain open until the complete accounting, controls, reliability and cutover checks below pass.
+- Phase 0: the architecture and recovery path are recorded. The used-feature inventory, sanitized native fixtures and baseline reconciliation are still incomplete.
+- Phase 1: authenticated Codex/Claude collectors on J, m3 and m5, durable observation replay, host-aware live cards and feedback are deployed. All three host heartbeats advanced after the 2026-09-22 rollout. Identity/reconnect acceptance and the latency targets have not been measured across all hosts.
+- Phase 2: migration 0088, the bounded turn contract, project-scoped paginated reads and revision-idempotent ingestion are deployed in the J application artifact `9739042c8`. Codex and Claude transcript parsers and durable turn delivery were deployed to the three host collectors from `d556695d0`. Collector tests passed 18/18 and focused core/dashboard tests passed 42/42 and 22/22. At the 2026-09-23 check, m3's repaired spool had 361 older observations ahead of 1,750 queued turn revisions; server turn acknowledgements had not yet been verified. The results UI, representative native comparisons and turn-history backfill remain unimplemented.
+- Phase 3: session-level usage and estimated cost with category rates exist in the Remote agents panel. Current context/capacity, effective-dated rates, an accessible compact cost popup, turn costs and expensive-task rankings are not complete.
+- Phase 4: queued external feedback and delivery receipts exist. Capability-gated stop/resume and full cross-host control acceptance are not complete.
+- Phase 5: an AI-overview foundation exists on a separate branch, but Qwen3.5-2B summaries are not deployed or accepted. Search and collector operations UI remain open.
+- Phase 6: historical AgentPulse import, parity reconciliation, primary-entry cutover and the 24-hour observation gate have not been completed. Standalone AgentPulse remains available for recovery.
+
+### Next work, in order
+
+1. Let m3's repaired observation spool drain, then verify turn acknowledgements and project-scoped PostgreSQL reads from real Codex and Claude sessions. Diagnose the isolated CLI smoke's `External session project storage unavailable` response; the live J API and focused route/store tests are healthy.
+2. Render the persisted turns in Remote agents and linked Fusion task detail: prompt above result, elapsed work time, tool activity, expandable historical file patches, pagination, deep links and explicit unavailable/truncated states. Compare real turns with native output, including the 20-file example if its transcript is available.
+3. Complete context size/capacity, normalized request and turn usage, effective-dated model prices, accessible detailed cost popup, and expensive-session/turn explanations with unknown-price coverage.
+4. Add only supported host-routed stop/resume controls, prove feedback delivery and command idempotency on disposable sessions across J, m3 and m5, and show queued/unsupported states clearly.
+5. Land and configure bounded Qwen3.5-2B summaries; add searchable output and operations health for lag, spool depth, acknowledgements, parser failures and summary failures.
+6. Import AgentPulse history with resumable native identities and provenance; reconcile counts, text, patches, usage and prices. Run the 24-hour acceptance window and rehearse rollback before switching the primary entry point. Retiring standalone AgentPulse requires separate explicit approval.
 
 ### Phase 0 — Confirm contracts and preserve recovery data
 
@@ -169,6 +183,6 @@ AgentPulse:
 - `src/shared/session-results.ts`, `src/shared/session-telemetry.ts`, `src/shared/model-pricing.ts`
 - `src/web/components/CostOverview.tsx`, `src/web/components/CostPopover.tsx`
 
-## First implementation slice
+## Current execution checkpoint
 
-Start with phases 0 and 1: one external Codex session and one Claude session from m3, m5 and J, where available, visible in Fusion with correct host, stable status and reliable replay. This proves collection and identity before adding history, pricing and commands. Do not retire AgentPulse at this stage.
+Start with item 1 in **Next work, in order**. Do not advance the Phase 2 gate merely because turn records are queued locally: verify server acknowledgement, project-scoped reads and the browser presentation against native sessions. Keep AgentPulse available through the later parity and rollback gates.
