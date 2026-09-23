@@ -1,7 +1,7 @@
 # AgentPulse integration into Fusion
 
 Status: implementation plan; PR1 ingestion foundation implemented on its isolated branch, full integration pending.
-PR1 foundation: provider-neutral domain/storage and authenticated durable ingestion are scoped in [External session ingestion](external-session-ingestion.md). This increment does not satisfy the phase 1 visibility gate; subsequent PRs and server J deployment/rollback prerequisites are documented there.
+PR1 foundation: provider-neutral domain/storage and authenticated durable ingestion are scoped in [External session ingestion](external-session-ingestion.md). This increment does not satisfy the phase 1 visibility gate; subsequent PRs and deployment/rollback prerequisites are documented there.
 Prepared: 2026-09-15.
 Baseline: Fusion fork `a58b374c7`, including upstream `6e6adf393`; AgentPulse fork `04f0dcf`.
 
