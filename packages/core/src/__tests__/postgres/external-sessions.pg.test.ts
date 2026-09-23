@@ -11,6 +11,7 @@ import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
 import { externalSessionTurnSchema } from "../../external-sessions/turn-contract.js";
 import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore } from "../../external-sessions/turn-store.js";
+import { ExternalSessionTurnSearch } from "../../external-sessions/turn-search.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
 const envelope = (sequence = 1, revision = sequence) => ({ schemaVersion: 1, streamId: "spool", sequence,
@@ -379,6 +380,85 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     const b = { commandId: randomUUID(), generation: "runtime-1", text: "Repaired schema" };
     expect((await s.feedback.submit(s.sessionId, b, s.now)).status).toBe("queued");
   });
+  async function searchCorpus() {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const a = turnEnvelope(first.sessionId, "turn-a", 0);
+    await turns.ingest({ ...a, turn: { ...a.turn, prompts: [{ at: null, text: "Please migrate the postgres schema applier" }], response: "Applied the migration and verified constraints" } });
+    const b = turnEnvelope(first.sessionId, "turn-b", 1);
+    await turns.ingest({ ...b, turn: { ...b.turn, prompts: [{ at: null, text: "Now render the dashboard panel" }], response: "Rendered the panel with tokens" } });
+    return first.sessionId;
+  }
+
+  it("finds collected output by word and returns a highlighted excerpt", async () => {
+    const sessionId = await searchCorpus();
+    const page = await new ExternalSessionTurnSearch(h.layer(), principal.projectId).search({ q: "migration" });
+    expect(page.hits).toHaveLength(1);
+    expect(page.hits[0]).toMatchObject({ sessionId, nativeTurnId: "turn-a", hostId: principal.hostId, provider: "runtime", title: "Session" });
+    expect(page.hits[0]!.snippet).toContain("<mark>");
+    // The English configuration stems, so the typed word need not match the stored form exactly.
+    expect((await new ExternalSessionTurnSearch(h.layer(), principal.projectId).search({ q: "migrating" })).hits).toHaveLength(1);
+  });
+
+  it("searches prompts as well as responses and supports quoted phrases and exclusion", async () => {
+    await searchCorpus();
+    const search = new ExternalSessionTurnSearch(h.layer(), principal.projectId);
+    expect((await search.search({ q: "dashboard" })).hits.map(hit => hit.nativeTurnId)).toEqual(["turn-b"]);
+    expect((await search.search({ q: '"postgres schema"' })).hits.map(hit => hit.nativeTurnId)).toEqual(["turn-a"]);
+    expect((await search.search({ q: "panel -dashboard" })).hits.map(hit => hit.nativeTurnId)).toEqual([]);
+  });
+
+  it("returns no searchable term instead of matching everything for stopword-only input", async () => {
+    await searchCorpus();
+    expect(await new ExternalSessionTurnSearch(h.layer(), principal.projectId).search({ q: "the and of" }))
+      .toMatchObject({ hits: [], more: false, query: null });
+  });
+
+  it("never raises on punctuation an operator can type into a search box", async () => {
+    await searchCorpus();
+    const search = new ExternalSessionTurnSearch(h.layer(), principal.projectId);
+    for (const q of ['"unbalanced', "a & b | c", "!!!", "' OR 1=1 --", "<script>"]) {
+      await expect(search.search({ q })).resolves.toMatchObject({ schemaVersion: 1 });
+    }
+  });
+
+  it("keeps search inside its project and honours host and session filters", async () => {
+    const sessionId = await searchCorpus();
+    const search = new ExternalSessionTurnSearch(h.layer(), principal.projectId);
+    expect((await search.search({ q: "migration", hostId: principal.hostId })).hits).toHaveLength(1);
+    expect((await search.search({ q: "migration", hostId: "other-host" })).hits).toEqual([]);
+    expect((await search.search({ q: "migration", sessionId })).hits).toHaveLength(1);
+    expect((await search.search({ q: "migration", sessionId: "b".repeat(64) })).hits).toEqual([]);
+    expect(() => new ExternalSessionTurnSearch(h.layer(), "other-project")).toThrow();
+  });
+
+  it("caps the page and reports that more matched", async () => {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    for (let i = 0; i < 4; i += 1) {
+      const base = turnEnvelope(first.sessionId, `bulk-${i}`, i);
+      await turns.ingest({ ...base, turn: { ...base.turn, prompts: [{ at: null, text: "repeated needle text" }], response: "needle" } });
+    }
+    const page = await new ExternalSessionTurnSearch(h.layer(), principal.projectId).search({ q: "needle", limit: 2 });
+    expect(page.hits).toHaveLength(2);
+    expect(page.more).toBe(true);
+  });
+
+  it("installs the 0089 search index and keeps it valid", async () => {
+    await searchCorpus();
+    const [index] = (await h.adminDb().execute(sql`SELECT indisvalid AS valid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = 'external_session_turn_search'`)) as unknown as Array<{ valid: boolean }>;
+    expect(index?.valid).toBe(true);
+    const ledger = await h.adminDb().execute(sql`SELECT version FROM public.fusion_schema_migrations WHERE version = '0089'`);
+    expect(ledger).toHaveLength(1);
+  });
+
+  it("reinstalls the search index when it is dropped but the ledger row remains", async () => {
+    await h.adminDb().execute(sql.raw("DROP INDEX project.external_session_turn_search"));
+    expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
+    const [index] = (await h.adminDb().execute(sql`SELECT indisvalid AS valid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = 'external_session_turn_search'`)) as unknown as Array<{ valid: boolean }>;
+    expect(index?.valid).toBe(true);
+  });
+
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
     await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);

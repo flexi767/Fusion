@@ -5,6 +5,7 @@ import { api } from "../api/client/client";
 import { withProjectId } from "../api/client/health";
 import { useVisibilityAwarePoll } from "../hooks/visibilitySuspension";
 import { RemoteAgentTurns } from "./RemoteAgentTurns";
+import { RemoteAgentSearch } from "./RemoteAgentSearch";
 import "./RemoteAgentsPanel.css";
 
 type Feedback = { commandId: string; status: string; createdAt: string; expiresAt: string; deliveredAt: string | null };
@@ -217,6 +218,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
       <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
       <button className="btn btn-sm" onClick={() => void load()} disabled={loading}>Refresh</button>
     </div>
+    {projectId && <RemoteAgentSearch projectId={projectId} {...(host ? { hostId: host } : {})} onOpenSession={setSelected} />}
     <section className="remote-agent-hosts" aria-labelledby="remote-agent-hosts-heading">
       <h3 id="remote-agent-hosts-heading">Servers</h3>
       {!hosts.length ? <p className="remote-agent-meta">No collector has reported for this project.</p> : <ul className="remote-agent-host-list">
@@ -235,7 +237,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
     {!projectId && <p>Select a Fusion project to view its remote agents.</p>}
     {error && <p role="alert">{error}</p>}
     {projectId && !sessions.length && !error && <p>{loading ? "Loading remote agents…" : "No remote sessions reported for this project."}</p>}
-    <p className="remote-agent-meta" role="status">{projectId && sessions.length ? `${sessions.length} ${sessions.length === 1 ? "session" : "sessions"} shown${loading ? ", refreshing" : ""}.` : ""}</p>
+    <p className="remote-agent-meta" role="status" aria-label="Session list status">{projectId && sessions.length ? `${sessions.length} ${sessions.length === 1 ? "session" : "sessions"} shown${loading ? ", refreshing" : ""}.` : ""}</p>
     <div className="remote-agent-layout"><div className="remote-agent-list">
       {!!sessions.length && <ul className="remote-agent-rows" aria-label="Remote agent sessions">
         {[...sessions].sort((a, b) => b.observation.observedAt.localeCompare(a.observation.observedAt)).map(s => <li key={s.id}>

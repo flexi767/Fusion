@@ -4,6 +4,7 @@ import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, e
   ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict, externalSessionTurnIngestionSchema } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import { sessionCostBadge } from "../remote-agents/session-cost.js";
+import { ExternalSessionTurnSearch } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
@@ -40,6 +41,28 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     const page = await new ExternalSessionReader(layer, projectId).list(query.data);
     const settings = await store.getGlobalSettingsStore().getSettings();
     res.json({ ...page, sessions: page.sessions.map(session => ({ ...session, cost: sessionCostBadge(session, settings.modelPricingOverrides) })) });
+  });
+  /*
+  FNXC:ExternalSessionSearch 2026-09-23-23:05: Registered BEFORE "/external-sessions/:id" on purpose; Express
+  matches in order, so the parameter route would otherwise capture "search" as a session id and 400.
+  */
+  ctx.router.get("/external-sessions/search", async (req, res) => {
+    const limit = typeof req.query.limit === "string" && /^\d+$/.test(req.query.limit) ? Number(req.query.limit) : undefined;
+    if (typeof req.query.q !== "string") throw new ApiError(400, "Search requires a query");
+    for (const key of ["hostId", "sessionId"] as const) {
+      if (req.query[key] !== undefined && typeof req.query[key] !== "string") throw new ApiError(400, "Invalid external session search filter");
+    }
+    const { store, projectId } = await ctx.getProjectContext(req); const layer = store.getAsyncLayer();
+    if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
+    try {
+      res.json(await new ExternalSessionTurnSearch(layer, projectId).search({ q: req.query.q,
+        ...(limit === undefined ? {} : { limit }),
+        ...(req.query.hostId === undefined ? {} : { hostId: String(req.query.hostId) }),
+        ...(req.query.sessionId === undefined ? {} : { sessionId: String(req.query.sessionId) }) }));
+    } catch (error) {
+      if (error instanceof Error && error.name === "ZodError") throw new ApiError(400, "Invalid external session search query");
+      throw error;
+    }
   });
   ctx.router.get("/external-sessions/:id", async (req, res) => {
     const id = externalSessionReadId.safeParse(req.params.id);

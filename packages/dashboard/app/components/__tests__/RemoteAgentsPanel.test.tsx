@@ -118,7 +118,7 @@ describe("standalone remote agents", () => {
     await screen.findByText("Fixture agent");
     const list = screen.getByRole("list", { name: "Remote agent sessions" });
     expect(within(list).getAllByRole("listitem")).toHaveLength(1);
-    expect(screen.getByRole("status")).toHaveTextContent("1 session shown");
+    expect(screen.getByRole("status", { name: "Session list status" })).toHaveTextContent("1 session shown");
   });
 
   it("surfaces monitoring errors instead of showing an empty success state", async () => {
