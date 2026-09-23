@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RemoteAgentsPanel } from "../RemoteAgentsPanel";
 import { api } from "../../api/client/client";
 
@@ -59,6 +59,61 @@ describe("standalone remote agents", () => {
     expect(screen.getByText("Fresh agent")).toBeInTheDocument();
     expect(screen.queryByText("Stale agent")).toBeNull();
     expect(screen.queryByRole("button", { name: "Load more sessions" })).toBeNull();
+  });
+
+  it("shows each session's cost on its card and never invents a total it cannot stand behind", async () => {
+    const priced = { ...fixture, id: "1".repeat(64), hostId: "j", observation: { ...fixture.observation, title: "Priced agent" }, cost: { estimatedUsd: 1.25, partialUsd: 1.25, usageComplete: true, unpricedRecords: 0 } };
+    const partial = { ...fixture, id: "2".repeat(64), hostId: "j", observation: { ...fixture.observation, title: "Partly priced agent" }, cost: { estimatedUsd: null, partialUsd: 0.5, usageComplete: false, unpricedRecords: 2 } };
+    const unknown = { ...fixture, id: "3".repeat(64), hostId: "m3", observation: { ...fixture.observation, title: "Unpriced agent" }, cost: { estimatedUsd: null, partialUsd: null, usageComplete: true, unpricedRecords: 1 } };
+    const empty = { ...fixture, id: "4".repeat(64), hostId: "m3", observation: { ...fixture.observation, title: "No usage agent" }, cost: { estimatedUsd: null, partialUsd: null, usageComplete: false, unpricedRecords: 0 } };
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }] } as never;
+      return { sessions: [priced, partial, unknown, empty], nextCursor: null } as never;
+    });
+    render(<RemoteAgentsPanel projectId="project-a" />);
+    const row = async (title: string) => (await screen.findByText(title)).closest("button")!;
+    expect(await row("Priced agent")).toHaveTextContent("$1.25 estimated");
+    // A partial total must say so and must not be presented as the session total.
+    expect(await row("Partly priced agent")).toHaveTextContent("$0.50 priced so far · 2 records unpriced");
+    expect(await row("Partly priced agent")).not.toHaveTextContent("$0.50 estimated");
+    expect(await row("Unpriced agent")).toHaveTextContent("Cost unknown · 1 record unpriced");
+    expect(await row("No usage agent")).toHaveTextContent("No usage reported");
+  });
+
+  it("summarizes every server with its own session count and flags an incomplete host total", async () => {
+    const priced = { ...fixture, id: "1".repeat(64), hostId: "j", observation: { ...fixture.observation, title: "J one" }, cost: { estimatedUsd: 2, partialUsd: 2, usageComplete: true, unpricedRecords: 0 } };
+    const alsoPriced = { ...fixture, id: "2".repeat(64), hostId: "j", observation: { ...fixture.observation, title: "J two" }, cost: { estimatedUsd: 3, partialUsd: 3, usageComplete: true, unpricedRecords: 0 } };
+    const incomplete = { ...fixture, id: "3".repeat(64), hostId: "m3", observation: { ...fixture.observation, title: "M3 one" }, cost: { estimatedUsd: null, partialUsd: 0.25, usageComplete: false, unpricedRecords: 1 } };
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }, { hostId: "m5", collectorConnected: false }] } as never;
+      return { sessions: [priced, alsoPriced, incomplete], nextCursor: null } as never;
+    });
+    render(<RemoteAgentsPanel projectId="project-a" />);
+    const items = await screen.findAllByRole("listitem");
+    const j = items.find(i => i.textContent?.startsWith("j"))!;
+    expect(j).toHaveTextContent("Collector connected");
+    expect(j).toHaveTextContent("2 sessions loaded");
+    expect(j).toHaveTextContent("$5.00 estimated");
+    const m3 = items.find(i => i.textContent?.startsWith("m3"))!;
+    expect(m3).toHaveTextContent("Collector offline");
+    expect(m3).toHaveTextContent("1 session loaded");
+    // One unpriced session makes the whole host total incomplete; it must not read as a finished number.
+    expect(m3).toHaveTextContent("incomplete");
+    const m5 = items.find(i => i.textContent?.startsWith("m5"))!;
+    expect(m5).toHaveTextContent("0 sessions loaded");
+    expect(m5).toHaveTextContent("No cost reported");
+  });
+
+  it("exposes the sessions as a labelled list and announces how many are shown", async () => {
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.includes("/hosts")) return { hosts: [] } as never;
+      return { sessions: [fixture], nextCursor: null } as never;
+    });
+    render(<RemoteAgentsPanel projectId="project-a" />);
+    await screen.findByText("Fixture agent");
+    const list = screen.getByRole("list", { name: "Remote agent sessions" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent("1 session shown");
   });
 
   it("surfaces monitoring errors instead of showing an empty success state", async () => {

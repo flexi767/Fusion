@@ -3,6 +3,7 @@ import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, e
   externalSessionCursorAfter, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackClaimSchema, feedbackAckSchema,
   ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict, externalSessionTurnIngestionSchema } from "@fusion/core";
 import { ApiError } from "../api-error.js";
+import { sessionCostBadge } from "../remote-agents/session-cost.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
@@ -31,7 +32,14 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     catch { throw new ApiError(400, "Invalid external session cursor"); }
     const layer = store.getAsyncLayer();
     if (!layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
-    res.json(await new ExternalSessionReader(layer, projectId).list(query.data));
+    /*
+    FNXC:RemoteAgents 2026-09-23-21:32: Cost used to be reachable only by opening one session at a time, so
+    "which session is expensive?" required N clicks. Each card now carries its own total, priced server-side
+    from the same summary the detail pane uses, so the list and the detail can never disagree.
+    */
+    const page = await new ExternalSessionReader(layer, projectId).list(query.data);
+    const settings = await store.getGlobalSettingsStore().getSettings();
+    res.json({ ...page, sessions: page.sessions.map(session => ({ ...session, cost: sessionCostBadge(session, settings.modelPricingOverrides) })) });
   });
   ctx.router.get("/external-sessions/:id", async (req, res) => {
     const id = externalSessionReadId.safeParse(req.params.id);

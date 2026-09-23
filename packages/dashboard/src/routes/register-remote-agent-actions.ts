@@ -1,6 +1,6 @@
 import { ExternalSessionReader, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackSubmitSchema, externalSessionReadId, pricingAsOf } from "@fusion/core";
 import { ApiError } from "../api-error.js";
-import { priceUsage } from "../remote-agents/pricing.js";
+import { summarizeSessionCost } from "../remote-agents/session-cost.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 
@@ -26,13 +26,9 @@ export const registerRemoteAgentActions: ApiRouteRegistrar = ctx => {
   ctx.router.get("/external-sessions/:id/cost", async (req, res) => {
     const { session, store } = await resolve(req);
     const settings = await store.getGlobalSettingsStore().getSettings();
-    const raw = session.observation.usage ?? [];
-    const pricingProvider = session.provider === "claude" ? "claude_code" : session.provider === "codex" ? "codex_cli" : session.provider;
-    const usage = raw.map(u => priceUsage(u, pricingProvider, settings.modelPricingOverrides)).filter((u): u is NonNullable<typeof u> => u !== null);
-    const priced = usage.filter(u => u.usd !== null); const partial = priced.reduce((n, u) => n + u.usd!, 0);
-    const complete = session.observation.usageComplete === true && usage.length > 0 && usage.length === raw.length && priced.length === usage.length;
-    res.json({ usage, estimatedUsd: complete ? partial : null, partialUsd: priced.length ? partial : null,
-      usageComplete: session.observation.usageComplete === true, pricingDate: settings.modelPricingFetchedAt ?? pricingAsOf, pricingSource: settings.modelPricingSource ?? "Fusion model pricing" });
+    const summary = summarizeSessionCost(session, settings.modelPricingOverrides);
+    res.json({ usage: summary.usage, estimatedUsd: summary.estimatedUsd, partialUsd: summary.partialUsd,
+      usageComplete: summary.usageComplete, pricingDate: settings.modelPricingFetchedAt ?? pricingAsOf, pricingSource: settings.modelPricingSource ?? "Fusion model pricing" });
   });
   ctx.router.get("/external-sessions/:id/feedback", async (req, res) => {
     const { layer, projectId, session } = await resolve(req);
