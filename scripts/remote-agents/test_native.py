@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
-from collector import connect, bind, scan, validated_base_url
+from collector import connect, bind, scan, validated_base_url, delivery_delay
 from native_parser import consume, totals
 from feedback_hook import run
 from install_hooks import identity, install
@@ -109,6 +109,42 @@ class NativeTests(unittest.TestCase):
         p.write_text('replaced\n')
         with self.assertRaises(ValueError): scan(self.db, p, 'codex')
         self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0], count)
+
+    def _rollout(self, events):
+        return '\n'.join(json.dumps(e) for e in events) + '\n'
+
+    def test_rewritten_transcript_rescans_without_double_counting(self):
+        p = self.root / 'rollout.jsonl'
+        meta = dict(type='session_meta', timestamp='2026-09-18T05:00:00Z', payload=dict(id='native', cwd='/work'))
+        usage = dict(type='token_usage_record', timestamp='2026-09-18T05:01:00Z', payload=dict(response_id='response-a', usage=dict(input_tokens=100, cached_input_tokens=0, output_tokens=5, reasoning_output_tokens=0)))
+        first = dict(type='event_msg', timestamp='2026-09-18T05:02:00Z', payload=dict(type='user_message', message='First prompt'))
+        p.write_text(self._rollout([meta, usage, first])); scan(self.db, p, 'codex')
+        old_inode = self.db.execute('SELECT inode FROM files').fetchone()[0]
+        later = dict(type='event_msg', timestamp='2026-09-18T05:03:00Z', payload=dict(type='user_message', message='Later prompt'))
+        rewritten = self.root / 'rollout.tmp'
+        rewritten.write_text(self._rollout([meta, usage, first, later])); rewritten.replace(p)
+        scan(self.db, p, 'codex')
+        self.assertNotEqual(self.db.execute('SELECT inode FROM files').fetchone()[0], old_inode)
+        self.assertEqual(self.db.execute('SELECT offset FROM files').fetchone()[0], p.stat().st_size)
+        self.assertEqual(totals(self.db, 'codex', 'native')[0]['inputTokens'], 100)
+        newest = json.loads(self.db.execute('SELECT body FROM pending ORDER BY sequence DESC LIMIT 1').fetchone()[0])
+        self.assertEqual(newest['session']['title'], 'Later prompt')
+        revisions = [json.loads(b)['session']['revision'] for (b,) in self.db.execute('SELECT body FROM pending ORDER BY sequence')]
+        self.assertEqual(revisions, sorted(set(revisions)))
+
+    def test_truncated_transcript_rescans_from_start(self):
+        p = self.root / 'rollout.jsonl'
+        meta = dict(type='session_meta', timestamp='2026-09-18T05:00:00Z', payload=dict(id='native', cwd='/work'))
+        long_prompt = dict(type='event_msg', timestamp='2026-09-18T05:01:00Z', payload=dict(type='user_message', message='x' * 4000))
+        p.write_text(self._rollout([meta, long_prompt])); scan(self.db, p, 'codex')
+        short = dict(type='event_msg', timestamp='2026-09-18T05:02:00Z', payload=dict(type='user_message', message='Compacted'))
+        with p.open('r+') as stream:
+            stream.truncate(0); stream.write(self._rollout([meta, short]))
+        scan(self.db, p, 'codex')
+        self.assertEqual(self.db.execute('SELECT offset FROM files').fetchone()[0], p.stat().st_size)
+
+    def test_delivery_backoff_doubles_to_a_ceiling_and_resets(self):
+        self.assertEqual([delivery_delay(n) for n in range(0, 9)], [0, 5, 10, 20, 40, 80, 160, 300, 300])
 
     def test_missing_usage_is_unknown_and_hook_install_preserves_other_hooks(self):
         state = {}

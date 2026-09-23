@@ -161,10 +161,18 @@ def drain_turns(db, project, host, send, limit=25):
 def scan(db, path, provider):
     stat = path.stat(); inode = f'{stat.st_dev}:{stat.st_ino}'
     old = db.execute('SELECT inode,offset,state,digest,revision FROM files WHERE path=?', (str(path),)).fetchone()
-    if old and (old[0] != inode or old[1] > stat.st_size):
-        raise ValueError('Transcript was replaced/truncated; cursor preserved for review')
-    offset, state, previous, revision = (old[1], json.loads(old[2]), old[3], old[4]) if old else (0, {}, '', 0)
-    turn_row = db.execute('SELECT state FROM turn_state WHERE path=?', (str(path),)).fetchone()
+    # FNXC:RemoteAgents 2026-09-23-09:40: A native CLI may rewrite its transcripts in place (a history
+    # migration replaced most rollout files with new inodes, some shorter). Refusing such a file paused its
+    # session forever. Rescan it from the start instead: usage rows are keyed by response/message identity or
+    # cumulative-usage digest and merged by maximum, turns only move forward by revision, and the observation
+    # revision is kept monotonic, so a rescan cannot double-count or regress anything already delivered.
+    rewritten = bool(old and (old[0] != inode or old[1] > stat.st_size))
+    if rewritten:
+        print('Transcript rewritten; rescanning from start:', provider, flush=True)
+        offset, state, previous, revision = 0, {}, old[3], old[4]
+    else:
+        offset, state, previous, revision = (old[1], json.loads(old[2]), old[3], old[4]) if old else (0, {}, '', 0)
+    turn_row = None if rewritten else db.execute('SELECT state FROM turn_state WHERE path=?', (str(path),)).fetchone()
     turn_state = json.loads(turn_row[0]) if turn_row else {}
     opaque = state.get('opaque')
     raw = b''
@@ -258,6 +266,43 @@ def scan(db, path, provider):
         db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?)', (str(path), inode, offset, encoded, previous, revision))
 
 
+DELIVERY_BACKOFF_BASE_SECONDS = 5
+DELIVERY_BACKOFF_MAX_SECONDS = 300
+
+
+def delivery_delay(failures):
+    # FNXC:RemoteAgents 2026-09-23-09:40: Consecutive failed delivery rounds back off 5s doubling to 5min, so
+    # collectors stop hammering a slow or unreachable Fusion; local scanning continues every loop regardless.
+    if failures <= 0:
+        return 0
+    return min(DELIVERY_BACKOFF_MAX_SECONDS, DELIVERY_BACKOFF_BASE_SECONDS * 2 ** (failures - 1))
+
+
+def deliver(db, args, token):
+    """One delivery round: heartbeat and spooled observations, then turns. Returns True when both succeed."""
+    delivered = True
+    try:
+        post(args.url, args.project, token, 'heartbeat', dict(schemaVersion=1, collectorVersion=VERSION))
+        for seq, body in db.execute('SELECT sequence,body FROM pending ORDER BY sequence LIMIT 100').fetchall():
+            b = json.loads(body); ack = post(args.url, args.project, token, 'ingest', b, timeout=20)
+            if ack.get('streamId') != b['streamId'] or ack.get('acknowledgedSequence', 0) < seq:
+                raise ValueError('Invalid ingestion acknowledgement')
+            with db:
+                db.execute('DELETE FROM pending WHERE sequence=?', (seq,))
+                db.execute('INSERT OR IGNORE INTO acknowledged_sessions VALUES (?,?)',
+                           (b['session']['provider'], b['session']['nativeSessionId']))
+    except Exception as error:
+        delivered = False
+        print('Fusion delivery unavailable:', type(error).__name__, flush=True)
+    try:
+        drain_turns(db, args.project, args.host,
+                    lambda operation, body: post(args.url, args.project, token, operation, body, timeout=20))
+    except Exception as error:
+        delivered = False
+        print('Fusion turn delivery unavailable:', type(error).__name__, flush=True)
+    return delivered
+
+
 def discover(home, days):
     cutoff = time.time() - days * 86400
     for provider, root, pattern in [('codex', home / '.codex/sessions', '*/*/*/*.jsonl'), ('claude', home / '.claude/projects', '*/*.jsonl')]:
@@ -281,24 +326,14 @@ def main():
     with args.state.with_suffix('.collector.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         db = connect(args.state); bind(db, args.project, args.host)
+        failures, next_delivery = 0, 0.0
         while True:
-            try:
-                post(args.url, args.project, token, 'heartbeat', dict(schemaVersion=1, collectorVersion=VERSION))
-                for seq, body in db.execute('SELECT sequence,body FROM pending ORDER BY sequence LIMIT 100').fetchall():
-                    b = json.loads(body); ack = post(args.url, args.project, token, 'ingest', b, timeout=20)
-                    if ack.get('streamId') != b['streamId'] or ack.get('acknowledgedSequence', 0) < seq:
-                        raise ValueError('Invalid ingestion acknowledgement')
-                    with db:
-                        db.execute('DELETE FROM pending WHERE sequence=?', (seq,))
-                        db.execute('INSERT OR IGNORE INTO acknowledged_sessions VALUES (?,?)',
-                                   (b['session']['provider'], b['session']['nativeSessionId']))
-            except Exception as error:
-                print('Fusion delivery unavailable:', type(error).__name__, flush=True)
-            try:
-                drain_turns(db, args.project, args.host,
-                            lambda operation, body: post(args.url, args.project, token, operation, body, timeout=20))
-            except Exception as error:
-                print('Fusion turn delivery unavailable:', type(error).__name__, flush=True)
+            if time.monotonic() >= next_delivery:
+                delivered = deliver(db, args, token)
+                failures = 0 if delivered else failures + 1
+                next_delivery = time.monotonic() + delivery_delay(failures)
+                if failures:
+                    print('Fusion delivery backing off:', delivery_delay(failures), 'seconds', flush=True)
             files = sorted(discover(args.home, args.days), key=lambda item: item[1].stat().st_mtime, reverse=True)
             for provider, path in files[:2000]:
                 try:
