@@ -5,6 +5,7 @@ import { api } from "../api/client/client";
 import { withProjectId } from "../api/client/health";
 import { useVisibilityAwarePoll } from "../hooks/visibilitySuspension";
 import { RemoteAgentTurns } from "./RemoteAgentTurns";
+import { RemoteAgentSummary } from "./RemoteAgentSummary";
 import { RemoteAgentSearch } from "./RemoteAgentSearch";
 import { RemoteAgentRankings } from "./RemoteAgentRankings";
 import "./RemoteAgentsPanel.css";
@@ -165,6 +166,7 @@ function RemoteAgentDetail({ session, projectId }: { session: ExternalSessionVie
     <p>Last activity: {new Date(detail.observation.observedAt).toLocaleString()}</p>
     <h4>Recent activity</h4>
     {detail.observation.recentActivity?.length ? detail.observation.recentActivity.map((a, i) => <article key={`${a.at}:${a.kind}:${i}`} className="remote-agent-activity"><strong>{a.kind}</strong> <time>{new Date(a.at).toLocaleTimeString()}</time><pre>{a.text}</pre></article>) : <p className="remote-agent-meta">No recent native activity reported.</p>}
+    <RemoteAgentSummary sessionId={detail.id} projectId={projectId} />
     <RemoteAgentTurns sessionId={detail.id} projectId={projectId} />
     <h4>Session token costs</h4>
     {!cost ? <p>Loading costs…</p> : <>

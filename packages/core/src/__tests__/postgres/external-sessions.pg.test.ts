@@ -15,6 +15,7 @@ import { ExternalSessionTurnSearch } from "../../external-sessions/turn-search.j
 import { externalSessionUsageIncrements } from "../../postgres/schema/project.js";
 import { ExternalSessionUsageIncrementReader } from "../../external-sessions/usage-increments.js";
 import { ExternalSessionRankings } from "../../external-sessions/rankings.js";
+import { ExternalSessionSummaryStore } from "../../external-sessions/summary.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
 const envelope = (sequence = 1, revision = sequence) => ({ schemaVersion: 1, streamId: "spool", sequence,
@@ -794,9 +795,70 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(only!.usage).toHaveLength(1);
   });
 
+  /*
+  FNXC:ExternalSessionSummary 2026-09-24-07:05 (operator decision F3 = A): the durable summary record. The
+  invariant worth a PG test is that a FAILED attempt never destroys the previous summary — during an inference
+  outage the older summary plus an explicit failure is strictly more useful than an empty pane.
+  */
+  const summaries = () => new ExternalSessionSummaryStore(h.layer(), principal.projectId);
+
+  it("preserves the previous summary when a later attempt fails, and recovers on the next success", async () => {
+    const created = await store().ingest(envelope());
+    await summaries().recordSuccess(created.sessionId, { summary: "Fixed the parser.", provider: "anthropic",
+      model: "model-a", coverage: { throughOrdinal: 2, turnCount: 3 } }, "2026-09-24T01:00:00.000Z");
+
+    const failed = await summaries().recordFailure(created.sessionId, "AI engine not available", "2026-09-24T02:00:00.000Z");
+    expect(failed.status).toBe("failed");
+    expect(failed.failure).toBe("AI engine not available");
+    // Everything describing the last GOOD summary survives untouched.
+    expect(failed.summary).toBe("Fixed the parser.");
+    expect(failed.generatedAt).toBe("2026-09-24T01:00:00.000Z");
+    expect(failed.throughOrdinal).toBe(2);
+    expect(failed.turnCount).toBe(3);
+    expect(failed.model).toBe("model-a");
+    expect(failed.attemptedAt).toBe("2026-09-24T02:00:00.000Z");
+
+    const recovered = await summaries().recordSuccess(created.sessionId, { summary: "Fixed the parser and its tests.",
+      provider: "anthropic", model: "model-b", coverage: { throughOrdinal: 5, turnCount: 6 } }, "2026-09-24T03:00:00.000Z");
+    expect(recovered.status).toBe("ready");
+    expect(recovered.failure).toBeNull();
+    expect((await summaries().read(created.sessionId))!.summary).toBe("Fixed the parser and its tests.");
+  });
+
+  it("records a first-attempt failure with no summary rather than inventing one", async () => {
+    const created = await store().ingest(envelope());
+    const failed = await summaries().recordFailure(created.sessionId, "  ");
+    expect(failed.status).toBe("failed");
+    expect(failed.summary).toBeNull();
+    expect(failed.throughOrdinal).toBeNull();
+    // An empty reason still has to say something an operator can act on.
+    expect(failed.failure).toBe("Summary generation failed");
+  });
+
+  it("reads the tail of the transcript and derives staleness from the session's real turns", async () => {
+    const created = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    for (let ordinal = 0; ordinal < 3; ordinal++) await turns.ingest(turnEnvelope(created.sessionId, `turn-${ordinal}`, ordinal));
+    expect((await summaries().latestOrdinal(created.sessionId))).toBe(2);
+    const tail = await summaries().tail(created.sessionId, 2);
+    expect(tail.map(t => t.ordinal)).toEqual([1, 2]);
+    expect((await summaries().latestOrdinal("c".repeat(64)))).toBeNull();
+    expect(() => new ExternalSessionSummaryStore(h.layer(), "other-project")).toThrow();
+  });
+
+  it("bounds a stored summary and refuses a summary for a session that does not exist", async () => {
+    const created = await store().ingest(envelope());
+    const stored = await summaries().recordSuccess(created.sessionId, { summary: "x".repeat(5000),
+      provider: null, model: null, coverage: { throughOrdinal: 0, turnCount: 1 } });
+    expect(stored.summary).toHaveLength(2000);
+    // The foreign key is the guard: a summary can only exist for a real session.
+    await expect(summaries().recordSuccess("d".repeat(64), { summary: "orphan", provider: null, model: null,
+      coverage: { throughOrdinal: 0, turnCount: 1 } })).rejects.toThrow();
+  });
+
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
     // 0091's increments reference external_sessions, so a pre-0086 upgrade must drop them too.
-    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_usage_increments, project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088', '0091');"));
+    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_summaries, project.external_session_usage_increments, project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088', '0091', '0092');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
     expect((await store().ingest(envelope())).applied).toBe(true);
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(false);

@@ -3215,3 +3215,9 @@ export type { ExternalSessionTurnSearchQuery, ExternalSessionTurnSearchHit, Exte
 export { ExternalSessionStore } from "./external-sessions/store.js";
 export * from "./external-sessions/read-contract.js";
 export { ExternalSessionReader } from "./external-sessions/reader.js";
+
+// FNXC:ExternalSessionSummary 2026-09-24-07:05 (F3 = A): durable session summaries with derived staleness.
+export { ExternalSessionSummaryStore, summaryInput, summaryState, boundSummary,
+  SUMMARY_TURN_LIMIT, SUMMARY_TURN_EXCERPT, SUMMARY_INPUT_LIMIT, SUMMARY_OUTPUT_LIMIT } from "./external-sessions/summary.js";
+export type { ExternalSessionSummaryRecord, SummaryCoverage, SummaryState } from "./external-sessions/summary.js";
+export { summarizeExternalSession, EXTERNAL_SESSION_SUMMARY_SYSTEM_PROMPT } from "./ai/ai-summarize.js";

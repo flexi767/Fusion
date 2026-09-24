@@ -122,6 +122,28 @@ export const externalSessionUsageIncrements = projectSchema.table("external_sess
   recordedAt: text("recorded_at").notNull(),
 }, t => [primaryKey({ columns: [t.projectId, t.sessionId, t.revision] })]);
 
+/*
+FNXC:ExternalSessionSummary 2026-09-24-07:05 (F3 = A): one current AI summary per session, stored with the turn
+range it covered so staleness can be DERIVED at read rather than stored. A failure never nulls `summary`: the
+previous summary plus an explicit failure beats an empty pane during an inference outage.
+*/
+export const externalSessionSummaries = projectSchema.table("external_session_summaries", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  sessionId: text("session_id").notNull(),
+  summary: text("summary"),
+  provider: text("provider"),
+  model: text("model"),
+  throughOrdinal: bigint("through_ordinal", { mode: "number" }),
+  turnCount: bigint("turn_count", { mode: "number" }),
+  generatedAt: text("generated_at"),
+  status: text("status").notNull().$type<"ready" | "failed">(),
+  failure: text("failure"),
+  attemptedAt: text("attempted_at").notNull(),
+}, t => [
+  primaryKey({ columns: [t.projectId, t.sessionId] }),
+  foreignKey({ columns: [t.projectId, t.sessionId], foreignColumns: [externalSessions.projectId, externalSessions.id] }).onDelete("cascade"),
+]);
+
 export const externalSessionTurns = projectSchema.table("external_session_turns", {
   projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
   sessionId: text("session_id").notNull(),
@@ -2756,7 +2778,7 @@ export const chatRoomMessages = projectSchema.table("chat_room_messages", {
  */
 export const projectTableNames = [
   "external_session_hosts", "external_session_streams", "external_sessions", "external_session_feedback", "external_session_turns",
-  "external_session_usage_increments",
+  "external_session_usage_increments", "external_session_summaries",
   "tasks", "config", "boards", "project_auth_users", "project_auth_memberships",
   "project_auth_providers", "project_auth_sessions", "task_reviewer_runs",
   "distributed_task_id_state", "distributed_task_id_reservations",

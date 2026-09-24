@@ -50,4 +50,9 @@ technology announces their size and position; the marker is removed for sighted 
 .remote-ranking-row button { display: flex; flex-direction: column; gap: var(--space-xs); text-align: start; background: none; border: 0; padding: 0; color: var(--text); cursor: pointer; width: 100%; }
 .remote-agent-rankings .remote-agent-meta p { margin: 0 0 var(--space-xs); }
 
+/* FNXC:ExternalSessionSummary 2026-09-24-07:05: The summary reuses the panel's meta primitive; qualifying state (coverage, staleness, failure) sits directly under the text so it cannot be read without them. */
+.remote-agent-summary { display: flex; flex-direction: column; gap: var(--space-sm); align-items: start; }
+.remote-agent-summary-text { margin: 0; overflow-wrap: anywhere; }
+.remote-agent-summary .remote-agent-meta p { margin: 0 0 var(--space-xs); }
+
 @media (max-width: 48rem) { .remote-agent-layout { flex-direction: column; } .remote-agent-list, .remote-agent-detail { width: 100%; } }

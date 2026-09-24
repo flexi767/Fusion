@@ -93,6 +93,19 @@ results and the search index built from them**. Those are ported.
 5. AI summaries, controls, launches, managed sessions, Ask — build on request, not for parity. See the
    correction above: none has durable operator-generated data in this deployment.
 
+## Session summaries were built on request, as a new capability (2026-09-24)
+
+The operator asked for AI summaries directly (decision F3 = A), explicitly as a NEW Fusion capability rather
+than a parity port. The distinction is load-bearing and is recorded in the code: there is no AgentPulse
+behaviour to reproduce here, so nothing in the implementation may be justified by "AgentPulse did it this way".
+
+What was built instead is what makes a summary trustworthy on its own terms: one durable summary per session,
+stored with the turn range it covered; staleness derived from the session's current turns rather than stored;
+and a failed attempt that preserves the previous summary, because during an inference outage the older summary
+plus an explicit failure is strictly more useful than an empty pane. Generation is operator-triggered, so
+opening a session costs nothing. It uses Fusion's own title-summarizer model lane, not AgentPulse's Qwen
+configuration.
+
 Historical import (Phase 6) must carry `sessions` 556 and `events` 96,006, and its
 reconciliation report is what proves parity. Retiring AgentPulse still requires separate
 explicit approval, and the recovery snapshot is retained regardless.

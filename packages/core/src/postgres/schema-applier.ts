@@ -96,12 +96,14 @@ touches no data; it must advance in the same change that ships a new migration f
  * claim those slots on this rebase target, so external-session ingestion and its feedback queue
  * move to 0086/0087 rather than colliding with them.
  */
-export const SCHEMA_BASELINE_VERSION = "0091";
+export const SCHEMA_BASELINE_VERSION = "0092";
 export const EXTERNAL_SESSIONS_VERSION = "0086";
 export const EXTERNAL_SESSION_TURNS_VERSION = "0088";
 export const EXTERNAL_SESSION_TURN_SEARCH_VERSION = "0089";
 export const EXTERNAL_SESSION_HOST_HEALTH_VERSION = "0090";
 export const EXTERNAL_SESSION_INCREMENTS_VERSION = "0091";
+/** FNXC:ExternalSessionSummary 2026-09-24-07:05 (F3 = A): durable AI summaries of collected sessions. */
+export const EXTERNAL_SESSION_SUMMARIES_VERSION = "0092";
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -415,6 +417,7 @@ const EXTERNAL_SESSION_TURNS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0088_externa
 const EXTERNAL_SESSION_TURN_SEARCH_MIGRATION_PATH = join(MIGRATIONS_DIR, "0089_external_session_turn_search.sql");
 const EXTERNAL_SESSION_HOST_HEALTH_MIGRATION_PATH = join(MIGRATIONS_DIR, "0090_external_session_host_health.sql");
 const EXTERNAL_SESSION_INCREMENTS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0091_external_session_usage_increments.sql");
+const EXTERNAL_SESSION_SUMMARIES_MIGRATION_PATH = join(MIGRATIONS_DIR, "0092_external_session_summaries.sql");
 const BASELINE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0000_initial.sql");
 const AUTOMATION_ISOLATION_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
@@ -1786,6 +1789,14 @@ export async function applySchemaBaseline(
     if (!applied.includes(EXTERNAL_SESSION_INCREMENTS_VERSION) || incrementsMissing) {
       await tx.execute(sql.raw(await readFile(EXTERNAL_SESSION_INCREMENTS_MIGRATION_PATH, "utf8")));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${EXTERNAL_SESSION_INCREMENTS_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    /* FNXC:ExternalSessionSummary 2026-09-24-07:05: Probe the table, not just the ledger, for the same reason as
+       0091: a hand-dropped table would otherwise leave every summary write failing behind a satisfied ledger. */
+    const summariesMissing = ((await tx.execute(sql`SELECT to_regclass('project.external_session_summaries') IS NULL AS missing`)) as unknown as Array<{ missing: boolean }>)[0]?.missing ?? true;
+    if (!applied.includes(EXTERNAL_SESSION_SUMMARIES_VERSION) || summariesMissing) {
+      await tx.execute(sql.raw(await readFile(EXTERNAL_SESSION_SUMMARIES_MIGRATION_PATH, "utf8")));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${EXTERNAL_SESSION_SUMMARIES_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };

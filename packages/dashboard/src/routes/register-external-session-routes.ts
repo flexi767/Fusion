@@ -7,6 +7,8 @@ import { sessionCostBadge, summarizeTurnCost, summarizeIncrementCost } from "../
 import { recordedRatesFor } from "../remote-agents/record-rates.js";
 import { rankSessions, rankTurns } from "../remote-agents/rankings.js";
 import { ExternalSessionTurnSearch, ExternalSessionRankings, ExternalSessionUsageIncrementReader } from "@fusion/core";
+import { ExternalSessionSummaryStore, summaryInput, summaryState, summarizeExternalSession,
+  resolveTitleSummarizerSettingsModel } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
@@ -115,6 +117,52 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     const session = await new ExternalSessionReader(layer, projectId).get(id.data);
     if (!session) throw new ApiError(404, "External session not found");
     res.json({ schemaVersion: 1, session });
+  });
+  /*
+  FNXC:ExternalSessionSummary 2026-09-24-07:05 (operator decision F3 = A):
+  Session summaries are a NEW Fusion capability, not AgentPulse parity — the measured AgentPulse watcher left no
+  durable summaries at all. Generation is explicitly operator-triggered: a background summarizer would spend
+  model budget on every ingested session whether or not anyone ever opens it.
+
+  The GET never generates. It returns the stored record plus DERIVED staleness, so opening a session is free and
+  a stale summary reads as stale rather than being silently regenerated.
+  */
+  const summaryContext = async (req: Parameters<typeof ctx.getProjectContext>[0], rawId: unknown) => {
+    const id = externalSessionReadId.safeParse(rawId);
+    if (!id.success) throw new ApiError(400, "Invalid external session id");
+    const { store, projectId } = await ctx.getProjectContext(req);
+    const layer = store.getAsyncLayer();
+    if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
+    return { id: id.data, store, layer, projectId, summaries: new ExternalSessionSummaryStore(layer, projectId) };
+  };
+  const summaryBody = async (summaries: ExternalSessionSummaryStore, id: string) => {
+    const record = await summaries.read(id);
+    return { schemaVersion: 1 as const, summary: record, ...summaryState(record, await summaries.latestOrdinal(id)) };
+  };
+  ctx.router.get("/external-sessions/:id/summary", async (req, res) => {
+    const { id, summaries } = await summaryContext(req, req.params.id);
+    res.json(await summaryBody(summaries, id));
+  });
+  ctx.router.post("/external-sessions/:id/summary", async (req, res) => {
+    const { id, store, summaries, layer, projectId } = await summaryContext(req, req.params.id);
+    const session = await new ExternalSessionReader(layer, projectId).get(id);
+    if (!session) throw new ApiError(404, "External session not found");
+    const input = summaryInput(await summaries.tail(id));
+    if (!input) throw new ApiError(409, "This session has no collected turns to summarize");
+    const settings = await store.getSettings();
+    const model = resolveTitleSummarizerSettingsModel(settings);
+    try {
+      const text = await summarizeExternalSession(input.text, store.getRootDir(), model.provider, model.modelId);
+      if (!text) throw new Error("Summarizer returned no summary");
+      await summaries.recordSuccess(id, { summary: text, provider: model.provider ?? null,
+        model: model.modelId ?? null, coverage: input.coverage });
+      res.json(await summaryBody(summaries, id));
+    } catch (error) {
+      /* The previous summary survives: an outage degrades the pane to "summary as of an earlier point, plus why
+         it has not advanced", never to an empty one. The 502 still tells the operator the attempt failed. */
+      await summaries.recordFailure(id, error instanceof Error ? error.message : String(error));
+      res.status(502).json(await summaryBody(summaries, id));
+    }
   });
   ctx.router.get("/external-sessions/:id/turns", async (req, res) => {
     const id = externalSessionReadId.safeParse(req.params.id);
