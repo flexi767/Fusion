@@ -5,7 +5,8 @@ import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, e
 import { ApiError } from "../api-error.js";
 import { sessionCostBadge, summarizeTurnCost } from "../remote-agents/session-cost.js";
 import { recordedRatesFor } from "../remote-agents/record-rates.js";
-import { ExternalSessionTurnSearch } from "@fusion/core";
+import { rankSessions, rankTurns } from "../remote-agents/rankings.js";
+import { ExternalSessionTurnSearch, ExternalSessionRankings } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
@@ -62,6 +63,32 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
         ...(req.query.sessionId === undefined ? {} : { sessionId: String(req.query.sessionId) }) }));
     } catch (error) {
       if (error instanceof Error && error.name === "ZodError") throw new ApiError(400, "Invalid external session search query");
+      throw error;
+    }
+  });
+  /* FNXC:ExternalSessionRankings 2026-09-24-00:04: Registered before "/:id" for the same reason as search. */
+  ctx.router.get("/external-sessions/rankings", async (req, res) => {
+    const scope = req.query.scope === "sessions" ? "sessions" : "turns";
+    for (const key of ["hostId", "model", "from", "to"] as const) {
+      if (req.query[key] !== undefined && typeof req.query[key] !== "string") throw new ApiError(400, "Invalid ranking filter");
+    }
+    const { store, projectId } = await ctx.getProjectContext(req); const layer = store.getAsyncLayer();
+    if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
+    const query = {
+      ...(req.query.hostId === undefined ? {} : { hostId: String(req.query.hostId) }),
+      ...(req.query.model === undefined ? {} : { model: String(req.query.model) }),
+      ...(req.query.from === undefined ? {} : { from: String(req.query.from) }),
+      ...(req.query.to === undefined ? {} : { to: String(req.query.to) }),
+    };
+    try {
+      const rankings = new ExternalSessionRankings(layer, projectId);
+      const settings = await store.getGlobalSettingsStore().getSettings();
+      const ranking = scope === "sessions"
+        ? rankSessions(await rankings.sessions(query), settings)
+        : rankTurns(await rankings.turns(query), settings);
+      res.json({ schemaVersion: 1, scope, ...ranking });
+    } catch (error) {
+      if (error instanceof Error && error.name === "ZodError") throw new ApiError(400, "Invalid ranking query");
       throw error;
     }
   });

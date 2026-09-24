@@ -6,6 +6,7 @@ import { withProjectId } from "../api/client/health";
 import { useVisibilityAwarePoll } from "../hooks/visibilitySuspension";
 import { RemoteAgentTurns } from "./RemoteAgentTurns";
 import { RemoteAgentSearch } from "./RemoteAgentSearch";
+import { RemoteAgentRankings } from "./RemoteAgentRankings";
 import "./RemoteAgentsPanel.css";
 
 type Feedback = { commandId: string; status: string; createdAt: string; expiresAt: string; deliveredAt: string | null };
@@ -188,7 +189,7 @@ function RemoteAgentDetail({ session, projectId }: { session: ExternalSessionVie
       <textarea id={`remote-feedback-${session.id}`} value={text} onChange={e => setText(e.target.value)} maxLength={8000} disabled={!supported || busy || !!pendingSame} rows={4} />
       <button className="btn btn-sm" type="submit" disabled={!supported || busy || !text.trim() || !!pendingSame}>{busy ? "Sending…" : "Send feedback"}</button>
     </form>
-    {error && <p role="alert">{error}</p>}
+    {error && <p role="alert" aria-label="Session detail error">{error}</p>}
     <ul className="remote-agent-receipts">{feedback.map(f => <li key={f.commandId}>{f.status} · {new Date(f.deliveredAt ?? f.createdAt).toLocaleString()} <small>{f.commandId}</small></li>)}</ul>
   </section>;
 }
@@ -260,6 +261,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
       <button className="btn btn-sm" onClick={() => void load()} disabled={loading}>Refresh</button>
     </div>
     {projectId && <RemoteAgentSearch projectId={projectId} {...(host ? { hostId: host } : {})} onOpenSession={setSelected} />}
+    {projectId && <RemoteAgentRankings projectId={projectId} {...(host ? { hostId: host } : {})} onOpenSession={setSelected} />}
     <section className="remote-agent-hosts" aria-labelledby="remote-agent-hosts-heading">
       <h3 id="remote-agent-hosts-heading">Servers</h3>
       {!hosts.length ? <p className="remote-agent-meta">No collector has reported for this project.</p> : <ul className="remote-agent-host-list">
@@ -279,7 +281,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
       {!!hosts.length && <p className="remote-agent-meta">Counts and totals cover the {sessions.length} {sessions.length === 1 ? "session" : "sessions"} loaded here{cursor ? ", not the full history" : ""}.</p>}
     </section>
     {!projectId && <p>Select a Fusion project to view its remote agents.</p>}
-    {error && <p role="alert">{error}</p>}
+    {error && <p role="alert" aria-label="Remote agents error">{error}</p>}
     {projectId && !sessions.length && !error && <p>{loading ? "Loading remote agents…" : "No remote sessions reported for this project."}</p>}
     <p className="remote-agent-meta" role="status" aria-label="Session list status">{projectId && sessions.length ? `${sessions.length} ${sessions.length === 1 ? "session" : "sessions"} shown${loading ? ", refreshing" : ""}.` : ""}</p>
     <div className="remote-agent-layout"><div className="remote-agent-list">

@@ -129,7 +129,7 @@ export function RemoteAgentTurns({ sessionId, projectId }: { sessionId: string; 
   }, [load]);
   return <section className="remote-agent-turns" aria-labelledby={`remote-turns-${sessionId}`}>
     <h4 id={`remote-turns-${sessionId}`}>Turn history</h4>
-    {error && <p role="alert">{error}</p>}
+    {error && <p role="alert" aria-label="Turn history error">{error}</p>}
     {!error && loaded && !turns.length && <p className="remote-agent-meta">No turns have been collected for this session.</p>}
     {!loaded && loading && <p className="remote-agent-meta">Loading turn history…</p>}
     {!!turns.length && <ul className="remote-turn-list" aria-label="Collected turns">{turns.map(turn => <Turn key={turn.nativeTurnId} turn={turn} />)}</ul>}

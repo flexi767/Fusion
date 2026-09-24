@@ -65,7 +65,7 @@ export function RemoteAgentSearch({ projectId, hostId, onOpenSession }: {
         placeholder="words, &quot;exact phrase&quot;, -exclude" />
       <button className="btn btn-sm" type="submit" disabled={busy || !term.trim()}>{busy ? "Searching…" : "Search"}</button>
     </form>
-    {error && <p role="alert">{error}</p>}
+    {error && <p role="alert" aria-label="Search error">{error}</p>}
     <p className="remote-agent-meta" role="status" aria-label="Search status">
       {!page ? "" : page.query === null
         ? "That search had no searchable words. Try a more specific term."

@@ -44,4 +44,10 @@ technology announces their size and position; the marker is removed for sighted 
 .remote-search-hit button { display: flex; flex-direction: column; gap: var(--space-xs); text-align: start; background: none; border: 0; padding: 0; color: var(--text); cursor: pointer; }
 .remote-search-snippet { margin: 0; font-size: var(--font-size-sm); overflow-wrap: anywhere; }
 
+/* FNXC:ExternalSessionRankings 2026-09-24-00:04: Ranking rows reuse the card primitive; the ordered list keeps rank order for assistive technology. */
+.remote-ranking-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-sm); }
+.remote-ranking-row { padding: var(--space-md); }
+.remote-ranking-row button { display: flex; flex-direction: column; gap: var(--space-xs); text-align: start; background: none; border: 0; padding: 0; color: var(--text); cursor: pointer; width: 100%; }
+.remote-agent-rankings .remote-agent-meta p { margin: 0 0 var(--space-xs); }
+
 @media (max-width: 48rem) { .remote-agent-layout { flex-direction: column; } .remote-agent-list, .remote-agent-detail { width: 100%; } }

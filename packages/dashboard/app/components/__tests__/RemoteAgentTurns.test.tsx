@@ -112,7 +112,7 @@ describe("remote agent turn history", () => {
   it("surfaces a read failure instead of implying the session has no turns", async () => {
     vi.mocked(api).mockRejectedValue(new Error("Turn storage unavailable"));
     render(<RemoteAgentTurns sessionId={sessionId} projectId="project-a" />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Turn storage unavailable");
+    expect(await screen.findByRole("alert", { name: "Turn history error" })).toHaveTextContent("Turn storage unavailable");
     expect(screen.queryByText("No turns have been collected for this session.")).toBeNull();
   });
 });

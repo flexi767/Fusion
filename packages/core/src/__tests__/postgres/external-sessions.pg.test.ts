@@ -12,6 +12,7 @@ import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
 import { externalSessionTurnSchema } from "../../external-sessions/turn-contract.js";
 import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore } from "../../external-sessions/turn-store.js";
 import { ExternalSessionTurnSearch } from "../../external-sessions/turn-search.js";
+import { ExternalSessionRankings } from "../../external-sessions/rankings.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
 const envelope = (sequence = 1, revision = sequence) => ({ schemaVersion: 1, streamId: "spool", sequence,
@@ -560,6 +561,63 @@ pgDescribe("external sessions: durable observation ingestion", () => {
       { asOf: "2026-07-16", source: "s", rates: { "a:b": { inputPer1M: 3 } } },
     ]) {
       await expect(turns.ingest({ ...base, turn: { ...base.turn, pricing: bad } as never })).rejects.toThrow();
+    }
+  });
+
+  async function rankingCorpus() {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const usage = (model: string) => [{ requestId: `r-${model}`, model, inputTokens: 1000, cachedInputTokens: 0,
+      cacheWriteTokens: 0, cacheWriteHourTokens: 0, outputTokens: 100, reasoningTokens: null, fast: false, longContext: false }];
+    const a = turnEnvelope(first.sessionId, "rank-a", 0);
+    await turns.ingest({ ...a, turn: { ...a.turn, endedAt: "2026-09-01T00:00:00.000Z", usage: usage("model-a"), usageComplete: true } });
+    const b = turnEnvelope(first.sessionId, "rank-b", 1);
+    await turns.ingest({ ...b, turn: { ...b.turn, endedAt: "2026-09-10T00:00:00.000Z", usage: usage("model-b"), usageComplete: true } });
+    const bare = turnEnvelope(first.sessionId, "rank-bare", 2);
+    await turns.ingest({ ...bare, turn: { ...bare.turn, endedAt: "2026-09-11T00:00:00.000Z" } });
+    return first.sessionId;
+  }
+
+  it("returns ranking candidates with their usage and counts rows that can never be ranked", async () => {
+    await rankingCorpus();
+    const scan = await new ExternalSessionRankings(h.layer(), principal.projectId).turns();
+    expect(scan.candidates).toHaveLength(3);
+    // A turn with no usage is reported, not dropped: coverage has to be able to say it exists.
+    expect(scan.withoutUsage).toBe(1);
+    expect(scan.truncated).toBe(false);
+  });
+
+  it("filters ranking candidates by date, host and model", async () => {
+    await rankingCorpus();
+    const rankings = new ExternalSessionRankings(h.layer(), principal.projectId);
+    expect((await rankings.turns({ from: "2026-09-05T00:00:00.000Z" })).candidates.map(c => c.nativeTurnId).sort())
+      .toEqual(["rank-b", "rank-bare"]);
+    expect((await rankings.turns({ to: "2026-09-05T00:00:00.000Z" })).candidates.map(c => c.nativeTurnId)).toEqual(["rank-a"]);
+    expect((await rankings.turns({ model: "model-a" })).candidates.map(c => c.nativeTurnId)).toEqual(["rank-a"]);
+    expect((await rankings.turns({ hostId: "other" })).candidates).toEqual([]);
+    expect((await rankings.turns({ hostId: principal.hostId })).candidates).toHaveLength(3);
+  });
+
+  it("reports truncation instead of silently ranking part of the range", async () => {
+    await rankingCorpus();
+    const scan = await new ExternalSessionRankings(h.layer(), principal.projectId).turns({ scanLimit: 2 });
+    expect(scan.candidates).toHaveLength(2);
+    expect(scan.truncated).toBe(true);
+  });
+
+  it("ranks sessions by their own usage and keeps them project-scoped", async () => {
+    await rankingCorpus();
+    const rankings = new ExternalSessionRankings(h.layer(), principal.projectId);
+    const scan = await rankings.sessions();
+    expect(scan.candidates).toHaveLength(1);
+    expect(scan.candidates[0]).toMatchObject({ hostId: principal.hostId, provider: "runtime" });
+    expect(() => new ExternalSessionRankings(h.layer(), "other-project")).toThrow();
+  });
+
+  it("rejects a malformed ranking query rather than scanning everything", async () => {
+    const rankings = new ExternalSessionRankings(h.layer(), principal.projectId);
+    for (const bad of [{ scanLimit: 0 }, { scanLimit: 99999 }, { from: "yesterday" }, { hostId: "" }]) {
+      await expect(rankings.turns(bad as never)).rejects.toThrow();
     }
   });
 

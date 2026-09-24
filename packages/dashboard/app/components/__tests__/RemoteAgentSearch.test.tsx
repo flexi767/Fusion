@@ -78,7 +78,7 @@ describe("remote agent output search", () => {
     render(<RemoteAgentSearch projectId="project-a" onOpenSession={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Search prompts and responses"), { target: { value: "migration" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Search unavailable");
+    expect(await screen.findByRole("alert", { name: "Search error" })).toHaveTextContent("Search unavailable");
     expect(screen.getByRole("status", { name: "Search status" })).toHaveTextContent("");
   });
 

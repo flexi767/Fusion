@@ -19,6 +19,7 @@ describe("standalone remote agents", () => {
       if (opts?.method === "POST") { const b = JSON.parse(String(opts.body)); calls.push(b); return { commandId: b.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString() } as never; }
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -46,6 +47,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("provider=claude")) return { sessions: [fresh], nextCursor: null } as never;
       // The first load must finish, because Refresh is disabled while a load is in flight.
       if (++listRequests > 1) await new Promise<void>(resolve => pending.push(resolve));
@@ -71,6 +73,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [priced, partial, unknown, empty], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -90,6 +93,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }, { hostId: "m5", collectorConnected: false }] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [priced, alsoPriced, incomplete], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -112,6 +116,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [fixture], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -130,6 +135,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -158,6 +164,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [recalculated, current], nextCursor: null } as never;
     });
     render(<RemoteAgentsPanel projectId="project-a" />);
@@ -171,7 +178,7 @@ describe("standalone remote agents", () => {
   it("surfaces monitoring errors instead of showing an empty success state", async () => {
     vi.mocked(api).mockRejectedValue(new Error("Collector storage unavailable"));
     render(<RemoteAgentsPanel projectId="project-a" />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Collector storage unavailable");
+    expect(await screen.findByRole("alert", { name: "Remote agents error" })).toHaveTextContent("Collector storage unavailable");
   });
   it("opens session details and submits a valid command ID when randomUUID is unavailable", async () => {
     vi.stubGlobal("crypto", {});
@@ -180,6 +187,7 @@ describe("standalone remote agents", () => {
       if (opts?.method === "POST") { const body = JSON.parse(String(opts.body)); calls.push(body); return { commandId: body.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString() } as never; }
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -197,6 +205,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -237,6 +246,7 @@ describe("standalone remote agents", () => {
       }
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: receiptStatus && posts[0] ? [{ commandId: posts[0].commandId, status: receiptStatus, createdAt: new Date().toISOString(), expiresAt: new Date().toISOString(), deliveredAt: null }] : [] } as never;
       if (path.includes(id)) return { session: fixture } as never;
@@ -246,7 +256,7 @@ describe("standalone remote agents", () => {
     fireEvent.click((await screen.findByText("Fixture agent")).closest("button")!);
     fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "Retry me" } });
     fireEvent.click(screen.getByRole("button", { name: "Send feedback" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Network response lost");
+    expect(await screen.findByRole("alert", { name: "Session detail error" })).toHaveTextContent("Network response lost");
 
     // The receipt surfaces as queued: the same command is still pending, so the composer stays locked.
     await act(async () => { vi.advanceTimersByTime(5_000); });
