@@ -43,7 +43,11 @@ describe("external-session ingestion registrar", () => {
     const ingest = vi.spyOn(ExternalSessionStore.prototype, "ingest").mockResolvedValue(ack as Awaited<ReturnType<ExternalSessionStore["ingest"]>>);
     const s = setup();
     await s.handlers.get("/external-sessions/ingest")!(s.req, s.res);
-    expect(ingest).toHaveBeenCalledWith(expect.objectContaining({ sequence: 1, session: expect.objectContaining({ provider: "other-provider" }) }));
+    // Ingest now also receives the rate stamp for this revision's usage increment (F1 = 3).
+    expect(ingest).toHaveBeenCalledWith(
+      expect.objectContaining({ sequence: 1, session: expect.objectContaining({ provider: "other-provider" }) }),
+      undefined,
+    );
     expect(s.json).toHaveBeenCalledWith(ack);
     expect(s.getProjectContext).toHaveBeenCalledTimes(1);
   });

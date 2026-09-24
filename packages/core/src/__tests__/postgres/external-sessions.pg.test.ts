@@ -12,6 +12,7 @@ import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
 import { externalSessionTurnSchema } from "../../external-sessions/turn-contract.js";
 import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore, ExternalSessionTurnRestamp } from "../../external-sessions/turn-store.js";
 import { ExternalSessionTurnSearch } from "../../external-sessions/turn-search.js";
+import { externalSessionUsageIncrements } from "../../postgres/schema/project.js";
 import { ExternalSessionRankings } from "../../external-sessions/rankings.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
@@ -692,8 +693,84 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     expect(() => new ExternalSessionTurnRestamp(h.layer(), "other-project")).toThrow();
   });
 
+  const band = (model: string, input: number, output: number, extra: Record<string, unknown> = {}) => ({
+    model, inputTokens: input, cachedInputTokens: 0, cacheWriteTokens: 0, cacheWriteHourTokens: 0,
+    outputTokens: output, reasoningTokens: null, fast: false, longContext: false, ...extra });
+  const withUsage = (sequence: number, revision: number, usage: unknown[], pricing?: unknown) => [{
+    ...envelope(sequence, revision),
+    session: { ...envelope(sequence, revision).session, usage, usageComplete: true },
+  }, pricing] as const;
+  const increments = async (sessionId: string) => (await h.adminDb().execute(sql`
+    SELECT revision, usage, pricing FROM project.external_session_usage_increments
+    WHERE project_id=${principal.projectId} AND session_id=${sessionId} ORDER BY revision`)) as unknown as Array<{ revision: number; usage: unknown[]; pricing: unknown }>;
+
+  it("records only what each revision added, so a mid-session model change prices at its own rate", async () => {
+    const rateA = { asOf: "2026-07-16", source: "baseline", rates: { "claude_code:model-a": { inputPer1M: 3, outputPer1M: 15, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75, source: "docs" } } };
+    const rateB = { asOf: "2026-09-24", source: "later", rates: { "claude_code:model-b": { inputPer1M: 9, outputPer1M: 45, cacheReadPer1M: 0.9, cacheWritePer1M: 11.25, source: "docs" } } };
+    const [first, p1] = withUsage(1, 1, [band("model-a", 1000, 100)], rateA);
+    const created = await store().ingest(first, p1);
+    // Revision 2 keeps model-a's cumulative total and adds model-b: only the new work is an increment.
+    const [second, p2] = withUsage(2, 2, [band("model-a", 1000, 100), band("model-b", 500, 50)], rateB);
+    await store().ingest(second, p2);
+    const rows = await increments(created.sessionId);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]!.usage).toEqual([expect.objectContaining({ model: "model-a", inputTokens: 1000, outputTokens: 100 })]);
+    expect(rows[0]!.pricing).toMatchObject({ asOf: "2026-07-16" });
+    // The second increment must NOT restate model-a, or its earlier work would be repriced at the later rate.
+    expect(rows[1]!.usage).toEqual([expect.objectContaining({ model: "model-b", inputTokens: 500, outputTokens: 50 })]);
+    expect(rows[1]!.pricing).toMatchObject({ asOf: "2026-09-24" });
+  });
+
+  it("records the growth of a single model rather than its running total", async () => {
+    const [first] = withUsage(1, 1, [band("model-a", 1000, 100)]);
+    const created = await store().ingest(first);
+    const [second] = withUsage(2, 2, [band("model-a", 2500, 260)]);
+    await store().ingest(second);
+    const rows = await increments(created.sessionId);
+    expect(rows[1]!.usage).toEqual([expect.objectContaining({ inputTokens: 1500, outputTokens: 160 })]);
+  });
+
+  it("writes no increment for a revision that added nothing", async () => {
+    const [first] = withUsage(1, 1, [band("model-a", 1000, 100)]);
+    const created = await store().ingest(first);
+    const [second] = withUsage(2, 2, [band("model-a", 1000, 100)]);
+    await store().ingest(second);
+    expect(await increments(created.sessionId)).toHaveLength(1);
+  });
+
+  it("treats a counter that goes backwards as unknown rather than negative work", async () => {
+    const [first] = withUsage(1, 1, [band("model-a", 5000, 500)]);
+    const created = await store().ingest(first);
+    // A collector that re-derived its accounting can report a LOWER cumulative total.
+    const [second] = withUsage(2, 2, [band("model-a", 100, 10)]);
+    await store().ingest(second);
+    const rows = await increments(created.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(Number(rows[0]!.revision)).toBe(1);
+  });
+
+  it("prices the same model at different tiers separately", async () => {
+    const [first] = withUsage(1, 1, [band("model-a", 1000, 100)]);
+    const created = await store().ingest(first);
+    const [second] = withUsage(2, 2, [band("model-a", 1000, 100), band("model-a", 700, 70, { longContext: true })]);
+    await store().ingest(second);
+    const rows = await increments(created.sessionId);
+    expect(rows[1]!.usage).toEqual([expect.objectContaining({ model: "model-a", longContext: true, inputTokens: 700 })]);
+  });
+
+  it("keeps an increment immutable when the same revision is replayed", async () => {
+    const rate = { asOf: "2026-07-16", source: "baseline", rates: {} };
+    const [first, p1] = withUsage(1, 1, [band("model-a", 1000, 100)], rate);
+    const created = await store().ingest(first, p1);
+    await expect(store().ingest(first, { asOf: "2099-01-01", source: "later", rates: {} })).resolves.toMatchObject({ applied: false });
+    const rows = await increments(created.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.pricing).toMatchObject({ asOf: "2026-07-16" });
+  });
+
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
-    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
+    // 0091's increments reference external_sessions, so a pre-0086 upgrade must drop them too.
+    await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_usage_increments, project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088', '0091');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);
     expect((await store().ingest(envelope())).applied).toBe(true);
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(false);

@@ -159,7 +159,19 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
           await sessions.heartbeat(parsed.data);
           res.json({ schemaVersion: 1, hostId: principal.hostId });
         } else if (operation === "ingest") {
-          res.json(await sessions.ingest(parsed.data));
+          /*
+          FNXC:ExternalSessionIncrements 2026-09-24-04:51 (F1 = 3): supply the rates applicable right now so the
+          increment this revision adds is priced at its own effective rate. Computed server-side from the
+          incoming usage, so a collector cannot choose them; an unavailable rate table leaves the increment
+          unpriced rather than refusing the observation.
+          */
+          const session = parsed.data as { session: { provider: string; usage?: Array<{ model?: unknown }> } };
+          let stamp: ReturnType<typeof recordedRatesFor>;
+          try {
+            stamp = recordedRatesFor(session.session.usage, session.session.provider,
+              await store.getGlobalSettingsStore().getSettings());
+          } catch { stamp = undefined; }
+          res.json(await sessions.ingest(parsed.data, stamp));
         } else if (operation === "turn-ingest") {
           /*
           FNXC:ExternalSessionRates 2026-09-24-00:04: Stamp the applicable rates as the turn arrives; this is the

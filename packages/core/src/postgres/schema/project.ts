@@ -112,6 +112,16 @@ export const externalSessionFeedback = projectSchema.table("external_session_fee
 ]);
 
 /** Historical transcript data is immutable by identity and advances only by native revision. */
+// FNXC:ExternalSessionIncrements 2026-09-24-04:51: One immutable row per revision that added usage.
+export const externalSessionUsageIncrements = projectSchema.table("external_session_usage_increments", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  sessionId: text("session_id").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  usage: jsonb("usage").notNull().$type<Record<string, unknown>[]>(),
+  pricing: jsonb("pricing").$type<Record<string, unknown> | null>(),
+  recordedAt: text("recorded_at").notNull(),
+}, t => [primaryKey({ columns: [t.projectId, t.sessionId, t.revision] })]);
+
 export const externalSessionTurns = projectSchema.table("external_session_turns", {
   projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
   sessionId: text("session_id").notNull(),
@@ -2746,6 +2756,7 @@ export const chatRoomMessages = projectSchema.table("chat_room_messages", {
  */
 export const projectTableNames = [
   "external_session_hosts", "external_session_streams", "external_sessions", "external_session_feedback", "external_session_turns",
+  "external_session_usage_increments",
   "tasks", "config", "boards", "project_auth_users", "project_auth_memberships",
   "project_auth_providers", "project_auth_sessions", "task_reviewer_runs",
   "distributed_task_id_state", "distributed_task_id_reservations",
