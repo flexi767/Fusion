@@ -51,6 +51,21 @@ const rateSchema = z.object({
   source: z.string().min(1).max(512),
 }).strict();
 
+/*
+FNXC:ExternalSessionRates 2026-09-24-04:51 (operator decision F2 = C):
+A frozen stamp is preserved by DEFAULT, so a provider price change never rewrites what past work cost. An
+operator may still restamp after a CATALOG CORRECTION — a rate that was wrong when it was recorded — and that
+is an audited act, not a silent recomputation: the audit keeps who did it, why, and the basis it replaced, so
+a restamped figure can always be traced back to the one it superseded.
+*/
+const restampSchema = z.object({
+  actor: z.string().min(1).max(256),
+  reason: z.string().min(1).max(1024),
+  at: z.string().datetime({ offset: true }).transform(value => new Date(value).toISOString()),
+  previousAsOf: z.string().min(1).max(64),
+  previousSource: z.string().min(1).max(512),
+}).strict();
+
 export const externalSessionTurnPricingSchema = z.object({
   /** Date the recorded rates were current as of. */
   asOf: z.string().min(1).max(64),
@@ -58,6 +73,8 @@ export const externalSessionTurnPricingSchema = z.object({
   source: z.string().min(1).max(512),
   /** Applicable rate per `<pricingProvider>:<model>`, exactly as used to price this turn. */
   rates: z.record(z.string().min(1).max(512), rateSchema),
+  /** Present only when an operator deliberately replaced an earlier stamp. */
+  restamp: restampSchema.optional(),
 }).strict();
 
 export type ExternalSessionTurnPricing = z.infer<typeof externalSessionTurnPricingSchema>;

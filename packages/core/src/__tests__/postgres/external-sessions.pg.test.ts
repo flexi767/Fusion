@@ -10,7 +10,7 @@ import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { ExternalSessionFeedback } from "../../external-sessions/feedback.js";
 import { externalSessionTurnSchema } from "../../external-sessions/turn-contract.js";
-import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore } from "../../external-sessions/turn-store.js";
+import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore, ExternalSessionTurnRestamp } from "../../external-sessions/turn-store.js";
 import { ExternalSessionTurnSearch } from "../../external-sessions/turn-search.js";
 import { ExternalSessionRankings } from "../../external-sessions/rankings.js";
 
@@ -619,6 +619,77 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     for (const bad of [{ scanLimit: 0 }, { scanLimit: 99999 }, { from: "yesterday" }, { hostId: "" }]) {
       await expect(rankings.turns(bad as never)).rejects.toThrow();
     }
+  });
+
+  const stampRate = { inputPer1M: 3, outputPer1M: 15, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75, source: "docs" };
+  const correctedRate = { ...stampRate, inputPer1M: 9, source: "catalog correction" };
+
+  async function stampedSession() {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const a = turnEnvelope(first.sessionId, "stamped", 0);
+    await turns.ingest({ ...a, turn: { ...a.turn,
+      pricing: { asOf: "2026-07-16", source: "Fusion model pricing", rates: { "claude_code:m": stampRate } } } });
+    const b = turnEnvelope(first.sessionId, "unstamped", 1);
+    await turns.ingest(b);
+    return first.sessionId;
+  }
+
+  it("preserves a frozen stamp by default: ingest never restamps", async () => {
+    const sessionId = await stampedSession();
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const again = turnEnvelope(sessionId, "stamped", 0, 2);
+    await turns.ingest({ ...again, turn: { ...again.turn, revision: 2,
+      pricing: { asOf: "2026-09-24", source: "newer", rates: { "claude_code:m": correctedRate } } } });
+    const [stamped] = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(sessionId)).turns
+      .filter(t => t.nativeTurnId === "stamped");
+    // A later ingest may carry its own stamp, but nothing in this path rewrites history behind the operator.
+    expect(stamped!.pricing?.restamp).toBeUndefined();
+  });
+
+  it("records actor, reason and the replaced basis when an operator restamps", async () => {
+    const sessionId = await stampedSession();
+    const result = await new ExternalSessionTurnRestamp(h.layer(), principal.projectId).apply(sessionId, {
+      actor: "operator@example.test", reason: "catalog had the wrong input rate",
+      rates: { "claude_code:m": correctedRate }, asOf: "2026-09-24", source: "Corrected catalog" });
+    expect(result).toMatchObject({ restamped: 1, skippedUnstamped: 1 });
+    const turns = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(sessionId)).turns;
+    const stamped = turns.find(t => t.nativeTurnId === "stamped")!;
+    expect(stamped.pricing).toMatchObject({ asOf: "2026-09-24", source: "Corrected catalog" });
+    expect(stamped.pricing!.rates["claude_code:m"]).toMatchObject({ inputPer1M: 9 });
+    expect(stamped.pricing!.restamp).toMatchObject({ actor: "operator@example.test",
+      reason: "catalog had the wrong input rate", previousAsOf: "2026-07-16", previousSource: "Fusion model pricing" });
+    expect(Date.parse(stamped.pricing!.restamp!.at)).toBeGreaterThan(0);
+  });
+
+  it("never stamps a turn that was never stamped, so an operator cannot invent a basis", async () => {
+    const sessionId = await stampedSession();
+    await new ExternalSessionTurnRestamp(h.layer(), principal.projectId).apply(sessionId, {
+      actor: "op", reason: "fix", rates: { "claude_code:m": correctedRate }, asOf: "2026-09-24", source: "Corrected" });
+    const turns = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(sessionId)).turns;
+    expect(turns.find(t => t.nativeTurnId === "unstamped")!.pricing).toBeUndefined();
+  });
+
+  it("rewrites only the stamp and leaves the measured work untouched", async () => {
+    const sessionId = await stampedSession();
+    const before = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(sessionId)).turns
+      .find(t => t.nativeTurnId === "stamped")!;
+    await new ExternalSessionTurnRestamp(h.layer(), principal.projectId).apply(sessionId, {
+      actor: "op", reason: "fix", rates: { "claude_code:m": correctedRate }, asOf: "2026-09-24", source: "Corrected" });
+    const after = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(sessionId)).turns
+      .find(t => t.nativeTurnId === "stamped")!;
+    // A catalog correction changes what work cost, never what happened.
+    expect({ ...after, pricing: undefined }).toEqual({ ...before, pricing: undefined });
+  });
+
+  it("refuses a restamp with no replacement rates or a missing actor or reason", async () => {
+    const sessionId = await stampedSession();
+    const restamp = new ExternalSessionTurnRestamp(h.layer(), principal.projectId);
+    for (const bad of [{ rates: {} }, { actor: "" }, { reason: "" }, { asOf: "" }]) {
+      await expect(restamp.apply(sessionId, { actor: "op", reason: "fix", rates: { "claude_code:m": correctedRate },
+        asOf: "2026-09-24", source: "Corrected", ...bad } as never)).rejects.toThrow();
+    }
+    expect(() => new ExternalSessionTurnRestamp(h.layer(), "other-project")).toThrow();
   });
 
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
