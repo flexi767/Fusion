@@ -8,7 +8,7 @@ import { recordedRatesFor } from "../remote-agents/record-rates.js";
 import { rankSessions, rankTurns } from "../remote-agents/rankings.js";
 import { ExternalSessionTurnSearch, ExternalSessionRankings, ExternalSessionUsageIncrementReader } from "@fusion/core";
 import { ExternalSessionSummaryStore, summaryInput, summaryState, summarizeExternalSession,
-  resolveTitleSummarizerSettingsModel } from "@fusion/core";
+  resolveTitleSummarizerSettingsModel, ExternalSessionAttribution } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
@@ -51,12 +51,22 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     */
     const bySession = await new ExternalSessionUsageIncrementReader(layer, projectId)
       .listForSessions(page.sessions.map(session => session.id)).catch(() => new Map());
+    /*
+    FNXC:ExternalSessionAttribution 2026-09-24-07:05 (operator decision F4 = 1): a session that IS a Fusion task
+    run is already counted in that task's telemetry, so adding its cost to a Fusion total would double count.
+    Attribution is carried on the card so the overlap is visible rather than latent; it is best-effort, and a
+    failure leaves sessions unattributed, which is the safe reading.
+    */
+    const attributed = await new ExternalSessionAttribution(layer, projectId)
+      .resolve(page.sessions.map(s => ({ sessionId: s.id, provider: s.provider, nativeSessionId: s.nativeSessionId })))
+      .catch(() => new Map());
     res.json({ ...page, sessions: page.sessions.map(session => {
+      const fusion = attributed.get(session.id) ?? null;
       const increments = bySession.get(session.id);
       const badge = sessionCostBadge(session, settings);
-      if (!increments?.length) return { ...session, cost: badge };
+      if (!increments?.length) return { ...session, cost: badge, fusion };
       const incremental = summarizeIncrementCost(increments as never, session.provider, settings);
-      return { ...session, cost: { ...badge, estimatedUsd: incremental.estimatedUsd,
+      return { ...session, fusion, cost: { ...badge, estimatedUsd: incremental.estimatedUsd,
         partialUsd: incremental.partialUsd, unpricedRecords: incremental.unpricedIncrements } };
     }) });
   });
@@ -116,7 +126,10 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
     const session = await new ExternalSessionReader(layer, projectId).get(id.data);
     if (!session) throw new ApiError(404, "External session not found");
-    res.json({ schemaVersion: 1, session });
+    // FNXC:ExternalSessionAttribution 2026-09-24-07:05 (F4 = 1): says whether this session IS a Fusion task run.
+    const fusion = (await new ExternalSessionAttribution(layer, projectId).resolve([{ sessionId: session.id,
+      provider: session.provider, nativeSessionId: session.nativeSessionId }]).catch(() => new Map())).get(session.id) ?? null;
+    res.json({ schemaVersion: 1, session, fusion });
   });
   /*
   FNXC:ExternalSessionSummary 2026-09-24-07:05 (operator decision F3 = A):

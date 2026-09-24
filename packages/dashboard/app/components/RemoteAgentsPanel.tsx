@@ -18,7 +18,21 @@ type HostHealth = {
 type PricingBasis = { asOf: string; source: string; recalculated: boolean };
 type CostBadge = { estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; unpricedRecords: number; basis?: PricingBasis };
 /** The list route attaches a priced badge to every session; older servers may not, so it stays optional. */
-type ListedSession = ExternalSessionView & { cost?: CostBadge };
+/*
+FNXC:ExternalSessionAttribution 2026-09-24-07:05 (operator decision F4 = 1): a session that IS a Fusion task run
+is already counted in that task's telemetry. Saying so on the card is what stops its cost being added twice by
+a reader totalling both surfaces; `ambiguous` is shown rather than hidden, because a contested native id means
+the owning task is unknown, not that there is no overlap.
+*/
+type FusionAttribution = { taskId: string | null; cliSessionId: string | null; ambiguous: boolean };
+type ListedSession = ExternalSessionView & { cost?: CostBadge; fusion?: FusionAttribution | null };
+
+function attributionLabel(fusion?: FusionAttribution | null): string | null {
+  if (!fusion) return null;
+  if (fusion.ambiguous) return "Matches more than one Fusion run · owning task unknown, may already be counted";
+  if (!fusion.taskId) return "Fusion-run session · already counted in task telemetry";
+  return `Fusion task ${fusion.taskId} · already counted in task telemetry`;
+}
 type Cost = { usage: RemoteUsage[]; estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; pricingDate: string; pricingSource: string; pricingRecalculated?: boolean };
 const number = (n: number) => n.toLocaleString();
 const usd = (n: number | null) => n === null ? "Unavailable" : new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(n);
@@ -292,6 +306,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
           <button className="card remote-agent-row" onClick={() => setSelected(s.id)} aria-pressed={selected === s.id}>
             <strong>{s.observation.title || s.nativeSessionId}</strong><span>{s.hostId} · {s.provider} · {s.observation.model ?? "Model unknown"}</span><span>{s.observation.activity} · {s.collectorConnected ? "Connected" : "Collector offline"}{s.activityStale ? " · Activity stale" : ""}</span>
             <span className="remote-agent-cost">{costLabel(s.cost)}</span>
+            {attributionLabel(s.fusion) && <span className="remote-agent-attribution">{attributionLabel(s.fusion)}</span>}
           </button>
         </li>)}
       </ul>}

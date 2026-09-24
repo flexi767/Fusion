@@ -56,3 +56,6 @@ technology announces their size and position; the marker is removed for sighted 
 .remote-agent-summary .remote-agent-meta p { margin: 0 0 var(--space-xs); }
 
 @media (max-width: 48rem) { .remote-agent-layout { flex-direction: column; } .remote-agent-list, .remote-agent-detail { width: 100%; } }
+
+/* FNXC:ExternalSessionAttribution 2026-09-24-07:05: The Fusion-run marker reuses the muted meta treatment; it qualifies the cost above it rather than competing with it. */
+.remote-agent-attribution { color: var(--text-muted); font-size: var(--font-size-sm); }

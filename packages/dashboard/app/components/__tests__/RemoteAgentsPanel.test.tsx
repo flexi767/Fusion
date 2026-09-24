@@ -200,6 +200,31 @@ describe("standalone remote agents", () => {
     await waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]!.commandId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
+  /*
+  FNXC:ExternalSessionAttribution 2026-09-24-07:05 (operator decision F4 = 1): a session that IS a Fusion task
+  run must say so, or a reader totalling both the remote-agent cost and the task's own telemetry double counts it.
+  */
+  it("marks a session that is a Fusion task run, and an ambiguous match, without inventing a task", async () => {
+    const attributed = { ...fixture, fusion: { taskId: "FN-1", cliSessionId: "cli-1", ambiguous: false } };
+    const ambiguous = { ...fixture, id: "b".repeat(64), observation: { ...fixture.observation, title: "Contested agent" },
+      fusion: { taskId: null, cliSessionId: null, ambiguous: true } };
+    const plain = { ...fixture, id: "c".repeat(64), observation: { ...fixture.observation, title: "Operator agent" }, fusion: null };
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
+      return { sessions: [attributed, ambiguous, plain], nextCursor: null } as never;
+    });
+    render(<RemoteAgentsPanel projectId="project-a" />);
+    const card = (await screen.findByText("Fixture agent")).closest("button")!;
+    expect(card).toHaveTextContent("Fusion task FN-1");
+    expect(card).toHaveTextContent("already counted in task telemetry");
+    const contested = (await screen.findByText("Contested agent")).closest("button")!;
+    expect(contested).toHaveTextContent("more than one Fusion run");
+    expect(contested).not.toHaveTextContent("FN-1");
+    // An unattributed session claims nothing at all.
+    expect((await screen.findByText("Operator agent")).closest("button")!).not.toHaveTextContent("already counted");
+  });
+
   it("polls list, hosts and the open session only while the tab is visible", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     vi.mocked(api).mockImplementation(async path => {

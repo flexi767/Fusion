@@ -76,3 +76,29 @@ regression that fails on double counting:
 
 Until one of those exists, any combined figure would rest on an assumption about directory layout, which is
 exactly the "project path alone" linkage the plan rules out.
+
+## Resolved 2026-09-24: option 1, deterministic provider + native-id reconciliation (F4 = 1)
+
+The operator chose bridge 1 above. `cli_sessions.native_session_id` is written back by the CLI telemetry hub
+whenever a runtime reports it, and `ExternalSessionAttribution`
+(`packages/core/src/external-sessions/attribution.ts`) resolves an external session to the Fusion task that
+produced it by matching **(provider → adapter, native session id)**. The list and detail read surfaces carry the
+result, so a session that IS a Fusion run is visibly already counted in that task's telemetry.
+
+No backfill by path was performed, and none is possible: the path comparison measured **0** matches in both
+directions, and the plan rules path matching out regardless. Sessions collected before the native id was written
+back stay unattributed, which is the safe reading — unattributed never suppresses a cost.
+
+Three refusals keep the match deterministic rather than plausible, each with a regression test in
+`packages/core/src/__tests__/postgres/external-session-attribution.pg.test.ts`:
+
+| Case | Answer | Why |
+| --- | --- | --- |
+| Native id still null (row created pre-spawn) | Not attributed | Null would otherwise match every unidentified session |
+| Provider outside the mapping | Not attributed | `claude`/`codex` map to `claude-code`/`codex`; anything else is a guess |
+| Two CLI sessions claim one native id | Ambiguous, no task named | A coin flip here mis-credits a real task's cost |
+| Same session resolved repeatedly | Identical result, one entry | A re-import cannot accumulate |
+| CLI session in another project | Not attributed | Scoped on `owner_project_id`, the domain project, as `CliSessionStore` is |
+
+What is still NOT built: a single combined total that adds task telemetry and external usage together. The
+attribution makes such a total *safe to build*; it does not itself produce one.

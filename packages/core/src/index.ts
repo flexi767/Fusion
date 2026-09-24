@@ -3221,3 +3221,7 @@ export { ExternalSessionSummaryStore, summaryInput, summaryState, boundSummary,
   SUMMARY_TURN_LIMIT, SUMMARY_TURN_EXCERPT, SUMMARY_INPUT_LIMIT, SUMMARY_OUTPUT_LIMIT } from "./external-sessions/summary.js";
 export type { ExternalSessionSummaryRecord, SummaryCoverage, SummaryState } from "./external-sessions/summary.js";
 export { summarizeExternalSession, EXTERNAL_SESSION_SUMMARY_SYSTEM_PROMPT } from "./ai/ai-summarize.js";
+
+// FNXC:ExternalSessionAttribution 2026-09-24-07:05 (F4 = 1): deterministic provider + native-id reconciliation.
+export { ExternalSessionAttribution, fusionAdapterFor, FUSION_ADAPTER_FOR_PROVIDER } from "./external-sessions/attribution.js";
+export type { Attribution, SessionIdentity } from "./external-sessions/attribution.js";

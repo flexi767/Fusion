@@ -126,3 +126,45 @@ describe("external session summary route", () => {
     expect(s.json).toHaveBeenCalledWith({ schemaVersion: 1, summary: null, stale: false, turnsSince: 0 });
   });
 });
+
+/*
+FNXC:ExternalSessionAttribution 2026-09-24-07:05 (operator decision F4 = 1): the read surfaces must carry
+whether a collected session IS a Fusion task run, because that is what stops its cost being counted twice.
+*/
+describe("external session attribution on the read surfaces", () => {
+  const listed = { id, hostId: "host-a", provider: "codex", nativeSessionId: "native-abc", revision: 1,
+    observation: { provider: "codex", nativeSessionId: "native-abc", revision: 1, activity: "working",
+      observedAt: new Date().toISOString() }, receivedAt: new Date().toISOString(), lastHeartbeatAt: null,
+    collectorConnected: true, activityStale: false } as never;
+
+  it("marks a listed session that is a Fusion task run", async () => {
+    const { ExternalSessionAttribution } = await import("@fusion/core");
+    vi.spyOn(ExternalSessionReader.prototype, "list").mockResolvedValue({ schemaVersion: 1, sessions: [listed], nextCursor: null });
+    const resolve = vi.spyOn(ExternalSessionAttribution.prototype, "resolve")
+      .mockResolvedValue(new Map([[id, { taskId: "FN-1", cliSessionId: "cli-1", ambiguous: false }]]));
+    const s = setup();
+    await s.gets.get("/external-sessions")!(s.req, s.res);
+    expect(resolve).toHaveBeenCalledWith([{ sessionId: id, provider: "codex", nativeSessionId: "native-abc" }]);
+    expect(s.json.mock.calls[0]![0].sessions[0].fusion).toEqual({ taskId: "FN-1", cliSessionId: "cli-1", ambiguous: false });
+  });
+
+  it("leaves a session unattributed when reconciliation is unavailable, rather than guessing", async () => {
+    const { ExternalSessionAttribution } = await import("@fusion/core");
+    vi.spyOn(ExternalSessionReader.prototype, "list").mockResolvedValue({ schemaVersion: 1, sessions: [listed], nextCursor: null });
+    vi.spyOn(ExternalSessionAttribution.prototype, "resolve").mockRejectedValue(new Error("storage unavailable"));
+    const s = setup();
+    await s.gets.get("/external-sessions")!(s.req, s.res);
+    // Unattributed is the safe reading: it never suppresses a cost that might be Fusion's own.
+    expect(s.json.mock.calls[0]![0].sessions[0].fusion).toBeNull();
+  });
+
+  it("carries attribution on the session detail too, so the two surfaces cannot disagree", async () => {
+    const { ExternalSessionAttribution } = await import("@fusion/core");
+    vi.spyOn(ExternalSessionReader.prototype, "get").mockResolvedValue(listed);
+    vi.spyOn(ExternalSessionAttribution.prototype, "resolve")
+      .mockResolvedValue(new Map([[id, { taskId: null, cliSessionId: null, ambiguous: true }]]));
+    const s = setup();
+    await s.gets.get("/external-sessions/:id")!(s.req, s.res);
+    expect(s.json.mock.calls[0]![0].fusion).toEqual({ taskId: null, cliSessionId: null, ambiguous: true });
+  });
+});
