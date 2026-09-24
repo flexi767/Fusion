@@ -13,6 +13,7 @@ import { externalSessionTurnSchema } from "../../external-sessions/turn-contract
 import { ExternalSessionTurnConflict, ExternalSessionTurnReader, ExternalSessionTurnStore, ExternalSessionTurnRestamp } from "../../external-sessions/turn-store.js";
 import { ExternalSessionTurnSearch } from "../../external-sessions/turn-search.js";
 import { externalSessionUsageIncrements } from "../../postgres/schema/project.js";
+import { ExternalSessionUsageIncrementReader } from "../../external-sessions/usage-increments.js";
 import { ExternalSessionRankings } from "../../external-sessions/rankings.js";
 
 const principal = { projectId: "external-test", hostId: "host-1" };
@@ -766,6 +767,31 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     const rows = await increments(created.sessionId);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.pricing).toMatchObject({ asOf: "2026-07-16" });
+  });
+
+  it("reads increments in revision order and groups a page in one query", async () => {
+    const [first, p1] = withUsage(1, 1, [band("model-a", 1000, 100)], { asOf: "2026-07-16", source: "early", rates: {} });
+    const created = await store().ingest(first, p1);
+    const [second, p2] = withUsage(2, 2, [band("model-a", 2000, 200)], { asOf: "2026-09-24", source: "later", rates: {} });
+    await store().ingest(second, p2);
+    const reader = new ExternalSessionUsageIncrementReader(h.layer(), principal.projectId);
+    const list = await reader.list(created.sessionId);
+    expect(list.map(i => i.revision)).toEqual([1, 2]);
+    expect(list[0]!.pricing).toMatchObject({ asOf: "2026-07-16" });
+    expect(list[1]!.pricing).toMatchObject({ asOf: "2026-09-24" });
+    const grouped = await reader.listForSessions([created.sessionId]);
+    expect(grouped.get(created.sessionId)!.map(i => i.revision)).toEqual([1, 2]);
+    // An unknown session must be absent rather than an empty-but-present entry that reads as "no cost".
+    expect(grouped.has("b".repeat(64))).toBe(false);
+    expect(() => new ExternalSessionUsageIncrementReader(h.layer(), "other-project")).toThrow();
+  });
+
+  it("records an increment unpriced when no rates were available at ingest", async () => {
+    const [first] = withUsage(1, 1, [band("model-a", 1000, 100)]);
+    const created = await store().ingest(first);
+    const [only] = await new ExternalSessionUsageIncrementReader(h.layer(), principal.projectId).list(created.sessionId);
+    expect(only!.pricing).toBeNull();
+    expect(only!.usage).toHaveLength(1);
   });
 
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {

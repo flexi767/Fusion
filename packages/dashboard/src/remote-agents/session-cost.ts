@@ -82,6 +82,58 @@ export function pricingBasis(settings: PricingSettings | undefined, activityAt?:
   return { asOf, source, recalculated, recorded: false };
 }
 
+
+/*
+FNXC:ExternalSessionIncrements 2026-09-24-04:51 (operator decision F1 = 3):
+A session's cost is the SUM of what each revision added, each priced at the rates recorded with it. That is why
+the increments are priced one at a time rather than concatenated: concatenating would price every band at one
+basis and reintroduce exactly the mid-session repricing this decision removes.
+
+An increment recorded without rates is unpriced and makes the whole session's total partial rather than
+silently smaller. A session with no increments at all is NOT free: it predates 0091, and the caller must fall
+back to pricing its cumulative observation instead of reading an empty list as zero.
+*/
+export interface IncrementCostSummary {
+  estimatedUsd: number | null;
+  partialUsd: number | null;
+  /** Increments that carried no usable rate, so the total is a floor rather than a figure. */
+  unpricedIncrements: number;
+  pricedIncrements: number;
+  /** Distinct rate bases contributing, so a mid-session rate change is visible rather than averaged away. */
+  bases: string[];
+}
+
+export function summarizeIncrementCost(
+  increments: Array<{ usage: unknown[]; pricing: { asOf: string; source: string; rates: ModelPricingOverrides } | null }>,
+  provider: string,
+  settings?: PricingSettings,
+): IncrementCostSummary {
+  let total = 0;
+  let priced = 0;
+  let unpriced = 0;
+  const bases = new Set<string>();
+  for (const increment of increments) {
+    if (!Array.isArray(increment.usage) || !increment.usage.length) continue;
+    const summary = summarizeTurnCost(
+      { usage: increment.usage as never, usageComplete: true, ...(increment.pricing ? { pricing: increment.pricing } : {}) },
+      provider, settings);
+    const amount = summary.estimatedUsd ?? summary.partialUsd;
+    if (amount === null) { unpriced += 1; continue; }
+    total += amount;
+    priced += 1;
+    bases.add(`${summary.basis.asOf}\u0000${summary.basis.source}`);
+    if (summary.estimatedUsd === null) unpriced += 1;
+  }
+  const complete = priced > 0 && unpriced === 0;
+  return {
+    estimatedUsd: complete ? total : null,
+    partialUsd: priced ? total : null,
+    unpricedIncrements: unpriced,
+    pricedIncrements: priced,
+    bases: [...bases].map(key => key.split("\u0000")[0]!),
+  };
+}
+
 /** The list card needs the totals, not the per-model breakdown; keep the list response small. */
 export type SessionCostBadge = Omit<SessionCostSummary, "usage">;
 

@@ -3208,6 +3208,8 @@ export { ExternalSessionRankings } from "./external-sessions/rankings.js";
 export type { ExternalSessionRankingQuery, RankingSessionCandidate, RankingTurnCandidate, RankingScan } from "./external-sessions/rankings.js";
 export { ExternalSessionTurnRestamp } from "./external-sessions/turn-store.js";
 export type { RestampInput, RestampResult } from "./external-sessions/turn-store.js";
+export { ExternalSessionUsageIncrementReader, usageDelta } from "./external-sessions/usage-increments.js";
+export type { UsageIncrement, UsageBand } from "./external-sessions/usage-increments.js";
 export { ExternalSessionTurnSearch } from "./external-sessions/turn-search.js";
 export type { ExternalSessionTurnSearchQuery, ExternalSessionTurnSearchHit, ExternalSessionTurnSearchPage } from "./external-sessions/turn-search.js";
 export { ExternalSessionStore } from "./external-sessions/store.js";

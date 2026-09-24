@@ -3,10 +3,10 @@ import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, e
   externalSessionCursorAfter, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackClaimSchema, feedbackAckSchema,
   ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict, externalSessionTurnIngestionSchema } from "@fusion/core";
 import { ApiError } from "../api-error.js";
-import { sessionCostBadge, summarizeTurnCost } from "../remote-agents/session-cost.js";
+import { sessionCostBadge, summarizeTurnCost, summarizeIncrementCost } from "../remote-agents/session-cost.js";
 import { recordedRatesFor } from "../remote-agents/record-rates.js";
 import { rankSessions, rankTurns } from "../remote-agents/rankings.js";
-import { ExternalSessionTurnSearch, ExternalSessionRankings } from "@fusion/core";
+import { ExternalSessionTurnSearch, ExternalSessionRankings, ExternalSessionUsageIncrementReader } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 import { registerRemoteAgentActions } from "./register-remote-agent-actions.js";
@@ -42,7 +42,21 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     */
     const page = await new ExternalSessionReader(layer, projectId).list(query.data);
     const settings = await store.getGlobalSettingsStore().getSettings();
-    res.json({ ...page, sessions: page.sessions.map(session => ({ ...session, cost: sessionCostBadge(session, settings) })) });
+    /*
+    FNXC:ExternalSessionIncrements 2026-09-24-04:51 (F1 = 3): cards use the same increment sum as the detail
+    pane, so the two cannot disagree. One query covers the whole page rather than one per session, and a session
+    with no increments keeps the cumulative badge because it predates 0091 rather than being free.
+    */
+    const bySession = await new ExternalSessionUsageIncrementReader(layer, projectId)
+      .listForSessions(page.sessions.map(session => session.id)).catch(() => new Map());
+    res.json({ ...page, sessions: page.sessions.map(session => {
+      const increments = bySession.get(session.id);
+      const badge = sessionCostBadge(session, settings);
+      if (!increments?.length) return { ...session, cost: badge };
+      const incremental = summarizeIncrementCost(increments as never, session.provider, settings);
+      return { ...session, cost: { ...badge, estimatedUsd: incremental.estimatedUsd,
+        partialUsd: incremental.partialUsd, unpricedRecords: incremental.unpricedIncrements } };
+    }) });
   });
   /*
   FNXC:ExternalSessionSearch 2026-09-23-23:05: Registered BEFORE "/external-sessions/:id" on purpose; Express

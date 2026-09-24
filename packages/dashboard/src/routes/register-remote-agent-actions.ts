@@ -1,6 +1,6 @@
-import { ExternalSessionReader, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackSubmitSchema, externalSessionReadId } from "@fusion/core";
+import { ExternalSessionReader, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackSubmitSchema, externalSessionReadId, ExternalSessionUsageIncrementReader } from "@fusion/core";
 import { ApiError } from "../api-error.js";
-import { summarizeSessionCost } from "../remote-agents/session-cost.js";
+import { summarizeSessionCost, summarizeIncrementCost } from "../remote-agents/session-cost.js";
 import type { ApiRouteRegistrar } from "./types.js";
 import { parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
 
@@ -28,10 +28,22 @@ export const registerRemoteAgentActions: ApiRouteRegistrar = ctx => {
     return { store, projectId, layer, session };
   };
   ctx.router.get("/external-sessions/:id/cost", async (req, res) => {
-    const { session, store } = await resolve(req);
+    const { session, store, layer, projectId } = await resolve(req);
     const settings = await store.getGlobalSettingsStore().getSettings();
     const summary = summarizeSessionCost(session, settings);
-    res.json({ usage: summary.usage, estimatedUsd: summary.estimatedUsd, partialUsd: summary.partialUsd,
+    /*
+    FNXC:ExternalSessionIncrements 2026-09-24-04:51 (F1 = 3): prefer the sum of per-revision increments, each at
+    the rates recorded with it. A session with NO increments predates 0091, so it falls back to the cumulative
+    figure rather than being reported as free.
+    */
+    const increments = await new ExternalSessionUsageIncrementReader(layer, projectId).list(session.id).catch(() => []);
+    const incremental = increments.length ? summarizeIncrementCost(increments as never, session.provider, settings) : null;
+    res.json({ usage: summary.usage,
+      estimatedUsd: incremental ? incremental.estimatedUsd : summary.estimatedUsd,
+      partialUsd: incremental ? incremental.partialUsd : summary.partialUsd,
+      pricedFromIncrements: incremental !== null,
+      incrementBases: incremental ? incremental.bases : [],
+      unpricedIncrements: incremental ? incremental.unpricedIncrements : 0,
       usageComplete: summary.usageComplete, pricingDate: summary.basis.asOf, pricingSource: summary.basis.source,
       pricingRecalculated: summary.basis.recalculated });
   });
