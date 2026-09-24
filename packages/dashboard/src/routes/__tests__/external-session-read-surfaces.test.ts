@@ -168,3 +168,53 @@ describe("external session attribution on the read surfaces", () => {
     expect(s.json.mock.calls[0]![0].fusion).toEqual({ taskId: null, cliSessionId: null, ambiguous: true });
   });
 });
+
+/*
+FNXC:ExternalSessionOverview 2026-09-24-08:12: the range aggregate. It must be registered ahead of "/:id", must
+reject a malformed filter, and must reuse the bounded session scan rather than walking the table.
+*/
+describe("external session cost overview route", () => {
+  it("aggregates the bounded session scan and carries the Fusion-run split", async () => {
+    const { ExternalSessionRankings, ExternalSessionAttribution } = await import("@fusion/core");
+    const band = { model: "gpt-5.6-sol", inputTokens: 1_000_000, cachedInputTokens: 0, cacheWriteTokens: 0,
+      cacheWriteHourTokens: 0, outputTokens: 100_000, reasoningTokens: null, fast: false, longContext: false };
+    const sessions = vi.spyOn(ExternalSessionRankings.prototype, "sessions").mockResolvedValue({
+      candidates: [{ sessionId: id, hostId: "m3", provider: "codex", title: null, nativeSessionId: "native-1",
+        observedAt: "2026-09-20T10:00:00.000Z", usage: [band], usageComplete: true }],
+      scanned: 1, truncated: false, withoutUsage: 0 });
+    vi.spyOn(ExternalSessionAttribution.prototype, "resolve")
+      .mockResolvedValue(new Map([[id, { taskId: "FN-1", cliSessionId: "cli-1", ambiguous: false }]]));
+    const s = setup();
+    s.req.query = { projectId: "project-a", from: "2026-09-01T00:00:00.000Z", hostId: "m3" };
+    await s.gets.get("/external-sessions/overview")!(s.req, s.res);
+    expect(sessions).toHaveBeenCalledWith({ from: "2026-09-01T00:00:00.000Z", hostId: "m3" });
+    const body = s.json.mock.calls[0]![0];
+    expect(body.totalUsd).toBeGreaterThan(0);
+    expect(body.byDay).toEqual([expect.objectContaining({ key: "2026-09-20", sessions: 1 })]);
+    // The split equals the whole total here because the only session is a Fusion run.
+    expect(body.fusionAttributed).toMatchObject({ sessions: 1, ambiguous: 0 });
+    expect(body.fusionAttributed.usd).toBeCloseTo(body.totalUsd, 10);
+  });
+
+  it("still answers when reconciliation is unavailable, attributing nothing", async () => {
+    const { ExternalSessionRankings, ExternalSessionAttribution } = await import("@fusion/core");
+    vi.spyOn(ExternalSessionRankings.prototype, "sessions").mockResolvedValue({
+      candidates: [], scanned: 0, truncated: false, withoutUsage: 0 });
+    vi.spyOn(ExternalSessionAttribution.prototype, "resolve").mockRejectedValue(new Error("storage unavailable"));
+    const s = setup();
+    await s.gets.get("/external-sessions/overview")!(s.req, s.res);
+    expect(s.json.mock.calls[0]![0].fusionAttributed).toEqual({ sessions: 0, usd: 0, ambiguous: 0 });
+  });
+
+  it("rejects a malformed filter rather than silently widening the range", async () => {
+    const s = setup();
+    s.req.query = { projectId: "project-a", from: ["a", "b"] };
+    await expect(s.gets.get("/external-sessions/overview")!(s.req, s.res)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it("rejects an out-of-range date rather than scanning everything", async () => {
+    const s = setup();
+    s.req.query = { projectId: "project-a", from: "not-a-date" };
+    await expect(s.gets.get("/external-sessions/overview")!(s.req, s.res)).rejects.toMatchObject({ statusCode: 400 });
+  });
+});

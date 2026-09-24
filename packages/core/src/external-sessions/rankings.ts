@@ -24,6 +24,9 @@ export type ExternalSessionRankingQuery = z.input<typeof rankingQuerySchema>;
 export interface RankingSessionCandidate {
   sessionId: string; hostId: string; provider: string; title: string | null;
   observedAt: string | null; usage: unknown[]; usageComplete: boolean;
+  /* FNXC:ExternalSessionAttribution 2026-09-24-08:12 (F4 = 1): carried so an aggregate over this scan can say
+     which sessions ARE Fusion task runs without a second query per session. */
+  nativeSessionId: string | null;
 }
 
 export interface RankingTurnCandidate {
@@ -64,6 +67,7 @@ export class ExternalSessionRankings {
       : sql` AND EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(s.observation->'usage', '[]'::jsonb)) u WHERE u->>'model' = ${query.model})`;
     const rows = (await this.layer.db.execute(sql`
       SELECT s.id AS "sessionId", s.host_id AS "hostId", s.provider AS provider, s.observation->>'title' AS title,
+             s.native_session_id AS "nativeSessionId",
              ${at} AS "observedAt", coalesce(s.observation->'usage', '[]'::jsonb) AS usage,
              coalesce((s.observation->>'usageComplete')::boolean, false) AS "usageComplete"
       FROM project.external_sessions s

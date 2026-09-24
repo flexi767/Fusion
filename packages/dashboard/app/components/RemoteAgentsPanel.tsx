@@ -6,6 +6,7 @@ import { withProjectId } from "../api/client/health";
 import { useVisibilityAwarePoll } from "../hooks/visibilitySuspension";
 import { RemoteAgentTurns } from "./RemoteAgentTurns";
 import { RemoteAgentSummary } from "./RemoteAgentSummary";
+import { RemoteAgentOverview } from "./RemoteAgentOverview";
 import { RemoteAgentSearch } from "./RemoteAgentSearch";
 import { RemoteAgentRankings } from "./RemoteAgentRankings";
 import "./RemoteAgentsPanel.css";
@@ -276,6 +277,7 @@ export function RemoteAgentsPanel({ projectId }: { projectId?: string }) {
       <label>Provider<select value={provider} onChange={e => setProvider(e.target.value)}><option value="">All providers</option><option value="codex">Codex</option><option value="claude">Claude</option></select></label>
       <button className="btn btn-sm" onClick={() => void load()} disabled={loading}>Refresh</button>
     </div>
+    {projectId && <RemoteAgentOverview projectId={projectId} {...(host ? { hostId: host } : {})} />}
     {projectId && <RemoteAgentSearch projectId={projectId} {...(host ? { hostId: host } : {})} onOpenSession={setSelected} />}
     {projectId && <RemoteAgentRankings projectId={projectId} {...(host ? { hostId: host } : {})} onOpenSession={setSelected} />}
     <section className="remote-agent-hosts" aria-labelledby="remote-agent-hosts-heading">

@@ -6,6 +6,7 @@ import { ApiError } from "../api-error.js";
 import { sessionCostBadge, summarizeTurnCost, summarizeIncrementCost } from "../remote-agents/session-cost.js";
 import { recordedRatesFor } from "../remote-agents/record-rates.js";
 import { rankSessions, rankTurns } from "../remote-agents/rankings.js";
+import { summarizeOverview } from "../remote-agents/overview.js";
 import { ExternalSessionTurnSearch, ExternalSessionRankings, ExternalSessionUsageIncrementReader } from "@fusion/core";
 import { ExternalSessionSummaryStore, summaryInput, summaryState, summarizeExternalSession,
   resolveTitleSummarizerSettingsModel, ExternalSessionAttribution } from "@fusion/core";
@@ -115,6 +116,37 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
       res.json({ schemaVersion: 1, scope, ...ranking });
     } catch (error) {
       if (error instanceof Error && error.name === "ZodError") throw new ApiError(400, "Invalid ranking query");
+      throw error;
+    }
+  });
+  /*
+  FNXC:ExternalSessionOverview 2026-09-24-08:12: Registered before "/:id" for the same reason as search and
+  rankings. Answers "what did this range cost", which per-session and top-N figures cannot: the panel's
+  per-server totals cover only the sessions currently loaded.
+  */
+  ctx.router.get("/external-sessions/overview", async (req, res) => {
+    for (const key of ["hostId", "model", "from", "to"] as const) {
+      if (req.query[key] !== undefined && typeof req.query[key] !== "string") throw new ApiError(400, "Invalid overview filter");
+    }
+    const { store, projectId } = await ctx.getProjectContext(req); const layer = store.getAsyncLayer();
+    if (!projectId || !layer || layer.projectId !== projectId) throw new ApiError(503, "External session project storage unavailable");
+    const query = {
+      ...(req.query.hostId === undefined ? {} : { hostId: String(req.query.hostId) }),
+      ...(req.query.model === undefined ? {} : { model: String(req.query.model) }),
+      ...(req.query.from === undefined ? {} : { from: String(req.query.from) }),
+      ...(req.query.to === undefined ? {} : { to: String(req.query.to) }),
+    };
+    try {
+      const scan = await new ExternalSessionRankings(layer, projectId).sessions(query);
+      const settings = await store.getGlobalSettingsStore().getSettings();
+      /* F4 = 1: the Fusion-run split is best-effort; a failure leaves it zero, which reads as "none proven",
+         never as a suppressed cost. */
+      const attributed = await new ExternalSessionAttribution(layer, projectId)
+        .resolve(scan.candidates.map(c => ({ sessionId: c.sessionId, provider: c.provider, nativeSessionId: c.nativeSessionId })))
+        .catch(() => new Map());
+      res.json({ schemaVersion: 1, ...summarizeOverview(scan, settings, attributed) });
+    } catch (error) {
+      if (error instanceof Error && error.name === "ZodError") throw new ApiError(400, "Invalid overview query");
       throw error;
     }
   });

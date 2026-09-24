@@ -19,6 +19,7 @@ describe("standalone remote agents", () => {
       if (opts?.method === "POST") { const b = JSON.parse(String(opts.body)); calls.push(b); return { commandId: b.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString() } as never; }
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
@@ -47,6 +48,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("provider=claude")) return { sessions: [fresh], nextCursor: null } as never;
       // The first load must finish, because Refresh is disabled while a load is in flight.
@@ -73,6 +75,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [priced, partial, unknown, empty], nextCursor: null } as never;
     });
@@ -93,6 +96,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [{ hostId: "j", collectorConnected: true }, { hostId: "m3", collectorConnected: false }, { hostId: "m5", collectorConnected: false }] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [priced, alsoPriced, incomplete], nextCursor: null } as never;
     });
@@ -116,6 +120,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [fixture], nextCursor: null } as never;
     });
@@ -135,6 +140,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [], nextCursor: null } as never;
     });
@@ -164,6 +170,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [recalculated, current], nextCursor: null } as never;
     });
@@ -187,6 +194,7 @@ describe("standalone remote agents", () => {
       if (opts?.method === "POST") { const body = JSON.parse(String(opts.body)); calls.push(body); return { commandId: body.commandId, status: "queued", createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString() } as never; }
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
@@ -211,6 +219,7 @@ describe("standalone remote agents", () => {
     const plain = { ...fixture, id: "c".repeat(64), observation: { ...fixture.observation, title: "Operator agent" }, fusion: null };
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       return { sessions: [attributed, ambiguous, plain], nextCursor: null } as never;
     });
@@ -230,6 +239,7 @@ describe("standalone remote agents", () => {
     vi.mocked(api).mockImplementation(async path => {
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: [] } as never;
@@ -271,6 +281,7 @@ describe("standalone remote agents", () => {
       }
       if (path.includes("/hosts")) return { hosts: [] } as never;
       if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      if (path.includes("/overview")) return { schemaVersion: 1, totalUsd: 0, coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 }, byDay: [], byModel: [], byHost: [], fusionAttributed: { sessions: 0, usd: 0, ambiguous: 0 } } as never;
       if (path.includes("/rankings")) return { schemaVersion: 1, scope: "turns", entries: [], coverage: { scanned: 0, priced: 0, unpriced: 0, withoutUsage: 0, truncated: false, pricedTotalUsd: 0 } } as never;
       if (path.includes("/cost")) return { usage: [], estimatedUsd: null, partialUsd: null, usageComplete: false, pricingDate: "2026-07-16", pricingSource: "Fusion" } as never;
       if (path.includes("/feedback")) return { feedback: receiptStatus && posts[0] ? [{ commandId: posts[0].commandId, status: receiptStatus, createdAt: new Date().toISOString(), expiresAt: new Date().toISOString(), deliveredAt: null }] : [] } as never;

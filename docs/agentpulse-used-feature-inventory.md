@@ -15,9 +15,9 @@ evidence; the code surface exists for all of them.
 | --- | --- | --- |
 | Session observation | `sessions` 556 | **Done.** Phase 1; `external_sessions`, Remote agents panel. |
 | Session events | `events` 96,006 | **Done.** Observation ingestion with durable replay. |
-| Turn history / results | covered by `events` | **API only.** Migration 0088 + `/external-sessions/:id/turns` are deployed and paginated; nothing renders them. Largest gap. |
-| Full-text search over output | `search_events_fts` 67,148 docs; `search_sessions_fts` 556 | **Missing.** Phase 5. Genuinely used at scale. |
-| AI watcher runs | `ai_watcher_runs` 817 | **Missing.** Phase 5 summaries. Heaviest AI usage in the deployment. |
+| Turn history / results | covered by `events` | **Done.** Turn history renders with per-turn cost and context. |
+| Full-text search over output | `search_events_fts` 67,148 docs; `search_sessions_fts` 556 | **Done.** Migration 0089 GIN index and the search panel. |
+| AI watcher runs | `ai_watcher_runs` 817 | **Superseded.** Zero durable output here (see correction). Summaries were built on request as a NEW capability, not a port. |
 | Session control actions | `control_actions` 7 | **Missing.** Phase 4 stop/resume, capability-gated. |
 | Managed sessions | `managed_sessions` 4 | **Partial.** Fusion owns its own sessions; external managed-session control is Phase 4. |
 | Launch requests | `launch_requests` 4 | **Missing.** Low usage; candidate for a named follow-up rather than parity. |
@@ -26,7 +26,7 @@ evidence; the code surface exists for all of them.
 | Settings | `settings` 9 | **Equivalent.** Fusion global settings. |
 | LLM providers | `llm_providers` 1 | **Equivalent.** Fusion provider/credential settings. |
 | API keys | `api_keys` 1 | **Equivalent.** Collector credentials. |
-| Cost overview / popover | `CostOverview.tsx`, `CostPopover.tsx` | **Partial.** Session + card totals done; turn costs, effective-dated rates and rankings open. |
+| Cost overview / popover | `CostOverview.tsx`, `CostPopover.tsx` | **Done.** Session and card totals, per-turn costs, effective-dated rates, rankings, and the range overview with day/model/server breakdown. |
 
 ## Not used in this deployment — zero rows, not parity requirements
 
@@ -109,3 +109,38 @@ configuration.
 Historical import (Phase 6) must carry `sessions` 556 and `events` 96,006, and its
 reconciliation report is what proves parity. Retiring AgentPulse still requires separate
 explicit approval, and the recovery snapshot is retained regardless.
+
+
+## Parity status as of 2026-09-24
+
+Every capability measured as genuinely used now has a Fusion equivalent:
+
+| Used capability | Fusion equivalent |
+| --- | --- |
+| Session observation, events | `external_sessions`, durable replay ingestion |
+| Turn history / results | Turn history panel, per-turn cost and context |
+| Full-text search over output | Migration 0089 GIN index, search panel |
+| Cost overview / popover | Card and session totals, per-turn costs, effective-dated rates, rankings, range overview |
+| Supervisors, credentials, settings, providers, API keys | Host-scoped collector credentials, Fusion settings |
+
+Still deliberately NOT built, because the corrected measurement showed their entire recorded use falls inside a
+single four-minute commissioning window on 2026-09-15 rather than operational use: **session controls**
+(`control_actions` 7), **launch requests** (4), **managed sessions** (4), **Ask threads** (1). These remain
+named follow-ups to build on request, exactly as the operator directed — not parity obligations.
+
+Two capabilities were built that AgentPulse does not provide at all, and neither is a parity claim: operational
+collector health (F-series groundwork) and AI session summaries (F3 = A).
+
+### The combined task + external total is NOT in parity scope
+
+Worth stating explicitly, because it is easy to assume otherwise. AgentPulse never held Fusion task telemetry,
+so its cost overview aggregated its OWN sessions only — which is exactly what the Fusion overview does. The
+idea of a single figure spanning `tasks.token_usage_*` and external usage comes from the integration plan's
+Phase 3 wording, not from any AgentPulse behaviour.
+
+It also cannot be built honestly yet. F4 attribution proves overlap only where a native session id was written
+back into `cli_sessions`, and that table held **0 rows** at the measurement recorded in
+docs/external-session-task-telemetry-boundary.md. With nothing to match against, every external session resolves
+as unattributed — and unattributed means *unproven*, not *proven separate*. A combined total today would
+therefore rest on the same unproven assumption the boundary document rejected. The overview reports the
+Fusion-run portion as a split of the external total instead, which is safe because it never adds the two.

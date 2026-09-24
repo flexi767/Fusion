@@ -59,3 +59,12 @@ technology announces their size and position; the marker is removed for sighted 
 
 /* FNXC:ExternalSessionAttribution 2026-09-24-07:05: The Fusion-run marker reuses the muted meta treatment; it qualifies the cost above it rather than competing with it. */
 .remote-agent-attribution { color: var(--text-muted); font-size: var(--font-size-sm); }
+
+/* FNXC:ExternalSessionOverview 2026-09-24-08:12: Breakdown lists reuse the panel's meta treatment; the groups wrap so a narrow viewport stacks them rather than scrolling sideways. */
+.remote-overview-groups { display: flex; flex-wrap: wrap; gap: var(--space-lg); }
+.remote-overview-group { min-width: 12rem; }
+.remote-overview-group h4 { margin-block: 0 var(--space-xs); }
+.remote-overview-group ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-xs); }
+.remote-overview-group li { display: flex; justify-content: space-between; gap: var(--space-md); font-size: var(--font-size-sm); color: var(--text-muted); }
+.remote-overview-group strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.remote-agent-overview .remote-agent-meta p { margin: 0 0 var(--space-xs); }
