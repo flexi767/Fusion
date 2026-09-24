@@ -204,3 +204,61 @@ class TurnUsageTests(unittest.TestCase):
         _, state = self.claude({'input_tokens': 10, 'cache_read_input_tokens': 0,
                                 'cache_creation_input_tokens': 0})
         self.assertEqual(state['turn']['usage'], [])
+
+
+class CodexTurnUsageTests(unittest.TestCase):
+    def drive(self, events):
+        state = {}
+        last = None
+        for event in events:
+            snap = consume_codex(state, event)
+            if snap:
+                last = snap
+        return last, state
+
+    def events(self, turn_id='t-1', usage_turn_id=None, usage=None, model='gpt-5.6-sol'):
+        usage = usage if usage is not None else {'input_tokens': 1000, 'cached_input_tokens': 200,
+                                                 'cache_write_input_tokens': 0, 'output_tokens': 50,
+                                                 'reasoning_output_tokens': 10}
+        return [
+            {'type': 'event_msg', 'timestamp': '2026-09-23T10:00:00Z', 'payload': {'type': 'user_message', 'message': 'go'}},
+            {'type': 'event_msg', 'timestamp': '2026-09-23T10:00:01Z', 'payload': {'type': 'task_started', 'turn_id': turn_id}},
+            {'type': 'turn_context', 'timestamp': '2026-09-23T10:00:02Z', 'payload': {'turn_id': turn_id, 'model': model}},
+            {'type': 'token_usage_record', 'timestamp': '2026-09-23T10:00:03Z',
+             'payload': {'turn_id': usage_turn_id or turn_id, 'response_id': 'resp-1', 'usage': usage}},
+        ]
+
+    def test_attaches_usage_by_the_turn_id_the_transcript_states(self):
+        turn, _ = self.drive(self.events())
+        self.assertEqual(len(turn['usage']), 1)
+        entry = turn['usage'][0]
+        self.assertEqual(entry['requestId'], 'resp-1')
+        self.assertEqual(entry['model'], 'gpt-5.6-sol')
+        self.assertEqual(entry['inputTokens'], 1000)
+        self.assertEqual(entry['cachedInputTokens'], 200)
+        self.assertEqual(entry['outputTokens'], 50)
+        self.assertEqual(entry['reasoningTokens'], 10)
+        self.assertEqual(turn['contextTokens'], 1000)
+        self.assertEqual(turn['contextCapacity'], 272000)
+
+    def test_does_not_attach_usage_belonging_to_a_different_turn(self):
+        # Guessing by position would attach this; the stated turn_id says it belongs elsewhere.
+        _, state = self.drive(self.events(turn_id='t-1', usage_turn_id='t-other'))
+        self.assertEqual(state['turn']['usage'], [])
+        self.assertIsNone(state['turn']['contextTokens'])
+
+    def test_unreadable_usage_marks_the_turn_incomplete_rather_than_zero(self):
+        _, state = self.drive(self.events(usage={'input_tokens': 'lots'}))
+        self.assertEqual(state['turn']['usage'], [])
+        self.assertIs(state['turn'].get('usageComplete'), False)
+
+    def test_does_not_double_count_a_repeated_response_id(self):
+        events = self.events()
+        _, state = self.drive(events + [events[-1]])
+        self.assertEqual(len(state['turn']['usage']), 1)
+
+    def test_records_usage_without_a_model_rather_than_inventing_one(self):
+        events = [e for e in self.events() if e['type'] != 'turn_context']
+        _, state = self.drive(events)
+        self.assertEqual(len(state['turn']['usage']), 1)
+        self.assertIsNone(state['turn']['usage'][0]['model'])

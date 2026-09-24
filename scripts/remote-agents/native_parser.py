@@ -13,6 +13,23 @@ def count(value):
 CONTEXT_CAPACITY = {'claude': 200000, 'codex': 272000}
 
 
+def codex_usage_record(payload):
+    """Normalized usage for one Codex token_usage_record, or None when the record cannot be trusted.
+
+    Shared with the turn parser. The record names its own ``turn_id``, so a turn's usage is stated by the
+    transcript rather than inferred from ordering.
+    """
+    u = payload.get('usage') if isinstance(payload, dict) else None
+    if not isinstance(u, dict):
+        return None
+    usage = dict(inputTokens=count(u.get('input_tokens')), cachedInputTokens=count(u.get('cached_input_tokens', 0)),
+                 outputTokens=count(u.get('output_tokens')), reasoningTokens=count(u.get('reasoning_output_tokens')),
+                 cacheWriteTokens=count(u.get('cache_write_input_tokens', 0)), cacheWriteHourTokens=0)
+    if usage['inputTokens'] is None or usage['outputTokens'] is None or usage['cachedInputTokens'] is None or usage['cacheWriteTokens'] is None:
+        return None
+    return usage
+
+
 def claude_message_usage(message):
     """Normalized usage for one Claude assistant message, or None when the record cannot be trusted.
 
@@ -113,8 +130,11 @@ def consume(db, state, event, provider, accounting=True):
         u = p.get('usage') or {}
         if isinstance(u, dict):
             request = 'response:' + str(p.get('response_id') or event.get('ordinal') or hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest())
-            usage = {k: count(u.get(v, 0 if k == 'cachedInputTokens' else None)) for k, v in fields.items()}
-            usage.update(cacheWriteTokens=count(u.get('cache_write_input_tokens', 0)), cacheWriteHourTokens=0)
+            usage = codex_usage_record(p)
+            if usage is None:
+                # Unreadable usage is UNKNOWN, not absent, exactly as on the Claude path.
+                state['unreportedUsage'] = True
+                return
             authoritative = True
     elif provider == 'codex' and sub == 'token_count':
         info = p.get('info') or {}; u = info.get('total_token_usage') or {}

@@ -5,7 +5,7 @@ read: a patch is shown only when the native event carries one.
 """
 from datetime import datetime
 
-from native_parser import CONTEXT_CAPACITY, bounded, claude_message_usage, content
+from native_parser import CONTEXT_CAPACITY, bounded, claude_message_usage, codex_usage_record, content
 
 
 def _elapsed(start, end):
@@ -53,7 +53,8 @@ def consume_codex(state, event):
         state['ordinal'] = state.get('ordinal', -1) + 1
         turn = dict(nativeTurnId='inferred:' + str(state['ordinal']), revision=0, ordinal=state['ordinal'],
                     state='ongoing', prompts=[], response=None, startedAt=at, endedAt=None,
-                    durationMs=None, durationSource=None, toolCallCount=0, fileChanges=[])
+                    durationMs=None, durationSource=None, toolCallCount=0, fileChanges=[],
+                    usage=[], contextTokens=None, contextCapacity=CONTEXT_CAPACITY['codex'])
         state['turn'] = turn
     if kind == 'event_msg' and sub == 'task_started':
         native_id = payload.get('turn_id')
@@ -70,6 +71,38 @@ def consume_codex(state, event):
                     state='ongoing', prompts=[], response=None, startedAt=at, endedAt=None,
                     durationMs=None, durationSource=None, toolCallCount=0, fileChanges=[])
         state['turn'] = turn
+    
+    """
+    FNXC:ExternalSessionUsage 2026-09-24-00:04: Codex states the correlation itself: turn_context and
+    token_usage_record both carry turn_id, and the transcript holds exactly one usage record per turn. Measured
+    on a real 81-turn rollout: 81 turn_contexts, 81 usage records, 81 distinct turn_ids, zero on either side
+    without a match. So usage is attached by stated identity, never by position or proximity.
+    """
+    if kind == 'turn_context':
+        identity = payload.get('turn_id')
+        model = payload.get('model')
+        if isinstance(identity, str) and identity and isinstance(model, str) and model:
+            models = state.setdefault('turnModels', {})
+            if len(models) < 256:
+                models[identity] = bounded(model, 256)
+    if kind == 'token_usage_record':
+        identity = payload.get('turn_id')
+        usage = codex_usage_record(payload)
+        if turn and isinstance(identity, str) and identity == turn['nativeTurnId']:
+            if usage is None:
+                # The record exists but cannot be read: the turn's accounting is incomplete, not zero.
+                turn['usageComplete'] = False
+                return dict(turn)
+            request = payload.get('response_id')
+            entries = turn.setdefault('usage', [])
+            if len(entries) < 64 and not any(u.get('requestId') == request for u in entries):
+                entries.append(dict(requestId=bounded(str(request), 256) if request else identity,
+                                    model=state.get('turnModels', {}).get(identity), **usage))
+                turn['contextTokens'] = usage['inputTokens']
+                turn['contextCapacity'] = CONTEXT_CAPACITY['codex']
+                return dict(turn)
+        return None
+
     if not turn:
         return None
     changed = False
