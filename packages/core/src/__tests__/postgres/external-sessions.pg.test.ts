@@ -534,6 +534,35 @@ pgDescribe("external sessions: durable observation ingestion", () => {
     }
   });
 
+  it("stores a recorded pricing stamp with its turn and leaves unstamped turns unstamped", async () => {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const base = turnEnvelope(first.sessionId, "turn-priced", 0);
+    const pricing = { asOf: "2026-07-16", source: "Fusion model pricing",
+      rates: { "claude_code:claude-sonnet-5": { inputPer1M: 3, outputPer1M: 15, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75, source: "docs" } } };
+    await turns.ingest({ ...base, turn: { ...base.turn, pricing } });
+    await turns.ingest(turnEnvelope(first.sessionId, "turn-unstamped", 1));
+    const stored = (await new ExternalSessionTurnReader(h.layer(), principal.projectId).list(first.sessionId)).turns;
+    expect(stored.find(t => t.nativeTurnId === "turn-priced")!.pricing).toMatchObject(pricing);
+    // An old turn stays without a stamp; it must never be back-filled from today's catalog.
+    expect(stored.find(t => t.nativeTurnId === "turn-unstamped")!.pricing).toBeUndefined();
+  });
+
+  it("rejects a malformed pricing stamp rather than storing an unusable rate", async () => {
+    const first = await store().ingest(envelope());
+    const turns = new ExternalSessionTurnStore(h.layer(), principal);
+    const base = turnEnvelope(first.sessionId, "turn-bad-rate", 0);
+    const good = { inputPer1M: 3, outputPer1M: 15, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75, source: "docs" };
+    for (const bad of [
+      { asOf: "", source: "s", rates: { "a:b": good } },
+      { asOf: "2026-07-16", source: "s", rates: { "a:b": { ...good, inputPer1M: -1 } } },
+      { asOf: "2026-07-16", source: "s", rates: { "a:b": { ...good, source: "" } } },
+      { asOf: "2026-07-16", source: "s", rates: { "a:b": { inputPer1M: 3 } } },
+    ]) {
+      await expect(turns.ingest({ ...base, turn: { ...base.turn, pricing: bad } as never })).rejects.toThrow();
+    }
+  });
+
   it("installs external-session migrations on an upgrade and reopening is idempotent", async () => {
     await h.adminDb().execute(sql.raw("DROP TABLE project.external_session_turns, project.external_session_feedback, project.external_sessions, project.external_session_streams, project.external_session_hosts; DELETE FROM public.fusion_schema_migrations WHERE version IN ('0086', '0087', '0088');"));
     expect((await applySchemaBaseline(h.adminDb())).applied).toBe(true);

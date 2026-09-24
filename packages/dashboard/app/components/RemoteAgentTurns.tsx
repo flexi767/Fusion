@@ -3,7 +3,7 @@ import type { ExternalSessionFileChange, ExternalSessionTurn } from "@fusion/cor
 import { api } from "../api/client/client";
 import { withProjectId } from "../api/client/health";
 
-type TurnCost = { estimatedUsd: number | null; partialUsd: number | null; unpricedRecords: number; usageComplete: boolean; contextTokens: number | null; contextCapacity: number | null; basis?: { asOf: string; source: string; recalculated: boolean } };
+type TurnCost = { estimatedUsd: number | null; partialUsd: number | null; unpricedRecords: number; usageComplete: boolean; contextTokens: number | null; contextCapacity: number | null; basis?: { asOf: string; source: string; recalculated: boolean; recorded?: boolean } };
 type PricedTurn = ExternalSessionTurn & { cost?: TurnCost | null };
 type TurnPage = { schemaVersion: 1; turns: PricedTurn[]; nextCursor: string | null };
 const money = (n: number) => new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(n);
@@ -15,7 +15,10 @@ indistinguishable from a measured one once it is on screen.
 */
 function turnCostLabel(cost?: TurnCost | null): string {
   if (!cost) return "Cost not reported";
-  if (cost.estimatedUsd !== null) return cost.basis?.recalculated ? `${money(cost.estimatedUsd)} at today\u2019s rates` : `${money(cost.estimatedUsd)}`;
+  if (cost.estimatedUsd !== null) {
+    if (cost.basis?.recorded) return `${money(cost.estimatedUsd)} at recorded rates`;
+    return cost.basis?.recalculated ? `${money(cost.estimatedUsd)} at today\u2019s rates` : `${money(cost.estimatedUsd)}`;
+  }
   if (cost.partialUsd !== null) return `${money(cost.partialUsd)} priced so far · ${cost.unpricedRecords} unpriced`;
   return cost.usageComplete ? "Cost not reported" : "Usage incomplete for this turn";
 }

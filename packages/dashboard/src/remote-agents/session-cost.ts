@@ -62,6 +62,8 @@ export interface PricingBasis {
   asOf: string;
   source: string;
   recalculated: boolean;
+  /** True when the rates were recorded at ingest, so this is the cost at the rates that actually applied. */
+  recorded: boolean;
 }
 
 export interface PricingSettings {
@@ -77,7 +79,7 @@ export function pricingBasis(settings: PricingSettings | undefined, activityAt?:
   const basisAt = Date.parse(asOf);
   // Unknown activity time cannot be proven older, so it is not claimed to be a recalculation.
   const recalculated = Number.isFinite(activity) && Number.isFinite(basisAt) && activity < basisAt;
-  return { asOf, source, recalculated };
+  return { asOf, source, recalculated, recorded: false };
 }
 
 /** The list card needs the totals, not the per-model breakdown; keep the list response small. */
@@ -110,12 +112,19 @@ interface TurnLike {
   usageComplete?: boolean;
   contextTokens?: number | null;
   contextCapacity?: number | null;
+  pricing?: { asOf: string; source: string; rates: ModelPricingOverrides };
 }
 
 export function summarizeTurnCost(turn: TurnLike, provider: string, settings?: PricingSettings, activityAt?: string | null): TurnCostSummary {
   const raw = turn.usage ?? [];
+  /*
+  FNXC:ExternalSessionRates 2026-09-24-00:04: When the turn carries rates recorded at ingest, price with THOSE,
+  so the figure is the cost at the rates that actually applied rather than a recalculation at today's. Passing
+  them as the override map reuses the one pricing seam; nothing else re-implements a rate lookup.
+  */
+  const recorded = turn.pricing?.rates && Object.keys(turn.pricing.rates).length ? turn.pricing : undefined;
   const priced = raw
-    .map(entry => priceUsage(entry, pricingProviderFor(provider), settings?.modelPricingOverrides))
+    .map(entry => priceUsage(entry, pricingProviderFor(provider), recorded ? recorded.rates : settings?.modelPricingOverrides))
     .filter((entry): entry is RemoteUsage => entry !== null && entry.usd !== null);
   const total = priced.reduce((sum, entry) => sum + entry.usd!, 0);
   const complete = turn.usageComplete !== false && raw.length > 0 && priced.length === raw.length;
@@ -126,6 +135,8 @@ export function summarizeTurnCost(turn: TurnLike, provider: string, settings?: P
     usageComplete: turn.usageComplete !== false,
     contextTokens: turn.contextTokens ?? null,
     contextCapacity: turn.contextCapacity ?? null,
-    basis: pricingBasis(settings, activityAt),
+    basis: recorded
+      ? { asOf: recorded.asOf, source: recorded.source, recalculated: false, recorded: true }
+      : pricingBasis(settings, activityAt),
   };
 }

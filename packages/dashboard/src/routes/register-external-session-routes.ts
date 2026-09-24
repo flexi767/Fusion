@@ -4,6 +4,7 @@ import { ExternalSessionStore, ExternalSessionReader, ExternalSessionConflict, e
   ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict, externalSessionTurnIngestionSchema } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import { sessionCostBadge, summarizeTurnCost } from "../remote-agents/session-cost.js";
+import { recordedRatesFor } from "../remote-agents/record-rates.js";
 import { ExternalSessionTurnSearch } from "@fusion/core";
 import type { ApiRouteRegistrar } from "./types.js";
 import { authenticateExternalSessionCollector, parseExternalSessionCollectorCredentials } from "./external-session-collector-auth.js";
@@ -133,7 +134,21 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
         } else if (operation === "ingest") {
           res.json(await sessions.ingest(parsed.data));
         } else if (operation === "turn-ingest") {
-          res.json(await new ExternalSessionTurnStore(layer, principal).ingest(parsed.data));
+          /*
+          FNXC:ExternalSessionRates 2026-09-24-00:04: Stamp the applicable rates as the turn arrives; this is the
+          last moment the true rate is knowable. The stamp is always recomputed here and overwrites anything the
+          collector sent, so a host cannot choose the rates its own work is priced at.
+          */
+          const body = parsed.data as { sessionId: string; turn: Record<string, unknown> };
+          let pricing: ReturnType<typeof recordedRatesFor>;
+          try {
+            const session = await new ExternalSessionReader(layer, principal.projectId).get(body.sessionId);
+            if (session) pricing = recordedRatesFor(body.turn.usage as never, session.provider, await store.getGlobalSettingsStore().getSettings());
+          } catch { pricing = undefined; }
+          // An unavailable rate table must not refuse the turn: unstamped stays honestly unstamped.
+          const turn = { ...body.turn, ...(pricing ? { pricing } : {}) };
+          if (!pricing) delete (turn as { pricing?: unknown }).pricing;
+          res.json(await new ExternalSessionTurnStore(layer, principal).ingest({ ...body, turn }));
         } else {
           const feedback = new ExternalSessionFeedback(layer, principal.projectId);
           res.json(operation === "feedback-claim" ? await feedback.claim(principal.hostId, parsed.data) : await feedback.acknowledge(principal.hostId, parsed.data));

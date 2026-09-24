@@ -3202,6 +3202,8 @@ export * from "./external-sessions/contract.js";
 export * from "./external-sessions/turn-contract.js";
 export { ExternalSessionTurnStore, ExternalSessionTurnReader, ExternalSessionTurnConflict } from "./external-sessions/turn-store.js";
 export type { ExternalSessionTurnListQuery } from "./external-sessions/turn-store.js";
+export { externalSessionTurnPricingSchema } from "./external-sessions/turn-contract.js";
+export type { ExternalSessionTurnPricing } from "./external-sessions/turn-contract.js";
 export { ExternalSessionTurnSearch } from "./external-sessions/turn-search.js";
 export type { ExternalSessionTurnSearchQuery, ExternalSessionTurnSearchHit, ExternalSessionTurnSearchPage } from "./external-sessions/turn-search.js";
 export { ExternalSessionStore } from "./external-sessions/store.js";
