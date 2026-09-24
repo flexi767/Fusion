@@ -24,6 +24,10 @@ export interface RankedEntry {
   recordedRates: boolean;
   /** True when the figure is a recalculation at rates newer than the work. */
   recalculated: boolean;
+  /** Measured explanation: largest charge category, its amount, and priced request volume. */
+  dominant: string | null;
+  dominantUsd: number;
+  requests: number;
 }
 
 export interface RankingCoverage {
@@ -65,7 +69,8 @@ export function rankTurns(scan: RankingScan<RankingTurnCandidate>, settings: Pri
     total += usd;
     entries.push({ sessionId: row.sessionId, hostId: row.hostId, provider: row.provider, title: row.title,
       at: row.at, usd, nativeTurnId: row.nativeTurnId, ordinal: row.ordinal,
-      recordedRates: cost.basis.recorded, recalculated: cost.basis.recalculated });
+      recordedRates: cost.basis.recorded, recalculated: cost.basis.recalculated,
+      dominant: cost.drivers.dominant, dominantUsd: cost.drivers.dominantUsd, requests: cost.drivers.requests });
   }
   return rank(entries, { scanned: scan.scanned, priced: entries.length, unpriced,
     withoutUsage: scan.withoutUsage, truncated: scan.truncated, pricedTotalUsd: total }, limit);
@@ -84,7 +89,8 @@ export function rankSessions(scan: RankingScan<RankingSessionCandidate>, setting
     if (usd === null) { unpriced += 1; continue; }
     total += usd;
     entries.push({ sessionId: row.sessionId, hostId: row.hostId, provider: row.provider, title: row.title,
-      at: row.observedAt, usd, recordedRates: cost.basis.recorded, recalculated: cost.basis.recalculated });
+      at: row.observedAt, usd, recordedRates: cost.basis.recorded, recalculated: cost.basis.recalculated,
+      dominant: cost.drivers.dominant, dominantUsd: cost.drivers.dominantUsd, requests: cost.drivers.requests });
   }
   return rank(entries, { scanned: scan.scanned, priced: entries.length, unpriced,
     withoutUsage: scan.withoutUsage, truncated: scan.truncated, pricedTotalUsd: total }, limit);

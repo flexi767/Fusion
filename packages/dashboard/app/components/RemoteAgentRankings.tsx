@@ -5,6 +5,7 @@ import { withProjectId } from "../api/client/health";
 type Entry = {
   sessionId: string; hostId: string; provider: string; title: string | null; at: string | null;
   usd: number; nativeTurnId?: string; ordinal?: number; recordedRates: boolean; recalculated: boolean;
+  dominant: string | null; dominantUsd: number; requests: number;
 };
 type Coverage = { scanned: number; priced: number; unpriced: number; withoutUsage: number; truncated: boolean; pricedTotalUsd: number };
 type RankingPage = { schemaVersion: 1; scope: "turns" | "sessions"; entries: Entry[]; coverage: Coverage };
@@ -18,6 +19,22 @@ without it silently answers "the most expensive work we had rates for", which is
 question. Truncation, unpriced rows and rows with no usage at all each get their own sentence, because
 collapsing them into one number hides which limitation applies.
 */
+
+/*
+FNXC:ExternalSessionDrivers 2026-09-24-01:44: The explanation is measured: the largest charge category, its
+amount and the priced request volume. Never a narrative cause like "long conversation".
+*/
+const CATEGORY_LABEL: Record<string, string> = {
+  freshInput: "fresh input", cachedInput: "cached input", cacheWrite: "cache writes",
+  cacheWriteHour: "1-hour cache writes", output: "output",
+};
+
+function driverText(entry: Entry): string {
+  const requests = `${entry.requests} priced ${entry.requests === 1 ? "request" : "requests"}`;
+  if (!entry.dominant) return `Cost drivers unavailable · ${requests}`;
+  return `Mostly ${CATEGORY_LABEL[entry.dominant] ?? entry.dominant} (${money(entry.dominantUsd)} of ${money(entry.usd)}) · ${requests}`;
+}
+
 function coverageText(coverage: Coverage, scope: "turns" | "sessions"): string[] {
   const noun = scope === "turns" ? "turns" : "sessions";
   const lines = [`Ranked ${coverage.priced} priced of ${coverage.scanned} ${noun} examined · ${money(coverage.pricedTotalUsd)} total across all priced ${noun}.`];
@@ -79,6 +96,7 @@ export function RemoteAgentRankings({ projectId, hostId, onOpenSession }: {
           <strong>{money(entry.usd)}</strong>
           <span>{entry.title || entry.sessionId.slice(0, 12)}{entry.ordinal === undefined ? "" : ` · turn ${entry.ordinal + 1}`}</span>
           <span className="remote-agent-meta">{entry.hostId} · {entry.provider}{entry.at ? ` · ${new Date(entry.at).toLocaleString()}` : ""}</span>
+          <span className="remote-agent-meta">{driverText(entry)}</span>
           <span className="remote-agent-meta">{entry.recordedRates ? "At recorded rates" : entry.recalculated ? "Recalculated at today’s rates" : "At current rates"}</span>
         </button>
       </li>)}

@@ -6,7 +6,7 @@ import { api } from "../../api/client/client";
 vi.mock("../../api/client/client", () => ({ api: vi.fn() }));
 const entry = (over: Record<string, unknown> = {}) => ({ sessionId: "a".repeat(64), hostId: "j", provider: "claude",
   title: "Expensive session", at: "2026-09-20T10:00:00.000Z", usd: 1.5, nativeTurnId: "t1", ordinal: 0,
-  recordedRates: true, recalculated: false, ...over });
+  recordedRates: true, recalculated: false, dominant: "output", dominantUsd: 1.2, requests: 3, ...over });
 const page = (over: Record<string, unknown> = {}) => ({ schemaVersion: 1, scope: "turns", entries: [entry()],
   coverage: { scanned: 10, priced: 8, unpriced: 1, withoutUsage: 1, truncated: false, pricedTotalUsd: 12.25 }, ...over });
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
@@ -23,6 +23,21 @@ describe("expensive work rankings", () => {
     expect(coverage).toHaveTextContent("$12.25 total across all priced turns");
     expect(coverage).toHaveTextContent("1 reported usage with no applicable rate");
     expect(coverage).toHaveTextContent("1 reported no usage at all");
+  });
+
+  it("explains cost with the measured dominant category and request volume", async () => {
+    vi.mocked(api).mockResolvedValue(page() as never);
+    render(<RemoteAgentRankings projectId="project-a" onOpenSession={vi.fn()} />);
+    const list = await screen.findByRole("list", { name: "Most expensive work" });
+    expect(list).toHaveTextContent("Mostly output ($1.20 of $1.50) · 3 priced requests");
+  });
+
+  it("says drivers are unavailable rather than inventing a cause", async () => {
+    vi.mocked(api).mockResolvedValue(page({ entries: [entry({ dominant: null, dominantUsd: 0, requests: 0 })] }) as never);
+    render(<RemoteAgentRankings projectId="project-a" onOpenSession={vi.fn()} />);
+    const list = await screen.findByRole("list", { name: "Most expensive work" });
+    expect(list).toHaveTextContent("Cost drivers unavailable · 0 priced requests");
+    expect(list).not.toHaveTextContent("Mostly");
   });
 
   it("says when the scan was cut instead of implying the ranking is complete", async () => {

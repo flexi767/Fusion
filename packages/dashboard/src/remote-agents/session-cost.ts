@@ -90,6 +90,63 @@ export function sessionCostBadge(session: ExternalSessionView, settings?: Pricin
   return { estimatedUsd, partialUsd, usageComplete, unpricedRecords, basis };
 }
 
+
+/*
+FNXC:ExternalSessionDrivers 2026-09-24-01:44:
+Why work was expensive, from measured counts and the rates actually applied — never a narrative guess. Each
+category charge is the reported token count for that category times the rate used to price it, and the
+categories are disjoint by construction in priceUsage (input excludes cached and cache-write; cacheWrite
+excludes the one-hour portion), so they sum to the record's own total. A test pins that sum, because a driver
+breakdown that does not reconcile with the total is worse than none: it looks like an explanation.
+
+Only priced records contribute. An unpriced record cannot say what drove its cost, so it is counted and
+reported as unexplained rather than folded in at zero.
+*/
+export type CostCategory = "freshInput" | "cachedInput" | "cacheWrite" | "cacheWriteHour" | "output";
+
+export interface CostDrivers {
+  /** Priced requests behind this figure: the measured request volume. */
+  requests: number;
+  /** Requests that could not be priced and therefore explain nothing. */
+  unexplained: number;
+  charges: Record<CostCategory, number>;
+  /** Largest category by charge, or null when nothing priced. */
+  dominant: CostCategory | null;
+  dominantUsd: number;
+  totalUsd: number;
+}
+
+const CATEGORY_RATE: Record<CostCategory, { count: keyof RemoteUsage; rate: string }> = {
+  freshInput: { count: "input", rate: "inputPer1M" },
+  cachedInput: { count: "cached", rate: "cacheReadPer1M" },
+  cacheWrite: { count: "cacheWrite", rate: "cacheWritePer1M" },
+  cacheWriteHour: { count: "cacheWriteHour", rate: "cacheWriteHourPer1M" },
+  output: { count: "output", rate: "outputPer1M" },
+};
+
+export function costDrivers(usage: RemoteUsage[]): CostDrivers {
+  const charges: Record<CostCategory, number> = { freshInput: 0, cachedInput: 0, cacheWrite: 0, cacheWriteHour: 0, output: 0 };
+  let requests = 0;
+  let unexplained = 0;
+  let totalUsd = 0;
+  for (const record of usage) {
+    if (record.usd === null || !record.rates) { unexplained += 1; continue; }
+    requests += 1;
+    totalUsd += record.usd;
+    for (const [category, { count, rate }] of Object.entries(CATEGORY_RATE) as [CostCategory, { count: keyof RemoteUsage; rate: string }][]) {
+      const tokens = record[count];
+      const perMillion = (record.rates as unknown as Record<string, number | null>)[rate];
+      if (typeof tokens === "number" && typeof perMillion === "number") charges[category] += (tokens * perMillion) / 1_000_000;
+    }
+  }
+  let dominant: CostCategory | null = null;
+  let dominantUsd = 0;
+  for (const [category, amount] of Object.entries(charges) as [CostCategory, number][]) {
+    if (amount > dominantUsd) { dominant = category; dominantUsd = amount; }
+  }
+  return { requests, unexplained, charges, dominant, dominantUsd, totalUsd };
+}
+
 /*
 FNXC:ExternalSessionUsage 2026-09-23-23:24: A turn is priced from its OWN measured requests, through the same
 priceUsage the session total uses, so a turn and its session can never disagree about a rate. A turn with no
@@ -105,6 +162,7 @@ export interface TurnCostSummary {
   contextTokens: number | null;
   contextCapacity: number | null;
   basis: PricingBasis;
+  drivers: CostDrivers;
 }
 
 interface TurnLike {
@@ -123,9 +181,10 @@ export function summarizeTurnCost(turn: TurnLike, provider: string, settings?: P
   them as the override map reuses the one pricing seam; nothing else re-implements a rate lookup.
   */
   const recorded = turn.pricing?.rates && Object.keys(turn.pricing.rates).length ? turn.pricing : undefined;
-  const priced = raw
+  const allPriced = raw
     .map(entry => priceUsage(entry, pricingProviderFor(provider), recorded ? recorded.rates : settings?.modelPricingOverrides))
-    .filter((entry): entry is RemoteUsage => entry !== null && entry.usd !== null);
+    .filter((entry): entry is RemoteUsage => entry !== null);
+  const priced = allPriced.filter(entry => entry.usd !== null);
   const total = priced.reduce((sum, entry) => sum + entry.usd!, 0);
   const complete = turn.usageComplete !== false && raw.length > 0 && priced.length === raw.length;
   return {
@@ -138,5 +197,6 @@ export function summarizeTurnCost(turn: TurnLike, provider: string, settings?: P
     basis: recorded
       ? { asOf: recorded.asOf, source: recorded.source, recalculated: false, recorded: true }
       : pricingBasis(settings, activityAt),
+    drivers: costDrivers(allPriced),
   };
 }
