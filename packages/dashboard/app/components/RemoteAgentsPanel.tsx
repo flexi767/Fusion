@@ -13,10 +13,11 @@ type HostHealth = {
   hostId: string; collectorConnected: boolean; collectorVersion?: string | null; heartbeatAgeMs?: number | null;
   spoolDepth?: number | null; spoolBytes?: number | null; parseFailures?: number | null; deliveryFailures?: number | null;
 };
-type CostBadge = { estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; unpricedRecords: number };
+type PricingBasis = { asOf: string; source: string; recalculated: boolean };
+type CostBadge = { estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; unpricedRecords: number; basis?: PricingBasis };
 /** The list route attaches a priced badge to every session; older servers may not, so it stays optional. */
 type ListedSession = ExternalSessionView & { cost?: CostBadge };
-type Cost = { usage: RemoteUsage[]; estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; pricingDate: string; pricingSource: string };
+type Cost = { usage: RemoteUsage[]; estimatedUsd: number | null; partialUsd: number | null; usageComplete: boolean; pricingDate: string; pricingSource: string; pricingRecalculated?: boolean };
 const number = (n: number) => n.toLocaleString();
 const usd = (n: number | null) => n === null ? "Unavailable" : new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(n);
 const tokenPrice = (perMillion: number) => `$${(perMillion / 1_000_000).toFixed(9)}`;
@@ -56,9 +57,15 @@ function failureLabel(host: HostHealth): string {
   return parts.length ? parts.join(" · ") : "No failures reported";
 }
 
+/*
+FNXC:ExternalSessionRates 2026-09-24-00:04: Fusion keeps no rate history, so a figure for work older than the
+rate basis is a recalculation at today's rates, not what it was billed. Saying "estimated" there would present
+a recomputation as a measurement, so those rows say so outright.
+*/
 function costLabel(cost?: CostBadge): string {
   if (!cost) return "Cost unavailable";
-  if (cost.estimatedUsd !== null) return `${usd(cost.estimatedUsd)} estimated`;
+  const qualifier = cost.basis?.recalculated ? "at today's rates" : "estimated";
+  if (cost.estimatedUsd !== null) return `${usd(cost.estimatedUsd)} ${qualifier}`;
   if (cost.partialUsd !== null) return `${usd(cost.partialUsd)} priced so far · ${cost.unpricedRecords} ${cost.unpricedRecords === 1 ? "record" : "records"} unpriced`;
   return cost.unpricedRecords ? `Cost unknown · ${cost.unpricedRecords} ${cost.unpricedRecords === 1 ? "record" : "records"} unpriced` : "No usage reported";
 }
@@ -171,6 +178,7 @@ function RemoteAgentDetail({ session, projectId }: { session: ExternalSessionVie
         {u.reason && <p>{u.reason}</p>}
       </section>)}
       <p className="remote-agent-meta">Fusion pricing baseline: {cost.pricingDate} · {cost.pricingSource}. Estimates are based on reported tokens and rates, rather than a provider bill.</p>
+      {cost.pricingRecalculated && <p className="remote-agent-meta">This session ran before that pricing baseline. Fusion keeps no historical rate table, so these figures are a recalculation at the current rates, not the rates in effect at the time.</p>}
     </>}
     <h4>Feedback to this agent</h4>
     <p className="remote-agent-meta">Queued feedback expires after five minutes and enters the agent’s next native hook. Delivered means context was emitted by that hook.</p>

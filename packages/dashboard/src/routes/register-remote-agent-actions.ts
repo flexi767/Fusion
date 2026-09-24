@@ -1,4 +1,4 @@
-import { ExternalSessionReader, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackSubmitSchema, externalSessionReadId, pricingAsOf } from "@fusion/core";
+import { ExternalSessionReader, ExternalSessionFeedback, ExternalFeedbackConflict, feedbackSubmitSchema, externalSessionReadId } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import { summarizeSessionCost } from "../remote-agents/session-cost.js";
 import type { ApiRouteRegistrar } from "./types.js";
@@ -30,9 +30,10 @@ export const registerRemoteAgentActions: ApiRouteRegistrar = ctx => {
   ctx.router.get("/external-sessions/:id/cost", async (req, res) => {
     const { session, store } = await resolve(req);
     const settings = await store.getGlobalSettingsStore().getSettings();
-    const summary = summarizeSessionCost(session, settings.modelPricingOverrides);
+    const summary = summarizeSessionCost(session, settings);
     res.json({ usage: summary.usage, estimatedUsd: summary.estimatedUsd, partialUsd: summary.partialUsd,
-      usageComplete: summary.usageComplete, pricingDate: settings.modelPricingFetchedAt ?? pricingAsOf, pricingSource: settings.modelPricingSource ?? "Fusion model pricing" });
+      usageComplete: summary.usageComplete, pricingDate: summary.basis.asOf, pricingSource: summary.basis.source,
+      pricingRecalculated: summary.basis.recalculated });
   });
   ctx.router.get("/external-sessions/:id/feedback", async (req, res) => {
     const { layer, projectId, session } = await resolve(req);

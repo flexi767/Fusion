@@ -150,6 +150,24 @@ describe("standalone remote agents", () => {
     expect(m5).not.toHaveTextContent("Spool empty");
   });
 
+  it("says a historical session's cost is at today's rates rather than calling it an estimate", async () => {
+    const recalculated = { ...fixture, id: "9".repeat(64), observation: { ...fixture.observation, title: "Old session" },
+      cost: { estimatedUsd: 2, partialUsd: 2, usageComplete: true, unpricedRecords: 0, basis: { asOf: "2026-07-16", source: "Fusion", recalculated: true } } };
+    const current = { ...fixture, id: "8".repeat(64), observation: { ...fixture.observation, title: "Recent session" },
+      cost: { estimatedUsd: 3, partialUsd: 3, usageComplete: true, unpricedRecords: 0, basis: { asOf: "2026-07-16", source: "Fusion", recalculated: false } } };
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.includes("/hosts")) return { hosts: [] } as never;
+      if (path.includes("/turns")) return { schemaVersion: 1, turns: [], nextCursor: null } as never;
+      return { sessions: [recalculated, current], nextCursor: null } as never;
+    });
+    render(<RemoteAgentsPanel projectId="project-a" />);
+    const row = async (title: string) => (await screen.findByText(title)).closest("button")!;
+    // Presenting a recomputation as an estimate would read as what the work actually cost.
+    expect(await row("Old session")).toHaveTextContent("at today's rates");
+    expect(await row("Old session")).not.toHaveTextContent("estimated");
+    expect(await row("Recent session")).toHaveTextContent("$3.00 estimated");
+  });
+
   it("surfaces monitoring errors instead of showing an empty success state", async () => {
     vi.mocked(api).mockRejectedValue(new Error("Collector storage unavailable"));
     render(<RemoteAgentsPanel projectId="project-a" />);

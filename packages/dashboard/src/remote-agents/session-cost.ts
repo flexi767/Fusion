@@ -1,4 +1,4 @@
-import type { ExternalSessionView, ModelPricingOverrides } from "@fusion/core";
+import { pricingAsOf, type ExternalSessionView, type ModelPricingOverrides } from "@fusion/core";
 import { priceUsage } from "./pricing.js";
 import type { RemoteUsage } from "./types.js";
 
@@ -19,6 +19,8 @@ export interface SessionCostSummary {
   usageComplete: boolean;
   /** Reported usage records that carry no applicable rate. Non-zero means estimatedUsd is deliberately null. */
   unpricedRecords: number;
+  /** What the figure was computed on, and whether the work predates those rates. */
+  basis: PricingBasis;
 }
 
 /** Collectors report a runtime name; Fusion's catalog is keyed by provider. Unmapped names stay unpriced. */
@@ -26,10 +28,10 @@ export function pricingProviderFor(provider: string): string {
   return provider === "claude" ? "claude_code" : provider === "codex" ? "codex_cli" : provider;
 }
 
-export function summarizeSessionCost(session: ExternalSessionView, overrides?: ModelPricingOverrides): SessionCostSummary {
+export function summarizeSessionCost(session: ExternalSessionView, settings?: PricingSettings): SessionCostSummary {
   const raw = session.observation.usage ?? [];
   const usage = raw
-    .map(entry => priceUsage(entry, pricingProviderFor(session.provider), overrides))
+    .map(entry => priceUsage(entry, pricingProviderFor(session.provider), settings?.modelPricingOverrides))
     .filter((entry): entry is RemoteUsage => entry !== null);
   const priced = usage.filter(entry => entry.usd !== null);
   const total = priced.reduce((sum, entry) => sum + entry.usd!, 0);
@@ -41,15 +43,49 @@ export function summarizeSessionCost(session: ExternalSessionView, overrides?: M
     partialUsd: priced.length ? total : null,
     usageComplete: session.observation.usageComplete === true,
     unpricedRecords: raw.length - priced.length,
+    basis: pricingBasis(settings, session.observation.observedAt),
   };
+}
+
+
+/*
+FNXC:ExternalSessionRates 2026-09-24-00:04:
+Fusion's catalog is a single current baseline with one `pricingAsOf` date; neither it nor the operator
+overrides carry per-rate effective dates, so there is NO record of what a model cost in the past. A figure for
+an old session is therefore a recalculation at today's rates, not what that work was billed.
+
+Rather than invent a rate history, every cost states the basis it was computed on and whether the work
+predates it. `recalculated` is true only when the activity is older than the basis date, which is exactly the
+case where presenting the number as "the cost" would be false.
+*/
+export interface PricingBasis {
+  asOf: string;
+  source: string;
+  recalculated: boolean;
+}
+
+export interface PricingSettings {
+  modelPricingFetchedAt?: string | null;
+  modelPricingSource?: string | null;
+  modelPricingOverrides?: ModelPricingOverrides;
+}
+
+export function pricingBasis(settings: PricingSettings | undefined, activityAt?: string | null): PricingBasis {
+  const asOf = settings?.modelPricingFetchedAt || pricingAsOf;
+  const source = settings?.modelPricingSource || "Fusion model pricing";
+  const activity = activityAt === undefined || activityAt === null ? NaN : Date.parse(activityAt);
+  const basisAt = Date.parse(asOf);
+  // Unknown activity time cannot be proven older, so it is not claimed to be a recalculation.
+  const recalculated = Number.isFinite(activity) && Number.isFinite(basisAt) && activity < basisAt;
+  return { asOf, source, recalculated };
 }
 
 /** The list card needs the totals, not the per-model breakdown; keep the list response small. */
 export type SessionCostBadge = Omit<SessionCostSummary, "usage">;
 
-export function sessionCostBadge(session: ExternalSessionView, overrides?: ModelPricingOverrides): SessionCostBadge {
-  const { estimatedUsd, partialUsd, usageComplete, unpricedRecords } = summarizeSessionCost(session, overrides);
-  return { estimatedUsd, partialUsd, usageComplete, unpricedRecords };
+export function sessionCostBadge(session: ExternalSessionView, settings?: PricingSettings): SessionCostBadge {
+  const { estimatedUsd, partialUsd, usageComplete, unpricedRecords, basis } = summarizeSessionCost(session, settings);
+  return { estimatedUsd, partialUsd, usageComplete, unpricedRecords, basis };
 }
 
 /*
@@ -66,6 +102,7 @@ export interface TurnCostSummary {
   /** Null when the provider reported no context size for this turn. */
   contextTokens: number | null;
   contextCapacity: number | null;
+  basis: PricingBasis;
 }
 
 interface TurnLike {
@@ -75,10 +112,10 @@ interface TurnLike {
   contextCapacity?: number | null;
 }
 
-export function summarizeTurnCost(turn: TurnLike, provider: string, overrides?: ModelPricingOverrides): TurnCostSummary {
+export function summarizeTurnCost(turn: TurnLike, provider: string, settings?: PricingSettings, activityAt?: string | null): TurnCostSummary {
   const raw = turn.usage ?? [];
   const priced = raw
-    .map(entry => priceUsage(entry, pricingProviderFor(provider), overrides))
+    .map(entry => priceUsage(entry, pricingProviderFor(provider), settings?.modelPricingOverrides))
     .filter((entry): entry is RemoteUsage => entry !== null && entry.usd !== null);
   const total = priced.reduce((sum, entry) => sum + entry.usd!, 0);
   const complete = turn.usageComplete !== false && raw.length > 0 && priced.length === raw.length;
@@ -89,5 +126,6 @@ export function summarizeTurnCost(turn: TurnLike, provider: string, overrides?: 
     usageComplete: turn.usageComplete !== false,
     contextTokens: turn.contextTokens ?? null,
     contextCapacity: turn.contextCapacity ?? null,
+    basis: pricingBasis(settings, activityAt),
   };
 }

@@ -40,7 +40,7 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
     */
     const page = await new ExternalSessionReader(layer, projectId).list(query.data);
     const settings = await store.getGlobalSettingsStore().getSettings();
-    res.json({ ...page, sessions: page.sessions.map(session => ({ ...session, cost: sessionCostBadge(session, settings.modelPricingOverrides) })) });
+    res.json({ ...page, sessions: page.sessions.map(session => ({ ...session, cost: sessionCostBadge(session, settings) })) });
   });
   /*
   FNXC:ExternalSessionSearch 2026-09-23-23:05: Registered BEFORE "/external-sessions/:id" on purpose; Express
@@ -85,15 +85,15 @@ export const registerExternalSessionRoutes: ApiRouteRegistrar = ctx => {
       /* FNXC:ExternalSessionUsage 2026-09-23-23:24: Pricing is additive to turn history, so a failure to resolve
          the session or the rate table leaves turns UNPRICED rather than making the history itself unavailable. */
       let session: { provider: string } | null = null;
-      let overrides: Parameters<typeof summarizeTurnCost>[2];
+      let settings: Parameters<typeof summarizeTurnCost>[2];
       try {
         session = await new ExternalSessionReader(layer, projectId).get(id.data as string);
-        overrides = (await store.getGlobalSettingsStore().getSettings()).modelPricingOverrides;
+        settings = await store.getGlobalSettingsStore().getSettings();
       } catch { session = null; }
       /* FNXC:ExternalSessionUsage 2026-09-23-23:24: Priced here rather than in core so turns reuse the dashboard's
          single pricing seam; a session that vanished mid-read leaves turns unpriced instead of guessing a provider. */
       return { ...page, turns: page.turns.map(turn => ({ ...turn,
-        cost: session ? summarizeTurnCost(turn, session.provider, overrides) : null })) };
+        cost: session ? summarizeTurnCost(turn, session.provider, settings, (turn.endedAt ?? turn.startedAt) as string | null) : null })) };
     };
     try { res.json(await priceTurns(await new ExternalSessionTurnReader(layer, projectId).list(id.data,
       { ...(limit === undefined ? {} : { limit: Number(limit) }), ...(req.query.cursor === undefined ? {} : { cursor: req.query.cursor }) }) as never)); }
