@@ -213,6 +213,13 @@ describe("ProviderIcon", () => {
     expect(screen.getByLabelText("Ollama")).toBeInTheDocument();
   });
 
+  // FN-9340 put Meta (Muse) in both static auth catalogs with no mark, so it rendered as the unknown-provider Cpu.
+  it("renders Meta brand icon for meta provider", () => {
+    render(<ProviderIcon provider="meta" />);
+    expect(screen.getByTestId("meta-icon")).toBeInTheDocument();
+    expect(screen.getByLabelText("Meta (Muse)")).toBeInTheDocument();
+  });
+
   it("renders llama.cpp aliases as the intentional non-Lucide-Cpu mark", () => {
     const { rerender } = render(<ProviderIcon provider="llama-cpp" />);
     expect(isNonCpuMark(screen.getByTestId("llama-cpp-icon"))).toBe(true);

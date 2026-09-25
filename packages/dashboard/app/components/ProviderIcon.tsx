@@ -46,6 +46,28 @@ function TavilyIcon({ size, color, label = "Tavily" }: { size: number; color: st
   );
 }
 
+/*
+FNXC:ProviderIcon 2026-09-25-08:56:
+FN-9340 added Meta (Muse) to both static auth catalogs without a mark, so every Authentication and onboarding
+surface rendered it as the unknown-provider Cpu. The FN-8488 catalog-completeness ratchet is what caught it:
+adding a first-class catalog ID without a brand mark fails closed by design.
+
+The mark is the Meta loop drawn as a single stroked path, so it stays legible at the compact card sizes where a
+filled two-tone mark would smudge.
+*/
+function MetaIcon({ size, color, label = "Meta (Muse)" }: { size: number; color: string; label?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" data-testid="meta-icon" aria-label={label}>
+      <path
+        d="M3 14.5c0-3.6 1.9-7 4.3-7 1.9 0 3.1 1.6 4.7 4.3 1.6-2.7 2.8-4.3 4.7-4.3 2.4 0 4.3 3.4 4.3 7 0 2-1 3.2-2.6 3.2-1.9 0-3-1.8-4.6-4.6L12 11.8l-1.8 1.3C8.6 15.9 7.5 17.7 5.6 17.7 4 17.7 3 16.5 3 14.5Z"
+        stroke={color}
+        strokeWidth="1.7"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export interface ProviderIconProps {
   provider: string;
   size?: "sm" | "md" | "lg";
@@ -895,6 +917,7 @@ const providerConfig: Record<
   */
   brave: { component: BraveIcon, color: "var(--provider-brave)", label: "Brave Search" },
   tavily: { component: TavilyIcon, color: "var(--provider-tavily)", label: "Tavily" },
+  meta: { component: MetaIcon, color: "var(--provider-meta)", label: "Meta (Muse)" },
 
   minimax: { component: MiniMaxIcon, color: "var(--provider-minimax)" },
   "minimax-cn": { component: MiniMaxIcon, color: "var(--provider-minimax)", label: "MiniMax (CN)" },
