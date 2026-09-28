@@ -81,5 +81,25 @@ class SanitizeTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ['in.jsonl'])
 
 
+class RealFixtureTests(unittest.TestCase):
+    """Sanitized real transcripts: every committed fixture must stay structure-only and parse."""
+
+    def test_every_fixture_is_structure_only(self):
+        fixtures = sorted(HERE.glob('*.jsonl'))
+        self.assertTrue(fixtures)
+        for path in fixtures:
+            with self.subTest(path.name):
+                for line in path.read_text().splitlines():
+                    validate(json.loads(line))
+
+    def test_claude_native_duration(self):
+        state, turns = {}, {}
+        for line in (HERE / 'claude-resumed-native-duration.jsonl').read_text().splitlines():
+            turn = consume_claude(state, json.loads(line))
+            if turn:
+                turns[turn['nativeTurnId']] = turn
+        self.assertEqual([(t['state'], t['durationSource']) for t in turns.values()], [('completed', 'native')])
+
+
 if __name__ == '__main__':
     unittest.main()
