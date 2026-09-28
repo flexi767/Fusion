@@ -12,6 +12,12 @@ keep only their line markers so added/removed counts stay exact.
 `validate()` is the gate: a fixture containing any string outside the placeholder grammar or
 the enum allowlist is rejected, so a new provider field cannot silently leak text.
 
+FNXC:RemoteAgentFixtures 2026-09-28-04:58:
+A real Claude window failed validation on a timestamp earlier than the window's first event
+(shifted before FIXTURE_EPOCH), and left a partial output file behind. Shifted timestamps only
+carry relative timing, so any well-formed shifted time is accepted; output is written to a
+temporary file and renamed only when every line validates, so a failure leaves no file.
+
 Usage: sanitize_transcript.py PROVIDER INPUT.jsonl OUTPUT.jsonl [--head N] [--start N] [--limit N]
 Runs anywhere Python 3 runs; sanitize on the host that owns the transcript so raw text never
 leaves it.
@@ -19,6 +25,7 @@ leaves it.
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
 
@@ -60,7 +67,8 @@ PLACEHOLDER = re.compile(
     r'lorem ipsum dolor sit|lorem ipsum dolor sit amet)?)$'
 )
 DIFF_LINE = re.compile(r'^(@@ -\d+(,\d+)? \+\d+(,\d+)? @@|[+\- ]x?|(\+\+\+|---) x|\\ x|x?)$')
-FIXTURE_TIME = re.compile(r'^2026-0[1-9]-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$')
+# Shifted times reveal only offsets from the first event, so any year is structure.
+FIXTURE_TIME = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
 
 
 class Sanitizer:
@@ -182,23 +190,32 @@ def sanitize_file(provider, source, target, start=0, limit=None, head=0):
     """`head` keeps the first N lines (e.g. Codex session_meta) before the `start` window."""
     if provider not in ('codex', 'claude'):
         raise ValueError('provider must be codex or claude')
-    sanitizer, written = Sanitizer(), 0
-    with open(source, errors='replace') as fh, open(target, 'w') as out:
-        for index, line in enumerate(fh):
-            if head <= index < start:
-                continue
-            if limit is not None and written >= limit + min(head, start):
-                break
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            clean = sanitizer.mapping(event)
-            validate(clean)
-            out.write(json.dumps(clean, sort_keys=True, separators=(',', ':')) + '\n')
-            written += 1
+    sanitizer, written, partial = Sanitizer(), 0, f'{target}.partial'
+    try:
+        with open(source, errors='replace') as fh, open(partial, 'w') as out:
+            for index, line in enumerate(fh):
+                if head <= index < start:
+                    continue
+                if limit is not None and written >= limit + min(head, start):
+                    break
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                clean = sanitizer.mapping(event)
+                try:
+                    validate(clean)
+                except ValueError as error:
+                    raise ValueError(f'source line {index + 1}: {error}') from None
+                out.write(json.dumps(clean, sort_keys=True, separators=(',', ':')) + '\n')
+                written += 1
+        os.replace(partial, target)
+    except BaseException:
+        if os.path.exists(partial):
+            os.unlink(partial)
+        raise
     return written
 
 

@@ -61,6 +61,25 @@ class SanitizeTests(unittest.TestCase):
             types = [json.loads(line)['type'] for line in target.read_text().splitlines()]
         self.assertEqual(types, ['session_meta', 'event_msg', 'event_msg'])
 
+    def test_event_older_than_window_start_is_kept(self):
+        lines = [dict(type='user', timestamp='2026-09-22T12:00:00Z', message=dict(content='a')),
+                 dict(type='user', timestamp='2026-09-22T11:59:00Z', message=dict(content='b'))]
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'in.jsonl', Path(directory) / 'out.jsonl'
+            source.write_text(''.join(json.dumps(e) + '\n' for e in lines))
+            self.assertEqual(sanitize_file('claude', source, target), 2)
+            times = [json.loads(line)['timestamp'] for line in target.read_text().splitlines()]
+        self.assertEqual(times, ['2026-01-01T00:00:00.000Z', '2025-12-31T23:59:00.000Z'])
+
+    def test_validation_failure_leaves_no_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'in.jsonl', Path(directory) / 'out.jsonl'
+            source.write_text(json.dumps(dict(type='user', timestamp='2026-09-22T12:00:00Z')) + '\n' +
+                              json.dumps({'free text key': 1}) + '\n')
+            with self.assertRaisesRegex(ValueError, 'source line 2'):
+                sanitize_file('claude', source, target)
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ['in.jsonl'])
+
 
 if __name__ == '__main__':
     unittest.main()
