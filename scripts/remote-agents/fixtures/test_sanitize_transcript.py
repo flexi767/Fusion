@@ -92,13 +92,33 @@ class RealFixtureTests(unittest.TestCase):
                 for line in path.read_text().splitlines():
                     validate(json.loads(line))
 
-    def test_claude_native_duration(self):
+    @staticmethod
+    def turns(name):
         state, turns = {}, {}
-        for line in (HERE / 'claude-resumed-native-duration.jsonl').read_text().splitlines():
+        for line in (HERE / name).read_text().splitlines():
             turn = consume_claude(state, json.loads(line))
             if turn:
                 turns[turn['nativeTurnId']] = turn
-        self.assertEqual([(t['state'], t['durationSource']) for t in turns.values()], [('completed', 'native')])
+        return list(turns.values())
+
+    def test_claude_native_duration(self):
+        turns = self.turns('claude-resumed-native-duration.jsonl')
+        self.assertEqual([(t['state'], t['durationSource']) for t in turns], [('completed', 'native')])
+
+    def test_claude_compaction_with_edits(self):
+        name = 'claude-compaction-edits.jsonl'
+        events = [json.loads(line) for line in (HERE / name).read_text().splitlines()]
+        self.assertEqual((sum(e.get('subtype') == 'compact_boundary' for e in events),
+                          sum(bool(e.get('isCompactSummary')) for e in events)), (5, 5))
+        changes = [c for t in self.turns(name) for c in t['fileChanges']]
+        self.assertEqual((len(changes), sum(c['addedLines'] for c in changes), sum(c['removedLines'] for c in changes)),
+                         (8, 28, 13))
+
+
+class McpNameTests(unittest.TestCase):
+    def test_server_segment_is_replaced(self):
+        clean = Sanitizer().mapping(dict(type='tool_use', name='mcp__postgres-prod__query'))
+        self.assertEqual(clean['name'], 'mcp__server-1__query')
 
 
 if __name__ == '__main__':

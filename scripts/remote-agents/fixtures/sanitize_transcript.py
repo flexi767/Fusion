@@ -18,6 +18,10 @@ A real Claude window failed validation on a timestamp earlier than the window's 
 carry relative timing, so any well-formed shifted time is accepted; output is written to a
 temporary file and renamed only when every line validates, so a failure leaves no file.
 
+FNXC:RemoteAgentFixtures 2026-09-29-08:05:
+MCP tool names carry the operator's local server name (e.g. a production database alias), so the
+server segment becomes a stable `server-N` surrogate while the tool segment stays readable.
+
 Usage: sanitize_transcript.py PROVIDER INPUT.jsonl OUTPUT.jsonl [--head N] [--start N] [--limit N]
 Runs anywhere Python 3 runs; sanitize on the host that owns the transcript so raw text never
 leaves it.
@@ -140,7 +144,9 @@ class Sanitizer:
         if key in PATH_KEYS:
             return self.path(value)
         if key == 'name' and parent_type in TOOL_TYPES and ENUM_VALUE.match(value):
-            return value
+            # MCP tool names embed the operator's server name: mcp__<server>__<tool>.
+            mcp = re.match(r'^mcp__(.+)__([^_].*)$', value)
+            return f'mcp__server-{self.surrogate("mcp:" + mcp.group(1))[3:]}__{mcp.group(2)}' if mcp else value
         if key in DIFF_KEYS:
             return self.diff(value)
         if key == 'model' and MODEL_VALUE.match(value):
