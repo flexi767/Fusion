@@ -121,6 +121,23 @@ class ClaudeTurnTests(unittest.TestCase):
         next_prompt = consume_claude(state, event(6, 'user', uuid='prompt-b', message=dict(content='Next')))
         self.assertEqual((next_prompt['nativeTurnId'], next_prompt['ordinal']), ('prompt-b', 1))
 
+    def test_message_from_another_session_starts_its_own_turn(self):
+        state = {}
+        def event(second, kind, **extra):
+            return dict(timestamp=f'2026-09-22T12:00:{second:02d}Z', type=kind, **extra)
+        consume_claude(state, event(0, 'user', uuid='prompt-a', message=dict(content='First')))
+        consume_claude(state, event(1, 'assistant', message=dict(content=[dict(type='text', text='One')], stop_reason='end_turn')))
+        # Host context injected as meta is not a prompt.
+        self.assertIsNone(consume_claude(state, event(2, 'user', isMeta=True, message=dict(content='Reminder'))))
+        peer = consume_claude(state, event(3, 'user', uuid='prompt-b', isMeta=True, origin=dict(kind='peer', **{'from': 'other'}),
+                                           message=dict(content='Another session sent a message: check it')))
+        self.assertEqual((peer['nativeTurnId'], peer['ordinal'], peer['prompts'][0]['text']),
+                         ('prompt-b', 1, 'Another session sent a message: check it'))
+        consume_claude(state, event(4, 'assistant', message=dict(content=[dict(type='tool_use', id='bash-1', name='Bash', input={})])))
+        done = consume_claude(state, event(5, 'assistant', message=dict(content=[dict(type='text', text='Two')], stop_reason='end_turn')))
+        self.assertEqual((done['nativeTurnId'], done['toolCallCount'], done['response'], done['endedAt']),
+                         ('prompt-b', 1, 'Two', '2026-09-22T12:00:05Z'))
+
     def test_unreported_patch_and_duplicate_tool_call(self):
         state = {}
         consume_claude(state, dict(timestamp='2026-09-22T12:00:00Z', type='user', uuid='a', message=dict(content='Write')))

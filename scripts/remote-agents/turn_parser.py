@@ -199,7 +199,12 @@ def consume_claude(state, event):
     blocks = message.get('content')
     blocks = blocks if isinstance(blocks, list) else []
     turn = state.get('turn')
-    if kind == 'user' and not event.get('isMeta'):
+    # FNXC:RemoteAgents 2026-10-04-19:30: a message from another Claude session is written as an isMeta user
+    # record with origin.kind 'peer', yet it starts a real turn. Skipping it as host context merged that turn's
+    # tools and answer into the previous one, which kept its old endedAt. Other meta records stay non-prompts.
+    origin = event.get('origin')
+    peer = isinstance(origin, dict) and origin.get('kind') == 'peer'
+    if kind == 'user' and (not event.get('isMeta') or peer):
         prompt = content(message.get('content'))
         if prompt:
             if not turn or turn['state'] != 'ongoing':
