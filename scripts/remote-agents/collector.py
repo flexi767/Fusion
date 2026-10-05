@@ -360,6 +360,7 @@ def scan(db, path, provider):
         raw = b''
     end = raw.rfind(b'\n') + 1
     parsed = malformed = 0
+    latest = {}
     with db:
         for line in raw[:end].splitlines():
             if len(line) > MAX_LINE:
@@ -379,16 +380,31 @@ def scan(db, path, provider):
             turn = consume_codex(turn_state, event) if provider == 'codex' else consume_claude(turn_state, event) if provider == 'claude' else None
             native = state.get('nativeSessionId')
             if turn and isinstance(native, str):
-                body = json.dumps(turn)
-                if len(body) > 2 * 1024 * 1024:
-                    raise ValueError('Turn exceeds durable spool limit; cursor preserved')
-                capacity = db.execute('SELECT count(*),coalesce(sum(length(body)),0) FROM turns WHERE revision>acked').fetchone()
-                if capacity[0] >= 5000 or capacity[1] + len(body) > 64 * 1024 * 1024:
-                    raise ValueError('Turn delivery spool full; cursor preserved')
-                db.execute('INSERT INTO turns(provider,native,turn_id,revision,body) VALUES (?,?,?,?,?) '
-                           'ON CONFLICT(provider,native,turn_id) DO UPDATE SET revision=excluded.revision,body=excluded.body '
-                           'WHERE excluded.revision>turns.revision',
-                           (provider, native, turn['nativeTurnId'], turn['revision'], body))
+                latest[(native, turn['nativeTurnId'])] = json.dumps(turn)
+        # FNXC:RemoteAgents 2026-10-05-17:30: the parser numbers a turn's revisions from 1 on every pass, so a rescan
+        # of a rewritten transcript that split or shrank a turn produced a lower revision than the one already
+        # delivered, and the spool kept the stale body: merged turns stayed merged (usage counted twice) and
+        # unchanged turns kept old ordinals beside renumbered ones. Each turn's last state in this pass is compared
+        # with the stored one: identical bodies are skipped, so a rescan resends nothing, and a changed body always
+        # gets a revision above the stored one.
+        for (native, turn_id), snapshot in latest.items():
+            turn = json.loads(snapshot)
+            stored = db.execute('SELECT revision,body FROM turns WHERE provider=? AND native=? AND turn_id=?',
+                                (provider, native, turn_id)).fetchone()
+            if stored and json.dumps(dict(turn, revision=stored[0])) == stored[1]:
+                continue
+            if stored:
+                turn['revision'] = max(turn['revision'], stored[0] + 1)
+            body = json.dumps(turn)
+            if len(body) > 2 * 1024 * 1024:
+                raise ValueError('Turn exceeds durable spool limit; cursor preserved')
+            capacity = db.execute('SELECT count(*),coalesce(sum(length(body)),0) FROM turns WHERE revision>acked').fetchone()
+            if capacity[0] >= 5000 or capacity[1] + len(body) > 64 * 1024 * 1024:
+                raise ValueError('Turn delivery spool full; cursor preserved')
+            db.execute('INSERT INTO turns(provider,native,turn_id,revision,body) VALUES (?,?,?,?,?) '
+                       'ON CONFLICT(provider,native,turn_id) DO UPDATE SET revision=excluded.revision,body=excluded.body '
+                       'WHERE excluded.revision>turns.revision',
+                       (provider, native, turn_id, turn['revision'], body))
         offset += end
         # A separate bounded tail keeps activity current while old token history
         # catches up. It never contributes usage, so tail/history cannot double bill.

@@ -170,6 +170,40 @@ class ClaudeTurnTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM turns').fetchone()[0], 1)
             db.close()
 
+    def test_rescan_that_shrinks_a_turn_still_supersedes_the_delivered_revision(self):
+        def event(second, kind, **extra):
+            return dict(type=kind, timestamp=f'2026-09-22T12:00:{second:02d}Z', sessionId='session', cwd='/work', **extra)
+        def tool(second, call_id):
+            return event(second, 'assistant', message=dict(content=[dict(type='tool_use', id=call_id, name='Bash', input={})]))
+        prompt = event(0, 'user', uuid='prompt-a', message=dict(content='Fix the file'))
+        answer = event(9, 'assistant', message=dict(content=[dict(type='text', text='Fixed')], stop_reason='end_turn'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = connect(root / 'spool.sqlite'); bind(db, 'project', 'host')
+            transcript = root / 'session.jsonl'
+            def rewrite(events):
+                replacement = root / 'replacement.jsonl'
+                replacement.write_text(''.join(json.dumps(item) + '\n' for item in events))
+                replacement.replace(transcript)
+            def stored():
+                revision, body = db.execute('SELECT revision,body FROM turns').fetchone()
+                return revision, json.loads(body)
+            rewrite([prompt, tool(1, 'a'), tool(2, 'b'), tool(3, 'c'), answer])
+            scan(db, transcript, 'claude')
+            delivered, body = stored()
+            self.assertEqual((body['toolCallCount'], body['revision']), (3, delivered))
+            db.execute('UPDATE turns SET acked=revision'); db.commit()
+            # The rewritten transcript yields fewer native revisions for the same turn; it must still win.
+            rewrite([prompt, tool(1, 'a'), answer])
+            scan(db, transcript, 'claude')
+            revision, body = stored()
+            self.assertGreater(revision, delivered)
+            self.assertEqual((body['toolCallCount'], body['revision']), (1, revision))
+            # Rescanning identical content changes nothing, so nothing is resent.
+            rewrite([prompt, tool(1, 'a'), answer])
+            scan(db, transcript, 'claude')
+            self.assertEqual(stored()[0], revision)
+            db.close()
+
 
 if __name__ == '__main__':
     unittest.main()
