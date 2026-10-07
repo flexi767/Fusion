@@ -363,4 +363,35 @@ describe("board surfaces resolve column roles per column, not per board", () => 
     fireEvent.click(screen.getByRole("button", { name: "Bulk Edit" }));
     expect(screen.getByRole("checkbox", { name: "Select FN-mapped" })).toBeDisabled();
   });
+
+  /*
+  FNXC:WorkflowResolvedColumns 2026-10-07-15:12:
+  The remap case above also rebuilds the column union, which refreshes the accessor by itself, so it stays
+  green even with taskContextMenuColumnsByTaskId missing from the accessor's dependency list. This is the
+  case that list exists for: the SSE task list delivers a task AFTER its workflow mapping is loaded, so only
+  the per-task map changes. A stale accessor then answers from the cross-workflow union instead of the
+  task's own (archived) workflow and offers Archive where the card's own workflow says Revert.
+  */
+  it("resolves a task's own workflow role when the task arrives after its mapping", async () => {
+    fetchBoardWorkflowsMock.mockImplementation(async () => mappingPayload("workflow-archived"));
+    window.localStorage.setItem(`kb:${PROJECT_ID}:kb-dashboard-board-workflow-selection`, "__all_workflows__");
+    const task = mappingTask();
+    const props = (tasks: Task[]) => ({
+      tasks, projectId: PROJECT_ID,
+      onMoveTask: vi.fn(async () => task), onRetryTask: vi.fn(async () => task), onDeleteTask: vi.fn(async () => task),
+      onMergeTask: vi.fn(async () => ({ merged: false })), onResetTask: vi.fn(async () => task),
+      onDuplicateTask: vi.fn(async () => task), onArchiveTask: vi.fn(async () => task),
+      onRevertTask: vi.fn(async () => ({ reverted: false })), onOpenDetail: vi.fn(), onNewTask: vi.fn(),
+      addToast: vi.fn(), globalPaused: false,
+    });
+    const view = render(createElement(ListView, props([])));
+    await waitFor(() => expect(fetchBoardWorkflowsMock).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+
+    view.rerender(createElement(ListView, props([task])));
+    await screen.findByText("Mapping-sensitive task");
+    fireEvent.contextMenu(document.querySelector("[data-id='FN-mapped']")!, { clientX: 24, clientY: 24 });
+    expect(await screen.findByRole("menuitem", { name: "Revert" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+  });
 });
