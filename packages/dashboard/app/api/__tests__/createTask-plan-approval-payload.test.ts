@@ -36,7 +36,8 @@ describe("createTask plan approval payload", () => {
   it("keeps supported create-time overrides in the explicit API whitelist", () => {
     const source = readFileSync(resolve(__dirname, "../tasks/tasks.ts"), "utf8");
     const start = source.indexOf("export async function createTask(");
-    const end = source.indexOf("/** Update explicit workspace repository intent", start);
+    // Bound by the next top-level export, a code construct, rather than a doc comment that can be reworded away.
+    const end = source.indexOf("\nexport ", start + 1);
     const createTaskSource = source.slice(start, end);
 
     expect(start).toBeGreaterThanOrEqual(0);
