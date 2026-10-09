@@ -204,6 +204,35 @@ class ClaudeTurnTests(unittest.TestCase):
             self.assertEqual(stored()[0], revision)
             db.close()
 
+    def test_rescan_never_makes_a_promptless_placeholder_deliverable(self):
+        def event(second, **payload):
+            return dict(type='event_msg', timestamp=f'2026-09-22T12:00:{second:02d}Z', payload=payload)
+        meta = dict(type='session_meta', timestamp='2026-09-22T12:00:00Z', payload=dict(id='native', cwd='/work'))
+        usage = {'input_tokens': 1000, 'cached_input_tokens': 0, 'cache_write_input_tokens': 0, 'output_tokens': 50,
+                 'reasoning_output_tokens': 0}
+        def usage_record(second, response):
+            return dict(type='token_usage_record', timestamp=f'2026-09-22T12:00:{second:02d}Z',
+                        payload=dict(turn_id='turn-a', response_id=response, usage=usage))
+        # Usage seen before the prompt yields a revision-0 snapshot with no prompts: a placeholder, never deliverable.
+        work = [event(1, type='task_started', turn_id='turn-a'),
+                dict(type='turn_context', timestamp='2026-09-22T12:00:02Z', payload=dict(turn_id='turn-a', model='gpt')),
+                usage_record(3, 'resp-1')]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = connect(root / 'spool.sqlite'); bind(db, 'project', 'host')
+            transcript = root / 'rollout.jsonl'
+            def rewrite(events):
+                replacement = root / 'replacement.jsonl'
+                replacement.write_text(''.join(json.dumps(item) + '\n' for item in events))
+                replacement.replace(transcript)
+            rewrite([meta] + work)
+            scan(db, transcript, 'codex')
+            self.assertEqual(db.execute('SELECT revision FROM turns').fetchone()[0], 0)
+            rewrite([meta] + work + [usage_record(4, 'resp-2')])
+            scan(db, transcript, 'codex')
+            # Still no prompt, so still revision 0: nothing that Fusion's contract would refuse is queued.
+            self.assertEqual(db.execute('SELECT count(*) FROM turns WHERE revision>acked').fetchone()[0], 0)
+            db.close()
+
 
 if __name__ == '__main__':
     unittest.main()

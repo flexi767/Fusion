@@ -386,14 +386,16 @@ def scan(db, path, provider):
         # delivered, and the spool kept the stale body: merged turns stayed merged (usage counted twice) and
         # unchanged turns kept old ordinals beside renumbered ones. Each turn's last state in this pass is compared
         # with the stored one: identical bodies are skipped, so a rescan resends nothing, and a changed body always
-        # gets a revision above the stored one.
+        # gets a revision above the stored one. Revision 0 is the parser's placeholder for a turn whose prompt it
+        # has not seen (Codex usage can precede it); it is never lifted, because a turn without a prompt is refused
+        # by Fusion's contract (lifting them got 290 placeholders on one host rejected on 2026-10-07).
         for (native, turn_id), snapshot in latest.items():
             turn = json.loads(snapshot)
             stored = db.execute('SELECT revision,body FROM turns WHERE provider=? AND native=? AND turn_id=?',
                                 (provider, native, turn_id)).fetchone()
             if stored and json.dumps(dict(turn, revision=stored[0])) == stored[1]:
                 continue
-            if stored:
+            if stored and turn['revision'] >= 1:
                 turn['revision'] = max(turn['revision'], stored[0] + 1)
             body = json.dumps(turn)
             if len(body) > 2 * 1024 * 1024:
