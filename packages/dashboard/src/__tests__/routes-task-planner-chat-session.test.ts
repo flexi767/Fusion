@@ -75,6 +75,12 @@ function buildApp(
     updateSession,
     findLatestActiveSessionForTarget,
     listSessionsPage: vi.fn(async () => ({ total: sessions.length, hasMore: false, nextCursor: null, sessions })),
+    // The common GET /chat/sessions feed reads through listSessions; without it the route answered 500
+    // and the preview-truncation contract below was never reached.
+    listSessions: vi.fn(async (filter: { projectId?: string; status?: string; agentId?: string } = {}) => sessions
+      .filter((session) => !filter.projectId || session.projectId === filter.projectId)
+      .filter((session) => !filter.status || session.status === filter.status)
+      .filter((session) => !filter.agentId || session.agentId === filter.agentId)),
     getLastMessageForSessions: vi.fn(async (ids: string[]) => new Map(
       ids.flatMap((id) => {
         const message = lastMessages.get(id);
