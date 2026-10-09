@@ -81,7 +81,8 @@ describe("task checklist step update route", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(updateStep).toHaveBeenCalledWith("FN-001", 1, "done");
+    // FN-255: a dashboard step edit is an operator override, so it is recorded as one.
+    expect(updateStep).toHaveBeenCalledWith("FN-001", 1, "done", { operatorOverride: true });
     expect((response.body as { steps: Array<{ status: string }> }).steps[1].status).toBe("done");
   });
 
