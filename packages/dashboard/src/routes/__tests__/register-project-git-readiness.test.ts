@@ -191,7 +191,10 @@ describe("POST /api/projects Git readiness", () => {
     await git(upstreamPath, ["add", "README.md"]);
     await git(upstreamPath, ["commit", "-m", "develop"]);
     await git(cloneParent, ["clone", "--branch", "develop", "--single-branch", upstreamPath, currentPath]);
-    await git(currentPath, ["symbolic-ref", "-d", "refs/remotes/origin/HEAD"]);
+    // The scenario needs a clone WITHOUT origin/HEAD. Older git leaves a symbolic origin/HEAD after a
+    // single-branch clone and newer git (2.54) leaves none, so delete it in a way that holds for both.
+    await git(currentPath, ["update-ref", "-d", "refs/remotes/origin/HEAD"]);
+    await expect(git(currentPath, ["show-ref", "--verify", "--quiet", "refs/remotes/origin/HEAD"])).rejects.toBeTruthy();
     await git(currentPath, ["checkout", "--detach", "HEAD"]);
     await git(currentPath, ["branch", "-D", "develop"]);
     const { central } = centralFor();
