@@ -183,7 +183,8 @@ describe("fetchAuthStatus", () => {
     const result = await fetchAuthStatus();
 
     expect(result.providers).toEqual([{ id: "anthropic", name: "Anthropic", authenticated: true }]);
-    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/status", {
+    // FN-9236: auth status names the dashboard origin so it selects the same remote device-code flow as login.
+    expect(globalThis.fetch).toHaveBeenCalledWith(`/api/auth/status?origin=${encodeURIComponent(window.location.origin)}`, {
       headers: API_JSON_HEADERS,
     });
   });
