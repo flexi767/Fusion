@@ -738,7 +738,9 @@ describe("Navigation history integration", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("task-detail-main-panel-content")).toBeTruthy();
-      expect(screen.queryByTestId("board-view")).toBeNull();
+      // FN-270 keeps the visited board mounted inside an aria-hidden keep-alive wrapper; it must just not be shown.
+      const board = screen.queryByTestId("board-view");
+      expect(board === null || board.closest('[aria-hidden="true"]') !== null).toBe(true);
     });
     expect((window.history.pushState as any).mock.calls.length).toBeGreaterThan(pushCallsBefore);
 

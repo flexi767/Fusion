@@ -702,6 +702,18 @@ import { DEFAULT_BOARD_WORKFLOWS } from "./boardWorkflows.test-helpers";
 
 
 
+
+/*
+FN-270 keeps a visited Board/List mounted inside an aria-hidden keep-alive wrapper so it can be restored exactly
+as left. "Not shown" therefore means absent OR hidden there, and text queries must ignore the hidden copy.
+*/
+function isShown(element: Element | null): boolean {
+  return !!element && !element.closest('[aria-hidden="true"]');
+}
+function shownByText(text: string): HTMLElement[] {
+  return screen.queryAllByText(text).filter(isShown);
+}
+
 async function waitForAppShell(): Promise<void> {
   await waitFor(() => {
     expect(fetchSettings).toHaveBeenCalled();
@@ -2125,7 +2137,7 @@ describe("App deep link handling", () => {
     await waitFor(() => {
       expect(screen.queryByText("Nested task")).toBeNull();
       expect(screen.getByTestId("main-panel-task-detail")).toBeTruthy();
-      expect(screen.getByText("Back nav task")).toBeTruthy();
+      expect(shownByText("Back nav task")).toHaveLength(1);
     });
   });
 
@@ -2669,7 +2681,8 @@ describe("App view switching", () => {
       expect(screen.queryByTestId("list-view-body")).toBeTruthy();
     });
 
-    fireEvent.click(screen.getByText("+ New Task"));
+    expect(shownByText("+ New Task")).toHaveLength(1);
+    fireEvent.click(shownByText("+ New Task")[0]!);
 
     // The NewTaskModal should be visible with its header and description field.
     // Scope the title to the modal heading; the left sidebar also renders a "New Task" nav label.
@@ -2935,8 +2948,8 @@ describe("App view switching", () => {
     }, { timeout: 5000 });
 
     // Should NOT show board or list view
-    expect(document.querySelector(".board")).toBeNull();
-    expect(screen.queryByTestId("list-view-body")).toBeNull();
+    expect(isShown(document.querySelector(".board"))).toBe(false);
+    expect(isShown(screen.queryByTestId("list-view-body"))).toBe(false);
   });
 
   it("persists agents view preference to localStorage", async () => {
@@ -3002,8 +3015,8 @@ describe("App view switching", () => {
     expect(await screen.findByTestId("insights-view")).toBeTruthy();
 
     // Should NOT show board, list, or agents view
-    expect(document.querySelector(".board")).toBeNull();
-    expect(screen.queryByTestId("list-view-body")).toBeNull();
+    expect(isShown(document.querySelector(".board"))).toBe(false);
+    expect(isShown(screen.queryByTestId("list-view-body"))).toBe(false);
     expect(document.querySelector(".agents-view")).toBeNull();
   });
 
@@ -3160,7 +3173,7 @@ describe("App view switching", () => {
 
     expect(screen.queryByTitle("Board view")).toBeNull();
     expect(document.querySelector(".insights-view")).toBeNull();
-    expect(document.querySelector(".board")).toBeNull();
+    expect(isShown(document.querySelector(".board"))).toBe(false);
 
     resolveSettings?.({
       ...defaultSettings,
@@ -3171,7 +3184,7 @@ describe("App view switching", () => {
       expect(document.querySelector(".insights-view")).toBeTruthy();
     });
 
-    expect(document.querySelector(".board")).toBeNull();
+    expect(isShown(document.querySelector(".board"))).toBe(false);
     localStorage.removeItem(taskViewStorageKey());
   });
 
@@ -3207,7 +3220,7 @@ describe("App view switching", () => {
       expect(document.querySelector(".memory-view")).toBeTruthy();
     });
 
-    expect(document.querySelector(".board")).toBeNull();
+    expect(isShown(document.querySelector(".board"))).toBe(false);
     localStorage.removeItem(taskViewStorageKey());
   });
 
@@ -3245,7 +3258,7 @@ describe("App view switching", () => {
     });
 
     expect(screen.getByTestId("sidebar-nav-goals")).toBeTruthy();
-    expect(document.querySelector(".board")).toBeNull();
+    expect(isShown(document.querySelector(".board"))).toBe(false);
     localStorage.removeItem(taskViewStorageKey());
   });
 
@@ -4823,8 +4836,8 @@ describe("App board branch filters", () => {
 
     fireEvent.click(screen.getByTestId("sidebar-nav-list"));
     await waitFor(() => {
-      expect(screen.getByText("Alpha Search")).toBeTruthy();
-      expect(screen.getByText("Beta Search")).toBeTruthy();
+      expect(shownByText("Alpha Search")).toHaveLength(1);
+      expect(shownByText("Beta Search")).toHaveLength(1);
     });
   });
 });
