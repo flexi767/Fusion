@@ -239,7 +239,7 @@ pgDescribe("plan approval status persistence", () => {
     }));
   });
 
-  it("rejects an exhausted Plan Review from a split workflow's review column", async () => {
+  it("regenerates an exhausted Plan Review in place in a split workflow's review column", async () => {
     const task = await store.createTask({ description: "Reject split-column review" });
     const splitWorkflow = await store.createWorkflowDefinition({
       name: "Split Plan Review rejection",
@@ -252,9 +252,12 @@ pgDescribe("plan approval status persistence", () => {
       },
     });
     await store.selectTaskWorkflow(task.id, splitWorkflow.id);
-    const intakeColumn = BUILTIN_CODING_WORKFLOW_IR.columns.find((column) =>
-      column.traits.some((trait) => trait.trait === "intake")
-    )!.id;
+    /*
+    FNXC:PlanApproval 2026-10-10-07:10:
+    Operator decision (2026-10-09): keep FN-228's behaviour. Plan Review counts as planning, so rejecting an exhausted
+    review in a split workflow's review column clears the plan and regenerates it in place; the card stays in that
+    column rather than returning to intake. This test previously encoded the FN-8845 move to intake.
+    */
     await store.moveTask(task.id, "in-review", {
       moveSource: "engine",
       recoveryRehome: true,
@@ -279,7 +282,7 @@ pgDescribe("plan approval status persistence", () => {
       const interrupted = await request(createApp(), "POST", `/api/tasks/${task.id}/reject-plan`);
       expect(interrupted.status).toBe(500);
       const partiallyRejected = await store.getTask(task.id);
-      expect(partiallyRejected.column).toBe(intakeColumn);
+      expect(partiallyRejected.column).toBe("in-review");
       expect(partiallyRejected.status).toBe("awaiting-approval");
       expect(partiallyRejected.awaitingApprovalReason).toBe("plan-review-replan-cap");
     } finally {
@@ -290,7 +293,7 @@ pgDescribe("plan approval status persistence", () => {
 
     expect(response.status).toBe(200);
     const persisted = await store.getTask(task.id);
-    expect(persisted.column).toBe(intakeColumn);
+    expect(persisted.column).toBe("in-review");
     expect(persisted.status).toBeUndefined();
   });
 
