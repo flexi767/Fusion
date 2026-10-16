@@ -1461,6 +1461,7 @@ export class InProcessRuntime
             rootDir: this.config.workingDirectory,
             pluginRunner: this.pluginRunner,
             agentStore: this.agentStore,
+            validationEvidenceProvider: this.config.createMissionValidationEvidenceProvider?.(this.taskStore),
           })
         : undefined;
 
@@ -2408,6 +2409,13 @@ export class InProcessRuntime
 
       // 5. Stop heartbeat monitor
       if (this.heartbeatMonitor) {
+        /*
+        FNXC:HeartbeatTerminalBoundary 2026-10-13-02:14:
+        Process shutdown must cancel monitor-owned heartbeat sessions before it
+        drops monitor admission. Persisted run state alone cannot stop a live
+        provider request, so wait for each owner to settle its terminal boundary.
+        */
+        await Promise.allSettled(this.heartbeatMonitor.getTrackedAgents().map((agentId) => this.heartbeatMonitor!.stopRun(agentId)));
         this.heartbeatMonitor.stop();
         runtimeLog.log("HeartbeatMonitor stopped");
       }

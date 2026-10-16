@@ -71,16 +71,7 @@ export type {
   TaskBranchOrigin,
 } from "./branch/branch-assignment.js";
 export { customProviderRegistryKey } from "./ai/custom-provider-key.js";
-export {
-  ANTHROPIC_PROVIDER_ID,
-  ANTHROPIC_API_KEY_PROVIDER_ID,
-  CLAUDE_OPUS_5_5_MODEL_ID,
-  CLAUDE_SONNET_5_5_MODEL_ID,
-  SUPPLEMENTAL_ANTHROPIC_PROVIDER_REGISTRATION,
-  mergeSupplementalAnthropicModels,
-  toExecutionModelProviderId,
-} from "./ai/anthropic-models.js";
-export type { AnthropicModelRegistration, AnthropicProviderRegistration } from "./ai/anthropic-models.js";
+export { ANTHROPIC_PROVIDER_ID, ANTHROPIC_API_KEY_PROVIDER_ID, toExecutionModelProviderId } from "./ai/anthropic-models.js";
 export {
   ANTHROPIC_MODEL_MIN_CLAUDE_CODE_VERSION,
   buildAnthropicClaudeCodeIdentityHeaders,
@@ -90,15 +81,7 @@ export {
   parseClaudeCodeVersion,
   resolveClaudeCodeClientVersion,
 } from "./ai/claude-code-identity.js";
-export {
-  OPENAI_CODEX_PROVIDER_ID,
-  GPT_5_6_LUNA_MODEL_ID,
-  GPT_5_6_SOL_MODEL_ID,
-  GPT_5_6_TERRA_MODEL_ID,
-  SUPPLEMENTAL_OPENAI_CODEX_PROVIDER_REGISTRATION,
-  mergeSupplementalOpenAiCodexModels,
-} from "./ai/openai-models.js";
-export type { OpenAiCodexProviderRegistration } from "./ai/openai-models.js";
+export { OPENAI_CODEX_PROVIDER_ID } from "./ai/openai-models.js";
 export { detectImageMimeFromBytes } from "./i18n/image-mime.js";
 export type { DetectedImageMime } from "./i18n/image-mime.js";
 export { resolveUpdateAutomationSettings } from "./config/update-automation.js";
@@ -151,21 +134,8 @@ export {
 } from "./tool-output-budget.js";
 export { MOCK_PROVIDER_ID } from "./ai/mock-provider-constants.js";
 export type { MockProviderId, MockSessionPurpose } from "./ai/mock-provider-constants.js";
-export {
-  ZAI_PROVIDER_ID,
-  ZAI_PROVIDER_REGISTRATION,
-  mergeBuiltInZaiProviderModels,
-  registerBuiltInZaiProvider,
-} from "./ai/zai-provider.js";
-export type { ZaiProviderRegistration } from "./ai/zai-provider.js";
-export {
-  GROK_CLI_PROVIDER_ID,
-  GROK_PROVIDER_REGISTRATION,
-  isGrokApiKeyFusionVisible,
-  mergeBuiltInGrokProviderModels,
-  registerBuiltInGrokProvider,
-} from "./ai/grok-provider.js";
-export type { GrokProviderRegistration } from "./ai/grok-provider.js";
+export { ZAI_PROVIDER_ID } from "./ai/zai-provider.js";
+export { GROK_API_BASE_URL, GROK_CLI_PROVIDER_ID, XAI_PROVIDER_ID, hydrateGrokApiKeyFromUserSettings, isGrokApiKeyFusionVisible, projectPiXaiModelsToGrokCli } from "./ai/grok-provider.js";
 export {
   resolveWorktrunkSettings,
   requiresWorktrunkInstallVerification,
@@ -1210,6 +1180,7 @@ export { describeMergeContentShape } from "./merge/merge-content-descriptor.js";
 export type { MergeContentDescriptor } from "./merge/merge-content-descriptor.js";
 export {
   AUTOMATED_BYPASS_ACTORS,
+  evaluatePreMergeAdmissionDecision,
   evaluatePreMergeApprovals,
   isAuditedOperatorBypass,
   requiresContentReviewProof,
@@ -1218,7 +1189,7 @@ export {
 export { getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
 export type { RequiredPostMergeEvidenceDecision } from "./merge/confirmed-merge-reconciliation.js";
 export type { ConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
-export type { PreMergeApproval, PreMergeApprovalState } from "./merge/pre-merge-approval.js";
+export type { PreMergeAdmissionDecision, PreMergeApproval, PreMergeApprovalState } from "./merge/pre-merge-approval.js";
 export {
   isBranchGroupMemberLanded,
   isBranchGroupComplete,
@@ -1231,6 +1202,11 @@ export type {
   PrEntitySourceType,
   PrReviewDecision,
   PrChecksRollup,
+  PrReadinessCapability,
+  PrReadinessCapabilityState,
+  PrReadinessSnapshot,
+  PrRequiredCheck,
+  PrRequiredCheckState,
   PrThreadState,
   PrThreadOutcome,
 } from "./types.js";
@@ -1239,6 +1215,7 @@ export {
   isPrBacked,
   isPrEntityActionable,
   isPrEntityAutoMergeReady,
+  isCurrentHeadReadinessReady,
   autoMergeGateReason,
   summarizePrThreadActivity,
   type PrThreadActivity,
@@ -1750,7 +1727,7 @@ export type {
   BuildUnblockWeightMapOptions,
   PriorityFanoutComparatorContext,
 } from "./tasks/task-priority.js";
-export { fileScopeLeaseBlocksCandidate, normalizeOverlapScopeForTask, taskHoldsUnmergedCheckout } from "./tasks/file-scope-lease.js";
+export { fileScopeLeaseBlocksCandidate, fileScopeLeaseScopeFingerprint, normalizeOverlapScopeForTask, taskHoldsUnmergedCheckout } from "./tasks/file-scope-lease.js";
 export type { FileScopeLeaseClassification, FileScopeLeaseKind } from "./tasks/file-scope-lease.js";
 
 // ── Mission Hierarchy Types ────────────────────────────────────────────
@@ -2614,3 +2591,5 @@ export type { ResearchFeaturePromotionInput } from "./research/research-feature-
 export { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "./types.js";
 export * from "./task-document-concurrency.js";
 export { TASK_LOG_READ_ONLY_SUFFIX, buildTaskLogReadOnlyMessage, buildTaskNotFoundMessage, isTaskLogWriteRefusal } from "./task-store/task-log-write-refusal.js";
+
+export { findWorkflowNodeInstance } from "./workflows/workflow-node-instance.js";

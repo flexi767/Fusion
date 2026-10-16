@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Task } from "../types.js";
 import { compareTasksByPriorityThenAgeAndId } from "./task-priority.js";
 
@@ -8,16 +9,27 @@ export interface FileScopeLeaseClassification {
   waivedForTaskIds: readonly string[];
 }
 
+/**
+ * FNXC:FileScopeRecovery 2026-10-12-17:09:
+ * A release receipt binds its follower waiver to the normalized holder scope, so every
+ * admission surface can reject a receipt after the declaration changes out-of-band.
+ */
+export function fileScopeLeaseScopeFingerprint(scope: readonly string[]): string {
+  return createHash("sha256").update(scope.join("\n")).digest("hex");
+}
+
 /*
 FNXC:WorkspaceFileOverlap 2026-08-30-19:14:
 Workspace tasks deliberately clear the singular `task.worktree` through
 `normalizeWorkspaceTaskWorktreeMetadata({ clearSingularWorktree: true })`, so overlap lifetime must also
-recognize their per-repository checkouts. A retained entry is the unfinished-work proof; executor and archive
-cleanup delete those entries when the checkout is removed, preserving checkout clearing as the early-release hatch.
+recognize their per-repository checkouts. A retained entry holds unfinished work until landing is confirmed;
+executor and archive cleanup also release the claim when they remove those entries.
 */
 export function taskHoldsUnmergedCheckout(
-  task: Pick<Task, "worktree" | "workspaceWorktrees">,
+  task: Pick<Task, "worktree" | "workspaceWorktrees" | "mergeDetails">,
 ): boolean {
+  // Post-merge verification may retain the checkout after implementation has landed.
+  if (task.mergeDetails?.mergeConfirmed === true) return false;
   if (typeof task.worktree === "string" && task.worktree.trim()) return true;
   return Object.values(task.workspaceWorktrees ?? {}).some(
     (entry) => typeof entry?.worktreePath === "string" && entry.worktreePath.trim().length > 0,

@@ -256,7 +256,8 @@ Fusion task columns use persisted enum values as the API/filter contract. Caller
 2. **todo** — ready for scheduling
 3. **in-progress** — executor active in isolated worktree
 4. **in-review** — implementation complete; awaiting finalization
-   - If merge/finalization hits a terminal error, tasks can remain in `in-review` with `status: "failed"` for explicit follow-up. This state is intentionally preserved by recovery (not auto-bounced to `todo`).
+   - Fusion distinguishes an explicit human-review hold from automatic recovery. User pauses, approval holds, project/engine pauses, `autoMerge:false` review contracts, and genuine external dependencies remain stationary. Lost continuations, expired execution or merge ownership, stale transition markers, and retry-budget exhaustion remain owned by their existing recovery route.
+   - If merge/finalization hits a non-recoverable error, tasks can remain in `in-review` with `status: "failed"` for explicit follow-up. Recoverable stale-proof and fast-path exhaustion states instead clear only the stale proof and reseed the normal merger in place; they are not converted to a manual failure.
    - Retry behavior splits by execution-vs-merge signals: `in-review` tasks with incomplete steps (`pending`/`in-progress`) are treated as execution failures and retried back to `todo` with `preserveProgress: true`; zero-step `in-review` tasks use `mergeRetries` as the tie-breaker (`mergeRetries === 0` or undefined → execution failure path back to `todo`, `mergeRetries > 0` → merge/finalization retry in `in-review` with merge retry state reset); tasks whose steps are all terminal (`done`/`skipped`/`failed`) also stay on the merge/finalization retry path.
    - Manual retry now clears the full persisted retry-budget counter set (`stuckKillCount`, `recoveryRetryCount`, `taskDoneRetryCount`, `worktreeSessionRetryCount`, `workflowStepRetries`, `verificationFailureCount`, `postReviewFixCount`, `mergeConflictBounceCount`, `branchConflictRecoveryCount`, `reviewerContextRetryCount`, `reviewerFallbackRetryCount`, `completionHandoffLimboRecoveryCount`, `mergeAuditBounceCount`) plus `nextRecoveryAt`; merge retry counters clear only on merge-failure/generic retry paths. `retrySummary` is recomputed from persisted counters at read time, so manual retry resets the dashboard retry badge/details back to zero immediately.
    - Persisted executor session state is resumed only when it still matches the task's current worktree context. If a retry fails with `Refusing to start coding agent in missing worktree: ...` (or the incomplete/unregistered worktree variants) and the persisted session points at stale worktree metadata, recovery clears stale session pointers and retries fresh so review retries do not reopen deleted worktree paths. Merge-active self-healing resets the exhausted session-start counter only after a guarded stale-metadata clear and increments `recoveryRetryCount` so repeated recurrences still escalate for human inspection. The same supported reset is available from dashboard retry, CLI `task retry`, and `fn_task_retry` even when the row is stuck in a merge-active status (`merging`, `merging-pr`, `merging-fix`): only the unusable-worktree session-start signature bypasses the usual merge-active status gate, and the retry clears `worktree`/`branch`/`sessionFile` while preserving step progress.
@@ -295,6 +296,10 @@ Self-healing surfaces this diagnosis via task log entries in the form:
 These entries are rate-limited per `(task, code)` over `taskStuckTimeoutMs`, so unchanged stalls are not spammed every cycle while state transitions can still surface a new code immediately.
 
 **Dashboard surface:** In-review, non-paused tasks with `inReviewStall` set show a `Stall` badge on `TaskCard` and a code-specific diagnostic row in `TaskDetailModal` above the PR section. The diagnostic row includes headline/description/action copy, raw reason text, observed timestamp, and a `View activity log` deep-link that switches to Logs → Activity and highlights the most recent matching `In-review stall surfaced [<code>]: <reason>` entry. This UI is diagnostic only: neither the badge nor the jump button mutates task state.
+
+#### Durable assignment recovery
+
+When a queued implementation task is assigned to a durable agent that explicitly defers executor-class work, Fusion releases that assignment once and lets the normal Workflow Executor claim the root. The task activity log records the handoff; repeated heartbeats do not create repeated handoffs or worktrees. The released assignment is projected only when its durable row version is still current, so a newer operator assignment remains authoritative in task details and activity views. A paused, missing, or errored owner can be recovered by the same fenced path, but an active owner that reported within its configured heartbeat cadence remains assigned between completed heartbeats. A human user pause, manual control, checkout, active execution, or newer operator assignment is never overridden. Downstream tasks remain blocked by their actual root until it completes; this diagnostic is an ownership blocker, not a dependency-cycle repair.
 
 #### Stale paused review signal
 
@@ -657,6 +662,12 @@ Behavior:
 - Placement is workflow-aware: automatic workflows retain their trait-derived `intake`; manual intakes (`autoTriage: false`) bypass the capture lane and use the workflow's trait-derived `hold`/Planning lane. If no workflow destination is available, the existing `triage` fallback is retained.
 - The selected workflow and refinement seed prompt are persisted with the child so normal planning and approval processing can continue from the returned column.
 - Refinement tasks inherit the source task's GitHub tracking state (unlinked sources opt out; linked sources inherit `enabled` and optional `repoOverride`, but never copy the source issue link).
+
+## File-scope overlap recovery
+
+When **Clear** is available for a file-scope overlap, Fusion can safely release a paused planning-only holder without resetting its plan, reviews, or task history. The release is durable and identity-fenced to the holder's lineage, declared scope, and clean no-checkout state, so a restart reaches the same scheduling decision.
+
+Clear refuses active, resumed, dirty, committed, or uninspectable work with an actionable message. A successful release only re-evaluates the waiting task through normal dependency, pause, capacity, workflow, and dispatch gates; it never force-starts work. Reset remains destructive recovery for real work and invalidates any prior safe-release receipt.
 
 ## Archive and Restore
 

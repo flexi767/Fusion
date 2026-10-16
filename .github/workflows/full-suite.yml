@@ -360,95 +360,46 @@ jobs:
   # Post-merge review needs the four shard payloads and their observed failure set, but Full Suite
   # is intentionally non-blocking. Preserve a normalized evidence manifest even when the shard
   # matrix is red; only absent or malformed reporter evidence fails this collector.
+  #
+  # FNXC:PipelineSmoke 2026-10-04-09:44:
+  # FN-9469 requires task-completion evidence from the post-merge smoke producer itself. Validate
+  # the retained report against this commit's manifest so a successful upload cannot hide a partial,
+  # duplicate, failed, or over-budget scenario census.
   post-merge-evidence-gate:
     name: Post-merge Full Suite evidence gate
-    needs: [test-shards]
+    needs: [test-shards, test-pipeline-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout manifest source
+        uses: actions/checkout@v7.0.1
+
       - name: Download required shard timing artifacts
+        id: download-shard-timings
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           pattern: test-timings-shard-*
           path: post-merge-evidence
 
-      - name: Validate and normalize shard evidence
+      - name: Download required pipeline smoke report
+        id: download-pipeline-smoke
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: pipeline-smoke-report
+          path: post-merge-evidence/pipeline-smoke-report
+
+      - name: Validate and normalize shard and Pipeline smoke evidence
         env:
           TEST_SHARDS_RESULT: ${{ needs.test-shards.result }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { readdir, readFile, writeFile } from "node:fs/promises";
-          import path from "node:path";
+          PIPELINE_SMOKE_RESULT: ${{ needs.test-pipeline-smoke.result }}
+        run: node scripts/post-merge-full-suite-evidence.mjs
 
-          const requiredArtifacts = [
-            "test-timings-shard-1",
-            "test-timings-shard-2",
-            "test-timings-shard-3",
-            "test-timings-shard-4",
-          ];
-
-          async function jsonFiles(root) {
-            const entries = await readdir(root, { withFileTypes: true });
-            const files = [];
-            for (const entry of entries) {
-              const child = path.join(root, entry.name);
-              if (entry.isDirectory()) files.push(...await jsonFiles(child));
-              else if (entry.isFile() && entry.name.endsWith(".json")) files.push(child);
-            }
-            return files;
-          }
-
-          const shards = [];
-          for (const artifact of requiredArtifacts) {
-            const artifactRoot = path.join("post-merge-evidence", artifact);
-            const files = await jsonFiles(artifactRoot);
-            if (files.length === 0) throw new Error(`${artifact} contains no timing JSON`);
-
-            const reports = [];
-            for (const file of files) {
-              const payload = JSON.parse(await readFile(file, "utf8"));
-              if (!Array.isArray(payload.testResults)) {
-                throw new Error(`${file} is not a Vitest timing reporter payload`);
-              }
-              const failedFullNames = payload.testResults.flatMap((result) => {
-                if (!Array.isArray(result?.assertionResults)) {
-                  throw new Error(`${file} has a malformed Vitest assertion result`);
-                }
-                return result.assertionResults
-                  .filter((assertion) => assertion?.status === "failed" && typeof assertion.fullName === "string")
-                  .map((assertion) => assertion.fullName);
-              });
-              reports.push({
-                path: path.relative("post-merge-evidence", file),
-                testResultCount: payload.testResults.length,
-                failedFullNames: [...new Set(failedFullNames)].sort(),
-              });
-            }
-            shards.push({ artifact, reports });
-          }
-
-          const evidence = {
-            version: 1,
-            run: {
-              repository: process.env.GITHUB_REPOSITORY,
-              runId: process.env.GITHUB_RUN_ID,
-              sha: process.env.GITHUB_SHA,
-              url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
-            },
-            producers: {
-              testShards: {
-                conclusion: process.env.TEST_SHARDS_RESULT,
-                nonBlocking: true,
-              },
-            },
-            shards,
-          };
-          await writeFile("post-merge-evidence/manifest.json", `${JSON.stringify(evidence, null, 2)}\n`);
-          console.log(`Retained ${shards.length} shard artifacts for post-merge disposition; test-shards=${process.env.TEST_SHARDS_RESULT}.`);
-          NODE
 
       - name: Retain normalized post-merge evidence
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: post-merge-full-suite-evidence

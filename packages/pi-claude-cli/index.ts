@@ -218,33 +218,8 @@ export default function (pi: ExtensionAPI) {
       maxTokens: model.maxTokens,
     }));
 
-    /*
-    FNXC:ModelCatalog 2026-10-01-02:51:
-    Pi 0.86.1 predates the two Claude 5.5 aliases. Add only those local-CLI compatibility rows,
-    then dedupe by ID so an upstream catalog row remains authoritative and singular after Pi updates.
-    */
-    const extraModels: typeof catalogModels = [
-      {
-        id: "claude-opus-5-5",
-        name: "Claude Opus 5.5",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
-        contextWindow: 1_000_000,
-        maxTokens: 128_000,
-      },
-      {
-        id: "claude-sonnet-5-5",
-        name: "Claude Sonnet 5.5",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
-        contextWindow: 1_000_000,
-        maxTokens: 128_000,
-      },
-    ];
-    const seen = new Set(catalogModels.map((model) => model.id));
-    const models = [...catalogModels, ...extraModels.filter((model) => !seen.has(model.id))];
+    // The installed Pi catalog is the sole source for Claude CLI model metadata.
+    const models = catalogModels;
 
     // Ensure all registered tools are active so pi can execute them.
     // Some tools (find, grep, ls) are registered but not activated by default.
@@ -262,7 +237,7 @@ export default function (pi: ExtensionAPI) {
       models,
       streamSimple: (model, context, options) => {
         /*
-        FNXC:PiTranscriptBridge 2026-09-20-16:20:
+        FNXC:PiTranscriptBridge 2026-10-04-07:28:
         Pi 0.86 replaces the retired Context.tools field with transcript system-message deltas. Replay the current prompt and tool declarations before building either local CLI bridge so resumed and branched sessions retain their latest instructions and MCP schemas.
         */
         const contextTools = normalizeTranscriptTools(getCurrentTools(context.messages));

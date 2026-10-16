@@ -403,6 +403,7 @@ const mocks = vi.hoisted(() => {
   const modelRegistry = {
     getAll: vi.fn().mockReturnValue([]),
     registerProvider: vi.fn(),
+    unregisterProvider: vi.fn(),
     refresh: vi.fn(),
   };
   /*
@@ -686,6 +687,15 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
     return {};
   }),
   createSkillsAdapter: mocks.createSkillsAdapterMock,
+  createDashboardMissionForgeReader: vi.fn((options: { getGitLabClient?: () => Promise<{ listNotes: (resource: string, project: string, iid: number) => Promise<string[]> } | undefined> }) => ({
+    read: async (task: { gitlabTracking?: { item?: { kind: string; projectPath?: string; iid?: number } } }) => {
+      const item = task.gitlabTracking?.item;
+      const client = await options.getGitLabClient?.();
+      if (item?.projectPath && item.iid && client) await client.listNotes(item.kind === "merge_request" ? "merge_requests" : "issues", item.projectPath, item.iid);
+      return { records: [] };
+    },
+  })),
+  resolveGitLabClient: vi.fn(),
   getProjectSettingsPath: vi.fn().mockReturnValue("/tmp/project/.fusion/settings.json"),
   loadTlsCredentialsFromEnv: vi.fn().mockReturnValue(undefined),
   refreshAllCustomProviderModels: mocks.refreshAllCustomProviderModels,
@@ -886,6 +896,22 @@ describe("runServe", () => {
     expect(mockSyncStartupModels).toHaveBeenCalledTimes(1);
   });
 
+  it("binds GitLab mission evidence to the executing engine's project store", async () => {
+    const dashboard = await import("@fusion/dashboard");
+    const { ProjectEngineManager } = await import("@fusion/engine");
+    const listNotes = vi.fn().mockResolvedValue(["merged review receipt"]);
+    vi.mocked(dashboard.resolveGitLabClient).mockResolvedValue({ ok: true, client: { listNotes } } as any);
+    await runServe(0, {});
+
+    const factory = vi.mocked(ProjectEngineManager).mock.calls.at(-1)?.[1]?.createMissionValidationEvidenceProvider;
+    const projectStore = {};
+    const reader = (factory?.(projectStore as never) as any).forgeReader;
+    await reader.read({ gitlabTracking: { item: { kind: "merge_request", projectPath: "group/project", iid: 3 } } });
+
+    expect(dashboard.resolveGitLabClient).toHaveBeenCalledWith(projectStore);
+    expect(listNotes).toHaveBeenCalledWith("merge_requests", "group/project", 3);
+  });
+
   it("binds native auto-merge to the executing engine's store", async () => {
     const lifecycle = await import("../task-lifecycle.js");
     const { ProjectEngineManager } = await import("@fusion/engine");
@@ -916,13 +942,20 @@ describe("runServe", () => {
     expect(process.exit).toHaveBeenCalledWith(130);
   });
 
-  it("registers built-in zai GLM-5.2 before refreshing models", async () => {
+  it("projects refreshed Pi xAI rows under grok-cli", async () => {
+    mocks.modelRegistry.getAll.mockReturnValue([{
+      provider: "xai",
+      id: "grok-dynamic",
+      name: "Pi Grok",
+      reasoning: true,
+    }]);
+
     await runServe(0, {});
 
-    expect(mocks.modelRegistry.registerProvider).toHaveBeenCalledWith("zai", expect.objectContaining({
-      models: expect.arrayContaining([expect.objectContaining({ id: "glm-5.2" })]),
-    }));
     expect(mocks.modelRegistry.refresh).toHaveBeenCalled();
+    expect(mocks.modelRegistry.registerProvider).toHaveBeenCalledWith("grok-cli", expect.objectContaining({
+      models: [expect.objectContaining({ id: "grok-dynamic", name: "Pi Grok", reasoning: true })],
+    }));
 
     await triggerSignal("SIGINT");
   });

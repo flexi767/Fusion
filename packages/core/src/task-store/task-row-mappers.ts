@@ -33,11 +33,11 @@ export function getTaskSelectClauseImpl2(store: TaskStore, slim: boolean, tableA
     const prefix = tableAlias ? `${tableAlias}.` : "";
     return [
       "id", "lineageId", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
-      "worktree", "blockedBy", "overlapBlockedBy", "paused", "pausedReason", "wedgeNotification", "userPaused", "baseBranch", "branch", "autoMerge", "autoMergeProvenance", "executionStartBranch", "baseCommitSha",
+      "worktree", "blockedBy", "overlapBlockedBy", "fileScopeLeaseRelease", "paused", "pausedReason", "wedgeNotification", "userPaused", "baseBranch", "branch", "autoMerge", "autoMergeProvenance", "executionStartBranch", "baseCommitSha",
       "modelPresetId", "modelProvider", "credentialInstanceId", "modelId",
       "validatorModelProvider", "validatorCredentialInstanceId", "validatorModelId",
       "planningModelProvider", "planningCredentialInstanceId", "planningModelId", "mergerModelProvider", "mergerCredentialInstanceId", "mergerModelId",
-      "mergeRetries", "aiMergeReviewReconciliation", "workflowStepRetries", "stuckKillCount", "resumeLimboCount", "executeRequeueLoopCount", "graphResumeRetryCount", "consecutiveToolFailureRetryCount", "executorEscalationAttempted", "toolFailureDetectorLogCursor", "toolFailureRetryExhaustedAuditEmitted", "resumeLimboTipSha", "resumeLimboStepSignature", "executeRequeueLoopSignature", "postReviewFixCount", "planReviewReplanCount", "recoveryRetryCount", "sessionContentionHoldCount", "sessionContentionWaitReason", "taskDoneRetryCount", "bulkCompletionRefusalAt", "worktreeSessionRetryCount", "completionHandoffLimboRecoveryCount", "verificationFailureCount", "mergeConflictBounceCount", "mergeAuditBounceCount", "mergeTransientRetryCount", "branchConflictRecoveryCount", "reviewerContextRetryCount", "reviewerFallbackRetryCount", "reviewConvergenceStage", "reviewConvergenceEscalationCount", "nextRecoveryAt",
+      "mergeRetries", "aiMergeReviewReconciliation", "workflowStepRetries", "stuckKillCount", "resumeLimboCount", "executeRequeueLoopCount", "graphResumeRetryCount", "consecutiveToolFailureRetryCount", "executorEscalationAttempted", "toolFailureDetectorLogCursor", "toolFailureRetryExhaustedAuditEmitted", "resumeLimboTipSha", "resumeLimboStepSignature", "executeRequeueLoopSignature", "postReviewFixCount", "planReviewReplanCount", "recoveryRetryCount", "recoveryDisposition", "sessionContentionHoldCount", "sessionContentionWaitReason", "taskDoneRetryCount", "bulkCompletionRefusalAt", "worktreeSessionRetryCount", "completionHandoffLimboRecoveryCount", "verificationFailureCount", "mergeConflictBounceCount", "mergeAuditBounceCount", "mergeTransientRetryCount", "branchConflictRecoveryCount", "reviewerContextRetryCount", "reviewerFallbackRetryCount", "reviewConvergenceStage", "reviewConvergenceEscalationCount", "nextRecoveryAt",
       "error", "summary", "recommendations", "thinkingLevel", "validatorThinkingLevel", "planningThinkingLevel", "mergerThinkingLevel", "executionMode",
       "tokenUsageInputTokens", "tokenUsageOutputTokens", "tokenUsageCachedTokens", "tokenUsageCacheWriteTokens", "tokenUsageTotalTokens", "tokenUsageFirstUsedAt", "tokenUsageLastUsedAt", "tokenUsageModelProvider", "tokenUsageModelId", "tokenUsagePerModel", "tokenBudgetSoftAlertedAt", "tokenBudgetHardAlertedAt", "tokenBudgetOverride",
       "createdAt", "updatedAt", "columnMovedAt", "firstExecutionAt", "cumulativeActiveMs", "cumulativePlanningMs", "planningStartedAt", "executionStartedAt", "executionCompletedAt",
@@ -130,6 +130,8 @@ export function rowToPrEntityImpl(store: TaskStore, row: PrEntityRow): PrEntity 
       prNumber: row.prNumber ?? undefined,
       prUrl: row.prUrl ?? undefined,
       headOid: row.headOid ?? undefined,
+      readiness: (row.readiness as PrEntity["readiness"] | null) ?? undefined,
+      readinessProvider: row.readinessProvider ?? undefined,
       mergeable: (row.mergeable as PrConflictState | null) ?? undefined,
       checksRollup: (row.checksRollup as PrChecksRollup | null) ?? undefined,
       reviewDecision: (row.reviewDecision as PrReviewDecision) ?? undefined,

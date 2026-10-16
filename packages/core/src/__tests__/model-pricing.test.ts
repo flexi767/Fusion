@@ -49,6 +49,7 @@ describe("model-pricing", () => {
   it.each([
     ["claude-opus-5-5", 10.1],
     ["claude-sonnet-5-5", 5.1],
+    ["claude-haiku-5-5", 1.275],
   ])("prices %s across input, output, cache-read, and cache-write tokens", (model, expectedUsd) => {
     const usage = {
       inputTokens: 1_000_000,
@@ -64,6 +65,14 @@ describe("model-pricing", () => {
     expect(explicit).toMatchObject({ unavailable: false, stale: false });
     expect(explicit.usd).toBeCloseTo(expectedUsd, 6);
     expect(bare.usd).toBeCloseTo(expectedUsd, 6);
+  });
+
+  it("uses Haiku 5.5's exact above-100k tier boundary", () => {
+    const below = costFor({ ...ZERO, inputTokens: 100_000 }, { provider: "anthropic", model: "claude-haiku-5-5" });
+    const aboveBoundary = costFor({ ...ZERO, inputTokens: 100_001 }, { provider: "anthropic", model: "claude-haiku-5-5" });
+
+    expect(below.usd).toBeCloseTo(0.01, 8);
+    expect(aboveBoundary.usd).toBeCloseTo(0.0500005, 8);
   });
 
   it("prices Claude Fable 5.1 instead of reporting it as unavailable", () => {
@@ -157,10 +166,10 @@ describe("model-pricing", () => {
       ["gpt-5.4", 5.5],
       ["gpt-5.4-mini", 1.65],
       ["gpt-5.5", 11],
-      ["gpt-5.6-luna", 2.2],
-      ["gpt-5.6-sol", 11],
-      ["gpt-5.6-terra", 5.5],
-      ["gpt-6-astra", 20],
+      ["gpt-5.6-luna", 0.76],
+      ["gpt-5.6-sol", 19],
+      ["gpt-5.6-terra", 7.6],
+      ["gpt-6-astra", 35],
     ] as const;
 
     for (const [model, expectedUsd] of cases) {
@@ -182,11 +191,11 @@ describe("model-pricing", () => {
       cacheWriteTokens: 400_000,
     };
     const cases = [
-      { provider: "openai", model: "gpt-5.6-luna", expectedUsd: 0.55 },
-      { provider: "openai", model: "gpt-5.6-sol", expectedUsd: 10.2 },
-      { provider: "openai", model: "gpt-5.6-terra", expectedUsd: 5.5 },
-      { provider: "openai", model: "gpt-6-astra", expectedUsd: 25.5 },
-      { provider: "openai-codex", model: "gpt-6-astra", expectedUsd: 25.5 },
+      { provider: "openai", model: "gpt-5.6-luna", expectedUsd: 0.98 },
+      { provider: "openai", model: "gpt-5.6-sol", expectedUsd: 18.4 },
+      { provider: "openai", model: "gpt-5.6-terra", expectedUsd: 9.8 },
+      { provider: "openai", model: "gpt-6-astra", expectedUsd: 46 },
+      { provider: "openai-codex", model: "gpt-6-astra", expectedUsd: 46 },
     ] as const;
 
     for (const { provider, model, expectedUsd } of cases) {
@@ -196,15 +205,20 @@ describe("model-pricing", () => {
       expect(lookupPricing({ provider, model })).toBe(MODEL_PRICING[`${provider}:${model}`]);
     }
 
-    // The duplicate Luna ID has different direct and Codex rates, proving these
-    // current rows resolve through their provider-qualified keys rather than one bare key.
-    const directLuna = costFor(usage, { provider: "openai", model: "gpt-5.6-luna" });
-    const codexLuna = costFor(usage, { provider: "openai-codex", model: "gpt-5.6-luna" });
-    expect(lookupPricing({ provider: "openai", model: "gpt-5.6-luna" }))
-      .toBe(MODEL_PRICING["openai:gpt-5.6-luna"]);
-    expect(lookupPricing({ provider: "openai-codex", model: "gpt-5.6-luna" }))
-      .toBe(MODEL_PRICING["openai-codex:gpt-5.6-luna"]);
-    expect(directLuna.usd).not.toBe(codexLuna.usd);
+    expect(costFor(
+      { inputTokens: 272_000, outputTokens: 0, cachedTokens: 0, cacheWriteTokens: 0 },
+      { provider: "openai", model: "gpt-6-astra" },
+    ).usd).toBeCloseTo(2.72, 6);
+    expect(costFor(
+      { inputTokens: 272_001, outputTokens: 0, cachedTokens: 0, cacheWriteTokens: 0 },
+      { provider: "openai", model: "gpt-6-astra" },
+    ).usd).toBeCloseTo(5.44002, 6);
+
+    const directLunaPricing = lookupPricing({ provider: "openai", model: "gpt-5.6-luna" });
+    const codexLunaPricing = lookupPricing({ provider: "openai-codex", model: "gpt-5.6-luna" });
+    expect(directLunaPricing).toBe(MODEL_PRICING["openai:gpt-5.6-luna"]);
+    expect(codexLunaPricing).toBe(MODEL_PRICING["openai-codex:gpt-5.6-luna"]);
+    expect(directLunaPricing).not.toBe(codexLunaPricing);
   });
 
   it("prices Codex mini latest instead of reporting unavailable", () => {

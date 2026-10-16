@@ -4627,7 +4627,7 @@ describe("taskCreate tool model inheritance", () => {
       }
     });
 
-    it("terminalizes a fallback-written plan when its shared retry budget is exhausted", async () => {
+    it("reseeds a fallback-written plan when its shared retry budget is exhausted", async () => {
       const task = createTriageTask({ id: "FN-FALLBACK-EXHAUSTED", recoveryRetryCount: 3 });
       const root = await createTriageFixtureRoot("fusion-triage-fallback-exhausted-");
       const promptPath = join(root, ".fusion", "tasks", task.id, "PROMPT.md");
@@ -4660,8 +4660,7 @@ describe("taskCreate tool model inheritance", () => {
       try {
         await new TriageProcessor(store, root, { onSpecifyComplete }).specifyTask(task);
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
-          status: "failed",
-          error: expect.stringContaining("Planner fallback engaged"),
+          error: null,
           recoveryRetryCount: null,
           nextRecoveryAt: null,
         }));
@@ -5186,7 +5185,7 @@ describe("taskCreate tool model inheritance", () => {
       });
     });
 
-    it("escalates to error state when triage retries are exhausted via specifyTask", async () => {
+    it("reseeds triage when transient retries are exhausted via specifyTask", async () => {
       const task = {
         id: "FN-201",
         description: "Test triage task",
@@ -5214,13 +5213,12 @@ describe("taskCreate tool model inheritance", () => {
 
       await processor.specifyTask(task);
 
-      // Should set error and clear recovery metadata
       expect(store.updateTask).toHaveBeenCalledWith("FN-201", expect.objectContaining({
-        error: expect.stringContaining("Specification failed after 3 transient errors"),
+        error: null,
         recoveryRetryCount: null,
         nextRecoveryAt: null,
       }));
-      expect(onSpecifyError).toHaveBeenCalled();
+      expect(onSpecifyError).not.toHaveBeenCalled();
     });
 
     it("parks missing provider credentials instead of making triage immediately claimable again", async () => {
@@ -5366,7 +5364,7 @@ describe("taskCreate tool model inheritance", () => {
       }));
     });
 
-    it("backfills blank titles when deterministic validation retries are exhausted", async () => {
+    it("reseeds deterministic validation exhaustion without terminal title backfill", async () => {
       const task = {
         id: "FN-7961-DETERMINISTIC",
         title: "",
@@ -5396,16 +5394,12 @@ describe("taskCreate tool model inheritance", () => {
       const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
       await processor.specifyTask(task);
 
-      const expectedError = "Specification failed deterministic validation after 3 retries (PROMPT.md file not found or empty). Retry after adjusting the task prompt or model.";
-      expect(store.updateTask).toHaveBeenCalledWith("FN-7961-DETERMINISTIC", {
-        status: "failed",
-        error: expectedError,
+      expect(store.updateTask).toHaveBeenCalledWith("FN-7961-DETERMINISTIC", expect.objectContaining({
+        error: null,
         recoveryRetryCount: null,
         nextRecoveryAt: null,
-      });
-      expect(store.updateTask).toHaveBeenCalledWith("FN-7961-DETERMINISTIC", {
-        title: "Backfill blank titles after deterministic prompt",
-      });
+      }));
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-7961-DETERMINISTIC", expect.objectContaining({ status: "failed" }));
     });
 
     it("backfills blank titles when planner model fallback is exhausted", async () => {
@@ -5491,7 +5485,7 @@ describe("taskCreate tool model inheritance", () => {
       });
     });
 
-    it("backfills blank titles when transient retries are exhausted", async () => {
+    it("reseeds transient retries without terminal title backfill", async () => {
       const task = {
         id: "FN-7961-TRANSIENT",
         title: "",
@@ -5514,14 +5508,12 @@ describe("taskCreate tool model inheritance", () => {
       const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
       await processor.specifyTask(task);
 
-      expect(store.updateTask).toHaveBeenCalledWith("FN-7961-TRANSIENT", {
-        error: "Specification failed after 3 transient errors: connection reset",
+      expect(store.updateTask).toHaveBeenCalledWith("FN-7961-TRANSIENT", expect.objectContaining({
+        error: null,
         recoveryRetryCount: null,
         nextRecoveryAt: null,
-      });
-      expect(store.updateTask).toHaveBeenCalledWith("FN-7961-TRANSIENT", {
-        title: "Identify failed rows after exhausted transient planning",
-      });
+      }));
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-7961-TRANSIENT", expect.objectContaining({ status: "failed" }));
     });
 
     /*
@@ -5567,7 +5559,7 @@ describe("taskCreate tool model inheritance", () => {
       );
     });
 
-    it("parks an unclassified planning failure once the retry budget is exhausted", async () => {
+    it("reseeds an unclassified planning failure once the retry budget is exhausted", async () => {
       const task = {
         id: "FN-GENERIC-EXHAUSTED",
         title: "Generic planning failure",
@@ -5590,15 +5582,15 @@ describe("taskCreate tool model inheritance", () => {
       const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
       await processor.specifyTask(task);
 
-      const parkWrite = store.updateTask.mock.calls.find(
-        ([id, patch]) => id === "FN-GENERIC-EXHAUSTED" && patch?.status === "failed",
+      const reseedWrite = store.updateTask.mock.calls.find(
+        ([id, patch]) => id === "FN-GENERIC-EXHAUSTED" && patch?.recoveryRetryCount === null,
       );
-      // `status: "failed"` is what suppresses triage rediscovery — without it the card is re-picked.
-      expect(parkWrite, "an exhausted budget must park the card for a human").toBeDefined();
-      expect(parkWrite?.[1]?.error).toContain("PLANNING_FAILED_EXHAUSTED:");
-      expect(parkWrite?.[1]?.error).toContain("kaboom: something nobody classified");
-      expect(parkWrite?.[1]?.recoveryRetryCount).toBeNull();
-      expect(parkWrite?.[1]?.nextRecoveryAt).toBeNull();
+      expect(reseedWrite, "an exhausted budget must return to triage's replan owner").toBeDefined();
+      expect(reseedWrite?.[1]).toMatchObject({ error: null, nextRecoveryAt: null });
+      expect(store.updateTask).not.toHaveBeenCalledWith(
+        "FN-GENERIC-EXHAUSTED",
+        expect.objectContaining({ status: "failed" }),
+      );
     });
 
     it("does not overwrite an existing title during terminal fallback exhaustion", async () => {
@@ -6727,10 +6719,15 @@ describe("specifyTask — status restore failure diagnostics", () => {
         updatedAt: new Date().toISOString(),
       } as Task;
 
+      let resolveRetryLog!: () => void;
+      const retryLogInvoked = new Promise<void>((resolve) => {
+        resolveRetryLog = resolve;
+      });
       const store = createMockStore({
         getTask: vi.fn().mockResolvedValue({ ...task, attachments: [], comments: [] }),
         logEntry: vi.fn().mockImplementation(async (_taskId: string, message: string) => {
           if (message.includes("Rate limited — retry")) {
+            resolveRetryLog();
             throw new Error("log write failed");
           }
         }),
@@ -6758,31 +6755,19 @@ describe("specifyTask — status restore failure diagnostics", () => {
 
       const specifyPromise = processor.specifyTask(task);
       /*
-      FNXC:TriagePlanningRetry 2026-08-09-15:55: Runtime setup is async; schedule its retry sleep before advancing fake time.
-      FNXC:TriagePlanningRetry 2026-08-23-18:30: `specifyTask` now awaits real work (the FN-8840
-      pre-planning duplicate check reads PROMPT.md) before it reaches the planner, so ONE zero-tick
-      no longer reaches the retry sleep and advancing 60s scheduled nothing — the promise never
-      settled. Drain pending async setup until the sleep exists instead of guessing a tick count;
-      this only flushes setup, it does not relax the retry assertions below.
-
-      FNXC:TriagePlanningRetry 2026-09-24-22:49:
-      Planning now creates its 90-minute turn timeout before `promptWithFallback` rejects. Waiting
-      for any timer mistakes that guard for the retry sleep and leaves the 429 retry unadvanced.
-      Wait for the observable retry log, then flush once to assert the retry timer is registered before
-      retaining the existing 60-second advance; this proves callback-before-sleep under the production path.
+      FNXC:TriagePlanningRetry 2026-10-05-04:34:
+      The shard failure proved that repeated zero-time fake-clock advances do not admit the real
+      filesystem setup before `specifyTask` invokes the planner. Wait for the production retry-log
+      callback instead: it proves the 429 reached `withRateLimitRetry` and preserves the required
+      callback-before-backoff ordering without guessing event-loop turns.
       */
-      for (
-        let tick = 0;
-        tick < 100 && !store.logEntry.mock.calls.some(([, message]) => String(message).includes("Rate limited — retry"));
-        tick += 1
-      ) {
-        await vi.advanceTimersByTimeAsync(0);
-      }
+      await retryLogInvoked;
       expect(store.logEntry).toHaveBeenCalledWith("FN-207", expect.stringContaining("Rate limited — retry"));
       await vi.advanceTimersByTimeAsync(0);
       expect(vi.getTimerCount()).toBe(1);
       await vi.advanceTimersByTimeAsync(60_000);
       await expect(specifyPromise).resolves.toBeUndefined();
+      expect(store.logEntry.mock.calls.filter(([, message]) => String(message).includes("Rate limited — retry"))).toHaveLength(1);
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining("FN-207: failed to log rate-limit retry entry"),
       );
@@ -6794,39 +6779,47 @@ describe("specifyTask — status restore failure diagnostics", () => {
 
   it("logs warning when transient-error retry status update fails", async () => {
     const warnSpy = vi.spyOn(planLog, "warn");
-    const task: Task = {
-      id: "FN-208",
-      description: "Transient retry test",
-      column: "triage",
-      dependencies: [],
-      steps: [],
-      currentStep: 0,
-      log: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    } as Task;
+    try {
+      const task: Task = {
+        id: "FN-208",
+        description: "Transient retry test",
+        column: "triage",
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+        log: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      } as Task;
 
-    const store = createMockStore({
-      getTask: vi.fn().mockResolvedValue({ ...task, attachments: [] }),
-      updateTask: vi.fn().mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
-        if (patch?.recoveryRetryCount === 1) {
-          throw new Error("retry status update failed");
-        }
-      }),
-    });
+      const store = createMockStore({
+        getTask: vi.fn().mockResolvedValue({ ...task, attachments: [] }),
+        updateTask: vi.fn().mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+          if (patch?.recoveryRetryCount === 1) {
+            throw new Error("retry status update failed");
+          }
+        }),
+      });
 
-    mockCreateFnAgent.mockRejectedValueOnce(new Error("upstream connect error"));
+      mockCreateFnAgent.mockRejectedValueOnce(new Error("upstream connect error"));
 
-    const processor = new TriageProcessor(store, "/test/root", {
-      pollIntervalMs: 100_000,
-    });
+      const processor = new TriageProcessor(store, "/test/root", {
+        pollIntervalMs: 100_000,
+      });
 
-    await expect(processor.specifyTask(task)).resolves.toBeUndefined();
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("FN-208: failed to restore status to 'null' during transient-error retry scheduling"),
-    );
-
-    warnSpy.mockRestore();
+      await expect(processor.specifyTask(task)).resolves.toBeUndefined();
+      expect(store.updateTask).toHaveBeenCalledWith("FN-208", expect.objectContaining({
+        status: null,
+        recoveryRetryCount: 1,
+        nextRecoveryAt: expect.any(String),
+      }));
+      expect(store.updateTask.mock.calls.some(([, patch]) => patch?.status === "failed")).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("FN-208: failed to restore status to 'null' during transient-error retry scheduling"),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });
 

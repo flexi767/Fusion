@@ -46,6 +46,17 @@ const mockModels = [
     contextWindow: 200000,
     maxTokens: 16384,
   },
+  ...["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"].map((id) => ({
+    id,
+    name: id,
+    api: "anthropic",
+    provider: "anthropic",
+    reasoning: true,
+    input: "text",
+    cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1.25 },
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+  })),
 ];
 
 const { MockAssistantMessageEventStream } = vi.hoisted(() => {
@@ -123,7 +134,7 @@ describe("provider registration (default export)", () => {
     expect(firstModel.cost).toBeDefined();
   });
 
-  it("adds the two 5.5 fallback rows with verified CLI metadata when Pi lacks them", async () => {
+  it("does not synthesize former fallback rows when Pi omits them", async () => {
     const registerProvider = vi.fn();
     const mockPi = { registerProvider, on: vi.fn() } as any;
 
@@ -131,12 +142,9 @@ describe("provider registration (default export)", () => {
     mod.default(mockPi);
 
     const models = registerProvider.mock.calls[0][1].models;
-    expect(models.filter((model: { id: string }) => model.id === "claude-opus-5-5")).toEqual([expect.objectContaining({
-      name: "Claude Opus 5.5", input: ["text", "image"], cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 }, contextWindow: 1_000_000, maxTokens: 128_000,
-    })]);
-    expect(models.filter((model: { id: string }) => model.id === "claude-sonnet-5-5")).toEqual([expect.objectContaining({
-      name: "Claude Sonnet 5.5", input: ["text", "image"], cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 }, contextWindow: 1_000_000, maxTokens: 128_000,
-    })]);
+    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]) {
+      expect(models.filter((model: { id: string }) => model.id === id)).toHaveLength(1);
+    }
   });
 
   it("projects a controlled Pi catalog exactly once and retains all projected fields", async () => {
@@ -171,7 +179,8 @@ describe("provider registration (default export)", () => {
       maxTokens: upstream.maxTokens,
     }]);
     expect(config.models.filter((model: { id: string }) => model.id === "claude-opus-5-5")).toHaveLength(1);
-    expect(config.models.filter((model: { id: string }) => model.id === "claude-sonnet-5-5")).toHaveLength(1);
+    expect(config.models.filter((model: { id: string }) => model.id === "claude-sonnet-5-5")).toHaveLength(0);
+    expect(config.models.filter((model: { id: string }) => model.id === "claude-haiku-5-5")).toHaveLength(0);
     expect(config.streamSimple).toEqual(expect.any(Function));
   });
 });

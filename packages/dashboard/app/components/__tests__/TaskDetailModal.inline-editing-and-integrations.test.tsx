@@ -2360,6 +2360,10 @@ describe("TaskDetailModal", () => {
         expect(screen.getByText(replacementAgent.name)).toBeInTheDocument();
         expect(document.querySelector(".agent-picker-dropdown")).toBeNull();
       });
+
+      await user.click(screen.getByRole("button", { name: "Change assignee" }));
+      expect(await screen.findByRole("button", { name: new RegExp(replacementAgent.name) })).toHaveClass("selected");
+      expect(screen.getByRole("button", { name: new RegExp(currentAgent.name) })).not.toHaveClass("selected");
     });
 
     it("keeps the current assignment and picker available when replacement is rejected", async () => {
@@ -2707,8 +2711,8 @@ describe("TaskDetailModal", () => {
 
       // After fetch resolves, spec content appears
       await waitFor(() => {
-        const markdownBody = document.querySelector(".markdown-body");
-        expect(markdownBody).toBeTruthy();
+        expect(document.querySelector(".markdown-body")).toBeTruthy();
+        expect(screen.getByText("This is the loaded spec content.")).toBeInTheDocument();
       }, { timeout: 3000 });
 
       // Loading indicator should be gone
@@ -2724,7 +2728,7 @@ describe("TaskDetailModal", () => {
       expect(screen.getByText("Execution mode")).toBeInTheDocument();
       expect(screen.getByText("Runtime status")).toBeInTheDocument();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
-      expectSingleStatsRuntimeStatus("executing");
+      expectSingleStatsRuntimeStatus("executing", "Recovery pending");
       const tokenTotals = screen.getByRole("list", { name: "Task token totals" });
       expect(within(tokenTotals).getByText((1200).toLocaleString())).toBeInTheDocument();
       expect(within(tokenTotals).getByText((450).toLocaleString())).toBeInTheDocument();

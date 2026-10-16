@@ -33,7 +33,7 @@ Run `35837857934` reported nine direct stale-fixture failures after FN-9370 chan
 
 ### Required post-landing Full Suite evidence
 
-The default-on workflow `post-merge-verification` gate makes Full Suite evidence a blocking task-completion requirement for merge-capable built-ins without changing branch protection. The gate must refuse approval until the delivery record identifies the landed SHA, the first Full Suite push-to-main run at or after that SHA with its run ID and SHA, conclusions for Pipeline smoke and Test shards 1/4 through 4/4, and all four `test-timings-shard-1` through `test-timings-shard-4` artifacts. Full Suite conclusions are non-blocking signals: a failed lane needs an explicit evidence-backed disposition, not a fabricated successful conclusion. The `post-merge-full-suite-evidence` artifact retains the normalized per-shard failed-name set and producer conclusion for that review. A pre-landing run, an unrelated main run, partial artifacts, or local verification are not substitutes; record the verified GitHub-hosted evidence and every non-success disposition in the task delivery record before final approval.
+The default-on workflow `post-merge-verification` gate makes Full Suite evidence a blocking task-completion requirement for merge-capable built-ins without changing branch protection. The gate must refuse approval until the delivery record identifies the landed SHA, the first Full Suite push-to-main run at or after that SHA with its run ID and SHA, conclusions for Pipeline smoke and Test shards 1/4 through 4/4, and all four `test-timings-shard-1` through `test-timings-shard-4` artifacts. The `post-merge-evidence-gate` downloads the Pipeline smoke report and fails closed unless its current-manifest census is exactly 41 unique passing records within the fixed 175000ms budget; its normalized artifact retains that duration and count alongside the shard failure sets. When a shard fails before Vitest starts, the shard runner writes a collector-compatible diagnostic timing payload with an empty assertion list and the failed stage; the normalized artifact preserves that payload without fabricating a failed test name. When a producer artifact is absent, malformed, duplicated, or cannot be downloaded, the reached collector instead retains a versioned incomplete diagnostic manifest and then fails: that manifest is inspectable failure evidence only, never a substitute for the four genuine timing artifacts, valid Pipeline smoke report, or first eligible hosted-run requirement. Full Suite conclusions are non-blocking signals: a failed lane needs an explicit evidence-backed disposition, not a fabricated successful conclusion. A pre-landing run, an unrelated main run, partial artifacts, or local verification are not substitutes; record the verified GitHub-hosted evidence and every non-success disposition in the task delivery record before final approval.
 
 <!-- FNXC:MergeGatePerformance 2026-08-16-10:41: FN-9122 corrected the W33 composition ledger: all 15 static validators, all 21 engine-core files, every PG/unit canary, nonzero propagation, and CI-shape-after-success remain blocking; a timing win that weakens any of those contracts is not accepted. -->
 **Static-validator and lane ordering:** `test:gate:static` declares the 15 canonical, directly runnable read-only validators. `scripts/run-static-gate-checks.mjs` starts them concurrently and waits for **every** result, so zero, one, or multiple policy failures remain fail-closed and observable before tests start. It then starts `engine-core`, `test:pg-gate`, and `test:unit-gate` concurrently; the shell waits for all **three** and returns nonzero if any fail. CI-shape runs only after that successful wait.
@@ -59,6 +59,8 @@ The initial harness wiring made a 27-worker PostgreSQL directory run worse, even
 <!-- FNXC:PgTestProvisioning 2026-08-22-17:08: FN-152 makes a durable local PostgreSQL test server opt-in because a postmaster derives `$libdir` from its executable and cannot survive deletion of an in-worktree payload. -->
 
 Use `pnpm pg:test:up`, `pnpm pg:test:status`, and `pnpm pg:test:down`; forward flags as `pnpm pg:test:up -- --replace` and `pnpm pg:test:down -- --purge`. The script stages the pinned embedded PostgreSQL binaries under `~/.fusion/pg-test-server` (or `FUSION_PG_TEST_SERVER_HOME`) and never starts a relative or worktree-native executable. `dynamic_library_path` cannot repair `$libdir/plpgsql` because PostgreSQL resolves that path from its executable.
+
+On Darwin, `pnpm pg:test:status` is supported for a manually provisioned local target and performs only target resolution plus read-only health probes. It cannot start, stop, replace, repair, clean, create roles, or create databases. `pnpm pg:test:up` and `pnpm pg:test:down` remain explicitly refused on Darwin; configure `FUSION_PG_TEST_URL_BASE` for the local server you operate yourself.
 
 The configured identity follows `postgres@3.4.9`: role is URL username, then `PGUSERNAME`, `PGUSER`, and the OS user; password is URL password then `PGPASSWORD`; database is URL path, then `PGDATABASE`, then the role name. A role-only repair therefore still fails when its role-named database is absent. The readiness gate runs configured login, PL/pgSQL, maintenance, and admin-DDL probes. A bare or CI-shaped probe is diagnostic-only unless its independently resolved role/database is one the script provisions; no harness connect dials a path-less base URL.
 
@@ -509,6 +511,21 @@ expand `pnpm test` or the merge gate. The non-blocking `Pipeline smoke tier` job
 PostgreSQL service; never add it to `pr-checks.yml`, branch protection, or the
 engine-core allow-list.
 
+<!-- FNXC:PipelineSmoke 2026-10-15-00:58: FN-9551 retained the fixed watchdog after a first hosted overrun and added diagnostic-only scenario starts, so an incomplete report identifies ongoing production work without lowering the strict completion census. -->
+**Incomplete-run evidence:** Full Suite run `38660462920` reached 175018 ms of the fixed
+175000 ms watchdog with 40 completed records and `S17/builtin:coding/post-merge` missing.
+The artifact's last completed record was Coding S17 `merge-in-flight`; it contained no Vitest
+JSON report, so it was an in-progress producer rather than a valid partial result. The incident
+was a first suite-only observation: the focused Coding S17 file passed in 48.1 s and a local
+`pnpm smoke:pipeline` passed all 41 records in 152924 ms. Do not raise the budget, workers,
+or timeouts to reproduce or address it. Every scenario now writes a redacted `started` event;
+on timeout, the retained failure report includes the uncompleted scenario key, its
+`scenario-execution` stage, and elapsed time, while only terminal records count toward the exact
+41 unique passing-record census. Use `pnpm smoke:pipeline` for an end-to-end reproduction and
+inspect `packages/engine/.pipeline-smoke-report.json`; GitHub-hosted evidence remains required
+for post-merge approval. A second sighting follows the file-level quarantine policy recorded in
+the observed suite-only flakes register.
+
 <!-- FNXC:PipelineSmoke 2026-09-12-22:57: FN-9291 keeps the opt-in lane observable from the ordinary engine test project without making its Git/PostgreSQL composition part of the merge gate. -->
 **Import-integrity ratchet:** Engine TypeScript configuration excludes `src/__tests__/**/*`, and this opt-in project is excluded from `engine-default`. Consequently, a test-only named import of a deleted engine export can evade typecheck, build, `verify:fast`, and the merge gate until the full smoke lane runs. `pipeline-smoke-import-integrity.test.ts` runs in `engine-default` and resolves each non-type named relative import from pipeline-smoke modules against its runtime module namespace, failing with the importer, specifier, and missing binding. When product behavior is removed, delete the tests that assert that retired behavior in the same change rather than restoring a compatibility stub.
 
@@ -570,10 +587,17 @@ missing, unexpected, duplicate, malformed, truncated, failing, or wedged records
 full invocation-key set. On any failed run, the same upload-path report is atomically replaced with
 bounded evidence: watchdog outcome, elapsed duration, Vitest/scenario-report availability, complete
 record count and final complete invocation, missing declared keys, and a truncated final JSONL record
-when present. S17 continues to cover all three built-in workflows at planning, execution, review,
-merge-in-flight, and post-merge, including the `builtin:coding-ideas-v2` post-merge boundary; its
-independent workflow tasks share each restart-stage fixture lifecycle to avoid repaying setup work
-without reducing restart-once coverage.
+when present.
+
+<!-- FNXC:PipelineSmoke 2026-10-04-10:27: FN-9470 preserves the fixed watchdog and full scenario census by using fork workers, so each disposable fixture owns its HOME/TMPDIR lifecycle without serializing independent worker files through shared process environment state. -->
+S17 continues to cover all three built-in workflows at planning, execution, review, merge-in-flight,
+and post-merge, including the `builtin:coding-ideas-v2` post-merge boundary. Each workflow's five
+restart cases share one disposable fixture while the unchanged three-worker fork-worker envelope keeps
+HOME/TMPDIR fixture ownership process-local. A timeout atomically replaces stale success with its
+complete partial evidence, including the final completed invocation, absent Vitest output, and every
+missing manifest key. A hosted push-to-main artifact is required proof: it must report exactly 41
+unique passing manifest keys, `passed: true`, and `durationMs <= 175000`; local Vitest evidence is a
+supported diagnostic substitute on Darwin, not delivery evidence.
 
 Each scenario declares one closed terminal state: `merged-done`, `inert-intake`,
 `parked`, `manual-hold`, or `no-op-merge`. The harness fails on an undeclared terminal

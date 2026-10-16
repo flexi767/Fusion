@@ -12,7 +12,11 @@ import type {
   WorkflowStepNotRunReason,
 } from "@fusion/core";
 import { BUILTIN_CODING_WORKFLOW_IR, FAST_LANE_SKIP_VALUE, FAST_MODE_BYPASS_ACTOR, PLAN_REVIEW_GROUP_ID, WORKFLOW_STEP_NOT_RUN_REASONS, WorkflowIrError, computeWorkflowIrPin, getWorkflowExtensionRegistry, instanceNodeId, resolveFastLaneRoute, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled, isPlanReviewSatisfied, parseNoOpCompletionMarker, requiresContentReviewProof, resolveRequiredPreMergeStepIds } from "@fusion/core";
-import { isNonPlanDefectPlanReviewFailure } from "../errors/transient-error-detector.js";
+import {
+  DEPENDENCY_BOOTSTRAP_CONFIGURATION_REQUIRED_VALUE,
+  isDependencyBootstrapConfigurationBlock,
+  isNonPlanDefectPlanReviewFailure,
+} from "../errors/transient-error-detector.js";
 import { isSessionContentionError } from "../errors/transient-error-patterns.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "../execution/required-workflow-artifacts.js";
 
@@ -164,6 +168,7 @@ export type WorkflowNodeAbortKind = "engine-pause";
 export const WORKFLOW_INTERRUPTED_NODE_ID_CONTEXT_KEY = "workflow:interruptedNodeId";
 export const WORKFLOW_INTERRUPTED_NODE_ABORT_KIND_CONTEXT_KEY = "workflow:interruptedNodeAbortKind";
 export const WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY = "workflow:optionalGroupActive";
+export const WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY = "workflow:optionalGroupPhase";
 /** Explicit parent marker for template execution; never inferred from template labels or output. */
 export const WORKFLOW_REVIEW_KIND_CONTEXT_KEY = "workflow:reviewKind";
 export const WORKFLOW_BLOCKING_SEVERITY_CONTEXT_KEY = "workflow:blockingSeverity";
@@ -1213,6 +1218,7 @@ export class WorkflowGraphExecutor {
               const optionalGroupContext = {
                 ...(contextOverride ?? context),
                 [WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]: node.id,
+                [WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY]: stepPhase,
                 ...(this.workflowReviewKind(node) ? { [WORKFLOW_REVIEW_KIND_CONTEXT_KEY]: this.workflowReviewKind(node) } : {}),
                 ...(this.workflowBlockingSeverity(node) ? { [WORKFLOW_BLOCKING_SEVERITY_CONTEXT_KEY]: this.workflowBlockingSeverity(node) } : {}),
               };
@@ -1552,15 +1558,19 @@ export class WorkflowGraphExecutor {
             ));
           if (nonPlanDefectPlanReviewFailure) {
             /*
-             * FNXC:PlanReviewReplan 2026-07-15-16:35:
-             * FN-7977: a classified provider/model/transport failure is a retryable
-             * hold, not a Plan Review REVISE. Do not traverse the built-in failure
-             * edge to plan-replan without remediation context; the executor retries
-             * this explicit hold in place and preserves advanced execution state.
+             * FNXC:DependencyBootstrap 2026-10-01-03:05:
+             * FN-9438 configuration evidence is not a provider outage. Preserve its distinct value so
+             * the graph-failure owner can hold for an operator command without consuming retry budget.
              */
+            const holdValue = isDependencyBootstrapConfigurationBlock({
+              failureValue: verdictRaw,
+              errorMessage: stepOutput ?? stepNotes,
+            })
+              ? DEPENDENCY_BOOTSTRAP_CONFIGURATION_REQUIRED_VALUE
+              : PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE;
             context[`node:${node.id}:outcome`] = "failure";
-            context[`node:${node.id}:value`] = PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE;
-            return { outcome: "failure", value: PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE };
+            context[`node:${node.id}:value`] = holdValue;
+            return { outcome: "failure", value: holdValue };
           }
           if (shouldRequestPreMergeFix) {
             const feedback = stepOutput?.trim()

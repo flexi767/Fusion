@@ -76,6 +76,12 @@ export function rowToTask(row: TaskRow): Task {
     worktree: row.worktree || undefined,
     blockedBy: row.blockedBy || undefined,
     overlapBlockedBy: row.overlapBlockedBy || undefined,
+    /*
+    FNXC:FileScopeRecovery 2026-10-12-16:07:
+    A safe overlap release must survive PostgreSQL hydration; otherwise a restart
+    silently recreates the speculative claim that Clear already proved safe.
+    */
+    fileScopeLeaseRelease: fromJson<Task["fileScopeLeaseRelease"]>(row.fileScopeLeaseRelease) ?? undefined,
     queuedLogEpisodeSignature: row.queuedLogEpisodeSignature || undefined,
     paused: row.paused ? true : undefined,
     pausedReason: row.pausedReason || undefined,
@@ -126,6 +132,7 @@ export function rowToTask(row: TaskRow): Task {
     postReviewFixCount: row.postReviewFixCount ?? undefined,
     planReviewReplanCount: row.planReviewReplanCount ?? undefined,
     recoveryRetryCount: row.recoveryRetryCount ?? undefined,
+    recoveryDisposition: (row.recoveryDisposition || undefined) as Task["recoveryDisposition"],
     sessionContentionHoldCount: row.sessionContentionHoldCount ?? undefined,
     sessionContentionWaitReason: row.sessionContentionWaitReason ?? undefined,
     taskDoneRetryCount: row.taskDoneRetryCount ?? undefined,

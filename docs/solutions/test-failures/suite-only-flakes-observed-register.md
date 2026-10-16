@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **3 active observation records** (entries 2, 13, and 18), all **active first sightings**. Entries 1 and 15 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **12 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **5 active observation records** (entries 2, 13, 20, 21, and 22), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **12 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -267,24 +267,61 @@ The failure occurred while validating FN-9334's unrelated resume-eligibility cas
 
 ### 18. Triage rate-limit retry log warning timer ordering
 
-- **Status:** Active first sighting — recorded 2026-09-24, unattributed.
+- **Status:** Closed 2026-10-05 — structurally resolved by FN-9498; no quarantine.
 - **File:** `packages/engine/src/__tests__/triage.test.ts`
-- **Exact test:** `specifyTask — status restore failure diagnostics > logs warning when logEntry fails during rate-limit retry`
-- **Observed tree/SHA:** `d486a4c275` (FN-9389 register-only commit).
-- **Observed frequency:** 1 sighting, Full Suite push shard 2 only.
+- **Exact tests:** `specifyTask — status restore failure diagnostics > logs warning when logEntry fails during rate-limit retry`; `specifyTask — status restore failure diagnostics > logs warning when transient-error retry status update fails`
+- **Original observed tree/SHA:** `d486a4c275` (FN-9389 register-only commit).
+- **Second observed tree/SHA:** `9f06d4fe16404f72c5d25ad97ebcfa93d4843b8c`.
+- **Observed frequency:** The original rate-limit identity had two shard-2 sightings; the transient-status identity was a new single sighting in the second run.
 
-Push Full Suite run [36053028228](https://github.com/Runfusion/Fusion/actions/runs/36053028228), shard 2 artifact `test-timings-shard-2` (`packages/engine/.timings/timings-shard2-1.json`), reported `STACK_TRACE_ERROR` at `triage.test.ts:6701` after 30032 ms. The shard completed 254 sibling tests; the three real-timer diagnostics in this describe passed. This is a high-value file, so it remains in the suite under the first-sighting exception.
+Push Full Suite run [36053028228](https://github.com/Runfusion/Fusion/actions/runs/36053028228), shard 2 artifact `test-timings-shard-2` (`packages/engine/.timings/timings-shard2-1.json`), reported `STACK_TRACE_ERROR` at `triage.test.ts:6701` after 30032 ms. The shard completed 254 sibling tests; the three real-timer diagnostics in this describe passed.
 
-No production retry race was established. `withRateLimitRetry` calls the non-awaited retry-log callback before registering its sleep, and a rejected `logEntry` is caught solely to warn without delaying a successful second prompt. The test had waited for any fake timer before advancing 60 seconds; the planning turn's 90-minute guard can exist first, so the original drain could advance before the retry sleep was installed. The regression now stubs the unrelated host capability probe, waits for the observable `Rate limited — retry` log, flushes once to prove the retry timer is registered, keeps the 60-second advancement and warning assertion, and completes the same production `specifyTask` path.
+Push Full Suite run [37260134709](https://github.com/Runfusion/Fusion/actions/runs/37260134709), job `111605429056`, ran `vitest run --silent=passed-only --reporter=dot --project=engine-default --project=engine-reliability --shard=2/2`. At `2026-10-05T03:58:14Z`, the rate-limit test had made zero retry-log calls and the following transient-status test timed out at 30000 ms. Its stderr shows the abandoned FN-207 work later consuming FN-208's mock queues, proving test cleanup contamination rather than a product retry defect.
+
+FN-9498 removed the arbitrary fake-clock polling. The rate-limit test waits for its own production retry-log callback, then verifies one registered retry backoff, successful `specifyTask` settlement, and the best-effort warning after a rejected `logEntry`. The transient-status test independently verifies the attempted first bounded recovery write (`recoveryRetryCount: 1` and `nextRecoveryAt`), no terminal state, its warning, and spy cleanup. `withRateLimitRetry` and production triage policy were unchanged: the callback remains before backoff and the rejected persistence remains non-blocking.
 
 | control | result |
 |---|---|
 | push run 36034454035 (`c76cb158`) | passed in 26.2 ms |
 | push run 35991562171 (`618204ad`) | passed in 39.8 ms |
-| current exact test | passed with the 429 → retry sleep → failed log write → warning → successful retry contract |
-| current four-case diagnostics describe | passed; rate-limit fake-timer and three real-timer warning diagnostics retained |
+| FN-9498 diagnostics describe | passed; both failure injections completed through real `specifyTask` behavior |
+| FN-9498 complete triage file | passed 255 tests in 6.9 s with the rate-limit and transient-status diagnostics retained |
 
-A **second sighting** of this exact test requires same-change file-level quarantine in `scripts/lib/test-quarantine.json` and a matching `engine-default` Vitest exclusion. Do not add retries, widen the timeout, remove the fake-timer drain, or weaken the warning assertion.
+The rate-limit identity was a repeated test-only failure, but a demonstrated structural test repair resolves it; quarantine would discard valuable coverage after the cause has been fixed. A future sighting is a new observation and follows the normal deletion-ratchet policy.
+
+### 20. ProjectEngine research recall composition ordering
+
+- **Status:** Active first sighting — recorded 2026-10-04, unattributed.
+- **File:** `packages/engine/src/__tests__/project-engine.test.ts`
+- **Exact test:** `ProjectEngine research recall composition > persists finalized research through ProjectEngine's live recall composition`
+- **Observed tree/SHA:** `56a86a3437` during FN-9471 focused three-file engine verification.
+- **Observed frequency:** 1 sighting in the combined three-file command; exact test passed alone.
+
+The combined ProjectEngine/workspace-merger verification observed an empty recall list after the real detached writer was flushed. The exact test passed immediately in a file-scoped rerun, retaining its production `ProjectEngine` composition, real PostgreSQL layer, writer drain, and persisted-recall assertion. No timeout, retry, quarantine, or assertion weakening was applied. A second sighting requires same-change file-level quarantine under the repository deletion-ratchet policy.
+
+### 21. Agent Detail legacy skill discovery ordering
+
+- **Status:** Active first sighting — recorded 2026-10-05 by FN-9506; deterministic test repair landed, with a second sighting requiring file-level quarantine.
+- **File:** `packages/dashboard/app/components/__tests__/AgentDetailView.core.test.tsx`
+- **Exact test:** `AgentDetailView — core > loads compatible legacy skill details through the resolved canonical ID`
+- **Observed tree/SHA:** Full Suite run [37279527225](https://github.com/Runfusion/Fusion/actions/runs/37279527225), `52e790446dbcfff118e4c6150056cec3d090da0c`.
+- **Observed frequency:** One complete shard-3 reporter sighting; the exact focused test passed in isolation.
+
+The verified `test-timings-shard-3` artifact (`11332755977`, SHA-256 `85a8465f96e26a8ec9f0d80ff9f051f6a9e66673a0042fdd18c2d434a7577ec4`) reported the badge as `pending` rather than `auto-available` at `AgentDetailView.core.test.tsx:507` after 58.443616 ms. The shard command was `pnpm test:ci:shard --shard 3 --total 4`; its dashboard reporter was otherwise complete (176 suites, 6,008 passing tests, one failure).
+
+FN-9506 reproduced the pending-to-resolved transition with a deferred discovery response. It preserves the stored legacy reference in the tooltip, proves a pending click makes no content request, waits for `data-skill-state="auto-available"`, and then proves one `fetchSkillContent(canonicalId, projectId)` request. Production code was unchanged: `AgentDetailView` deliberately mounts skill discovery only after the agent has loaded, so agent-before-discovery is the reachable lifecycle. No retry, timeout, skip, or weakened assertion was introduced. The file has 55 focused cases and is outside the thin merge gate, so this high-value first sighting remains recorded rather than quarantined. A second sighting of this file requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
+
+### 22. Pipeline smoke Coding S17 post-merge restart
+
+- **Status:** Active first sighting — recorded 2026-10-15 by FN-9551; no quarantine.
+- **File:** `packages/engine/src/__tests__/pipeline-smoke/pipeline-restart-coding.pipeline.test.ts`
+- **Exact test:** `pipeline smoke: Coding restart scenarios > S17 runs every Coding restart stage through one fixture lifecycle` (`builtin:coding`, `post-merge` record).
+- **Observed tree/SHA:** Full Suite run [38660462920](https://github.com/Runfusion/Fusion/actions/runs/38660462920), `0a427caf1fa2a3ba04b70d887686ca9c9e31942c`.
+- **Observed frequency:** One hosted Pipeline smoke sighting; the focused test and one full local smoke reproduction passed.
+
+The retained `pipeline-smoke-report` artifact recorded a watchdog timeout at 175018 ms against the unchanged 175000 ms budget. It retained 40 completed records, last completed `S17/builtin:coding/merge-in-flight`, and exactly one missing key: `S17/builtin:coding/post-merge`. The report contained no malformed line and no Vitest result JSON, proving the producer was still executing rather than accepting a partial census.
+
+FN-9551 ran the unchanged focused engine-pipeline-smoke Coding S17 file successfully in 48.1 s and `pnpm smoke:pipeline` successfully in 152924 ms with all 41 unique passing records; Coding S17 post-merge completed once in 5769 ms. The incident did not reproduce locally. FN-9550 changes only PostgreSQL cleanup/status support and does not cross this runner or S17 execution path. The smoke report now retains a redacted start event so a future watchdog failure names the in-flight scenario, `scenario-execution` stage, and elapsed time while the 41-record census still fails closed. The file retains five real Git/PostgreSQL restart stages and valuable production coverage, so this first isolated observation is registered rather than quarantined. A second sighting requires same-change file-level quarantine under the deletion ratchet.
 
 ### Common shape and investigated result
 
@@ -800,29 +837,21 @@ self-tests spawned `pnpm --filter @fusion/dashboard test`, re-entering the suite
 
 ---
 
-## Entry: `executor-prompt` pause-resume agent-creation count (first sighting)
+## Entry: `executor-prompt` pause-resume agent-creation count (quarantined second sighting)
 
+- **Status:** Quarantined 2026-10-05 by FN-9510 under the deletion ratchet; delete the file, ledger row, and engine-default exclusion after 2026-10-19 unless a non-appeasement root-cause repair rescues it.
 - **File:** `packages/engine/src/__tests__/executor-prompt.test.ts`
 - **Exact test:** `TaskExecutor pause behavior > resumes unpaused in-progress task with no active session`
-- **Owner:** unowned — first sighting, recorded rather than quarantined because the file's remaining 113 tests are substantial coverage and quarantine is file-level.
-- **Observed tree/SHA:** `5769d5cd6` plus the then-uncommitted main-checkout-guard narrowing (guard classification, its audit metadata, and the workspace prompt string) — none of which this test exercises.
-- **Observed frequency:** once, and only when the file ran in the same vitest command as five other executor/workspace files. Passes deterministically alone (114/114).
+- **Observed trees/SHAs:** [run 33034719148](https://github.com/Runfusion/Fusion/actions/runs/33034719148) at `5769d5cd610e8830be24c4ede6eb79b38d2143c1`, and [run 37339500295](https://github.com/Runfusion/Fusion/actions/runs/37339500295) at `1a648d35d3987a6722b221e37df3084f75df6f0d`.
+- **Observed frequency:** two shard/multi-file sightings. The first record's six-file arrangement and the current isolated file both passed locally; the current hosted shard failed with 564 reported engine results.
 
-Verbatim observed failure:
+The second-sighting timing artifact [`11358593242`](https://github.com/Runfusion/Fusion/actions/runs/37339500295) reports the exact identity failed in 79.776822 ms at `executor-prompt.test.ts:1083:51` with `AssertionError: expected 0 to be greater than or equal to 2`. Post-merge artifact `11359244080` confirms it was the only failed engine identity in shard 2. The original assertion is retained unchanged; only routine engine-default discovery excludes the file.
 
-```
-FAIL |engine-default| src/__tests__/executor-prompt.test.ts > TaskExecutor pause behavior > resumes unpaused in-progress task with no active session
-AssertionError: expected 0 to be greater than or equal to 2
- ❯ src/__tests__/executor-prompt.test.ts:1047:51
-```
-
-| run | result |
+| evidence | result |
 |---|---|
-| six files in one command (`task-done-refusal-x-invariant`, `executor-workspace`, `executor-prompt`, `verify-worktree-invariants-missing`, `executor-workspace-config-propagation`, `executor-workspace-capture`) | **failed** — 1 failed / 147 passed |
-| `executor-prompt.test.ts` alone, same tree | **passed** (114/114) |
+| first sighting: six files in one command (`task-done-refusal-x-invariant`, `executor-workspace`, `executor-prompt`, `verify-worktree-invariants-missing`, `executor-workspace-config-propagation`, `executor-workspace-capture`) | **failed** — 1 failed / 147 passed |
+| first sighting: `executor-prompt.test.ts` alone | **passed** (114/114) |
+| FN-9510: current `executor-prompt.test.ts` alone | **passed** in 6.3s |
+| FN-9510: documented six-file engine-default arrangement | **passed** in 8.6s |
 
-The assertion counts `createFnAgent` calls after a resume and observed ZERO, so the resume path never
-reached agent creation at all — reads as module-mock ownership racing across files that share the
-`@fusion/core` agent-factory mock, not a wait that needs lengthening. No timeout was widened, no retry
-added, and no assertion relaxed. A SECOND sighting is an ordinary on-sight quarantine with no further
-discretion, per the standing rule in AGENTS.md.
+The assertion counts `createFnAgent` calls after a resume and observed zero only in broad shard/multi-file execution. FN-9510 traced the production `task:updated` listener through its synchronous single-flight claim, pause/dependency admission, active session/graph re-check, resume log, and graph-owned execution handoff; no reachable resume invariant violation was found. No timeout was widened, no retry added, and no assertion relaxed. This is therefore a file-level quarantine rather than a product repair, with healthy coverage intentionally excluded until the 14-day deletion deadline.

@@ -1,4 +1,4 @@
-import { resumeMissingPostMergeGate } from "./merge/post-merge-gate-reseed.js";
+import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./merge/post-merge-gate-reseed.js";
 /**
  * SelfHealingManager — enables unattended multi-day/week operation by
  * providing automatic recovery from common failure modes.
@@ -29,13 +29,14 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSy
 import { readFile } from "node:fs/promises";
 import { tmpdir, hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type MoveTaskOptions, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
+import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type MoveTaskOptions, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
 
   resolveNearDuplicateCanonicalFlags,
   LEGACY_COLUMN_IDS_BY_ROLE,
   TERMINAL_ROLES,
   resolveProjectColumnsForRoles,
   REVIEW_ROLES,
+  DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS,
   pruneTaskLifecycleEvents,
   pruneGitHubCheckStatesAsync,
   resolveAgentActivityAttribution,
@@ -46,6 +47,8 @@ import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, loadWorkspaceConfig, type TaskMoveLane
   isTaskExternallyBlocked,
   isTaskLogWriteRefusal,
   hasNonTerminalSteps,
+  isBuiltinWorkflowRoleAgent,
+  isWorkflowPrincipalEligible,
   fileScopeLeaseBlocksCandidate,
   normalizeOverlapScopeForTask,
   resolveWorktreePathReservationDirectory,
@@ -402,6 +405,8 @@ const PRE_EXECUTION_WORKTREE_MAX_IDLE_MS = 30 * 24 * 60 * 60 * 1000;
 export interface SelfHealingOptions {
   /** Project root directory (parent of .worktrees/) */
   rootDir: string;
+  /** Refreshes authoritative provider PR state before external-merge recovery. */
+  reconcileFreshExternalPrs?: () => Promise<number>;
   /** Injected only by tests; production uses exact profile + daemon-ancestry discovery. */
   reapExpiredFusionBrowserLeases?: () => Promise<number>;
   /*
@@ -775,6 +780,22 @@ const DEFAULT_UNBACKED_MERGING_FANOUT_GRACE_MS = 60_000;
 const DURABLE_ERROR_RECOVERY_BASE_COOLDOWN_MS = 30_000;
 const DURABLE_ERROR_RECOVERY_MAX_COOLDOWN_MS = 15 * 60_000;
 const RUNNING_ON_INACTIVE_TASK_STALE_RUN_MS = PARKED_AGENT_LINK_FRESH_RUN_MS;
+const UNAVAILABLE_OWNER_HEARTBEAT_STALE_MULTIPLIER = 1.5;
+const MIN_UNAVAILABLE_OWNER_HEARTBEAT_STALE_MS = 10 * 60_000;
+
+function hasRecentDurableOwnerHeartbeat(agent: Agent, now: number): boolean {
+  const heartbeatAt = agent.lastHeartbeatAt ? Date.parse(agent.lastHeartbeatAt) : Number.NaN;
+  if (!Number.isFinite(heartbeatAt)) return false;
+  const configuredInterval = agent.runtimeConfig?.heartbeatIntervalMs;
+  const intervalMs = typeof configuredInterval === "number" && Number.isFinite(configuredInterval) && configuredInterval > 0
+    ? configuredInterval
+    : DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS;
+  const staleAfterMs = Math.max(
+    MIN_UNAVAILABLE_OWNER_HEARTBEAT_STALE_MS,
+    intervalMs * UNAVAILABLE_OWNER_HEARTBEAT_STALE_MULTIPLIER,
+  );
+  return now - heartbeatAt <= staleAfterMs;
+}
 
 function bumpTaskPriority(priority: TaskPriority | undefined): TaskPriority {
   switch (priority ?? "normal") {
@@ -978,6 +999,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
   private readonly githubCheckStateRetentionLastPrunedAt = new Map<string, number>();
   private readonly processBootStartedAt = Date.now();
   private lastDbCorruptionNotifiedAt: number | null = null;
+  private reconcileFreshExternalPrs?: () => Promise<number>;
 
   private boardStallWindow: {
     windowStartMs: number;
@@ -1010,6 +1032,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     /* U4 substrate PR1: the git-evidence readers moved to a base class, so this
        derived constructor needs an explicit super(). No other change. */
     super();
+    this.reconcileFreshExternalPrs = options.reconcileFreshExternalPrs;
   }
 
   /*
@@ -2002,6 +2025,14 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       every subsequent restart untouched.
       */
       { name: "reconcile-stranded-workflow-continuations", fn: () => this.reconcileStrandedWorkflowContinuations().then(() => undefined) },
+      /*
+      FNXC:ProgressOwningRecovery 2026-10-06-15:13:
+      A restart is the most likely point for the transition-pending marker to lose its
+      post-commit clearer. Recover it before any lifecycle classifier decides that a
+      card has no owner; waiting for periodic maintenance leaves a dispatchable card
+      stationary through the entire first maintenance interval.
+      */
+      { name: "recover-stale-transition-pending", fn: () => this.runStaleTransitionPendingSweep() },
       { name: "completed-tasks", fn: () => this.recoverCompletedTasks().then(() => undefined) },
       { name: "recover-stranded-completed-todo", fn: () => this.recoverStrandedCompletedTodoTasks().then(() => undefined) },
       { name: "recover-advanced-triage", fn: () => this.recoverAdvancedTriageTasks().then(() => undefined) },
@@ -2052,6 +2083,13 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       { name: "recover-orphan-only-scope-violations", fn: () => this.recoverOrphanOnlyScopeViolations().then(() => undefined) },
       { name: "recover-stuck-merge-deadlocks", fn: () => this.recoverStuckMergeDeadlocks().then(() => undefined) },
       { name: "misclassified-failures", fn: () => this.recoverMisclassifiedFailures().then(() => undefined) },
+      /*
+      FNXC:ProgressOwningRecovery 2026-10-06-15:13:
+      Abort parks are engine-owned retry states, not operator holds. Run their
+      bounded recovery at startup as well as maintenance so a process crash cannot
+      leave an otherwise eligible non-terminal card waiting for the next sweep.
+      */
+      { name: "recover-paused-abort-failures", fn: () => this.recoverPausedAbortFailures().then(() => undefined) },
       { name: "partial-progress-no-task-done", fn: () => this.recoverPartialProgressNoTaskDoneFailures().then(() => undefined) },
       { name: "orphaned-executions", fn: () => this.recoverOrphanedExecutions().then(() => undefined) },
       { name: "approved-triage", fn: () => this.recoverApprovedTriageTasks().then(() => undefined) },
@@ -2073,9 +2111,17 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         },
       },
       { name: "recover-running-on-inactive-tasks", fn: () => this.recoverAgentsRunningOnInactiveTasks().then(() => undefined) },
+      { name: "recover-unavailable-queued-agent-ownership", fn: () => this.recoverUnavailableQueuedAgentOwnership().then(() => undefined) },
       { name: "recover-drifted-agent-task-links", fn: () => this.recoverDriftedAgentTaskLinks().then(() => undefined) },
       { name: "reconcile-soft-delete-column-drift", fn: () => this.reconcileSoftDeletedColumnDrift().then(() => undefined) },
       { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy().then(() => undefined) },
+      /*
+      FNXC:ProgressOwningRecovery 2026-10-06-15:13:
+      A paused scope holder with blocked followers has an automatic recovery owner.
+      Apply the normal age-gated rebound during startup before dependency repair so
+      followers can make progress without waiting for the periodic maintenance pass.
+      */
+      { name: "auto-rebound-paused-scope-decay", fn: () => this.autoReboundPausedScopeDecay().then(() => undefined) },
       { name: "reconcile-self-defeating-deps", fn: () => this.reconcileSelfDefeatingDependencies().then(() => undefined) },
       { name: "reconcile-missing-dependencies", fn: () => this.reconcileMissingDependencies().then(() => undefined) },
       { name: "reconcile-dependency-blocking-leases", fn: () => this.reconcileDependencyBlockingLeases().then(() => undefined) },
@@ -2096,6 +2142,13 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       { name: "surface-in-review-stalled", fn: () => this.surfaceInReviewStalled(startupSurfacing()).then(() => undefined) },
       { name: "surface-stale-paused-reviews", fn: () => this.surfaceStalePausedReviews(startupSurfacing()).then(() => undefined) },
       { name: "surface-stale-paused-todos", fn: () => this.surfaceStalePausedTodos(startupSurfacing()).then(() => undefined) },
+      /*
+      FNXC:ProgressOwningRecovery 2026-10-06-15:13:
+      Run the detector after all specialized recovery owners have had one chance.
+      It remains non-mutating, but an unknown stranded shape is now surfaced on
+      restart rather than silently waiting for the first maintenance interval.
+      */
+      { name: "detect-stalled-cards", fn: () => this.detectStalledCards().then(() => undefined) },
       { name: "audit-no-commits-expected-candidates", fn: () => this.auditNoCommitsExpectedCandidates().then(() => undefined) },
     ];
 
@@ -3121,6 +3174,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns() },
           { name: "reattach-orphaned-assigned-executions", fn: () => this.reattachOrphanedAssignedExecutions() },
           { name: "recover-running-on-inactive-tasks", fn: () => this.recoverAgentsRunningOnInactiveTasks() },
+          { name: "recover-unavailable-queued-agent-ownership", fn: () => this.recoverUnavailableQueuedAgentOwnership() },
           { name: "recover-drifted-agent-task-links", fn: () => this.recoverDriftedAgentTaskLinks() },
           { name: "reconcile-soft-delete-column-drift", fn: () => this.reconcileSoftDeletedColumnDrift() },
           { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy() },
@@ -3460,7 +3514,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         if (task.mergeDetails?.mergeConfirmed === true) {
           const evidenceBlocker = await getRequiredPostMergeEvidenceBlocker(this.store, task);
           if (evidenceBlocker) {
-            if ((await getRequiredPostMergeEvidenceDecision(this.store, task)).outcome === "resumable") await resumeMissingPostMergeGate(this.store, task.id);
+            await resumeMissingPostMergeGate(this.store, task.id);
             log.debug(`${task.id} remains blocked pending post-merge evidence: ${evidenceBlocker}`);
             continue;
           }
@@ -3583,7 +3637,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         if (task.mergeDetails?.mergeConfirmed === true) {
           const evidenceBlocker = await getRequiredPostMergeEvidenceBlocker(this.store, task);
           if (evidenceBlocker) {
-            if ((await getRequiredPostMergeEvidenceDecision(this.store, task)).outcome === "resumable") await resumeMissingPostMergeGate(this.store, task.id);
+            await resumeMissingPostMergeGate(this.store, task.id);
             log.debug(`${task.id} remains blocked pending post-merge evidence: ${evidenceBlocker}`);
             continue;
           }
@@ -3826,7 +3880,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             if (live.mergeDetails?.mergeConfirmed === true) {
               const evidenceBlocker = await getRequiredPostMergeEvidenceBlocker(this.store, live);
               if (evidenceBlocker) {
-                if ((await getRequiredPostMergeEvidenceDecision(this.store, live)).outcome === "resumable") await resumeMissingPostMergeGate(this.store, live.id);
+                await resumeMissingPostMergeGate(this.store, live.id);
                 log.debug(`${live.id} remains blocked pending post-merge evidence: ${evidenceBlocker}`);
                 continue;
               }
@@ -4211,14 +4265,14 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
    * Backward lifecycle move gated on triple proof (FN-5335).
    * When the predicate fails, emits `task:reclaim-pr-conflict-no-action` and skips lifecycle mutation.
    */
-  async reclaimPrConflictForTask(taskId: string): Promise<{ outcome: "reclaimed" | "stale-resolved" | "tip-already-merged" | "paused-unrecoverable" | "skipped"; reason?: string; perPr?: Array<{ number: number; outcome: "reclaimed" | "stale-resolved" | "tip-already-merged" | "paused-unrecoverable" | "skipped"; reason?: string }> }> {
+  async reclaimPrConflictForTask(taskId: string): Promise<{ outcome: "reclaimed" | "stale-resolved" | "tip-already-merged" | "paused-unrecoverable" | "escalated-reseed" | "held-by-policy" | "skipped"; reason?: string; perPr?: Array<{ number: number; outcome: "reclaimed" | "stale-resolved" | "tip-already-merged" | "paused-unrecoverable" | "escalated-reseed" | "held-by-policy" | "skipped"; reason?: string }> }> {
     const task = await this.store.getTask(taskId);
     if (!task) return { outcome: "skipped", reason: "task-not-found" };
     const conflictingPrs = (task.prInfos ?? (task.prInfo ? [task.prInfo] : [])).filter((pr) => pr.mergeable === "conflicting");
     if (conflictingPrs.length === 0) {
       return { outcome: "skipped", reason: "no-conflicting-pr" };
     }
-    const withPerPr = (result: { outcome: "reclaimed" | "stale-resolved" | "tip-already-merged" | "paused-unrecoverable" | "skipped"; reason?: string }) => {
+    const withPerPr = (result: { outcome: "reclaimed" | "stale-resolved" | "tip-already-merged" | "paused-unrecoverable" | "escalated-reseed" | "held-by-policy" | "skipped"; reason?: string }) => {
       if (conflictingPrs.length <= 1) {
         return result;
       }
@@ -4438,38 +4492,50 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         retryCount: task.recoveryRetryCount ?? 0,
         settings: (await this.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
       });
-      if (decision.action === "pause") {
-        /*
-        FNXC:BranchConflictRecoveryFence 2026-10-01-08:15:
-        The dispatcher can finish after an operator Retry has reset this failure. Persist its
-        pause only while the inspected recovery generation remains live; otherwise the old sweep
-        would restore branch-conflict-unrecoverable after the successful retry.
-        */
-        let pauseApplied = false;
-        await this.store.updateTaskAtomic(task.id, (live) => {
-          const stillOwnsFailure = live.branch === task.branch
-            && live.worktree === task.worktree
-            && live.status === task.status
-            && live.error === task.error
-            && live.paused === task.paused
-            && live.pausedReason === task.pausedReason
-            && live.userPaused !== true;
-          if (!stillOwnsFailure) return null;
-          pauseApplied = true;
-          return {
-            status: "failed",
-            error: `Task branch conflict: ${task.branch} is not safely reclaimable (${message})`,
-            paused: true,
-            pausedReason: "branch-conflict-unrecoverable",
-          };
-        });
-        if (pauseApplied) {
-          await this.handoffTaskToReview(task.id, "branch-conflict-unrecoverable-repromote");
-          await this.store.logEntry(task.id, `Auto-recovery failed: branch conflict unrecoverable — ${message}`);
-        }
+      if (decision.action === "escalate") {
+        const escalated = await this.reseedExhaustedBranchConflict(task);
+        return withPerPr({ outcome: escalated ? "escalated-reseed" : "skipped", reason: message });
       }
-      return withPerPr({ outcome: "paused-unrecoverable", reason: message });
+      if (decision.action === "pause") {
+        return withPerPr({ outcome: "held-by-policy", reason: message });
+      }
+      return withPerPr({ outcome: "skipped", reason: message });
     }
+  }
+
+  /**
+   * FNXC:RecoveryOwnership 2026-10-06-15:28:
+   * Exhausting branch-conflict retries is evidence to re-run the existing non-destructive
+   * reclaim classifier, not authorization to convert a recoverable card into a manual park.
+   * Keep the current workflow lane intact and fence the reset against an operator pause or a
+   * newer ownership generation so the next maintenance pass owns the conservative reseed.
+   */
+  private async reseedExhaustedBranchConflict(task: Task): Promise<boolean> {
+    let reseeded = false;
+    await this.store.updateTaskAtomic(task.id, (live) => {
+      const stillOwnsFailure = live.branch === task.branch
+        && live.worktree === task.worktree
+        && live.status === task.status
+        && live.error === task.error
+        && live.paused === task.paused
+        && live.pausedReason === task.pausedReason
+        && live.userPaused !== true;
+      if (!stillOwnsFailure) return null;
+      reseeded = true;
+      return {
+        status: null,
+        error: null,
+        paused: false,
+        pausedReason: undefined,
+        recoveryRetryCount: null,
+        recoveryDisposition: "escalated-reseed",
+        nextRecoveryAt: null,
+      };
+    });
+    if (reseeded) {
+      await this.store.logEntry(task.id, "Branch-conflict recovery retry budget escalated to a fenced reclaim reseed");
+    }
+    return reseeded;
   }
 
   /**
@@ -4762,6 +4828,9 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             continue;
           }
           if (inspection.kind === "stale-resolved") {
+            // A missing expected ref does not prove its registered checkout is gone. Acquisition
+            // can rebind a renamed, task-owned branch; clearing the pointers loses that evidence.
+            if (await isUsableTaskWorktree(this.options.rootDir, task.worktree)) continue;
             await this.store.updateTask(task.id, {
               worktree: null,
               branch: null, branchWriteOrigin: "engine" as const,
@@ -5296,29 +5365,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             retryCount: task.recoveryRetryCount ?? 0,
             settings: (await this.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
           });
-          if (decision.action === "pause") {
-            let pauseApplied = false;
-            await this.store.updateTaskAtomic(task.id, (live) => {
-              const stillOwnsFailure = live.branch === task.branch
-                && live.worktree === task.worktree
-                && live.status === task.status
-                && live.error === task.error
-                && live.paused === task.paused
-                && live.pausedReason === task.pausedReason
-                && live.userPaused !== true;
-              if (!stillOwnsFailure) return null;
-              pauseApplied = true;
-              return {
-                status: "failed",
-                error: `Task branch conflict: ${task.branch} is not safely reclaimable (${message})`,
-                paused: true,
-                pausedReason: "branch-conflict-unrecoverable",
-              };
-            });
-            if (pauseApplied) {
-              await this.handoffTaskToReview(task.id, "branch-conflict-unrecoverable-repromote");
-              await this.store.logEntry(task.id, `Auto-recovery failed: branch conflict unrecoverable — ${message}`);
-            }
+          if (decision.action === "escalate") {
+            await this.reseedExhaustedBranchConflict(task);
           }
         }
       }
@@ -5810,6 +5858,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         */
         const roles = await resolveLeaseRolesFor(blocker);
         const classification = classifyFileScopeLease(blocker, allTasks, {
+          schedulingDependencyOptions: {
+            satisfactionColumnsByTaskId: await resolveDependencySatisfactionColumns(
+              this.store, allTasks.filter((dependency) => blocker.dependencies?.includes(dependency.id)), leaseRoleIrCache,
+            ),
+          },
           mergeRequestContractShadowEnabled: settings.mergeRequestContractShadowEnabled,
           handoffAccepted: settings.mergeRequestContractShadowEnabled === true && roles.isReviewColumn
             ? (await this.store.getCompletionHandoffAcceptedMarker(blocker.id)) !== null
@@ -6986,6 +7039,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         if (!blocker) return false;
         const roles = await resolveLeaseRolesFor(blocker);
         const classification = classifyFileScopeLease(blocker, allTasks, {
+          schedulingDependencyOptions: {
+            satisfactionColumnsByTaskId: await resolveDependencySatisfactionColumns(
+              this.store, allTasks.filter((dependency) => blocker.dependencies?.includes(dependency.id)), leaseRoleIrCache,
+            ),
+          },
           mergeRequestContractShadowEnabled: settings.mergeRequestContractShadowEnabled,
           handoffAccepted: settings.mergeRequestContractShadowEnabled === true && roles.isReviewColumn
             ? (await this.store.getCompletionHandoffAcceptedMarker(blocker.id)) !== null
@@ -12705,36 +12763,22 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
   // ── Misclassified failure recovery ───────────────────────────────
 
+  /** Install the runtime-owned authoritative provider refresh after startup wiring completes. */
+  setFreshExternalPrReconciler(reconciler: (() => Promise<number>) | undefined): void {
+    this.reconcileFreshExternalPrs = reconciler;
+  }
+
   /**
-   * Finalize review cards whose durable PR mirror already records an external merge.
-   *
-   * This is deliberately provider-independent: dashboard/CLI adapters write the remote state, and the
-   * TaskStore transition owns proof persistence and lifecycle movement. A closed PR is excluded because
-   * it is not merge evidence; active merger ownership is left untouched for its current owner to settle.
+   * Refresh provider state before recovery; persisted PR mirrors are never sufficient merge proof.
    */
   async reconcileExternallyMergedPrTasks(): Promise<number> {
-    const reviewColumns = await resolveProjectColumnsForRoles(this.store, REVIEW_ROLES);
-    const candidates = new Map<string, Task>();
-    for (const column of reviewColumns) {
-      for (const task of await this.store.listTasks({ column, slim: true })) {
-        const prInfos = task.prInfos ?? (task.prInfo ? [task.prInfo] : []);
-        if (task.deletedAt || task.paused || ["merging", "merging-pr", "merging-fix"].includes(task.status ?? "") || !prInfos.some((pr) => pr.status === "merged")) continue;
-        candidates.set(task.id, task);
-      }
-    }
-
-    let reconciled = 0;
-    for (const task of candidates.values()) {
-      const result = await this.store.applyPrMergedTransition(task.id, {
-        agentId: "self-healing",
-        runId: generateSyntheticRunId("external-pr-reconcile", task.id),
-      }).catch((error) => {
-        log.warn(`External PR reconciliation failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
-        return { moved: false };
-      });
-      if (result.moved) reconciled++;
-    }
-    return reconciled;
+    /*
+    FNXC:ExternalPrCloseout 2026-10-05-03:15:
+    Self-healing used to complete cards from a persisted `status:"merged"` mirror.
+    Only the ProjectEngine-owned reconciler can refresh and corroborate the current
+    head before closeout, so an unwired startup pass safely does nothing.
+    */
+    return this.reconcileFreshExternalPrs ? await this.reconcileFreshExternalPrs() : 0;
   }
 
   /**
@@ -12810,10 +12854,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       ]) {
         if (!mergedCandidateById.has(task.id)) mergedCandidateById.set(task.id, task);
       }
+      /*
+      FNXC:PostMergeCloseout 2026-10-12-15:10:
+      Auto-merge authorization decides whether this sweep may land work, not whether it may
+      close out an already durable landing. Proven manual landings still pass through the existing
+      graph-owned post-merge gate; its pause, lease, session, active-work, and evidence fences remain
+      authoritative, while unmerged manual holds never enter this recovery path.
+      */
       const mergedButNotDone = [...mergedCandidateById.values()].filter((t) =>
-        !t.deletedAt &&
-        allowsAutoMergeProcessing(t, settings) &&
-        t.mergeDetails?.mergeConfirmed === true,
+        !t.deletedAt && !t.paused && !t.userPaused && t.mergeDetails?.mergeConfirmed === true,
       );
 
       if (mergedButNotDone.length === 0) return 0;
@@ -13590,14 +13639,21 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             mergeTargetSource: mergeTarget.source,
           };
 
-          /* A proven land never re-runs stale review/checklist state during recovery. */
-          const postMergeBlocker = getPostMergeFinalizeBlocker({ status: task.status, error: task.error });
+          /*
+          FNXC:LandedContentRecovery 2026-10-04-15:49:
+          Content-scan recovery has proof that an owned commit reached the target, but it lacks
+          the durable merge record that may supersede unfinished implementation steps. Keep hard
+          blockers in review without stamping mergeConfirmed: a later confirmed-merge sweep must
+          not treat inferred content as authority to bypass the unfinished checklist.
+          */
+          const postMergeBlocker = getPostMergeFinalizeBlocker({ status: task.status, error: task.error })
+            ?? getMergeConfirmedFinalizationBlocker(task, {
+              reviewColumns: await ownReviewLanesForAlreadyMerged(task),
+            });
           if (postMergeBlocker) {
-
             await this.store.updateTask(task.id, {
               status: "failed",
               error: `Confirmed merge finalization deferred: ${postMergeBlocker}`,
-              mergeDetails,
             });
             await this.store.logEntry(
               task.id,
@@ -14220,18 +14276,20 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     const graceMs = (settings.taskStuckTimeoutMs ?? STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS) * PHANTOM_EXECUTOR_BINDING_AGE_MULTIPLIER;
     const leaseAge = task.checkoutLeaseRenewedAt ? Date.now() - Date.parse(task.checkoutLeaseRenewedAt) : Number.POSITIVE_INFINITY;
     if (task.checkoutRunId && Number.isFinite(leaseAge) && leaseAge >= 0 && leaseAge < graceMs) return { outcome: "ineligible", reason: "checkout-leased" };
-    if ((options.requireAutoMergeEligible && !allowsAutoMergeProcessing(task, settings)) || task.autoMerge === false) return { outcome: "ineligible", reason: "auto-merge-off" };
+    if (options.requireAutoMergeEligible && !allowsAutoMergeProcessing(task, settings)) return { outcome: "ineligible", reason: "auto-merge-off" };
     if (task.mergeDetails?.mergeConfirmed) {
       /*
       FNXC:PostMergeRecovery 2026-10-01-06:36:
       Manual reconciliation reports the graph-owned recovery truth: it may resume only absent required
-      evidence after the same pause, hold, liveness, lease, and auto-merge fences as every other owner.
+      evidence after the same pause, hold, liveness, and lease fences as every other owner. A durable
+      landing is closeout work, so auto-merge authorization no longer suppresses its existing gate.
       */
       const decision = await getRequiredPostMergeEvidenceDecision(this.store, task);
-      if (decision.outcome === "resumable") {
-        const resumed = await resumeMissingPostMergeGate(this.store, task.id);
+      if (isPostMergeGateRecoveryDue(task, decision)
+        || (options.source === "manual" && decision.outcome === "blocked" && decision.reason === "failed")) {
+        const resumed = await resumeMissingPostMergeGate(this.store, task.id, { manualRetry: options.source === "manual" });
         if (resumed.outcome === "resumed") return resumed;
-        return { outcome: "raced", reason: "post-merge-continuation-not-idle" };
+        if (decision.outcome === "resumable") return { outcome: "raced", reason: "post-merge-continuation-not-idle" };
       }
       return { outcome: "ineligible", reason: decision.outcome === "blocked" ? "post-merge-evidence-pending" : "awaiting-finalization" };
     }
@@ -15594,6 +15652,92 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     return recoveredAgentIds.size;
   }
 
+  /**
+   * FNXC:DurableAgentHandoff 2026-10-04-16:18:
+   * An unavailable durable owner can pin a queued root outside the executor
+   * pool and make downstream work look cyclic. Reuse the explicit heartbeat
+   * CAS handoff so recovery releases only the stale owner; user control and
+   * dependency ordering remain authoritative.
+   */
+  async recoverUnavailableQueuedAgentOwnership(): Promise<number> {
+    const agentStore = this.options.agentStore;
+    if (!agentStore) return 0;
+    const settings = await this.store.getSettings();
+    if (settings.globalPause || settings.enginePaused) return 0;
+    const taskIsLive = (taskId: string) => executingTaskLock.has(taskId)
+      || activeSessionRegistry.pathsForTask(taskId).length > 0
+      || this.options.isTaskActive?.(taskId) === true;
+    const irCache = new Map<string, WorkflowIr>();
+
+    const agents = await agentStore.listAgents({ includeEphemeral: false });
+    const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+    const tasks = await this.store.listTasks({ slim: true });
+    const now = Date.now();
+    let recovered = 0;
+
+    for (const task of tasks) {
+      const ownerId = task.assignedAgentId;
+      /*
+      FNXC:DurableAgentHandoff 2026-10-04-16:26:
+      Recovery may clear only an automatic pause recorded for this unavailable
+      owner. A user or manual-control pause remains an explicit operator fence,
+      even when its assignee can no longer run.
+      */
+      const hasRecoverableAgentPause = task.paused === true
+        && task.pausedByAgentId === ownerId
+        && !task.userPaused;
+      if (!ownerId || task.userPaused || (task.paused && !hasRecoverableAgentPause) || task.checkedOutBy || task.deletedAt) continue;
+      const preWip = await this.isPreWipColumn(task);
+      const owner = agentsById.get(ownerId);
+      if (owner && isBuiltinWorkflowRoleAgent(owner) && isWorkflowPrincipalEligible(owner)) continue;
+      if (!preWip) {
+        // Startup can promote a queued task before unavailable-owner recovery runs.
+        // Only a lone executor principal hold may release ownership after that boundary.
+        if (task.paused || taskIsLive(task.id) || (owner && isWorkflowPrincipalEligible(owner))) continue;
+        const roles = await resolveFileScopeLeaseTaskRoles(this.store, task, irCache);
+        if (!roles.isWipColumn || !task.workflowIrPinNodeId) continue;
+        const items = await this.store.listWorkflowWorkItemsForTask(task.id);
+        const active = items.filter((item) => ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(item.state));
+        if (active.length !== 1) continue;
+        const held = active[0];
+        const matchesPinnedNode = held.nodeId === task.workflowIrPinNodeId
+          || held.nodeInstanceId?.startsWith(`${task.workflowIrPinNodeId}#`) === true
+          || held.nodeInstanceId?.startsWith(`${task.workflowIrPinNodeId}::`) === true;
+        // Core validates nested template identity under the selected IR inside its handoff fence.
+        if (held.kind !== "task" || held.state !== "held" || !matchesPinnedNode
+          || (held.workflowRole != null && held.workflowRole !== "executor")
+          || (held.authorityKind != null && held.authorityKind !== "task-assignee")
+          || held.blockedReason !== "workflow-principal-named-principal-unavailable:executor") continue;
+      }
+
+      /*
+      FNXC:DurableAgentHandoff 2026-10-04-16:50:
+      A completed heartbeat leaves no active-run row, so absence of that row is
+      not proof an active durable owner abandoned its queued task. Preserve an
+      owner that has reported within its configured cadence (with a busy-work
+      floor); only a stale, paused, missing, or non-executing owner reaches the
+      CAS handoff. This keeps self-healing from stealing valid assignments
+      between ordinary heartbeat runs while still unstranding genuinely stale
+      roots.
+      */
+      if (owner && await agentStore.getActiveHeartbeatRun(owner.id)) continue;
+      if (owner && this.options.hasActiveAgentExecution?.(owner.id) === true) continue;
+      if (owner?.state === "active" && isWorkflowPrincipalEligible(owner) && hasRecentDurableOwnerHeartbeat(owner, now)) continue;
+
+      if (taskIsLive(task.id)) continue;
+      const currentSettings = await this.store.getSettings();
+      if (currentSettings.globalPause || currentSettings.enginePaused || taskIsLive(task.id)) continue;
+      const result = await agentStore.handoffTaskToWorkflowExecutor(ownerId, task.id, undefined, {
+        allowAgentOwnedPause: hasRecoverableAgentPause,
+        ...(!preWip ? { allowIdleWipPrincipalHold: true } : {}),
+      });
+      if (!result.ok) continue;
+      recovered += 1;
+      log.log(`Released unavailable durable owner ${ownerId} from ${preWip ? "queued task" : "held executor continuation"} ${task.id} for Workflow Executor admission`);
+    }
+    return recovered;
+  }
+
   async recoverDriftedAgentTaskLinks(): Promise<number> {
     /* FNXC:WorkflowLifecycleColumns 2026-07-31-22:30 (self-healing cluster): a drifted agent link pointing at a FINISHED card. Keyed on the literal this sweep answered "no" for every card on a renamed board. */
     const driftedTerminalColumns = await resolveProjectColumnsForRoles(this.store, TERMINAL_ROLES);
@@ -16563,9 +16707,12 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       recoveryRetryCount: task.recoveryRetryCount,
       nextRecoveryAt: task.nextRecoveryAt,
     });
-    const exhaustedMessage =
-      `PLANNING_LIFECYCLE_LOCK_RECOVERY_EXHAUSTED: canonical planning handoff failed after `
-      + `${MAX_RECOVERY_RETRIES} retries — last error: ${error.message}`;
+    /*
+    FNXC:PlanningHandoffRecovery 2026-10-06-16:27:
+    A lifecycle-lock transport loss does not invalidate an approved plan. After bounded
+    verification retries, re-admit the card through triage's existing needs-replan owner
+    instead of terminalizing it, so startup and maintenance cannot strand planning work.
+    */
     const patch = decision.shouldRetry
       ? {
           status: "planning" as const,
@@ -16574,9 +16721,10 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           nextRecoveryAt: decision.nextState.nextRecoveryAt,
         }
       : {
-          status: "failed" as const,
-          error: exhaustedMessage,
+          status: "needs-replan" as const,
+          error: null,
           recoveryRetryCount: null,
+          recoveryDisposition: "escalated-reseed" as const,
           nextRecoveryAt: null,
         };
     let persisted = false;
@@ -16598,7 +16746,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     if (!persisted) return;
     const action = decision.shouldRetry
       ? `Planning lifecycle lock transport failure during approved triage recovery — retry ${decision.nextState.recoveryRetryCount}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}: ${error.message}`
-      : exhaustedMessage;
+      : `Planning lifecycle lock transport recovery exhausted after ${MAX_RECOVERY_RETRIES} retries; escalated to a fresh planning pass.`;
     await this.store.logEntry(task.id, action).catch(() => undefined);
   }
 
@@ -17356,9 +17504,13 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         continue;
       }
       try {
-        // FNXC:WorktreeCleanup: rmdir is deliberately non-recursive. Any content
-        // makes it fail closed and preserves the unregistered checkout.
-        rmdirSync(path);
+        /*
+        FNXC:WorktreeOrphanReap 2026-10-04-15:28:
+        A proven dangling linked worktree includes a `.git` pointer and can retain ignored secret
+        sidecars. This sweep has already established containment, project ownership, no Git
+        registration, and no live-session reservation, so recursively reclaim the complete orphan.
+        */
+        rmSync(path, { recursive: true, force: true });
         log.log(`Cleaned unregistered worktree dir: ${path}`);
         cleaned++;
       } catch (err: unknown) {
@@ -17381,8 +17533,14 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
    * Safety is bounded by age gates plus active-session checks.
    */
   private async cleanupStaleTempMergeWorktrees(): Promise<number> {
-    /* FNXC:WorkflowLifecycleColumns 2026-07-31-22:30 (self-healing cluster): a temp merge worktree whose owning task has finished. Keyed on the literal this sweep answered "no" for every card on a renamed board. */
-    const mergeTempTerminalColumns = await resolveProjectColumnsForRoles(this.store, TERMINAL_ROLES);
+    /*
+    FNXC:TempWorktreeArchiveProof 2026-10-04-15:21:
+    A column with an archived role is not physical archival proof: custom workflows may expose an
+    archived-role live lane. Complete lanes may use the shorter post-completion grace immediately,
+    while archived lanes may do so only after the row carries `archivedAt`.
+    */
+    const mergeTempCompleteColumns = await resolveProjectColumnsForRoles(this.store, ["complete"]);
+    const mergeTempArchivedColumns = await resolveProjectColumnsForRoles(this.store, ["archived"]);
     try {
       const settings = await this.store.getSettings();
       if (settings.worktrunk?.enabled === true) {
@@ -17443,7 +17601,9 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             if (taskId) {
               try {
                 const task = await this.store.getTask(taskId);
-                if (mergeTempTerminalColumns.has(task.column)) {
+                const physicallyArchived = mergeTempArchivedColumns.has(task.column)
+                  && typeof task.archivedAt === "string";
+                if (mergeTempCompleteColumns.has(task.column) || physicallyArchived) {
                   ageGateMs = DONE_TASK_TEMP_WORKTREE_GRACE_MS;
                   cleanupReason = "done-task-stale";
                 }

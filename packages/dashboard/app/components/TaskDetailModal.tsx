@@ -1124,6 +1124,13 @@ export function TaskDetailContent({
       idle: true,
       overlapBlockedBy: workingTask.overlapBlockedBy ?? null,
       sessionContentionWaitReason: workingTask.sessionContentionWaitReason ?? null,
+      recoveryRetryCount: workingTask.recoveryRetryCount,
+      recoveryDisposition: workingTask.recoveryDisposition,
+      nextRecoveryAt: workingTask.nextRecoveryAt,
+      userPaused: workingTask.userPaused,
+      paused: workingTask.paused,
+      awaitingApproval: workingTask.status === "awaiting-approval",
+      externalBlocked: workingTask.status === "blocked",
     });
   const originalTaskPrompt = workingTask.description ?? "";
   const hasOriginalTaskPrompt = originalTaskPrompt.trim().length > 0;
@@ -4023,7 +4030,9 @@ export function TaskDetailContent({
         setFullDetail((prev) => prev ? ({ ...prev, ...updatedTask } as TaskDetail) : updatedTask);
         onTaskUpdated?.(updatedTask);
       }
-      addToast(result.message, "success");
+      /* FNXC:FileScopeRecovery 2026-10-12-17:32: Clear can safely refuse without throwing; retain its
+         actionable reason and do not represent an unreleased file claim as a successful recovery. */
+      addToast(result.message, result.repaired ? "success" : "warning");
     } catch (err) {
       if (activeTaskIdRef.current !== requestTaskId) {
         return;
@@ -4197,7 +4206,8 @@ export function TaskDetailContent({
     onTaskUpdated?.(updatedTask);
   }, [onTaskUpdated]);
 
-  const assignedAgentLabel = assignedAgent?.name ?? task.assignedAgentId ?? null;
+  const assignedAgentId = assignedAgent?.id ?? task.assignedAgentId;
+  const assignedAgentLabel = assignedAgent?.name ?? assignedAgentId ?? null;
   const detailProviders = useMemo(() => {
     const providers: string[] = [];
     if (workingTask.modelProvider) providers.push(workingTask.modelProvider);
@@ -6897,7 +6907,7 @@ export function TaskDetailContent({
                     {!agentsLoading && agents.map((a) => (
                       <button
                         key={a.id}
-                        className={`agent-picker-item${task.assignedAgentId === a.id ? " selected" : ""}`}
+                        className={`agent-picker-item${assignedAgentId === a.id ? " selected" : ""}`}
                         onClick={() => void handleAssignAgent(a.id)}
                       >
                         <Bot size={14} />

@@ -46,14 +46,10 @@ import {
   getProjectRootFromWorktree,
   reconcileClaudeCliPaths,
   reconcileDroidCliPaths,
-  mergeBuiltInGrokProviderModels,
-  mergeBuiltInZaiProviderModels,
-  mergeSupplementalAnthropicModels,
-  mergeSupplementalOpenAiCodexModels,
+  hydrateGrokApiKeyFromUserSettings,
+  projectPiXaiModelsToGrokCli,
   buildAnthropicClaudeCodeIdentityHeaders,
   toExecutionModelProviderId,
-  registerBuiltInGrokProvider,
-  registerBuiltInZaiProvider,
   registerFusionSessionIdentity,
   runWithFusionSessionIdentity,
   resolvePiExtensionProjectRoot,
@@ -1138,6 +1134,8 @@ export interface AgentOptions {
    * `allowMcpToolsInReadonly` opt-in; omit it to preserve the reviewed planning-lane behavior.
    */
   readonlyMcpServerAllowlist?: string[];
+  /** Names of caller-supplied custom tools explicitly trusted for this readonly session only. */
+  readonlyCustomToolAllowlist?: string[];
   /** Test seam for MCP session tools; production uses the SDK client/transport factories. */
   mcpClientFactory?: McpClientFactory;
   /** Test seam for MCP retry timing. */
@@ -1561,8 +1559,7 @@ function resolveVendoredDroidCliEntry(): string | null {
 }
 
 async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegistry): Promise<void> {
-  registerBuiltInZaiProvider(modelRegistry, (message) => extensionsLog.warn(message));
-  registerBuiltInGrokProvider(modelRegistry, (message) => extensionsLog.warn(message));
+  hydrateGrokApiKeyFromUserSettings((message) => extensionsLog.warn(message));
 
   try {
     const agentDir = getPackageManagerAgentDir();
@@ -1624,8 +1621,6 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
     }
 
     extensionsResult.runtime.pendingProviderRegistrations = [];
-    mergeBuiltInZaiProviderModels(modelRegistry, (message) => extensionsLog.warn(message));
-    mergeBuiltInGrokProviderModels(modelRegistry, (message) => extensionsLog.warn(message));
     /*
     FNXC:ModelRegistry 2026-07-21-17:15:
     Bound post-extension refresh so a hung catalog fetch cannot stall agent session setup.
@@ -1633,6 +1628,7 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
     await refreshFusionModelRegistry(modelRegistry, {
       log: (message) => extensionsLog.warn(message),
     });
+    projectPiXaiModelsToGrokCli(modelRegistry, (message) => extensionsLog.warn(message));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     extensionsLog.error(`Failed to discover extensions: ${message}`);
@@ -1640,6 +1636,7 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
     await refreshFusionModelRegistry(modelRegistry, {
       log: (message) => extensionsLog.warn(message),
     });
+    projectPiXaiModelsToGrokCli(modelRegistry, (message) => extensionsLog.warn(message));
   }
 }
 
@@ -2638,12 +2635,7 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
   await refreshFusionModelRegistry(modelRegistry, {
     log: (message) => extensionsLog.warn(message),
   });
-  mergeSupplementalAnthropicModels(modelRegistry as unknown as Parameters<typeof mergeSupplementalAnthropicModels>[0], (message) => extensionsLog.warn(message));
-  /*
-   * FNXC:ModelCatalog 2026-07-09-00:00:
-   * FN-7754 mirrors the dashboard register-model-routes.ts supplemental merge seam so the GPT-5.6 codenamed OpenAI-Codex models surface on the engine createFnAgent registry-seeding path, not just /api/models. FN-7745 only wired the dashboard surface; this merge is additive and dedupe-safe, so pinned catalog rows win and no duplicate ids are added.
-   */
-  mergeSupplementalOpenAiCodexModels(modelRegistry, (message) => extensionsLog.warn(message));
+  projectPiXaiModelsToGrokCli(modelRegistry, (message) => extensionsLog.warn(message));
 
   // Build the pi built-in tool set. We deliberately do NOT use the bundled
   // `createCodingTools` / `createReadOnlyTools` presets — they're missing
@@ -2933,17 +2925,16 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
       ...(options.customTools ?? []),
       ...(mcpToolset?.tools ?? []),
     ];
+    const trustedReadonlyCustomNames = new Set(options.readonlyCustomToolAllowlist ?? []);
+    const callerCustomTools = new Set(options.customTools ?? []);
     const readonlyFilteredCustomTools = isReadonly
-      ? filterCustomToolsForReadonly(
-          candidateCustomTools,
-          allowReadonlyMcpTools
-            ? {
-                allowTool: (tool) => readonlyMcpServerAllowlist === undefined
-                  ? mcpReadonlyTools.has(tool)
-                  : readonlyMcpServerAllowlist.has(mcpToolset?.serverByToolName?.get(tool.name) ?? ""),
-              }
-            : {},
-        )
+      ? filterCustomToolsForReadonly(candidateCustomTools, {
+          allowTool: (tool) => (callerCustomTools.has(tool) && trustedReadonlyCustomNames.has(tool.name)
+            && !["bash", "write", "edit"].includes(tool.name))
+            || (allowReadonlyMcpTools && mcpReadonlyTools.has(tool)
+              && (readonlyMcpServerAllowlist === undefined
+                || readonlyMcpServerAllowlist.has(mcpToolset?.serverByToolName?.get(tool.name) ?? ""))),
+        })
       : { allowed: candidateCustomTools, denied: [] };
     const allowlistFilteredCustomTools = {
       ...readonlyFilteredCustomTools,

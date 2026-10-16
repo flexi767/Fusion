@@ -301,6 +301,7 @@ function createMockStore(initialSettings: Record<string, unknown>) {
 
   const store = {
     getSettings: vi.fn(async () => structuredClone(settings)),
+    getProjectId: vi.fn().mockReturnValue("proj_test"),
     listTasks: vi.fn(async (): Promise<Array<Record<string, unknown>>> => []),
     /*
     FNXC:EngineTests 2026-09-01-05:50:
@@ -320,8 +321,20 @@ function createMockStore(initialSettings: Record<string, unknown>) {
       steps: [],
       enabledWorkflowSteps: [],
     })),
+    getStaleReviewCallbackWaiverReceipts: vi.fn().mockResolvedValue([]),
     updateTask: vi.fn(async () => undefined),
+    updateTaskAtomic: vi.fn(async (taskId: string, mutate: (task: Record<string, unknown>) => Record<string, unknown> | null | undefined | Promise<Record<string, unknown> | null | undefined>) => {
+      const current = await store.getTask(taskId);
+      const patch = await mutate(current);
+      return patch ? { ...current, ...patch } : current;
+    }),
     moveTask: vi.fn(async () => undefined),
+    moveTaskIf: vi.fn(async (taskId: string, column: string, predicate: (task: Record<string, unknown>) => boolean | Promise<boolean>) => {
+      const current = await store.getTask(taskId);
+      if (!await predicate(current)) return { moved: false, task: current };
+      const task = await store.moveTask(taskId, column);
+      return { moved: true, task: task ?? { ...current, column } };
+    }),
     updateSettings: vi.fn(async (patch: Record<string, unknown>) => {
       settings = {
         ...settings,
@@ -2289,7 +2302,8 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
         // A real row carries these. Without them the merge-confirmed fast path threw on `steps.map`
         // and never reached the workspace gate-skip this test exists to prove.
         steps: [],
-        enabledWorkflowSteps: [],
+        enabledWorkflowSteps: ["post-merge-verification"],
+        workflowStepResults: [{ workflowStepId: "post-merge-verification", status: "passed", verdict: "APPROVE" }],
         mergeDetails: {
           mergeConfirmed: true,
           // A sub-repo squash sha — unreachable from the workspace ROOT cwd; the gate would
@@ -2712,21 +2726,28 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
   it("emits task:merged when mergeConfirmed fast-path finalizes to done", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
-    mockStore.store.getTask.mockResolvedValueOnce({
+    const currentTask = {
       id: "FN-merged",
       column: "in-review",
       paused: false,
       mergeRetries: 0,
       status: null,
       branch: "fusion/fn-merged",
+      steps: [],
+      enabledWorkflowSteps: ["post-merge-verification"],
+      workflowStepResults: [{ workflowStepId: "post-merge-verification", status: "passed", verdict: "APPROVE" }],
       mergeDetails: { mergeConfirmed: true, mergedAt: "2026-05-18T00:00:00.000Z", mergeTargetBranch: "main" },
+    };
+    mockStore.store.getTask.mockImplementation(async () => currentTask);
+    mockStore.store.updateTaskAtomic.mockImplementation(async (_id: string, mutate: (task: typeof currentTask) => Partial<typeof currentTask> | null | undefined | Promise<Partial<typeof currentTask> | null | undefined>) => {
+      const patch = await mutate(currentTask);
+      if (patch) Object.assign(currentTask, patch);
+      return currentTask;
     });
-    mockStore.store.moveTask.mockResolvedValueOnce({
-      id: "FN-merged",
-      column: "done",
-      branch: "fusion/fn-merged",
-      mergeDetails: { mergeConfirmed: true, mergedAt: "2026-05-18T00:00:00.000Z", mergeTargetBranch: "main" },
-    } as any);
+    mockStore.store.moveTask.mockImplementation(async (_id: string, column: string) => {
+      currentTask.column = column;
+      return currentTask;
+    });
     mocks.currentStore = mockStore.store;
 
     const engine = createEngine();
@@ -2850,12 +2871,10 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     await engine.stop();
   });
 
-  it("FN-5627: fast-path refusal parks task as failed when mergeRetries budget is exhausted", async () => {
-    // When auto-recovery has already cycled through 3 attempts without
-    // landing, the next refusal is terminal. The task is parked with
-    // status=failed for manual review, with no further re-enqueue. The
-    // downstream FN-5488 fast-path on `clearStaleBlockedBy` recognizes this
-    // as a permanent blocker so dependents aren't held forever.
+  it("FN-9512: fast-path exhaustion clears stale proof and reseeds a fresh merge", async () => {
+    // The fast-path proof can be stale even after its local retry budget is spent.
+    // Exhaustion must return ownership to the normal merger rather than strand an
+    // in-review card in a failed manual-review park.
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
     mockStore.store.getTask.mockResolvedValueOnce({
       id: "FN-exhausted",
@@ -2904,18 +2923,21 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
     await vi.waitFor(() => {
       const calls = (mockStore.store.updateTask as ReturnType<typeof vi.fn>).mock.calls as unknown as Array<[string, Record<string, unknown>]>;
-      const terminalCall = calls.find((call) =>
+      const escalationCall = calls.find((call) =>
         call[0] === "FN-exhausted"
-        && call[1]?.status === "failed"
-        && typeof call[1]?.error === "string"
-        && /retry budget exhausted|after 3 attempts/.test(call[1].error as string),
+        && call[1]?.status === null
+        && call[1]?.error === null
+        && call[1]?.mergeRetries === 0,
       );
-      expect(terminalCall).toBeDefined();
-      const updates = terminalCall![1] as { mergeDetails?: { mergeConfirmed?: boolean; commitSha?: string } };
+      expect(escalationCall).toBeDefined();
+      const updates = escalationCall![1] as { mergeDetails?: { mergeConfirmed?: boolean; commitSha?: string } };
       expect(updates.mergeDetails?.mergeConfirmed).toBe(false);
       expect(updates.mergeDetails?.commitSha).toBeUndefined();
     });
 
+    const failedCall = (mockStore.store.updateTask as ReturnType<typeof vi.fn>).mock.calls
+      .find((call: unknown[]) => call[0] === "FN-exhausted" && (call[1] as { status?: string })?.status === "failed");
+    expect(failedCall).toBeUndefined();
     expect(mockStore.store.moveTask).not.toHaveBeenCalledWith("FN-exhausted", "done");
 
     await engine.stop();
@@ -2926,13 +2948,16 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     // (verified-short-circuit / proven-no-op / already-on-main paths). The
     // reachability gate must not break those.
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
-    mockStore.store.getTask.mockResolvedValueOnce({
+    const currentTask = {
       id: "FN-noop",
       column: "in-review",
       paused: false,
       mergeRetries: 0,
       status: null,
       branch: "fusion/fn-noop",
+      steps: [],
+      enabledWorkflowSteps: ["post-merge-verification"],
+      workflowStepResults: [{ workflowStepId: "post-merge-verification", status: "passed", verdict: "APPROVE" }],
       mergeDetails: {
         mergeConfirmed: true,
         noOpMerge: true,
@@ -2940,18 +2965,17 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
         mergeTargetBranch: "main",
         // No commitSha — verified no-op.
       },
+    };
+    mockStore.store.getTask.mockImplementation(async () => currentTask);
+    mockStore.store.updateTaskAtomic.mockImplementation(async (_id: string, mutate: (task: typeof currentTask) => Partial<typeof currentTask> | null | undefined | Promise<Partial<typeof currentTask> | null | undefined>) => {
+      const patch = await mutate(currentTask);
+      if (patch) Object.assign(currentTask, patch);
+      return currentTask;
     });
-    mockStore.store.moveTask.mockResolvedValueOnce({
-      id: "FN-noop",
-      column: "done",
-      branch: "fusion/fn-noop",
-      mergeDetails: {
-        mergeConfirmed: true,
-        noOpMerge: true,
-        mergedAt: "2026-05-28T19:34:17.022Z",
-        mergeTargetBranch: "main",
-      },
-    } as any);
+    mockStore.store.moveTask.mockImplementation(async (_id: string, column: string) => {
+      currentTask.column = column;
+      return currentTask;
+    });
     mocks.currentStore = mockStore.store;
 
     const engine = createEngine();
@@ -4568,7 +4592,17 @@ pgDescribe("ProjectEngine research recall composition", () => {
 
   it("persists finalized research through ProjectEngine's live recall composition", async () => {
     const store = h.store();
-    const run = await store.getResearchStore().createRun({ query: "ProjectEngine recall composition", tags: ["project-engine"] });
+    const researchStore = store.getResearchStore();
+    const run = await researchStore.createRun({ query: "ProjectEngine recall composition", tags: ["project-engine"] });
+    /*
+    FNXC:FullSuiteShardInvestigation 2026-10-05-14:25:
+    This fixture invokes the finalization seam directly, so its persisted run must not remain queued
+    when ProjectEngine starts its real dispatcher. A queued run is production-dispatchable and can race
+    the direct finalization call into a real provider search; mark it running before startup to isolate
+    this composition contract without weakening dispatcher coverage.
+    */
+    await researchStore.updateStatus(run.id, "running");
+    const listQueuedRuns = vi.spyOn(researchStore, "listRuns");
     const realFactory = fusionCore.createRecallCaptureWriter;
     const writerFactory = vi.spyOn(fusionCore, "createRecallCaptureWriter");
     let writer: RecallCaptureWriterWithTestDrain | undefined;
@@ -4580,6 +4614,8 @@ pgDescribe("ProjectEngine research recall composition", () => {
 
     try {
       await engine.start();
+      await vi.waitFor(() => expect(listQueuedRuns).toHaveBeenCalledWith({ status: "queued" }));
+      expect(await researchStore.getRun(run.id)).toMatchObject({ status: "running" });
       const orchestrator = engine.getResearchOrchestrator() as unknown as {
         runFinalizing(runId: string, output: string, citations: string[], confidence: number | undefined, signal: AbortSignal): Promise<void>;
       };
@@ -4594,6 +4630,7 @@ pgDescribe("ProjectEngine research recall composition", () => {
         }),
       ]));
     } finally {
+      listQueuedRuns.mockRestore();
       writerFactory.mockRestore();
       await engine.stop();
     }

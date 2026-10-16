@@ -950,7 +950,8 @@ export function ListView({
     union is an approximation reserved for the case where we have no per-task metadata AT ALL.
     */
     return fromOwnWorkflow ?? (own ? undefined : columnFlagsById.get(task.column));
-  }, [columnFlagsById]);
+  // FNXC:WorkflowResolvedColumns 2026-10-04-22:12: A task's role must refresh with its own workflow mapping, not a stale cross-workflow union snapshot.
+  }, [columnFlagsById, taskContextMenuColumnsByTaskId]);
 
   const getTaskColumnDisplayLabel = useCallback((task: Task): string => {
     return taskContextMenuColumnsByTaskId.get(task.id)?.find((column) => column.id === task.column)?.label
@@ -3045,7 +3046,7 @@ export function ListView({
                             : isLivePlanning || isTransientPlannerActive
                               ? t("tasks.statusPlanning", "Planning")
                               : wipLifecycleBadgeLabel
-                                ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null }));
+                                ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked" }));
                           const hasDependencies = Boolean(task.dependencies && task.dependencies.length > 0);
                           const taskProgress = getTaskProgress(task, getTaskColumnFlags(task));
                           const hasProgress = taskProgress.hasProgress;
@@ -3332,7 +3333,7 @@ export function ListView({
                               : isLivePlanning || isTransientPlannerActive
                                 ? t("tasks.statusPlanning", "Planning")
                                 : wipLifecycleBadgeLabel
-                                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null }));
+                                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked" }));
 
                             return (
                               <tr

@@ -2395,13 +2395,21 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         }
       })();
       const archivedColumns = await archivedColumnsForTask(scopedStore, parent.id);
+      const archivedSourceRecord = typeof parent.archivedAt === "string"
+        ? await scopedStore.getTask(parent.id, { includeDeleted: true }).catch(() => null)
+        : null;
       /*
-      FNXC:ArchivedRecommendations 2026-09-20-18:54:
-      Cold archive detail is a terminal source just like a complete lane. Resolve the parent lane
-      from its workflow's archived trait and require archivedAt, so a live lane name cannot bypass
-      the physical-snapshot gate while renamed archive lanes remain eligible.
+      FNXC:MailboxRecommendationCreation 2026-10-04-08:53:
+      Cold archive detail normalizes its display column, so the snapshot's captured pre-archive
+      column is the physical-snapshot signal when the display value cannot resolve to an archived
+      trait. The forensic row proves it is retained and soft-deleted; it does not carry the archive
+      entry's pre-archive field. An active custom lane has no such retained proof and remains ineligible.
       */
-      const isPhysicalArchivedSource = archivedColumns.has(parent.column) && typeof parent.archivedAt === "string";
+      const isPhysicalArchivedSource = Boolean(
+        typeof parent.archivedAt === "string"
+        && archivedSourceRecord?.deletedAt
+        && (archivedColumns.has(parent.column) || parent.preArchiveColumn),
+      );
       if (!completeColumns.has(parent.column) && !isPhysicalArchivedSource) {
         throw conflict("recommendations are available only on completed or archived tasks");
       }
@@ -4804,6 +4812,35 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       } else {
         rethrowAsApiError(err, "Internal server error");
       }
+    }
+  });
+
+  /**
+   * GET /api/tasks/:id/workflow-admission
+   * Returns the same current required-gate decision used by merge admission.
+   */
+  router.get("/tasks/:id/workflow-admission", async (req, res) => {
+    try {
+      const { store: scopedStore, engine } = await getProjectContext(req);
+      await scopedStore.getTask(req.params.id);
+      if (!engine) {
+        res.json({ allApproved: false, gates: [], requiredGateIds: [], resolution: "read-failed" });
+        return;
+      }
+      try {
+        const admission = await engine.getPreMergeAdmissionDecision(req.params.id);
+        res.json({
+          ...admission.decision,
+          requiredGateIds: [...admission.gate.requiredPreMergeStepIds],
+          resolution: admission.gate.resolution,
+        });
+      } catch {
+        res.json({ allApproved: false, gates: [], requiredGateIds: [], resolution: "read-failed" });
+      }
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      if (isTaskLookupMiss(err)) throw notFound(`Task ${req.params.id} not found`);
+      rethrowAsApiError(err, "Internal server error");
     }
   });
 

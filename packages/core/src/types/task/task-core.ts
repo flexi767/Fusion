@@ -51,6 +51,14 @@ export type TaskPlanningFailureState = {
 };
 
 export interface MergeDetails {
+  /** Restart-safe delivery retry state; does not grant post-merge verification approval. */
+  pushRecovery?: {
+    target: string;
+    commitSha: string;
+    nextAttemptAt: string;
+    pushedAt?: string;
+    error?: string;
+  };
   /**
    * FNXC:WorkflowMergeRecovery 2026-09-21-10:40:
    * Missing merge proof is repairable only while durable execution evidence changes.
@@ -507,6 +515,51 @@ export type PrReviewDecision =
 /** Aggregate CI rollup mirror (matches PrInfo.checkRollup shape). */
 export type PrChecksRollup = "success" | "failure" | "pending" | "none";
 
+/** A provider capability outcome; unavailable data is never silently pending. */
+export type PrReadinessCapabilityState = "supported" | "unsupported" | "permission-denied" | "transient-unavailable";
+
+export interface PrReadinessCapability {
+  state: PrReadinessCapabilityState;
+  /** Bounded, credential-free provider diagnosis suitable for operators. */
+  reason?: string;
+}
+
+export type PrRequiredCheckState = "success" | "pending" | "failure" | "missing";
+
+export interface PrRequiredCheck {
+  name: string;
+  state: PrRequiredCheckState;
+}
+
+/**
+ * Provider-neutral observation for one exact pull-request head.
+ *
+ * FNXC:PullRequestReadiness 2026-10-04-23:13:
+ * Readiness is evidence, not a mutable PR property. A consumer may admit an
+ * action only when this snapshot names the entity's current head and every
+ * required capability is supported; missing, denied, and stale evidence fails
+ * closed instead of looking permanently pending.
+ */
+export interface PrReadinessSnapshot {
+  observedHeadOid: string;
+  baseOid?: string;
+  headBehindBase: boolean;
+  requiredChecks: PrRequiredCheck[];
+  approval: "approved" | "changes-requested" | "review-required" | "none";
+  mergeable: PrConflictState;
+  protectionBlockers: string[];
+  state: "open" | "closed" | "merged";
+  mergeCommitSha?: string;
+  /** A fresh provider comparison proved this merge commit contains observedHeadOid. */
+  mergeCommitIncludesHead?: boolean;
+  deployments: PrReadinessCapability;
+  branchUpdate: PrReadinessCapability;
+  checks: PrReadinessCapability;
+  reviews: PrReadinessCapability;
+  merge: PrReadinessCapability;
+  observedAt: string;
+}
+
 export interface PrEntity {
   id: string;
   sourceType: PrEntitySourceType;
@@ -520,6 +573,9 @@ export interface PrEntity {
   prNumber?: number;
   prUrl?: string;
   headOid?: string;
+  /** Provider-neutral current-head observation, replaced atomically by the readiness fence. */
+  readiness?: PrReadinessSnapshot;
+  readinessProvider?: string;
   mergeable?: PrConflictState;
   checksRollup?: PrChecksRollup;
   reviewDecision?: PrReviewDecision;
@@ -558,6 +614,8 @@ export interface PrEntityUpdate {
   prNumber?: number | null;
   prUrl?: string | null;
   headOid?: string | null;
+  readiness?: PrReadinessSnapshot | null;
+  readinessProvider?: string | null;
   mergeable?: PrConflictState | null;
   checksRollup?: PrChecksRollup | null;
   reviewDecision?: PrReviewDecision;
@@ -831,6 +889,18 @@ export interface AiMergeReviewReconciliation {
   terminal?: boolean;
 }
 
+export interface FileScopeLeaseReleaseReceipt {
+  holderId: string;
+  holderLineageId?: string;
+  scopeFingerprint: string;
+  releasedFollowerIds: string[];
+  /** `no-checkout` is planning-only; `clean-checkout` has bounded git evidence. */
+  checkoutIdentity: "no-checkout" | "clean-checkout";
+  checkoutEpoch?: number;
+  inspectedAt: string;
+  revision: number;
+}
+
 export interface Task {
   id: string;
   /** Immutable lineage identity used for durable commit/task attribution. */
@@ -930,6 +1000,8 @@ export interface Task {
    *  Cleared when the overlap resolves (the blocker task moves to done or its
    *  scope no longer overlaps). */
   overlapBlockedBy?: string;
+  /** Durable, identity-fenced waiver for a paused planning-only scope claim. */
+  fileScopeLeaseRelease?: FileScopeLeaseReleaseReceipt;
   /**
    * Durable identity of the currently reported dependency/file-scope queue episode.
    * Internal producers use it to make persisted queue activity edge-triggered.
@@ -1221,6 +1293,8 @@ export interface Task {
    *  recovery-policy module on each recoverable failure; cleared when work restarts
    *  cleanly or reaches a terminal column (in-review, done, archived). */
   recoveryRetryCount?: number;
+  /** Structured, privacy-safe recovery state retained after a bounded owner reseeds work. */
+  recoveryDisposition?: "pending" | "verification-pending" | "escalated-reseed";
   /** FNXC:WorkspaceContention 2026-08-23-06:40: Durable owner-local retry budget for holdForSessionContention; manual retry, clean completion, and exhausted waits reset it. */
   sessionContentionHoldCount?: number;
   /** Operator-visible bounded reason owned only while holdForSessionContention schedules a retry. */
@@ -1795,4 +1869,3 @@ export interface TaskCreateInput {
    */
   sessionAdvisorEnabled?: boolean;
 }
-

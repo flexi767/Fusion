@@ -191,6 +191,7 @@ export const tasks = projectSchema.table("tasks", {
   worktree: text("worktree"),
   blockedBy: text("blocked_by"),
   overlapBlockedBy: text("overlap_blocked_by"),
+  fileScopeLeaseRelease: jsonb("file_scope_lease_release"),
   queuedLogEpisodeSignature: text("queued_log_episode_signature"),
   paused: integer("paused").default(0),
   userPaused: integer("user_paused").default(0),
@@ -231,6 +232,7 @@ export const tasks = projectSchema.table("tasks", {
   executeRequeueLoopCount: integer("execute_requeue_loop_count").default(0),
   executeRequeueLoopSignature: text("execute_requeue_loop_signature"),
   recoveryRetryCount: integer("recovery_retry_count"),
+  recoveryDisposition: text("recovery_disposition"),
   sessionContentionHoldCount: integer("session_contention_hold_count").default(0),
   sessionContentionWaitReason: text("session_contention_wait_reason"),
   taskDoneRetryCount: integer("task_done_retry_count").default(0),
@@ -1730,6 +1732,8 @@ export const pullRequests = projectSchema.table("pull_requests", {
   prNumber: integer("pr_number"),
   prUrl: text("pr_url"),
   headOid: text("head_oid"),
+  readiness: jsonb("readiness"),
+  readinessProvider: text("readiness_provider"),
   mergeable: text("mergeable"),
   checksRollup: jsonb("checks_rollup"),
   reviewDecision: text("review_decision"),
@@ -2794,7 +2798,9 @@ export const staleReviewCallbackWaiverReceipts = projectSchema.table("stale_revi
   state: text("state").notNull().default("issued"),
 }, (t) => [
   primaryKey({ columns: [t.projectId, t.id] }),
-  foreignKey({ columns: [t.projectId, t.taskId], foreignColumns: [tasks.projectId, tasks.id] }).onDelete("cascade"),
+  foreignKey({ columns: [t.projectId, t.taskId], foreignColumns: [tasks.projectId, tasks.id] })
+    .onDelete("cascade")
+    .onUpdate("cascade"),
   unique("stale_review_callback_waiver_receipts_attempt_unique").on(t.projectId, t.taskId, t.workflowStepId, t.attemptId),
   index("idxStaleReviewCallbackWaiverReceiptsTask").on(t.projectId, t.taskId),
 ]);

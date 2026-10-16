@@ -28,7 +28,15 @@ function createStore(): TaskStore & EventEmitter {
   (emitter as any).listTasks = vi.fn();
   (emitter as any).getTask = vi.fn().mockResolvedValue({ column: "in-review" });
   (emitter as any).updateTask = vi.fn(withBranchWriteProvenance(async () => undefined));
+  (emitter as any).updateTaskAtomic = vi.fn(async (_taskId: string, mutate: (task: Record<string, unknown>) => Promise<Record<string, unknown> | null | undefined> | Record<string, unknown> | null | undefined) => {
+    const task = await (emitter as any).getTask();
+    const patch = await mutate(task);
+    if (patch) await (emitter as any).updateTask(_taskId, patch);
+    return patch ? { ...task, ...patch } : task;
+  });
   (emitter as any).moveTask = vi.fn().mockResolvedValue(undefined);
+  (emitter as any).handoffToReview = vi.fn(async (taskId: string) => ({ id: taskId, column: "in-review", updatedAt: new Date().toISOString() }));
+  (emitter as any).recordAgentActivity = vi.fn().mockResolvedValue(undefined);
   (emitter as any).logEntry = vi.fn().mockResolvedValue(undefined);
   (emitter as any).recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
   return emitter;
@@ -48,6 +56,7 @@ describe("self-healing ghost branch reclaim", () => {
   });
 
   function mockSweepTask(task: any) {
+    (store.getTask as any).mockResolvedValue(task);
     (store.listTasks as any)
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
@@ -67,7 +76,11 @@ describe("self-healing ghost branch reclaim", () => {
 
     expect(recovered).toBe(1);
     expect(store.updateTask).toHaveBeenCalledWith("FN-9001", expect.objectContaining({ worktree: null, branch: null, baseCommitSha: null }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-9001", "in-progress", expect.objectContaining({ preserveProgress: true, preserveResumeState: true }));
+    /*
+    FNXC:BranchConflictRecovery 2026-10-04-12:10:
+    Review-lane recovery is contained in review: clearing a stranded branch must not automatically move an in-review card back into execution.
+    */
+    expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.logEntry).toHaveBeenCalledWith("FN-9001", expect.stringContaining("[recovery] tip-already-merged FN-9001"));
     expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "branch:auto-reclaim", metadata: expect.objectContaining({ phase: "tip-already-merged" }) }));
   });
@@ -75,6 +88,8 @@ describe("self-healing ghost branch reclaim", () => {
   it("invalidates cached metadata on stale-resolved and preserves branch ref", async () => {
     mockSweepTask({ id: "FN-9001", column: "in-review", checkedOutBy: null, branch: "fusion/fn-9001", worktree: "/tmp/ghost-cat", baseCommitSha: "m0", paused: true, pausedReason: "branch-conflict-unrecoverable", status: "failed" });
     vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({ kind: "stale-resolved" } as any);
+    // It was usable on entry but disappeared during inspection.
+    vi.mocked(worktreePool.isUsableTaskWorktree).mockResolvedValueOnce(true).mockResolvedValueOnce(false);
 
     await manager.reclaimSelfOwnedBranchConflicts();
 
@@ -83,6 +98,14 @@ describe("self-healing ghost branch reclaim", () => {
     // a missing provenance is exactly what the store guard rejects.
     expect(store.updateTask).toHaveBeenCalledWith("FN-9001", { worktree: null, branch: null, branchWriteOrigin: "engine", baseCommitSha: null });
     expect(execMock).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D"), expect.anything());
+  });
+
+  it("preserves a registered checkout when only the cached branch disappeared", async () => {
+    mockSweepTask({ id: "FN-9001", column: "in-review", checkedOutBy: null, branch: "fusion/fn-9001", worktree: "/tmp/ghost-cat", baseCommitSha: "m0", paused: true, pausedReason: "branch-conflict-unrecoverable", status: "failed" });
+    vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({ kind: "stale-resolved" } as any);
+    await manager.reclaimSelfOwnedBranchConflicts();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("keeps genuine live-foreign conflicts parked", async () => {
@@ -102,7 +125,13 @@ describe("self-healing ghost branch reclaim", () => {
 
     await manager.reclaimSelfOwnedBranchConflicts();
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-9001", expect.objectContaining({ pausedReason: "branch-conflict-unrecoverable", status: "failed" }));
+    /*
+     * FNXC:BranchConflictRecovery 2026-10-06-18:03:
+     * A genuine foreign conflict remains an operator-owned hold. FN-9512 must not overwrite the
+     * existing paused failed state merely to repeat it; no automatic mutation is the safe refusal.
+     */
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("is idempotent after tip-already-merged cleanup", async () => {

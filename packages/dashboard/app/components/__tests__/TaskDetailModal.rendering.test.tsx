@@ -1161,6 +1161,43 @@ describe("TaskDetailModal", () => {
     });
   });
 
+  it("shows an actionable refusal as a warning and retains Clear", async () => {
+    const addToast = vi.fn();
+    vi.mocked(dashboardApi.repairOverlapBlocker).mockResolvedValueOnce({
+      taskId: "FN-T",
+      dryRun: false,
+      repaired: false,
+      statusCleared: false,
+      previousOverlapBlockedBy: "FN-OVER",
+      currentOverlapBlockedBy: "FN-OVER",
+      reason: "scopes-still-overlap",
+      message: "Task FN-T still overlaps FN-OVER; preserve or land dirty work before clearing",
+      task: makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER", status: "queued" }),
+    });
+
+    render(
+      <TaskDetailModal
+        initialTab="dependencies"
+        task={makeTask({ id: "FN-T", column: "todo", overlapBlockedBy: "FN-OVER", status: "queued" })}
+        onClose={noop}
+        onDeleteTask={noopDelete}
+        onMergeTask={noopMerge}
+        onOpenDetail={noopOpenDetail}
+        addToast={addToast}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith(
+        "Task FN-T still overlaps FN-OVER; preserve or land dirty work before clearing",
+        "warning",
+      );
+    });
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+  });
+
   it("applies rerouted overlap blocker returned by repair API", async () => {
     vi.mocked(dashboardApi.repairOverlapBlocker).mockResolvedValueOnce({
       taskId: "FN-T",
@@ -2916,8 +2953,8 @@ describe("TaskDetailModal", () => {
 
       // After fetch resolves, spec content appears
       await waitFor(() => {
-        const markdownBody = document.querySelector(".markdown-body");
-        expect(markdownBody).toBeTruthy();
+        expect(document.querySelector(".markdown-body")).toBeTruthy();
+        expect(screen.getByText("This is the loaded spec content.")).toBeInTheDocument();
       }, { timeout: 3000 });
 
       // Loading indicator should be gone
@@ -2933,7 +2970,7 @@ describe("TaskDetailModal", () => {
       expect(screen.getByText("Execution mode")).toBeInTheDocument();
       expect(screen.getByText("Runtime status")).toBeInTheDocument();
       expect(screen.getAllByText("Fast").length).toBeGreaterThan(0);
-      expectSingleStatsRuntimeStatus("executing");
+      expectSingleStatsRuntimeStatus("executing", "Recovery pending");
       const statsPanel = screen.getByRole("region", { name: "Task execution statistics" });
       expect(within(statsPanel).getByText((1200).toLocaleString())).toBeInTheDocument();
       expect(within(statsPanel).getByText((450).toLocaleString())).toBeInTheDocument();

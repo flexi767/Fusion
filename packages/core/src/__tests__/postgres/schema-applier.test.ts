@@ -124,6 +124,10 @@ import {
   EXTERNAL_SESSION_HOST_HEALTH_VERSION,
   EXTERNAL_SESSION_INCREMENTS_VERSION,
   EXTERNAL_SESSION_SUMMARIES_VERSION,
+  STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
+  PULL_REQUEST_READINESS_VERSION,
+  RECOVERY_DISPOSITION_VERSION,
+  FILE_SCOPE_LEASE_RELEASE_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -187,7 +191,15 @@ describe("schema-applier: immutable migration identities", () => {
     expect(EXTERNAL_SESSION_HOST_HEALTH_VERSION).toBe("0090");
     expect(EXTERNAL_SESSION_INCREMENTS_VERSION).toBe("0091");
     expect(EXTERNAL_SESSION_SUMMARIES_VERSION).toBe("0092");
-    expect(SCHEMA_BASELINE_VERSION).toBe("0092");
+    expect(STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION).toBe("0093");
+    expect(PULL_REQUEST_READINESS_VERSION).toBe("0094");
+    expect(RECOVERY_DISPOSITION_VERSION).toBe("0095");
+    expect(FILE_SCOPE_LEASE_RELEASE_VERSION).toBe("0096");
+    expect(Number(PULL_REQUEST_READINESS_VERSION)).toBeGreaterThan(Number(STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION));
+    expect(Number(RECOVERY_DISPOSITION_VERSION)).toBeGreaterThan(Number(PULL_REQUEST_READINESS_VERSION));
+    expect(Number(FILE_SCOPE_LEASE_RELEASE_VERSION)).toBeGreaterThan(Number(RECOVERY_DISPOSITION_VERSION));
+    expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(FILE_SCOPE_LEASE_RELEASE_VERSION));
+    expect(SCHEMA_BASELINE_VERSION).toBe("0096");
   });
 
   it("keeps monitor and approval isolation assigned to version 0003", () => {
@@ -738,12 +750,12 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     refusal marker (100 → 105); later baseline additions bring the count to 106; and 0048 adds
     GitHub check state (106 → 107); 0049 adds the agent-activity outbox and counter (→ 109);
     0050 adds immutable lock, evidence, and report history (109 → 112); 0052 adds recall records (→ 113);
-    0060 adds workspace coordination leases and land intents (→ 115); 0071 adds patchnode_entries and 0084 adds task_overlap_waits (→ 117). Plugin tables are added separately
-    by the schema-init hook and are excluded here.
+    0060 adds workspace coordination leases and land intents (→ 115); 0071 adds patchnode_entries and 0084 adds task_overlap_waits (→ 117). Migration 0086 adds stale review callback waiver receipts (→ 118). Migration 0087 adds columns to pull_requests without changing the table count.
+    Plugin tables are added separately by the schema-init hook and are excluded here.
     */
     // FNXC:ExternalSessions 2026-09-22-19:42: Migrations 0086-0088 add five project-isolated external-session tables after the current 117-table baseline.
     // FNXC:ExternalSessions 2026-09-27-01:18: 0091 adds usage increments and 0092 session summaries (122 -> 124); 0089 (search index) and 0090 (host health columns) add no tables.
-    expect(bySchema.project).toBe(124);
+    expect(bySchema.project).toBe(125);
     /*
     FNXC:CapacityModel 2026-07-29-08:10 (drop the cross-project cap — table half):
     17, not 18: `central.global_concurrency` is dropped by migration 0037. A fresh
@@ -1330,6 +1342,12 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       VALUES ('local-fallback', 'FN-1', 'fallback task', 'todo', '2026-01-01', '2026-01-01');
       INSERT INTO project.task_documents(project_id, id, task_id, key, created_at, updated_at)
       VALUES ('local-fallback', 'doc-1', 'FN-1', 'PROMPT.md', '2026-01-01', '2026-01-01');
+      INSERT INTO project.stale_review_callback_waiver_receipts(
+        project_id, id, task_id, workflow_step_id, attempt_id, policy_version, actor, reason, issued_at
+      ) VALUES (
+        'local-fallback', 'receipt-1', 'FN-1', 'code-review', 'attempt-1', 'fn-9429-v1',
+        'system:stale-review-callback-waiver', 'proven-stale-code-review-callback', '2026-01-01'
+      );
       INSERT INTO public.fusion_sqlite_migrations(migration_key, project_id, status, updated_at)
       VALUES ('project:local-fallback', 'local-fallback', 'complete', now());
     `);
@@ -1344,9 +1362,12 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       SELECT project_id, id FROM project.tasks
       UNION ALL
       SELECT project_id, task_id FROM project.task_documents
+      UNION ALL
+      SELECT project_id, task_id FROM project.stale_review_callback_waiver_receipts
       ORDER BY 1, 2
     `)) as unknown as Array<{ project_id: string; id: string }>;
     expect(rows).toEqual([
+      { project_id: "registered-project", id: "FN-1" },
       { project_id: "registered-project", id: "FN-1" },
       { project_id: "registered-project", id: "FN-1" },
     ]);
@@ -1356,6 +1377,65 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
         AND project_id = 'registered-project'
         AND status = 'complete'
     `)).resolves.toHaveLength(1);
+  });
+
+  it("repairs the legacy receipt foreign key for populated partition promotion", async () => {
+    ctx = await setupBaselinedDb();
+    await applySchemaBaseline(ctx.db);
+    await ctx.db.execute(sql`
+      ALTER TABLE project.stale_review_callback_waiver_receipts
+        DROP CONSTRAINT stale_review_callback_waiver_receipts_task_fk;
+      ALTER TABLE project.stale_review_callback_waiver_receipts
+        ADD CONSTRAINT stale_review_callback_waiver_receipts_task_fk
+          FOREIGN KEY (project_id, task_id) REFERENCES project.tasks(project_id, id)
+            ON DELETE CASCADE;
+    `);
+
+    expect((await applySchemaBaseline(ctx.db)).applied).toBe(true);
+    const action = (await ctx.db.execute(sql`
+      SELECT con.confupdtype AS update_action, con.confdeltype AS delete_action
+      FROM pg_constraint con
+      WHERE con.conrelid = 'project.stale_review_callback_waiver_receipts'::regclass
+        AND con.conname = 'stale_review_callback_waiver_receipts_task_fk'
+    `)) as unknown as Array<{ update_action: string; delete_action: string }>;
+    expect(action).toEqual([{ update_action: "c", delete_action: "c" }]);
+
+    await ctx.db.execute(sql`
+      CREATE TABLE public.fusion_sqlite_migrations (
+        migration_key text PRIMARY KEY,
+        project_id text,
+        status text NOT NULL,
+        last_error text,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO project.tasks(project_id, id, description, "column", created_at, updated_at)
+      VALUES ('local-fallback', 'FN-legacy', 'legacy fallback task', 'todo', '2026-01-01', '2026-01-01');
+      INSERT INTO project.task_documents(project_id, id, task_id, key, created_at, updated_at)
+      VALUES ('local-fallback', 'doc-legacy', 'FN-legacy', 'PROMPT.md', '2026-01-01', '2026-01-01');
+      INSERT INTO project.stale_review_callback_waiver_receipts(
+        project_id, id, task_id, workflow_step_id, attempt_id, policy_version, actor, reason, issued_at
+      ) VALUES (
+        'local-fallback', 'receipt-legacy', 'FN-legacy', 'code-review', 'attempt-legacy', 'fn-9429-v1',
+        'system:stale-review-callback-waiver', 'proven-stale-code-review-callback', '2026-01-01'
+      );
+      INSERT INTO public.fusion_sqlite_migrations(migration_key, project_id, status, updated_at)
+      VALUES ('project:local-fallback', 'local-fallback', 'complete', now());
+    `);
+    await expect(rekeyFallbackProjectPartition(ctx.db, "local-fallback", "registered-project"))
+      .resolves.toBe(true);
+    await expect(ctx.db.execute(sql`
+      SELECT project_id FROM project.tasks WHERE id = 'FN-legacy'
+      UNION ALL
+      SELECT project_id FROM project.task_documents WHERE task_id = 'FN-legacy'
+      UNION ALL
+      SELECT project_id FROM project.stale_review_callback_waiver_receipts WHERE task_id = 'FN-legacy'
+      ORDER BY 1
+    `)).resolves.toEqual([
+      { project_id: "registered-project" },
+      { project_id: "registered-project" },
+      { project_id: "registered-project" },
+    ]);
+    expect((await applySchemaBaseline(ctx.db)).applied).toBe(false);
   });
 
   it("merges dual partitions fallback-wins with NULL-correct catalog unique rules", async () => {
@@ -1825,6 +1905,41 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
         updated_at text NOT NULL
       );
       CREATE INDEX "idxAutomationsScope" ON project.automations(scope);
+      /*
+      FNXC:PgSchemaApplier 2026-10-05-01:35:
+      The 0000 upgrade fixture must retain the real pull_requests relation so migration 0087
+      exercises its ALTER TABLE contract rather than passing through a synthetic missing-table escape hatch.
+      */
+      CREATE TABLE project.pull_requests (
+        id text PRIMARY KEY,
+        source_type text NOT NULL,
+        source_id text NOT NULL,
+        repo text NOT NULL,
+        head_branch text NOT NULL,
+        base_branch text,
+        state text NOT NULL DEFAULT 'creating',
+        pr_number integer,
+        pr_url text,
+        head_oid text,
+        mergeable text,
+        checks_rollup jsonb,
+        review_decision text,
+        auto_merge integer NOT NULL DEFAULT 0,
+        unverified integer NOT NULL DEFAULT 0,
+        failure_reason text,
+        response_rounds integer NOT NULL DEFAULT 0,
+        created_at bigint NOT NULL,
+        updated_at bigint NOT NULL,
+        closed_at bigint,
+        CONSTRAINT pull_requests_source_type_check CHECK (source_type IN ('task','branch-group')),
+        CONSTRAINT pull_requests_state_check CHECK (state IN ('creating','open','responding','merged','closed','failed'))
+      );
+      CREATE UNIQUE INDEX "idxPullRequestsOpenSource" ON project.pull_requests(source_type, source_id)
+        WHERE state NOT IN ('merged','closed','failed');
+      CREATE UNIQUE INDEX "idxPullRequestsOpenBranch" ON project.pull_requests(repo, head_branch)
+        WHERE state NOT IN ('merged','closed','failed');
+      CREATE UNIQUE INDEX "idxPullRequestsNumber" ON project.pull_requests(repo, pr_number)
+        WHERE pr_number IS NOT NULL;
       CREATE TABLE public.fusion_schema_migrations (
         version text PRIMARY KEY,
         applied_at timestamptz NOT NULL DEFAULT now()
@@ -1860,6 +1975,28 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SELECT project_id, id, name FROM project.automations
     `)) as unknown as Array<{ project_id: string; id: string; name: string }>;
     expect(rows).toEqual([{ project_id: "project-a", id: "legacy-automation", name: "Legacy" }]);
+    const readinessColumns = (await ctx.db.execute(sql`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'pull_requests'
+        AND column_name IN ('readiness', 'readiness_provider')
+      ORDER BY column_name
+    `)) as unknown as Array<{ column_name: string; data_type: string }>;
+    expect(readinessColumns).toEqual([
+      { column_name: "readiness", data_type: "jsonb" },
+      { column_name: "readiness_provider", data_type: "text" },
+    ]);
+    const recoveryDispositionColumns = (await ctx.db.execute(sql`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'tasks'
+        AND column_name = 'recovery_disposition'
+    `)) as unknown as Array<{ column_name: string; data_type: string }>;
+    expect(recoveryDispositionColumns).toEqual([
+      { column_name: "recovery_disposition", data_type: "text" },
+    ]);
     const versions = (await ctx.db.execute(sql`
       SELECT version FROM public.fusion_schema_migrations ORDER BY version
     `)) as unknown as Array<{ version: string }>;
@@ -1946,7 +2083,74 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       EXTERNAL_SESSION_HOST_HEALTH_VERSION,
       EXTERNAL_SESSION_INCREMENTS_VERSION,
       EXTERNAL_SESSION_SUMMARIES_VERSION,
+      STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
+      PULL_REQUEST_READINESS_VERSION,
+      RECOVERY_DISPOSITION_VERSION,
+      FILE_SCOPE_LEASE_RELEASE_VERSION,
     ]);
+    const readinessMarkerCount = (await ctx.db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM public.fusion_schema_migrations
+      WHERE version = ${PULL_REQUEST_READINESS_VERSION}
+    `)) as unknown as Array<{ count: number }>;
+    expect(readinessMarkerCount).toEqual([{ count: 1 }]);
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
+    const rerunMarkerCount = (await ctx.db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM public.fusion_schema_migrations
+      WHERE version = ${PULL_REQUEST_READINESS_VERSION}
+    `)) as unknown as Array<{ count: number }>;
+    expect(rerunMarkerCount).toEqual([{ count: 1 }]);
+  });
+
+  it("applies and records recovery disposition exactly once on an upgraded database", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      ALTER TABLE project.tasks DROP COLUMN recovery_disposition;
+      DELETE FROM public.fusion_schema_migrations WHERE version = '${RECOVERY_DISPOSITION_VERSION}';
+    `));
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'tasks'
+        AND column_name = 'recovery_disposition'
+    `)) as unknown as Array<{ column_name: string; data_type: string }>;
+    expect(columns).toEqual([{ column_name: "recovery_disposition", data_type: "text" }]);
+    const marker = (await ctx.db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM public.fusion_schema_migrations
+      WHERE version = ${RECOVERY_DISPOSITION_VERSION}
+    `)) as unknown as Array<{ count: number }>;
+    expect(marker).toEqual([{ count: 1 }]);
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
+  });
+
+  it("repairs a recorded file-scope lease release migration whose column is absent", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      ALTER TABLE project.tasks DROP COLUMN file_scope_lease_release;
+    `));
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'tasks'
+        AND column_name = 'file_scope_lease_release'
+    `)) as unknown as Array<{ column_name: string; data_type: string }>;
+    expect(columns).toEqual([{ column_name: "file_scope_lease_release", data_type: "jsonb" }]);
+    const marker = (await ctx.db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM public.fusion_schema_migrations
+      WHERE version = ${FILE_SCOPE_LEASE_RELEASE_VERSION}
+    `)) as unknown as Array<{ count: number }>;
+    expect(marker).toEqual([{ count: 1 }]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
 
@@ -2054,6 +2258,10 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       EXTERNAL_SESSION_HOST_HEALTH_VERSION,
       EXTERNAL_SESSION_INCREMENTS_VERSION,
       EXTERNAL_SESSION_SUMMARIES_VERSION,
+      STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
+      PULL_REQUEST_READINESS_VERSION,
+      RECOVERY_DISPOSITION_VERSION,
+      FILE_SCOPE_LEASE_RELEASE_VERSION,
     ]);
   });
 
@@ -2295,6 +2503,10 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       EXTERNAL_SESSION_HOST_HEALTH_VERSION,
       EXTERNAL_SESSION_INCREMENTS_VERSION,
       EXTERNAL_SESSION_SUMMARIES_VERSION,
+      STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
+      PULL_REQUEST_READINESS_VERSION,
+      RECOVERY_DISPOSITION_VERSION,
+      FILE_SCOPE_LEASE_RELEASE_VERSION,
     ]);
   });
 
@@ -2417,6 +2629,10 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       EXTERNAL_SESSION_HOST_HEALTH_VERSION,
       EXTERNAL_SESSION_INCREMENTS_VERSION,
       EXTERNAL_SESSION_SUMMARIES_VERSION,
+      STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
+      PULL_REQUEST_READINESS_VERSION,
+      RECOVERY_DISPOSITION_VERSION,
+      FILE_SCOPE_LEASE_RELEASE_VERSION,
     ]);
   });
 
@@ -2539,6 +2755,10 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       EXTERNAL_SESSION_HOST_HEALTH_VERSION,
       EXTERNAL_SESSION_INCREMENTS_VERSION,
       EXTERNAL_SESSION_SUMMARIES_VERSION,
+      STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
+      PULL_REQUEST_READINESS_VERSION,
+      RECOVERY_DISPOSITION_VERSION,
+      FILE_SCOPE_LEASE_RELEASE_VERSION,
     ]);
   });
 });

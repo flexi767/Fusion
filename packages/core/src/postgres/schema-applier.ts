@@ -98,7 +98,8 @@ touches no data; it must advance in the same change that ships a new migration f
  */
 // FNXC:UpstreamMerge 2026-10-04 (X-4385): upstream's 0086 (FN-9429 waiver receipts) collides with this
 // fork's released 0086 (external sessions, applied on J), so it is renumbered to 0093 below.
-export const SCHEMA_BASELINE_VERSION = "0093";
+// FNXC:UpstreamSync 2026-10-16-22:04: preserve released fork migrations 0086-0093; incoming readiness, recovery and lease release use 0094-0096.
+export const SCHEMA_BASELINE_VERSION = "0096";
 export const EXTERNAL_SESSIONS_VERSION = "0086";
 export const EXTERNAL_SESSION_TURNS_VERSION = "0088";
 export const EXTERNAL_SESSION_TURN_SEARCH_VERSION = "0089";
@@ -294,6 +295,11 @@ export const OVERLAP_WAIT_SYNC_VERSION = "0084";
 export const DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION = "0085";
 /** FN-9429: project-scoped authority receipts for automated stale callback waivers. */
 export const STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION = "0093";
+/** FN-9439: provider-neutral current-head readiness snapshot columns. */
+export const PULL_REQUEST_READINESS_VERSION = "0094";
+/** FN-9512: privacy-safe route code for a recovery owner that has reseeded work. */
+export const RECOVERY_DISPOSITION_VERSION = "0095";
+export const FILE_SCOPE_LEASE_RELEASE_VERSION = "0096";
 
 /** FNXC:MemoryFocus 2026-08-13-15:57: explicit registration prevents the per-conversation memory-focus migration from being skipped. Renumbered to 0060 (FN-9037 took 0059), then 0061, then 0065 (2026-08-20) when the upstream FN-066..FN-094 batch claimed 0061-0064. */
 export const CHAT_SESSION_MEMORY_FOCUS_VERSION = "0066";
@@ -571,6 +577,9 @@ const CHAT_MESSAGES_SESSION_RECENCY_INDEX_MIGRATION_PATH = join(MIGRATIONS_DIR, 
 const OVERLAP_WAIT_SYNC_MIGRATION_PATH = join(MIGRATIONS_DIR, "0084_fn_332_overlap_sync.sql");
 const DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_MIGRATION_PATH = join(MIGRATIONS_DIR, "0085_drop_excluded_upstream_feature_schema.sql");
 const STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0093_fn_9429_stale_review_callback_waiver_receipts.sql");
+const PULL_REQUEST_READINESS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0094_fn_9439_pull_request_readiness.sql");
+const RECOVERY_DISPOSITION_MIGRATION_PATH = join(MIGRATIONS_DIR, "0095_fn_9512_recovery_disposition.sql");
+const FILE_SCOPE_LEASE_RELEASE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0096_fn_9529_file_scope_lease_release.sql");
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -717,6 +726,9 @@ export async function applySchemaBaseline(
     const overlapWaitSyncAlreadyApplied = applied.includes(OVERLAP_WAIT_SYNC_VERSION);
     const dropExcludedUpstreamFeatureSchemaAlreadyApplied = applied.includes(DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION);
     const staleReviewCallbackWaiverReceiptsAlreadyApplied = applied.includes(STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION);
+    const pullRequestReadinessAlreadyApplied = applied.includes(PULL_REQUEST_READINESS_VERSION);
+    const recoveryDispositionAlreadyApplied = applied.includes(RECOVERY_DISPOSITION_VERSION);
+    const fileScopeLeaseReleaseAlreadyApplied = applied.includes(FILE_SCOPE_LEASE_RELEASE_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -1805,9 +1817,22 @@ export async function applySchemaBaseline(
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${EXTERNAL_SESSION_SUMMARIES_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
+    /*
+    FNXC:StaleReviewCallbackWaiver 2026-10-03-23:08:
+    Migration 0086 originally created a delete-only task FK. Re-run the idempotent migration when
+    that legacy shape remains so populated fallback partitions can rekey task receipts atomically.
+    */
     const staleReviewCallbackWaiverReceiptsMissing = ((await tx.execute(sql`
       SELECT COALESCE((
         SELECT NOT (c.relrowsecurity AND c.relforcerowsecurity)
+          OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint con
+            WHERE con.conrelid = c.oid
+              AND con.conname = 'stale_review_callback_waiver_receipts_task_fk'
+              AND con.contype = 'f'
+              AND con.confupdtype = 'c'
+              AND con.confdeltype = 'c'
+          )
         FROM pg_class c
         WHERE c.oid = to_regclass('project.stale_review_callback_waiver_receipts')
       ), true) AS missing
@@ -1816,6 +1841,27 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_MIGRATION_PATH, "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    if (!pullRequestReadinessAlreadyApplied) {
+      const migrationSql = await readFile(PULL_REQUEST_READINESS_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${PULL_REQUEST_READINESS_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    if (!recoveryDispositionAlreadyApplied) {
+      const migrationSql = await readFile(RECOVERY_DISPOSITION_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${RECOVERY_DISPOSITION_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    const fileScopeLeaseReleaseExists = ((await tx.execute(sql`
+      SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'project' AND table_name = 'tasks' AND column_name = 'file_scope_lease_release') AS present
+    `)) as unknown as Array<{ present: boolean }>)[0]?.present === true;
+    if (!fileScopeLeaseReleaseAlreadyApplied || !fileScopeLeaseReleaseExists) {
+      const migrationSql = await readFile(FILE_SCOPE_LEASE_RELEASE_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${FILE_SCOPE_LEASE_RELEASE_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };

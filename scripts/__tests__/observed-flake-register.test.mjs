@@ -155,6 +155,16 @@ FNXC:SkillsGetFlakeRegister 2026-09-29-14:00:
 FN-9423 records one built CLI completion timeout only after the real built-entry file test passed.
 The active inventory and evidence check keep the second-sighting quarantine decision tied to the
 exact global-flag child lifecycle without widening its existing test budget.
+
+FNXC:TriagePlanningRetry 2026-10-05-04:34:
+FN-9498 closed entry 18 after the shard logs proved an abandoned fake-timer test was consuming
+its successor's mocks. Keep the active inventory and retained evidence separate: the closed record
+must preserve both test identities and the synchronization repair without authorizing quarantine.
+
+FNXC:AgentSkillDetailOrdering 2026-10-05-08:54:
+FN-9506 records the shard-three Agent Detail badge observation after a controlled pending-discovery
+repair. Keep the first-sighting record active so a second appearance follows the file-level
+quarantine rule rather than silently treating a deterministic test repair as a policy exemption.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -178,35 +188,45 @@ test("observed-flake register active count, escalation state, and owners stay sy
       status: "Active first sighting — recorded 2026-08-23, unattributed.",
     },
     {
-      heading: "18. Triage rate-limit retry log warning timer ordering",
-      status: "Active first sighting — recorded 2026-09-24, unattributed.",
+      heading: "20. ProjectEngine research recall composition ordering",
+      status: "Active first sighting — recorded 2026-10-04, unattributed.",
+    },
+    {
+      heading: "21. Agent Detail legacy skill discovery ordering",
+      status: "Active first sighting — recorded 2026-10-05 by FN-9506; deterministic test repair landed, with a second sighting requiring file-level quarantine.",
+    },
+    {
+      heading: "22. Pipeline smoke Coding S17 post-merge restart",
+      status: "Active first sighting — recorded 2026-10-15 by FN-9551; no quarantine.",
     },
   ]);
 });
 
-test("triage timeout first-sighting record retains shard evidence and quarantine escalation", () => {
+test("closed triage retry record retains both shard diagnoses and structural repair evidence", () => {
   const register = readFileSync(registerPath, "utf8");
   const sections = readActiveRecordSections(register).filter(
     ({ heading }) => heading === "18. Triage rate-limit retry log warning timer ordering",
   );
-  assert.equal(sections.length, 1, "Expected exactly one active triage timeout first-sighting record");
+  assert.equal(sections.length, 1, "Expected exactly one retained closed triage retry record");
 
   const [{ body }] = sections;
   for (const evidence of [
-    "Active first sighting — recorded 2026-09-24, unattributed.",
+    "Closed 2026-10-05 — structurally resolved by FN-9498; no quarantine.",
     "packages/engine/src/__tests__/triage.test.ts",
-    "specifyTask — status restore failure diagnostics > logs warning when logEntry fails during rate-limit retry",
+    "logs warning when logEntry fails during rate-limit retry",
+    "logs warning when transient-error retry status update fails",
     "d486a4c275",
+    "9f06d4fe16404f72c5d25ad97ebcfa93d4843b8c",
     "36053028228",
-    "test-timings-shard-2",
-    "packages/engine/.timings/timings-shard2-1.json",
-    "STACK_TRACE_ERROR",
-    "triage.test.ts:6701",
-    "30032 ms",
-    "same-change file-level quarantine in `scripts/lib/test-quarantine.json`",
-    "matching `engine-default` Vitest exclusion",
+    "37260134709",
+    "111605429056",
+    "--shard=2/2",
+    "30000 ms",
+    "rejected `logEntry`",
+    "recoveryRetryCount: 1",
+    "no terminal state",
   ]) {
-    assert.ok(body.includes(evidence), `Triage timeout record is missing ${evidence}`);
+    assert.ok(body.includes(evidence), `Closed triage retry record is missing ${evidence}`);
   }
 });
 

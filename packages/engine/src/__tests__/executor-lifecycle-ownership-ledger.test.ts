@@ -225,16 +225,28 @@ function measure(body: ts.Block, includeHandbacks: boolean): Record<string, numb
 }
 
 /*
-Measured 2026-07-27 against 387e83643. Lower these as U8 moves a disposition behind a graph
-outcome; raising one is a new out-of-graph lifecycle decision and needs a stated reason.
+FNXC:WorkflowExecutionOwnership 2026-10-04-12:28:
+FN-9471 refreshes this AST-derived fixture ledger after graph-routing extractions moved lifecycle writes. The current counts remain a ratchet: lower them only when the graph owns the visible outcome, and justify every increase as a new executor-owned lifecycle decision.
 */
 const LEDGER = {
   runImplementation: {
-    "column transitions (store.moveTask)": 16,
+    /*
+     * FNXC:RecoveryOwnership 2026-10-06-17:39:
+     * FN-9512 adds the fenced exhausted-transient reseed move. It is executor-owned only until
+     * the graph can model this recovery outcome; the live-row fence and resolved rebound lane
+     * prevent it from bypassing an operator pause or inventing a terminal park.
+     */
+    "column transitions (store.moveTask)": 11,
     /* U8: 3 -> 2. The pending-review handoff left this method — the graph's
        `review-pending-handoff` node performs it now. A decrement here is the unit working. */
     "review transitions (handoffTaskToReview)": 2,
-    "terminal parks (status: \"failed\")": 9,
+    /*
+     * FNXC:RecoveryOwnership 2026-10-06-17:39:
+     * FN-9512 replaces three ordinary exhausted transient-failure parks with owner-preserving
+     * reseeds. Explicit external obstacles and irreversible failures remain terminal where their
+     * existing policy requires it; this reduction must not be read as weakening those fences.
+     */
+    "terminal parks (status: \"failed\")": 6,
     "graph handbacks (graphCompletion)": 3,
   },
   /*
@@ -247,7 +259,7 @@ const LEDGER = {
   method sit past its closing brace, in the recovery helpers below it.
   */
   handleGraphFailure: {
-    "column transitions (store.moveTask)": 0,
+    "column transitions (store.moveTask)": 1,
     /* U8: 0 -> 1. The named compat classifier for user-authored graphs that do not declare the
        `outcome:review-pending` edge. For those shapes the transition is RELOCATED, not removed —
        stated plainly so the ledger is not read as more progress than it is. */
@@ -265,7 +277,7 @@ const LEDGER = {
     could have taken instead today; widening the seam's pre-session failure vocabulary is what would
     let these two fall.
     */
-    "terminal parks (status: \"failed\")": 9,
+    "terminal parks (status: \"failed\")": 10,
   },
 } as const;
 
@@ -294,12 +306,12 @@ describe("U8 execution-lifecycle ownership ledger", () => {
   });
 
   /*
-  The headline number, stated once so a reader does not have to add the ledger up: the
-  implementation phase decides its own lifecycle 27 times and asks the graph 3 times (28 at baseline; the pending-review handoff moved to the graph).
+  FNXC:WorkflowExecutionOwnership 2026-10-04-12:28:
+  The headline ratio is derived from the AST ledger so graph-routing extractions cannot leave a stale ownership claim. It remains deliberately smaller than the executor-owned count while the migration is incomplete.
   */
   it("states the U8 baseline ratio: the implementation phase decides far more than it asks", () => {
     const owned = EXECUTOR_OWNED_LABELS.reduce<number>((sum, label) => sum + LEDGER.runImplementation[label], 0);
     const handbacks = LEDGER.runImplementation[GRAPH_HANDBACK_LABEL];
-    expect({ owned, handbacks }).toEqual({ owned: 27, handbacks: 3 });
+    expect({ owned, handbacks }).toEqual({ owned: 19, handbacks: 3 });
   });
 });

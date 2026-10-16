@@ -15,6 +15,7 @@ import type {
   PlannerOversightStage,
 } from "@fusion/core";
 import {
+  computeWorkflowIrPin,
   resolveProjectColumnsForRoles,
   REVIEW_ROLES,
   resolveWorkflowIrForTask,
@@ -56,20 +57,24 @@ import {
   sortTasksByPriorityThenAgeAndId,
   resolveWipTargetForTask,
   clearMergeConfirmedTransientStatus,
+  getRequiredPostMergeEvidenceDecision,
+  getRequiredPostMergeEvidenceBlocker,
   classifyGhError,
   createRecallCaptureWriter,
   resolveEngineIncarnationId,
   resolveEngineNodeId,
   type WorkspaceLeaseHandle,
+  type PreMergeAdmissionDecision,
   getTaskMergeBlocker,
+  evaluatePreMergeAdmissionDecision,
   resolvePreMergeGateForTask,
   buildManualRetryResetPatch,
 } from "@fusion/core";
 import { assemblePlannerOverseerRuntimeSnapshot } from "./overseer/planner-overseer-runtime-snapshot.js";
-import { moveTaskToContainedBackwardTarget } from "./execution/lifecycle-move.js";
 import { activeSessionRegistry, executingTaskLock } from "./agents/active-session-registry.js";
 import { isTaskExecutionLive } from "./merge/merge-execution-exclusion.js";
 import { isMergeActiveStatus } from "./merge/merge-active-status.js";
+import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./merge/post-merge-gate-reseed.js";
 import { captureMergeContentDescriptor } from "./merge/merge-content-capture.js";
 import { resolveIntegrationBranch } from "./merge/integration-branch.js";
 import { execFile } from "node:child_process";
@@ -89,7 +94,7 @@ import {
 import { extractAdvisorAssistantText } from "./overseer/overseer-advise-tool.js";
 import { createResolvedAgentSession } from "./agents/agent-session-helpers.js";
 import type { PrNodeGithubOps } from "./merge/pr-nodes.js";
-import { PrReconciler, type PrReconcileGithubOps } from "./merge/pr-reconcile.js";
+import { PrReconciler, type PrReconcileFetchResult, type PrReconcileGithubOps } from "./merge/pr-reconcile.js";
 import { PrCommentHandler } from "./merge/pr-comment-handler.js";
 import { NtfyNotifier } from "./util/notifier.js";
 import { NotificationService, OAuthAlertStateStore, OAuthExpiryMonitor, OAuthRefreshScheduler, OAuthValidityLogger } from "./notification/index.js";
@@ -150,6 +155,7 @@ import { ResearchRunDispatcher } from "./research/research-dispatcher.js";
 import { ResearchProviderRegistry } from "./research/provider-registry.js";
 import { createRunAuditor, generateSyntheticRunId } from "./util/run-audit.js";
 import { finalizeProvenAutoMergeTask } from "./merge/auto-merge-finalization.js";
+import { recoverConfirmedMergePush } from "./merge/recover-confirmed-merge-push.js";
 import { isTransientError } from "./errors/transient-error-detector.js";
 import { classifyTransientMergeError, MAX_AUTO_MERGE_TRANSIENT_RETRIES } from "./errors/transient-merge-error-classifier.js";
 import { TunnelProcessManager } from "./remote-access/tunnel-process-manager.js";
@@ -434,6 +440,8 @@ export interface ProjectEngineOptions {
    * Use this for callbacks that need project-scoped settings.
    */
   createPrNodeGithubOps?: (store: TaskStore) => PrNodeGithubOps;
+  /** Builds project-scoped, read-only Mission validation evidence without importing host clients into engine. */
+  createMissionValidationEvidenceProvider?: (store: TaskStore) => import("./missions/mission-validation-evidence.js").MissionValidationEvidenceProvider;
   /**
    * Node-agnostic GitHub reconcile ops (U4): the injected ETag-probe +
    * deep-fetch callbacks backing {@link PrReconciler}. Injected from the CLI
@@ -482,6 +490,69 @@ type MergeResolver = {
   reject: (err: Error) => void;
   graphOwnedPostMergeTraversal?: boolean;
 };
+
+const EXTERNAL_MERGE_REGION_KINDS = new Set([
+  "merge-gate", "merge-attempt", "manual-merge-hold", "retry-backoff",
+  "recovery-router", "branch-group-member-integration", "branch-group-promotion",
+]);
+
+/** Return the first success-reachable graph-native post-merge boundary for an external landing. */
+export function resolveExternalMergeCloseoutNode(ir: WorkflowIr): string | undefined {
+  const nodes = new Map(ir.nodes.map((node) => [node.id, node]));
+  const successors = new Map<string, string[]>();
+  for (const edge of ir.edges) {
+    if (edge.kind === "rework" || (edge.condition && edge.condition !== "success")) continue;
+    const values = successors.get(edge.from) ?? [];
+    values.push(edge.to);
+    successors.set(edge.from, values);
+  }
+
+  const queue = ir.nodes
+    .filter((node) => EXTERNAL_MERGE_REGION_KINDS.has(node.kind))
+    .map((node) => node.id);
+  const visited = new Set<string>();
+  const postMergeNodes: string[] = [];
+  while (queue.length > 0) {
+    const nodeId = queue.shift()!;
+    if (visited.has(nodeId)) continue;
+    visited.add(nodeId);
+    const node = nodes.get(nodeId);
+    if (!node) continue;
+    if (node.kind === "optional-group" && node.config?.phase === "post-merge") {
+      postMergeNodes.push(nodeId);
+      continue;
+    }
+    for (const successor of successors.get(nodeId) ?? []) queue.push(successor);
+  }
+  return postMergeNodes.sort()[0];
+}
+
+/*
+FNXC:ExternalPrCloseout 2026-10-05-04:07:
+A runnable continuation is superseded only when its success path still enters the
+pre-merge region. Unknown and post-merge work retains its existing owner.
+*/
+function isConclusivePreMergeContinuation(ir: WorkflowIr, nodeId: string): boolean {
+  const nodes = new Map(ir.nodes.map((node) => [node.id, node]));
+  const node = nodes.get(nodeId);
+  if (!node || (node.kind === "optional-group" && node.config?.phase === "post-merge")) return false;
+  const successors = new Map<string, string[]>();
+  for (const edge of ir.edges) {
+    if (edge.kind === "rework" || (edge.condition && edge.condition !== "success")) continue;
+    successors.set(edge.from, [...(successors.get(edge.from) ?? []), edge.to]);
+  }
+  const pending = [nodeId];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const current = pending.shift()!;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    const currentNode = nodes.get(current);
+    if (currentNode && EXTERNAL_MERGE_REGION_KINDS.has(currentNode.kind)) return true;
+    pending.push(...(successors.get(current) ?? []));
+  }
+  return false;
+}
 
 export class ProjectEngine {
   private readonly staleContentRerouteAuditKeys = new Set<string>();
@@ -870,6 +941,7 @@ export class ProjectEngine {
       ...(options.externalTaskStore ? { externalTaskStore: options.externalTaskStore } : {}),
       ...(options.prNodeGithubOps ? { prNodeGithubOps: options.prNodeGithubOps } : {}),
       ...(options.createPrNodeGithubOps ? { createPrNodeGithubOps: options.createPrNodeGithubOps } : {}),
+      ...(options.createMissionValidationEvidenceProvider ? { createMissionValidationEvidenceProvider: options.createMissionValidationEvidenceProvider } : {}),
     };
     this.runtime = new InProcessRuntime(runtimeConfig, centralCore);
     // Let the runtime's SelfHealingManager re-enqueue tasks directly into our
@@ -977,6 +1049,111 @@ export class ProjectEngine {
         });
       },
     });
+  }
+
+  /**
+   * Reconcile a dashboard-observed PR through the same owner as the background
+   * provider poller. The caller supplies fresh provider evidence; this method
+   * deliberately declines when the observation cannot be bound to an active PR entity.
+   */
+  async reconcileDashboardMergedPr(taskId: string, result: PrReconcileFetchResult): Promise<boolean> {
+    const store = this.runtime.getTaskStore();
+    const task = await store.getTask(taskId);
+    if (!task?.prInfo?.number || !task.prInfo.headOid || result.prNumber !== task.prInfo.number) return false;
+    const entity = await store.getActivePrEntityBySource?.("task", taskId);
+    if (!entity) return false;
+    return this.reconcileExternallyMergedCurrentHead(entity, result);
+  }
+
+  /*
+  FNXC:ExternalPrCloseout 2026-10-05-04:10:
+  Fresh current-head proof may outrank stale retry selection, but never an
+  operator pause or a live executor/merge owner. Re-read under the task fence
+  before retiring a stale continuation so an external landing cannot steal
+  active work or resume a deliberately paused card.
+  */
+  private async reconcileExternallyMergedCurrentHead(
+    entity: import("@fusion/core").PrEntity,
+    result: PrReconcileFetchResult,
+  ): Promise<boolean> {
+    const readiness = result.readiness;
+    if (entity.sourceType !== "task" || readiness?.state !== "merged") return false;
+    const store = this.runtime.getTaskStore();
+    let accepted = false;
+    let closeoutTask: Task | undefined;
+    await store.withPlanningLifecycleLock(entity.sourceId, async () => {
+      const task = await store.getTask(entity.sourceId);
+      if (!task?.prInfo || task.prInfo.number !== entity.prNumber
+        || task.prInfo.headOid !== entity.headOid
+        || readiness.observedHeadOid !== task.prInfo.headOid
+        || result.headOid !== task.prInfo.headOid
+        || !readiness.mergeCommitSha
+        || readiness.mergeCommitIncludesHead !== true
+        || task.paused || task.userPaused || task.deletedAt
+        || isTaskExecutionLive(task.id, { activeSessionRegistry, executingTaskLock })
+        || await this.isMergePending(task.id)) return;
+      const ir = await resolveWorkflowIrForTask(store, task.id);
+      const closeoutNodeId = resolveExternalMergeCloseoutNode(ir);
+      const active = (await store.listWorkflowWorkItemsForTask(task.id, { kinds: ["task"] }))
+        .filter((item) => ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(item.state));
+      if (active.some((item) => item.state === "running" || item.state === "held")) return;
+      /*
+      FNXC:ExternalPrCloseout 2026-10-05-04:07:
+      Unknown or post-merge continuations have their own owner; only a graph-proven
+      predecessor may be retired by an external-landing handoff.
+      */
+      if (active.some((item) => item.nodeId !== closeoutNodeId && !isConclusivePreMergeContinuation(ir, item.nodeId))) return;
+      const prInfo = {
+        ...task.prInfo,
+        status: "merged" as const,
+        mergeCommitSha: readiness.mergeCommitSha,
+        lastCheckedAt: readiness.observedAt,
+      };
+      await store.updatePrInfo(task.id, prInfo);
+      if (!closeoutNodeId) {
+        const finalized = await store.applyPrMergedTransition(task.id, {
+          agentId: "pr-reconcile",
+          runId: `external-pr-current-head:${entity.id}:${readiness.observedHeadOid}`,
+          externallyLanded: true,
+          lifecycleLockHeld: true,
+        });
+        accepted = finalized.moved;
+        return;
+      }
+      if (active.some((item) => item.nodeId === closeoutNodeId)) return;
+      const live = await store.updateTask(task.id, {
+        status: null,
+        error: null,
+        mergeDetails: {
+          ...task.mergeDetails,
+          mergeConfirmed: true,
+          commitSha: readiness.mergeCommitSha,
+          prNumber: task.prInfo.number,
+        },
+      });
+      await store.replaceActiveTaskWorkflowContinuation({
+        runId: `external-pr-current-head:${entity.id}:${readiness.observedHeadOid}`,
+        taskId: task.id,
+        nodeId: closeoutNodeId,
+        kind: "task",
+        state: "runnable",
+        stableWorkflowRunId: `${task.id}:${ir.name}`,
+        continuationSequence: 0,
+        waitReason: null,
+        sourceColumn: live.column,
+        targetColumn: live.column,
+        irHash: computeWorkflowIrPin(ir, closeoutNodeId).irHash,
+      });
+      closeoutTask = live;
+      accepted = true;
+    });
+    /*
+    FNXC:ExternalPrCloseout 2026-10-05-04:07:
+    Execute after releasing the cross-process lifecycle fence: the durable
+    continuation is the handoff, and graph execution may acquire that fence itself.
+    */
+    if (closeoutTask) await this.runtime.getExecutor?.()?.execute(closeoutTask);
+    return accepted;
   }
 
   getActiveMergeTaskId(): string | null {
@@ -1392,7 +1569,15 @@ export class ProjectEngine {
       this.prReconciler = new PrReconciler({
         store,
         ops: this.options.prReconcileGithubOps,
+        releaseAwaitingChecks: async (taskId, prEntityId, expectedHeadOid) => {
+          await store.releaseAwaitingPrChecksIfCurrentHead(taskId, prEntityId, expectedHeadOid);
+        },
+        onMergedCurrentHead: async (entity, result) =>
+          this.reconcileExternallyMergedCurrentHead(entity, result),
       });
+      this.runtime.getSelfHealingManager()?.setFreshExternalPrReconciler(async () =>
+        (await this.prReconciler?.reconcileAllOnce() ?? []).length,
+      );
       this.prReconciler.start();
     }
 
@@ -1439,6 +1624,7 @@ export class ProjectEngine {
     }
 
     this.gridlockDetector = new GridlockDetector(store, {
+      agentStore: this.runtime.getAgentStore(),
       onGridlock: (event) => this.notifier?.notifyGridlock(event),
       onGridlockCleared: () => this.notifier?.notifyGridlock(null),
     });
@@ -2294,10 +2480,8 @@ export class ProjectEngine {
    * `injectGuidance`/`requestTargetedFix` post a planner-authored steering
    * comment via `store.addSteeringComment` (the same channel the executor's
    * real-time injection listener already watches); `retryStep` calls the
-   * store's existing in-progress→todo retry/re-enqueue path
-   * (`moveTask(id, "todo", { preserveProgress: true })`), preserving
-   * progress exactly like the auto-recovery/self-healing retry handlers do.
-   * No new session/tool/merge channel is introduced.
+   * durable idle continuation seam in the current WIP column. Recovery preserves
+   * progress and never claims revision authority to move a card backward.
    */
   private buildPlannerRecoveryHandlers(store: TaskStore): PlannerRecoveryHandlers {
     return {
@@ -2347,26 +2531,55 @@ export class ProjectEngine {
         }
         // Live surface cleared — allow a fresh skip log if work goes live again later.
         this.plannerLiveRetrySkipLogDedup.delete(`${task.id}::${decision.watchedStage ?? "executor"}`);
-        /* FNXC:WorkflowResolvedColumns 2026-07-30-22:20: census-invisible moveTask DESTINATION — a call argument, not a comparison. */
-        const recovery = await moveTaskToContainedBackwardTarget(store, task.id, "self-healing-stranded-recovery", {
-          preserveProgress: true,
-          moveSource: "engine",
-        }, task.column);
-        if (!recovery.moved) {
-          if (!("reason" in recovery) || recovery.reason !== "in-place-recovery"
-            || task.status !== "failed"
-            || (await this.resolveTaskColumnFlags(store, task, new Map()))?.countsTowardWip !== true) return false;
-          let resumed = false;
-          await store.updateTaskAtomic(task.id, (current) => {
-            if (current.column !== task.column || current.status !== "failed"
-              || current.error !== task.error || current.updatedAt !== task.updatedAt
-              || current.paused || current.userPaused || current.deletedAt
-              || executor?.isTaskLiveForOverseerRetry?.(task.id) === true) return null;
-            resumed = true;
-            return { status: "queued", error: null, sessionFile: null };
+        if (task.status !== "failed" || task.paused || task.userPaused || task.deletedAt
+          || !task.updatedAt || !task.workflowIrPinNodeId
+          || (await this.resolveTaskColumnFlags(store, task, new Map()))?.countsTowardWip !== true) return false;
+        const settings = await store.getSettings();
+        if (settings.globalPause || settings.enginePaused
+          || isTaskExecutionLive(task.id, { activeSessionRegistry, executingTaskLock })) return false;
+        const selection = await store.getTaskWorkflowSelectionAsync(task.id);
+        const ir = await resolveWorkflowIrForTask(store, task.id);
+        const node = ir.version === "v2"
+          ? ir.nodes.find((candidate) => candidate.id === task.workflowIrPinNodeId && candidate.column === task.column)
+          : undefined;
+        if (!node) return false;
+        let resumed = false;
+        const resumedTask = await store.updateTaskAtomic(task.id, async (current) => {
+          if (current.column !== task.column || current.status !== "failed"
+            || current.error !== task.error || current.updatedAt !== task.updatedAt
+            || current.workflowIrPinNodeId !== node.id
+            || current.paused || current.userPaused || current.deletedAt
+            || executor?.isTaskLiveForOverseerRetry?.(task.id) === true) return null;
+          const currentSettings = await store.getSettings();
+          if (currentSettings.globalPause || currentSettings.enginePaused
+            || executor?.isTaskLiveForOverseerRetry?.(task.id) === true
+            || isTaskExecutionLive(task.id, { activeSessionRegistry, executingTaskLock })) return null;
+          // Persist the wake before clearing failure. The idle seed refuses every
+          // active work-item kind and fences task/selection changes under its lock.
+          // Do not log before this CAS: task logs also advance updatedAt.
+          const items = await store.listWorkflowWorkItemsForTask(task.id);
+          const seeded = await store.seedWorkspaceCodeReviewContinuationIfIdle({
+            taskId: task.id, nodeId: node.id, kind: "task", state: "runnable",
+            runId: `${task.id}:planner-recovery:${node.id}:${items.length}`,
+            stableWorkflowRunId: `${task.id}:${ir.name}`,
+            continuationSequence: items.length,
+            sourceColumn: task.column, targetColumn: task.column,
+            irHash: computeWorkflowIrPin(ir, node.id).irHash,
+            expectedWorkflowSelection: selection ?? null,
+            expectedTaskUpdatedAt: current.updatedAt,
           });
-          if (!resumed) return false;
-        }
+          if (!seeded.seeded) return null;
+          resumed = true;
+          return { status: "queued", error: null, sessionFile: null };
+        }, undefined, () => executor?.isTaskLiveForOverseerRetry?.(task.id) !== true
+          && !isTaskExecutionLive(task.id, { activeSessionRegistry, executingTaskLock }), {
+          expectedUpdatedAt: task.updatedAt,
+          expectedCheckedOutBy: task.checkedOutBy ?? null,
+          expectedCheckoutNodeId: task.checkoutNodeId ?? null,
+          expectedCheckoutLeaseEpoch: task.checkoutLeaseEpoch ?? 0,
+        });
+        if (!resumed || resumedTask.status !== "queued" || resumedTask.error
+          || resumedTask.column !== task.column || resumedTask.paused || resumedTask.userPaused || resumedTask.deletedAt) return false;
         // FN-7551: the attempt just dispatched — record it as attemptCount + 1
         // (decision.attemptCount is the count BEFORE this dispatch).
         await this.emitOverseerInterventionSafe(() =>
@@ -2930,11 +3143,13 @@ export class ProjectEngine {
     updatedAt?: string | null;
     mergeDetails?: { mergeConfirmed?: boolean } | null;
   }, maxAutoMergeRetries: number, reviewColumns?: ReadonlySet<string>, enforcePrRetryBackoff = false, resolvedMergeBlocker?: string | null): boolean {
-    // Merge-confirmed tasks use the fast-path finalizer, which applies blocker
-    // checks after clearing transient status/error state. Once that path parks
-    // a blocked task as failed, skip future auto-merge retries.
+    /*
+    FNXC:PostMergeEvidenceHold 2026-10-03-23:32:
+    Landing proof bypasses pre-merge checks, not the resolved post-merge evidence hold. Re-admitting
+    a rejected or pending gate every sweep only repeats finalization; it cannot produce new evidence.
+    */
     if (task.mergeDetails?.mergeConfirmed) {
-      return true;
+      return !resolvedMergeBlocker;
     }
     /*
     FNXC:MergeExecutionExclusion 2026-08-23-06:52:
@@ -2951,7 +3166,10 @@ export class ProjectEngine {
     // Terminal failure: don't let the cooldown sweep re-attempt a merge that
     // already gave up (verification cap, conflict-bounce cap, or non-conflict
     // error). The task is parked for human/follow-up intervention.
-    if (task.status === "failed" || task.status === "awaiting-approval" || task.status === "awaiting-user-review") return false;
+    // A PR check wait is released solely by PrReconciler after a SHA-fenced
+    // readiness observation. Sweeps must not turn ordinary CI latency into a
+    // fresh merge attempt or consume its retry budget.
+    if (task.status === "failed" || task.status === "awaiting-approval" || task.status === "awaiting-user-review" || task.status === "awaiting-pr-checks") return false;
     /*
     FNXC:AutoMergeRetries 2026-08-09-03:02:
     Retry backoff must be enforced at this shared admission point, not only by
@@ -2980,36 +3198,103 @@ export class ProjectEngine {
   proof as direct merge doors. Capture is asynchronous because workspace evidence
   probes each repository; a failure becomes an unprovable descriptor and defers.
   */
-  private async resolveMergeGateBlocker(store: TaskStore, task: Task, settings: Settings): Promise<string | undefined> {
-    // Confirmed work takes the reconciliation fast path and must not be stranded
-    // behind a review capture while its executor session winds down.
-    if (task.mergeDetails?.mergeConfirmed) return undefined;
-    const injected = this.options.getTaskMergeBlocker?.(task);
-    if (injected || !Array.isArray(task.steps)) return injected ?? undefined;
-    let mergeGate;
-    try {
-      mergeGate = await resolvePreMergeGateForTask(store, task.id, task.enabledWorkflowSteps, task);
-    } catch {
-      return "merge gate could not resolve the task workflow";
-    }
-    if (mergeGate.provenance === "default" && !mergeGate.selectionAbsent) {
-      return "merge gate could not resolve the task workflow";
-    }
+  /**
+   * FNXC:PreMergeAdmission 2026-10-12-18:20:
+   * Dashboard Workflow Results and every merge door must evaluate the same current content proof.
+   * Keep descriptor capture and stale-callback waiver resolution in this engine-owned boundary so a
+   * displayed approval cannot silently omit the fingerprint evidence that closes merge admission.
+   */
+  async getPreMergeAdmissionDecision(taskId: string): Promise<{
+    gate: { requiredPreMergeStepIds: ReadonlySet<string>; resolution: string };
+    decision: PreMergeAdmissionDecision;
+  }> {
+    const store = this.runtime.getTaskStore();
+    const task = await store.getTask(taskId);
+    const settings = await store.getSettings();
+    const admission = await this.resolvePreMergeAdmissionDecision(store, task, settings);
+    return {
+      gate: {
+        requiredPreMergeStepIds: admission.gate.requiredPreMergeStepIds,
+        resolution: admission.gate.resolution,
+      },
+      decision: admission.decision,
+    };
+  }
+
+  private async resolvePreMergeAdmissionDecision(store: TaskStore, task: Task, settings: Settings) {
+    const gate = await resolvePreMergeGateForTask(store, task.id, task.enabledWorkflowSteps, task);
     const mergeContent = await captureMergeContentDescriptor(task, {
       workspaceRootDir: this.config.workingDirectory,
       settings,
     });
-    const receipts = await store.getStaleReviewCallbackWaiverReceipts(task.id);
+    const staleReviewCallbackWaiver = {
+      projectId: store.getProjectId() ?? "",
+      effectiveAutoMerge: allowsAutoMergeProcessing(task, settings) && resolveEffectiveAutoMerge(task, settings),
+      hasOpenFindings: task.workflowStepResults?.some((result) => result.findings?.some(isOpenWorkflowReviewFinding)) === true,
+      receipts: await store.getStaleReviewCallbackWaiverReceipts(task.id),
+    };
+    return {
+      gate,
+      mergeContent,
+      staleReviewCallbackWaiver,
+      decision: evaluatePreMergeAdmissionDecision(task, {
+        requiredPreMergeStepIds: gate.requiredPreMergeStepIds,
+        mergeContent,
+        staleReviewCallbackWaiver,
+      }),
+    };
+  }
+
+  private async resolveMergeGateBlocker(store: TaskStore, task: Task, settings: Settings): Promise<string | undefined> {
+    /*
+    FNXC:PostMergeEvidenceHold 2026-10-03-23:32:
+    Confirmed work still bypasses pre-merge capture. An absent post-merge gate may be resumed by
+    finalization, but an existing pending/rejected result must wait for its evidence owner instead
+    of monopolizing the merge pump. Once approved, this read automatically admits finalization again.
+    */
+    if (task.mergeDetails?.mergeConfirmed) {
+      if (!await this.isMergePending(task.id)) await recoverConfirmedMergePush(store, task, settings);
+      const decision = await getRequiredPostMergeEvidenceDecision(store, task);
+      if (decision.outcome !== "blocked") return undefined;
+      if (isPostMergeGateRecoveryDue(task, decision) && !await this.isMergePending(task.id)) {
+        await resumeMissingPostMergeGate(store, task.id);
+      }
+      if (!task.paused && !task.userPaused && !task.deletedAt && task.autoMerge !== false
+        && !settings.globalPause && !settings.enginePaused && isMergeActiveStatus(task.status)
+        && !isTaskExecutionLive(task.id, { activeSessionRegistry, executingTaskLock })
+        && !await this.isMergePending(task.id)) {
+        const cleared = await store.updateTaskAtomic(task.id, (current) => {
+          if (current.updatedAt !== task.updatedAt || current.status !== task.status
+            || this.mergeActive.has(task.id) || this.mergeQueue.includes(task.id)
+            || this.capacityDeferredMergeTaskIds.has(task.id)
+            || current.paused || current.userPaused || current.deletedAt
+            || !current.mergeDetails?.mergeConfirmed
+            || isTaskExecutionLive(task.id, { activeSessionRegistry, executingTaskLock })) return null;
+          return { status: null };
+        });
+        if (cleared) await store.logEntry(task.id,
+          `[post-merge] Landing is complete; cleared stale merge activity while '${decision.gateId}' remains ${decision.reason}. Verification evidence is unchanged.`);
+      }
+      return await getRequiredPostMergeEvidenceBlocker(store, task)
+        ?? `required post-merge evidence gate '${decision.gateId}' is not approved`;
+    }
+    const injected = this.options.getTaskMergeBlocker?.(task);
+    if (injected || !Array.isArray(task.steps)) return injected ?? undefined;
+    let admission;
+    try {
+      admission = await this.resolvePreMergeAdmissionDecision(store, task, settings);
+    } catch {
+      return "merge gate could not resolve the task workflow";
+    }
+    const { gate: mergeGate, mergeContent, staleReviewCallbackWaiver } = admission;
+    if (mergeGate.provenance === "default" && !mergeGate.selectionAbsent) {
+      return "merge gate could not resolve the task workflow";
+    }
     const blocker = getTaskMergeBlocker(task, {
       reviewColumns: mergeGate.reviewColumns.size > 0 ? mergeGate.reviewColumns : new Set(["in-review"]),
       requiredPreMergeStepIds: mergeGate.requiredPreMergeStepIds,
       mergeContent,
-      staleReviewCallbackWaiver: {
-        projectId: store.getProjectId() ?? "",
-        effectiveAutoMerge: allowsAutoMergeProcessing(task, settings) && resolveEffectiveAutoMerge(task, settings),
-        hasOpenFindings: task.workflowStepResults?.some((result) => result.findings?.some(isOpenWorkflowReviewFinding)) === true,
-        receipts,
-      },
+      staleReviewCallbackWaiver,
     });
     if (mergeContent.kind === "singular" && !await this.isMergePending(task.id)) {
       // Use the same in-memory admission fence as every other no-verdict recovery owner.
@@ -4172,52 +4457,41 @@ export class ProjectEngine {
                 };
 
                 if (budgetExhausted) {
-                  // Retry budget exhausted — terminal park for manual review.
-                  // FN-4538-class invariant: failed `in-review` blockers at the
-                  // retry ceiling are recognized by downstream `clearStaleBlockedBy`
-                  // fast paths (FN-5488), so dependents won't deadlock.
-                  const errorMsg =
-                    `Auto-merge fast-path refused after ${currentRetries} attempts: commit ${shortSha} is not reachable from ` +
-                    `${integrationBranchForGate} (${reachability.reason}). Manual review required.`;
+                  /*
+                  FNXC:RecoveryEscalation 2026-10-06-15:13:
+                  A rejected merge-confirmed proof is recoverable work, not a human-only terminal
+                  park. Exhaustion clears only the poisoned proof and resets this fast-path budget
+                  before the normal merger owns a fresh, fenced attempt; no diagnostic text or git
+                  evidence is persisted in audit metadata.
+                  */
                   runtimeLog.warn(
-                    `Auto-merge: ${taskId} fast-path REFUSED + budget exhausted — ${reachability.reason}: ${reachability.diagnostic}`,
+                    `Auto-merge: ${taskId} fast-path budget exhausted; escalating to a fresh merge attempt (${reachability.reason})`,
                   );
                   await store.logEntry(
                     taskId,
-                    `[FN-5627] Auto-merge fast-path refused (retry budget exhausted) — ${errorMsg}`,
+                    "Auto-recovered: fast-path retry budget exhausted — cleared stale merge proof and reseeded a fresh merge attempt.",
                   );
                   await store.updateTask(taskId, {
                     mergeDetails: cleanedMergeDetails,
-                    status: "failed",
-                    error: errorMsg,
+                    mergeRetries: 0,
+                    status: null,
+                    error: null,
                   });
-                  try {
-                    const auditor = createRunAuditor(store, {
-                      runId: generateSyntheticRunId("merger-fast-path-refused", taskId),
-                      agentId: "merger",
+                  await emitBoundedRunAudit(store, {
+                    taskId,
+                    agentId: "merger",
+                    runId: generateSyntheticRunId("merger-fast-path-escalated", taskId),
+                    domain: "database",
+                    mutationType: "merger:fast-path-recovery-escalated",
+                    target: taskId,
+                    metadata: {
                       taskId,
-                      phase: "auto-merge-fast-path-gate",
-                    });
-                    await auditor.database({
-                      type: "merger:fast-path-blocked-foreign-commit",
-                      target: taskId,
-                      metadata: {
-                        taskId,
-                        commitSha: sha,
-                        integrationBranch: integrationBranchForGate,
-                        reason: reachability.reason,
-                        diagnostic: reachability.diagnostic,
-                        mergeRetries: currentRetries,
-                        budgetExhausted: true,
-                      },
-                    });
-                  } catch (auditErr) {
-                    runtimeLog.warn(
-                      `Auto-merge: ${taskId} fast-path audit emit failed: ${
-                        auditErr instanceof Error ? auditErr.message : String(auditErr)
-                      }`,
-                    );
-                  }
+                      reason: reachability.reason,
+                      priorRetryCount: currentRetries,
+                      outcome: "fresh-merge-reseeded",
+                    },
+                  }, { log: runtimeLog });
+                  this.internalEnqueueMerge(taskId);
                   continue;
                 }
 

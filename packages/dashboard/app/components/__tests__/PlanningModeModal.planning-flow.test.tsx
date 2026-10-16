@@ -68,7 +68,21 @@ async function selectResponseAfterHydration(label: string) {
   await screen.findByLabelText(label);
   await act(async () => {});
   fireEvent.click(screen.getByLabelText(label));
-  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await clickEnabledPlanningButton("Next");
+}
+
+/*
+FNXC:PlanningTestReadiness 2026-10-05-18:31:
+Answer selection commits through React before the live Next control becomes actionable. Re-query the
+rendered control after that commit so ordering coverage dispatches only a user-available action rather
+than retaining a disabled node that hydration is about to replace.
+*/
+async function clickEnabledPlanningButton(name: string) {
+  await waitFor(() => expect(screen.getByRole("button", { name })).toBeEnabled());
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name }));
+    await Promise.resolve();
+  });
 }
 
 describe("PlanningModeModal sequential flow", () => {
@@ -1085,23 +1099,32 @@ describe("PlanningModeModal sequential flow", () => {
     });
     renderSession();
 
-    const workspace = await screen.findByTestId("planning-workspace");
+    await screen.findByTestId("planning-workspace");
+    /*
+    FNXC:PlanningMode 2026-10-05-03:07:
+    A resumed mobile session can first render its workspace before the question-keyed effect
+    resets the selected tab. Settle that hydration commit and reacquire controls so this test
+    validates the live Questions-to-Plan-preview interaction people can actually perform.
+    */
+    await act(async () => {});
     // The viewport-mode hook is mocked without changing jsdom's CSS media viewport.
+    const workspace = screen.getByTestId("planning-workspace");
     const questionsTab = screen.getByRole("tab", { name: "Questions", hidden: true });
     const planTab = screen.getByRole("tab", { name: "Plan preview", hidden: true });
     expect(questionsTab).toHaveAttribute("aria-selected", "true");
     expect(workspace).toHaveClass("planning-workspace--mobile-tab-question");
 
     fireEvent.click(planTab);
-    expect(planTab).toHaveAttribute("aria-selected", "true");
-    expect(questionsTab).toHaveAttribute("aria-selected", "false");
-    expect(workspace).toHaveClass("planning-workspace--mobile-tab-plan");
+    expect(screen.getByRole("tab", { name: "Plan preview", hidden: true })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Questions", hidden: true })).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByTestId("planning-workspace")).toHaveClass("planning-workspace--mobile-tab-plan");
     expect(screen.getByTestId("planning-plan-pane")).toHaveTextContent("Build authentication system");
 
     fireEvent.click(screen.getByRole("button", { name: "History", hidden: true }));
     expect(screen.getByRole("region", { name: "Question and answer history" })).toBeInTheDocument();
     expect(screen.getByText("No history yet")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close history" }));
+    expect(screen.queryByRole("region", { name: "Question and answer history" })).toBeNull();
   });
 
   it.each([
@@ -1246,10 +1269,12 @@ describe("PlanningModeModal sequential flow", () => {
 
     renderSession();
     fireEvent.click(await screen.findByLabelText("Secure defaults"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Next" }));
-      await Promise.resolve();
-    });
+    /*
+     * FNXC:PlanningTurnReconciliation 2026-10-05-15:57:
+     * The production action submits only after the selected answer commits and enables Next.
+     * Await that observable readiness so a loaded dashboard lane cannot click the prior disabled form.
+     */
+    await clickEnabledPlanningButton("Next");
     await waitFor(() => expect(mockRespondToPlanning).toHaveBeenCalledTimes(1));
 
     if (status === "awaiting_input") {
@@ -1318,11 +1343,7 @@ describe("PlanningModeModal sequential flow", () => {
 
     const props = { isOpen: true, onClose: vi.fn(), onTaskCreated: vi.fn(), onTasksCreated: vi.fn(), tasks: mockTasks, projectId: "project-1" };
     const { rerender } = render(<PlanningModeModal {...props} resumeSessionId="session-a" />);
-    fireEvent.click(await screen.findByLabelText("Secure defaults"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Next" }));
-      await Promise.resolve();
-    });
+    await selectResponseAfterHydration("Secure defaults");
     await waitFor(() => expect(sessionAReads).toBe(2));
 
     rerender(<PlanningModeModal {...props} resumeSessionId="session-b" />);
@@ -1385,8 +1406,7 @@ describe("PlanningModeModal sequential flow", () => {
     mockRespondToPlanning.mockRejectedValue(new Error("Generation already in progress for this response"));
 
     renderSession();
-    fireEvent.click(await screen.findByLabelText("Secure defaults"));
-    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await selectResponseAfterHydration("Secure defaults");
     await waitFor(() => expect(sessionReads).toBe(2));
     await waitFor(() => expect(mockConnectPlanningStream).toHaveBeenCalledWith("session-1", "project-1", expect.any(Object)));
 
@@ -1460,8 +1480,7 @@ describe("PlanningModeModal sequential flow", () => {
     }
 
     renderSession(sessionId);
-    fireEvent.click(await screen.findByLabelText("Secure defaults"));
-    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await selectResponseAfterHydration("Secure defaults");
     await waitFor(() => expect(fetchCount).toBe(2));
 
     await act(async () => {
@@ -1537,10 +1556,7 @@ describe("PlanningModeModal sequential flow", () => {
     const { rerender } = render(<PlanningModeModal {...props} resumeSessionId="session-a" />);
 
     fireEvent.click(await screen.findByLabelText("Secure defaults"));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Next" }));
-      await Promise.resolve();
-    });
+    await clickEnabledPlanningButton("Next");
     await waitFor(() => expect(mockRespondToPlanning).toHaveBeenCalledTimes(1));
     rerender(<PlanningModeModal {...props} resumeSessionId="session-b" />);
     expect(await screen.findByText("What did session B ask?")).toBeInTheDocument();
@@ -1600,8 +1616,7 @@ describe("PlanningModeModal sequential flow", () => {
     expect(await screen.findByLabelText("Secure defaults")).toBeInTheDocument();
     handlers?.onError?.("The old stream failed");
     await waitFor(() => expect(fetchCount).toBe(2));
-    fireEvent.click(screen.getByLabelText("Secure defaults"));
-    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await selectResponseAfterHydration("Secure defaults");
     const connectionCountAfterResponse = mockConnectPlanningStream.mock.calls.length;
     await act(async () => {
       resolveRecovery({
@@ -1662,8 +1677,7 @@ describe("PlanningModeModal sequential flow", () => {
     });
     mockRespondToPlanning.mockReturnValue(new Promise(() => undefined));
     renderSession();
-    fireEvent.click(await screen.findByLabelText("Secure defaults"));
-    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await selectResponseAfterHydration("Secure defaults");
     const workspace = screen.getByTestId("planning-workspace");
     expect(workspace).toHaveAttribute("aria-busy", "true");
     expect(screen.getByText("Generating plan…")).toBeInTheDocument();
@@ -1870,7 +1884,7 @@ describe("PlanningModeModal sequential flow", () => {
       currentQuestion: { id: "q-next", type: "text", question: "What comes next?" },
       summary: summaryWithRefinements,
     });
-    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await clickEnabledPlanningButton("Next");
     await waitFor(() => expect(mockRespondToPlanning).toHaveBeenCalledWith(
       "session-1",
       { "q-prior": "Preserve drafts" },
@@ -1975,12 +1989,16 @@ describe("PlanningModeModal sequential flow", () => {
     });
     renderSession();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Stop" }));
+    const stopButton = await screen.findByRole("button", { name: "Stop" });
+    await act(async () => {
+      fireEvent.click(stopButton);
+      await Promise.resolve();
+    });
     /*
-    FNXC:PlanningMode 2026-07-23-00:00:
-    Wait for the stop to settle into plan review before grabbing Refine. Clicking the workspace
-    pane's Refine while the stop transition remounts the plan pane dispatches on a detached node
-    and the refinement menu never opens.
+    FNXC:PlanningTestReadiness 2026-10-05-18:31:
+    Stop restores plan review after its best-effort request settles. Flush that request and find the
+    restored workspace before selecting Refine, because its former loading-pane button can remount
+    during the same event turn and cannot represent a user action.
     */
     await waitFor(() => expect(mockStopPlanningGeneration).toHaveBeenCalledWith("session-1", "project-1"));
     await screen.findByTestId("planning-plan-review");
