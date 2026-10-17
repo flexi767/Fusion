@@ -2,7 +2,7 @@
 
 Measured: 2026-09-24, against the live production AgentPulse on J
 (`agentpulse.service`, `agentpulse-supervisor.service`, `agentpulse-private-relay.service`,
-SQLite at `/home/ubuntu/.agentpulse/data/agentpulse.db`, 1,013,276,672 bytes).
+SQLite at `~/.agentpulse/data/agentpulse.db` on that host, 1,013,276,672 bytes).
 
 The integration plan scopes parity to "the AgentPulse features **used in this deployment**".
 This inventory answers that from data rather than from the source tree: a feature whose tables

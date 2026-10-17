@@ -5,7 +5,7 @@ no worktree of its own. Plan Review is the canonical one. With the bare root as 
 key, the SECOND task to reach such a node failed with "active-session path <root> is held by task <other>;
 task <self> may not overwrite it" — narrated as a Plan Review provider failure, retried in place against a
 hold retrying can never clear, then parked once the budget was spent (reported: FN-1398 holding
-/home/ubuntu/dev/freemap-svelte while FN-1403 planned).
+/workspace/example-project while FN-1403 planned).
 
 Invariant under test: on a plain single-repo project (NO workspaceConfig — the workspace fix did not cover
 this), two different tasks register root-rooted sessions concurrently across ALL THREE registration

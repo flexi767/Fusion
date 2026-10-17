@@ -1,6 +1,6 @@
 /*
 FNXC:SessionContention 2026-07-25-21:30 (contention is never a provider failure — regression):
-Reported symptom: FN-1403's Plan Review hit "active-session path /home/ubuntu/dev/freemap-svelte is held
+Reported symptom: FN-1403's Plan Review hit "active-session path /workspace/example-project is held
 by task FN-1398; task FN-1403 may not overwrite it". The engine narrated that as "Plan Review provider
 failure — retrying in place (2/2)", spent the provider budget on two immediate retries that could not
 possibly clear another task's hold, then left the task parked.
@@ -27,7 +27,7 @@ import {
 } from "../agents/active-session-registry.js";
 
 const REPORTED_MESSAGE =
-  "active-session path /home/ubuntu/dev/freemap-svelte is held by task FN-1398; task FN-1403 may not overwrite it";
+  "active-session path /workspace/example-project is held by task FN-1398; task FN-1403 may not overwrite it";
 const ACQUIRE_BUSY_MESSAGE = "workspace sub-repo apps/web acquisition is in progress for task FN-1398";
 const LAND_BUSY_MESSAGE = "workspace sub-repo apps/web land is in progress for task FN-1398";
 

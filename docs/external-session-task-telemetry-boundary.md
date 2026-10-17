@@ -38,13 +38,13 @@ datasets are therefore live at the same time, on overlapping providers.
 
 Sessions by host: `m3` 637, `m5` 47, `j` 21.
 
-All 637 m3 and 47 m5 sessions carry macOS operator paths (`/Users/v/dev/...`, `/Users/v/.codex/worktrees/...`).
-Fusion's tasks run on J with worktrees under `/home/ubuntu/fusion-src/.fusion/worktrees/` and
-`/srv/scrapeui-dev/.worktrees/`. Different machines: no possible double count.
+All 637 m3 and 47 m5 sessions carry macOS operator paths (the operator's `~/dev/...` and `~/.codex/worktrees/...`).
+Fusion's tasks run on J with worktrees under the Fusion checkout's `.fusion/worktrees/` and the
+application checkout's `.worktrees/`. Different machines: no possible double count.
 
 All 21 J-host sessions carry server paths, so J does run both Fusion and a collector — but they sit in
-different trees: `/home/ubuntu/.openclaw/workspace`, `/home/ubuntu/agentpulse-verification`,
-`/home/ubuntu/fusion-deployments/...`, `/srv/scrapeui-rc`, versus Fusion's `.fusion/worktrees` and
+different trees: an assistant workspace, an AgentPulse verification checkout, the Fusion
+deployment directories and an application release checkout, versus Fusion's `.fusion/worktrees` and
 `.worktrees` roots.
 
 ## The exact ambiguity

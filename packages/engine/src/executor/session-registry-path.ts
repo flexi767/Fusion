@@ -24,7 +24,7 @@
  * at the same time collided: the second failed with "active-session path <root> is held by task <other>;
  * task <self> may not overwrite it", which surfaced as a Plan Review provider failure, burned the
  * in-place retry budget against a hold that retrying can never clear, and left the task parked
- * (reported: FN-1398 holding /home/ubuntu/dev/freemap-svelte while FN-1403 planned).
+ * (reported: FN-1398 holding /workspace/example-project while FN-1403 planned).
  * Path-exclusivity on the shared root is not what keeps these sessions correct: write-capable nodes are
  * refused at the root outright (no-worktree-for-write-node), real per-sub-repo exclusivity is the
  * workspace-repo-acquire lease, and every isPathActive consumer guards removable WORKTREE paths — the

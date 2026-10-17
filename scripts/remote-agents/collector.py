@@ -76,7 +76,7 @@ def validate_url(value):
         return value.rstrip('/')
     if parsed.scheme != 'http':
         raise ValueError('Collector URL must use HTTPS or private HTTP')
-    allowed_hosts = {'localhost', 'wj'}
+    allowed_hosts = {'localhost'}
     allowed_hosts.update(host.strip().lower() for host in os.environ.get('FUSION_REMOTE_AGENTS_HTTP_HOSTS', '').split(',') if host.strip())
     if parsed.hostname.lower() in allowed_hosts:
         return value.rstrip('/')
