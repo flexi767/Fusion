@@ -17,7 +17,7 @@ import "../builtin-traits.js";
 import {allowsAutoMergeProcessing} from "../merge/task-merge.js";
 import {getInReviewStallReason, DEFAULT_STALE_MERGING_MIN_AGE_MS, type InReviewStallContext} from "../tasks/in-review-stall.js";
 import {getAgentLogFilePath} from "../agents/agent-log-file-store.js";
-import {getInReviewStalledSignal, DEFAULT_IN_REVIEW_STALLED_THRESHOLD_MS, type InReviewStalledContext} from "../tasks/in-review-stalled.js";
+import {getInReviewStalledSignal, type InReviewStalledContext} from "../tasks/in-review-stalled.js";
 import {getStalePausedReviewSignal, type StalePausedReviewContext} from "../tasks/stale-paused-review.js";
 import {getStalePausedTodoSignal} from "../tasks/stale-paused-todo.js";
 import {resolveLifecycleColumns, resolveReviewColumns} from "../workflows/workflow-lifecycle-traits.js";
@@ -26,7 +26,7 @@ import type {WorkflowIr} from "../workflows/workflow-ir-types.js";
 
 import {getTaskAgeStalenessSignal, type TaskAgeStalenessThresholds} from "../tasks/task-age-staleness.js";
 import {resolveTaskLifecycleColumns} from "../workflows/workflow-lifecycle-traits.js";
-import {detectStalledReview, STALLED_REVIEW_WINDOW_MS} from "../tasks/stalled-review-detector.js";
+import {detectStalledReview} from "../tasks/stalled-review-detector.js";
 import {computeRetrySummary} from "../tasks/retry-summary.js";
 // FNXC:TaskLookup404 2026-07-26-11:20: typed miss signal so API boundaries can
 // answer 404 instead of 500 (see TaskNotFoundError in task-store/errors.ts).
@@ -456,31 +456,18 @@ export async function listTasksImpl(store: TaskStore, options?: ListTasksOptions
       : undefined;
     const sqlPaginated = (!includeColdStorage && (paginationLimit !== undefined || paginationOffset > 0))
       || boundedMergedPrefix !== undefined;
-    const now = Date.now();
-    const settings = await store.getSettingsFast();
-    /*
-    FNXC:SlimLogWindow 2026-10-18-14:30:
-    Slim rows drop their log before they leave this function, and the log-derived signals below read
-    only timing entries, the last hour, entries newer than the in-review stall threshold, and the latest
-    entry. Ask SQL for just those (see trimmedTaskLogColumn) instead of every row's whole history.
-    */
-    const logSince = slim
-      ? new Date(now - Math.max(
-          STALLED_REVIEW_WINDOW_MS,
-          settings.inReviewStalledThresholdMs ?? DEFAULT_IN_REVIEW_STALLED_THRESHOLD_MS,
-        )).toISOString()
-      : undefined;
     const filteredRows = await readLiveTaskRows(layer, {
       includeDeleted: options?.includeDeleted,
       column: columnFilter ?? undefined,
       excludeColumn: !columnFilter && !includeArchived ? "archived" : undefined,
-      ...(logSince !== undefined ? { logSince } : {}),
       ...(boundedMergedPrefix !== undefined
         ? { limit: boundedMergedPrefix, offset: 0 }
         : sqlPaginated
           ? { limit: paginationLimit, offset: paginationOffset }
           : {}),
     });
+    const now = Date.now();
+    const settings = await store.getSettingsFast();
     const mergeQueuedTaskIds = await store.getMergeQueuedTaskIdsAsync();
     /*
     FNXC:WorkflowLifecycleColumns 2026-07-28-18:05 (PR #2479 review, P2):
