@@ -434,9 +434,33 @@ export async function readTaskRowInTransaction(
  *   column/excludeColumn filter by board column in SQL; limit/offset paginate
  *   in SQL (ordered by createdAt then numeric id suffix).
  */
+/*
+FNXC:SlimLogWindow 2026-10-18-14:30:
+A slim board list needs the task log only to derive timedExecutionMs (every `[timing]` entry),
+stalledReview (entries in the last hour), and inReviewStalled (entries newer than the stall threshold,
+plus the latest log timestamp). On a long-lived board the log was over 90% of each row's bytes and was
+shipped and parsed on every poll. This projection keeps exactly what those derivations can read: every
+timing entry, every entry at or after `since`, the last entry and the newest-timestamp entry, and any
+entry whose timestamp is missing or not a plain UTC ISO string (kept rather than misjudged).
+*/
+function trimmedTaskLogColumn(since: string) {
+  const log = sql`COALESCE(${schema.project.tasks.log}, '[]'::jsonb)`;
+  return sql<unknown>`(
+    SELECT COALESCE(jsonb_agg(entry ORDER BY ord), '[]'::jsonb)
+    FROM jsonb_array_elements(${log}) WITH ORDINALITY AS kept(entry, ord)
+    WHERE ord = jsonb_array_length(${log})
+      OR COALESCE(entry->>'action', '') LIKE '%[timing]%'
+      OR COALESCE(entry->>'outcome', '') LIKE '%[timing]%'
+      OR entry->>'timestamp' IS NULL
+      OR entry->>'timestamp' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$'
+      OR entry->>'timestamp' >= ${since}
+      OR entry->>'timestamp' = (SELECT max(newest->>'timestamp') FROM jsonb_array_elements(${log}) AS newest)
+  )`;
+}
+
 export async function readLiveTaskRows(
   layer: AsyncDataLayer,
-  options?: { excludeLog?: boolean; includeDeleted?: boolean; column?: string; excludeColumn?: string; limit?: number; offset?: number },
+  options?: { excludeLog?: boolean; includeDeleted?: boolean; column?: string; excludeColumn?: string; limit?: number; offset?: number; logSince?: string },
 ): Promise<Record<string, unknown>[]> {
   // FNXC:TaskStoreForensicRead 2026-06-26-15:20:
   // VAL-DATA-006 — Forensic reads surface soft-deleted rows when explicitly
@@ -486,6 +510,15 @@ export async function readLiveTaskRows(
     if (offset > 0) q = q.offset(offset);
     return q;
   };
+  if (options?.logSince !== undefined && !options.excludeLog) {
+    let query = layer.db
+      .select({ ...TASK_SLIM_PROJECTION, log: trimmedTaskLogColumn(options.logSince) })
+      .from(schema.project.tasks)
+      .$dynamic();
+    if (liveFilter) query = query.where(liveFilter);
+    const rows = await applyPagination(query);
+    return rows as unknown as Record<string, unknown>[];
+  }
   if (options?.excludeLog) {
     // FNXC:TaskStoreReads 2026-06-26-11:45:
     // Select every column except `log` via a Drizzle `.select({...projection})`
