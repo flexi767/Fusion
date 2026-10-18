@@ -1855,8 +1855,15 @@ export async function applySchemaBaseline(
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${RECOVERY_DISPOSITION_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
+    /*
+    FNXC:SchemaRepair 2026-10-18-19:30:
+    A repair pass can run while project.tasks is absent (external-session repair, renamed table). The
+    column probe then read "missing" and re-ran 0096, whose ALTER TABLE failed and aborted the whole
+    repair. A missing table has no lease-release column to restore, so it counts as present here.
+    */
     const fileScopeLeaseReleaseExists = ((await tx.execute(sql`
-      SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'project' AND table_name = 'tasks' AND column_name = 'file_scope_lease_release') AS present
+      SELECT to_regclass('project.tasks') IS NULL
+        OR EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'project' AND table_name = 'tasks' AND column_name = 'file_scope_lease_release') AS present
     `)) as unknown as Array<{ present: boolean }>)[0]?.present === true;
     if (!fileScopeLeaseReleaseAlreadyApplied || !fileScopeLeaseReleaseExists) {
       const migrationSql = await readFile(FILE_SCOPE_LEASE_RELEASE_MIGRATION_PATH, "utf8");
