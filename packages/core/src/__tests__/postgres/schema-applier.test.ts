@@ -128,6 +128,7 @@ import {
   PULL_REQUEST_READINESS_VERSION,
   RECOVERY_DISPOSITION_VERSION,
   FILE_SCOPE_LEASE_RELEASE_VERSION,
+  TASK_LOG_SIGNAL_ENTRIES_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -199,7 +200,9 @@ describe("schema-applier: immutable migration identities", () => {
     expect(Number(RECOVERY_DISPOSITION_VERSION)).toBeGreaterThan(Number(PULL_REQUEST_READINESS_VERSION));
     expect(Number(FILE_SCOPE_LEASE_RELEASE_VERSION)).toBeGreaterThan(Number(RECOVERY_DISPOSITION_VERSION));
     expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(FILE_SCOPE_LEASE_RELEASE_VERSION));
-    expect(SCHEMA_BASELINE_VERSION).toBe("0096");
+    expect(TASK_LOG_SIGNAL_ENTRIES_VERSION).toBe("0097");
+    expect(Number(TASK_LOG_SIGNAL_ENTRIES_VERSION)).toBeGreaterThan(Number(FILE_SCOPE_LEASE_RELEASE_VERSION));
+    expect(SCHEMA_BASELINE_VERSION).toBe("0097");
   });
 
   it("keeps monitor and approval isolation assigned to version 0003", () => {
@@ -2087,6 +2090,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
       FILE_SCOPE_LEASE_RELEASE_VERSION,
+      TASK_LOG_SIGNAL_ENTRIES_VERSION,
     ]);
     const readinessMarkerCount = (await ctx.db.execute(sql`
       SELECT count(*)::int AS count
@@ -2262,6 +2266,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
       FILE_SCOPE_LEASE_RELEASE_VERSION,
+      TASK_LOG_SIGNAL_ENTRIES_VERSION,
     ]);
   });
 
@@ -2507,6 +2512,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
       FILE_SCOPE_LEASE_RELEASE_VERSION,
+      TASK_LOG_SIGNAL_ENTRIES_VERSION,
     ]);
   });
 
@@ -2633,6 +2639,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
       FILE_SCOPE_LEASE_RELEASE_VERSION,
+      TASK_LOG_SIGNAL_ENTRIES_VERSION,
     ]);
   });
 
@@ -2759,6 +2766,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
       FILE_SCOPE_LEASE_RELEASE_VERSION,
+      TASK_LOG_SIGNAL_ENTRIES_VERSION,
     ]);
   });
 });

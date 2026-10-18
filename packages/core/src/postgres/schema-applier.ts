@@ -99,7 +99,7 @@ touches no data; it must advance in the same change that ships a new migration f
 // FNXC:UpstreamMerge 2026-10-04 (X-4385): upstream's 0086 (FN-9429 waiver receipts) collides with this
 // fork's released 0086 (external sessions, applied on J), so it is renumbered to 0093 below.
 // FNXC:UpstreamSync 2026-10-16-22:04: preserve released fork migrations 0086-0093; incoming readiness, recovery and lease release use 0094-0096.
-export const SCHEMA_BASELINE_VERSION = "0096";
+export const SCHEMA_BASELINE_VERSION = "0097";
 export const EXTERNAL_SESSIONS_VERSION = "0086";
 export const EXTERNAL_SESSION_TURNS_VERSION = "0088";
 export const EXTERNAL_SESSION_TURN_SEARCH_VERSION = "0089";
@@ -300,6 +300,8 @@ export const PULL_REQUEST_READINESS_VERSION = "0094";
 /** FN-9512: privacy-safe route code for a recovery owner that has reseeded work. */
 export const RECOVERY_DISPOSITION_VERSION = "0095";
 export const FILE_SCOPE_LEASE_RELEASE_VERSION = "0096";
+/** X-4682: trigger-maintained subset of task logs that slim board lists read. */
+export const TASK_LOG_SIGNAL_ENTRIES_VERSION = "0097";
 
 /** FNXC:MemoryFocus 2026-08-13-15:57: explicit registration prevents the per-conversation memory-focus migration from being skipped. Renumbered to 0060 (FN-9037 took 0059), then 0061, then 0065 (2026-08-20) when the upstream FN-066..FN-094 batch claimed 0061-0064. */
 export const CHAT_SESSION_MEMORY_FOCUS_VERSION = "0066";
@@ -580,6 +582,7 @@ const STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_MIGRATION_PATH = join(MIGRATIONS_DIR
 const PULL_REQUEST_READINESS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0094_fn_9439_pull_request_readiness.sql");
 const RECOVERY_DISPOSITION_MIGRATION_PATH = join(MIGRATIONS_DIR, "0095_fn_9512_recovery_disposition.sql");
 const FILE_SCOPE_LEASE_RELEASE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0096_fn_9529_file_scope_lease_release.sql");
+const TASK_LOG_SIGNAL_ENTRIES_MIGRATION_PATH = join(MIGRATIONS_DIR, "0097_x4682_task_log_signal_entries.sql");
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -729,6 +732,7 @@ export async function applySchemaBaseline(
     const pullRequestReadinessAlreadyApplied = applied.includes(PULL_REQUEST_READINESS_VERSION);
     const recoveryDispositionAlreadyApplied = applied.includes(RECOVERY_DISPOSITION_VERSION);
     const fileScopeLeaseReleaseAlreadyApplied = applied.includes(FILE_SCOPE_LEASE_RELEASE_VERSION);
+    const taskLogSignalEntriesAlreadyApplied = applied.includes(TASK_LOG_SIGNAL_ENTRIES_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -1869,6 +1873,18 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(FILE_SCOPE_LEASE_RELEASE_MIGRATION_PATH, "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${FILE_SCOPE_LEASE_RELEASE_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    const taskLogSignalEntriesExists = ((await tx.execute(sql`
+      SELECT to_regclass('project.tasks') IS NULL
+        OR (EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'project' AND table_name = 'tasks' AND column_name = 'log_signal_entries')
+          AND (EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'tasks_log_signal_entries' AND tgrelid = to_regclass('project.tasks'))
+            OR NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'project' AND table_name = 'tasks' AND column_name = 'log'))) AS present
+    `)) as unknown as Array<{ present: boolean }>)[0]?.present === true;
+    if (!taskLogSignalEntriesAlreadyApplied || !taskLogSignalEntriesExists) {
+      const migrationSql = await readFile(TASK_LOG_SIGNAL_ENTRIES_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${TASK_LOG_SIGNAL_ENTRIES_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };
