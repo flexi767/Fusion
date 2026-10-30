@@ -26,7 +26,18 @@ export function recordedRatesFor(
   const rates: ExternalSessionTurnPricing["rates"] = {};
   for (const model of models) {
     const rate = lookupPricing({ provider: pricingProvider === "claude_code" ? "anthropic" : pricingProvider === "codex_cli" ? "openai-codex" : pricingProvider, model }, overrides);
-    if (rate) rates[`${pricingProvider}:${model}`] = { ...rate };
+    // FNXC:ExternalSessionRates 2026-10-30: the strict stamp holds base rates only. Copying the catalog entry
+    // also copied its volume `tiers` (pi-ai 1.1.0), so the route's own stamp failed validation and every turn
+    // on a tiered model was rejected with HTTP 500. Remote pricing reports tier rates as unavailable anyway.
+    if (rate) {
+      rates[`${pricingProvider}:${model}`] = {
+        inputPer1M: rate.inputPer1M,
+        outputPer1M: rate.outputPer1M,
+        cacheReadPer1M: rate.cacheReadPer1M,
+        cacheWritePer1M: rate.cacheWritePer1M,
+        source: rate.source,
+      };
+    }
   }
   if (!Object.keys(rates).length) return undefined;
   return { asOf: settings?.modelPricingFetchedAt || pricingAsOf, source: settings?.modelPricingSource || "Fusion model pricing", rates };
