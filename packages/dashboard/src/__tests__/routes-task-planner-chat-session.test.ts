@@ -74,7 +74,6 @@ function buildApp(
     createSession,
     updateSession,
     findLatestActiveSessionForTarget,
-    listSessions: vi.fn(async () => sessions),
     listSessionsPage: vi.fn(async () => ({ total: sessions.length, hasMore: false, nextCursor: null, sessions })),
     // The common GET /chat/sessions feed reads through listSessions; without it the route answered 500
     // and the preview-truncation contract below was never reached.
